@@ -87,10 +87,6 @@ class TestFunctional(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        # builder_config = builder.create_builder_config(
-        #         name='embedding',
-        #         precision='float16' if fp16 else 'float32',
-        #         timing_cache=timing_cache)
 
         net = builder.create_network()
         if use_lookup_plugin:

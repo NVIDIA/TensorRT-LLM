@@ -18,26 +18,25 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
+
+#include <NvInferRuntime.h>
 
 namespace tensorrt_llm::runtime
 {
 
-void LoraManager::create(
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& manager)
+void LoraManager::create(ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto modules = modelConfig.getLoraModules();
-    SizeType modOff = 0;
+    SizeType32 modOff = 0;
     for (auto const& m : modules)
     {
         mModuleIdToModule[m.value()] = m;
@@ -48,12 +47,12 @@ void LoraManager::create(
 }
 
 void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftTable const& peftTable,
-    ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, GptModelConfig const& modelConfig,
+    ReqIdsVec const& reqIds, std::vector<SizeType32> const& reqBeamWidth, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto batchSize = static_cast<SizeType>(reqIds.size());
-    for (SizeType bid = 0; bid < batchSize; ++bid)
+    auto batchSize = static_cast<SizeType32>(reqIds.size());
+    for (SizeType32 bid = 0; bid < batchSize; ++bid)
     {
         auto it = peftTable.find(reqIds[bid]);
         if (it == peftTable.end())
@@ -67,13 +66,13 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 }
 
 void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues,
-    SizeType batchIdx, SizeType beamWidth, GptModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    SizeType32 batchIdx, SizeType32 beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
-    auto const localNumLayers = modelConfig.getNbLayers(ppSize);
+    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize);
     auto const firstLayerId = ppRank * localNumLayers;
 
     auto weightsPointersPtr = bufferCast<int64_t>(*weightsPtrs);
@@ -81,8 +80,8 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 
     TLLM_CHECK(!peftValues->empty());
 
-    auto const numRows = static_cast<SizeType>(peftValues->size());
-    for (SizeType row = 0; row < numRows; ++row)
+    auto const numRows = static_cast<SizeType32>(peftValues->size());
+    for (SizeType32 row = 0; row < numRows; ++row)
     {
         auto const& peftValue = peftValues->at(row);
         auto const moduleId = peftValue.moduleId;
@@ -93,22 +92,22 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
         auto const inWeightsPtr = peftValue.weightsInPointer;
         auto const outWeightsPtr = peftValue.weightsOutPointer;
 
-        auto weightsPointersPtrOffset = common::flat_index4(modOff, layerIdx - firstLayerId, batchIdx, 0,
+        auto weightsPointersPtrOffset = common::flat_index4(modOff, layerIdx - firstLayerId, batchIdx, SizeType32{0},
             weightsPtrs->getShape().d[1], weightsPtrs->getShape().d[2], weightsPtrs->getShape().d[3]);
         auto adapterSizesPtrOffset = common::flat_index3(
             modOff, layerIdx - firstLayerId, batchIdx, adapterSizes->getShape().d[1], adapterSizes->getShape().d[2]);
 
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(weightsPtrs->getSize())
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(weightsPtrs->getSize())
                 >= weightsPointersPtrOffset + lora::kLORA_NUM_WEIGHTS_POINTERS * beamWidth,
             "Coding error attempting to write lora ptrs outside range of buffer");
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(adapterSizes->getSize()) >= adapterSizesPtrOffset + beamWidth,
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(adapterSizes->getSize()) >= adapterSizesPtrOffset + beamWidth,
             "Coding error attempting to write lora low ranks outside range of buffer");
 
         auto const writeWeightsPtr = weightsPointersPtr + weightsPointersPtrOffset;
         auto const writeAdapterSizesPtr = adapterSizesPtr + adapterSizesPtrOffset;
 
-        SizeType weightsPtrsOff = 0;
-        for (SizeType beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        SizeType32 weightsPtrsOff = 0;
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
         {
             writeWeightsPtr[weightsPtrsOff++] = inWeightsPtr;
             writeWeightsPtr[weightsPtrsOff++] = outWeightsPtr;
@@ -119,10 +118,10 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 }
 
 void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsPtrs, TensorPtr adapterSizes,
-    GptModelConfig const& modelConfig, WorldConfig const& worldConfig) const
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto localNbLayers = modelConfig.getNbLayers(worldConfig.getPipelineParallelism());
+    auto localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     for (auto const& [modId, mod] : mModuleIdToModule)

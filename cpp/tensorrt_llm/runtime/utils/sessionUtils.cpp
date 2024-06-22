@@ -50,15 +50,15 @@ std::vector<uint8_t> loadEngine(std::string const& enginePath)
     return engineBlob;
 }
 
-std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, SizeType const indexOffset,
-    SizeType const numBuffers, std::string const& prefix, MemoryType memType)
+std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, SizeType32 const indexOffset,
+    SizeType32 const numBuffers, std::string const& prefix, MemoryType memType)
 {
     auto const& manager = runtime.getBufferManager();
     auto const& engine = runtime.getEngine();
 
     std::vector<ITensor::SharedPtr> vector;
 
-    for (SizeType i = indexOffset; i < indexOffset + numBuffers; ++i)
+    for (SizeType32 i = indexOffset; i < indexOffset + numBuffers; ++i)
     {
         std::string name{prefix + std::to_string(i)};
         auto type = engine.getTensorDataType(name.c_str());
@@ -68,13 +68,13 @@ std::vector<ITensor::SharedPtr> createBufferVector(TllmRuntime const& runtime, S
 }
 
 std::vector<ITensor::SharedPtr> createBufferVector(
-    TllmRuntime const& runtime, SizeType const numBuffers, MemoryType const memType, nvinfer1::DataType const dtype)
+    TllmRuntime const& runtime, SizeType32 const numBuffers, MemoryType const memType, nvinfer1::DataType const dtype)
 {
     auto const& manager = runtime.getBufferManager();
 
     std::vector<ITensor::SharedPtr> vector;
 
-    for (SizeType i = 0; i < numBuffers; ++i)
+    for (SizeType32 i = 0; i < numBuffers; ++i)
     {
         vector.emplace_back(manager.emptyTensor(memType, dtype));
     }
@@ -90,24 +90,38 @@ void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims
 }
 
 std::vector<ITensor::SharedPtr> sliceBufferVector(
-    std::vector<ITensor::SharedPtr> const& vector, SizeType const offset, SizeType const size)
+    std::vector<ITensor::SharedPtr> const& vector, SizeType32 const offset, SizeType32 const size)
 {
     return transformVector(
         vector, [offset, size](auto const& buffer) { return std::shared_ptr{ITensor::slice(buffer, offset, size)}; });
 }
 
 void insertTensorVector(StringPtrMap<ITensor>& map, std::string const& key, std::vector<ITensor::SharedPtr> const& vec,
-    SizeType const indexOffset)
+    SizeType32 indexOffset, std::vector<ModelConfig::LayerType> const& layerTypes, ModelConfig::LayerType type)
 {
-    for (std::size_t i = 0; i < vec.size(); ++i)
-        map.insert_or_assign(key + std::to_string(indexOffset + i), vec[i]);
+    if (layerTypes.empty())
+    {
+        for (std::size_t i = 0; i < vec.size(); ++i)
+            map.insert_or_assign(key + std::to_string(indexOffset + i), vec[i]);
+    }
+    else
+    {
+        std::size_t vecIndex = 0;
+        for (std::size_t i = 0; i < layerTypes.size(); ++i)
+        {
+            if (layerTypes[i] == type)
+            {
+                map.insert_or_assign(key + std::to_string(indexOffset + i), vec.at(vecIndex++));
+            }
+        }
+    }
 }
 
 void insertTensorSlices(
-    StringPtrMap<ITensor>& map, std::string const& key, ITensor::SharedPtr const& tensor, SizeType const indexOffset)
+    StringPtrMap<ITensor>& map, std::string const& key, ITensor::SharedPtr const& tensor, SizeType32 const indexOffset)
 {
     auto const numSlices = tensor->getShape().d[0];
-    for (SizeType i = 0; i < numSlices; ++i)
+    for (SizeType32 i = 0; i < numSlices; ++i)
     {
         ITensor::SharedPtr slice = ITensor::slice(tensor, i, 1);
         slice->squeeze(0);
@@ -141,15 +155,15 @@ void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input)
     auto const& inputRows = input->getShape().d[0];
     auto const pointersLength = static_cast<int32_t>(pointers.getSizeInBytes() / sizeof(void**));
     TLLM_CHECK_WITH_INFO(inputRows == pointersLength,
-        tc::fmtstr("Input dim 0 (%d) does not match pointers length (%d).", inputRows, pointersLength));
+        tc::fmtstr("Input dim 0 (" FMT_DIM ") does not match pointers length (%d).", inputRows, pointersLength));
 
-    for (SizeType inputSlot = 0; inputSlot < inputRows; ++inputSlot)
+    for (SizeType32 inputSlot = 0; inputSlot < inputRows; ++inputSlot)
     {
         setRawPointers(pointers, input, inputSlot, inputSlot);
     }
 }
 
-void scatterBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager)
+void scatterBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth, BufferManager& manager)
 {
     if (tensor)
     {
@@ -163,7 +177,7 @@ void scatterBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, Buffer
     }
 }
 
-void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager)
+void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth, BufferManager& manager)
 {
     if (tensor)
     {
@@ -180,7 +194,7 @@ void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferMan
 namespace
 {
 template <typename T>
-void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager)
+void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType32 beamWidth)
 {
     TLLM_CHECK(tensor != nullptr);
     TLLM_CHECK(tensor->getDataType() == TRTDataType<T>::value);
@@ -190,8 +204,8 @@ void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth, Bu
     ITensor::SharedPtr tiledTensor;
     switch (tensor->getMemoryType())
     {
-    case MemoryType::kCPU: tiledTensor = std::shared_ptr(manager.cpu(shape, tensor->getDataType())); break;
-    case MemoryType::kPINNED: tiledTensor = std::shared_ptr(manager.pinned(shape, tensor->getDataType())); break;
+    case MemoryType::kCPU: tiledTensor = std::shared_ptr(BufferManager::cpu(shape, tensor->getDataType())); break;
+    case MemoryType::kPINNED: tiledTensor = std::shared_ptr(BufferManager::pinned(shape, tensor->getDataType())); break;
     default: TLLM_THROW("Tensor is not using CPU memory."); break;
     }
     auto const src = bufferCast<T>(*tensor);
@@ -205,19 +219,19 @@ void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType beamWidth, Bu
 }
 } // namespace
 
-void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType beamWidth, BufferManager& manager)
+void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth)
 {
     if (tensor)
     {
         switch (tensor->getDataType())
         {
-        case nvinfer1::DataType::kINT32: tileCpuBufferReplaceImpl<int32_t>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kFLOAT: tileCpuBufferReplaceImpl<float>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kHALF: tileCpuBufferReplaceImpl<half>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kINT8: tileCpuBufferReplaceImpl<int8_t>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kBOOL: tileCpuBufferReplaceImpl<bool>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kUINT8: tileCpuBufferReplaceImpl<uint8_t>(tensor, beamWidth, manager); break;
-        case nvinfer1::DataType::kINT64: tileCpuBufferReplaceImpl<int64_t>(tensor, beamWidth, manager); break;
+        case nvinfer1::DataType::kINT32: tileCpuBufferReplaceImpl<int32_t>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kFLOAT: tileCpuBufferReplaceImpl<float>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kHALF: tileCpuBufferReplaceImpl<half>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kINT8: tileCpuBufferReplaceImpl<int8_t>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kBOOL: tileCpuBufferReplaceImpl<bool>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kUINT8: tileCpuBufferReplaceImpl<uint8_t>(tensor, beamWidth); break;
+        case nvinfer1::DataType::kINT64: tileCpuBufferReplaceImpl<int64_t>(tensor, beamWidth); break;
         default: TLLM_THROW("unsupported data type");
         }
     }

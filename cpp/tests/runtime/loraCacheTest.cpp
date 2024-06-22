@@ -23,11 +23,14 @@
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntimeBase.h>
-#include <filesystem>
+
+#include <NvInferRuntime.h>
+
 #include <gmock/gmock-matchers.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <filesystem>
 #include <memory>
 
 namespace fs = std::filesystem;
@@ -59,7 +62,7 @@ protected:
 
     void SetUp() override
     {
-        mModelConfig = std::make_unique<GptModelConfig>(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+        mModelConfig = std::make_unique<ModelConfig>(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         mModelConfig->setMlpHiddenSize(32);
         mWorldConfig = std::make_unique<WorldConfig>(2, 1, 0);
         std::vector<LoraModule> modules{
@@ -93,7 +96,7 @@ protected:
 
     std::shared_ptr<BufferManager> mManager;
     BufferManager::CudaStreamPtr mStream;
-    std::unique_ptr<GptModelConfig> mModelConfig;
+    std::unique_ptr<ModelConfig> mModelConfig;
     std::unique_ptr<WorldConfig> mWorldConfig;
     std::unique_ptr<LoraCache> mLoraCache;
     std::unique_ptr<LoraCache> mLoraCache2;
@@ -101,8 +104,8 @@ protected:
 
 TEST_F(LoraCacheTest, LoraCachePageManagerTest)
 {
-    SizeType constexpr maxAdapterSize = 4;
-    SizeType constexpr maxAdapterWeights = 8;
+    SizeType32 constexpr maxAdapterSize = 4;
+    SizeType32 constexpr maxAdapterWeights = 8;
     auto pageShape = ITensor::makeShape({maxAdapterSize, maxAdapterWeights});
 
     LoraCachePageManagerConfig config(
@@ -118,10 +121,10 @@ TEST_F(LoraCacheTest, LoraCachePageManagerTest)
     EXPECT_TRUE(ITensor::shapeEquals(block1->getShape(), expectedBlockShape1));
 
     std::vector<ITensor::SharedConstPtr> expectedPages;
-    for (SizeType blockIdx = 0; blockIdx < 2; ++blockIdx)
+    for (SizeType32 blockIdx = 0; blockIdx < 2; ++blockIdx)
     {
         auto block = blockIdx == 0 ? block0 : block1;
-        for (SizeType i = 0; i < (blockIdx == 0 ? 6 : 2); ++i)
+        for (SizeType32 i = 0; i < (blockIdx == 0 ? 6 : 2); ++i)
         {
             TensorPtr page = ITensor::slice(
                 ITensor::wrap(const_cast<void*>(block->data()), block->getDataType(), block->getShape()), i, 1);
@@ -163,7 +166,7 @@ TEST_F(LoraCacheTest, LoraCachePageManagerTest)
 
 TEST_F(LoraCacheTest, determineNumPages)
 {
-    GptModelConfig modelConfig(0, 2, 1, 4, nvinfer1::DataType::kFLOAT);
+    ModelConfig modelConfig(0, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
     modelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2));
     WorldConfig worldConfig(1, 1, 0);
 
@@ -179,8 +182,8 @@ TEST_F(LoraCacheTest, determineNumPages)
         1,
         64,
     };
-    TensorPtr loraConfig
-        = ITensor::wrap(loraConfigVector, ITensor::makeShape({static_cast<SizeType>(loraConfigVector.size()) / 3, 3}));
+    TensorPtr loraConfig = ITensor::wrap(
+        loraConfigVector, ITensor::makeShape({static_cast<SizeType32>(loraConfigVector.size()) / 3, 3}));
     auto numPages = cache.determineNumPages(loraConfig);
     EXPECT_EQ(numPages, 2);
 
@@ -196,8 +199,8 @@ TEST_F(LoraCacheTest, determineNumPages)
         64,
     };
 
-    loraConfig
-        = ITensor::wrap(loraConfigVector, ITensor::makeShape({static_cast<SizeType>(loraConfigVector.size()) / 3, 3}));
+    loraConfig = ITensor::wrap(
+        loraConfigVector, ITensor::makeShape({static_cast<SizeType32>(loraConfigVector.size()) / 3, 3}));
     numPages = cache.determineNumPages(loraConfig);
     EXPECT_EQ(numPages, 2);
 
@@ -216,8 +219,8 @@ TEST_F(LoraCacheTest, determineNumPages)
         24,
     };
 
-    loraConfig
-        = ITensor::wrap(loraConfigVector, ITensor::makeShape({static_cast<SizeType>(loraConfigVector.size()) / 3, 3}));
+    loraConfig = ITensor::wrap(
+        loraConfigVector, ITensor::makeShape({static_cast<SizeType32>(loraConfigVector.size()) / 3, 3}));
     numPages = cache.determineNumPages(loraConfig);
     EXPECT_EQ(numPages, 3);
 
@@ -239,8 +242,8 @@ TEST_F(LoraCacheTest, determineNumPages)
         1,
     };
 
-    loraConfig
-        = ITensor::wrap(loraConfigVector, ITensor::makeShape({static_cast<SizeType>(loraConfigVector.size()) / 3, 3}));
+    loraConfig = ITensor::wrap(
+        loraConfigVector, ITensor::makeShape({static_cast<SizeType32>(loraConfigVector.size()) / 3, 3}));
     numPages = cache.determineNumPages(loraConfig);
     EXPECT_EQ(numPages, 2);
 
@@ -265,8 +268,8 @@ TEST_F(LoraCacheTest, determineNumPages)
         1,
     };
 
-    loraConfig
-        = ITensor::wrap(loraConfigVector, ITensor::makeShape({static_cast<SizeType>(loraConfigVector.size()) / 3, 3}));
+    loraConfig = ITensor::wrap(
+        loraConfigVector, ITensor::makeShape({static_cast<SizeType32>(loraConfigVector.size()) / 3, 3}));
     numPages = cache.determineNumPages(loraConfig);
     EXPECT_EQ(numPages, 4);
 }
@@ -316,7 +319,7 @@ TEST_F(LoraCacheTest, basicPutGet)
         float const* weightsOutPtr = reinterpret_cast<float*>(values[i].weightsOutPointer);
 
         TensorPtr row = ITensor::slice(loraDestWeights, i, 1);
-        auto const rowSize = static_cast<SizeType>(ITensor::volume(row->getShape()));
+        auto const rowSize = static_cast<SizeType32>(ITensor::volume(row->getShape()));
         TensorPtr rowFlatView = ITensor::view(row, ITensor::makeShape({rowSize}));
         TensorPtr expectedIn = ITensor::slice(rowFlatView, 0, inSize);
         TensorPtr expectedOut = ITensor::slice(rowFlatView, inSize, outSize);
@@ -355,10 +358,10 @@ TEST_F(LoraCacheTest, basicPutGet)
 
 TEST_F(LoraCacheTest, splitTransposeCpu)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     auto worldConfig = WorldConfig(2, 1, 0);
 
-    SizeType const split{2};
+    SizeType32 const split{2};
     std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
     std::vector<std::int32_t> const outputRank0{28524, 5093, 23316, 11, 263, 355};
     std::vector<std::int32_t> const outputRank1{287, 12, 4881, 30022, 8776, 257};
@@ -366,8 +369,8 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
     std::vector<std::int32_t> const output2Rank1{5093, 12, 11, 30022, 355, 257};
 
     {
-        SizeType const batchSize{6};
-        auto const inputLength = static_cast<SizeType>(input.size() / batchSize);
+        SizeType32 const batchSize{6};
+        auto const inputLength = static_cast<SizeType32>(input.size() / batchSize);
         auto const inputShape = ITensor::makeShape({batchSize, inputLength});
         auto const outputShape = ITensor::makeShape({batchSize, inputLength / split});
 
@@ -377,13 +380,13 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
         mManager->setZero(*outputTensorRank0);
         mManager->setZero(*outputTensorRank1);
 
-        auto outputPtrRank0 = bufferCast<SizeType>(*outputTensorRank0);
-        auto outputPtrRank1 = bufferCast<SizeType>(*outputTensorRank1);
+        auto outputPtrRank0 = bufferCast<SizeType32>(*outputTensorRank0);
+        auto outputPtrRank1 = bufferCast<SizeType32>(*outputTensorRank1);
 
         LoraCache::splitTransposeCpu(*outputTensorRank0, *inputTensor, split, 0);
         LoraCache::splitTransposeCpu(*outputTensorRank1, *inputTensor, split, 1);
 
-        for (SizeType i = 0; i < static_cast<SizeType>(outputRank0.size()); ++i)
+        for (SizeType32 i = 0; i < static_cast<SizeType32>(outputRank0.size()); ++i)
         {
             EXPECT_EQ(outputPtrRank0[i], outputRank0[i]);
             EXPECT_EQ(outputPtrRank1[i], outputRank1[i]);
@@ -391,8 +394,8 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
     }
 
     {
-        SizeType const batchSize{3};
-        auto const inputLength = static_cast<SizeType>(input.size() / batchSize);
+        SizeType32 const batchSize{3};
+        auto const inputLength = static_cast<SizeType32>(input.size() / batchSize);
         auto const inputShape = ITensor::makeShape({batchSize, inputLength});
         auto const outputShape = ITensor::makeShape({batchSize, inputLength / split});
 
@@ -405,10 +408,10 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
         LoraCache::splitTransposeCpu(*outputTensorRank0, *inputTensor, split, 0);
         LoraCache::splitTransposeCpu(*outputTensorRank1, *inputTensor, split, 1);
 
-        auto outputPtrRank0 = bufferCast<SizeType>(*outputTensorRank0);
-        auto outputPtrRank1 = bufferCast<SizeType>(*outputTensorRank1);
+        auto outputPtrRank0 = bufferCast<SizeType32>(*outputTensorRank0);
+        auto outputPtrRank1 = bufferCast<SizeType32>(*outputTensorRank1);
 
-        for (SizeType i = 0; i < static_cast<SizeType>(outputRank0.size()); ++i)
+        for (SizeType32 i = 0; i < static_cast<SizeType32>(outputRank0.size()); ++i)
         {
             EXPECT_EQ(outputPtrRank0[i], output2Rank0[i]);
             EXPECT_EQ(outputPtrRank1[i], output2Rank1[i]);
@@ -418,7 +421,7 @@ TEST_F(LoraCacheTest, splitTransposeCpu)
 
 TEST_F(LoraCacheTest, copyToPages_tp1)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(1, 1, 0);
     std::vector<LoraModule> modules{
@@ -437,7 +440,7 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
         LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
-    std::unordered_map<SizeType, LoraModule> moduleIdToModule;
+    std::unordered_map<SizeType32, LoraModule> moduleIdToModule;
     for (auto const& m : modelConfig.getLoraModules())
     {
         moduleIdToModule[m.value()] = m;
@@ -453,7 +456,7 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
     TensorPtr pageBlock = mManager->cpu(targetPageBlock->getShape(), targetPageBlock->getDataType());
     mManager->setZero(*pageBlock);
     std::vector<TensorPtr> pages;
-    for (SizeType p = 0; p < pageBlock->getShape().d[0]; ++p)
+    for (SizeType32 p = 0; p < pageBlock->getShape().d[0]; ++p)
     {
         pages.push_back(ITensor::view(ITensor::slice(pageBlock, p, 1),
             ITensor::makeShape({pageBlock->getShape().d[1], pageBlock->getShape().d[2]})));
@@ -468,7 +471,7 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
     auto pagePtr = bufferCast<float>(*pageBlock);
     auto targetPtr = bufferCast<float>(*targetPageBlock);
 
-    for (SizeType i = 0; i < pageBlock->getSize(); ++i)
+    for (SizeType32 i = 0; i < pageBlock->getSize(); ++i)
     {
         EXPECT_FLOAT_EQ(pagePtr[i], targetPtr[i]);
     }
@@ -476,7 +479,7 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
 
 TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(2, 1, 0);
     std::vector<LoraModule> modules{
@@ -495,7 +498,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
         LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
-    std::unordered_map<SizeType, LoraModule> moduleIdToModule;
+    std::unordered_map<SizeType32, LoraModule> moduleIdToModule;
     for (auto const& m : modelConfig.getLoraModules())
     {
         moduleIdToModule[m.value()] = m;
@@ -510,7 +513,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
     TensorPtr pageBlock = mManager->cpu(targetPageBlock->getShape(), targetPageBlock->getDataType());
     mManager->setZero(*pageBlock);
     std::vector<TensorPtr> pages;
-    for (SizeType p = 0; p < pageBlock->getShape().d[0]; ++p)
+    for (SizeType32 p = 0; p < pageBlock->getShape().d[0]; ++p)
     {
         pages.push_back(ITensor::view(ITensor::slice(pageBlock, p, 1),
             ITensor::makeShape({pageBlock->getShape().d[1], pageBlock->getShape().d[2]})));
@@ -525,7 +528,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
     auto pagePtr = bufferCast<float>(*pageBlock);
     auto targetPtr = bufferCast<float>(*targetPageBlock);
 
-    for (SizeType i = 0; i < pageBlock->getSize(); ++i)
+    for (SizeType32 i = 0; i < pageBlock->getSize(); ++i)
     {
         EXPECT_FLOAT_EQ(pagePtr[i], targetPtr[i]);
     }
@@ -533,7 +536,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
 
 TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
 {
-    auto modelConfig = GptModelConfig(0, 2, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(2, 1, 1);
     std::vector<LoraModule> modules{
@@ -552,7 +555,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
         LoraModule(LoraModule::ModuleType::kCROSS_ATTN_DENSE, 16, 16, false, true, 1, -1),
     };
     modelConfig.setLoraModules(modules);
-    std::unordered_map<SizeType, LoraModule> moduleIdToModule;
+    std::unordered_map<SizeType32, LoraModule> moduleIdToModule;
     for (auto const& m : modelConfig.getLoraModules())
     {
         moduleIdToModule[m.value()] = m;
@@ -567,7 +570,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
     TensorPtr pageBlock = mManager->cpu(targetPageBlock->getShape(), targetPageBlock->getDataType());
     mManager->setZero(*pageBlock);
     std::vector<TensorPtr> pages;
-    for (SizeType p = 0; p < pageBlock->getShape().d[0]; ++p)
+    for (SizeType32 p = 0; p < pageBlock->getShape().d[0]; ++p)
     {
         pages.push_back(ITensor::view(ITensor::slice(pageBlock, p, 1),
             ITensor::makeShape({pageBlock->getShape().d[1], pageBlock->getShape().d[2]})));
@@ -582,7 +585,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
     auto pagePtr = bufferCast<float>(*pageBlock);
     auto targetPtr = bufferCast<float>(*targetPageBlock);
 
-    for (SizeType i = 0; i < pageBlock->getSize(); ++i)
+    for (SizeType32 i = 0; i < pageBlock->getSize(); ++i)
     {
         EXPECT_FLOAT_EQ(pagePtr[i], targetPtr[i]);
     }

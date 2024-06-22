@@ -597,6 +597,10 @@ __device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
     return __hmax(val.x, val.y);
+#else
+    assert(0);
+    asm volatile("brkpt;\n" ::);
+    return __nv_bfloat16(0);
 #endif
 }
 #endif

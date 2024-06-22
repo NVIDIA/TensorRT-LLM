@@ -24,8 +24,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import str_dtype_to_torch, torch_to_numpy
 from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.models.convert_utils import get_model_path, load_state_dict
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)
@@ -79,7 +80,7 @@ def convert_hf_model(model_dir, dtype, out_dir):
     with open(f"{model_dir}/adapter_config.json", "r") as f:
         config = json.load(f)
         config["r"]
-    lora_model = torch.load(f"{model_dir}/adapter_model.bin")
+    lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
     all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
     converted_config = []
@@ -117,9 +118,10 @@ def convert_hf_model(model_dir, dtype, out_dir):
         converted_weights[i] = torch.nn.functional.pad(
             converted_weights[i],
             (0, max_row_size - converted_weights[i].shape[0])).unsqueeze(0)
-    converted_weights = torch.concatenate(
-        converted_weights,
-        dim=0).unsqueeze(0).to(dtype=str_dtype_to_torch(dtype)).cpu().numpy()
+    converted_weights = torch_to_numpy(
+        torch.concatenate(
+            converted_weights,
+            dim=0).unsqueeze(0).to(dtype=str_dtype_to_torch(dtype)).cpu())
     converted_config = torch.tensor(converted_config,
                                     dtype=torch.int32,
                                     device='cpu').unsqueeze(0).numpy()

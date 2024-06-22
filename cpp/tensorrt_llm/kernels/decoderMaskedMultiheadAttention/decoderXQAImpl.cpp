@@ -15,6 +15,7 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
 
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplPrecompiled.h"
 
 #include <cassert>
@@ -27,17 +28,16 @@ namespace kernels
 {
 
 template <>
-void DecoderXQAImpl::run(XQAParams const& xqa_params, KVLinearBuffer& kv_linear_buffer,
-    int2& rotary_kernel_launch_cache, cudaStream_t const& stream)
+void DecoderXQAImpl::run(
+    XQAParams const& xqa_params, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream)
 {
-    runWithKVLinearBuffer(xqa_params, kv_linear_buffer, rotary_kernel_launch_cache, stream);
+    runWithKVLinearBuffer(xqa_params, kv_linear_buffer, stream);
 }
 
 template <>
-void DecoderXQAImpl::run(XQAParams const& xqa_params, KVBlockArray& kv_block_array, int2& rotary_kernel_launch_cache,
-    cudaStream_t const& stream)
+void DecoderXQAImpl::run(XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream)
 {
-    runWithKVBlockArray(xqa_params, kv_block_array, rotary_kernel_launch_cache, stream);
+    runWithKVBlockArray(xqa_params, kv_block_array, stream);
 }
 
 std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner, ImplType implType)
@@ -45,12 +45,10 @@ std::unique_ptr<DecoderXQAImpl> DecoderXQAImpl::create(DecoderXQARunner* runner,
     switch (implType)
     {
     case ImplType::kPrecompiled: return std::unique_ptr<DecoderXQAImpl>(new DecoderXQAImplPrecompiled(runner));
-    // TODO(minwei): JIT impl.
-    case ImplType::kJIT: return nullptr;
+    case ImplType::kJIT: return std::unique_ptr<DecoderXQAImpl>(new DecoderXQAImplJIT(runner));
     }
     // Shouldn't reach here.
-    assert(false);
-    return nullptr;
+    TLLM_THROW("Unknown DecoderXQAImpl::ImplType");
 }
 
 } // namespace kernels

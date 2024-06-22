@@ -39,7 +39,7 @@ class GptManager
 {
 public:
     GptManager(std::filesystem::path const& trtEnginePath, tensorrt_llm::batch_manager::TrtGptModelType modelType,
-        int32_t maxBeamWidth, tensorrt_llm::batch_manager::batch_scheduler::SchedulerPolicy schedulerPolicy,
+        int32_t maxBeamWidth, tensorrt_llm::executor::SchedulerConfig const& SchedulerConfig,
         GetInferenceRequestsCallback const& getInferenceRequestsCb, SendResponseCallback const& sendResponseCb,
         tensorrt_llm::batch_manager::PollStopSignalCallback const& pollStopSignalCb = nullptr,
         tensorrt_llm::batch_manager::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb = nullptr,

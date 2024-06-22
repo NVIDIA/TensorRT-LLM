@@ -14,6 +14,13 @@
  * limitations under the License.
  */
 
+/*****************************************************************************
+ *
+ * GptSession is going to be deprecated soon.
+ * Please do not add new functionality in this file!
+ *
+ *****************************************************************************/
+
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
@@ -23,8 +30,8 @@
 #include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -54,18 +61,18 @@ namespace utils
 std::vector<uint8_t> loadEngine(std::string const& enginePath);
 }
 
-class IpcMemory;
+class AllReduceBuffers;
 class IStatefulGptDecoder;
 class NcclCommunicator;
 class RuntimeBuffers;
 class TllmRuntime;
 
-class GptSession
+class [[deprecated("Use the executor API instead.")]] GptSession
 {
     using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
     using KvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig;
     using TensorPtr = runtime::ITensor::SharedPtr;
-    using TokenGeneratedCallback = std::function<void(SizeType step, bool finished)>;
+    using TokenGeneratedCallback = std::function<void(SizeType32 step, bool finished)>;
 
 public:
     using LoggerPtr = std::shared_ptr<nvinfer1::ILogger>;
@@ -76,19 +83,23 @@ public:
     class Config
     {
     public:
-        Config(SizeType maxBatchSize, SizeType maxBeamWidth, SizeType maxSequenceLength)
+        Config(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
+            float gpuWeightsPercent = 1.0)
             : maxBatchSize{maxBatchSize}
             , maxBeamWidth{maxBeamWidth}
             , maxSequenceLength{maxSequenceLength}
+            , gpuWeightsPercent{gpuWeightsPercent}
         {
         }
 
         // The maximum number of sequences in a batch
-        SizeType maxBatchSize;
+        SizeType32 maxBatchSize;
         // The maximum width of the beams in beam-search
-        SizeType maxBeamWidth;
+        SizeType32 maxBeamWidth;
         // The length of the longest input sequence
-        SizeType maxSequenceLength;
+        SizeType32 maxSequenceLength;
+        // Percentage of weights on the gpu at runtime
+        float gpuWeightsPercent;
         // Whether the session will use a different decoder per request.
         // It must be set to `true` when running in-flight batching
         bool decoderPerRequest{false};
@@ -97,10 +108,10 @@ public:
         KvCacheConfig kvCacheConfig{};
         // The micro batch size to be used in context phase.
         // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size
-        std::optional<SizeType> ctxMicroBatchSize = std::nullopt;
+        std::optional<SizeType32> ctxMicroBatchSize = std::nullopt;
         // The micro batch size to be used in generation phase.
         // Batches entered in `GptSession::generation` will be split into smaller micro batches of this size.
-        std::optional<SizeType> genMicroBatchSize = std::nullopt;
+        std::optional<SizeType32> genMicroBatchSize = std::nullopt;
         std::optional<DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
     };
@@ -150,17 +161,17 @@ public:
     //! @param engineBuffer  The compiled TensorRT engine (const void*),
     //! @param engineSize    The size in bytes of the TensorRT engine (size_t),
     //! @param logger        The optional logger.
-    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         void const* engineBuffer, std::size_t engineSize, LoggerPtr logger = nullptr);
 
-    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::vector<uint8_t> const& engineBuffer, LoggerPtr logger = nullptr)
         : GptSession(
             sessionConfig, modelConfig, worldConfig, engineBuffer.data(), engineBuffer.size(), std::move(logger))
     {
     }
 
-    GptSession(Config const& sessionConfig, GptModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         std::string const& engineFile, LoggerPtr logger = nullptr)
         : GptSession(sessionConfig, modelConfig, worldConfig, utils::loadEngine(engineFile), std::move(logger))
     {
@@ -170,7 +181,7 @@ public:
 
     [[nodiscard]] BufferManager const& getBufferManager() const;
 
-    [[nodiscard]] GptModelConfig const& getModelConfig() const
+    [[nodiscard]] ModelConfig const& getModelConfig() const
     {
         return mModelConfig;
     }
@@ -189,6 +200,8 @@ public:
     {
         return mNormalizeLogProbs;
     }
+
+    [[nodiscard]] nvinfer1::IEngineInspector& getEngineInspector() const;
 
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
 
@@ -220,6 +233,12 @@ public:
     void generate(GenerationOutput& outputs, GenerationInput const& inputs, SamplingConfig const& samplingConfig,
         std::shared_ptr<GenerationProfiler> const generationProfiler = nullptr);
 
+    //! @brief Set LayerProfiler to collect performance per layer.
+    void setLayerProfiler();
+
+    //! @brief Print profile information per layer.
+    [[nodiscard]] std::string getLayerProfileInfo() const;
+
 private:
     [[nodiscard]] bool useCudaGraphs()
     {
@@ -233,35 +252,35 @@ private:
     void setup(Config const& sessionConfig);
 
     void createContexts();
-    void createBuffers(SizeType numMicroBatches);
-    void createDecoders(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow, SizeType sinkTokenLength,
-        SizeType maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest, SizeType numMicroBatches,
-        DecodingMode const& decodingMode);
-    void createKvCacheManager(SizeType batchSize, SizeType beamWidth, SizeType maxAttentionWindow,
-        SizeType sinkTokenLength, SizeType maxSequenceLength, KvCacheConfig const& config);
-    void createCustomAllReduceWorkspace(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
+    void createBuffers(SizeType32 numMicroBatches);
+    void createDecoders(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType logitsType, bool decoderPerRequest,
+        SizeType32 numMicroBatches, DecodingMode const& decodingMode);
+    void createKvCacheManager(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, KvCacheConfig const& config);
+    void createCustomAllReduceWorkspace(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
     void executeContextStep(std::vector<GenerationInput> const& generationBatchesInputs,
-        std::vector<SizeType> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
-    SizeType executeGenerationStep(SizeType step, std::vector<GenerationInput> const& microBatchesInputs,
-        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType> const& microBatchOffsets,
+        std::vector<SizeType32> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager);
+    SizeType32 executeGenerationStep(SizeType32 step, std::vector<GenerationInput> const& microBatchesInputs,
+        std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType32> const& microBatchOffsets,
         KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished);
 
     //! @brief Execute decoder on last PP rank, receive decoder output on other PP ranks.
-    void decoderStepAsync(SizeType decoderStep, SizeType microBatchId);
+    void decoderStepAsync(SizeType32 decoderStep, SizeType32 microBatchId);
 
     //! @brief Synchronize with the decoder and return the `shouldStop` flag.
-    bool shouldStopSync(SizeType batchSize, SizeType beamWidth, SizeType microBatchId);
+    bool shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 microBatchId);
 
     //! @brief Collect final output ids and log probs on last PP rank and send them to first PP rank.
     //! @details Receives are asynchronous on host, so synchronization is required before access.
-    void finalize(SizeType microBatchId);
+    void finalize(SizeType32 microBatchId);
 
-    void kvCacheAddSequences(SizeType beamWidth, SizeType microBatchId, SizeType firstBatchIdx);
+    void kvCacheAddSequences(SizeType32 beamWidth, SizeType32 microBatchId, SizeType32 firstBatchIdx);
 
     //! @brief Populate outputIds and return reference to newTokens tensor
     ITensor::SharedPtr initDecoder(ITensor& outputIds, GenerationInput const& inputs, GenerationOutput const& outputs,
-        SamplingConfig const& samplingConfig, SizeType microBatchId) const;
+        SamplingConfig const& samplingConfig, SizeType32 microBatchId) const;
 
     TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
@@ -288,7 +307,7 @@ private:
         }
 
         void clear();
-        void prepareNextGraph(TllmRuntime const& runtime, SizeType nextContextId);
+        void prepareNextGraph(TllmRuntime const& runtime, SizeType32 nextContextId);
         void launch(CudaStream const& stream);
 
     private:
@@ -310,43 +329,41 @@ private:
         {
         }
 
-        explicit MicroBatchConfig(SizeType maxBatchSize, SizeType pipelineParallelism,
-            std::optional<SizeType> genMicroBatchSize, std::optional<SizeType> ctxMicroBatchSize);
+        explicit MicroBatchConfig(SizeType32 maxBatchSize, SizeType32 pipelineParallelism,
+            std::optional<SizeType32> genMicroBatchSize, std::optional<SizeType32> ctxMicroBatchSize);
 
-        constexpr SizeType numCtxPerGen() const
+        constexpr SizeType32 numCtxPerGen() const
         {
             return numCtxBatches / numGenBatches;
         }
 
         //! @details flip-flop between 2 graph instances for each generation batch.
-        constexpr SizeType getGenGraphId(SizeType flipFlopId, SizeType generationBatchId) const
+        constexpr SizeType32 getGenGraphId(SizeType32 flipFlopId, SizeType32 generationBatchId) const
         {
             return flipFlopId * numGenBatches + generationBatchId;
         }
 
-        SizeType numCtxBatches;
-        SizeType numGenBatches;
-        SizeType ctxBatchSize;
-        SizeType genBatchSize;
+        SizeType32 numCtxBatches;
+        SizeType32 numGenBatches;
+        SizeType32 ctxBatchSize;
+        SizeType32 genBatchSize;
     };
 
     friend class batch_manager::TrtGptModelV1;
 
 private:
-    GptModelConfig const mModelConfig;
+    ModelConfig const mModelConfig;
     WorldConfig const mWorldConfig;
     int mDevice{-1};
     std::shared_ptr<NcclCommunicator> mPipelineComm;
     std::shared_ptr<CudaStream> mCommStream;
     CudaEvent mCommEvent{};
 
-    // tensor parallelism with custom allreduce plugin
-    ITensor::SharedPtr mCommPtrs;
-    std::vector<std::shared_ptr<IpcMemory>> mIpcMemoryHandles;
+    std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
-    SizeType mDecoderMaxSequenceLength{};
-    SizeType mDecoderMaxAttentionWindow{};
-    SizeType mDecoderSinkTokenLength{};
+    SizeType32 mDecoderMaxSequenceLength{};
+    SizeType32 mDecoderMaxAttentionWindow{};
+    SizeType32 mDecoderSinkTokenLength{};
 
     LoggerPtr mLogger;
     std::shared_ptr<TllmRuntime> mRuntime;

@@ -1,7 +1,9 @@
+import argparse
 import copy
 import dataclasses
 import json
 import os
+from enum import IntFlag, auto
 from functools import cached_property
 from typing import Dict, List, Optional, Union
 
@@ -18,9 +20,11 @@ from ..layers import (AttentionParams, Embedding, FusedGatedMLP, GatedMLP,
 from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Lora
+from ..layers.moe import MOE, MoeOOTB
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
+from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.layers import FP8Linear
 from ..quantization.mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo
@@ -29,6 +33,27 @@ from .convert_utils import weight_only_quantize_dict
 from .generation_mixin import GenerationMixin
 
 WEIGHT_LOADER_MODELS = {"PhiForCausalLM"}
+
+
+class SpeculativeDecodingMode(IntFlag):
+    # [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/runtime/speculativeDecodingMode.h
+    NONE = auto()
+    DRAFT_TOKENS_EXTERNAL = auto()
+    MEDUSA = auto()
+    LOOKAHEAD_DECODING = auto()
+
+    @staticmethod
+    def from_arguments(args: argparse.Namespace):
+        if args.speculative_decoding_mode is None:
+            return SpeculativeDecodingMode.NONE
+        elif args.speculative_decoding_mode == "draft_tokens_external":
+            return SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
+        elif args.speculative_decoding_mode == "medusa":
+            return SpeculativeDecodingMode.MEDUSA
+        elif args.speculative_decoding_mode == "lookahead_decoding":
+            return SpeculativeDecodingMode.LOOKAHEAD_DECODING
+        else:
+            assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
 
 @dataclasses.dataclass
@@ -55,8 +80,8 @@ class QuantConfig:
             self.kv_cache_quant_algo,
         )
 
-    def quant_algo_to_ammo_qformat(self):
-        algo_to_ammo_map = {
+    def quant_algo_to_modelopt_qformat(self):
+        algo_to_modelopt_map = {
             QuantAlgo.W8A16: "int8_wo",
             QuantAlgo.W4A16: "int4_wo",
             QuantAlgo.W4A16_AWQ: "int4_awq",
@@ -65,8 +90,8 @@ class QuantConfig:
             QuantAlgo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
         }
         if self.quant_algo is not None:
-            assert self.quant_algo in algo_to_ammo_map, f"We don't use AMMO for quantization algorithm {self.quant_algo}, you probably shall not call this"
-            qformat = algo_to_ammo_map[self.quant_algo]
+            assert self.quant_algo in algo_to_modelopt_map, f"We don't use Modelopt for quantization algorithm {self.quant_algo}, you probably shall not call this"
+            qformat = algo_to_modelopt_map[self.quant_algo]
         else:
             qformat = 'full_prec'
         return qformat
@@ -108,11 +133,13 @@ class PretrainedConfig:
                  world_size: int,
                  tp_size: int,
                  pp_size: int,
+                 gpus_per_node: int,
                  quantization: Union[QuantConfig, dict],
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
                  share_embedding_table: bool = False,
                  head_size: int = None,
+                 qk_layernorm: bool = False,
                  **kwargs):
         self.architecture = architecture
         self.dtype = dtype
@@ -125,6 +152,7 @@ class PretrainedConfig:
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_size = hidden_size // num_attention_heads if head_size is None else head_size
+        self.qk_layernorm = qk_layernorm
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
         self.norm_epsilon = norm_epsilon
@@ -135,7 +163,8 @@ class PretrainedConfig:
         self.share_embedding_table = share_embedding_table
         self.mapping = Mapping(world_size=world_size,
                                tp_size=tp_size,
-                               pp_size=pp_size)
+                               pp_size=pp_size,
+                               gpus_per_node=gpus_per_node)
         if isinstance(quantization, dict):
             self.quantization = dataclasses.replace(QuantConfig(),
                                                     **quantization)
@@ -184,14 +213,11 @@ class PretrainedConfig:
         embedding_sharding_dim = config.pop('embedding_sharding_dim', 0)
         share_embedding_table = config.pop('share_embedding_table', False)
 
-        mapping = config.pop('mapping', {
-            'world_size': 1,
-            'tp_size': 1,
-            'pp_size': 1
-        })
+        mapping = config.pop('mapping', {})
         world_size = mapping.get('world_size', 1)
         tp_size = mapping.get('tp_size', 1)
         pp_size = mapping.get('pp_size', 1)
+        gpus_per_node = mapping.get('gpus_per_node', 8)
 
         if share_embedding_table and tp_size > 1:
             if (not use_parallel_embedding) or (use_parallel_embedding and
@@ -221,7 +247,7 @@ class PretrainedConfig:
                    max_position_embeddings, hidden_size, num_hidden_layers,
                    num_attention_heads, num_key_value_heads, hidden_act,
                    intermediate_size, norm_epsilon, position_embedding_type,
-                   world_size, tp_size, pp_size, quant_config,
+                   world_size, tp_size, pp_size, gpus_per_node, quant_config,
                    use_parallel_embedding, embedding_sharding_dim,
                    share_embedding_table, **config)
 
@@ -239,6 +265,7 @@ class PretrainedConfig:
             'world_size': self.mapping.world_size,
             'tp_size': self.mapping.tp_size,
             'pp_size': self.mapping.pp_size,
+            'gpus_per_node': self.mapping.gpus_per_node,
         }
         output['quantization'] = dataclasses.asdict(self.quantization)
 
@@ -252,7 +279,8 @@ class PretrainedConfig:
         self.mapping = Mapping(self.mapping.world_size,
                                rank=rank,
                                tp_size=self.mapping.tp_size,
-                               pp_size=self.mapping.pp_size)
+                               pp_size=self.mapping.pp_size,
+                               gpus_per_node=self.mapping.gpus_per_node)
 
 
 class DecoderLayerList(ModuleList):
@@ -269,8 +297,8 @@ class DecoderLayerList(ModuleList):
                 attention_params=None,
                 position_ids=None,
                 lora_params=None,
-                medusa_position_offsets=None,
-                medusa_packed_mask=None):
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
@@ -288,10 +316,11 @@ class DecoderLayerList(ModuleList):
                 kwargs['position_ids'] = position_ids
             if lora_layer_params is not None:
                 kwargs['lora_layer_params'] = lora_layer_params
-            if medusa_position_offsets is not None:
-                kwargs['medusa_position_offsets'] = medusa_position_offsets
-            if medusa_packed_mask is not None:
-                kwargs['medusa_packed_mask'] = medusa_packed_mask
+            if spec_decoding_position_offsets is not None:
+                kwargs[
+                    'spec_decoding_position_offsets'] = spec_decoding_position_offsets
+            if spec_decoding_packed_mask is not None:
+                kwargs['spec_decoding_packed_mask'] = spec_decoding_packed_mask
 
             hidden_states = layer(
                 hidden_states,
@@ -305,10 +334,12 @@ class DecoderLayerList(ModuleList):
                     host_max_attention_window_sizes,
                     host_sink_token_length=kv_cache_params.
                     host_sink_token_length,
-                    kv_cache_block_pointers=kv_cache_params.
-                    kv_cache_block_pointers,
-                    host_kv_cache_block_pointers=kv_cache_params.
-                    host_kv_cache_block_pointers,
+                    kv_cache_block_offsets=kv_cache_params.
+                    kv_cache_block_offsets,
+                    host_kv_cache_block_offsets=kv_cache_params.
+                    host_kv_cache_block_offsets,
+                    host_kv_cache_pool_pointers=kv_cache_params.
+                    host_kv_cache_pool_pointers,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 **kwargs)
@@ -382,26 +413,48 @@ class PretrainedModel(Module,
 
         return model
 
-    def load(self, weights):
-        expected_names = set([name for name, param in self.named_parameters()])
+    def load(self, weights, from_pruned=False):
+        expected_names = set()
+        required_names = set()
+        for name, param in self.named_parameters():
+            expected_names.add(name)
+            if not param.is_inited():
+                required_names.add(name)
+
         provided_names = set(weights.keys())
-        assert expected_names.issubset(
-            provided_names
-        ), f"Expected but not provided tensors:{expected_names.difference(provided_names)}"
+        if not required_names.issubset(provided_names):
+            raise RuntimeError(
+                f"Required but not provided tensors:{required_names.difference(provided_names)}"
+            )
+        if not provided_names.issubset(expected_names):
+            logger.warning(
+                f"Provided but not expected tensors: {provided_names.difference(expected_names)}"
+            )
 
         if self.config.architecture in WEIGHT_LOADER_MODELS:
             mapping = self.config.mapping
             for name, param in self.named_parameters():
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(mapping, param, weights[name])
+                if name in provided_names:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    if from_pruned and param._shape != weights[name].shape:
+                        dummy_weight = torch.empty(param._shape,
+                                                   dtype=trt_dtype_to_torch(
+                                                       param._dtype))
+                        weight_loader(mapping, param, dummy_weight)
+                    else:
+                        weight_loader(mapping, param, weights[name])
         else:
             for name, param in self.named_parameters():
-                try:
-                    param.value = weights[name]
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Encounter error '{e}' for parameter '{name}'")
+                if name in provided_names:
+                    if not from_pruned:
+                        try:
+                            param.value = weights[name]
+                        except Exception as e:
+                            raise RuntimeError(
+                                f"Encounter error '{e}' for parameter '{name}'")
+                    else:
+                        param.set_value_or_dummy(weights[name])
 
     def load_partial_weights(self, weights: dict):
         params = {name: param for name, param in self.named_parameters()}
@@ -440,9 +493,11 @@ class PretrainedModel(Module,
                        prompt_embedding_table_size: int = 0,
                        position_encoding_2d: bool = False,
                        max_draft_len: int = 0,
+                       speculative_decoding_draft_tokens_external: bool = False,
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
-                       lora_target_modules: List[str] = None):
+                       lora_target_modules: List[str] = None,
+                       opt_batch_size: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -488,9 +543,12 @@ class PretrainedModel(Module,
             use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             max_draft_len=max_draft_len,
+            speculative_decoding_draft_tokens_external=
+            speculative_decoding_draft_tokens_external,
             lora_target_modules=lora_target_modules,
             multiple_profiles=multiple_profiles,
-            streamingllm=streamingllm)
+            streamingllm=streamingllm,
+            opt_batch_size=opt_batch_size)
 
         result = {
             'input_ids':
@@ -511,9 +569,11 @@ class PretrainedModel(Module,
                 host_max_attention_window_sizes=model_inputs[
                     'host_max_attention_window_sizes'],
                 host_sink_token_length=model_inputs['host_sink_token_length'],
-                kv_cache_block_pointers=model_inputs['kv_cache_block_pointers'],
-                host_kv_cache_block_pointers=model_inputs[
-                    'host_kv_cache_block_pointers'],
+                kv_cache_block_offsets=model_inputs['kv_cache_block_offsets'],
+                host_kv_cache_block_offsets=model_inputs[
+                    'host_kv_cache_block_offsets'],
+                host_kv_cache_pool_pointers=model_inputs[
+                    'host_kv_cache_pool_pointers'],
                 cache_indirection=model_inputs['cache_indirection'],
             ),
             'attention_params':
@@ -539,6 +599,11 @@ class PretrainedModel(Module,
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types'])
+        if model_inputs['spec_decoding_packed_mask'] is not None:
+            result['spec_decoding_position_offsets'] = model_inputs[
+                'spec_decoding_position_offsets']
+            result['spec_decoding_packed_mask'] = model_inputs[
+                'spec_decoding_packed_mask']
 
         return result
 
@@ -551,33 +616,36 @@ class PretrainedModel(Module,
         *,
         dtype='float16',
         mapping: Optional[Mapping] = None,
+        calib_dataset='cnn_dailymail',
         calib_batches=512,
         calib_batch_size=1,
+        calib_max_seq_length=512,
         random_seed=1234,
         tokenizer_max_seq_length=2048,
     ):
         if mapping is None:  # single gpu
             mapping = Mapping()
-        ammo_qformat = quant_config.quant_algo_to_ammo_qformat()
+        modelopt_qformat = quant_config.quant_algo_to_modelopt_qformat()
         kv_cache_dtype = quant_config.kv_cache_quant_algo
-        assert ammo_qformat is not None
+        assert modelopt_qformat is not None
         from ..quantization import quantize_and_export
         hf_model_dir = str(
             hf_model_dir)  # quantize_and_export has some code can not take Path
         quantize_and_export(
             model_dir=hf_model_dir,
+            calib_dataset=calib_dataset,
             dtype=dtype,
-            device='cuda',
-            qformat=ammo_qformat,
+            qformat=modelopt_qformat,
             kv_cache_dtype=kv_cache_dtype,
             calib_size=calib_batches,
             batch_size=calib_batch_size,
+            calib_max_seq_length=calib_max_seq_length,
+            awq_block_size=quant_config.group_size,
             output_dir=output_dir,
             tp_size=mapping.tp_size,
             pp_size=mapping.pp_size,
             seed=random_seed,
-            max_seq_length=tokenizer_max_seq_length,
-            awq_block_size=quant_config.group_size,
+            tokenizer_max_seq_length=tokenizer_max_seq_length,
         )
 
 
@@ -601,8 +669,8 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None,
-                medusa_position_offsets=None,
-                medusa_packed_mask=None):
+                spec_decoding_position_offsets=None,
+                spec_decoding_packed_mask=None):
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -622,10 +690,11 @@ class DecoderModelForCausalLM(PretrainedModel):
         if prompt_vocab_size is not None:
             kwargs['prompt_vocab_size'] = prompt_vocab_size
 
-        if medusa_position_offsets is not None:
-            kwargs['medusa_position_offsets'] = medusa_position_offsets
-        if medusa_packed_mask is not None:
-            kwargs['medusa_packed_mask'] = medusa_packed_mask
+        if spec_decoding_position_offsets is not None:
+            kwargs[
+                'spec_decoding_position_offsets'] = spec_decoding_position_offsets
+        if spec_decoding_packed_mask is not None:
+            kwargs['spec_decoding_packed_mask'] = spec_decoding_packed_mask
 
         hidden_states = self.transformer.forward(**kwargs)
 
@@ -659,6 +728,8 @@ class DecoderModelForCausalLM(PretrainedModel):
 
 
 def fuse_gate_mlp(model):
+    from ..quantization.quantize import fp8_quantize
+
     for layer in model.transformer.layers:
         if not hasattr(layer, 'mlp'):
             continue
@@ -676,6 +747,9 @@ def fuse_gate_mlp(model):
                 quant_mode=layer.mlp.quant_mode)
 
             if quant_algo == QuantAlgo.FP8:
+                fused_layer = fp8_quantize(fused_layer,
+                                           model.config.quantization)
+
                 if isinstance(layer.mlp.dtype, str):
                     dtype = str_dtype_to_torch(layer.mlp.dtype)
                 else:
@@ -739,7 +813,8 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
             if layer.unfuse_qkv_gemm:
                 continue
             layer.unfuse_qkv_gemm = True
-            linear_class = FP8Linear if layer.use_fp8_qdq else ColumnLinear
+            linear_class = FP8Linear if layer.quant_mode.has_fp8_qdq(
+            ) else ColumnLinear
             q = linear_class(layer.hidden_size,
                              layer.attention_hidden_size,
                              bias=layer.bias,
@@ -850,6 +925,18 @@ def add_lora(model: PretrainedModel,
     return model
 
 
+def to_ootb_moe(model: PretrainedModel) -> PretrainedModel:
+    ''' Use OOTB MoE instead of MoE plugin, return the changed model
+    '''
+    for name, module in model.named_modules(remove_duplicate=True):
+        if not hasattr(module, 'mlp'):
+            continue
+        layer = module.mlp
+        if isinstance(layer, MOE):
+            module.mlp = layer.to(MoeOOTB, model.config)
+    return model
+
+
 def parallelize_embedding(model: DecoderModelForCausalLM):
     if model.config.mapping.is_first_pp_rank():
         for name, module in model.transformer.named_children():
@@ -872,14 +959,25 @@ def share_embedding(model: DecoderModelForCausalLM):
     return model
 
 
+def set_fp8_context_fhma(model: DecoderModelForCausalLM):
+    for layer in model.transformer.layers:
+        scale = [1.0
+                 ] / layer.attention.dense.activation_scaling_factor.raw_value
+        layer.attention.attention_output_orig_quant_scale = Parameter(
+            value=scale.astype(np.float32))
+    return model
+
+
 def optimize_model(model: DecoderModelForCausalLM,
                    use_parallel_embedding: bool = False,
                    share_embedding_table: bool = False,
                    use_fused_mlp: bool = False,
                    use_unfused_qkv_gemm: bool = False,
+                   use_ootb_moe: bool = False,
                    use_prompt_tuning: bool = False,
                    use_lora: bool = False,
-                   max_lora_rank: Optional[int] = None):
+                   max_lora_rank: Optional[int] = None,
+                   use_fp8_context_fmha: bool = False):
     if use_parallel_embedding:
         model = parallelize_embedding(model)
     if share_embedding_table:
@@ -888,29 +986,40 @@ def optimize_model(model: DecoderModelForCausalLM,
         model = fuse_gate_mlp(model)
     if use_unfused_qkv_gemm:
         model = unfuse_qkv_gemm(model)
+    if use_ootb_moe:
+        model = to_ootb_moe(model)
     if use_prompt_tuning:
         model = set_prompt_tuning(model)
     if use_lora:
         model = add_lora(model, max_lora_rank)
+    if use_fp8_context_fmha:
+        model = set_fp8_context_fhma(model)
     return model
 
 
-def preprocess_weights(
-        weights: Dict[str, torch.Tensor],
-        model_config: PretrainedConfig) -> Dict[str, torch.Tensor]:
+def preprocess_weights(weights: Dict[str, torch.Tensor],
+                       model_config: PretrainedConfig,
+                       from_pruned=False) -> Dict[str, torch.Tensor]:
     quant_algo = model_config.quantization.quant_algo
     kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
 
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+        if quant_algo == QuantAlgo.W4A8_AWQ:
+            activation_type = torch.float8_e4m3fn
+        elif quant_algo == QuantAlgo.W4A16_AWQ:
+            activation_type = torch.float16
         for name, param in weights.items():
+            if from_pruned and param.numel() == 0:
+                continue
             if name.endswith('weight') and param.dtype == torch.int8:
                 dtype = torch.float16
                 if model_config.dtype == "bfloat16":
                     dtype = torch.bfloat16
                 weights[name] = preprocessor(param.T.contiguous(),
-                                             torch.quint4x2).view(dtype)
+                                             torch.quint4x2,
+                                             activation_type).view(dtype)
             if name.endswith('weights_scaling_factor'):
                 weights[name] = param.T.contiguous().to(
                     str_dtype_to_torch(model_config.dtype))
@@ -961,8 +1070,8 @@ def preprocess_weights(
             if name.endswith('kv_cache_scaling_factor'):
                 weights[name] = torch.tensor([1.0], dtype=torch.float32)
 
-    # If layer_norm bias is None. (For MPT)
-    if model_config.architecture == 'MPTForCausalLM':
+    # If layer_norm bias is None. (For MPT and DBRX)
+    if model_config.architecture in ['MPTForCausalLM', 'DbrxForCausalLM']:
         update_dict = {}
         for name, param in weights.items():
             if 'input_layernorm.weight' in name and name.replace(
@@ -1028,6 +1137,14 @@ def load_model(
             logger.warning(
                 f"Cannot find {model_path}. Use dummy model weights.")
 
+    if model_config.share_embedding_table and weights:
+        if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
+            assert not (
+                weights["lm_head.weight"] -
+                weights["transformer.vocab_embedding.weight"]
+            ).any(
+            ), "When share_embedding_table is enabled, lm_head.weight and transformer.vocab_embedding.weight must be same."
+
     # Currently, use_parallel_embedding and share_embedding_table should be enabled before weight loading;
     # otherwise, the model will be inconsistent with the weights loaded from checkpoint.
     model = optimize_model(
@@ -1035,9 +1152,11 @@ def load_model(
         use_parallel_embedding=model_config.use_parallel_embedding,
         share_embedding_table=model_config.share_embedding_table,
     )
-
+    is_checkpoint_pruned = getattr(model_config, 'is_pruned', False)
     if weights is not None:
-        preprocess_weights(weights, model_config)
-        model.load(weights)
+        preprocess_weights(weights,
+                           model_config,
+                           from_pruned=is_checkpoint_pruned)
+        model.load(weights, from_pruned=is_checkpoint_pruned)
 
     return model

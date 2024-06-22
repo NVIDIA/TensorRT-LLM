@@ -59,10 +59,10 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     int const tile_id_m = blockIdx.x, tile_id_n = blockIdx.y, tid = threadIdx.x;
     int const offset_m = tile_id_m * CtaM, interleaved_offset_n = tile_id_n * CtaN;
     int const real_offset_n = interleaved_offset_n * Details::kInterleave
-        + ((tid * StepK / Details::LayoutDeatils::kTileSize) % Details::kInterleave);
+        + ((tid * StepK / Details::LayoutDetails::kTileSize) % Details::kInterleave);
     int const real_offset_k
-        = (tid * StepK / (Details::kInterleave * Details::LayoutDeatils::kTileSize)) * Details::LayoutDeatils::kTileSize
-        + ((tid * StepK) % Details::LayoutDeatils::kTileSize);
+        = (tid * StepK / (Details::kInterleave * Details::LayoutDetails::kTileSize)) * Details::LayoutDetails::kTileSize
+        + ((tid * StepK) % Details::LayoutDetails::kTileSize);
 
     GMemIterator<Mandatory, AccessTypeA, CtaM, Details::kAccessNumA, TypeA> act_iterator(
         act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);

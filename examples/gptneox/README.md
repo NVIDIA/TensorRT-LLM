@@ -167,7 +167,7 @@ sh gptq_convert.sh
 ### 3. Convert weights from HF Transformers to TensorRT-LLM format
 
 To apply groupwise quantization GPTQ, addition command-line flags need to be passed to `convert_checkpoint.py`:
-Here `--ammo_quant_ckpt_path` flag specifies the output safetensors of `gptq_convert.sh` script.
+Here `--modelopt_quant_ckpt_path` flag specifies the output safetensors of `gptq_convert.sh` script.
 
 ```bash
 # Single GPU
@@ -175,7 +175,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
                               --dtype float16 \
                               --use_weight_only \
                               --weight_only_precision int4_gptq \
-                              --ammo_quant_ckpt_path ./gptneox_model/gptneox-20b-4bit-gs128.safetensors \
+                              --modelopt_quant_ckpt_path ./gptneox_model/gptneox-20b-4bit-gs128.safetensors \
                               --output_dir ./gptneox/20B/trt_ckpt/int4_gptq/1-gpu/
 # With 2-way Tensor Parallel
 python3 convert_checkpoint.py --model_dir ./gptneox_model \
@@ -184,7 +184,7 @@ python3 convert_checkpoint.py --model_dir ./gptneox_model \
                               --weight_only_precision int4_gptq \
                               --tp_size 2 \
                               --workers 2 \
-                              --ammo_quant_ckpt_path ./gptneox_model/gptneox-20b-4bit-gs128.safetensors \
+                              --modelopt_quant_ckpt_path ./gptneox_model/gptneox-20b-4bit-gs128.safetensors \
                               --output_dir ./gptneox/20B/trt_ckpt/int4_gptq/2-gpu/
 ```
 

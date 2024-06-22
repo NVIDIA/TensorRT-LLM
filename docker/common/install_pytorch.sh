@@ -4,8 +4,8 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html#rel-24-02
-TORCH_VERSION="2.2.1"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-03.html#rel-24-03
+TORCH_VERSION="2.2.2"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -42,6 +42,8 @@ install_from_source() {
     cd /tmp
     git clone --depth 1 --branch v$TORCH_VERSION https://github.com/pytorch/pytorch
     cd pytorch
+    # Apply PyTorch patch for supporting compiling with CUDA 12.4 from source codes.
+    git apply /tmp/pytorch_pr_116072.patch
     git submodule sync && git submodule update --init --recursive
     pip3 install -r requirements.txt
     python3 setup.py install

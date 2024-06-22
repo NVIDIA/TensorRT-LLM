@@ -14,10 +14,10 @@ import pygit2
 sys.path.insert(0, os.path.abspath('../..'))
 
 project = 'tensorrt_llm'
-copyright = '2023, NVidia'
+copyright = '2024, NVidia'
 author = 'NVidia'
 branch_name = pygit2.Repository('.').head.shorthand
-
+html_show_sphinx = False
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 

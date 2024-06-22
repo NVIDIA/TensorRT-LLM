@@ -16,6 +16,12 @@ from tensorrt_llm.quantization import QuantAlgo
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument(
+        '--qwen_type',
+        default='qwen',
+        choices=['qwen', 'qwen2'],
+        help="Used only if model_dir is not provided."
+        "In this case users should explicitly passing the version.")
     parser.add_argument('--tp_size',
                         type=int,
                         default=1,
@@ -61,6 +67,13 @@ def parse_arguments():
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
+    )
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
     )
     parser.add_argument(
         "--smoothquant",
@@ -229,6 +242,7 @@ def from_cli_args(args):
         'hidden_act': args.hidden_act,
         'rotary_base': args.rotary_base,
         'norm_epsilon': args.rms_norm_eps,
+        'qwen_type': args.qwen_type,
         'mapping': {
             'world_size': args.tp_size * args.pp_size,
             'tp_size': args.tp_size,
@@ -282,6 +296,7 @@ def convert_and_save_hf(args):
                  args.output_dir,
                  mapping=mapping,
                  quantization=quantization,
+                 calib_dataset=args.calib_dataset,
                  override_fields=override_fields,
                  dataset_cache_dir=args.dataset_cache_dir,
                  smoothquant_val=args.smoothquant,

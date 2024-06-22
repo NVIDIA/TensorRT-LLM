@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/executor.h"
+
 namespace tensorrt_llm
 {
 namespace runtime
@@ -54,37 +56,37 @@ public:
         return DecodingMode{kMedusa};
     }
 
-    bool constexpr isNone()
+    bool constexpr isNone() const
     {
         return mState == 0;
     }
 
-    bool constexpr isTopK()
+    bool constexpr isTopK() const
     {
         return anyBitSet(kTopK);
     }
 
-    bool constexpr isTopP()
+    bool constexpr isTopP() const
     {
         return anyBitSet(kTopP);
     }
 
-    bool constexpr isTopKorTopP()
+    bool constexpr isTopKorTopP() const
     {
         return anyBitSet(kTopKTopP);
     }
 
-    bool constexpr isTopKandTopP()
+    bool constexpr isTopKandTopP() const
     {
         return allBitSet(kTopKTopP);
     }
 
-    bool constexpr isBeamSearch()
+    bool constexpr isBeamSearch() const
     {
         return anyBitSet(kBeamSearch);
     }
 
-    bool constexpr isMedusa()
+    bool constexpr isMedusa() const
     {
         return anyBitSet(kMedusa);
     }
@@ -95,6 +97,28 @@ public:
     {
         return mState == other.mState;
     }
+
+    static DecodingMode fromExecutor(executor::DecodingMode decodingMode)
+    {
+        switch (decodingMode)
+        {
+        case executor::DecodingMode::kNONE: return DecodingMode::None();
+
+        case executor::DecodingMode::kTOP_K: return DecodingMode::TopK();
+
+        case executor::DecodingMode::kTOP_P: return DecodingMode::TopP();
+
+        case executor::DecodingMode::kBEAM_SEARCH: return DecodingMode::BeamSearch();
+
+        case executor::DecodingMode::kMEDUSA: return DecodingMode::Medusa();
+
+        case executor::DecodingMode::kTOP_K_TOP_P: return DecodingMode::TopKTopP();
+
+        default: TLLM_THROW("Invalid decoding mode"); break;
+        }
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, DecodingMode other);
 
 private:
     constexpr DecodingMode(UnderlyingType state)

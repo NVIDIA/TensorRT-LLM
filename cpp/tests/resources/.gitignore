@@ -1,8 +1,4 @@
-models/gpt2
-models/gpt-j-6b
-models/llama-7b-hf
-models/c-model
-models/rt_engine
-/models/v2
+models/**/
 data/*/**/*.npy
 data/*.json
+!data/test_model_lora_config.json

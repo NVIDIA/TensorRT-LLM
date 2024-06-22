@@ -99,6 +99,7 @@ python convert_checkpoint.py --model_version v1_13b \
                              --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/int8_weight_only/1-gpu/
 
 # Convert the Baichuan V1 13B model using a single GPU and apply INT4 weight-only quantization.
+# Note that Baichuan V1 7B performs not well when using INT4 weight-only quantization.
 python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
@@ -137,9 +138,9 @@ python convert_checkpoint.py --model_version v1_13b \
 
 #### FP8 Post-Training Quantization
 
-The examples below uses the NVIDIA AMMO (AlgorithMic Model Optimization) toolkit for the model quantization process.
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
-First make sure AMMO(version>=0.7.0) toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
 ```bash
 # Quantize HF Baichuan v2 13B into FP8 and export a single-rank checkpoint
@@ -155,7 +156,7 @@ Note that you can enable fp8 context fmha to get further acceleration by setting
 
 #### Groupwise quantization (AWQ/GPTQ)
 ##### AWQ
-NVIDIA AMMO toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for AMMO installation instructions.
+NVIDIA Modelopt toolkit is used for AWQ weight quantization. Please see [examples/quantization/README.md](/examples/quantization/README.md#preparation) for Modelopt installation instructions.
 ```bash
 # Quantize HF Baichuan 13B checkpoint into INT4 AWQ format
 python ../quantization/quantize.py --model_dir /code/model/Baichuan2-13B-Chat/ \
@@ -195,7 +196,7 @@ To run the GPTQ Baichuan example, the following steps are required:
 #### INT8 KV cache
 INT8 KV cache could be enabled to reduce memory footprint. It will bring more performance gains when batch size gets larger.
 
-You can get the INT8 scale of KV cache through NVIDIA AMMO (AlgorithMic Model Optimization) toolkit, which features a
+You can get the INT8 scale of KV cache through NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit, which features a
 `--kv_cache_dtype` option.
 
 Example:

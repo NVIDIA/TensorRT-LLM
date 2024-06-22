@@ -30,7 +30,7 @@ class GenericPromptTuningParams
 {
 public:
     using TensorPtr = TTensor;
-    using SizeType = tensorrt_llm::runtime::SizeType;
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit GenericPromptTuningParams(
         TensorPtr embeddingTable = TensorPtr(), TensorPtr tasks = TensorPtr(), TensorPtr vocabSize = TensorPtr())
@@ -56,7 +56,7 @@ class PromptTuningParams : public GenericPromptTuningParams<ITensor::SharedPtr>
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
-    using SizeType = GenericPromptTuningParams::SizeType;
+    using SizeType32 = GenericPromptTuningParams::SizeType32;
 
     explicit PromptTuningParams(
         TensorPtr embeddingTable = nullptr, TensorPtr tasks = nullptr, TensorPtr vocabSize = nullptr)
@@ -66,8 +66,8 @@ public:
 
     // Fill the tasks tensor for the batch using the provided tasksHost
     // Function assumes that the first numContextRequests requests in the batch are context requests
-    void fillTasksTensor(TensorPtr tasksHost, const SizeType batchSize, const SizeType numContextRequests,
-        std::vector<SizeType> const& reqBeamWidths, std::vector<SizeType> const& reqPromptLengths,
+    void fillTasksTensor(TensorPtr tasksHost, const SizeType32 batchSize, const SizeType32 numContextRequests,
+        std::vector<SizeType32> const& reqBeamWidths, std::vector<SizeType32> const& reqPromptLengths,
         BufferManager const& manager, bool packedInput);
 };
 

@@ -1,3 +1,5 @@
 gpt*
 *.log
 c-model
+*.safetensors
+*.json

@@ -16,16 +16,8 @@
 
 #pragma once
 
-#include <cstdint>
+#include <NvInferRuntime.h>
 #include <mutex>
-
-// Forward declarations
-namespace nvinfer1
-{
-class ILoggerFinder;
-class IPluginCreator;
-class ILogger;
-} // namespace nvinfer1
 
 namespace tensorrt_llm::plugins::api
 {
@@ -51,7 +43,6 @@ private:
     nvinfer1::ILoggerFinder* mLoggerFinder{nullptr};
     std::mutex mMutex;
 };
-
 } // namespace tensorrt_llm::plugins::api
 
 extern "C"
@@ -64,4 +55,5 @@ extern "C"
     // see https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#generating-plugin-library
     [[maybe_unused]] void setLoggerFinder([[maybe_unused]] nvinfer1::ILoggerFinder* finder);
     [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(int32_t& nbCreators);
+    [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators);
 }

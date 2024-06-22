@@ -72,7 +72,7 @@ std::shared_ptr<tr::GenerationInput> GenerationInput::toTrtLlm() const
 void GenerationInput::initBindings(pybind11::module_& m)
 {
     py::class_<GenerationInput>(m, "GenerationInput")
-        .def(py::init<SizeType, SizeType, GenerationInput::TensorPtr, GenerationInput::TensorPtr, bool>(),
+        .def(py::init<SizeType32, SizeType32, GenerationInput::TensorPtr, GenerationInput::TensorPtr, bool>(),
             py::arg("end_id"), py::arg("pad_id"), py::arg("ids"), py::arg("lengths"), py::arg("packed") = false)
         .def_readwrite("end_id", &GenerationInput::endId)
         .def_readwrite("pad_id", &GenerationInput::padId)

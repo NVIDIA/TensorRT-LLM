@@ -20,8 +20,8 @@ namespace tensorrt_llm::runtime
 {
 
 std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> const& loraModuleNames,
-    SizeType hiddenSize, SizeType mlpHiddenSize, SizeType numAttentionHeads, SizeType numKvAttentionHeads,
-    SizeType attentionHeadSize, SizeType tpSize)
+    SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
+    SizeType32 attentionHeadSize, SizeType32 tpSize)
 {
     auto const hidden = hiddenSize * tpSize;
     auto const mlpHidden = mlpHiddenSize * tpSize;
@@ -40,7 +40,7 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kATTN_QKV:
         case ModuleType::kCROSS_ATTN_QKV:
             modules.emplace_back(
-                LoraModule(t, hidden, (numHeads * attnHeadSize + 2 * numKvHeads * attnHeadSize), false, true, -1, 0));
+                t, hidden, (numHeads * attnHeadSize + 2 * numKvHeads * attnHeadSize), false, true, -1, 0);
             break;
         case ModuleType::kATTN_Q:
         case ModuleType::kATTN_K:
@@ -53,6 +53,11 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMLP_H_TO_4H: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_GATE: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_4H_TO_H: modules.emplace_back(t, mlpHiddenSize, hidden, false, true, 1, -1); break;
+        // TODO(TRTLLM-379): Support MOE LoRA weights
+        case ModuleType::kMOE_H_TO_4H:
+        case ModuleType::kMOE_GATE:
+        case ModuleType::kMOE_4H_TO_H:
+        case ModuleType::kMOE_ROUTER:
         case ModuleType::kINVALID: throw std::runtime_error("Invalid loRA module " + moduleName);
         }
     }

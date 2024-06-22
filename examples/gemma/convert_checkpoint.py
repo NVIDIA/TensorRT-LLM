@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import pathlib
 import re
 import time
@@ -17,15 +18,16 @@ import sentencepiece as sp
 import torch
 import utils.params
 import utils.transformer
-from datasets import load_dataset
 from easydict import EasyDict
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
-from tensorrt_llm._utils import torch_to_numpy
+from tensorrt_llm._utils import (np_bfloat16, numpy_to_torch,
+                                 str_dtype_to_torch, torch_to_numpy)
+from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.gemma.smoothquant import *
 from tensorrt_llm.models.gemma.weight import (dummy_weights_awq,
-                                              load_from_fp8_llama,
+                                              load_from_fp8_gemma,
                                               quantize_fp8_weights)
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -60,14 +62,21 @@ def parse_arguments():
         "--fp8_kv_cache",
         action="store_true",
         help=
-        "By default, we use dtype for KV cache. fp8_kv_cache chooses int8 quantization for KV",
+        "By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV",
     )
     parser.add_argument(
-        "--ammo_quant_ckpt_path",
+        "--modelopt_quant_ckpt_path",
         default=None,
         help=
         "Path of a directory to quantized model checkpoints in .safetensors format or \
               path of a quantized model checkpoint in .npz format")
+    parser.add_argument(
+        '--calib_dataset',
+        type=str,
+        default='ccdv/cnn_dailymail',
+        help=
+        "The huggingface dataset name or the local directory of the dataset for calibration."
+    )
     parser.add_argument('--use_smooth_quant',
                         default=False,
                         action="store_true",
@@ -109,7 +118,7 @@ def parse_arguments():
         help='tokenizer path; defaults to jax_model_dir if left unspecified')
 
     args = parser.parse_args()
-
+    args.use_embedding_sharing = True
     return args
 
 
@@ -117,6 +126,7 @@ class JAXParser:
 
     def load_parameters(self, checkpoint_path: pathlib.Path):
         checkpoint_path = checkpoint_path.absolute()
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         return utils.params.nest_params(
             utils.params.param_remapper(
                 utils.params.load_params(checkpoint_path)))
@@ -161,7 +171,13 @@ class JAXParser:
             raise ValueError(f"Don't know how to rename {prefix}.{name}")
 
     def flatten_params(self, params):
-        return flax.traverse_util.flatten_dict(params, sep=".")
+        new_params = flax.traverse_util.flatten_dict(params, sep=".")
+        # if the dtype is bfloat16, cast to float32
+        for k in new_params:
+            if new_params[k].dtype != np.float32 and new_params[
+                    k].dtype != np.float16:
+                new_params[k] = new_params[k].astype(np.float32)
+        return new_params
 
 
 class KerasParser:
@@ -233,7 +249,13 @@ class KerasParser:
 
         def walk(name, obj):
             if isinstance(obj, h5py.Dataset):
-                f_params[name] = np.array(obj)
+                if obj.dtype == "|V2":
+                    # bfloat16 case
+                    f_params[name] = torch_to_numpy(
+                        numpy_to_torch(np.array(obj).astype(np_bfloat16)).to(
+                            torch.float32))
+                else:
+                    f_params[name] = np.array(obj)
 
         params.visititems(walk)
         return f_params
@@ -405,10 +427,12 @@ def add_trt_llm_weight(weights: typing.Dict[str, np.ndarray],
                        param: np.ndarray,
                        dtype: typing.Optional[np.dtype] = None):
     assert name not in weights, f"{name} is already added."
+    param = numpy_to_torch(param)
     if dtype is not None:
-        param = param.astype(dtype)
-    param = np.ascontiguousarray(param)
-    weights[name] = param
+        assert isinstance(dtype,
+                          str), f"dtype must be str, but get type {type(dtype)}"
+        param = param.to(str_dtype_to_torch(dtype))
+    weights[name] = param.contiguous()
 
 
 def quantize(param: np.ndarray,
@@ -793,10 +817,6 @@ def convert_from_checkpoint(
                     add_trt_llm_weight(weights, "lm_head.weight",
                                        np.copy(lm_head), trt_llm_config.dtype)
 
-                param = np.multiply(
-                    param.astype(np.float32),
-                    math.sqrt(trt_llm_config.hidden_size),
-                )
                 if trt_llm_config.use_parallel_embedding:
                     assert trt_llm_config.vocab_size % tp_size == 0
                     param = split_matrix_tp(
@@ -838,8 +858,16 @@ def convert(worker_rank, args, convert_kwargs):
         if args.use_smooth_quant_plugin is not None or args.calibrate_kv_cache:
             qkv_para = {}
             smoother = {}
-            dataset = load_dataset("ccdv/cnn_dailymail", '3.0.0')
+            dataset = load_calib_dataset(args.calib_dataset)
+            assert args.tokenizer_dir is not None, "Must set tokenizer_dir to do calibration"
             tokenizer = sp.SentencePieceProcessor(model_file=args.tokenizer_dir)
+            if "transformer.vocab_embedding.weight" in weights:
+                # To use the HF to do SmoothQuant, we need to scale the embedding.
+                weights["transformer.vocab_embedding.weight"] = torch.multiply(
+                    weights["transformer.vocab_embedding.weight"].to(
+                        torch.float32),
+                    math.sqrt(trt_llm_config.hidden_size),
+                )
             hf_model = create_model_from_config(trt_llm_config, weights)
             act_range = capture_activation_range(hf_model, tokenizer, dataset)
             if args.use_smooth_quant_plugin is not None:
@@ -853,6 +881,18 @@ def convert(worker_rank, args, convert_kwargs):
                 torch.quint4x2, args.use_smooth_quant_plugin is not None,
                 args.per_channel, args.per_token, args.calibrate_kv_cache,
                 act_range, qkv_para, smoother)
+            if "transformer.vocab_embedding.weight" in weights:
+                # Revert the scaling of embedding
+                weights["transformer.vocab_embedding.weight"] = torch.divide(
+                    weights["transformer.vocab_embedding.weight"].to(
+                        torch.float32),
+                    math.sqrt(trt_llm_config.hidden_size),
+                ).to(str_dtype_to_torch(args.dtype))
+            if trt_llm_config.share_embedding_table and "lm_head.weight" in weights:
+                # When share_embedding_table is enabled, we add lm_head into weights
+                # to do quantization in HF. Remove lm_head before saving it in unified
+                # checkpoint.
+                del weights["lm_head.weight"]
             safetensors.torch.save_file(
                 weights, args.output_model_dir / f"rank{rank}.safetensors")
             return
@@ -871,13 +911,13 @@ def convert(worker_rank, args, convert_kwargs):
             weight_scales = quantize_fp8_weights(
                 weights, trt_llm_config.num_hidden_layers,
                 trt_llm_config.mapping)
-            scales = load_from_fp8_llama(args.ammo_quant_ckpt_path,
+            scales = load_from_fp8_gemma(args.modelopt_quant_ckpt_path,
                                          trt_llm_config.num_hidden_layers,
                                          trt_llm_config.mapping,
                                          args.fp8_kv_cache, weight_scales)
             weights.update(scales)
 
-        safetensors.numpy.save_file(
+        safetensors.torch.save_file(
             weights, args.output_model_dir / f"rank{rank}.safetensors")
 
 
@@ -966,7 +1006,9 @@ def main():
         world_size=args.world_size,
         tp_size=args.world_size,
         pp_size=1,
+        gpus_per_node=8,
         quantization=quant_config,
+        share_embedding_table=args.use_embedding_sharing,
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

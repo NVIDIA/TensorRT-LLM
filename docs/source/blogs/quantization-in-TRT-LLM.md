@@ -5,7 +5,7 @@ The deployment and inference speed of LLMs are often impeded by limitations in m
 In this blog, we provide an overview of the quantization features in TensorRT-LLM, share benchmark, and offer best practices of selecting the appropriate quantization methods tailored to your specific use case.
 
 ## Quantization in TensorRT-LLM
-TensorRT-LLM offers a best-in-class unified quantization toolkit to significantly speedup DL/GenAI deployment on NVIDIA hardware, while maintaining model accuracy. This toolkit is designed with easy-of-use in mind. You can follow [this user guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize [supported LLMs](../reference/support-matrix.md) with a few lines of codes. We currently focus on providing SOTA **Post-Training Quantization (PTQ)** and will soon expand to more model optimization techniques in the near future.
+TensorRT-LLM offers a best-in-class unified quantization toolkit to significantly speedup DL/GenAI deployment on NVIDIA hardware, while maintaining model accuracy. This toolkit is designed with easy-of-use in mind. You can follow [this user guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize [supported LLMs](https://nvidia.github.io/TensorRT-LLM/precision.html#support-matrix) with a few lines of codes. We currently focus on providing SOTA **Post-Training Quantization (PTQ)** and will soon expand to more model optimization techniques in the near future.
 
 ## Benchmark
 
@@ -48,7 +48,7 @@ A quantization method comprises three primary components:
 
 Typically, in the context of small-batch inference scenarios (batch size ≤ 4), the key consideration is memory bandwidth, making weight-only quantization methods the preferred choice. Conversely, for large-batch inference scenarios, such as serving scenarios (batch size ≥ 16), both memory bandwidth and computation density become crucial factors. Consequently, it's recommended to opt for a quantization method that has both weight and activation quantized. For batch size ≥ 16, the choice of quantization method can be model speicfic. We suggest to prioritize using FP8 first, as we typically see it offers the best performance and accuracy. If the results do not meet your specific use case, you can further experiment with Int8 SmoothQuant (Int8 SQ) followed by AWQ and/or GPTQ.
 
-Based on specific use cases, users might have different tolerances on accuracy impact and calibration time. The table below summarizes the tradeoffs* to consider when choosing a quantization method. You can also learn more about precision formats in our [documentation](../reference/precision.md).
+Based on specific use cases, users might have different tolerances on accuracy impact and calibration time. The table below summarizes the tradeoffs* to consider when choosing a quantization method. You can also learn more about precision formats in our [documentation](https://nvidia.github.io/TensorRT-LLM/precision.html).
 
 | Quantization Methods | Performance Improvement (batch size <= 4) | Performance Improvement (batch size >= 16)  | Accuracy Impact | Calibration Time** |
 | :--------------------------- | :--------: | :--------------: | :----------: | :--------------: |

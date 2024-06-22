@@ -5,10 +5,12 @@ from tensorrt_llm.hlapi.llm import LLM, ModelConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere, skip_pre_hopper
 
-llama_model_path = str(llm_models_root() / "llama-models/llama-7b-hf")
+try:
+    from .test_llm import llama_model_path
+except ImportError:
+    from test_llm import llama_model_path
 
 
 @skip_pre_ampere
@@ -23,7 +25,7 @@ def test_llm_int4_awq_quantization():
     sampling_config.max_new_tokens = 6
     for output in llm.generate(["A B C"], sampling_config=sampling_config):
         print(output)
-        assert output.text == "<s> A B C D E F G H I"
+        assert output.text == "D E F G H I"
 
 
 @skip_pre_hopper
@@ -40,7 +42,7 @@ def test_llm_fp8_quantization():
     sampling_config.max_new_tokens = 6
     for output in llm.generate(["A B C"], sampling_config=sampling_config):
         print(output)
-        assert output.text == "<s> A B C D E F G H I"
+        assert output.text == "D E F G H I"
 
 
 if __name__ == "__main__":

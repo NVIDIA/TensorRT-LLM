@@ -31,9 +31,9 @@ PAD_ID = 50256
 
 work_dir = Path(__file__).parent.resolve() / 'check_gpt'
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../utils'))
-from llm_data import llm_models_root
-from util import getSMVersion
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
+from utils.util import getSMVersion
 
 gpt_example_root = os.path.join(os.path.dirname(__file__), '../../examples/gpt')
 

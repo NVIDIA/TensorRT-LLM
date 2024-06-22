@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "rmsnormQuantizationPlugin.h"
+#include "pluginUtils.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 
 using namespace nvinfer1;
@@ -135,12 +136,13 @@ int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     //     output [M(*), N]
     //     dynamic_scaling [M(*), 1] (optional output)
 
-    int m = 1;
+    int64_t m64 = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims - 1; ++i)
     {
-        m *= inputDesc[0].dims.d[i];
+        m64 *= inputDesc[0].dims.d[i];
     }
-    int const n = inputDesc[1].dims.d[0];
+    int const m = TLLM_INT32_CAST(m64);
+    int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[0]);
 
     float const* scale = reinterpret_cast<float const*>(inputs[3]);
     int8_t* output = reinterpret_cast<int8_t*>(outputs[0]);

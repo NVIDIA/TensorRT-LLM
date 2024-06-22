@@ -39,7 +39,7 @@ class LlmRequest : public tb::GenericLlmRequest<at::Tensor, c10::Stream>
 public:
     using Base = GenericLlmRequest<at::Tensor, c10::Stream>;
     using TensorPtr = Base::TensorPtr;
-    using SizeType = Base::SizeType;
+    using SizeType32 = Base::SizeType32;
     using TokenIdType = Base::TokenIdType;
     using RequestIdType = Base::RequestIdType;
     using LoraTaskIdType = Base::LoraTaskIdType;
@@ -48,14 +48,15 @@ public:
     using VecTokens = Base::VecTokens;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
-    LlmRequest(RequestIdType requestId, SizeType maxNewTokens, std::vector<TokenIdType> inputTokens,
-        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType> endId = std::nullopt,
-        std::optional<SizeType> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+    LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
         std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType> promptVocabSize = std::nullopt, std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
-        std::optional<TensorPtr> loraWeights = std::nullopt, std::optional<TensorPtr> loraConfig = std::nullopt,
-        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),

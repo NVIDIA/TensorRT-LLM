@@ -79,7 +79,7 @@ void sm90_dispatch_epilogue_schedules(ActivationType const* A, WeightType const*
 
     2x2x1 cluster shape is only supported when both the M and N tiles are at least 128.
 
-    We make the above restrictions are to improve compilation speed in TRT-LLM by pruning kernels
+    We make the above restrictions to improve compilation speed in TRT-LLM, by pruning kernels
     that may not be very useful in practice.
  */
 template <typename CTAShape, typename ClusterShape>

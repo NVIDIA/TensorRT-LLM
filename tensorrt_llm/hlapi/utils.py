@@ -116,6 +116,25 @@ def get_total_gpu_memory(device: int) -> float:
     return torch.cuda.get_device_properties(device).total_memory
 
 
+class GpuArch:
+
+    @staticmethod
+    def is_post_hopper() -> bool:
+        return get_gpu_arch() >= 9
+
+    @staticmethod
+    def is_post_ampere() -> bool:
+        return get_gpu_arch() >= 8
+
+    @staticmethod
+    def is_post_volta() -> bool:
+        return get_gpu_arch() >= 7
+
+
+def get_gpu_arch(device: int = 0) -> int:
+    return torch.cuda.get_device_properties(device).major
+
+
 class ContextManager:
     ''' A helper to create a context manager for a resource. '''
 
@@ -127,3 +146,7 @@ class ContextManager:
 
     def __exit__(self, exc_type, exc_value, traceback):
         return self.resource.__exit__(exc_type, exc_value, traceback)
+
+
+def is_directory_empty(directory: Path) -> bool:
+    return not any(directory.iterdir())

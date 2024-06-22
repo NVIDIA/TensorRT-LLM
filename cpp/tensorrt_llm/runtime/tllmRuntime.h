@@ -18,6 +18,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/layerProfiler.h"
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -31,44 +32,67 @@ class TllmRuntime
 public:
     using TensorMap = StringPtrMap<ITensor>;
 
-    explicit TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer1::ILogger& logger);
+    explicit TllmRuntime(
+        void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger);
 
-    explicit TllmRuntime(nvinfer1::IHostMemory const& engineBuffer, nvinfer1::ILogger& logger)
-        : TllmRuntime{engineBuffer.data(), engineBuffer.size(), logger}
+    explicit TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer1::ILogger& logger)
+        : TllmRuntime{engineData, engineSize, 1, logger}
     {
     }
 
-    explicit TllmRuntime(void const* engineData, std::size_t engineSize);
-
-    explicit TllmRuntime(nvinfer1::IHostMemory const& engineBuffer)
-        : TllmRuntime{engineBuffer.data(), engineBuffer.size()}
+    explicit TllmRuntime(
+        nvinfer1::IHostMemory const& engineBuffer, float const gpuWeightsPercent, nvinfer1::ILogger& logger)
+        : TllmRuntime{engineBuffer.data(), engineBuffer.size(), gpuWeightsPercent, logger}
     {
     }
 
-    SizeType getNbContexts() const
+    explicit TllmRuntime(void const* engineData, std::size_t engineSize, float const gpuWeightsPercent);
+
+    explicit TllmRuntime(nvinfer1::IHostMemory const& engineBuffer, float const gpuWeightsPercent)
+        : TllmRuntime{engineBuffer.data(), engineBuffer.size(), gpuWeightsPercent}
     {
-        return static_cast<SizeType>(mContexts.size());
     }
 
-    nvinfer1::IExecutionContext& getContext(SizeType contextIndex) const
+    SizeType32 getNbContexts() const
+    {
+        return static_cast<SizeType32>(mContexts.size());
+    }
+
+    nvinfer1::IExecutionContext& getContext(SizeType32 contextIndex) const
     {
         return *mContexts.at(contextIndex);
     }
 
-    SizeType getNbProfiles() const
+    SizeType32 getNbProfiles() const
     {
-        return static_cast<SizeType>(mEngine->getNbOptimizationProfiles());
+        return static_cast<SizeType32>(mEngine->getNbOptimizationProfiles());
+    }
+
+    /// @brief If multiple TensorRT optimization profiles are built in the engine, this function selects the
+    /// corresponding profile that is going to be used based on the runtime shape, for now, TensorRT-LLM only split
+    /// multiple profiles on the num_tokens dimension, hence the profile index is selected based on which profile
+    /// handles the actual num_tokens
+    /// @return The index of the selected TensorRT optimization profile
+    [[nodiscard]] SizeType32 getOptProfileId(int numTokens, std::vector<SizeType32> const& splitPoint) const
+    {
+        if (getNbProfiles() == 1)
+        {
+            return 0;
+        }
+        auto const it = std::lower_bound(splitPoint.begin(), splitPoint.end(), numTokens);
+        auto const optProfileId = std::distance(splitPoint.begin(), it);
+        return optProfileId;
     }
 
     nvinfer1::IExecutionContext& addContext(std::int32_t profileIndex);
 
     void clearContexts();
 
-    void setInputTensors(SizeType contextIndex, TensorMap const& tensorMap);
+    void setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap);
 
-    void setOutputTensors(SizeType contextIndex, TensorMap& tensorMap);
+    void setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap);
 
-    bool executeContext(SizeType contextIndex) const;
+    bool executeContext(SizeType32 contextIndex) const;
 
     CudaStream const& getStream() const;
 
@@ -87,6 +111,16 @@ public:
         return *mEngine;
     }
 
+    nvinfer1::IEngineInspector& getEngineInspector()
+    {
+        return *mEngineInspector;
+    }
+
+    nvinfer1::IEngineInspector const& getEngineInspector() const
+    {
+        return *mEngineInspector;
+    }
+
     BufferManager& getBufferManager()
     {
         return mBufferManager;
@@ -97,6 +131,11 @@ public:
         return mBufferManager;
     }
 
+    void setLayerProfiler();
+    bool hasLayerProfiler(SizeType32 contextId) const;
+    std::string getLayerProfileInfo() const;
+    void reportToProfiler(SizeType32 contextId);
+
 private:
     BufferManager::CudaStreamPtr mStream;
     BufferManager mBufferManager;
@@ -105,5 +144,7 @@ private:
     BufferManager::IBufferPtr mEngineBuffer;
     std::vector<std::unique_ptr<nvinfer1::IExecutionContext>> mContexts;
     std::unique_ptr<ITensor> mDummyTensor;
+    std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
+    std::unique_ptr<LayerProfiler> mLayerProfiler;
 };
 } // namespace tensorrt_llm::runtime

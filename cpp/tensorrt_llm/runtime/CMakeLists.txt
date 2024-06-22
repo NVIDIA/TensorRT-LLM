@@ -19,6 +19,7 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
@@ -38,7 +39,7 @@ set(SRCS
     promptTuningParams.cpp
     runtimeBuffers.cpp
     runtimeKernels.cu
-    ssmStateBuffers.cpp
+    rnnStateBuffers.cpp
     statefulGptDecoder.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp

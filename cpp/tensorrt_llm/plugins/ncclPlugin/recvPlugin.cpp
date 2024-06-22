@@ -86,7 +86,7 @@ int RecvPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     {
         return 0;
     }
-    int size = 1;
+    size_t size = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
         size *= inputDesc[0].dims.d[i];
@@ -128,7 +128,7 @@ int RecvPlugin::initialize() noexcept
         return 0;
     }
     ncclUniqueId id;
-    COMM_SESSION.recv(id, mSrcRank, 0);
+    COMM_SESSION.recvValue(id, mSrcRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }

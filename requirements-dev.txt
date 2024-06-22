@@ -1,7 +1,6 @@
 -r requirements.txt
 datasets
 einops
-evaluate
 graphviz
 mypy
 parameterized

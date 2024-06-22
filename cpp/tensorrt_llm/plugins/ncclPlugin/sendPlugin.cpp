@@ -87,7 +87,7 @@ int SendPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     {
         return 0;
     }
-    int size = 1;
+    size_t size = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims; ++i)
     {
         size *= inputDesc[0].dims.d[i];
@@ -131,7 +131,7 @@ int SendPlugin::initialize() noexcept
 
     ncclUniqueId id;
     ncclGetUniqueId(&id);
-    COMM_SESSION.send(id, mTgtRank, 0);
+    COMM_SESSION.sendValue(id, mTgtRank, 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 0));
     return 0;
 }

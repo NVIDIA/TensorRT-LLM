@@ -161,8 +161,9 @@ private:
     using WarpFragmentB = typename Operator::FragmentB;
     Dequantizer warp_dequantizer_;
 
+    using ElementA = typename IteratorA::Element;
     using ElementB = typename IteratorB::Element;
-    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementB, ArchTag>;
+    using LayoutDetailsForB = kernel::LayoutDetailsB<ElementA, ElementB, ArchTag>;
 
     static constexpr bool RequiresTileInterleave
         = layout::IsColumnMajorTileInterleave<typename LayoutDetailsForB::Layout>::value;

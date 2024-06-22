@@ -20,6 +20,8 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
+#include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -36,11 +38,11 @@ namespace layers
 {
 
 template <int32_t TOP_K_MAX>
-__global__ void setupTopKRuntimeArgs(SizeType batchSize, SizeType topK, SizeType* topKs, SizeType topKsSize, float topP,
-    float* topPs, SizeType topPsSize, bool* skipDecode, SizeType const* batchSlots)
+__global__ void setupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs, SizeType32 topKsSize,
+    float topP, float* topPs, SizeType32 topPsSize, bool* skipDecode, SizeType32 const* batchSlots)
 {
-    auto const index = static_cast<SizeType>(blockIdx.x * blockDim.x + threadIdx.x);
-    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType>(gridDim.x * blockDim.x))
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
         auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
         auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
@@ -70,13 +72,13 @@ __global__ void setupTopKRuntimeArgs(SizeType batchSize, SizeType topK, SizeType
 }
 
 template <typename T>
-TopKSamplingLayer<T>::TopKSamplingLayer(SizeType maxBatchSize, SizeType vocabSize, SizeType vocabSizePadded,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
-    : BaseSamplingLayer<T>(maxBatchSize, vocabSize, vocabSizePadded, stream, std::move(allocator), nullptr)
+TopKSamplingLayer<T>::TopKSamplingLayer(
+    DecoderDomain const& decoderDomain, cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
+    : BaseLayer(decoderDomain, stream, std::move(allocator))
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    allocateBuffer(mMaxBatchSize);
+    allocateBuffer(mDecoderDomain.getMaxBatchSize());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -92,14 +94,14 @@ TopKSamplingLayer<T>::~TopKSamplingLayer()
 }
 
 template <typename T>
-void TopKSamplingLayer<T>::allocateBuffer(SizeType const batchSize)
+void TopKSamplingLayer<T>::allocateBuffer(SizeType32 const batchSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mSamplingWorkspaceSize = getTopKWorkspaceSize<T>(batchSize, 1, TOP_K_MAX, mVocabSizePadded);
+    mWorkspaceSize = getTopKWorkspaceSize<T>(batchSize, 1, TOP_K_MAX, mDecoderDomain.getVocabSizePadded());
 
     std::array<size_t, 4> deviceBufferSizes;
-    deviceBufferSizes[0] = sizeof(SizeType) * batchSize;
+    deviceBufferSizes[0] = sizeof(SizeType32) * batchSize;
     deviceBufferSizes[1] = sizeof(float) * batchSize;
     deviceBufferSizes[2] = sizeof(bool) * batchSize;
     deviceBufferSizes[3] = std::max(deviceBufferSizes[0], deviceBufferSizes[1]);
@@ -132,17 +134,20 @@ void TopKSamplingLayer<T>::freeBuffer()
 }
 
 template <typename T>
-void TopKSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batchSlots, SetupParams const& setupParams)
+void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
+    std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType constexpr defaultTopK = 0;
-    auto runtimeTopK = setupParams.runtime_top_k.value_or(std::vector<SizeType>{defaultTopK});
-    auto runtimeTopP = setupParams.runtime_top_p.value_or(std::vector<float>{});
+    auto setupParams = std::dynamic_pointer_cast<SamplingSetupParams>(baseSetupParams);
+
+    auto const defaultTopK = DefaultDecodingParams::getTopK();
+    auto runtimeTopK = setupParams->runtime_top_k.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
+    auto runtimeTopP = setupParams->runtime_top_p.value_or(std::vector<float>{});
 
     auto const runtimeTopKSize = runtimeTopK.size();
     auto const runtimeTopPSize = runtimeTopP.size();
-    mNormalizeLogProbs = setupParams.normalize_log_probs.has_value() && setupParams.normalize_log_probs.value();
+    mNormalizeLogProbs = setupParams->normalize_log_probs.has_value() && setupParams->normalize_log_probs.value();
 
     for (auto& topP : runtimeTopP)
     {
@@ -154,24 +159,24 @@ void TopKSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
     }
     for (auto& topK : runtimeTopK)
     {
-        if (topK > TOP_K_MAX)
+        if (topK < 0 || topK > TOP_K_MAX)
         {
             TLLM_LOG_WARNING(
                 "TopK (%d) is larger than max supported number (%d). Clip to max supported number.", topK, TOP_K_MAX);
-            topK = TOP_K_MAX;
+            topK = std::clamp(topK, 0, static_cast<SizeType32>(TOP_K_MAX));
         }
     }
 
     auto const topK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
-    auto const topP = (runtimeTopPSize == 0) ? 0.0f : runtimeTopP.front();
+    auto const topP = (runtimeTopPSize == 0) ? DefaultDecodingParams::getTopP() : runtimeTopP.front();
 
     if (runtimeTopKSize > 1)
     {
         TLLM_CHECK_WITH_INFO(runtimeTopK.size() == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
         cudaAutoCpy(
-            reinterpret_cast<runtime::SizeType*>(mSetupWorkspaceDevice), runtimeTopK.data(), batchSize, mStream);
-        invokeScatterDecodingParams(reinterpret_cast<runtime::SizeType*>(mSetupWorkspaceDevice), mRuntimeTopKDevice,
+            reinterpret_cast<runtime::SizeType32*>(mSetupWorkspaceDevice), runtimeTopK.data(), batchSize, mStream);
+        invokeScatterDecodingParams(reinterpret_cast<runtime::SizeType32*>(mSetupWorkspaceDevice), mRuntimeTopKDevice,
             batchSlots, batchSize, mStream);
     }
     if (runtimeTopPSize > 1)
@@ -191,12 +196,12 @@ void TopKSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
             runtimeTopKSize, topP, mRuntimeTopPDevice, runtimeTopPSize, mSkipDecodeDevice, batchSlots);
     }
 
-    cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mMaxBatchSize, mStream);
-    std::vector<SizeType> runtimeTopKs(mMaxBatchSize);
-    cudaAutoCpy(runtimeTopKs.data(), mRuntimeTopKDevice, mMaxBatchSize, mStream);
+    cudaAutoCpy(mSkipDecodeHost, mSkipDecodeDevice, mDecoderDomain.getMaxBatchSize(), mStream);
+    std::vector<SizeType32> runtimeTopKs(mDecoderDomain.getMaxBatchSize());
+    cudaAutoCpy(runtimeTopKs.data(), mRuntimeTopKDevice, mDecoderDomain.getMaxBatchSize(), mStream);
     {
-        runtime::SizeType maxTopK = 0;
-        for (SizeType bi = 0; bi < static_cast<SizeType>(batchSize); ++bi)
+        runtime::SizeType32 maxTopK = 0;
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto bid = bi;
             if (batchSlots)
@@ -212,43 +217,73 @@ void TopKSamplingLayer<T>::setup(SizeType const batchSize, SizeType const* batch
 }
 
 template <typename T>
-void TopKSamplingLayer<T>::forward(DecodingOutputParams& outputs, ForwardParams& inputs)
+void TopKSamplingLayer<T>::forward(
+    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const batchSize = inputs.logits.shape[0];
+    std::shared_ptr<SamplingInputParams> inputs = std::dynamic_pointer_cast<SamplingInputParams>(baseInputs);
+    std::shared_ptr<SamplingOutputParams> outputs = std::dynamic_pointer_cast<SamplingOutputParams>(baseOutputs);
 
-    auto logits = inputs.logits.template getPtr<T>();
-    auto endIds = inputs.end_ids.template getPtr<TokenIdType const>();
-    auto batchSlots = inputs.batch_slots ? inputs.batch_slots->template getPtr<SizeType const>() : nullptr;
-    auto curandStatesDevice = inputs.curand_states;
-    auto samplingWorkspaceDevice = inputs.sampling_workspace;
-    auto const probsComputed = inputs.probs_computed;
+    auto const batchSize = inputs->logits.shape[0];
+
+    auto logits = inputs->logits.template getPtr<T>();
+    auto endIds = inputs->end_ids.template getPtr<TokenIdType const>();
+    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
+    auto curandStatesDevice = inputs->curand_states;
+    auto samplingWorkspaceDevice = inputs->sampling_workspace;
+    auto const probsComputed = inputs->probs_computed;
+
+    std::vector<int32_t> batchSlotsVec(batchSize);
+    std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
+    auto batchSlotsHost
+        = inputs->batch_slots ? inputs->batch_slots->template getPtr<int const>() : batchSlotsVec.data();
+    auto const skip = allOfBatchSlots(batchSlotsHost, mSkipDecodeHost, batchSize, true);
+    if (skip)
+    {
+        return;
+    }
 
     TLLM_CHECK_WITH_INFO(curandStatesDevice, "No curand states provided");
     TLLM_CHECK_WITH_INFO(samplingWorkspaceDevice, "No sampling workspace provided");
 
-    FinishedState* finishedInput = (inputs.finished)
-        ? reinterpret_cast<FinishedState*>(inputs.finished->template getPtr<FinishedState::UnderlyingType>())
+    FinishedState* finishedInput = (inputs->finished)
+        ? reinterpret_cast<FinishedState*>(inputs->finished->template getPtr<FinishedState::UnderlyingType>())
         : nullptr;
-    FinishedState* finishedOutput = (outputs.finished)
-        ? reinterpret_cast<FinishedState*>(outputs.finished->template getPtr<FinishedState::UnderlyingType>())
+    FinishedState* finishedOutput = (outputs->finished)
+        ? reinterpret_cast<FinishedState*>(outputs->finished->template getPtr<FinishedState::UnderlyingType>())
         : nullptr;
 
-    auto cumLogProbs
-        = (outputs.cum_log_probs) ? outputs.cum_log_probs->template getPtr<float>() : static_cast<float*>(nullptr);
-    auto outputLogProbs = (outputs.output_log_probs) ? outputs.output_log_probs->template getPtr<float>()
-                                                     : static_cast<float*>(nullptr);
-    auto sequenceLength = (outputs.sequence_length) ? outputs.sequence_length->template getPtr<SizeType>()
-                                                    : static_cast<SizeType*>(nullptr);
+    auto cumLogProbs = (outputs->cum_log_probs) ? outputs->cum_log_probs->template getPtr<float>() : nullptr;
+    auto outputLogProbs = (outputs->output_log_probs) ? outputs->output_log_probs->template getPtr<float>() : nullptr;
+    auto sequenceLengths
+        = (outputs->sequence_length) ? outputs->sequence_length->template getPtr<SizeType32>() : nullptr;
 
-    invokeBatchTopKSampling(samplingWorkspaceDevice, logits, static_cast<T const* const*>(nullptr),
-        outputs.output_ids_ptr.template getPtr<TokenIdType*>(), /* outputIds */ nullptr, sequenceLength, finishedInput,
-        finishedOutput, cumLogProbs, outputLogProbs, curandStatesDevice, static_cast<SizeType>(mRuntimeMaxTopK),
-        static_cast<SizeType*>(mRuntimeTopKDevice), 1.0f, mRuntimeTopPDevice, mVocabSizePadded, endIds, batchSlots,
-        mStream, batchSize, mMaxBatchSize, /* tokens per step */ nullptr, /* max tokens per step */ 1,
-        /* maxSeqLen ignored as outputIds is nullptr */ 0, mSkipDecodeDevice, mNormalizeLogProbs, probsComputed,
-        /* return all Top-K*/ false);
+    TopKSamplingKernelParams<T> params;
+    params.logProbs = logits;
+    params.outputIdsPtrs = outputs->output_ids_ptr.template getPtr<TokenIdType*>();
+    params.workspace = samplingWorkspaceDevice;
+    params.maxTopP = 1.0f;
+    params.topPs = mRuntimeTopPDevice;
+    params.maxTopK = mRuntimeMaxTopK;
+    params.topKs = mRuntimeTopKDevice;
+    params.sequenceLengths = sequenceLengths;
+    params.endIds = endIds;
+    params.batchSlots = batchSlots;
+    params.finishedInput = finishedInput;
+    params.finishedOutput = finishedOutput;
+    params.skipDecode = mSkipDecodeDevice;
+    params.cumLogProbs = cumLogProbs;
+    params.outputLogProbs = outputLogProbs;
+    params.curandState = curandStatesDevice;
+    params.batchSize = batchSize;
+    params.maxBatchSize = mDecoderDomain.getMaxBatchSize();
+    params.maxTokensPerStep = 1;
+    params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+    params.normalizeLogProbs = mNormalizeLogProbs;
+    params.logitsHasProbs = probsComputed;
+
+    invokeBatchTopKSampling(params, mStream);
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

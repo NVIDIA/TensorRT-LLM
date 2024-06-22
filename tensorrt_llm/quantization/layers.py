@@ -19,10 +19,11 @@ import tensorrt as trt
 
 from .._common import default_net, precision
 from .._utils import fp32_array, is_same_dtype
-from ..functional import (ACT2FN, Tensor, allgather, allreduce, cast, concat,
-                          constant, generate_alibi_slopes, gpt_attention,
-                          matmul, mul, shape, slice, softmax, split, where)
-from ..layers.attention import AttentionMaskType, PositionEmbeddingType
+from ..functional import (ACT2FN, AttentionMaskType, PositionEmbeddingType,
+                          RopeEmbeddingUtils, RotaryScalingType, Tensor,
+                          allgather, allreduce, cast, concat, constant,
+                          generate_alibi_slopes, gpt_attention, matmul, mul,
+                          shape, slice, softmax, split, where)
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
 from ..parameter import Parameter
@@ -76,7 +77,7 @@ class Dequantize(Module):
 
     def __init__(self, axis: int = -1) -> None:
         super().__init__()
-        self.scaling_factor = Parameter(shape=())
+        self.scaling_factor = Parameter(shape=(), dtype='float32')
         self.axis = axis
 
     def forward(self, input):
@@ -709,7 +710,9 @@ class Int8SmoothQuantRowLinear(RowLinear):
                                self.weights_scaling_factor.value.dtype)
 
         w_deq_out = cast(w_deq_out, self.dtype)
-        return super().multiply_reduce(dequantized_out, w_deq_out, False)
+        return self.multiply_reduce(dequantized_out,
+                                    w_deq_out,
+                                    gemm_plugin=None)
 
 
 class Int8SmoothQuantLinear(Linear):
@@ -764,7 +767,9 @@ class Int8SmoothQuantLinear(Linear):
                                self.weights_scaling_factor.value.dtype)
         w_deq_out = cast(w_deq_out, self.dtype)
 
-        return super().multiply_gather(dequantized_out, w_deq_out, False)
+        return self.multiply_gather(dequantized_out,
+                                    w_deq_out,
+                                    gemm_plugin=None)
 
 
 class FP8Linear(Linear):
@@ -783,10 +788,11 @@ class FP8Linear(Linear):
                          out_features,
                          bias=bias,
                          dtype=dtype,
-                         use_fp8=True,
                          tp_group=tp_group,
                          tp_size=tp_size,
                          gather_output=gather_output)
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype='fp8')
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
@@ -815,7 +821,10 @@ class FP8Linear(Linear):
                                self.dtype)
 
         # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
-        return self.multiply_gather(dequantized_out, w_deq_out, False)
+        return self.multiply_gather(dequantized_out,
+                                    w_deq_out,
+                                    gemm_plugin=None,
+                                    use_fp8=True)
 
 
 class FP8RowLinear(RowLinear):
@@ -833,9 +842,10 @@ class FP8RowLinear(RowLinear):
                          out_features,
                          bias=bias,
                          dtype=dtype,
-                         use_fp8=True,
                          tp_group=tp_group,
                          tp_size=tp_size)
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype='fp8')
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
@@ -865,7 +875,7 @@ class FP8RowLinear(RowLinear):
         # TODO: allow gemm plugin default_net().plugin_config.gemm_plugin
         return self.multiply_reduce(dequantized_out,
                                     w_deq_out,
-                                    False,
+                                    gemm_plugin=None,
                                     use_fp8=True)
 
 
@@ -949,6 +959,8 @@ class SmoothQuantAttention(Module):
             dtype=None,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
             rotary_embedding_base=10000.0,
+            rotary_embedding_scaling=None,
+            rotary_embedding_percentage=1.0,
             tp_group=None,
             tp_size=1,
             tp_rank=0,
@@ -965,7 +977,7 @@ class SmoothQuantAttention(Module):
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size // tp_size
-        self.max_position_embeddings = max_position_embeddings
+        self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
         self.tp_rank = tp_rank
 
@@ -986,9 +998,36 @@ class SmoothQuantAttention(Module):
         self.paged_kv_cache = paged_kv_cache
 
         self.rotary_embedding_base = rotary_embedding_base
+        self.rotary_embedding_scale_type = RotaryScalingType.none
+        self.rotary_embedding_scale = 1.0
         self.rotary_embedding_dim = 0
+
+        if rotary_embedding_scaling is not None:
+            assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
+            self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
+                "type"] == "linear" else RotaryScalingType.dynamic
+            self.rotary_embedding_scale = rotary_embedding_scaling["factor"]
+            assert self.rotary_embedding_scale > 1.0
+
         if self.position_embedding_type.is_rope():
-            self.rotary_embedding_dim = self.attention_head_size
+            self.rotary_embedding_dim = int(self.attention_head_size *
+                                            rotary_embedding_percentage)
+            embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                self.max_position_embeddings, self.rotary_embedding_dim,
+                self.rotary_embedding_base, self.rotary_embedding_scale,
+                self.rotary_embedding_scale_type)
+            self.register_parameter(
+                'embed_positions_for_gpt_attention',
+                Parameter(embed_positions_for_gpt_attention, dtype='float32'))
+        elif self.position_embedding_type.is_alibi():
+            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
+            alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
+                                                 self.tp_size,
+                                                 tp_size=self.tp_size,
+                                                 tp_rank=self.tp_rank,
+                                                 alibi_scale=alibi_scale)
+            self.register_parameter('alibi_slopes',
+                                    Parameter(alibi_slopes, dtype='float32'))
 
         self.quant_mode = quant_mode
         self.dtype = dtype
@@ -1005,11 +1044,7 @@ class SmoothQuantAttention(Module):
             qkv_quant_mode = QuantMode.from_description(
                 True, True, quant_mode.has_per_token_dynamic_scaling(), True)
 
-        if self.quant_mode.has_int8_kv_cache():
-            self.kv_cache_scaling_factor = Parameter(shape=(1, ),
-                                                     dtype='float32')
-        else:
-            self.register_parameter('kv_cache_scaling_factor', None)
+        self.register_parameter('kv_cache_scaling_factor', None)
 
         self.qkv = SmoothQuantColumnLinear(
             hidden_size,
@@ -1038,8 +1073,8 @@ class SmoothQuantAttention(Module):
         self,
         hidden_states: Tensor,
         attention_mask=None,
-        medusa_packed_mask=None,
-        medusa_position_offsets=None,
+        spec_decoding_packed_mask=None,
+        spec_decoding_position_offsets=None,
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
@@ -1056,6 +1091,7 @@ class SmoothQuantAttention(Module):
 
         alibi_slopes = None
         if self.position_embedding_type == PositionEmbeddingType.alibi:
+            alibi_slopes = self.alibi_slopes.value
             dtype = trt.float32
             if default_net().plugin_config.gpt_attention_plugin or default_net(
             ).plugin_config.inflight_batching_gpt_attention_plugin:
@@ -1063,12 +1099,7 @@ class SmoothQuantAttention(Module):
                 ) else hidden_states[0].dtype
                 if dtype == trt.int8:
                     dtype = trt.float16
-            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
-            alibi_slopes = alibi_scale * generate_alibi_slopes(
-                self.num_attention_heads * self.tp_size,
-                dtype=dtype,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank)
+            alibi_slopes = cast(alibi_slopes, dtype)
 
         if default_net().plugin_config.gpt_attention_plugin:
 
@@ -1079,11 +1110,14 @@ class SmoothQuantAttention(Module):
                 default_net().plugin_config.gpt_attention_plugin)
             assert self.attention_mask_type == AttentionMaskType.causal, \
                 'Plugin only support masked MHA.'
-            kv_quant_scale = constant(
-                fp32_array([1.0])
-            ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_int8_kv_cache(
-            ) else None
-            kv_dequant_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_int8_kv_cache(
+            if self.kv_cache_scaling_factor is not None:
+                kv_orig_quant_scale = constant(fp32_array(
+                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_quant_orig_scale = self.kv_cache_scaling_factor.value
+            else:
+                kv_orig_quant_scale = None
+                kv_quant_orig_scale = None
+            rotary_cos_sin = self.embed_positions_for_gpt_attention.value if self.position_embedding_type.is_rope(
             ) else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
@@ -1104,20 +1138,26 @@ class SmoothQuantAttention(Module):
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 rotary_embedding_base=self.rotary_embedding_base,
+                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+                rotary_embedding_scale=self.rotary_embedding_scale,
+                rotary_embedding_max_positions=self.max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
-                kv_orig_quant_scale=kv_quant_scale,
-                kv_quant_orig_scale=kv_dequant_scale,
+                rotary_cos_sin=rotary_cos_sin,
+                kv_orig_quant_scale=kv_orig_quant_scale,
+                kv_quant_orig_scale=kv_quant_orig_scale,
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 alibi_slopes=alibi_slopes,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                kv_cache_block_pointers=kv_cache_params.kv_cache_block_pointers,
-                host_kv_cache_block_pointers=kv_cache_params.
-                host_kv_cache_block_pointers,
+                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
+                host_kv_cache_block_offsets=kv_cache_params.
+                host_kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=kv_cache_params.
+                host_kv_cache_pool_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
-                medusa_position_offsets=medusa_position_offsets,
-                medusa_packed_mask=medusa_packed_mask)
+                spec_decoding_position_offsets=spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_packed_mask)
         else:
             assert self.paged_kv_cache == False
 

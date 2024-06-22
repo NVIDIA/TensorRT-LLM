@@ -190,14 +190,14 @@ void testBuffer(IBuffer& buffer, std::int32_t typeSize)
     EXPECT_EQ(byteBuffer->getSizeInBytes(), buffer.getSizeInBytes());
     EXPECT_EQ(byteBuffer->getCapacity(), buffer.getSizeInBytes());
     auto tensorWrapped = ITensor::wrap(buffer.data(), buffer.getDataType(),
-        ITensor::makeShape({static_cast<SizeType>(buffer.getSize())}), buffer.getCapacity());
+        ITensor::makeShape({static_cast<SizeType32>(buffer.getSize())}), buffer.getCapacity());
     EXPECT_EQ(tensorWrapped->getSize(), buffer.getSize());
     EXPECT_EQ(tensorWrapped->getCapacity(), buffer.getCapacity());
     EXPECT_EQ(tensorWrapped->getDataType(), buffer.getDataType());
     EXPECT_EQ(tensorWrapped->getMemoryType(), buffer.getMemoryType());
-    EXPECT_NO_THROW(tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType>(buffer.getCapacity()) / 2})));
-    EXPECT_THROW(
-        tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType>(buffer.getCapacity()) * 2})), std::bad_alloc);
+    EXPECT_NO_THROW(tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType32>(buffer.getCapacity()) / 2})));
+    EXPECT_THROW(tensorWrapped->reshape(ITensor::makeShape({static_cast<SizeType32>(buffer.getCapacity()) * 2})),
+        std::bad_alloc);
 }
 } // namespace
 
@@ -357,7 +357,7 @@ TEST_F(TllmBuffersTest, ExtendedTypes)
 TEST_F(TllmBuffersTest, BytesToString)
 {
     auto constexpr precision = 2;
-    MemoryCounters::SizeType size;
+    MemoryCounters::SizeType32 size;
     MemoryCounters::DiffType diff;
 
     size = (1ul << 10) - 1;

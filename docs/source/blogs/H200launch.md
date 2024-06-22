@@ -21,7 +21,7 @@ TensorRT-LLM evaluation of the [new H200 GPU](https://nvidianews.nvidia.com/news
 
 <sup>*(1) Largest batch supported on given TP configuration by power of 2.*</sup> <sup>*(2) TP = Tensor Parallelism*</sup>
 
-Additional Performance data is available on the [NVIDIA Data Center Deep Learning Product Performance](https://developer.nvidia.com/deep-learning-performance-training-inference/ai-inference) page, & soon in [TensorRT-LLM's Performance Documentation](../performance/perf-overview.md).
+Additional Performance data is available on the [NVIDIA Data Center Deep Learning Product Performance](https://developer.nvidia.com/deep-learning-performance-training-inference/ai-inference) page, & soon in [TensorRT-LLM's Performance Documentation](https://nvidia.github.io/TensorRT-LLM/performance.html).
 
 ### H200 vs H100
 

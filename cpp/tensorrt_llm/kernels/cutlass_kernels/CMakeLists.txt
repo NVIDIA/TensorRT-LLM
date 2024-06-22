@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -14,9 +14,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 #
-
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
 
 # The Python executable will only be defined if building with Torch support. If
 # not, we need to find it here.
@@ -43,10 +40,12 @@ set_directory_properties(
   PROPERTIES CMAKE_CONFIGURE_DEPENDS
              ${CMAKE_CURRENT_SOURCE_DIR}/python/generate_kernels.py)
 
+set(INSTANTIATION_GENERATION_DIR
+    ${CMAKE_CURRENT_BINARY_DIR}/cutlass_instantiations)
 execute_process(
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/
   COMMAND ${Python3_EXECUTABLE} generate_kernels.py -o
-          ${CMAKE_CURRENT_BINARY_DIR}
+          ${INSTANTIATION_GENERATION_DIR}
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 
 if(NOT _KERNEL_GEN_SUCCESS MATCHES 0)
@@ -56,41 +55,73 @@ if(NOT _KERNEL_GEN_SUCCESS MATCHES 0)
   )
 endif()
 
-file(GLOB_RECURSE CU_INSTANTIATIONS ${CMAKE_CURRENT_BINARY_DIR}/*.cu)
+# Get the sources for Mixed Input GEMM launchers
+file(GLOB_RECURSE MIXED_CU_INSTANTIATIONS
+     ${INSTANTIATION_GENERATION_DIR}/gemm/*.cu)
+file(GLOB_RECURSE MIXED_SRC_CPP fpA_intB_gemm/*.cpp)
+file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
 
-add_library(cutlass2_src STATIC ${SRC_CPP} ${SRC_CU})
-set_property(TARGET cutlass2_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET cutlass2_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# Get the sources for MOE Grouped GEMM launchers
+file(GLOB_RECURSE GROUPED_CU_INSTANTIATIONS
+     ${INSTANTIATION_GENERATION_DIR}/gemm_grouped/*.cu)
+file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
+file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
 
-add_library(cutlass3_src STATIC ${CU_INSTANTIATIONS})
-set_property(TARGET cutlass3_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET cutlass3_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# Get the sources for all the remaining sources
+file(GLOB_RECURSE SRC_CPP *.cpp)
+file(GLOB_RECURSE SRC_CU *.cu)
+set(ALL_SRCS ${SRC_CPP};${SRC_CU})
+list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
 
-# Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
-# specified). This is because sm_90a has arch conditional instructions that are
-# not forward compatible. As a result, it does not make sense to embed PTX into
-# the binary anyway.
-if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST
-   OR "9.0+PTX" IN_LIST TORCH_CUDA_ARCH_LIST
-   OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
-  message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
-  target_compile_options(
-    cutlass3_src
-    PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
+message(
+  STATUS
+    "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
+message(
+  STATUS
+    "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
+)
+message(STATUS "All srcs ${ALL_SRCS}")
 
-  # Hopper kernels require cuda lib for TMA APIs
-  target_link_libraries(cutlass3_src PRIVATE CUDA::cuda_driver)
+add_library(cutlass_src STATIC ${ALL_SRCS})
+set_property(TARGET cutlass_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET cutlass_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-  # No kernels should be parsed, unless hopper is specified. This is a build
-  # time improvement
-  target_compile_definitions(cutlass3_src
-                             PRIVATE COMPILE_HOPPER_MIXED_INPUT_GEMMS)
-endif()
+add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
+                                     ${MIXED_CU_INSTANTIATIONS})
+add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
+                                ${GROUPED_CU_INSTANTIATIONS})
+foreach(target_name fpA_intB_gemm_src;moe_gemm_src)
+  set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-# Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
-# changed in GCC 4.6 This note appears for kernels using TMA and clutters the
-# compilation output.
-if(NOT WIN32)
-  target_compile_options(
-    cutlass3_src PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
-endif()
+  # Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
+  # specified). This is because sm_90a has arch conditional instructions that
+  # are not forward compatible. As a result, it does not make sense to embed PTX
+  # into the binary anyway.
+  if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST
+     OR "9.0+PTX" IN_LIST TORCH_CUDA_ARCH_LIST
+     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
+
+    message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
+    target_compile_options(
+      ${target_name}
+      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
+
+    # Hopper kernels require cuda lib for TMA APIs
+    target_link_libraries(${target_name} PRIVATE CUDA::cuda_driver)
+
+    # No kernels should be parsed, unless hopper is specified. This is a build
+    # time improvement
+    target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
+  endif()
+
+  # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
+  # changed in GCC 4.6 This note appears for kernels using TMA and clutters the
+  # compilation output.
+  if(NOT WIN32)
+    target_compile_options(
+      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
+  endif()
+
+endforeach()

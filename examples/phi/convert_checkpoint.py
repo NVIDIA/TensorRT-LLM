@@ -17,7 +17,7 @@ import os
 import time
 
 import tensorrt_llm
-from tensorrt_llm.models.phi.model import PhiForCausalLM
+from tensorrt_llm.models import Phi3ForCausalLM, PhiForCausalLM
 
 
 def parse_arguments():
@@ -31,6 +31,12 @@ def parse_arguments():
                         type=str,
                         default='tllm_checkpoint',
                         help='The path to save the TensorRT-LLM checkpoint')
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        default='phi-2',
+        choices=['phi-2', 'Phi-3-mini-4k-instruct', 'Phi-3-mini-128k-instruct'],
+        help='Model to be converted.')
     args = parser.parse_args()
 
     return args
@@ -44,9 +50,10 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    PhiForCausalLM.convert_hf_checkpoint(args.model_dir,
-                                         dtype=args.dtype,
-                                         output_dir=args.output_dir)
+    modelForCausalLM = PhiForCausalLM if args.model_type == "phi-2" else Phi3ForCausalLM
+    modelForCausalLM.convert_hf_checkpoint(args.model_dir,
+                                           dtype=args.dtype,
+                                           output_dir=args.output_dir)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
