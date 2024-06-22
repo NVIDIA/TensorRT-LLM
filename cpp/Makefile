@@ -24,19 +24,19 @@ endif
 # Build the Cortex engine
 build:
 ifeq ($(OS),Windows_NT)
-	@powershell -Command "cd ..; python .\scripts\build_wheel.py -a '80-real;86-real;89-real' --trt_root 'C:\workspace\TensorRT-9.3.0.1\' -D 'BUILD_CORTEX_TENSORRT-LLM=ON' --use_ccache"
-	@powershell -Command "cd build; cmake .. -DCMAKE_CUDA_ARCHITECTURES='80-real;86-real;89-real' -DTRT_LIB_DIR='C:/workspace/TensorRT-9.3.0.1/lib' -DTRT_INCLUDE_DIR='C:/workspace/TensorRT-9.3.0.1/include' -DBUILD_CORTEX_TENSORRT-LLM=ON -DCMAKE_CUDA_COMPILER='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.2/bin/nvcc.exe' -DENABLE_MULTI_DEVICE=0 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -G Ninja; cmake --build . --parallel 2 --config Release"
+	@powershell -Command "cd ..; python .\scripts\build_wheel.py -a '80-real;86-real;89-real' --trt_root 'C:\workspace\TensorRT-10.0.1.6\' -D \"CMAKE_CUDA_COMPILER='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe'\" -D 'BUILD_CORTEX_TENSORRT-LLM=ON' --use_ccache"
+	@powershell -Command "cd build; cmake .. -DCMAKE_CUDA_ARCHITECTURES='80-real;86-real;89-real' -DTRT_LIB_DIR='C:/workspace/TensorRT-10.0.1.6/lib' -DTRT_INCLUDE_DIR='C:/workspace/TensorRT-10.0.1.6/include' -DBUILD_CORTEX_TENSORRT-LLM=ON -DCMAKE_CUDA_COMPILER='C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe' -DENABLE_MULTI_DEVICE=0 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -G Ninja; cmake --build . --parallel 2 --config Release"
 else
-	@mkdir -p build && cd build; \
-	cmake .. -GNinja -DBUILD_CORTEX_TENSORRT-LLM=ON -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache -DCMAKE_BUILD_TYPE='Release' -DBUILD_PYT='OFF' -DBUILD_PYBIND='OFF' -DNVTX_DISABLE='ON' -DCMAKE_CUDA_ARCHITECTURES='80-real;86-real;89-real' '-DENABLE_MULTI_DEVICE=0' '-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc' -DBUILD_BENCHMARKS=OFF '-DBUILD_TESTS=OFF' -DTRT_LIB_DIR=/usr/local/tensorrt/lib -DTRT_INCLUDE_DIR=/usr/local/tensorrt/include; \
-	cmake --build . --config Release;
+	@cd .. && python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --cuda_architectures "80-real;86-real;89-real" --extra-cmake-vars "BUILD_CORTEX_TENSORRT-LLM=ON" --use_ccache
+	@cd build && cmake .. -DCMAKE_CUDA_ARCHITECTURES='80-real;86-real;89-real' -DTRT_LIB_DIR='/usr/local/tensorrt/lib' -DTRT_INCLUDE_DIR='/usr/local/tensorrt/include' -DBUILD_CORTEX_TENSORRT-LLM=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -G Ninja && cmake --build . --config Release;
+
 endif
 
 # Prepackage the Cortex engine
 pre-package:
 ifeq ($(OS),Windows_NT)
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; mkdir -p cortex.tensorrt-llm; cp ..\..\build\tensorrt_llm\cortex.tensorrt-llm\engine.dll cortex.tensorrt-llm\;"
-	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force C:\workspace\TensorRT-9.3.0.1\lib\nvinfer.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force C:\workspace\TensorRT-10.0.1.6\lib\nvinfer.dll cortex.tensorrt-llm\;"
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force C:\workspace\cuDNN\bin\cudnn64_8.dll cortex.tensorrt-llm\;"
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force C:\workspace\cuDNN\bin\cudnn_ops_infer64_8.dll cortex.tensorrt-llm\;"
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force ..\..\build\tensorrt_llm\plugins\nvinfer_plugin_tensorrt_llm.dll cortex.tensorrt-llm\;"

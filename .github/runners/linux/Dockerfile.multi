@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=24.02-py3
+ARG BASE_TAG=24.03-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
@@ -48,7 +48,10 @@ RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
 # Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
-RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
+# Apply PyTorch patch for supporting compiling with CUDA 12.4 from source codes
+COPY docker/common/pytorch_pr_116072.patch /tmp/pytorch_pr_116072.patch
+RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh /tmp/pytorch_pr_116072.patch
+
 COPY setup.py requirements.txt requirements-dev.txt ./
 
 RUN pip install --no-cache-dir -r requirements-dev.txt
@@ -85,11 +88,13 @@ ADD docker/common/start.sh start.sh
 
 RUN chmod +x start.sh
 
-RUN sudo chmod +x /root/.cargo/bin/sccache
+RUN chmod +x /root/.cargo/bin/sccache && cp /root/.cargo/bin/sccache /usr/local/bin/sccache
 
 USER runner
 
-ENV PATH=/root/.cargo/bin${PATH:+:${PATH}}
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    sudo ./aws/install
 
 ENTRYPOINT ["./start.sh"]
 
@@ -139,4 +144,3 @@ ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
-
