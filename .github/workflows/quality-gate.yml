@@ -38,7 +38,7 @@ jobs:
       - name: Install tools on Windows
         if: runner.os == 'Windows'
         run: |
-          choco install make pkgconfiglite ccache awscli -y
+          choco install make pkgconfiglite ccache awscli 7zip -y
           Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
           refreshenv
 

@@ -16,7 +16,7 @@
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
-#include "tensorrt_llm/runtime/gptModelConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
@@ -127,7 +127,7 @@ class TensorrtllmEngine : public EngineI {
 
   GptSession::Config session_config{1, 1, 1};
   SamplingConfig sampling_config{1};
-  std::unique_ptr<GptModelConfig> model_config;
+  std::unique_ptr<ModelConfig> model_config;
   std::shared_ptr<TllmLogger> logger;
   std::string user_prompt;
   std::string ai_prompt;

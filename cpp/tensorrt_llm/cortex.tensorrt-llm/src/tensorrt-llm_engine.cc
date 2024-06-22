@@ -110,7 +110,7 @@ void InferenceThread(
 
   // Define the callback to stream each generated token
   generation_output.onTokenGenerated = [&infer_state, input_len, outputLen, self, &generation_output](
-                                          GenerationOutput::TensorPtr const& output_ids, SizeType step, bool finished) {
+                                          GenerationOutput::TensorPtr const& output_ids, SizeType32 step, bool finished) {
     LOG_INFO << "Generating tokenizer in thread";                                            
     // Assuming the shape of output_ids tensor is (1, 1, 160), where 160 is the number of tokens
     int output_length = output_ids->getShape().d[2]; // Get the length of output IDs based on the tensor shape
@@ -319,7 +319,7 @@ void TensorrtllmEngine::LoadModel(std::shared_ptr<Json::Value> json_body, std::f
     std::filesystem::path json_file_name = model_dir / "config.json";
     auto json = GptJsonConfig::parse(json_file_name);
     auto config = json.getModelConfig();
-    model_config = std::make_unique<GptModelConfig>(config);
+    model_config = std::make_unique<ModelConfig>(config);
     auto world_config = WorldConfig::mpi(1, json.getTensorParallelism(), json.getPipelineParallelism());
     LOG_INFO << "Loaded config from " << json_file_name.string();
     // auto dtype = model_config->getDataType();
