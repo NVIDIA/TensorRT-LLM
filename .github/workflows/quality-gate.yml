@@ -24,7 +24,7 @@ jobs:
             runs-on: "linux-tensorrt-llm-cuda-12-3"
             run-e2e: false
             s3-key-prefix: "linux-tensorrt-llm-0-9-0-cuda-12-3"
-            ccache-dir: "/home/runner/.ccache"
+            ccache-dir: "/home/runner/.cache/ccache"
     permissions:
       contents: write
     steps:
