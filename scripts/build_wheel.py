@@ -88,7 +88,7 @@ def main(build_type: str = "Release",
         if cuda_architectures is not None else "")
 
     cmake_def_args = []
-    cmake_generator = ""
+    cmake_generator = "-GNinja"
 
     hardware_arch = platform.machine()
 

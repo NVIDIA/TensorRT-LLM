@@ -43,13 +43,13 @@ jobs:
             runs-on: "windows-tensorrt-llm-cuda-12-2"
             run-e2e: false
             s3-key-prefix: "windows-tensorrt-llm-ccache"
-            sccache-conf-path: 'C:\sccache.conf'
+            ccache-dir: 'C:\Users\ContainerAdministrator\AppData\Local\ccache'
           - os: "linux"
             name: "cuda-12-3"
             runs-on: "linux-tensorrt-llm-cuda-12-3"
             run-e2e: false
-            s3-key-prefix: "linux-tensorrt-llm"
-            sccache-conf-path: '/tmp/sccache.conf'
+            s3-key-prefix: "linux-tensorrt-llm-0-9-0-cuda-12-3"
+            ccache-dir: "/home/runner/.ccache"
     permissions:
       contents: write
     steps:
@@ -60,51 +60,34 @@ jobs:
           submodules: recursive
           lfs: true
 
-      - name: Install choco on Windows
+      - name: Install tools on Windows
         if: runner.os == 'Windows'
         run: |
-          choco install make pkgconfiglite ccache awscli -y
+          choco install make pkgconfiglite ccache awscli 7zip -y
+          Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+          refreshenv
 
-      - name: create sccache.conf file Linux
-        if: runner.os == 'Linux'
-        run: |
-          echo "[cache.s3]" > ${{ matrix.sccache-conf-path }}
-          echo 'bucket = "${{ secrets.MINIO_BUCKET_NAME }}"' >> ${{ matrix.sccache-conf-path }}
-          echo 'endpoint = "${{ secrets.MINIO_ENDPOINT }}"' >> ${{ matrix.sccache-conf-path }}
-          echo 'key_prefix = "${{ matrix.s3-key-prefix }}"' >> ${{ matrix.sccache-conf-path }}
-          echo 'use_ssl = false' >> ${{ matrix.sccache-conf-path }}
-          echo 'server_side_encryption = false' >> ${{ matrix.sccache-conf-path }}
-          echo 'no_credentials = false' >> ${{ matrix.sccache-conf-path }}
-      
       - name: Download ccache from s3
-        continue-on-error: true
         if: runner.os == 'Windows'
+        continue-on-error: true
         run: |
           Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
           refreshenv
-          aws s3 cp s3://${{ secrets.MINIO_BUCKET_NAME }}/${{ matrix.s3-key-prefix }} C:\Users\ContainerAdministrator\AppData\Local\ccache --recursive --endpoint ${{ secrets.MINIO_ENDPOINT }}
+          aws s3 cp s3://${{ secrets.MINIO_BUCKET_NAME }}/${{ matrix.s3-key-prefix }} ${{ matrix.ccache-dir }} --recursive --endpoint ${{ secrets.MINIO_ENDPOINT }}
         env:
           AWS_ACCESS_KEY_ID: "${{ secrets.MINIO_ACCESS_KEY_ID }}"
           AWS_SECRET_ACCESS_KEY: "${{ secrets.MINIO_SECRET_ACCESS_KEY }}"
           AWS_DEFAULT_REGION: "${{ secrets.MINIO_REGION }}"
 
-      - name: start sccache server for linux
+      - name: Download ccache from s3
         if: runner.os == 'Linux'
-        working-directory: cpp
+        continue-on-error: true
         run: |
-          sccache --start-server
+          aws s3 cp s3://${{ secrets.MINIO_BUCKET_NAME }}/${{ matrix.s3-key-prefix }} ${{ matrix.ccache-dir }} --recursive --endpoint ${{ secrets.MINIO_ENDPOINT }}
         env:
-          SCCACHE_BUCKET: "${{ secrets.MINIO_BUCKET_NAME }}"
-          SCCACHE_REGION: "${{ secrets.MINIO_REGION }}"
-          SCCACHE_ENDPOINT: "${{ secrets.MINIO_ENDPOINT }}"
-          SCCACHE_S3_USE_SSL: "false"
-          SCCACHE_S3_SERVER_SIDE_ENCRYPTION: "false"
-          SCCACHE_S3_KEY_PREFIX: "${{ matrix.s3-key-prefix }}"
-          SCCACHE_LOG: "debug"
-          SCCACHE_CONF: '${{ matrix.sccache-conf-path }}'
           AWS_ACCESS_KEY_ID: "${{ secrets.MINIO_ACCESS_KEY_ID }}"
           AWS_SECRET_ACCESS_KEY: "${{ secrets.MINIO_SECRET_ACCESS_KEY }}"
-          SCCACHE_IDLE_TIMEOUT: "0"
+          AWS_DEFAULT_REGION: "${{ secrets.MINIO_REGION }}"
 
       - name: Build Dependencies
         working-directory: cpp
@@ -141,13 +124,6 @@ jobs:
           asset_path: cpp/tensorrt_llm/cortex.tensorrt-llm/cortex.tensorrt-llm.tar.gz
           asset_name: cortex.tensorrt-llm-${{ needs.create-draft-release.outputs.version }}-${{ matrix.os }}-${{ matrix.name }}.tar.gz
           asset_content_type: application/gzip
-      
-      - name: Clean
-        if: always()
-        continue-on-error: true
-        run: |
-          sccache --stop-server
-          rm ${{ matrix.sccache-conf-path }}
 
       - name: Upload ccache to s3
         continue-on-error: true
@@ -155,11 +131,22 @@ jobs:
         run: |
           Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
           refreshenv
-          aws s3 cp C:\Users\ContainerAdministrator\AppData\Local\ccache s3://${{ secrets.MINIO_BUCKET_NAME }}/${{ matrix.s3-key-prefix }} --recursive --endpoint ${{ secrets.MINIO_ENDPOINT }}
+          aws s3 cp ${{ matrix.ccache-dir }} s3://${{ secrets.MINIO_BUCKET_NAME }}/${{ matrix.s3-key-prefix }} --recursive --endpoint ${{ secrets.MINIO_ENDPOINT }}
         env:
           AWS_ACCESS_KEY_ID: "${{ secrets.MINIO_ACCESS_KEY_ID }}"
           AWS_SECRET_ACCESS_KEY: "${{ secrets.MINIO_SECRET_ACCESS_KEY }}"
           AWS_DEFAULT_REGION: "${{ secrets.MINIO_REGION }}"
+
+      - name: Upload ccache to s3
+        continue-on-error: true
+        if: always() && runner.os == 'Linux'
+        run: |
+          aws s3 cp ${{ matrix.ccache-dir }} s3://${{ secrets.MINIO_BUCKET_NAME }}/${{ matrix.s3-key-prefix }} --recursive --endpoint ${{ secrets.MINIO_ENDPOINT }}
+        env:
+          AWS_ACCESS_KEY_ID: "${{ secrets.MINIO_ACCESS_KEY_ID }}"
+          AWS_SECRET_ACCESS_KEY: "${{ secrets.MINIO_SECRET_ACCESS_KEY }}"
+          AWS_DEFAULT_REGION: "${{ secrets.MINIO_REGION }}"
+
   update_release_draft:
     needs: [build-and-test]
     permissions:
@@ -183,10 +170,3 @@ jobs:
         #   disable-autolabeler: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Clean
-        if: always()
-        continue-on-error: true
-        run: |
-          sccache --stop-server
-          rm ${{ matrix.sccache-conf-path }}
