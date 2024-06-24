@@ -18,7 +18,7 @@ build-deps:
 ifeq ($(OS),Windows_NT)
 	@powershell -Command "cd tensorrt_llm/cortex.tensorrt-llm; cmake -S ./third-party -B ./build_deps/third-party -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_OBJECT_PATH_MAX=500; cmake --build ./build_deps/third-party --config Release -j8;"
 else
-	@cd tensorrt_llm/cortex.tensorrt-llm && cmake -S ./third-party -B ./build_deps/third-party -DCMAKE_BUILD_TYPE=Release -DCMAKE_OBJECT_PATH_MAX=500 && make -C ./build_deps/third-party -j 10 && rm -rf ./build_deps/third-party;
+	@cd tensorrt_llm/cortex.tensorrt-llm && cmake -S ./third-party -B ./build_deps/third-party -DCMAKE_BUILD_TYPE=Release && make -C ./build_deps/third-party -j 10 && rm -rf ./build_deps/third-party;
 endif
 
 # Build the Cortex engine
@@ -29,7 +29,6 @@ ifeq ($(OS),Windows_NT)
 else
 	@cd .. && python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --cuda_architectures "80-real;86-real;89-real" --extra-cmake-vars "BUILD_CORTEX_TENSORRT-LLM=ON" --use_ccache
 	@cd build && cmake .. -DCMAKE_CUDA_ARCHITECTURES='80-real;86-real;89-real' -DTRT_LIB_DIR='/usr/local/tensorrt/lib' -DTRT_INCLUDE_DIR='/usr/local/tensorrt/include' -DBUILD_CORTEX_TENSORRT-LLM=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -G Ninja && cmake --build . --config Release;
-
 endif
 
 # Prepackage the Cortex engine

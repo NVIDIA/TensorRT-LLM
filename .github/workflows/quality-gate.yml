@@ -24,7 +24,7 @@ jobs:
             runs-on: "linux-tensorrt-llm-0-10-0-cuda-12-4"
             run-e2e: false
             s3-key-prefix: "linux-tensorrt-llm-tensorrt-llm-0-10-0-sccache"
-            ccache-dir: '/home/runner/.ccache'
+            ccache-dir: '/home/runner/.cache/ccache'
     permissions:
       contents: write
     steps:
@@ -111,5 +111,3 @@ jobs:
           AWS_ACCESS_KEY_ID: "${{ secrets.MINIO_ACCESS_KEY_ID }}"
           AWS_SECRET_ACCESS_KEY: "${{ secrets.MINIO_SECRET_ACCESS_KEY }}"
           AWS_DEFAULT_REGION: "${{ secrets.MINIO_REGION }}"
-
-          

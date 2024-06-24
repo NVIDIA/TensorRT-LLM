@@ -49,7 +49,7 @@ jobs:
             runs-on: "linux-tensorrt-llm-0-10-0-cuda-12-4"
             run-e2e: false
             s3-key-prefix: "linux-tensorrt-llm-tensorrt-llm-0-10-0-sccache"
-            ccache-dir: '/home/runner/.ccache'
+            ccache-dir: '/home/runner/.cache/ccache'
     permissions:
       contents: write
     steps:
