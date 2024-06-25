@@ -3414,7 +3414,7 @@ class GenerationSession(object):
         stop_words_list_ptrs = None
         max_stop_words_len = 0
         if stop_words_list is not None:
-            stop_words_list = torch.from_numpy(stop_words_list).to('cuda')
+            stop_words_list = torch.from_numpy(stop_words_list).contiguous().to('cuda')
             max_stop_words_len = stop_words_list.shape[2]
             stop_words_lens = torch.full((batch_size, ),
                                          max_stop_words_len,
@@ -3432,7 +3432,7 @@ class GenerationSession(object):
         bad_words_list_ptrs = None
         max_bad_words_len = 0
         if bad_words_list is not None:
-            bad_words_list = torch.from_numpy(bad_words_list).to('cuda')
+            bad_words_list = torch.from_numpy(bad_words_list).contiguous().to('cuda')
             max_bad_words_len = bad_words_list.shape[2]
             bad_words_lens = torch.full((batch_size, ),
                                         max_bad_words_len,
