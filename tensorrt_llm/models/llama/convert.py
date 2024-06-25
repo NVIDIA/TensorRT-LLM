@@ -1535,6 +1535,12 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
 
     moe_config = config.moe
 
+    kv_tp_size = None
+    kv_tp_rank = None
+    if config.num_key_value_heads < mapping.tp_size:
+        kv_tp_size = config.num_key_value_heads
+        kv_tp_rank = mapping.tp_rank * kv_tp_size // mapping.tp_size
+
     model_prefix = "model."
     key_list = [
         "embed_tokens.weight",  # vocab_embedding
@@ -1552,7 +1558,12 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
 
     torch_dtype = str_dtype_to_torch(dtype)
 
-    def load(key, tp_dim=-1, no_prefix=0, is_expert_weights=False):
+    def load(key,
+             tp_dim=-1,
+             no_prefix=0,
+             is_expert_weights=False,
+             tp_size=None,
+             tp_rank=None):
         if not no_prefix:
             key = model_prefix + key
         ptr_idx = safetensors_map[key] if key in safetensors_map else 0
@@ -1560,38 +1571,28 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         if key not in safetensors_ptrs[ptr_idx].keys():
             return None
 
+        tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
+        tensor_shape = tensor_slice.get_shape()
         if tp_dim == -1:
-            res = safetensors_ptrs[ptr_idx].get_tensor(key)
-        else:
+            res = tensor_slice[:]
+        elif tp_dim >= 0 and tp_dim < len(tensor_shape):
             if is_expert_weights:
                 tp_size = mapping.moe_tp_size
                 tp_rank = mapping.moe_tp_rank
             else:
-                tp_size = mapping.tp_size
-                tp_rank = mapping.tp_rank
-            tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
-            tensor_shape = tensor_slice.get_shape()
-            if len(tensor_shape) == 1:
-                if tp_dim == 0:
-                    slice_width = tensor_shape[0] // tp_size
-                    res = tensor_slice[slice_width * tp_rank:slice_width *
-                                       (tp_rank + 1)]
-                else:
-                    res = tensor_slice[:]
-            else:
-                if tensor_shape[tp_dim] % tp_size != 0:
-                    logger.error(
-                        "Current weight shape is invalid for tp_size=" +
-                        str(tp_size))
-                slice_width = tensor_shape[tp_dim] // tp_size
-                if tp_dim == 0:
-                    res = tensor_slice[slice_width * tp_rank:slice_width *
-                                       (tp_rank + 1), :]
-                elif tp_dim == 1:
-                    res = tensor_slice[:, slice_width * tp_rank:slice_width *
-                                       (tp_rank + 1)]
-                else:
-                    assert False, "Invalid TP dim"
+                tp_size = tp_size or mapping.tp_size
+                tp_rank = tp_rank or mapping.tp_rank
+            dim_size = tensor_shape[tp_dim]
+            if dim_size % tp_size != 0:
+                logger.error(
+                    f"Current weight shape {tensor_shape} is invalid at dimension {tp_dim} for TP size {tp_size}"
+                )
+            indices = [slice(None)] * len(tensor_shape)
+            indices[tp_dim] = slice(dim_size * tp_rank // tp_size,
+                                    dim_size * (tp_rank + 1) // tp_size)
+            res = tensor_slice[indices]
+        else:
+            raise ValueError(f"Invalid TP dim: {tp_dim}")
         return res.to(torch_dtype).contiguous(
         ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
 
@@ -1632,11 +1633,19 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         # Attention
         qkv_list = []
         for comp in ["q", "k", "v"]:
-            weight_part = load(prefix + key_list[3] + comp + key_list[4], 0)
+            tp_size = kv_tp_size if comp != "q" else None
+            tp_rank = kv_tp_rank if comp != "q" else None
+            weight_part = load(prefix + key_list[3] + comp + key_list[4],
+                               0,
+                               tp_size=tp_size,
+                               tp_rank=tp_rank)
             qkv_list.append(weight_part)
             bias_part = load(
                 (prefix + key_list[3] + comp + key_list[4]).replace(
-                    "weight", "bias"), 0)
+                    "weight", "bias"),
+                0,
+                tp_size=tp_size,
+                tp_rank=tp_rank)
             if bias_part is not None:
                 qkv_list.append(bias_part)
         if len(qkv_list) == 3:

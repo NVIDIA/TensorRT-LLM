@@ -292,6 +292,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         return tllm_llama
 
     def check_config(self, config):
+        config.set_if_not_exist("share_embedding_table", True)
         config.set_if_not_exist('use_parallel_embedding', False)
         config.set_if_not_exist('embedding_sharding_dim', 0)
         config.set_if_not_exist('mlp_bias', False)

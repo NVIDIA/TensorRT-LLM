@@ -644,7 +644,7 @@ One can enable AWQ/GPTQ INT4 weight only quantization with these options when bu
 - `--use_weight_only` enables weight only GEMMs in the network.
 - `--per_group` enable groupwise weight only quantization, for GPT-J example, we support AWQ with the group size default as 128.
 - `--weight_only_precision` should specify the weight only quantization format. Supported formats are `int4_awq` or `int4_gptq`.
-- `--modelopt_quant_ckpt_path` passes the quantized checkpoint to build the engine.
+- `--quant_ckpt_path` passes the quantized checkpoint to build the engine.
 
 AWQ/GPTQ examples below involves 2 steps:
 1. Weight quantization
@@ -700,7 +700,7 @@ To run the GPTQ LLaMa example, the following steps are required:
     python convert_checkpoint.py --model_dir /tmp/llama-7b-hf \
                                  --output_dir ./tllm_checkpoint_2gpu_gptq \
                                  --dtype float16 \
-                                 --modelopt_quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
+                                 --quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \

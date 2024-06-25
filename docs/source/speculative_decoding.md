@@ -15,9 +15,9 @@ If the first assumption holds true, the latency of speculative decoding will no 
 The combination of both these allows speculative decoding to result in reduced latency.
 
 TensorRT-LLM supports several approaches for generating draft tokens, including:
+
 1. Utilizing a smaller, auxiliary model, known as the draft model approach. For more information, refer to the [Fast Inference from Transformers via Speculative Decoding paper](https://arxiv.org/pdf/2211.17192.pdf).
 2. Implementing additional language model heads that predict tokens for future positions, as detailed in the [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper](https://arxiv.org/abs/2401.10774).
-
 
 ## Performance Improvements
 
@@ -55,6 +55,166 @@ and the draft tokens must be set in the `draftTokens` field of the `LlmRequest` 
 it is advisable to enable KV cache reuse for both models.
 This can be achieved by adding the `--use_paged_context_fmha=enable` flag to the `trtllm-build` command
 and setting `enableBlockReuse=true` in the `KVCacheConfig`.
+
+## Using Draft model approach with Triton Inference Server
+
++ Draft model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with [Business Logic Scripting](https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting), BLS).
++ The source file of Draft model with BLS can be found [here](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/lib/decode.py).
++ This example is based on TensorRT-LLM-0.10.0 and TRTLLM-backend-0.10.0, using docker image `nvcr.io/nvidia/tritonserver:24.05-trtllm-py3`.
++ Llama-7B-hf and Llama-30B-hf are used as draft and target model respectively in this example, assuming the paths to the models' repository are `DRAFT_MODEL_PATH` and `TARGET_MODEL_PATH`.
++ Maximum number of draft tokens is set to 10 in this example.
+
+1. Prepare TensorRT engine for inference
+    + Here are the commands to build draft / target engines in FP16 or FP8. All combinations of the data type (Draft-FP16/FP8 + Target-FP16/FP8) are supported.
+    + `--remove_input_padding=enable --paged_kv_cache=enable` are necessary for inflight-batching.
+    + `--context_fmha=enable --use_paged_context_fmha=enable` are optional, but recommended for the performance.
+    + `--gather_generation_logits` is necessary if using generation logits for selecting tokens in target model.
+    + `--tp_size` can be modified set if using TP mode for draft / target model.
+    + `--max_batch_size` more than 1 is acceptable in general usage, but we use 1 in this example.
+
+    ```bash
+    export MAX_DRAFT_LENGTH=10
+    export COMMON_COMMAND="--max_batch_size=1 --max_input_len=2048 --max_output_len=1024 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits"
+    export DRAFT_COMMAND_FP16="$COMMON_COMMAND"
+    export TARGET_COMMAND_FP16="$DRAFT_COMMAND_FP16 --max_draft_len=$MAX_DRAFT_LENGTH --speculative_decoding_mode draft_tokens_external"
+    export DRAFT_COMMAND_FP8="$COMMON_COMMAND --strongly_typed --use_fp8_context_fmha=enable"
+    export TARGET_COMMAND_FP8="$DRAFT_COMMAND_FP8 --max_draft_len=$MAX_DRAFT_LENGTH --speculative_decoding_mode draft_tokens_external"
+
+    # Build checkpoints and engines in tensorrt_llm/examples/llama/
+    # FP16 mode
+    export DRAFT_NAME=llama-7b-fp16-tp1
+    export TARGET_NAME=llama-30b-fp16-tp1
+    python3 convert_checkpoint.py --model_dir=$DRAFT_MODEL_PATH --output_dir=ckpt/$DRAFT_NAME --tp_size=1
+    python3 convert_checkpoint.py --model_dir=$TARGET_MODEL_PATH --output_dir=ckpt/$TARGET_NAME --tp_size=1
+    trtllm-build --checkpoint_dir=ckpt/$DRAFT_NAME --output_dir=engine/draft/$DRAFT_NAME $DRAFT_COMMAND_FP16
+    trtllm-build --checkpoint_dir=ckpt/$TARGET_NAME --output_dir=engine/target/$TARGET_NAME $TARGET_COMMAND_FP16
+    export DRAFT_ENGINE_PATH=$(pwd)/engine/draft/$DRAFT_NAME
+    export TARGET_ENGINE_PATH=$(pwd)/engine/target/$TARGET_NAME
+
+    # FP8 mode
+    export DRAFT_NAME=llama-7b-fp8-tp1
+    export TARGET_NAME=llama-30b-fp8-tp1
+    python3 convert_checkpoint.py --model_dir=$DRAFT_MODEL_PATH --output_dir=ckpt/$DRAFT_NAME --tp_size=1
+    python3 convert_checkpoint.py --model_dir=$TARGET_MODEL_PATH --output_dir=ckpt/$TARGET_NAME --tp_size=1
+    trtllm-build --checkpoint_dir=ckpt/$DRAFT_NAME --output_dir=engine/draft/$DRAFT_NAME $DRAFT_COMMAND_FP8
+    trtllm-build --checkpoint_dir=ckpt/$TARGET_NAME --output_dir=engine/target/$TARGET_NAME $TARGET_COMMAND_FP8
+    export DRAFT_ENGINE_PATH=$(pwd)/engine/draft/$DRAFT_NAME
+    export TARGET_ENGINE_PATH=$(pwd)/engine/target/$TARGET_NAME
+    ```
+
+2. Edit Triton configuration
+    + If both draft and target model can be placed in one GPU (for example, llama-7B-FP8 + llama-30B-FP8, totally 40GiB in one H100-80GiB GPU), `DRAFT_GPU_DEVICE_IDS` and `TARGET_GPU_DEVICE_IDS` can be the same, `0` as example. It appears better performance than placing on two separate GPUs.
+    + Elsewise, the draft and target models can be placed in different GPUs, `DRAFT_GPU_DEVICE_IDS="0"` and `TARGET_GPU_DEVICE_IDS="1"` as example.
+    + Furthermore, if TP mode is used, the value of `GPU_DEVICE_IDS` can be a list, `DRAFT_GPU_DEVICE_IDS="0"` and `TARGET_GPU_DEVICE_IDS="1,2,3,4"` as example.
+    + For more configuration of launching models with Tritonserver, please visit [TensorRT-LLM Backed repo](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/README.md).
+
+    ```bash
+    ACCUMULATE_TOKEN="false"
+    BACKEND="tensorrtllm"
+    BATCH_SCHEDULER_POLICY="guaranteed_no_evict"
+    BATCHING_STRATEGY="inflight_fused_batching"
+    BLS_INSTANCE_COUNT="1"
+    DECODING_MODE="top_k_top_p"
+    DECOUPLED_MODE="False"
+    DRAFT_GPU_DEVICE_IDS="0"
+    E2E_MODEL_NAME="ensemble"
+    ENABLE_KV_CACHE_REUSE="true"
+    ENGINE_PATH=$TARGET_ENGINE_PATH
+    EXCLUDE_INPUT_IN_OUTPUT="false"
+    KV_CACHE_FREE_GPU_MEM_FRACTION="0.8"
+    MAX_ATTENTION_WINDOW_SIZE=""
+    MAX_BEAM_WIDTH="1"
+    MAX_QUEUE_DELAY_MICROSECONDS="0"
+    MAX_TOKENS_IN_KV_CACHE=""
+    NORMALIZE_LOG_PROBS="true"
+    POSTPROCESSING_INSTANCE_COUNT="1"
+    PREPROCESSING_INSTANCE_COUNT="1"
+    TARGET_GPU_DEVICE_IDS="1"
+    TENSORRT_LLM_DRAFT_MODEL_NAME="tensorrt_llm_draft"
+    TENSORRT_LLM_MODEL_NAME="tensorrt_llm"
+    TOKENIZER_PATH=$DRAFT_MODEL_PATH
+    TOKENIZER_TYPE=llama
+    TRITON_GRPC_PORT="8001"
+    TRITON_HTTP_PORT="8000"
+    TRITON_MAX_BATCH_SIZE="4"
+    TRITON_METRICS_PORT="8002"
+    TRITON_REPO="triton_repo"
+    USE_DRAFT_LOGITS="false"
+
+    # Make a copy of triton repo and replace the fields in the configuration files
+    cd /tensorrtllm_backend/
+    apt-get update && apt-get install -y build-essential cmake git-lfs
+    pip3 install git-lfs tritonclient grpcio
+    rm -rf ${TRITON_REPO}
+    cp -R all_models/inflight_batcher_llm ${TRITON_REPO}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/ensemble/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/preprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_PATH},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},preprocessing_instance_count:${PREPROCESSING_INSTANCE_COUNT}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/postprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_PATH},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},postprocessing_instance_count:${POSTPROCESSING_INSTANCE_COUNT}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm_bls/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},accumulate_tokens:${ACCUMULATE_TOKEN},bls_instance_count:${BLS_INSTANCE_COUNT},tensorrt_llm_model_name:${TENSORRT_LLM_MODEL_NAME},tensorrt_llm_draft_model_name:${TENSORRT_LLM_DRAFT_MODEL_NAME}
+
+    # Make a copy of tensorrt_llm as configurations of draft / target models.
+    cp -R ${TRITON_REPO}/tensorrt_llm ${TRITON_REPO}/tensorrt_llm_draft
+    sed -i 's/name: "tensorrt_llm"/name: "tensorrt_llm_draft"/g' ${TRITON_REPO}/tensorrt_llm_draft/config.pbtxt
+    python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm/config.pbtxt          triton_backend:${BACKEND},engine_dir:${ENGINE_PATH},decoupled_mode:${DECOUPLED_MODE},max_tokens_in_paged_kv_cache:${MAX_TOKENS_IN_KV_CACHE},max_attention_window_size:${MAX_ATTENTION_WINDOW_SIZE},batch_scheduler_policy:${BATCH_SCHEDULER_POLICY},batching_strategy:${BATCHING_STRATEGY},kv_cache_free_gpu_mem_fraction:${KV_CACHE_FREE_GPU_MEM_FRACTION},exclude_input_in_output:${EXCLUDE_INPUT_IN_OUTPUT},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS},max_beam_width:${MAX_BEAM_WIDTH},enable_kv_cache_reuse:${ENABLE_KV_CACHE_REUSE},normalize_log_probs:${NORMALIZE_LOG_PROBS},enable_chunked_context:${ENABLE_CHUNKED_CONTEXT},gpu_device_ids:${TARGET_GPU_DEVICE_IDS},decoding_mode:${DECODING_MODE}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm_draft/config.pbtxt    triton_backend:${BACKEND},engine_dir:${DRAFT_ENGINE_PATH},decoupled_mode:${DECOUPLED_MODE},max_tokens_in_paged_kv_cache:${MAX_TOKENS_IN_KV_CACHE},max_attention_window_size:${MAX_ATTENTION_WINDOW_SIZE},batch_scheduler_policy:${BATCH_SCHEDULER_POLICY},batching_strategy:${BATCHING_STRATEGY},kv_cache_free_gpu_mem_fraction:${KV_CACHE_FREE_GPU_MEM_FRACTION},exclude_input_in_output:${EXCLUDE_INPUT_IN_OUTPUT},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS},max_beam_width:${MAX_BEAM_WIDTH},enable_kv_cache_reuse:${ENABLE_KV_CACHE_REUSE},normalize_log_probs:${NORMALIZE_LOG_PROBS},enable_chunked_context:${ENABLE_CHUNKED_CONTEXT},gpu_device_ids:${DRAFT_GPU_DEVICE_IDS},decoding_mode:${DECODING_MODE}
+    ```
+
+3. Launch Triton server
+    + `--multi-model` is necessary if TP mode is used for target model.
+
+    ```bash
+    python3 scripts/launch_triton_server.py \
+        --model_repo=${TRITON_REPO} \
+        --tensorrt_llm_model_name "tensorrt_llm,tensorrt_llm_draft" \
+        --multi-model \
+        --log &
+    ```
+
+    + Verbose log will be written in to file `triton_log.txt`. Triton server launches successfully if you see the output below in the file:
+
+    ```txt
+    Started HTTPService at 0.0.0.0:8000
+    Started GRPCInferenceService at 0.0.0.0:8001
+    Started Metrics Service at 0.0.0.0:8002
+    ```
+
+4. Send Requests
+    + Prepare a JSON file `input_data.json` containing input data as below (more requests are acceptable).
+
+    ```json
+    [
+        {
+            "input": "James Best, best known for his ",
+            "instruction": "Continue writing the following story:",
+            "output": "                                                                "
+        }
+    ]
+    ```
+
+    + Use command below to launch requests for inference.
+    + `--num-draft-tokens` can be modified by runtime draft lengths, 4 is used in this example.
+
+    ```bash
+    python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
+        --max-input-len 2048 \
+        --dataset=input_data.json \
+        --url-target=localhost:8001 \
+        --url-draft=localhost:8001 \
+        --draft-tensorrt-llm-model-name="${TENSORRT_LLM_DRAFT_MODEL_NAME}" \
+        --target-tensorrt-llm-model-name="${TENSORRT_LLM_MODEL_NAME}" \
+        --bls-speculative-tensorrt-llm-model-name="tensorrt_llm_bls" \
+        --execute-bls-speculative-decoding \
+        --disable-output-comparison \
+        --num-draft-tokens=4 \
+        --verbose
+    ```
+
+5. Kill Tritonserver after finishing inference
+
+    ```bash
+    pkill -9 -f trtllmExecutorWorker
+    pkill -9 -f tritonserver
+    ```
 
 # Medusa
 

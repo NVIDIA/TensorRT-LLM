@@ -30,10 +30,9 @@ from ..builder import BuildConfig, Engine, build
 from ..logger import logger
 from ..lora_manager import LoraConfig, LoraManager
 from ..models import MODEL_MAP, PretrainedConfig
-from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
+from ..models.modeling_utils import (WEIGHT_LOADER_MODELS,
                                      SpeculativeDecodingMode)
 from ..plugin import PluginConfig, add_plugin_argument
-from ..quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -133,10 +132,6 @@ def parse_arguments():
                         type=str,
                         default=None,
                         choices=['float16', 'float32'])
-    parser.add_argument('--weight_only_precision',
-                        type=str,
-                        default=None,
-                        choices=['int8', 'int4'])
     parser.add_argument('--weight_sparsity', default=False, action='store_true')
     parser.add_argument(
         '--max_draft_len',
@@ -269,14 +264,6 @@ def build_model(build_config: BuildConfig,
     logits_dtype = kwargs.get('logits_dtype')
     if logits_dtype is not None:
         model_config.logits_dtype = logits_dtype
-
-    weight_only_precision = kwargs.get('weight_only_precision', None)
-    if not model_config.quant_mode.has_any_quant(
-    ) and weight_only_precision is not None:
-        if weight_only_precision == 'int4':
-            model_config.quantization = QuantConfig(QuantAlgo.W4A16)
-        else:
-            model_config.quantization = QuantConfig(QuantAlgo.W8A16)
 
     architecture = model_config.architecture
     assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
@@ -420,7 +407,6 @@ def main():
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
-        'weight_only_precision': args.weight_only_precision,
         'tp_size': args.tp_size,
         'pp_size': args.pp_size,
         'lora_dir': args.lora_dir,

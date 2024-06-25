@@ -29,9 +29,6 @@ Please install required packages first and setup `git-lfs`:
 
 ```bash
 pip install -r requirements.txt
-pip install "transformers>=4.39.0"
-
-# Setup git-lfs
 git lfs install
 ```
 
@@ -98,8 +95,7 @@ The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpo
 # mamba-2.8b
 trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
              --paged_kv_cache disable \
-             --gemm_plugin bfloat16 \
-             --mamba_conv1d_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_seq_len 1024 \
@@ -108,8 +104,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
 # mamba-1.4b
 trtllm-build --checkpoint_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
              --paged_kv_cache disable \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_seq_len 1024 \
@@ -118,8 +113,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
 # mamba-790m
 trtllm-build --checkpoint_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/ \
              --paged_kv_cache disable \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_seq_len 1024 \
@@ -128,8 +122,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/ \
 # mamba-370m
 trtllm-build --checkpoint_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/ \
              --paged_kv_cache disable \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_seq_len 1024 \
@@ -138,8 +131,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/ \
 # mamba-130m
 trtllm-build --checkpoint_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --paged_kv_cache disable \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 924 \
              --max_seq_len 1024 \

@@ -28,7 +28,7 @@ def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
     covert_cmd = [_sys.executable, "examples/medusa/convert_checkpoint.py"] + (
         ['--model_dir', str(weight_dir)] if weight_dir else []) + [
             '--medusa_model_dir', str(medusa_dir), \
-            '--output_dir', str(engine_dir), '--dtype=float16', '--fixed_num_medusa_heads=4'
+            '--output_dir', str(engine_dir), '--dtype=float16', '--num_medusa_heads=4'
         ] + list(args)
 
     run_command(covert_cmd)

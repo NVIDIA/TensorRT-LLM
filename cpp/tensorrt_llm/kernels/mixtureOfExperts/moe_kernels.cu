@@ -1072,10 +1072,38 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWo
     size_t const hopper_size = using_hopper ? HopperGroupedGemmInput::workspaceSize(num_experts_per_node) : 0;
     size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
 
-    std::vector<size_t> workspace{source_rows_size, permuted_rows_size, permuted_experts_size, permuted_data_size,
-        total_rows_before_expert_size, softmax_out_size, glu_inter_size,
+    // We do some overlapping of the large workspace buffers. Although we could overlap some of the other buffers, they
+    // are small enough (i.e no factor of hidden size) they will only be a couple MiB at most, so we don't bother
+    // in the case of fused activation we overlap permuted_data and fc2_result
+    // in the case of unfused activation we overlap permuted_data and fc1_result
+    // we need to calculate the max possible size, so use the max of all three
+    size_t overlapped_gemm1_gemm2_inputs = std::max(permuted_data_size, fc2_result_size);
+    // When glu_inter_elems is 0 we are always fused, otherwise we may need the un-fused case
+    if (glu_inter_elems > 0)
+    {
+        overlapped_gemm1_gemm2_inputs = std::max(overlapped_gemm1_gemm2_inputs, fc1_result_size);
+    }
+
+    // if we have glu_inter we overlap it with fc2_result, otherwise we use fc1_result by itself
+    size_t overlapped_gemm1_gemm2_outputs = fc1_result_size;
+    if (glu_inter_elems > 0)
+    {
+        overlapped_gemm1_gemm2_outputs
+            = std::max(std::max(glu_inter_size, fc2_result_size), overlapped_gemm1_gemm2_outputs);
+    }
+
+    std::vector<size_t> workspace{     //
+        source_rows_size,              //
+        permuted_rows_size,            //
+        permuted_experts_size,         //
+        total_rows_before_expert_size, //
+        softmax_out_size,              //
+        sorter_size,                   //
         // These pointers reuse the same memory
-        std::max(fc1_result_size, sorter_size), fc2_result_size, hopper_size, gemm_workspace_size};
+        overlapped_gemm1_gemm2_inputs,  //
+        overlapped_gemm1_gemm2_outputs, //
+        hopper_size,                    //
+        gemm_workspace_size};
     return workspace;
 }
 
@@ -1088,7 +1116,9 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWorkspaceSize(i
     TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of ep size");
     auto workspace = getWorkspaceBufferSizes(
         num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type);
-    return tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
+    auto ws_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
+    TLLM_LOG_DEBUG("Mixture Of Experts Plugin requires workspace of %2f MiB", ws_size / 1024.f / 1024.f);
+    return ws_size;
 }
 
 template <class T, class WeightType, class OutputType, class Enable>
@@ -1109,29 +1139,38 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::configureWsPtrs(char
     source_rows_ = (int*) ws_sliced[0];
     permuted_rows_ = (int*) ws_sliced[1];
     permuted_experts_ = (int*) ws_sliced[2];
-    permuted_data_ = (T*) ws_sliced[3];
 
-    total_rows_before_expert_ = (int64_t*) ws_sliced[4];
+    total_rows_before_expert_ = (int64_t*) ws_sliced[3];
 
     softmax_out_ = nullptr;
     bool const is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     if (!is_pow_2 || num_experts > 256)
     {
-        softmax_out_ = (float*) ws_sliced[5];
+        softmax_out_ = (float*) ws_sliced[4];
     }
 
-    glu_inter_result_ = (T*) ws_sliced[6];
+    sorter_ws_ = (char*) ws_sliced[5];
 
-    // These pointers are aliased. Since the sort ws can be overwritten after it is finished
-    sorter_ws_ = (char*) ws_sliced[7];
-    fc1_result_ = (T*) ws_sliced[7];
+    // Always 6, but overlapped with either fc1_result_ or fc2_result_
+    permuted_data_ = (T*) ws_sliced[6];
 
-    fc2_result_ = (T*) ws_sliced[8];
+    bool const is_gated_activation = isGatedActivation(activation_type);
+    bool const use_fused_moe = moe_gemm_runner_.isFusedGatedActivation(is_gated_activation, inter_size, hidden_size);
+    bool const using_hopper = moe_gemm_runner_.isHopperSpecialised();
+    bool const hopper_has_glu = using_hopper && (mayHaveDifferentGEMMOutputType() || is_gated_activation);
+    bool const non_hopper_has_glu = !using_hopper && !use_fused_moe && is_gated_activation;
+    bool const has_glu_inter_result = hopper_has_glu || non_hopper_has_glu;
+    // Always 7, ignored if not needed
+    glu_inter_result_ = has_glu_inter_result ? (T*) ws_sliced[7] : nullptr;
+
+    // fc1 and fc2 alias one of the above pointers, but it depends on if actfn is fused/unfused which is overlapped
+    fc1_result_ = has_glu_inter_result ? (T*) ws_sliced[6] : (T*) ws_sliced[7];
+    fc2_result_ = has_glu_inter_result ? (T*) ws_sliced[7] : (T*) ws_sliced[6];
 
     hopper_grouped_gemm_input_ = {};
     if (moe_gemm_runner_.isHopperSpecialised())
     {
-        hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[9], num_experts_per_node, ws_sliced[10], ws_sizes[10]);
+        hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[8], num_experts_per_node, ws_sliced[9], ws_sizes[9]);
     }
 }
 
@@ -1293,6 +1332,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     }
     else
     {
+
         // Run the GEMM with activation function overridden with `Identity`, we do the activation separately
         ActivationType activation_type = (use_fused_moe) ? fc1_activation_type : ActivationType::Identity;
         T* gemm_result = (use_fused_moe) ? fc1_result_ : static_cast<T*>(glu_inter_result_);

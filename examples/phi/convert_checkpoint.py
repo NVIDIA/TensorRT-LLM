@@ -19,8 +19,7 @@ import time
 from transformers import AutoConfig
 
 import tensorrt_llm
-from tensorrt_llm.models import (Phi3ForCausalLM, Phi3SmallForCausalLM,
-                                 PhiForCausalLM)
+from tensorrt_llm.models import Phi3ForCausalLM, PhiForCausalLM
 
 
 def parse_arguments():
@@ -81,16 +80,14 @@ if __name__ == '__main__':
     model_config = AutoConfig.from_pretrained(args.model_dir,
                                               trust_remote_code=True)
     model_type = model_config.architectures[0]
-    supported_model = {
-        'PhiForCausalLM': PhiForCausalLM,
-        'Phi3ForCausalLM': Phi3ForCausalLM,
-        'Phi3VForCausalLM': Phi3ForCausalLM,
-        'Phi3SmallForCausalLM': Phi3SmallForCausalLM
-    }
+    supported_models = [
+        'PhiForCausalLM', 'Phi3ForCausalLM', 'Phi3VForCausalLM',
+        'Phi3SmallForCausalLM'
+    ]
     modelForCausalLM = None
-    if model_type not in supported_model:
+    if model_type not in supported_models:
         assert False, "Invalid model type"
-    modelForCausalLM = supported_model[model_type]
+    modelForCausalLM = PhiForCausalLM if model_type == 'PhiForCausalLM' else Phi3ForCausalLM
 
     modelForCausalLM.convert_hf_checkpoint(args.model_dir,
                                            dtype=args.dtype,

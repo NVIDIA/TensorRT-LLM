@@ -944,6 +944,7 @@ def build_gpt(args):
     network = builder.create_network()
     network.trt_network.name = engine_name
     network.plugin_config.to_legacy_setting()
+    network.plugin_config.dtype = args.dtype
 
     # Plugins
     if args.mode in ['plugin', 'plugin-ifb']:

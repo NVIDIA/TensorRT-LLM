@@ -1146,8 +1146,8 @@ class GraphGroup(ABC):
         num_kv_heads = plugin_info.pfc_as_ndarray["num_kv_heads"].copy()
         tp_size = plugin_info.pfc_as_ndarray["tp_size"].copy()
         tp_rank = plugin_info.pfc_as_ndarray["tp_rank"].copy()
-        num_kv_heads = num_kv_heads // kv_partition
-        num_heads = num_heads // partition
+        num_kv_heads = np.maximum(num_kv_heads // kv_partition, 1)
+        num_heads = np.maximum(num_heads // partition, 1)
         tp_size[0] = partition
         tp_rank[0] = index
 

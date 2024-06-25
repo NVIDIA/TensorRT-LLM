@@ -257,7 +257,7 @@ protected:
     template <class T>
     T* allocBuffer(size_t size)
     {
-        managed_buffers.emplace_back(mBufferManager->managed(size * sizeof(T)));
+        managed_buffers.emplace_back(mBufferManager->gpu(size * sizeof(T)));
         EXPECT_EQ(cudaGetLastError(), cudaSuccess) << "Error allocating buffer of size: " << size;
         T* ptr = static_cast<T*>(managed_buffers.back()->data());
         return ptr;
@@ -268,15 +268,27 @@ protected:
         this->managed_buffers.clear();             // Make sure all the previous buffers are freed
         check_cuda_error(cudaDeviceSynchronize()); // Sync to make sure all previous operations are resolved
 
-        size_t weight_size = hidden_size * hidden_size * 4 * num_experts * sizeof(WeightType);
-        // Skip the test if the GPU does not have enough memory
-        size_t workspace_size = this->mMoERunner.getWorkspaceSize(
+        // Calculate the size contributions for all the large buffers to check if the GPU has enough space
+        bool const is_gated = tensorrt_llm::isGatedActivation(mActType);
+        size_t const num_gemms = 2 + is_gated;
+        // Expert weights
+        size_t const weight_size = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms;
+        // Workspace size
+        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
             num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, {});
+        // The input/output buffers
+        size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
-        size_t total_size = workspace_size + weight_size * 2;
+        // This should be correct to within 100MiB (on tests with 30GiB total)
+        size_t const total_size = workspace_size + weight_size + in_out_size;
 
+        size_t const memory_pool_free_mem_size = mBufferManager->memoryPoolFree();
         auto const [freeMem, totalMem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
-        return freeMem >= total_size;
+        float const freeMemBuffer = 0.9f; // Add some buffer so we aren't completely pushing the limits
+        std::cout << "Free memory is: " << freeMem << ", memory pool size is: " << memory_pool_free_mem_size
+                  << ", required memory is: " << total_size << ", device total memory capacity: " << totalMem
+                  << std::endl;
+        return (freeMem + memory_pool_free_mem_size) * freeMemBuffer >= total_size;
     }
 
     void initBuffersPermute(std::vector<std::vector<DataType>> h_hidden_states,
@@ -362,7 +374,10 @@ protected:
             initFP8Scales(mMaxInput);
         }
 
-        mTpExpertScratch = allocBuffer<DataType>(mTpExpertScratchSize);
+        if (parallelism_config.tp_size > 1 || parallelism_config.ep_size > 1)
+        {
+            mTpExpertScratch = allocBuffer<DataType>(mTpExpertScratchSize);
+        }
 
         mActiveRows = mTotalTokens;
         mFinished = nullptr;
@@ -475,10 +490,18 @@ protected:
         ASSERT_NE(mExpertFP8Scale1, nullptr);
         ASSERT_NE(mExpertFP8Scale2, nullptr);
         ASSERT_NE(mExpertFP8Scale3, nullptr);
+
         // Dequant values for each expert are 1/(w_i*a_i) calculated above
-        std::fill_n(mExpertFP8Scale1, mNumExperts, 1.f / (scaleW1 * scaleAct1));
-        std::fill_n(mExpertFP8Scale3, mNumExperts, 1.f / (scaleW2 * scaleAct2));
-        *mExpertFP8Scale2 = scaleAct2;
+        std::vector<float> scales_1(mNumExperts, 1.f / (scaleW1 * scaleAct1));
+        std::vector<float> scales_2(1, scaleAct2);
+        std::vector<float> scales_3(mNumExperts, 1.f / (scaleW2 * scaleAct2));
+
+        check_cuda_error(cudaMemcpyAsync(mExpertFP8Scale1, scales_1.data(), scales_1.size() * sizeof(float),
+            cudaMemcpyHostToDevice, mStream->get()));
+        check_cuda_error(cudaMemcpyAsync(mExpertFP8Scale2, scales_2.data(), scales_2.size() * sizeof(float),
+            cudaMemcpyHostToDevice, mStream->get()));
+        check_cuda_error(cudaMemcpyAsync(mExpertFP8Scale3, scales_3.data(), scales_3.size() * sizeof(float),
+            cudaMemcpyHostToDevice, mStream->get()));
 
         check_cuda_error(cudaStreamSynchronize(mStream->get()));
     }
@@ -560,6 +583,13 @@ protected:
         void* ep_scale_1 = FP8 ? (void*) mExpertFP8Scale1 : (void*) mExpertIntScale1;
         void* ep_scale_2 = FP8 ? (void*) mExpertFP8Scale2 : (void*) mExpertIntScale2;
         void* ep_scale_3 = FP8 ? mExpertFP8Scale3 : nullptr;
+
+        // Handle the case with no parallelism to not require the extra alloc
+        if (parallelism_config.tp_size == 1 && parallelism_config.ep_size == 1)
+        {
+            return std::tuple{
+                mExpertWeight1, mExpertWeight2, mExpertBias1, mExpertBias2, ep_scale_1, ep_scale_2, ep_scale_3};
+        }
 
         // Slice weights for EP
         size_t const gated_inter = mInterSize * mGatedMultiplier;
