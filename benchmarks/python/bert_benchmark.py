@@ -31,7 +31,7 @@ class BERTBenchmark(BaseBenchmark):
 
     def __init__(self, args, batch_sizes, in_lens, gpu_weights_percents, rank,
                  world_size):
-        super().__init__(args.engine_dir, args.model, args.dtype, rank,
+        super().__init__(args.engine_dir, args.model, args.mode, args.dtype, rank,
                          world_size, args.serial_build)
         self.batch_sizes = batch_sizes
         self.in_lens = in_lens
@@ -110,16 +110,6 @@ class BERTBenchmark(BaseBenchmark):
         assert ok, "Runtime execution failed"
         torch.cuda.synchronize()
 
-    def report(self, config, latency, percentile95, percentile99,
-               peak_gpu_used):
-        if self.runtime_rank == 0:
-            line = '[BENCHMARK] ' + (
-                f'model_name {self.model_name} world_size {self.world_size} precision {self.dtype} '
-                f'batch_size {config[0]} input_length {config[1]} gpu_peak_mem(gb) {peak_gpu_used} '
-                f'build_time(s) {self.build_time} percentile95(ms) {percentile95} '
-                f'percentile99(ms) {percentile99} latency(ms) {latency}')
-            print(line)
-
     def report(self,
                config,
                latency,
@@ -145,13 +135,5 @@ class BERTBenchmark(BaseBenchmark):
         report_dict["percentile95(ms)"] = percentile95
         report_dict["percentile99(ms)"] = percentile99
         report_dict["gpu_peak_mem(gb)"] = peak_gpu_used
-        if self.runtime_rank == 0:
-            if csv:
-                line = ",".join([str(v) for v in report_dict.values()])
-                print(line)
-                with open(self.get_csv_filename(), "a") as file:
-                    file.write(line + "\n")
-            else:
-                kv_pairs = [f"{k} {v}" for k, v in report_dict.items()]
-                line = '[BENCHMARK] ' + " ".join(kv_pairs)
-                print(line)
+        
+        self.print_report_dict(report_dict, csv)

@@ -402,8 +402,7 @@ def main(args):
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    benchmarker.print_report_header(args.csv,
-                                    benchmark_profiler=benchmark_profiler)
+
     for config in benchmarker.get_config():
         if isinstance(benchmarker, GPTBenchmark):
             benchmarker.check_memory(config, raise_exception=args.debug_memory)

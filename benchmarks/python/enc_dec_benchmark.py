@@ -40,7 +40,7 @@ class EncDecBenchmark(BaseBenchmark):
         self.output_dir = args.output_dir
         self.runtime_rank = rank
         self.world_size = world_size
-        self.csv_filename = ""  # lazy init
+        
         self.batch_sizes = batch_sizes
         self.in_out_lens = in_out_lens
         self.num_beams = args.num_beams
@@ -52,6 +52,8 @@ class EncDecBenchmark(BaseBenchmark):
         self.encoder_engine_model_name = args.model
         self.decoder_engine_model_name = args.model
         self.gpu_weights_percents = gpu_weights_percents
+
+        self.csv_filename = self.get_csv_filename()
 
         # only for whisper parameter
         self.n_mels = 0
@@ -453,13 +455,5 @@ class EncDecBenchmark(BaseBenchmark):
         report_dict["percentile95(ms)"] = percentile95
         report_dict["percentile99(ms)"] = percentile99
         report_dict["gpu_peak_mem(gb)"] = peak_gpu_used
-        if self.runtime_rank == 0:
-            if csv:
-                line = ",".join([str(v) for v in report_dict.values()])
-                print(line)
-                with open(self.get_csv_filename(), "a") as file:
-                    file.write(line + "\n")
-            else:
-                kv_pairs = [f"{k} {v}" for k, v in report_dict.items()]
-                line = "[BENCHMARK] " + " ".join(kv_pairs)
-                print(line)
+        
+        self.print_report_dict(report_dict, csv)

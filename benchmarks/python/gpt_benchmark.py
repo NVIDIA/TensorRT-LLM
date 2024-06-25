@@ -45,13 +45,12 @@ class GPTBenchmark(BaseBenchmark):
 
     def __init__(self, args, batch_sizes, in_out_lens, gpu_weights_percents,
                  rank, world_size):
-        super().__init__(args.engine_dir, args.model, args.dtype, rank,
+        super().__init__(args.engine_dir, args.model, args.mode, args.dtype, rank,
                          world_size, args.serial_build)
         self.batch_sizes = batch_sizes
         self.in_out_lens = in_out_lens
         self.gpu_weights_percents = gpu_weights_percents
         self.num_beams = args.num_beams
-        self.mode = args.mode
         self.build_time = 0
 
         self.cuda_graph_mode = args.enable_cuda_graph
@@ -369,16 +368,7 @@ class GPTBenchmark(BaseBenchmark):
                 total_tokens * 1000.0 / generation_time_ms, 3)
             report_dict["generation_tokens_per_second"] = tokens_per_second
 
-        if self.runtime_rank == 0:
-            if csv:
-                line = ",".join([str(v) for v in report_dict.values()])
-                print(line)
-                with open(self.get_csv_filename(), "a") as file:
-                    file.write(line + "\n")
-            else:
-                kv_pairs = [f"{k} {v}" for k, v in report_dict.items()]
-                line = '[BENCHMARK] ' + " ".join(kv_pairs)
-                print(line)
+        self.print_report_dict(report_dict, csv)
 
         if self.dump_layer_info:
             engine_inspector = self.decoder.engine_inspector
