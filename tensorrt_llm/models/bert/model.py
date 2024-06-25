@@ -18,8 +18,8 @@ import numpy as np
 
 from ..._common import default_net
 from ...functional import (ACT2FN, bert_attention, cast, concat, constant,
-                           expand, expand_mask, matmul, select, shape,
-                           slice, softmax, split, unsqueeze, cumsum, index_select)
+                           expand, expand_mask, matmul, select, shape, slice,
+                           softmax, split, unsqueeze, cumsum, index_select)
 from ...layers import MLP, ColumnLinear, Embedding, LayerNorm, Linear, RowLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList

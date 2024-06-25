@@ -50,8 +50,8 @@ def parse_arguments():
 
 def process_input(input_ids_list: List[torch.Tensor],
                   token_type_ids_list: List[torch.Tensor]):
-    input_lengths = []      # [batch_size]
-    position_ids_list = []  # [batch_size, seq_len]
+    input_lengths = []
+    position_ids_list = []
     max_input_length = 0
     for i, input_ids in enumerate(input_ids_list):
         input_len = len(input_ids)
