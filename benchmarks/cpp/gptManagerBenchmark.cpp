@@ -165,6 +165,9 @@ struct BenchmarkParams
 
     // Weights offloading
     float gpuWeightsPercent{1.0};
+
+    // Decoding params
+    std::optional<std::vector<std::vector<SizeType32>>> medusaChoices;
 };
 
 class InferenceRequestsSyncSend
@@ -791,6 +794,10 @@ public:
             executorConfig.setMaxBatchSize(benchmarkParams.maxBatchSize.value());
         }
 
+        executorConfig.setDecodingConfig(texec::DecodingConfig(
+            benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
+            std::nullopt, benchmarkParams.medusaChoices));
+
         mExecutor = std::make_unique<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
 
         if (logIterationData)
@@ -1346,6 +1353,9 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.maxBeamWidth = beamWidth;
     optionalParams.maxBatchSize = benchmarkParams.maxBatchSize;
     optionalParams.schedulerConfig = texec::SchedulerConfig{capacitySchedulerPolicy};
+    optionalParams.decodingConfig = texec::DecodingConfig(
+        benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
+        std::nullopt, benchmarkParams.medusaChoices);
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
     SizeType32 deviceCount{0};
@@ -1600,6 +1610,32 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
     }
 }
 
+std::vector<std::vector<SizeType32>> parseVectorOfVectors(std::string const& input)
+{
+    std::vector<std::vector<SizeType32>> result;
+    std::regex outer_regex(R"(\[(.*?)\])");
+    std::regex inner_regex(R"(\d+)");
+    auto outer_begin = std::sregex_iterator(input.begin(), input.end(), outer_regex);
+    auto outer_end = std::sregex_iterator();
+
+    for (std::sregex_iterator i = outer_begin; i != outer_end; ++i)
+    {
+        std::smatch match = *i;
+        std::string inner_str = match.str(1);
+        std::vector<int> inner_vec;
+        auto inner_begin = std::sregex_iterator(inner_str.begin(), inner_str.end(), inner_regex);
+        auto inner_end = std::sregex_iterator();
+
+        for (std::sregex_iterator j = inner_begin; j != inner_end; ++j)
+        {
+            std::smatch inner_match = *j;
+            inner_vec.push_back(std::stoi(inner_match.str()));
+        }
+        result.push_back(inner_vec);
+    }
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -1692,6 +1728,8 @@ int main(int argc, char* argv[])
     options.add_options()("gpu_weights_percent",
         "Specify the percentage of weights that reside on GPU (from 0.0 to 1.0).",
         cxxopts::value<float>()->default_value("1.0"));
+    options.add_options()(
+        "medusa_choices", "Medusa choices in the format of [[0], [0, 1], [0, 0, 1]]", cxxopts::value<std::string>());
 
     auto result = options.parse(argc, argv);
 
@@ -1822,6 +1860,12 @@ int main(int argc, char* argv[])
 
     // Argument: If offloaded blocks should be onboarded to primary memory before they are reused.
     benchmarkParams.kvOnboardBlocks = !result["kv_dont_onboard_blocks"].as<bool>();
+
+    // Argument: Medusa choices for the Medusa speculative decoding.
+    if (result.count("medusa_choices"))
+    {
+        benchmarkParams.medusaChoices = parseVectorOfVectors(result["medusa_choices"].as<std::string>());
+    }
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

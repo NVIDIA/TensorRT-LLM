@@ -398,9 +398,9 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             max_batch_size,
             max_input_len,
             max_seq_len,
+            max_num_tokens,
             use_cache,
             max_beam_width: int = 1,
-            max_num_tokens: int = None,
             opt_num_tokens: int = None,
             opt_batch_size: int = 0,
             prompt_embedding_table_size: int = 0,
@@ -434,44 +434,20 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
         self.gather_context_logits = gather_context_logits
         mapping = self.config.mapping
 
-        default_range = GenerationMixin.default_range
-        batch_range = default_range(max_batch_size)
-        bbd_range = [
-            batch_range[i] * ((max_draft_len + 1) if i != 0 else 1)
-            for i in range(len(batch_range))
-        ]
-        inlen_range_cxt = default_range(max_input_len)
-        inlen_range_gen = [1, 1, max_draft_len + 1]
-
         # basic inputs
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
-        if max_num_tokens is None:
-            max_num_tokens = max(
-                max_input_len * max_batch_size,
-                max_beam_width * (max_draft_len + 1) * max_batch_size)
-        if enable_ctx_gen_opt_profiles:
-            num_profiles = 2
-            inlen_range = [inlen_range_cxt, inlen_range_gen]
-            num_tokens_range_ctx = default_range(max_num_tokens)
-            num_tokens_range_gen = default_range(
-                max_batch_size * (max_draft_len + 1) * max_beam_width)
-            num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
-            position_ids_inlen_range = [inlen_range_cxt, [1, 1, 1]]
-        else:
-            max_bs_x_max_bw = max_batch_size * max_beam_width
-            if opt_num_tokens is None:
-                opt_num_tokens = max_bs_x_max_bw
-            if multiple_profiles:
-                num_tokens_range = GenerationMixin.split_num_tokens_range(
-                    max_num_tokens)
-            else:
-                num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
-            num_profiles = len(num_tokens_range)
-            inlen_range = [[1, 1, max_input_len]] * num_profiles
-            position_ids_inlen_range = [[1, 1, max_input_len]] * num_profiles
-        bb_range = [batch_range] * num_profiles
+        num_profiles, ranges = GenerationMixin.get_profiles_ranges(
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_num_tokens=max_num_tokens,
+            max_draft_len=max_draft_len,
+            opt_batch_size=opt_batch_size,
+            opt_num_tokens=opt_num_tokens,
+            enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
+            multiple_profiles=multiple_profiles)
 
         if remove_input_padding:
             assert use_mamba_conv1d_plugin, "mamba_conv1d_plugin is needed to support remove_input_padding"
@@ -479,14 +455,14 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                                dtype=trt.int32,
                                shape=[-1],
                                dim_range=OrderedDict([
-                                   ('num_tokens', num_tokens_range),
+                                   ('num_tokens', ranges['num_tokens_range']),
                                ]))
             position_ids = Tensor(name='position_ids',
                                   dtype=trt.int32,
                                   shape=[-1],
                                   dim_range=OrderedDict([
                                       ('position_ids_num_tokens_range',
-                                       num_tokens_range),
+                                       ranges['num_tokens_range']),
                                   ]))
         else:
             input_ids = Tensor(name='input_ids',
@@ -494,16 +470,17 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                                shape=[-1, -1],
                                dim_range=OrderedDict([
                                    ('batch_size_beam_width',
-                                    [batch_range] * num_profiles),
-                                   ('input_len', inlen_range),
+                                    ranges['bb_range']),
+                                   ('input_len', ranges['inlen_range']),
                                ]))
             position_ids = Tensor(name='position_ids',
                                   dtype=trt.int32,
                                   shape=[-1, -1],
                                   dim_range=OrderedDict([
-                                      ('batch_size_beam_width', bb_range),
+                                      ('batch_size_beam_width',
+                                       ranges['bb_range']),
                                       ('position_ids_inlen_range',
-                                       position_ids_inlen_range),
+                                       ranges['position_ids_inlen_range']),
                                   ]))
         if use_custom_all_reduce and mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
@@ -559,7 +536,8 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 name='host_request_types',
                 dtype=trt.int32,
                 shape=[-1],
-                dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
+                dim_range=OrderedDict([('batch_size_beam_width',
+                                        ranges['bb_range'])]),
             )
 
         last_token_ids = Tensor(
@@ -567,7 +545,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             dtype=trt.int32,
             shape=[-1],
             dim_range=OrderedDict([
-                ('batch_size_last_token_ids', [bbd_range] * num_profiles),
+                ('batch_size_last_token_ids', ranges['bbd_range']),
             ]),
         )
         last_token_ids_for_logits = None
@@ -581,7 +559,8 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 name='host_context_lengths',
                 dtype=trt.int32,
                 shape=[-1],
-                dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
+                dim_range=OrderedDict([('batch_size_beam_width',
+                                        ranges['bb_range'])]),
             )
         else:
             host_context_lengths = None

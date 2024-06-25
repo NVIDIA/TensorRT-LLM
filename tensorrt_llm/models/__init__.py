@@ -40,7 +40,6 @@ from .modeling_utils import (PretrainedConfig, PretrainedModel,
 from .mpt.model import MPTForCausalLM, MPTModel
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
-from .phi3.phi3small.model import Phi3SmallForCausalLM, Phi3SmallModel
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
@@ -70,10 +69,8 @@ __all__ = [
     'GPTNeoXForCausalLM',
     'PhiModel',
     'Phi3Model',
-    'Phi3SmallModel',
     'PhiForCausalLM',
     'Phi3ForCausalLM',
-    'Phi3SmallForCausalLM',
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',
@@ -103,7 +100,7 @@ MODEL_MAP = {
     'FalconForCausalLM': FalconForCausalLM,
     'PhiForCausalLM': PhiForCausalLM,
     'Phi3ForCausalLM': Phi3ForCausalLM,
-    'Phi3SmallForCausalLM': Phi3SmallForCausalLM,
+    'Phi3SmallForCausalLM': Phi3ForCausalLM,
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,

@@ -62,6 +62,80 @@ class GenerationMixin:
             [split_point[-1], max_num_tokens, max_num_tokens])
         return num_tokens_ranges
 
+    @staticmethod
+    def get_profiles_ranges(
+        *,
+        max_batch_size,
+        max_beam_width,
+        max_input_len,
+        max_num_tokens,
+        max_draft_len,
+        opt_batch_size,
+        opt_num_tokens,
+        enable_ctx_gen_opt_profiles,
+        multiple_profiles,
+    ):
+        default_range = GenerationMixin.default_range
+        if opt_batch_size:
+            bb_range_cxt = [1, opt_batch_size, max_batch_size]
+            bb_range_gen = [
+                1, opt_batch_size * max_beam_width,
+                max_batch_size * max_beam_width
+            ]
+        else:
+            bb_range_cxt = default_range(max_batch_size)
+            bb_range_gen = default_range(max_batch_size * max_beam_width)
+        tokens_per_engine_step = max_draft_len + 1
+        tokens_per_engine_step_range = [
+            1, tokens_per_engine_step, tokens_per_engine_step
+        ]
+        bbd_range_ctx = [
+            bb_range_cxt[i] * (tokens_per_engine_step if i != 0 else 1)
+            for i in range(len(bb_range_cxt))
+        ]
+        bbd_range_gen = [
+            bb_range_gen[i] * (tokens_per_engine_step if i != 0 else 1)
+            for i in range(len(bb_range_gen))
+        ]
+        inlen_range_cxt = default_range(max_input_len)
+        inlen_range_gen = [1, 1, tokens_per_engine_step]
+        if enable_ctx_gen_opt_profiles:
+            num_profiles = 2
+            bb_range = [bb_range_cxt, bb_range_gen]
+            bbd_range = [bbd_range_ctx, bbd_range_gen]
+            inlen_range = [inlen_range_cxt, inlen_range_gen]
+            position_ids_inlen_range = [inlen_range_cxt, [1, 1, 1]]
+            num_tokens_range_ctx = default_range(max_batch_size * max_input_len)
+            # Draft tokens cannot be combined with beam search
+            num_tokens_range_gen = default_range(
+                max_batch_size * max(tokens_per_engine_step, max_beam_width))
+            num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
+        else:
+            if multiple_profiles:
+                num_tokens_range = GenerationMixin.split_num_tokens_range(
+                    max_num_tokens)
+            else:
+                if opt_num_tokens is None:
+                    opt_num_tokens = min(max_num_tokens,
+                                         max_batch_size * max_beam_width)
+                num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
+            num_profiles = len(num_tokens_range)
+            bb_range = [bb_range_gen] * num_profiles
+            bbd_range = [bbd_range_gen] * num_profiles
+            inlen_range = [[1, 1, max_input_len]] * num_profiles
+            position_ids_inlen_range = [[1, 1, max_input_len]] * num_profiles
+        tokens_per_engine_step_range = [tokens_per_engine_step_range
+                                        ] * num_profiles
+        ranges = {
+            'bb_range': bb_range,
+            'bbd_range': bbd_range,
+            'inlen_range': inlen_range,
+            'position_ids_inlen_range': position_ids_inlen_range,
+            'num_tokens_range': num_tokens_range,
+            'tokens_per_engine_step_range': tokens_per_engine_step_range,
+        }
+        return num_profiles, ranges
+
     def prepare_attention_inputs(self,
                                  *,
                                  max_batch_size,
@@ -343,61 +417,26 @@ class GenerationMixin:
             streamingllm: bool = False,
             opt_batch_size=None):
 
-        default_range = GenerationMixin.default_range
-        tokens_per_engine_step = max_draft_len + 1
-        tokens_per_engine_step_range = [
-            1, tokens_per_engine_step, tokens_per_engine_step
-        ]
-        if opt_batch_size:
-            bb_range_cxt = [1, opt_batch_size, max_batch_size]
-            bb_range_gen = [
-                1, opt_batch_size * max_beam_width,
-                max_batch_size * max_beam_width
-            ]
-        else:
-            bb_range_cxt = default_range(max_batch_size)
-            bb_range_gen = default_range(max_batch_size * max_beam_width)
-        bbd_range_ctx = [
-            bb_range_cxt[i] * (tokens_per_engine_step if i != 0 else 1)
-            for i in range(len(bb_range_cxt))
-        ]
-        bbd_range_gen = [
-            bb_range_gen[i] * (tokens_per_engine_step if i != 0 else 1)
-            for i in range(len(bb_range_gen))
-        ]
-        inlen_range_cxt = default_range(max_input_len)
-        inlen_range_gen = [1, 1, tokens_per_engine_step]
-
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
             paged_kv_cache)
-        if enable_ctx_gen_opt_profiles:
-            num_profiles = 2
-            bb_range = [bb_range_cxt, bb_range_gen]
-            bbd_range = [bbd_range_ctx, bbd_range_gen]
-            inlen_range = [inlen_range_cxt, inlen_range_gen]
-            position_ids_inlen_range = [inlen_range_cxt, [1, 1, 1]]
-            num_tokens_range_ctx = default_range(max_batch_size * max_input_len)
-            # Draft tokens cannot be combined with beam search
-            num_tokens_range_gen = default_range(
-                max_batch_size * max(tokens_per_engine_step, max_beam_width))
-            num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
-        else:
-            if multiple_profiles:
-                num_tokens_range = GenerationMixin.split_num_tokens_range(
-                    max_num_tokens)
-            else:
-                if opt_num_tokens is None:
-                    opt_num_tokens = min(max_num_tokens,
-                                         max_batch_size * max_beam_width)
-                num_tokens_range = [[1, opt_num_tokens, max_num_tokens]]
-            num_profiles = len(num_tokens_range)
-            bb_range = [bb_range_gen] * num_profiles
-            bbd_range = [bbd_range_gen] * num_profiles
-            inlen_range = [[1, 1, max_input_len]] * num_profiles
-            position_ids_inlen_range = [[1, 1, max_input_len]] * num_profiles
-        tokens_per_engine_step_range = [tokens_per_engine_step_range
-                                        ] * num_profiles
+
+        num_profiles, ranges = GenerationMixin.get_profiles_ranges(
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
+            max_num_tokens=max_num_tokens,
+            max_draft_len=max_draft_len,
+            opt_batch_size=opt_batch_size,
+            opt_num_tokens=opt_num_tokens,
+            enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
+            multiple_profiles=multiple_profiles)
+        bb_range = ranges['bb_range']
+        bbd_range = ranges['bbd_range']
+        inlen_range = ranges['inlen_range']
+        num_tokens_range = ranges['num_tokens_range']
+        position_ids_inlen_range = ranges['position_ids_inlen_range']
+        tokens_per_engine_step_range = ranges['tokens_per_engine_step_range']
         position_ids_num_tokens_range = num_tokens_range
 
         input_ids = None
@@ -597,12 +636,13 @@ class GenerationMixin:
         spec_decoding_params = None
         # Use positional offsets and packed mask only when not in SpS spec decoding
         if speculative_decoding_draft_tokens_external == False and max_draft_len > 0:
+            tokens_per_engine_step = max_draft_len + 1
             # 32 bits packed mask aligned.
             num_packed_masks = (tokens_per_engine_step + 32 - 1) // 32
             packed_mask_len_range = [[0, 1, num_packed_masks]] * num_profiles
             # total number of spec decoding tokens for all sequences (sequence length can be variable).
             num_gen_tokens_range = [
-                default_range(
+                GenerationMixin.default_range(
                     max_batch_size * max_beam_width * tokens_per_engine_step,
                     min_range=0)
             ] * num_profiles

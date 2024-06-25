@@ -80,7 +80,7 @@ test_gptq() {
     python convert_checkpoint.py --model_dir ${MODEL} \
                                  --output_dir ./tllm_checkpoint/2gpu_gptq \
                                  --dtype float16 \
-                                 --modelopt_quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
+                                 --quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \

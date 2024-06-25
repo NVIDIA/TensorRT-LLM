@@ -247,7 +247,7 @@ def main(args):
 
     model_name, model_version = read_model_name(
         args.engine_dir) if not is_enc_dec else ("", "")
-    if args.tokenizer_dir is None:
+    if args.tokenizer_dir is None and model_name in DEFAULT_HF_MODEL_DIRS:
         logger.warning(
             "tokenizer_dir is not specified. Try to infer from model_name, but this may be incorrect."
         )

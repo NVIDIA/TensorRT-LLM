@@ -13,6 +13,7 @@ For more info about Medusa visit [speculative decoding documentation](../../docs
   * GPU Compute Capability >= 8.0 (Ampere or newer)
   * FP16
   * BF16
+  * FP8 (base model)
   * PAGED_KV_CACHE
   * Tensor Parallel
 
@@ -32,7 +33,7 @@ https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3
 ```
 
 We use `convert_checkpoint.py` script to convert the model for Medusa decoding into TensorRT-LLM checkpoint format.
-Here we also add `--fixed_num_medusa_heads 4` as `medusa_num_heads` is 2 in `config.json` of `medusa-vicuna-7b-v1.3` but it actually has 4.
+We could use `--num_medusa_heads` to set the number of medusa heads that we want to use. If not, `num_medusa_heads` will be set according to the `medusa_num_heads` from medusa weights' `config.json`.
 
 Here is the example:
 ```bash
@@ -41,20 +42,21 @@ python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                             --medusa_model_dir medusa-vicuna-7b-v1.3 \
                             --output_dir ./tllm_checkpoint_1gpu_medusa \
                             --dtype float16 \
-                            --fixed_num_medusa_heads 4
+                            --num_medusa_heads 4
 
+# Note: Increasing the batch size may have a negative impact on performance
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --speculative_decoding_mode medusa \
-             --max_batch_size 8
+             --max_batch_size 4
 
 # Convert and Build Medusa decoding support for vicuna-13b-v1.3 with 4-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                             --medusa_model_dir medusa-vicuna-7b-v1.3 \
                             --output_dir ./tllm_checkpoint_1gpu_medusa \
                             --dtype float16 \
-                            --fixed_num_medusa_heads 4 \
+                            --num_medusa_heads 4 \
                             --tp_size 4 \
                             --workers 4
 
@@ -62,7 +64,30 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --output_dir ./tmp/medusa/7B/trt_engines/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --speculative_decoding_mode medusa \
-             --max_batch_size 8
+             --max_batch_size 4
+```
+
+### FP8 Post-Training Quantization for Base Model
+The example below quantizes the base model to FP8, while keeping the weight of the medusa head non-quantize.
+```bash
+# Quantize base model into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir /path/to/base-model-hf/ \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_base_model_fp8_medusa_fp16 \
+                                   --calib_size 512 \
+                                   --tp_size 1 \
+                                   --medusa_model_dir /path/to/medusa_head/ \
+                                   --num_medusa_heads 4
+
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_base_model_fp8_medusa_fp16 \
+         --output_dir ./trt_engine_1gpu_base_model_fp8_medusa_fp16 \
+         --gemm_plugin float16 \
+         --gpt_attention_plugin float16 \
+         --speculative_decoding_mode medusa \
+         --max_batch_size 4
 ```
 
 ### Run

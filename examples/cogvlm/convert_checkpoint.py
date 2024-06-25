@@ -119,7 +119,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--modelopt_quant_ckpt_path',
+        '--quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
@@ -438,7 +438,7 @@ def main():
 
         if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
             weights = load_weights_from_gptq(
-                args.modelopt_quant_ckpt_path,
+                args.quant_ckpt_path,
                 PretrainedConfig.from_dict(copy.deepcopy(config)),
             )
 

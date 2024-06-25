@@ -15,10 +15,6 @@
 
 import torch
 
-from tensorrt_llm.quantization import QuantAlgo
-
-from ...._utils import str_dtype_to_torch
-
 
 def shuffle_qkv_weights(weights, config):
     # Input weights are organized as
@@ -29,8 +25,7 @@ def shuffle_qkv_weights(weights, config):
     # (q00, q01, ..., qnm), (k0, k1, .., kn), (v0, v1, .., vn)
 
     num_heads = config['num_attention_heads']
-    num_kv_heads = config['num_kv_heads'] if 'num_kv_heads' in config.keys(
-    ) else config['num_key_value_heads']
+    num_kv_heads = config['num_key_value_heads']
     num_q_per_kv = num_heads // num_kv_heads
 
     hidden_size = config['hidden_size']
@@ -152,7 +147,7 @@ def get_tllm_linear_weight(weight,
 
 def split_weights_tp(config, weights, args, rank, dtype):
     num_heads = config['num_attention_heads']
-    num_kv_heads = config['num_kv_heads']
+    num_kv_heads = config['num_key_value_heads']
     hidden_size = config['hidden_size']
 
     mha_mode = num_heads == num_kv_heads
@@ -228,96 +223,3 @@ def split_weights_tp(config, weights, args, rank, dtype):
                                                 dim=0)
 
     return weights
-
-
-def convert_hf_weights(hf_model, config, args, rank):
-    torch_dtype = str_dtype_to_torch(args.dtype)
-    hf_state_dict = hf_model.state_dict()
-    weights = {}
-
-    # replace key name
-    for key, value in hf_state_dict.items():
-        # Decoder Layers
-        if "model.layers." in key:
-            key = key.replace("model.layers.", "transformer.layers.")
-            key = key.replace("self_attn.", "attention.")
-            key = key.replace("query_key_value.", "qkv.")
-            key = key.replace("mlp.up_proj.", "mlp.fc.")
-            key = key.replace("mlp.down_proj.", "mlp.proj.")
-            key = key.replace("post_attention_layernorm.", "post_layernorm.")
-        # Embedding
-        key = key.replace("model.embed_tokens.weight",
-                          "transformer.vocab_embedding.weight")
-        # Final Layer norm
-        key = key.replace("model.final_layernorm.", "transformer.ln_f.")
-        weights[key] = value.to(torch_dtype).cpu()
-
-    weights['lm_head.weight'] = weights[
-        'transformer.vocab_embedding.weight'].clone()
-
-    # Transform QKV weights from custom Phi3Small format to TRT-LLM format
-    for key, value in weights.items():
-        if "qkv." in key:
-            weights[key] = shuffle_qkv_weights(weights[key], config)
-
-    weights = split_weights_tp(config, weights, args, rank, torch_dtype)
-
-    return weights
-
-
-def convert_hf_config(hf_config, dtype, args):
-    config = {
-        'architecture': 'Phi3SmallForCausalLM',
-        'dtype': dtype,
-        'num_hidden_layers': hf_config.num_hidden_layers,
-        'num_attention_heads': hf_config.num_attention_heads,
-        'num_kv_heads': hf_config.num_key_value_heads,
-        'rotary_embedding_base': hf_config.rope_embedding_base,
-        'hidden_size': hf_config.hidden_size,
-        'intermediate_size': hf_config.intermediate_size,
-        'vocab_size': hf_config.vocab_size,
-        'max_position_embeddings': hf_config.max_position_embeddings,
-        'hidden_act': hf_config.hidden_act,
-        'share_embedding_table': False,
-        'gegelu_limit': hf_config.gegelu_limit,
-        'mup_attn_multiplier': hf_config.mup_attn_multiplier,
-        'mup_embedding_multiplier': hf_config.mup_embedding_multiplier,
-        'mup_use_scaling': hf_config.mup_use_scaling,
-        'mup_width_multiplier': hf_config.mup_width_multiplier,
-        'blocksparse_block_size': hf_config.blocksparse_block_size,
-        'blocksparse_homo_head_pattern':
-        hf_config.blocksparse_homo_head_pattern,
-        'blocksparse_num_local_blocks': hf_config.blocksparse_num_local_blocks,
-        'blocksparse_vertical_stride': hf_config.blocksparse_vert_stride,
-        'dense_attention_every_n_layers':
-        hf_config.dense_attention_every_n_layers,
-    }
-
-    if args is not None:
-        config.update({
-            'mapping': {
-                'world_size': args.tp_size * args.pp_size,
-                'tp_size': args.tp_size,
-                'pp_size': args.pp_size,
-            }
-        })
-
-        if args.use_weight_only and args.weight_only_precision == 'int8':
-            config.update({'quantization': {'quant_algo': QuantAlgo.W8A16}})
-        elif args.use_weight_only and args.weight_only_precision == 'int4':
-            config.update({'quantization': {'quant_algo': QuantAlgo.W4A16}})
-
-    if hf_config.max_position_embeddings >= 128000:
-        config.update({
-            'original_max_position_embeddings':
-            hf_config.original_max_position_embeddings,
-            'longrope_scaling_short_factors':
-            hf_config.rope_scaling["short_factor"],
-            'longrope_scaling_long_factors':
-            hf_config.rope_scaling["long_factor"],
-            'longrope_long_mscale':
-            hf_config.rope_scaling["long_mscale"],
-            'longrope_short_mscale':
-            hf_config.rope_scaling["short_mscale"]
-        })
-    return config

@@ -363,11 +363,13 @@ def main():
 
     if args.test_trt_llm:
         assert not args.test_hf, "Cannot test both TRT-LLM and HF"
-        runner_cls = ModelRunner if (args.debug_mode
-                                     or not PYTHON_BINDINGS) else ModelRunnerCpp
+        runner_cls = ModelRunner if not PYTHON_BINDINGS else ModelRunnerCpp
+        runner_kwargs = {}
+        if PYTHON_BINDINGS:
+            runner_kwargs.update(max_beam_width=1)
         model = runner_cls.from_dir(args.engine_dir,
                                     rank=runtime_rank,
-                                    debug_mode=args.debug_mode)
+                                    **runner_kwargs)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
         if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':

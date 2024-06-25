@@ -424,7 +424,8 @@ std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType>:
 template <typename T, typename WeightType>
 bool MoeGemmRunner<T, WeightType>::isHopperSpecialised() const
 {
-    bool config_is_sm90 = best_config_ && best_config_->is_sm90;
+    TLLM_CHECK_WITH_INFO(best_config_, "Cannot determine if hopper is specialised without a selected config");
+    bool config_is_sm90 = best_config_->is_sm90;
     return supportsHopperSpecialisation() && config_is_sm90;
 }
 
@@ -440,7 +441,7 @@ int MoeGemmRunner<T, WeightType>::getSM() const
     return this->sm_;
 }
 
-// currently support sm80 bf16/fp16 gate ativation, only set predication tensor for m direction
+// currently support sm80 bf16/fp16 gate activation, only set predication tensor for m direction
 template <typename T, typename WeightType>
 bool MoeGemmRunner<T, WeightType>::isFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const
 {

@@ -27,6 +27,10 @@ from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..quantization import QuantMode
+from ..quantization.layers import (WeightOnlyGroupwiseQuantLinear,
+                                   WeightOnlyGroupwiseQuantRowLinear,
+                                   WeightOnlyQuantLinear,
+                                   WeightOnlyQuantRowLinear)
 from ..quantization.mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..top_model_mixin import TopModelMixin
 from .convert_utils import weight_only_quantize_dict
@@ -841,7 +845,8 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
                 continue
             qkv_params = get_init_params(layer.qkv, ColumnLinear)
             qkv_params["bias"] = qkv_params["bias"] is not None
-            qkv_params["strict_dtype"] = qkv_params["strict_dtype"] is not None
+            qkv_params["strict_dtype"] = qkv_params.get(
+                "strict_dtype") is not None
             q = ColumnLinear(
                 **{
                     **qkv_params,
@@ -866,20 +871,34 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
             q = quantize(q, model.config.quantization)
             k = quantize(k, model.config.quantization)
             v = quantize(v, model.config.quantization)
+            out_features = q.out_features + k.out_features + v.out_features
+            if isinstance(layer.qkv, (
+                    WeightOnlyQuantLinear,
+                    WeightOnlyQuantRowLinear,
+                    WeightOnlyGroupwiseQuantLinear,
+                    WeightOnlyGroupwiseQuantRowLinear,
+            )):
+                out_dim = 1
+            else:
+                out_dim = 0
             if layer.qkv.weight.is_inited():
                 qkv_weight = layer.qkv.weight.raw_value
                 weights = np.split(qkv_weight, [
-                    q.out_features,
-                    q.out_features + k.out_features,
-                ])
+                    qkv_weight.shape[out_dim] * q.out_features // out_features,
+                    qkv_weight.shape[out_dim] *
+                    (q.out_features + k.out_features) // out_features,
+                ],
+                                   axis=out_dim)
                 for gemm, weight in zip([q, k, v], weights):
                     gemm.weight.value = weight
             if layer.qkv.bias is not None and layer.qkv.bias.is_inited():
                 qkv_bias = layer.qkv.bias.raw_value
                 biases = np.split(qkv_bias, [
-                    q.out_features,
-                    q.out_features + k.out_features,
-                ])
+                    qkv_bias.shape[out_dim] * q.out_features // out_features,
+                    qkv_bias.shape[out_dim] *
+                    (q.out_features + k.out_features) // out_features,
+                ],
+                                  axis=out_dim)
                 for gemm, bias in zip([q, k, v], biases):
                     gemm.bias.value = bias
             for name, parameter in layer.qkv._parameters.items():

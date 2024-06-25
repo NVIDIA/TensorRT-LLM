@@ -84,10 +84,12 @@ class TestMamba(unittest.TestCase):
             hf_config, hf_path, hf_mamba, load_mode, dtype)
         with net_guard(network):
             network.set_named_parameters(tensorrt_llm_mamba.named_parameters())
-            inputs = tensorrt_llm_mamba.prepare_inputs(batch_size,
-                                                       input_len,
-                                                       input_len + output_len,
-                                                       use_cache=False)
+            inputs = tensorrt_llm_mamba.prepare_inputs(
+                batch_size,
+                input_len,
+                input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=False)
             # Prepare
             tensorrt_llm_mamba(**inputs)
         return network

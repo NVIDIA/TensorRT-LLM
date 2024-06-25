@@ -23,10 +23,11 @@ All published functionality in the Release Notes has been fully tested and verif
 - TBD
 
 ### Infrastructure changes
-  - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.04-py3`.
-  - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.04-py3`.
+  - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.05-py3`.
+  - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.05-py3`.
+  - The dependent TensorRT version is updated to 10.1.0.
   - The dependent CUDA version is updated to 12.4.1.
-  - The dependent PyTorch version is updated to 2.3.0.
+  - The dependent PyTorch version is updated to 2.3.1.
 
 
 ## TensorRT-LLM Release 0.10.0

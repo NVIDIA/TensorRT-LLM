@@ -431,7 +431,8 @@ void InitBindings(pybind11::module_& m)
             &tle::DecodingConfig::setLookaheadDecoding)
         .def_property("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices);
 
-    auto executorConfigGetState = [&](tle::ExecutorConfig const& self)
+    auto executorConfigGetState = [&peftCacheConfigGetstate, &kvCacheConfigGetstate, &schedulerConfigGetstate,
+                                      &parallelConfigGetstate](tle::ExecutorConfig const& self)
     {
         py::object peftCacheConfigState = py::none();
 
@@ -453,7 +454,8 @@ void InitBindings(pybind11::module_& m)
             peftCacheConfigState, self.getLogitsPostProcessorMap(), self.getLogitsPostProcessorBatched(),
             self.getDecodingConfig(), self.getGpuWeightsPercent());
     };
-    auto executorConfigSetState = [&](py::tuple state)
+    auto executorConfigSetState = [&kvCacheConfigSetstate, &peftCacheConfigSetstate, &schedulerConfigSetstate,
+                                      &parallelConfigSetstate](py::tuple state)
     {
         if (state.size() != 15)
         {
