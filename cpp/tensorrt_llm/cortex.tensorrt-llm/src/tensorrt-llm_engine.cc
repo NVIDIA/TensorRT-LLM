@@ -16,6 +16,7 @@
 #include <thread>
 #include <trantor/utils/Logger.h>
 #include <vector>
+#include <chrono>
 
 using json = nlohmann::json;
 using namespace tensorrtllm;
@@ -346,7 +347,8 @@ void TensorrtllmEngine::LoadModel(std::shared_ptr<Json::Value> json_body, std::f
     Json::Value status_resp;
     status_resp["status_code"] = k200OK;
     callback(std::move(status_resp), std::move(json_resp));
-    return;
+    start_time_ = std::chrono::system_clock::now().time_since_epoch() /
+      std::chrono::milliseconds(1);
 };
 
 void TensorrtllmEngine::UnloadModel(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
