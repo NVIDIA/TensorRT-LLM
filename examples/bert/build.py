@@ -103,7 +103,7 @@ def parse_arguments():
                             'RobertaForQuestionAnswering',
                             'RobertaForSequenceClassification',
                         ])
-    parser.add_argument('--model_dir', type=str, required=True)
+    parser.add_argument('--model_dir', type=str, default=None)
     return parser.parse_args()
 
 def prepare_inputs():
@@ -279,9 +279,11 @@ if __name__ == '__main__':
         )
         output_name = 'logits'
     elif args.model == 'BertForSequenceClassification' or args.model == 'RobertaForSequenceClassification':
-        hf_bert = globals()[f'{model_type}ForSequenceClassification'](config=bert_config)
-        state_dict = torch.load(os.path.join(args.model_dir, "pytorch_model.bin"))
-        hf_bert.load_state_dict(state_dict, strict=False)
+        hf_bert = globals()[f'{model_type}ForSequenceClassification'](
+            bert_config).cuda().to(torch_dtype).eval()
+        if args.model_dir:
+            state_dict = torch.load(os.path.join(args.model_dir, "pytorch_model.bin"))
+            hf_bert.load_state_dict(state_dict, strict=False)
         
         tensorrt_llm_bert = tensorrt_llm.models.BertForSequenceClassification(
             num_layers=bert_config.num_hidden_layers,
