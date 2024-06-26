@@ -105,25 +105,35 @@ def _transpose_for_scores(tensor, heads):
 
 
 def _attention(query, key, value, scale):
-    attention_scores = matmul(query, key.transpose(-1, -2))
-    attention_scores = attention_scores * scale
+    # Multiply scale first to avoid overflow
+    # Do not use use_fp32_acc or it will be very slow
+    attention_scores = matmul(query * math.sqrt(scale),
+                              key.transpose(-1, -2) * math.sqrt(scale),
+                              use_fp32_acc=False)
     attention_probs = softmax(attention_scores, dim=-1)
-    hidden_states = matmul(attention_probs, value)
+    hidden_states = matmul(attention_probs, value, use_fp32_acc=False)
     hidden_states = hidden_states.permute([0, 2, 1, 3])
     return hidden_states
 
 
 class SelfAttention(Module):
 
-    def __init__(self, query_dim: int, heads: int = 8, dim_head: int = 64):
+    def __init__(self,
+                 query_dim: int,
+                 heads: int = 8,
+                 dim_head: int = 64,
+                 dtype=None):
         super().__init__()
         self.inner_dim = dim_head * heads
         self.scale = dim_head**-0.5
         self.heads = heads
         self._slice_size = None
 
-        self.to_qkv = Linear(query_dim, 3 * self.inner_dim, bias=False)
-        self.to_out = Linear(self.inner_dim, query_dim)
+        self.to_qkv = Linear(query_dim,
+                             3 * self.inner_dim,
+                             bias=False,
+                             dtype=dtype)
+        self.to_out = Linear(self.inner_dim, query_dim, dtype=dtype)
 
     def forward(self, hidden_states, mask=None):
         assert not hidden_states.is_dynamic()
@@ -148,7 +158,8 @@ class CrossAttention(Module):
                  query_dim: int,
                  context_dim: Optional[int] = None,
                  heads: int = 8,
-                 dim_head: int = 64):
+                 dim_head: int = 64,
+                 dtype=None):
         super().__init__()
         self.inner_dim = dim_head * heads
         context_dim = context_dim if context_dim is not None else query_dim
@@ -156,9 +167,12 @@ class CrossAttention(Module):
         self.heads = heads
         self._slice_size = None
 
-        self.to_q = Linear(query_dim, self.inner_dim, bias=False)
-        self.to_kv = Linear(context_dim, 2 * self.inner_dim, bias=False)
-        self.to_out = Linear(self.inner_dim, query_dim)
+        self.to_q = Linear(query_dim, self.inner_dim, bias=False, dtype=dtype)
+        self.to_kv = Linear(context_dim,
+                            2 * self.inner_dim,
+                            bias=False,
+                            dtype=dtype)
+        self.to_out = Linear(self.inner_dim, query_dim, dtype=dtype)
 
     def forward(self, hidden_states, context=None, mask=None):
         assert not hidden_states.is_dynamic()
@@ -182,12 +196,16 @@ class CrossAttention(Module):
 
 class FeedForward(Module):
 
-    def __init__(self, dim: int, dim_out: Optional[int] = None, mult: int = 4):
+    def __init__(self,
+                 dim: int,
+                 dim_out: Optional[int] = None,
+                 mult: int = 4,
+                 dtype=None):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
-        self.proj_in = Linear(dim, inner_dim * 2)
-        self.proj_out = Linear(inner_dim, dim_out)
+        self.proj_in = Linear(dim, inner_dim * 2, dtype=dtype)
+        self.proj_out = Linear(inner_dim, dim_out, dtype=dtype)
 
     def forward(self, hidden_states):
         x = self.proj_in(hidden_states)
@@ -203,20 +221,23 @@ class BasicTransformerBlock(Module):
         n_heads: int,
         d_head: int,
         context_dim: Optional[int] = None,
+        dtype=None,
     ):
         super().__init__()
         self.attn1 = SelfAttention(query_dim=dim,
                                    heads=n_heads,
-                                   dim_head=d_head)  # is a self-attention
-        self.ff = FeedForward(dim)
+                                   dim_head=d_head,
+                                   dtype=dtype)  # is a self-attention
+        self.ff = FeedForward(dim, dtype=dtype)
         self.attn2 = CrossAttention(
             query_dim=dim,
             context_dim=context_dim,
             heads=n_heads,
-            dim_head=d_head)  # is self-attn if context is none
-        self.norm1 = LayerNorm(dim)
-        self.norm2 = LayerNorm(dim)
-        self.norm3 = LayerNorm(dim)
+            dim_head=d_head,
+            dtype=dtype)  # is self-attn if context is none
+        self.norm1 = LayerNorm(dim, dtype=dtype)
+        self.norm2 = LayerNorm(dim, dtype=dtype)
+        self.norm3 = LayerNorm(dim, dtype=dtype)
 
     def forward(self, hidden_states, context=None):
         hidden_states = self.attn1(self.norm1(hidden_states)) + hidden_states
@@ -236,8 +257,11 @@ class Transformer2DModel(Module):
         num_layers: int = 1,
         norm_num_groups: int = 32,
         cross_attention_dim: Optional[int] = None,
+        use_linear_projection: bool = False,
+        dtype=None,
     ):
         super().__init__()
+        self.use_linear_projection = use_linear_projection
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
@@ -245,39 +269,64 @@ class Transformer2DModel(Module):
         self.norm = GroupNorm(num_groups=norm_num_groups,
                               num_channels=in_channels,
                               eps=1e-6,
-                              affine=True)
+                              affine=True,
+                              dtype=dtype)
 
-        self.proj_in = Conv2d(in_channels,
-                              inner_dim,
-                              kernel_size=(1, 1),
-                              stride=(1, 1),
-                              padding=(0, 0))
+        if use_linear_projection:
+            self.proj_in = Linear(in_channels, inner_dim, dtype=dtype)
+        else:
+            self.proj_in = Conv2d(in_channels,
+                                  inner_dim,
+                                  kernel_size=(1, 1),
+                                  stride=(1, 1),
+                                  padding=(0, 0),
+                                  dtype=dtype)
 
         self.transformer_blocks = ModuleList([
             BasicTransformerBlock(inner_dim,
                                   num_attention_heads,
                                   attention_head_dim,
-                                  context_dim=cross_attention_dim)
-            for d in range(num_layers)
+                                  context_dim=cross_attention_dim,
+                                  dtype=dtype) for d in range(num_layers)
         ])
-        self.proj_out = Conv2d(inner_dim,
-                               in_channels,
-                               kernel_size=(1, 1),
-                               stride=(1, 1),
-                               padding=(0, 0))
+
+        if use_linear_projection:
+            self.proj_out = Linear(inner_dim, in_channels, dtype=dtype)
+        else:
+            self.proj_out = Conv2d(inner_dim,
+                                   in_channels,
+                                   kernel_size=(1, 1),
+                                   stride=(1, 1),
+                                   padding=(0, 0),
+                                   dtype=dtype)
 
     def forward(self, hidden_states, context=None):
         assert not hidden_states.is_dynamic()
         batch, _, height, weight = hidden_states.size()
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.proj_in(hidden_states)
-        inner_dim = hidden_states.size()[1]
-        hidden_states = hidden_states.permute([0, 2, 3, 1]).view(
-            [batch, height * weight, inner_dim])
+
+        if not self.use_linear_projection:
+            hidden_states = self.proj_in(hidden_states)
+            inner_dim = hidden_states.size()[1]
+            hidden_states = hidden_states.permute([0, 2, 3, 1]).view(
+                [batch, height * weight, inner_dim])
+        else:
+            inner_dim = hidden_states.size()[1]
+            hidden_states = hidden_states.permute([0, 2, 3, 1]).view(
+                [batch, height * weight, inner_dim])
+            hidden_states = self.proj_in(hidden_states)
+
         for block in self.transformer_blocks:
             hidden_states = block(hidden_states, context=context)
-        hidden_states = hidden_states.view([batch, height, weight,
-                                            inner_dim]).permute([0, 3, 1, 2])
-        hidden_states = self.proj_out(hidden_states)
+
+        if not self.use_linear_projection:
+            hidden_states = hidden_states.view(
+                [batch, height, weight, inner_dim]).permute([0, 3, 1, 2])
+            hidden_states = self.proj_out(hidden_states)
+        else:
+            hidden_states = self.proj_out(hidden_states)
+            hidden_states = hidden_states.view(
+                [batch, height, weight, inner_dim]).permute([0, 3, 1, 2])
+
         return hidden_states + residual

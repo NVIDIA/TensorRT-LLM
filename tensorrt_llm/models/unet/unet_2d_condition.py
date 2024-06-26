@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...functional import silu
+from typing import Optional
+
+from ...functional import cast, concat, silu
 from ...layers import Conv2d, GroupNorm
 from ...module import Module, ModuleList
 from .embeddings import TimestepEmbedding, Timesteps
@@ -42,27 +44,56 @@ class UNet2DConditionModel(Module):
         norm_num_groups=32,
         norm_eps=1e-5,
         cross_attention_dim=1280,
+        transformer_layers_per_block=1,
         attention_head_dim=8,
+        use_linear_projection=False,
+        addition_embed_type: Optional[str] = None,
+        addition_time_embed_dim: Optional[int] = None,
+        projection_class_embeddings_input_dim: Optional[int] = None,
+        dtype=None,
     ):
         super().__init__()
 
         self.sample_size = sample_size
+        self.addition_embed_type = addition_embed_type
         time_embed_dim = block_out_channels[0] * 4
 
         # input
         self.conv_in = Conv2d(in_channels,
                               block_out_channels[0],
                               kernel_size=(3, 3),
-                              padding=(1, 1))
+                              padding=(1, 1),
+                              dtype=dtype)
         # time
-        self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos,
-                                   freq_shift)
+        self.time_proj = Timesteps(block_out_channels[0],
+                                   flip_sin_to_cos,
+                                   freq_shift,
+                                   dtype=dtype)
         timestep_input_dim = block_out_channels[0]
 
         self.time_embedding = TimestepEmbedding(timestep_input_dim,
-                                                time_embed_dim)
+                                                time_embed_dim,
+                                                dtype=dtype)
+
+        if addition_embed_type == "text_time":
+            self.add_time_proj = Timesteps(addition_time_embed_dim,
+                                           flip_sin_to_cos,
+                                           freq_shift,
+                                           dtype=dtype)
+            self.add_embedding = TimestepEmbedding(
+                projection_class_embeddings_input_dim,
+                time_embed_dim,
+                dtype=dtype)
+
         down_blocks = []
         up_blocks = []
+
+        if isinstance(attention_head_dim, int):
+            attention_head_dim = (attention_head_dim, ) * len(down_block_types)
+
+        if isinstance(transformer_layers_per_block, int):
+            transformer_layers_per_block = [transformer_layers_per_block
+                                            ] * len(down_block_types)
 
         # down
         output_channel = block_out_channels[0]
@@ -74,6 +105,7 @@ class UNet2DConditionModel(Module):
             down_block = get_down_block(
                 down_block_type,
                 num_layers=layers_per_block,
+                transformer_layers_per_block=transformer_layers_per_block[i],
                 in_channels=input_channel,
                 out_channels=output_channel,
                 temb_channels=time_embed_dim,
@@ -81,9 +113,10 @@ class UNet2DConditionModel(Module):
                 resnet_eps=norm_eps,
                 resnet_act_fn=act_fn,
                 cross_attention_dim=cross_attention_dim,
-                attn_num_head_channels=attention_head_dim,
+                attn_num_head_channels=attention_head_dim[i],
                 downsample_padding=downsample_padding,
-            )
+                use_linear_projection=use_linear_projection,
+                dtype=dtype)
             down_blocks.append(down_block)
         self.down_blocks = ModuleList(down_blocks)
         # mid
@@ -93,13 +126,19 @@ class UNet2DConditionModel(Module):
             resnet_eps=norm_eps,
             resnet_act_fn=act_fn,
             output_scale_factor=mid_block_scale_factor,
+            transformer_layers_per_block=transformer_layers_per_block[-1],
             resnet_time_scale_shift="default",
             cross_attention_dim=cross_attention_dim,
-            attn_num_head_channels=attention_head_dim,
+            attn_num_head_channels=attention_head_dim[-1],
             resnet_groups=norm_num_groups,
+            use_linear_projection=use_linear_projection,
+            dtype=dtype,
         )
         # up
         reversed_block_out_channels = list(reversed(block_out_channels))
+        reversed_attention_head_dim = list(reversed(attention_head_dim))
+        reversed_transformer_layers_per_block = list(
+            reversed(transformer_layers_per_block))
         output_channel = reversed_block_out_channels[0]
         for i, up_block_type in enumerate(up_block_types):
             prev_output_channel = output_channel
@@ -113,6 +152,8 @@ class UNet2DConditionModel(Module):
             up_block = get_up_block(
                 up_block_type,
                 num_layers=layers_per_block + 1,
+                transformer_layers_per_block=
+                reversed_transformer_layers_per_block[i],
                 in_channels=input_channel,
                 out_channels=output_channel,
                 prev_output_channel=prev_output_channel,
@@ -121,7 +162,9 @@ class UNet2DConditionModel(Module):
                 resnet_eps=norm_eps,
                 resnet_act_fn=act_fn,
                 cross_attention_dim=cross_attention_dim,
-                attn_num_head_channels=attention_head_dim,
+                attn_num_head_channels=reversed_attention_head_dim[i],
+                use_linear_projection=use_linear_projection,
+                dtype=dtype,
             )
             up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -129,15 +172,34 @@ class UNet2DConditionModel(Module):
         # out
         self.conv_norm_out = GroupNorm(num_channels=block_out_channels[0],
                                        num_groups=norm_num_groups,
-                                       eps=norm_eps)
+                                       eps=norm_eps,
+                                       dtype=dtype)
         self.conv_act = silu
         self.conv_out = Conv2d(block_out_channels[0],
                                out_channels, (3, 3),
-                               padding=(1, 1))
+                               padding=(1, 1),
+                               dtype=dtype)
 
-    def forward(self, sample, timesteps, encoder_hidden_states):
+    def forward(self,
+                sample,
+                timesteps,
+                encoder_hidden_states,
+                text_embeds=None,
+                time_ids=None):
+        # time
         t_emb = self.time_proj(timesteps)
         emb = self.time_embedding(t_emb)
+
+        aug_emb = None
+        if self.addition_embed_type == "text_time":
+            assert text_embeds is not None and time_ids is not None
+            time_embeds = self.add_time_proj(time_ids.view([-1]))
+            time_embeds = time_embeds.view([text_embeds.shape[0], -1])
+            add_embeds = concat([text_embeds, time_embeds], dim=1)
+            add_embeds = cast(add_embeds, emb.dtype)
+            aug_emb = self.add_embedding(add_embeds)
+
+        emb = emb + aug_emb if aug_emb is not None else emb
 
         sample = self.conv_in(sample)
 

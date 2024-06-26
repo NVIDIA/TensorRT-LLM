@@ -132,6 +132,7 @@ class Builder():
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
                               profiling_verbosity: str = "layer_names_only",
+                              precision_constraints: Optional[str] = "obey",
                               use_strip_plan: bool = False,
                               weight_streaming: bool = False,
                               **kwargs) -> BuilderConfig:
@@ -178,16 +179,15 @@ class Builder():
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
             if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
                 config.set_flag(trt.BuilderFlag.INT8)
-
             if fp8:
                 config.set_flag(trt.BuilderFlag.FP8)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+
+        if not fp8 and precision_constraints == 'obey':
+            config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
 
         config.set_preview_feature(trt.PreviewFeature.PROFILE_SHARING_0806,
                                    True)

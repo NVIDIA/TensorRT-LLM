@@ -493,6 +493,12 @@ class Tensor(object):
         '''
         return split(self, split_size_or_sections, dim)
 
+    def select(self, dim, index):
+        '''
+        See functional.select.
+        '''
+        return select(self, dim, index)
+
     def unbind(self, dim=0):
         '''
         See functional.unbind.
@@ -1145,7 +1151,8 @@ def slice(input: Tensor,
           starts: Union[Tensor, Sequence[int]],
           sizes: Union[Tensor, Sequence[int]],
           strides: Union[Tensor, Sequence[int]] = None,
-          mode: trt.SampleMode = None) -> Tensor:
+          mode: trt.SampleMode = None,
+          fill_value: Union[float, Tensor] = None) -> Tensor:
     '''
     Add an operation to extract a slice from a tensor.
 
@@ -1220,6 +1227,9 @@ def slice(input: Tensor,
     if isinstance(strides, Tensor) or strides is None:
         trt_strides = [1 for _ in range(input_ndim)]
 
+    if fill_value is not None and isinstance(fill_value, float):
+        fill_value = constant(fp32_array(fill_value))
+
     layer = default_trtnet().add_slice(input.trt_tensor,
                                        start=trt_starts,
                                        shape=trt_sizes,
@@ -1235,6 +1245,9 @@ def slice(input: Tensor,
 
     if isinstance(strides, Tensor):
         layer.set_input(3, strides.trt_tensor)
+
+    if mode is trt.SampleMode.FILL and isinstance(fill_value, Tensor):
+        layer.set_input(4, fill_value.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
 
@@ -2971,7 +2984,7 @@ def log_softmax(input: Tensor, dim: int) -> Tensor:
 
 def reduce(input: Tensor,
            op: trt.ReduceOperation,
-           dim: int,
+           dim: Union[int, Tuple[int]],
            keepdim: bool = False) -> Tensor:
     '''
     Add an reduction operation to do along a dimension.
@@ -3010,7 +3023,9 @@ prod = partial(reduce, op=trt.ReduceOperation.PROD)
 min = partial(reduce, op=trt.ReduceOperation.MIN)
 
 
-def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
+def mean(input: Tensor,
+         dim: Union[int, Tuple[int]],
+         keepdim: bool = False) -> Tensor:
     '''
     Add an operation to compute the mean along a dimension.
 
@@ -3248,15 +3263,19 @@ def group_norm(input: Tensor,
     ] + [input.size(i) for i in range(2, ndim)])
     x = input.view(new_shape)
 
-    reduce_dim = tuple(range(2, ndim + 1))
-    ux = x.mean(dim=reduce_dim, keepdim=True)
-    numerator = x - ux
-    varx = numerator * numerator
-    varx = varx.mean(dim=reduce_dim, keepdim=True)
-
-    denom = varx + eps
-    denom = denom.sqrt()
-    y = numerator / denom
+    # instance norm
+    w_shape = [1, num_groups] + [1 for i in range(ndim - 1)]
+    instance_weight = constant(np.ones(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    instance_bias = constant(np.zeros(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    axes_mask = 0
+    for i in range(2, x.ndim()):
+        axes_mask |= 1 << i
+    layer = default_trtnet().add_normalization(x.trt_tensor,
+                                               instance_weight.trt_tensor,
+                                               instance_bias.trt_tensor,
+                                               axes_mask)
+    layer.epsilon = eps
+    y = _create_tensor(layer.get_output(0), layer)
     y = y.view(old_shape)
 
     new_shape = concat([num_channels] + [1 for _ in range(2, ndim)])
