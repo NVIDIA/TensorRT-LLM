@@ -15,6 +15,8 @@
 import argparse
 import json
 import os
+import random
+from typing import List
 
 # isort: off
 import torch
@@ -41,11 +43,32 @@ def trt_dtype_to_torch(dtype):
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--engine_dir', type=str, default='bert_outputs')
+    parser.add_argument("--log_level", type=str, default="info")
+    parser.add_argument("--engine_dir", type=str)
 
     return parser.parse_args()
 
+def process_input(input_ids_list: List[torch.Tensor],
+                  token_type_ids_list: List[torch.Tensor]):
+    input_lengths = []
+    position_ids_list = []
+    max_input_length = 0
+    for i, input_ids in enumerate(input_ids_list):
+        input_len = len(input_ids)
+        assert input_len == len(token_type_ids_list[i]), f"sample {i}: len(input_ids)={len(input_ids)}, " \
+                                                         f"len(token_type_ids)={len(token_type_ids_list[i])}, not equal"
+        input_lengths.append(input_len)
+        position_ids_list.append(torch.arange(0, input_len, dtype=torch.int32))
+        max_input_length = max(max_input_length, input_len)
+
+    # [num_tokens]
+    input_ids = torch.concat(input_ids_list).int().cuda()            
+    token_type_ids = torch.concat(token_type_ids_list).int().cuda()
+    position_ids = torch.concat(position_ids_list).int().cuda()
+
+    input_lengths = torch.tensor(input_lengths).int().cuda()  # [batch_size]
+    max_input_length = torch.empty((max_input_length, )).int().cuda()
+    return input_ids, input_lengths, token_type_ids, position_ids, max_input_length
 
 if __name__ == '__main__':
     args = parse_arguments()
@@ -55,10 +78,6 @@ if __name__ == '__main__':
     config_path = os.path.join(args.engine_dir, 'config.json')
     with open(config_path, 'r') as f:
         config = json.load(f)
-    
-    assert config["plugin_config"]["remove_input_padding"] == False, \
-        "Please refer to run_remove_input_padding.py for running BERT models with remove_input_padding enabled"
-    
     dtype = config['builder_config']['precision']
     world_size = config['builder_config']['tensor_parallel']
     assert world_size == tensorrt_llm.mpi_world_size(), \
@@ -82,26 +101,36 @@ if __name__ == '__main__':
         engine_buffer = f.read()
     logger.info(f'Creating session from engine')
     session = Session.from_serialized_engine(engine_buffer)
+    
+    remove_input_padding = config["plugin_config"]["remove_input_padding"]
+    assert remove_input_padding, "This is a demo for BERT models with remove_input_padding enabled"
+    
 
     for i in range(3):
         batch_size = (i + 1) * 4
-        seq_len = (i + 1) * 32
-        input_ids = torch.randint(100, (batch_size, seq_len)).int().cuda()
-        input_lengths = seq_len * torch.ones(
-            (batch_size, ), dtype=torch.int32, device='cuda')
-        token_type_ids = torch.randint(100, (batch_size, seq_len)).int().cuda()
-
+        # use list of tensor to represent unpadded samples
+        input_ids = []
+        token_type_ids = []
+        for _ in range(batch_size):
+            seq_len = random.randint(64, 128)
+            input_ids.append(torch.randint(100, size=(seq_len, )).int().cuda())
+            token_type_ids.append(torch.randint(0, 1, size=(seq_len, )).int().cuda())
+            
+        input_ids, input_lengths, token_type_ids, position_ids, max_input_length = \
+            process_input(input_ids, token_type_ids)
         inputs = {
-            'input_ids': input_ids,
-            'input_lengths': input_lengths,
-            'token_type_ids': token_type_ids
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "token_type_ids": token_type_ids,
+            "position_ids": position_ids,
+            "max_input_length": max_input_length
         }
         output_info = session.infer_shapes([
-            TensorInfo('input_ids', trt.DataType.INT32, input_ids.shape),
-            TensorInfo('input_lengths', trt.DataType.INT32,
-                       input_lengths.shape),
-            TensorInfo('token_type_ids', trt.DataType.INT32,
-                       token_type_ids.shape),
+            TensorInfo("input_ids", trt.DataType.INT32, input_ids.shape),
+            TensorInfo("input_lengths", trt.DataType.INT32, input_lengths.shape),
+            TensorInfo("token_type_ids", trt.DataType.INT32, token_type_ids.shape),
+            TensorInfo("position_ids", trt.DataType.INT32, position_ids.shape),
+            TensorInfo("max_input_length", trt.DataType.INT32, max_input_length.shape)
         ])
         outputs = {
             t.name: torch.empty(tuple(t.shape),
@@ -109,20 +138,12 @@ if __name__ == '__main__':
                                 device='cuda')
             for t in output_info
         }
-        if (model_name == 'BertModel' or model_name == 'RobertaModel'):
-            output_name = 'hidden_states'
-        elif (model_name == 'BertForQuestionAnswering'
-              or model_name == 'RobertaForQuestionAnswering'):
-            output_name = 'logits'
-        elif (model_name == 'BertForSequenceClassification'
-              or model_name == 'RobertaForSequenceClassification'):
-            output_name = 'logits'
-        else:
-            assert False, f"Unknown BERT model {model_name}"
-
-        assert output_name in outputs, f'{output_name} not found in outputs, check if build.py set the name correctly'
+        output_name = "logits"
+        assert output_name in outputs, f'{output_name} not found in outputs, check if build.py set output name correctly'
 
         ok = session.run(inputs, outputs, stream)
         assert ok, "Runtime execution failed"
         torch.cuda.synchronize()
         res = outputs[output_name]
+        print(res)
+
