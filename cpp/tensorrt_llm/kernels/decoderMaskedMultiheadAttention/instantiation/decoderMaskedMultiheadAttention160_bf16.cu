@@ -33,7 +33,7 @@ namespace mmha
 #ifdef ENABLE_BF16
 INSTANTIATE_MMHA_LAUNCHERS(__nv_bfloat16, kSizePerHead)
 #endif // ENABLE_BF16
-#endif
+#endif // FAST_BUILD
 
 } // namespace mmha
 
