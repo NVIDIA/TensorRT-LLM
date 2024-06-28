@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import platform
 import time
 from functools import partial
 from typing import Literal, Optional, Tuple, Union
@@ -115,22 +116,24 @@ class PyNVMLContext:
             pynvml.nvmlShutdown()
 
 
-if pynvml is not None:
-    with PyNVMLContext():
-        driver_version = pynvml.nvmlSystemGetDriverVersion()
-        if pynvml.__version__ < '11.5.0' or driver_version < '526':
-            logger.warning(
-                f'Found pynvml=={pynvml.__version__} and cuda driver version '
-                f'{driver_version}. Please use pynvml>=11.5.0 and cuda '
-                f'driver>=526 to get accurate memory usage.')
-            # Support legacy pynvml. Note that an old API could return
-            # wrong GPU memory usage.
-            _device_get_memory_info_fn = pynvml.nvmlDeviceGetMemoryInfo
-        else:
-            _device_get_memory_info_fn = partial(
-                pynvml.nvmlDeviceGetMemoryInfo,
-                version=pynvml.nvmlMemory_v2,
-            )
+on_aarch64 = platform.machine() == "aarch64"
+if not on_aarch64:
+    if pynvml is not None:
+        with PyNVMLContext():
+            driver_version = pynvml.nvmlSystemGetDriverVersion()
+            if pynvml.__version__ < '11.5.0' or driver_version < '526':
+                logger.warning(
+                    f'Found pynvml=={pynvml.__version__} and cuda driver version '
+                    f'{driver_version}. Please use pynvml>=11.5.0 and cuda '
+                    f'driver>=526 to get accurate memory usage.')
+                # Support legacy pynvml. Note that an old API could return
+                # wrong GPU memory usage.
+                _device_get_memory_info_fn = pynvml.nvmlDeviceGetMemoryInfo
+            else:
+                _device_get_memory_info_fn = partial(
+                    pynvml.nvmlDeviceGetMemoryInfo,
+                    version=pynvml.nvmlMemory_v2,
+                )
 
 
 def host_memory_info(pid: Optional[int] = None) -> Tuple[int, int, int]:

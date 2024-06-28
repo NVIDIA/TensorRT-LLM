@@ -1,14 +1,13 @@
+import platform
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Union
 
-import pynvml
 import torch
 from cuda import cudart
 
 from tensorrt_llm._utils import DictConversion
 from tensorrt_llm.logger import logger
-from tensorrt_llm.profiler import PyNVMLContext, _device_get_memory_info_fn
 
 
 @dataclass
@@ -450,80 +449,89 @@ def nvlink_bandwidth(nvlink_version: int) -> int:
 def infer_cluster_info() -> ClusterInfo:
     device = torch.cuda.current_device()
     index = device.index if isinstance(device, torch.device) else device
-    with PyNVMLContext():
-        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-        compute_cap = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
-        logger.info(f"Compute capability: {compute_cap}")
-        err, properties = cudart.cudaGetDeviceProperties(0)
-        sm_count = properties.multiProcessorCount
-        logger.info(f"SM count: {sm_count}")
-        sm_clock = pynvml.nvmlDeviceGetMaxClockInfo(
-            handle,
-            pynvml.NVML_CLOCK_SM,
-        )
-        logger.info(f"SM clock: {sm_clock} MHz")
-        math_throughput = MathThroughput.to_tflops(
-            ipc_per_sm(compute_cap),
-            sm_count,
-            sm_clock,
-        )
-        for name in math_throughput.__dataclass_fields__:
-            tflops = getattr(math_throughput, name)
-            logger.info(f"{name} TFLOPS: {tflops}")
+    on_aarch64 = platform.machine() == "aarch64"
+    if not on_aarch64:
+        import pynvml
 
-        mem_info = _device_get_memory_info_fn(handle)
-        memory_budget = mem_info.total // (1024**3)
-        logger.info(f"Total Memory: {memory_budget} GiB")
+        from tensorrt_llm.profiler import (PyNVMLContext,
+                                           _device_get_memory_info_fn)
+        with PyNVMLContext():
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            compute_cap = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            logger.info(f"Compute capability: {compute_cap}")
+            err, properties = cudart.cudaGetDeviceProperties(0)
+            sm_count = properties.multiProcessorCount
+            logger.info(f"SM count: {sm_count}")
+            sm_clock = pynvml.nvmlDeviceGetMaxClockInfo(
+                handle,
+                pynvml.NVML_CLOCK_SM,
+            )
+            logger.info(f"SM clock: {sm_clock} MHz")
+            math_throughput = MathThroughput.to_tflops(
+                ipc_per_sm(compute_cap),
+                sm_count,
+                sm_clock,
+            )
+            for name in math_throughput.__dataclass_fields__:
+                tflops = getattr(math_throughput, name)
+                logger.info(f"{name} TFLOPS: {tflops}")
 
-        mem_clock = pynvml.nvmlDeviceGetMaxClockInfo(
-            handle,
-            pynvml.NVML_CLOCK_MEM,
-        )
-        logger.info(f"Memory clock: {mem_clock} MHz")
-        if pynvml.__version__ < '11.5.0':
-            mem_bus_width = properties.memoryBusWidth
-        else:
-            mem_bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
-        logger.info(f"Memory bus width: {mem_bus_width}")
-        memory_bw = mem_bus_width * mem_clock * 2 // int(8e3)
-        logger.info(f"Memory bandwidth: {memory_bw} GB/s")
+            mem_info = _device_get_memory_info_fn(handle)
+            memory_budget = mem_info.total // (1024**3)
+            logger.info(f"Total Memory: {memory_budget} GiB")
 
-        try:
-            is_nvl_active = bool(pynvml.nvmlDeviceGetNvLinkState(handle, 0))
-            logger.info(f"NVLink is active: {is_nvl_active}")
-        except pynvml.NVMLError:
-            is_nvl_active = False
-
-        intra_node_sharp = False
-        if is_nvl_active:
-            nvl_version_enum = pynvml.nvmlDeviceGetNvLinkVersion(handle, 0)
-            nvl_version = nvlink_version(nvl_version_enum)
-            logger.info(f"NVLink version: {nvl_version}")
-            nvl_bw = nvlink_bandwidth(nvl_version)
-            logger.info(f"NVLink bandwidth: {nvl_bw} GB/s")
-            intra_node_bw = nvl_bw
-            if nvl_version >= 4:
-                intra_node_sharp = True
-        else:
+            mem_clock = pynvml.nvmlDeviceGetMaxClockInfo(
+                handle,
+                pynvml.NVML_CLOCK_MEM,
+            )
+            logger.info(f"Memory clock: {mem_clock} MHz")
             if pynvml.__version__ < '11.5.0':
-                pcie_gen = pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle)
-                pcie_speed = (2**pcie_gen) * 1000
+                mem_bus_width = properties.memoryBusWidth
             else:
-                pcie_speed = pynvml.nvmlDeviceGetPcieSpeed(handle)
-            logger.info(f"PCIe speed: {pcie_speed} Mbps")
-            pcie_link_width = pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle)
-            logger.info(f"PCIe link width: {pcie_link_width}")
-            pcie_bw = pcie_speed * pcie_link_width // int(8e3)
-            logger.info(f"PCIe bandwidth: {pcie_bw} GB/s")
-            intra_node_bw = pcie_bw
+                mem_bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+            logger.info(f"Memory bus width: {mem_bus_width}")
+            memory_bw = mem_bus_width * mem_clock * 2 // int(8e3)
+            logger.info(f"Memory bandwidth: {memory_bw} GB/s")
 
-        cluster_info = ClusterInfo(
-            math_throughput=math_throughput,
-            memory_bw=memory_bw,
-            memory_budget_per_device=memory_budget,
-            intra_node_bw_per_device=intra_node_bw,
-            intra_node_sharp=intra_node_sharp,
-        )
+            try:
+                is_nvl_active = bool(pynvml.nvmlDeviceGetNvLinkState(handle, 0))
+                logger.info(f"NVLink is active: {is_nvl_active}")
+            except pynvml.NVMLError:
+                is_nvl_active = False
+
+            intra_node_sharp = False
+            if is_nvl_active:
+                nvl_version_enum = pynvml.nvmlDeviceGetNvLinkVersion(handle, 0)
+                nvl_version = nvlink_version(nvl_version_enum)
+                logger.info(f"NVLink version: {nvl_version}")
+                nvl_bw = nvlink_bandwidth(nvl_version)
+                logger.info(f"NVLink bandwidth: {nvl_bw} GB/s")
+                intra_node_bw = nvl_bw
+                if nvl_version >= 4:
+                    intra_node_sharp = True
+            else:
+                if pynvml.__version__ < '11.5.0':
+                    pcie_gen = pynvml.nvmlDeviceGetCurrPcieLinkGeneration(
+                        handle)
+                    pcie_speed = (2**pcie_gen) * 1000
+                else:
+                    pcie_speed = pynvml.nvmlDeviceGetPcieSpeed(handle)
+                logger.info(f"PCIe speed: {pcie_speed} Mbps")
+                pcie_link_width = pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle)
+                logger.info(f"PCIe link width: {pcie_link_width}")
+                pcie_bw = pcie_speed * pcie_link_width // int(8e3)
+                logger.info(f"PCIe bandwidth: {pcie_bw} GB/s")
+                intra_node_bw = pcie_bw
+
+            cluster_info = ClusterInfo(
+                math_throughput=math_throughput,
+                memory_bw=memory_bw,
+                memory_budget_per_device=memory_budget,
+                intra_node_bw_per_device=intra_node_bw,
+                intra_node_sharp=intra_node_sharp,
+            )
+    else:
+        cluster_info = None
     return cluster_info
 
 

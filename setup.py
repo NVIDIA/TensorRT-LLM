@@ -76,11 +76,20 @@ class BinaryDistribution(Distribution):
 
 
 on_windows = platform.system() == "Windows"
-required_deps, extra_URLs = parse_requirements(
-    Path("requirements-windows.txt" if on_windows else "requirements.txt"))
-devel_deps, _ = parse_requirements(
-    Path("requirements-dev-windows.txt"
-         if on_windows else "requirements-dev.txt"))
+on_aarch64 = platform.machine() == "aarch64"
+if on_windows:
+    requirements_file = "requirements-windows.txt"
+    requirements_dev_file = "requirements-dev-windows.txt"
+elif on_aarch64:
+    requirements_file = "requirements-jetson.txt"
+    requirements_dev_file = "requirements-dev-jetson.txt"
+else:
+    requirements_file = "requirements.txt"
+    requirements_dev_file = "requirements-dev.txt"
+
+required_deps, extra_URLs = parse_requirements(Path(requirements_file))
+devel_deps, _ = parse_requirements(Path(requirements_dev_file))
+
 sanity_check()
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html

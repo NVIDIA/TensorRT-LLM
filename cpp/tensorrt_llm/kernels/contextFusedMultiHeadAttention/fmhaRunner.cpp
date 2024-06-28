@@ -88,7 +88,8 @@ public:
         , sm(sm_)
     {
         TLLM_CHECK_WITH_INFO(
-            (sm == kSM_70 || sm == kSM_80 || sm == kSM_86 || sm == kSM_89 || sm == kSM_90), "Unsupported architecture");
+            (sm == kSM_70 || sm == kSM_80 || sm == kSM_86 || sm == kSM_87 || sm == kSM_89 || sm == kSM_90),
+            "Unsupported architecture");
         TLLM_CHECK_WITH_INFO(
             (mDataType == DATA_TYPE_FP16 || mDataType == DATA_TYPE_BF16 || mDataType == DATA_TYPE_E4M3),
             "Unsupported data type");
@@ -186,7 +187,7 @@ public:
 
         bool const isSm70 = (sm == kSM_70);
         bool const isSm90 = (sm == kSM_90);
-        bool const isSm8x = (sm == kSM_86 || sm == kSM_89);
+        bool const isSm8x = (sm == kSM_86 || sm == kSM_87 || sm == kSM_89);
         bool const isSm80 = (sm == kSM_80);
 
         // Only warp-specialized FMHA kernels support FP8 on Hopper.
@@ -288,7 +289,7 @@ public:
         // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
         bool const isSm90 = (sm == kSM_90);
         bool const isSm70 = (sm == kSM_70);
-        bool const isSm8x = (sm == kSM_86 || sm == kSM_89);
+        bool const isSm8x = (sm == kSM_86 || sm == kSM_87 || sm == kSM_89);
         bool const isSm80 = (sm == kSM_80);
 
         // always use flash attention kernels.
@@ -768,7 +769,7 @@ bool FusedMHARunnerV2::isValid(int s) const
 bool MHARunner::fmha_supported(int const headSize, int const sm)
 {
     // Check if the gpu architecture is supported or not.
-    if (sm == 70 || sm == 80 || sm == 86 || sm == 89 || sm == 90)
+    if (sm == 70 || sm == 80 || sm == 86 || sm == 87 || sm == 89 || sm == 90)
     {
         // Check if the head size is supported or not.
         return (headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96

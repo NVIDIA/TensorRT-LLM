@@ -1,0 +1,19 @@
+-r requirements-jetson.txt
+datasets==2.19.2
+einops
+graphviz
+mypy
+parameterized
+pre-commit
+pybind11
+pybind11-stubgen
+pytest-cov
+pytest-forked
+pytest-xdist
+rouge_score
+cloudpickle
+typing-extensions==4.8.0
+bandit==1.7.7
+jsonlines==4.0.0
+jieba==0.42.1
+rouge==1.0.1
