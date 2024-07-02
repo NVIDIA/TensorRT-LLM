@@ -68,7 +68,6 @@ class Tokenizer {
 
 struct InferenceState {
   int prev_pos{0};
-  std::string prev_text;
   bool is_finished;
   std::queue<std::string> texts_to_stream;
   std::mutex queue_mutex; // Mutex to protect access to textsToStream
@@ -76,10 +75,10 @@ struct InferenceState {
   std::vector<std::string> sequence_openhermes = {"<", "|", "im", "_", "end", "|", ">"};
   std::vector<std::string> sequence_mistral = {"[", "INST", "]"};
   int token_gen_count = 0;
+  std::vector<std::string> rewind_strs;
 
   void Reset() {
-      stop_word_match_len = 0;
-      prev_text = "";
+    stop_word_match_len = 0;
   }
 
   bool IsComplete(bool is_openhermes) const {
