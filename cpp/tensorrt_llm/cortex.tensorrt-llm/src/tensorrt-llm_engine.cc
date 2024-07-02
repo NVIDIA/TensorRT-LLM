@@ -21,35 +21,82 @@
 using json = nlohmann::json;
 using namespace tensorrtllm;
 
+namespace {
+  constexpr const int k200OK = 200;
+  constexpr const int k400BadRequest = 400;
+  constexpr const int k409Conflict = 409;
+  constexpr const int k500InternalServerError = 500;
 
-constexpr const int k200OK = 200;
-constexpr const int k400BadRequest = 400;
-constexpr const int k409Conflict = 409;
-constexpr const int k500InternalServerError = 500;
+  // https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#generationinput-h
+  // stopWordsList 
+  // 'im', '_' , 'end', '</s>', '<|im_end|>'
+  const std::vector<int32_t> kOpenhermesStopWords = {321, 28730, 416, 2, 32000, 3, 4, 5, -1, -1};
+  const std::string kOhUserPrompt = "<|im_end|>\n<|im_start|>user\n";
+  const std::string kOhAiPrompt = "<|im_end|>\n<|im_start|>assistant\n";
+  const std::string kOhSystemPrompt = "<|im_start|>system\n";
+  const std::unordered_map<std::string, int> kOpenhermesTemplate = {{"<|im_end|>", 32000} , {"<|im_start|>", 32001}};
 
+  // '[', 'INST', ']', '[INST]', ''[, '/' , 'INST',']', '[/INST]', '</s>'
+  const std::vector<int32_t> kMistral_V0_3_StopWords 
+    = {29560, 17057, 29561, 3, 29560, 29516, 17057, 29561, 4, 2, 3, 4, 8, 9, 10, -1, -1, -1, -1, -1};
+  const std::string kMistralUserPrompt = "[INST] ";
+  const std::string kMistralAiPrompt = "[/INST] ";
+  const std::string kMistralSystemPrompt = "<s>";
+  const std::unordered_map<std::string, int> kMistralTemplate = {{"[INST]", 3} , {"[/INST]", 4}};
+
+  // TODO(sang) This is fragile, just a temporary solution. Maybe can use a config file or model architect, etc... 
+  bool IsOpenhermes(const std::string& s) {
+    if (s.find("mistral") != std::string::npos || s.find("Mistral") != std::string::npos) {
+      return false;
+    } 
+    return true;
+  }
+
+  std::string GetUserPrompt(bool is_openhermes) {
+    if(is_openhermes) {
+      return kOhUserPrompt;
+    }
+    return kMistralUserPrompt;
+  }
+
+  std::string GetAiPrompt(bool is_openhermes) {
+    if(is_openhermes) {
+      return kOhAiPrompt;
+    }
+    return kMistralAiPrompt;
+  }
+
+  std::string GetSystemPrompt(bool is_openhermes) {
+    if(is_openhermes) {
+      return kOhSystemPrompt;
+    }
+    return kMistralSystemPrompt;
+  }
+}
 TensorrtllmEngine::~TensorrtllmEngine() {}
 
 void RemoveId(std::vector<int>& vec, int id) {
   vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
 }
 
-bool HandleMatch(std::string const& rew_text, std::shared_ptr<InferenceState> infer_state) {
-  if (infer_state->IsComplete()) {
+bool HandleMatch(std::string const& rew_text, std::shared_ptr<InferenceState> infer_state, bool is_openhermes) {
+  if (infer_state->IsComplete(is_openhermes)) {
     return false;
   }
   if (infer_state->stop_word_match_len == 0) {
-    if (rew_text.find('<') != std::string::npos) { // Found "<" anywhere in the text
+    if ((is_openhermes && rew_text.find('<') != std::string::npos) || 
+        (!is_openhermes && rew_text.find('[') != std::string::npos)) {
       infer_state->stop_word_match_len++; // Move to next state
       infer_state->prev_text = rew_text;
       return true;
     }
   }
-  else if (rew_text == infer_state->sequence[infer_state->stop_word_match_len]) {
+  else if (rew_text == infer_state->GetSequence(is_openhermes, infer_state->stop_word_match_len)) {
     infer_state->stop_word_match_len++; // Move to next state
     infer_state->prev_text = rew_text;
     return true;
   }
-  else if (infer_state->stop_word_match_len > 0 && rew_text == infer_state->sequence[0]) {
+  else if (infer_state->stop_word_match_len > 0 && rew_text == infer_state->GetSequence(is_openhermes, 0u)) {
     infer_state->stop_word_match_len = 1; // Restart from first match if sequence breaks but matches start
     infer_state->prev_text = rew_text;
     return true;
@@ -67,9 +114,11 @@ GenerationInput::TensorPtr TensorrtllmEngine::GetTensorSingleStopWordList(int st
 }
 
 GenerationInput::TensorPtr TensorrtllmEngine::GetTensorChatMLStopWordList() {
-  std::vector<int32_t> stop_words_tokens
-    = {321, 28730, 416, 2, 32000, 3, 4, 5, -1, -1}; // Extend with -1 for increased length
-  return gpt_session->getBufferManager().copyFrom(stop_words_tokens, ITensor::makeShape({1, 2, 5}), MemoryType::kGPU);
+  if(is_openhermes_) {
+    return gpt_session->getBufferManager().copyFrom(kOpenhermesStopWords, ITensor::makeShape({1, 2, static_cast<int>(kOpenhermesStopWords.size()/2)}), MemoryType::kGPU);
+  } else {
+    return gpt_session->getBufferManager().copyFrom(kMistral_V0_3_StopWords, ITensor::makeShape({1, 2, static_cast<int>(kMistral_V0_3_StopWords.size()/2)}), MemoryType::kGPU);
+  }
 }
 
 GenerationInput TensorrtllmEngine::CreateGenerationInput(std::vector<int32_t> input_ids_host) {
@@ -102,7 +151,7 @@ void InferenceThread(
     TensorrtllmEngine* self,
     SamplingConfig sampling_config,
     int input_len,
-    int outputLen) {
+    int outputLen, bool is_openhermes) {
 
   // Input preparation
   LOG_INFO << "Inference thread started";
@@ -110,9 +159,9 @@ void InferenceThread(
   GenerationOutput generation_output = self->CreateGenerationOutput();
 
   // Define the callback to stream each generated token
-  generation_output.onTokenGenerated = [&infer_state, input_len, outputLen, self, &generation_output](
+  generation_output.onTokenGenerated = [&infer_state, input_len, outputLen, self, &generation_output, is_openhermes](
                                           GenerationOutput::TensorPtr const& output_ids, SizeType step, bool finished) {
-    LOG_INFO << "Generating tokenizer in thread";                                            
+    // LOG_INFO << "Generating tokenizer in thread";                                            
     // Assuming the shape of output_ids tensor is (1, 1, 160), where 160 is the number of tokens
     int output_length = output_ids->getShape().d[2]; // Get the length of output IDs based on the tensor shape
     // Copy output IDs from GPU to host for printing
@@ -120,9 +169,17 @@ void InferenceThread(
     self->gpt_session->getBufferManager().copy(*output_ids, output_idsHost.data(), MemoryType::kCPU);
     // Find the last non-zero value in the output IDs starting from the end of the input sequence
     std::vector<int> output_idsHostDecode(output_idsHost.begin() + input_len, output_idsHost.end());
+
     RemoveId(output_idsHostDecode, 0);
-    RemoveId(output_idsHostDecode, 32000);
-    RemoveId(output_idsHostDecode, 32001);
+    if(is_openhermes) {
+      for(auto const& [_, v]: kOpenhermesTemplate) {
+        RemoveId(output_idsHostDecode, v);
+      }
+    } else {
+      for(auto const& [_, v]: kMistralTemplate) {
+        RemoveId(output_idsHostDecode, v);
+      }
+    }
     std::string text = self->cortex_tokenizer->Decode(output_idsHostDecode);
 
     if (infer_state->prev_pos >= 0 && infer_state->prev_pos < text.size()) {
@@ -225,6 +282,7 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
     }
   }
   formatted_input += ai_prompt;
+  // LOG_INFO << formatted_input;
   // Format the input from user
 
   std::shared_ptr<InferenceState> infer_state = std::make_shared<InferenceState>();
@@ -243,23 +301,25 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
   sampling_config.repetitionPenalty = std::vector{request.frequency_penalty};
   // Input preparation
 
-  std::thread inference_thread(InferenceThread, infer_state, input_ids_host, callback, this, sampling_config, input_len, outputLen);
+  std::thread inference_thread(InferenceThread, infer_state, input_ids_host, callback, this, sampling_config, input_len, outputLen, is_openhermes_);
   inference_thread.detach(); // Detach the thread to allow it to run independently
 
-  q_->runTaskInQueue([cb = std::move(callback), infer_state]() {
+  q_->runTaskInQueue([this, cb = std::move(callback), infer_state]() {
+    // std::string res_str;
     LOG_INFO << "Preparing to run inference task queue...";
     while (true) { // Continuously check if the queue is not empty
       std::unique_lock<std::mutex> lock(infer_state->queue_mutex); // Lock the queue for exclusive access
       if (!infer_state->texts_to_stream.empty()) {
         std::string rew_text = infer_state->texts_to_stream.front();
+        // res_str += rew_text;
         infer_state->texts_to_stream.pop();
-        if (HandleMatch(rew_text, infer_state) && rew_text != "[DONE]") {
+        if (HandleMatch(rew_text, infer_state, is_openhermes_) && rew_text != "[DONE]") {
             continue;
         };
 
         if (rew_text == "[DONE]") {
           const std::string str
-              = "data: " + tensorrtllm_utils::CreateReturnJson(tensorrtllm_utils::GenerateRandomString(20), "_", "", "stop")
+              = "data: " + tensorrtllm_utils::CreateReturnJson(tensorrtllm_utils::GenerateRandomString(20), model_id_, "", "stop")
               + "\n\n" + "data: [DONE]" + "\n\n";
 
           infer_state->is_finished = true;
@@ -275,7 +335,7 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
           break;
         }
         const std::string text_to_stream
-            = "data: " + tensorrtllm_utils::CreateReturnJson(tensorrtllm_utils::GenerateRandomString(20), "_", rew_text) + "\n\n";
+            = "data: " + tensorrtllm_utils::CreateReturnJson(tensorrtllm_utils::GenerateRandomString(20), model_id_, rew_text) + "\n\n";
 
         lock.unlock(); // Unlock as soon as possible
         infer_state->prev_text = rew_text;
@@ -293,6 +353,7 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
         lock.unlock();
       }
     }
+    // LOG_INFO << res_str;
   });
 
   LOG_INFO << "Inference completed";
@@ -302,11 +363,12 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
 void TensorrtllmEngine::LoadModel(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
     model::LoadModelRequest request = model::fromJson(json_body);
     std::filesystem::path model_dir = request.model_path;
+    is_openhermes_ = IsOpenhermes(request.model_path);
 
     int ctx_len = request.ctx_len;
-    this->user_prompt = request.user_prompt;
-    this->ai_prompt = request.ai_prompt;
-    this->system_prompt = request.system_prompt;
+    this->user_prompt = request.user_prompt.empty() ? GetUserPrompt(is_openhermes_) : request.user_prompt;
+    this->ai_prompt = request.ai_prompt.empty() ? GetAiPrompt(is_openhermes_) : request.ai_prompt;
+    this->system_prompt = request.system_prompt.empty() ? GetSystemPrompt(is_openhermes_) : request.system_prompt;
     this->model_id_ = GetModelId(*json_body);
 
     logger = std::make_shared<TllmLogger>();

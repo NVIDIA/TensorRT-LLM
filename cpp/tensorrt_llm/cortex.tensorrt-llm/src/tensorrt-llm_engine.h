@@ -73,7 +73,8 @@ struct InferenceState {
   std::queue<std::string> texts_to_stream;
   std::mutex queue_mutex; // Mutex to protect access to textsToStream
   size_t stop_word_match_len = 0;
-  std::vector<std::string> sequence{"<", "|", "im", "_", "end", "|", ">"};
+  std::vector<std::string> sequence_openhermes = {"<", "|", "im", "_", "end", "|", ">"};
+  std::vector<std::string> sequence_mistral = {"[", "INST", "]"};
   int token_gen_count = 0;
 
   void Reset() {
@@ -81,8 +82,21 @@ struct InferenceState {
       prev_text = "";
   }
 
-  bool IsComplete() const {
-      return stop_word_match_len >= sequence.size();
+  bool IsComplete(bool is_openhermes) const {
+    if(is_openhermes) {
+      return stop_word_match_len >= sequence_openhermes.size();
+    } else {
+      return stop_word_match_len >= sequence_mistral.size();
+    }
+  }
+
+  const std::string& GetSequence(bool is_openhermes, size_t index) {
+    if(is_openhermes) {
+      return sequence_openhermes[index];
+    } else {
+      return sequence_mistral[index];
+    }
+
   }
 };
 
@@ -138,6 +152,7 @@ class TensorrtllmEngine : public EngineI {
   uint64_t start_time_;
   std::atomic<bool> model_loaded_;
   std::unique_ptr<trantor::ConcurrentTaskQueue> q_;
+  bool is_openhermes_ = true;
 };
 
 } // namespace inferences
