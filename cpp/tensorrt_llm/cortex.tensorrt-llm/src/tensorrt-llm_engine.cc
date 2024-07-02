@@ -123,12 +123,12 @@ GenerationInput::TensorPtr TensorrtllmEngine::GetTensorChatMLStopWordList() {
 
 GenerationInput TensorrtllmEngine::CreateGenerationInput(std::vector<int32_t> input_ids_host) {
   int input_len = input_ids_host.size();
-  std::vector<int32_t> input_lengths_host(batchSize, input_len);
+  std::vector<int32_t> input_lengths_host(batch_size_, input_len);
   GenerationInput::TensorPtr input_lengths
-      = gpt_session->getBufferManager().copyFrom(input_lengths_host, ITensor::makeShape({batchSize}), MemoryType::kGPU);
+      = gpt_session->getBufferManager().copyFrom(input_lengths_host, ITensor::makeShape({batch_size_}), MemoryType::kGPU);
   GenerationInput::TensorPtr input_ids = gpt_session->getBufferManager().copyFrom(
-      input_ids_host, ITensor::makeShape({batchSize, input_len}), MemoryType::kGPU);
-  GenerationInput generation_input{0, 0, input_ids, input_lengths, model_config->usePackedInput()};
+      input_ids_host, ITensor::makeShape({batch_size_, input_len}), MemoryType::kGPU);
+  GenerationInput generation_input{0, 0, input_ids, input_lengths, model_config_->usePackedInput()};
   generation_input.stopWordsList = GetTensorChatMLStopWordList();
 
   LOG_INFO << "Create generation input successfully";
@@ -249,7 +249,7 @@ bool TensorrtllmEngine::CheckModelLoaded(std::function<void(Json::Value&&, Json:
 
 void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_body, std::function<void(Json::Value&&, Json::Value&&)>&& callback) {
   inferences::ChatCompletionRequest request = inferences::fromJson(json_body);
-  std::string formatted_input = pre_prompt;
+  std::string formatted_input = pre_prompt_;
   nlohmann::json data;
   // data["stream"] = completion.stream;
   // data["n_predict"] = completion.max_tokens;
@@ -261,17 +261,17 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
     std::string input_role = message["role"].asString();
     std::string role;
     if (input_role == "user") {
-        role = user_prompt;
+        role = user_prompt_;
         std::string content = message["content"].asString();
         formatted_input += role + content;
     }
     else if (input_role == "assistant") {
-        role = ai_prompt;
+        role = ai_prompt_;
         std::string content = message["content"].asString();
         formatted_input += role + content;
     }
     else if (input_role == "system") {
-        role = system_prompt;
+        role = system_prompt_;
         std::string content = message["content"].asString();
         formatted_input = role + content + formatted_input;
     }
@@ -281,7 +281,7 @@ void TensorrtllmEngine::HandleChatCompletion(std::shared_ptr<Json::Value> json_b
         formatted_input += role + content;
     }
   }
-  formatted_input += ai_prompt;
+  formatted_input += ai_prompt_;
   // LOG_INFO << formatted_input;
   // Format the input from user
 
@@ -366,14 +366,14 @@ void TensorrtllmEngine::LoadModel(std::shared_ptr<Json::Value> json_body, std::f
     is_openhermes_ = IsOpenhermes(request.model_path);
 
     int ctx_len = request.ctx_len;
-    this->user_prompt = request.user_prompt.empty() ? GetUserPrompt(is_openhermes_) : request.user_prompt;
-    this->ai_prompt = request.ai_prompt.empty() ? GetAiPrompt(is_openhermes_) : request.ai_prompt;
-    this->system_prompt = request.system_prompt.empty() ? GetSystemPrompt(is_openhermes_) : request.system_prompt;
-    this->model_id_ = GetModelId(*json_body);
+    user_prompt_ = request.user_prompt.empty() ? GetUserPrompt(is_openhermes_) : request.user_prompt;
+    ai_prompt_ = request.ai_prompt.empty() ? GetAiPrompt(is_openhermes_) : request.ai_prompt;
+    system_prompt_ = request.system_prompt.empty() ? GetSystemPrompt(is_openhermes_) : request.system_prompt;
+    model_id_ = GetModelId(*json_body);
 
-    logger = std::make_shared<TllmLogger>();
-    logger->setLevel(nvinfer1::ILogger::Severity::kINFO);
-    initTrtLlmPlugins(logger.get());
+    logger_ = std::make_shared<TllmLogger>();
+    logger_->setLevel(nvinfer1::ILogger::Severity::kINFO);
+    initTrtLlmPlugins(logger_.get());
 
     std::filesystem::path tokenizer_model_name = model_dir / "tokenizer.model";
     cortex_tokenizer = std::make_unique<Tokenizer>(tokenizer_model_name.string());
@@ -382,20 +382,20 @@ void TensorrtllmEngine::LoadModel(std::shared_ptr<Json::Value> json_body, std::f
     std::filesystem::path json_file_name = model_dir / "config.json";
     auto json = GptJsonConfig::parse(json_file_name);
     auto config = json.getModelConfig();
-    model_config = std::make_unique<GptModelConfig>(config);
+    model_config_ = std::make_unique<GptModelConfig>(config);
     auto world_config = WorldConfig::mpi(1, json.getTensorParallelism(), json.getPipelineParallelism());
     LOG_INFO << "Loaded config from " << json_file_name.string();
     // auto dtype = model_config->getDataType();
 
     // Currently doing fixed session config
-    session_config.maxBatchSize = batchSize;
-    session_config.maxBeamWidth = 1; // Fixed for simplicity
-    session_config.maxSequenceLength = ctx_len;
-    session_config.cudaGraphMode = true; // Fixed for simplicity
+    session_config_.maxBatchSize = batch_size_;
+    session_config_.maxBeamWidth = 1; // Fixed for simplicity
+    session_config_.maxSequenceLength = ctx_len;
+    session_config_.cudaGraphMode = true; // Fixed for simplicity
 
     // Init gpt_session
     auto model_path = model_dir / json.engineFilename(world_config, model_id_);
-    gpt_session = std::make_unique<GptSession>(session_config, *model_config, world_config, model_path.string(), logger);
+    gpt_session = std::make_unique<GptSession>(session_config_, *model_config_, world_config, model_path.string(), logger_);
 
     model_loaded_ = true;
     if (q_ == nullptr) {
@@ -427,8 +427,8 @@ void TensorrtllmEngine::UnloadModel(std::shared_ptr<Json::Value> json_body, std:
   gpt_session.reset();
   cortex_tokenizer.reset();
   q_.reset();
-  model_config.reset();
-  logger.reset();
+  model_config_.reset();
+  logger_.reset();
   model_loaded_ = false;
 
   Json::Value json_resp;

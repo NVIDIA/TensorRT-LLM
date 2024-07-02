@@ -139,15 +139,14 @@ class TensorrtllmEngine : public EngineI {
   bool CheckModelLoaded(
       std::function<void(Json::Value&&, Json::Value&&)>& callback);
 
-  GptSession::Config session_config{1, 1, 1};
-  SamplingConfig sampling_config{1};
-  std::unique_ptr<GptModelConfig> model_config;
-  std::shared_ptr<TllmLogger> logger;
-  std::string user_prompt;
-  std::string ai_prompt;
-  std::string system_prompt;
-  std::string pre_prompt;
-  int batchSize = 1;
+  GptSession::Config session_config_{1, 1, 1};
+  std::unique_ptr<GptModelConfig> model_config_;
+  std::shared_ptr<TllmLogger> logger_;
+  std::string user_prompt_;
+  std::string ai_prompt_;
+  std::string system_prompt_;
+  std::string pre_prompt_;
+  int batch_size_ = 1;
   std::string model_id_;
   uint64_t start_time_;
   std::atomic<bool> model_loaded_;
