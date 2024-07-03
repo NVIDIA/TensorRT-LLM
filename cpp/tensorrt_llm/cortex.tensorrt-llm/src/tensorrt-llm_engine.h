@@ -75,7 +75,6 @@ struct InferenceState {
   std::vector<std::string> sequence_openhermes = {"<", "|", "im", "_", "end", "|", ">"};
   std::vector<std::string> sequence_mistral = {"[", "INST", "]"};
   int token_gen_count = 0;
-  std::vector<std::string> rewind_strs;
 
   void Reset() {
     stop_word_match_len = 0;
