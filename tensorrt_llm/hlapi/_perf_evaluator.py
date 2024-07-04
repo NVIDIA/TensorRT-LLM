@@ -15,7 +15,7 @@ from tensorrt_llm import logger
 
 from .._utils import release_gc
 from ..profiler import device_memory_info, host_memory_info
-from .llm import LLM, ModelConfig, SamplingParams
+from .llm import LLM, SamplingParams
 from .utils import is_directory_empty, print_colored
 
 
@@ -37,7 +37,7 @@ class Report:
     avg_latency: float
     seq_throughput: float
     token_throughput: float
-    ave_tokens_per_sample: int
+    ave_tokens_per_sample: float
     memory_usage_samples: "MemoryContinuousMonitorThread.RecordList" = field(
         default_factory=list)
 
@@ -149,28 +149,25 @@ def get_gpu_memory_usage() -> Iterable[float]:
 class LLMPerfEvaluator:
 
     @classmethod
-    def create(
-        cls,
-        model_config: ModelConfig,
-        samples_path: Path,
-        num_samples: int = -1,
-        warmup: int = 100,
-        batch_size: int = -1,
-        engine_cache_path: Optional[Path] = None,
-        memory_monitor_interval: Optional[int] = None,
-        # The additional arguments are for the LLM constructor
-        **kwargs
-    ) -> Optional['LLMPerfEvaluator']:
+    def create(cls,
+               model: str,
+               samples_path: Path,
+               num_samples: int = -1,
+               warmup: int = 100,
+               batch_size: int = -1,
+               engine_cache_path: Optional[Path] = None,
+               memory_monitor_interval: Optional[int] = None,
+               **kwargs) -> 'LLMPerfEvaluator':
         '''
         Args:
-            model_config: ModelConfig
+            model: The model name or a local path to the model directory.
             samples_path: path to the input data samples
-            kv_cache_free_gpu_memory_fraction: the fraction of free GPU memory to use for the key-value cache
             num_samples: number of the heading samples to run, if set to -1, all samples will be used
             warmup: number of samples for warmup runs
             batch_size: batch size for the runs, if left default, the batch size will be the same as the number of samples
             engine_cache_path: path to the engine file, if provided, the engine will save the built engine to the path and reuse it for the next runs
             memory_monitor_interval: the interval to monitor the host and GPU memory usage, if set to None, the memory monitor will be disabled
+            kwargs: the additional arguments are for the LLM constructor
         '''
 
         from_cache = False
@@ -179,7 +176,7 @@ class LLMPerfEvaluator:
         ) and not is_directory_empty(engine_cache_path):
             print(f"Loading engine from {engine_cache_path}\n")
             from_cache = True
-            model_config.model_dir = engine_cache_path
+            model = engine_cache_path
 
         memory_monitor_thread = None
         if memory_monitor_interval is not None:
@@ -189,10 +186,9 @@ class LLMPerfEvaluator:
 
         # TODO[chunweiy]: Fixit, this barely work, the cpp runtime will trigger RuntimeError, which cannot be caught
         try:
-            llm = LLM(model_config, **kwargs)
+            llm = LLM(model, skip_tokenizer_init=True, **kwargs)
         except Exception as e:
-            logger.error(
-                f"Failed to create LLM with {model_config} and {kwargs}")
+            logger.error(f"Failed to create LLM with {model} and {kwargs}")
             raise e
 
         if engine_cache_path is not None and not from_cache:
@@ -213,7 +209,7 @@ class LLMPerfEvaluator:
                    memory_monitor_thread=memory_monitor_thread)
 
     def __init__(self,
-                 llm,
+                 llm: LLM,
                  samples: List[Sample],
                  warmup: int,
                  max_num_samples: int,
@@ -256,16 +252,15 @@ class LLMPerfEvaluator:
 
                 start = time.time()
                 output = self.llm.generate_async(
-                    sample.input_ids,
-                    sampling_params=SamplingParams(
-                        max_new_tokens=sample.output_len))
+                    sample.input_ids, sampling_params=sampling_params)
                 output = await output.aresult()
                 end = time.time()
 
                 perf_item = PerfItem(start=start,
                                      end=end,
-                                     num_out_tokens=len(output.token_ids) -
-                                     len(sample.input_ids))
+                                     num_out_tokens=sum(
+                                         beam_output.length
+                                         for beam_output in output.outputs))
                 if not warmup:
                     self.perf_items.append(perf_item)
 

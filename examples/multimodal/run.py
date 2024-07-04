@@ -760,16 +760,22 @@ class MultimodalModelRunner:
         elif "video-neva" in self.model_type:
             image = args.video_path
         else:
-            img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
-            image = Image.open(requests.get(img_url,
-                                            stream=True).raw).convert('RGB')
+            img_url = args.image_path
+            if img_url is None:
+                img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+
+            if img_url.startswith("http") or img_url.startswith("https"):
+                image = Image.open(requests.get(img_url,
+                                                stream=True).raw).convert('RGB')
+            else:
+                image = Image.open(img_url).convert("RGB")
 
         return image
 
     def setup_inputs(self, input_text, raw_image):
         attention_mask = None
         if 'blip2' in self.model_type:
-            processor = Blip2Processor.from_pretrained(self.model_type)
+            processor = Blip2Processor.from_pretrained(self.args.hf_model_dir)
             image = processor(raw_image, input_text,
                               return_tensors="pt")['pixel_values']
 
@@ -934,9 +940,12 @@ class MultimodalModelRunner:
             decoder_input_ids = None
         else:
             config = AutoConfig.from_pretrained(args.hf_model_dir)
-            decoder_start_id = config.decoder_start_token_id  # T5
-            if decoder_start_id is None:
+            if "blip2" in self.model_type:
+                decoder_start_id = config.text_config.decoder_start_token_id  # T5
+            elif "nougat" in self.model_type:
                 decoder_start_id = config.decoder.bos_token_id  # Nougat
+            else:
+                decoder_start_id = config.decoder_start_token_id
 
             decoder_input_ids = torch.IntTensor([[decoder_start_id]])
             decoder_input_ids = decoder_input_ids.repeat((args.batch_size, 1))
@@ -990,7 +999,7 @@ class MultimodalModelRunner:
                 elif self.model_type == "pix2struct":
                     assert "characteristic | cat food, day | cat food, wet | cat treats" in output_text[
                         0][0].lower()
-                elif self.model_type in ['neva', 'phi-3-vision']:
+                elif self.model_type in ['blip2', 'neva', 'phi-3-vision']:
                     assert 'singapore' in output_text[0][0].lower()
                 elif self.model_type == 'video-neva':
                     assert 'robot' in output_text[0][0].lower()

@@ -36,8 +36,6 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-#define DO_SPLIT_SMALL_TOP_K_SOFTMAX
-
 #define TOPK_FP16_STORAGE 0
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
@@ -46,17 +44,17 @@ template <typename T, int PAD_2K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__
     void beamStage3Kernel(int const* __restrict pTempId, T const* __restrict pTempVal, BeamHypotheses bh)
 {
-    int const bid = blockIdx.x;          // Index of Batch
+    int const bid = blockIdx.x; // Index of Batch
     int const tid = threadIdx.x;
+    auto const slot = bh.batchSlots ? bh.batchSlots[bid] : bid;
     int const nMBS{bh.nMaxBatchSize};    // Only for bh.logProbsTiled
-    int const nBS{bh.nBatchSize};
-    int const gbid{nBS * bh.nIte + bid}; // Global batch index, TODO: distinguish bid and gbid in the future
     int const nBM{bh.nBeamWidth};
     int const nCandidate{nBM * nBM * 2}; // Keep top 2K candidates from each beam output
     int const nV{bh.nVocabSize};
-    float const diversityRate{bh.diversityRates[gbid]};
-    float const lengthPenalty{bh.lengthPenalties[gbid]};
-    int const earlyStopping{bh.earlyStoppings[gbid]};
+    float const diversityRate{bh.diversityRates[slot]};
+    float const lengthPenalty{bh.lengthPenalties[slot]};
+    int const earlyStopping{bh.earlyStoppings[slot]};
+
     T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
 
     __shared__ int nBeamForNextStep; // Only used by thread of tid == 0
@@ -68,26 +66,26 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     }
     if (tid < nBM)
     {
-        smemCumLogProbs[tid] = bh.cumLogProbs[bid * nBM + tid];
+        smemCumLogProbs[tid] = bh.cumLogProbs[slot * nBM + tid];
     }
     __syncthreads();
 
     if (bh.numBeamsCBA != nullptr)
     {
         // Beam search is enabled
-        if (bh.numBeamsCBA[gbid] == 0 && tid == 0)
+        if (bh.numBeamsCBA[slot] == 0 && tid == 0)
         {
             // Initialize worst score in the first call
-            bh.minNormedScoresCBA[gbid] = FLT_MAX;
+            bh.minNormedScoresCBA[slot] = FLT_MAX;
         }
-        else if (earlyStopping == 1 && bh.numBeamsCBA[gbid] == nBM
-            || earlyStopping != 1 && bh.finished[bid * nBM].isFinished())
+        else if (earlyStopping == 1 && bh.numBeamsCBA[slot] == nBM
+            || earlyStopping != 1 && bh.finished[slot * nBM].isFinished())
         {
             // Condition of early return:
             // 1. In EarlyStopping mode, and we have got enough beams
             // 2. In NonEarlyStopping mode, and this batch has been marked as done
             // TODO: improve the condition like below
-            // earlyStopping == 1 && bh.numBeamsCBA[gbid] == nBM || earlyStopping != 1 && bh.batchDones[bid]
+            // earlyStopping == 1 && bh.numBeamsCBA[slot] == nBM || earlyStopping != 1 && bh.batchDones[slot]
             return;
         }
     }
@@ -148,18 +146,18 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
         {
             int const topKey = smemTopKV[i].key;
             T const topValue = smemTopKV[i].value;
-            bool const isEndToken = pTempId[topKey] % nV == bh.endIds[bid];
+            bool const isEndToken = pTempId[topKey] % nV == bh.endIds[slot];
             if (i < nBM && bh.numBeamsCBA != nullptr && isEndToken)
             {
                 // Condition of this branch
                 // This token is end-token and belongs to top nBM range in Beam search mode
-                int const nSeqLen = bh.sequenceLengths[bid * nBM + i] + 1 - bh.inputLengths[gbid * nBM + i];
+                int const nSeqLen = bh.sequenceLengths[slot * nBM + i] + 1 - bh.inputLengths[slot * nBM + i];
                 float const score = applyLengthPenalty(topValue, nSeqLen, lengthPenalty);
-                int nCBA = bh.numBeamsCBA[gbid];
+                int nCBA = bh.numBeamsCBA[slot];
                 if (nCBA == nBM)
                 {
                     // There are already nBM beams
-                    if (score < bh.minNormedScoresCBA[gbid])
+                    if (score < bh.minNormedScoresCBA[slot])
                     {
                         // Current score is worse than the worst one in candidate beams
                         if (earlyStopping)
@@ -179,16 +177,16 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                         // Find the candidate beam index with the worst score and erase it
                         for (int j = 0; j < nBM; j++)
                         {
-                            if (bh.normedScoresCBA[gbid * (nBM * 2) + j] == bh.minNormedScoresCBA[gbid])
+                            if (bh.normedScoresCBA[slot * (nBM * 2) + j] == bh.minNormedScoresCBA[slot])
                             {
                                 nCBA = j;
-                                bh.numBeamsCBA[gbid]--;
-                                bh.minNormedScoresCBA[gbid] = FLT_MAX;
-                                bh.normedScoresCBA[gbid * (nBM * 2) + j] = score;
+                                bh.numBeamsCBA[slot]--;
+                                bh.minNormedScoresCBA[slot] = FLT_MAX;
+                                bh.normedScoresCBA[slot * (nBM * 2) + j] = score;
                                 for (int l = 0; l < nBM; l++)
                                 {
-                                    bh.minNormedScoresCBA[gbid]
-                                        = min(bh.minNormedScoresCBA[gbid], bh.normedScoresCBA[gbid * (nBM * 2) + l]);
+                                    bh.minNormedScoresCBA[slot]
+                                        = min(bh.minNormedScoresCBA[slot], bh.normedScoresCBA[slot * (nBM * 2) + l]);
                                 }
                                 break;
                             }
@@ -198,9 +196,9 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                 // Copy finished beam from work tree to CBA
                 // The last token
                 int indexPrev = (pTempId[topKey] / nV) % nBM;
-                int const step = bh.sequenceLengths[bid * nBM + indexPrev];
-                int const offsetCBA = (gbid * nBM * 2 + nCBA) * bh.nMaxSeqLen;
-                bh.outputIdsCBA[offsetCBA + step] = bh.endIds[bid];
+                int const step = bh.sequenceLengths[slot * nBM + indexPrev];
+                int const offsetCBA = (slot * nBM * 2 + nCBA) * bh.nMaxSeqLen;
+                bh.outputIdsCBA[offsetCBA + step] = bh.endIds[slot];
                 if (bh.logProbsCBA != nullptr)
                 {
                     bh.logProbsCBA[offsetCBA + step]
@@ -209,25 +207,25 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                 // Previous tokens
                 for (int j = step - 1; j >= 0; j--)
                 {
-                    bh.outputIdsCBA[offsetCBA + j] = bh.outputIdsPtr[bid][indexPrev * bh.nMaxSeqLen + j];
-                    indexPrev = bh.parentIdsPtr[bid][indexPrev * bh.nMaxSeqLen + j];
+                    bh.outputIdsCBA[offsetCBA + j] = bh.outputIdsPtr[slot][indexPrev * bh.nMaxSeqLen + j];
+                    indexPrev = bh.parentIdsPtr[slot][indexPrev * bh.nMaxSeqLen + j];
                 }
                 if (bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr)
                 {
                     indexPrev = (pTempId[topKey] / nV) % nBM;
                     for (int j = step - 1; j >= 0; j--)
                     {
-                        int const index = (j * nMBS + gbid) * nBM + indexPrev;
+                        int const index = (j * nMBS + slot) * nBM + indexPrev;
                         bh.logProbsCBA[offsetCBA + j] = bh.logProbsTiled[index];
-                        indexPrev = bh.parentIdsPtr[bid][indexPrev * bh.nMaxSeqLen + j];
+                        indexPrev = bh.parentIdsPtr[slot][indexPrev * bh.nMaxSeqLen + j];
                     }
                 }
                 // Other parameters
-                int const index = gbid * (nBM * 2) + nCBA;
+                int const index = slot * (nBM * 2) + nCBA;
                 bh.sequenceLengthsCBA[index] = step;
                 bh.normedScoresCBA[index] = score;
-                bh.minNormedScoresCBA[gbid] = min(bh.minNormedScoresCBA[gbid], bh.normedScoresCBA[index]);
-                bh.numBeamsCBA[gbid]++;
+                bh.minNormedScoresCBA[slot] = min(bh.minNormedScoresCBA[slot], bh.normedScoresCBA[index]);
+                bh.numBeamsCBA[slot]++;
                 bh.cumLogProbsCBA[index] = (float) pTempVal[topKey];
             }
             else if (i < nBM || bh.numBeamsCBA != nullptr && !isEndToken)
@@ -236,16 +234,16 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                 // 1. bh.numBeamsCBA == nullptr && i <  nBM, i.e., beam search is disable
                 // 2. bh.numBeamsCBA != nullptr && i <  nBM && isEndToken == false, i.e., add token at the end
                 // 3. bh.numBeamsCBA != nullptr && i >= nBM && isEndToken == false, i.e., add token at the end
-                int const step = bh.sequenceLengths[bid * nBM + nBeamForNextStep];
+                int const step = bh.sequenceLengths[slot * nBM + nBeamForNextStep];
                 // Copy the selected token to work tree
-                bh.outputIdsPtr[bid][nBeamForNextStep * bh.nMaxSeqLen + step] = pTempId[topKey];
+                bh.outputIdsPtr[slot][nBeamForNextStep * bh.nMaxSeqLen + step] = pTempId[topKey];
                 if (bh.logProbsTiled != nullptr)
                 {
-                    int const index = step * nMBS * nBM + bid * nBM + nBeamForNextStep;
+                    int const index = step * nMBS * nBM + slot * nBM + nBeamForNextStep;
                     int const indexBeam = pTempId[topKey] / nV % nBM;
                     bh.logProbsTiled[index] = (float) pTempVal[topKey] - smemCumLogProbs[indexBeam];
                 }
-                bh.cumLogProbs[bid * nBM + nBeamForNextStep] = (float) pTempVal[topKey];
+                bh.cumLogProbs[slot * nBM + nBeamForNextStep] = (float) pTempVal[topKey];
                 nBeamForNextStep++;
             }
             else
@@ -262,7 +260,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
                 // 2. In EarlyStopping mode, and get enough tokens for the next generation step
                 // 3. In NonEarlyStopping mode, and get enough tokens for the next generation step
                 // TODO: improve the condition like below
-                // earlyStopping == 1 && bh.numBeamsCBA[gbid] >= nBM || nBeamForNextStep >= nBM
+                // earlyStopping == 1 && bh.numBeamsCBA[slot] >= nBM || nBeamForNextStep >= nBM
                 break;
             }
         }
@@ -271,31 +269,31 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     // Update bh.batchDones
     if (tid == 0 && bh.numBeamsCBA != nullptr)
     {
-        if (bh.numBeamsCBA[bid] < nBM)
+        if (bh.numBeamsCBA[slot] < nBM)
         {
             // no enough beams
-            bh.batchDones[bid] = false;
+            bh.batchDones[slot] = false;
         }
         else if (earlyStopping == 1)
         {
             // enough candidate beams in EarlyStopping mode
-            bh.batchDones[bid] = true;
+            bh.batchDones[slot] = true;
         }
         else
         {
             // enough beams in NonEarlyStopping mode
-            int nSeqLen = bh.sequenceLengths[bid * nBM] + 1 - bh.inputLengths[gbid * nBM];
+            int nSeqLen = bh.sequenceLengths[slot * nBM] + 1 - bh.inputLengths[slot * nBM];
             float const bestCumLogProbs = smemTopKV[0].value;
             // According to semantics of HF, smemTopKV[0].value is used as bestCumLogProbs
-            // But maybe bh.cumLogProbs[bid * nBM + i] is more suitable?
+            // But maybe bh.cumLogProbs[slot * nBM + i] is more suitable?
             // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L307
             if (earlyStopping != 0 && lengthPenalty > 0.0f)
             {
                 // Specialization for earlyStopping == "never" and lengthPenalty > 0 in HF
-                nSeqLen = bh.nMaxSeqLen - bh.inputLengths[gbid * nBM];
+                nSeqLen = bh.nMaxSeqLen - bh.inputLengths[slot * nBM];
             }
             float const bestAttainableScore = applyLengthPenalty(bestCumLogProbs, nSeqLen, lengthPenalty);
-            bh.batchDones[bid] = bh.minNormedScoresCBA[gbid] >= bestAttainableScore;
+            bh.batchDones[slot] = bh.minNormedScoresCBA[slot] >= bestAttainableScore;
         }
     }
     __syncthreads();
@@ -304,32 +302,33 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     __shared__ int smemSeqLen[PAD_2K / 2];
     if (tid < nBM)
     {
-        smemSeqLen[tid] = bh.sequenceLengths[bid * nBM + tid];
+        smemSeqLen[tid] = bh.sequenceLengths[slot * nBM + tid];
     }
     __syncthreads();
 
     if (tid < nBM)
     {
-        int const indexBatchBeam = bid * nBM + tid;
+        int const indexBatchBeam = slot * nBM + tid;
         int const step = smemSeqLen[tid];
         if (!bh.finished[indexBatchBeam].isFinished())
         {
             smemSeqLen[tid]++;
         }
-        int const newId = bh.outputIdsPtr[bid][tid * bh.nMaxSeqLen + step];
+        int const newId = bh.outputIdsPtr[slot][tid * bh.nMaxSeqLen + step];
         int const newBeamId = (newId / nV) % nBM;
         int const newTokenId = newId % nV;
         bh.sequenceLengths[indexBatchBeam] = smemSeqLen[newBeamId];
-        if (newTokenId == bh.endIds[bid])
+        if (newTokenId == bh.endIds[slot])
         {
             bh.finished[indexBatchBeam].setFinishedEOS();
         }
-        bh.parentIdsPtr[bid][tid * bh.nMaxSeqLen + step] = newBeamId;
-        bh.outputIdsPtr[bid][tid * bh.nMaxSeqLen + step] = newTokenId;
-        if ((earlyStopping == 1) && (bh.numBeamsCBA != nullptr && bh.numBeamsCBA[gbid] == nBM)
-            || (earlyStopping != 1) && bh.batchDones[bid])
+        bh.parentIdsPtr[slot][tid * bh.nMaxSeqLen + step] = newBeamId;
+        bh.outputIdsPtr[slot][tid * bh.nMaxSeqLen + step] = newTokenId;
+
+        if ((earlyStopping == 1) && (bh.numBeamsCBA != nullptr && bh.numBeamsCBA[slot] == nBM)
+            || (earlyStopping != 1) && bh.batchDones[slot])
         {
-            bh.batchDones[bid] = true;
+            bh.batchDones[slot] = true;
             bh.finished[indexBatchBeam].setFinished();
         }
     }
@@ -350,174 +349,19 @@ __device__ __forceinline__ MD reduce_md_op(MD a, MD b)
     return res;
 }
 
-template <typename T, int PAD_K>
-struct TopKMD
-{
-    MD md;
-    TopK<T, PAD_K> topk;
-};
-
-template <typename T, int PAD_K>
-__device__ __forceinline__ TopKMD<T, PAD_K> reduce_topk_md_op(TopKMD<T, PAD_K> const& a, TopKMD<T, PAD_K> const& b)
-{
-    TopKMD<T, PAD_K> res;
-    res.md = reduce_md_op(a.md, b.md);
-    res.topk = reduce_topk_op(a.topk, b.topk);
-    return res;
-}
-
-template <typename T, int ITEMS_PER_THREAD, int PAD_K, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void beamKernel(T const* __restrict logits, T const* __restrict bias,
-    int* __restrict pTempId, T* __restrict pTempVal, BeamHypotheses bh)
-{
-    int const tid = threadIdx.x;
-    int const bid = blockIdx.x;
-    int const nBM{bh.nBeamWidth};
-    int const nV{bh.nVocabSize};
-    int const* endIds{bh.endIds};
-    float const* cumLogProbs{bh.cumLogProbs};
-    FinishedState const* finished{bh.finished};
-    T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
-
-    TopKMD<float, PAD_K> partial;
-    partial.md.m = -MAX_T_VAL;
-    partial.md.d = 0.0F;
-    partial.topk.init();
-
-    if (finished[bid].isFinished())
-    {
-        for (int i = tid; i < nV; i += THREADBLOCK_SIZE)
-        {
-            float const val = i == endIds[bid / nBM] ? MAX_T_VAL : -MAX_T_VAL;
-            partial.md = reduce_md_op(partial.md, {val, 1.0F});
-            partial.topk.insert(val, i);
-        }
-    }
-    else
-    {
-        T const* local_logits = logits + bid * nV;
-        for (int i = tid; i < nV; i += THREADBLOCK_SIZE)
-        {
-            float const val = local_logits[i] + bias[i];
-            partial.md = reduce_md_op(partial.md, {val, 1.0F});
-            partial.topk.insert(val, i);
-        }
-    }
-
-    typedef cub::BlockReduce<TopKMD<float, PAD_K>, THREADBLOCK_SIZE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage smemReduceBuffer;
-
-    TopKMD<float, PAD_K> total = BlockReduce(smemReduceBuffer).Reduce(partial, reduce_topk_md_op<float, PAD_K>);
-
-    if (tid == 0)
-    {
-        int* localTopKId = pTempId + bid * nBM;
-        T const* localTopKVal = pTempVal + bid * nBM;
-        float const total_m = total.md.m;
-        float const total_d = logf(total.md.d);
-        float localCumLogProbs = cumLogProbs[bid];
-        for (int i = 0; i < nBM; ++i)
-        {
-            localTopKId[i] = total.topk.p[i] + bid * nV;
-            localTopKVal[i] = total.topk.u[i] - total_m - total_d + localCumLogProbs;
-        }
-    }
-}
-
 template <typename T, int ITEMS_PER_THREAD, int PAD_2K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
-    void beamStage1BaseKernel(T const* __restrict logits, T const* __restrict bias, float* __restrict pTemp,
-        int const* __restrict endIds, FinishedState const* __restrict finished, int nBM, int nV)
+    void beamStage1Kernel(T const* __restrict logits, T const* __restrict bias, float* __restrict pTemp,
+        int const* __restrict endIds, FinishedState const* __restrict finished, int const nV, int const nVLocal,
+        runtime::SizeType32 const* batchSlots, int dyn_smem_size)
 {
-    // Compare to beamStage1FastKernel, here is no share memory for storage of logits,
-    // and each ThreadBlock is responsible for `nV / nVPart` elements
-    constexpr int PACKED_TOP_KMD_SIZE = 2 * PAD_2K + 2;
+    constexpr auto PACKED_TOP_KMD_SIZE = 2 * PAD_2K + 2;
+    int const nBM = gridDim.y;
     int const tid = threadIdx.x;
-    int const bid = blockIdx.x;
-    int const nVLocal = (nV + gridDim.y - 1) / gridDim.y;
-    int const section_start = nVLocal * blockIdx.y;
+    int const slot = batchSlots ? batchSlots[blockIdx.x] : blockIdx.x;
+    int const section_start = nVLocal * blockIdx.z;
     int const section_end = std::min(section_start + nVLocal, nV);
-    T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
-
-    // Load element from logits to do reduce_md and argmax meanwhile
-#if TOPK_FP16_STORAGE == 1
-    TopKMD<__half, PAD_2K> partial;
-#else
-    TopKMD<T, PAD_2K> partial;
-#endif
-    partial.md.m = -MAX_T_VAL;
-    partial.md.d = 0.0F;
-    partial.topk.init();
-
-    if (finished[bid].isFinished())
-    {
-#pragma unroll 1
-        for (int i = section_start + tid; i < section_end; i += THREADBLOCK_SIZE)
-        {
-            float const val = (i == endIds[bid / nBM]) ? MAX_T_VAL : -MAX_T_VAL;
-            MD const new_elem_md{val, 1.0F};
-            partial.md = reduce_md_op(partial.md, new_elem_md);
-            partial.topk.insert(val, i);
-        }
-    }
-    else
-    {
-        T const* local_logits = logits + bid * nV;
-#pragma unroll 1
-        for (int i = section_start + tid; i < section_end; i += THREADBLOCK_SIZE)
-        {
-            T const b = bias == nullptr ? (T) 0.0f : bias[i];
-            T const val = local_logits[i] + b;
-            MD new_elem_md{val, 1.0F};
-            partial.md = reduce_md_op(partial.md, new_elem_md);
-            partial.topk.insert(val, i);
-        }
-    }
-
-    // Search the top 2K elements among `nV` elements and write into smemOutput
-#if TOPK_FP16_STORAGE == 1
-    typedef cub::BlockReduce<TopKMD<__half, PAD_2K>, THREADBLOCK_SIZE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage smemReduceBuffer;
-    TopKMD<__half, PAD_2K> total = BlockReduce(smemReduceBuffer).Reduce(partial, reduce_topk_md_op<__half, PAD_2K>);
-#else
-    typedef cub::BlockReduce<TopKMD<T, PAD_2K>, THREADBLOCK_SIZE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage smemReduceBuffer;
-    TopKMD<T, PAD_2K> total = BlockReduce(smemReduceBuffer).Reduce(partial, reduce_topk_md_op<T, PAD_2K>);
-#endif
-    __shared__ float smemOutput[PACKED_TOP_KMD_SIZE];
-
-    if (tid == 0)
-    {
-        for (int i = 0; i < 2 * nBM; i++)
-        {
-            int const index = bid * nV + total.topk.p[i];
-            reinterpret_cast<int*>(smemOutput)[i] = index;
-            smemOutput[PAD_2K + i] = total.topk.u[i];
-        }
-        smemOutput[2 * PAD_2K] = total.md.d;
-        smemOutput[2 * PAD_2K + 1] = total.md.m;
-    }
-    __syncthreads();
-
-    // Write the smemOutput into pTemp
-    float* local_temp_buffer = pTemp + bid * PACKED_TOP_KMD_SIZE * gridDim.y + blockIdx.y * PACKED_TOP_KMD_SIZE;
-#pragma unroll
-    for (int i = tid; i < PACKED_TOP_KMD_SIZE; i += THREADBLOCK_SIZE)
-    {
-        local_temp_buffer[i] = smemOutput[i];
-    }
-}
-
-template <typename T, int ITEMS_PER_THREAD, int PAD_2K, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T const* __restrict logits,
-    T const* __restrict bias, float* __restrict pTemp, int const* __restrict endIds,
-    FinishedState const* __restrict finished, int const nBM, int const nV, int const nVLocal)
-{
-    constexpr int PACKED_TOP_KMD_SIZE = 2 * PAD_2K + 2;
-    int const tid = threadIdx.x;
-    int const bid = blockIdx.x;
-    int const section_start = nVLocal * blockIdx.y;
-    int const section_end = std::min(section_start + nVLocal, nV);
+    auto const nVOffset = (blockIdx.x * nBM + blockIdx.y) * nV;
     int const valid_smem_length = section_end - section_start;
     T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
 
@@ -533,15 +377,15 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
 #else
     using KVPair = cub::KeyValuePair<int, T>;
 #endif
-    KVPair topKVPairPartial{nV - 1, -MAX_T_VAL};
+
+    KVPair topKVPairPartial{-1, -MAX_T_VAL};
     cub::ArgMax argmax;
 
-    if (finished[bid].isFinished())
+    if (finished[slot * nBM + blockIdx.y].isFinished())
     {
-#pragma unroll 1
         for (int i = section_start + tid; i < section_end; i += THREADBLOCK_SIZE)
         {
-            float const val = (i == endIds[bid / nBM]) ? MAX_T_VAL : -MAX_T_VAL;
+            float const val = (i == endIds[slot]) ? MAX_T_VAL : -MAX_T_VAL;
             int const smem_index = i - section_start;
             smemLogProbs[smem_index] = val;
             MD const new_elem_md{val, 1.0F};
@@ -552,12 +396,10 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
     }
     else
     {
-        T const* local_logits = logits + bid * nV;
-#pragma unroll 1
         for (int i = section_start + tid; i < section_end; i += THREADBLOCK_SIZE)
         {
             T const b = bias == nullptr ? (T) 0.0f : bias[i];
-            T const val = local_logits[i] + b;
+            T const val = logits[nVOffset + i] + b;
             int const smem_index = i - section_start;
             smemLogProbs[smem_index] = val;
             MD new_elem_md{val, 1.0F};
@@ -566,6 +408,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
             topKVPairPartial = argmax(topKVPairPartial, new_elem_topk);
         }
     }
+
     __syncthreads();
 
     // Search the top 2K elements among `nVLocal` elements of this ThreadBlock and write into smemOutput
@@ -587,7 +430,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
         KVPair topKVPair = BlockReduceTopK(smemReduceBuffer.topk).Reduce(topKVPairPartial, argmax);
         if (tid == 0)
         {
-            int const index = bid * nV + section_start + topKVPair.key;
+            int const index = nVOffset + section_start + topKVPair.key;
             reinterpret_cast<int*>(smemOutput)[i] = index;
             smemOutput[PAD_2K + i] = topKVPair.value;
             smemLogProbs[topKVPair.key] = -MAX_T_VAL; // pollute the value of the popped element
@@ -606,11 +449,13 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
                 topKVPairPartial = argmax(topKVPairPartial, {index, smemLogProbs[index]});
             }
         }
+
+        // Sync due to threadToUpdate RAW dependency
+        __syncthreads();
     }
 
     // Do reduce_md among the top 2K elements in the smemOutput and write into tail of smemOutput
-    auto reduce_md_func = [](const MD& a, const MD& b) { return reduce_md_op(a, b); };
-    MD total_md = BlockReduceMD(smemReduceBuffer.md).Reduce(partial_md, reduce_md_func);
+    MD total_md = BlockReduceMD(smemReduceBuffer.md).Reduce(partial_md, reduce_md_op);
     if (tid == 0)
     {
         smemOutput[2 * PAD_2K] = total_md.d;
@@ -619,8 +464,8 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
     __syncthreads();
 
     // Write the smemOutput into pTemp
-    float* local_temp_buffer = pTemp + bid * PACKED_TOP_KMD_SIZE * gridDim.y + blockIdx.y * PACKED_TOP_KMD_SIZE;
-#pragma unroll
+    float* local_temp_buffer
+        = pTemp + (blockIdx.x * nBM + blockIdx.y) * PACKED_TOP_KMD_SIZE * gridDim.z + blockIdx.z * PACKED_TOP_KMD_SIZE;
     for (int i = tid; i < PACKED_TOP_KMD_SIZE; i += THREADBLOCK_SIZE)
     {
         local_temp_buffer[i] = smemOutput[i];
@@ -628,12 +473,15 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__ void beamStage1FastKernel(T co
 }
 
 template <typename T, int PAD_2K, int THREADBLOCK_SIZE, bool IS_FAST_KERNEL>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage2Kernel(int* __restrict pTempId, T* __restrict pTempVal,
-    float* __restrict pTemp, float const* __restrict cumLogProbs, int const nBM, int const nV, int const nVPart)
+__launch_bounds__(THREADBLOCK_SIZE) __global__
+    void beamStage2Kernel(int* __restrict pTempId, T* __restrict pTempVal, float* __restrict pTemp,
+        float const* __restrict cumLogProbs, int const nV, int const nVPart, runtime::SizeType32 const* batchSlots)
 {
     constexpr int PACKED_TOP_KMD_SIZE = 2 * PAD_2K + 2;
-    int const bid = blockIdx.x;
+    auto const nBM = gridDim.y;
+    auto const gbid = blockIdx.x * gridDim.y + blockIdx.y;
     int const tid = threadIdx.x;
+    auto const slot = batchSlots ? batchSlots[blockIdx.x] : blockIdx.x;
     T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
 
     using KVPair = cub::KeyValuePair<int, T>;
@@ -653,10 +501,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage2Kernel(int* __rest
     MD partial_md{-MAX_T_VAL, 0.0f};
     KVPair topKVPair{nV - 1, -MAX_T_VAL};
 
-    auto reduce_md_func = [](const MD& a, const MD& b) { return reduce_md_op(a, b); };
-
     // Load and unpack into registers through smem
-    float* localTempBuffer = pTemp + PACKED_TOP_KMD_SIZE * bid * nVPart;
+    float* localTempBuffer = pTemp + PACKED_TOP_KMD_SIZE * gbid * nVPart;
     if constexpr (IS_FAST_KERNEL) // Use share memory instead of global memory
     {
         extern __shared__ char smem[];
@@ -710,26 +556,23 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage2Kernel(int* __rest
     }
     __syncthreads();
 
-    MD total_md = BlockReduceMD(smemReduceBuffer.md).Reduce(partial_md, reduce_md_func);
+    MD total_md = BlockReduceMD(smemReduceBuffer.md).Reduce(partial_md, reduce_md_op);
 
     if (tid == 0)
     {
         float d_total_log = logf(total_md.d);
+        auto const cumLogProbsValue = cumLogProbs[slot * nBM + blockIdx.y];
 
-        for (int i = 0; i < PAD_2K; ++i)
+        for (int i = 0; i < 2 * nBM; ++i)
         {
             float val = (float) buf_smem_kv[i].value - total_md.m - d_total_log;
-            if (i < 2 * nBM)
-            {
-                pTempId[bid * 2 * nBM + i] = buf_smem_kv[i].key;
-                pTempVal[bid * 2 * nBM + i] = val + cumLogProbs[bid];
-            }
+            pTempId[gbid * 2 * nBM + i] = buf_smem_kv[i].key;
+            pTempVal[gbid * 2 * nBM + i] = val + cumLogProbsValue;
         }
     }
 }
 
 #define BEAM_STAGE2_KERNEL(N_VOCAB_PART, IS_FAST_KERNEL)                                                               \
-    do                                                                                                                 \
     {                                                                                                                  \
         if (IS_FAST_KERNEL && nShareMemory >= (48 << 10))                                                              \
         {                                                                                                              \
@@ -737,14 +580,15 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage2Kernel(int* __rest
                 cudaFuncAttributeMaxDynamicSharedMemorySize, nShareMemory));                                           \
         }                                                                                                              \
         beamStage2Kernel<T, PAD_2K, N_VOCAB_PART, IS_FAST_KERNEL>                                                      \
-            <<<nBS * nBM, N_VOCAB_PART, IS_FAST_KERNEL * nShareMemory, stream>>>(                                      \
-                pTempId, pTempVal, pTemp, cumLogProbs, nBM, nV, nVPart);                                               \
-    } while (0);                                                                                                       \
+            <<<dim3(nBS, nBM), N_VOCAB_PART, IS_FAST_KERNEL * nShareMemory, stream>>>(                                 \
+                pTempId, pTempVal, pTemp, cumLogProbs, nV, nVPart, batchSlots);                                        \
+    }                                                                                                                  \
     return;
 
 template <typename T, int PAD_2K>
 __inline__ void beamStage2KernelLauncher(float* pTemp, float const* cumLogProbs, int* pTempId, T* pTempVal,
-    int const nBS, int const nBM, int const nVPart, int const nV, int const max_smem_per_block, cudaStream_t stream)
+    int const nBS, int const nBM, int const nVPart, int const nV, int const max_smem_per_block, cudaStream_t stream,
+    runtime::SizeType32 const* batchSlots)
 {
     // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
     size_t const nShareMemory = sizeof(float) * nVPart * (2 * PAD_2K + 2) + sizeof(cub::KeyValuePair<int, T>) * PAD_2K;
@@ -813,6 +657,7 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     int const nBM{bh.nBeamWidth};
     int const nV{bh.nVocabSize};
     int const* endIds{bh.endIds};
+    runtime::SizeType32 const* batchSlots{bh.batchSlots};
     FinishedState const* finished{bh.finished};
 
     int const offset = roundUp(nBS * nBM * nBM * 2, 4);
@@ -820,12 +665,10 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     T* pTempVal = reinterpret_cast<T*>(pTempId + offset);
     float* pTemp = reinterpret_cast<float*>(pTempVal + offset);
 
-#ifdef DO_SPLIT_SMALL_TOP_K_SOFTMAX
-
     // Upper limit count of ThreadBlock, gotten by using no share memory
     int max_active_blocks = -1;
     TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_active_blocks, beamStage1FastKernel<T, items_per_thread, 2 * PAD_K, nBlockSize>, nBlockSize, 0));
+        &max_active_blocks, beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize>, nBlockSize, 0));
 
     // Find the max smem on the device and use that to determine the vocab parts in the best case.
     int max_smem_per_sm = -1;
@@ -834,7 +677,7 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
     cudaFuncAttributes attr;
-    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1FastKernel<T, items_per_thread, 2 * PAD_K, nBlockSize>));
+    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize>));
 
     // One ThreadBlock must at least have share memory of `sizeof(T) * nV / nMaxVocabPartForStage1FastKernel` bytes
     int const static_smem = attr.sharedSizeBytes;
@@ -855,47 +698,22 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
         nVPart = ceilDiv(sizeof(T) * nV, dyn_smem_size);
     }
 
-    if (nVPart <= nMaxVocabPartForStage1FastKernel)
+    int const nVocabChunk = (nV + nVPart - 1) / nVPart;
+    int const dyn_smem_size = sizeof(T) * nVocabChunk;
+    if (dyn_smem_size >= (48 << 10))
     {
-        // Use stage 1 fast kernel
-        int const nVocabChunk = (nV + nVPart - 1) / nVPart;
-        int const dyn_smem_size = sizeof(T) * nVocabChunk;
-        if (dyn_smem_size >= (48 << 10))
-        {
-            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage1FastKernel<T, items_per_thread, 2 * PAD_K, nBlockSize>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem_size));
-        }
-        dim3 gridSize(nBS * nBM, nVPart);
-        beamStage1FastKernel<T, items_per_thread, 2 * PAD_K, nBlockSize>
-            <<<gridSize, nBlockSize, dyn_smem_size, stream>>>(
-                logits, bias, pTemp, endIds, finished, nBM, nV, nVocabChunk);
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem_size));
     }
-    else
-    {
-        // Use stage 1 base kernel, useless branch now
-        int nVPart = 4;
-        if (nBS * nBM < 256)
-        {
-            // TODO: add heuristics for base stage 1 kernel
-            // Volta has 80 SMs, so we aim for three waves
-            nVPart = (240 + nBS * nBM - 1) / (nBS * nBM);
-            nVPart = std::min(128, nVPart); // we implement up to 128
-        }
-        cudaFuncSetAttribute(beamStage1BaseKernel<T, items_per_thread, 2 * PAD_K, nBlockSize>,
-            cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxL1);
-        dim3 gridSize(nBS * nBM, nVPart);
-        beamStage1BaseKernel<T, items_per_thread, 2 * PAD_K, nBlockSize>
-            <<<gridSize, nBlockSize, 0, stream>>>(logits, bias, pTemp, endIds, finished, nBM, nV);
-    }
+
+    dim3 gridSize(nBS, nBM, nVPart);
+    beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize><<<gridSize, nBlockSize, dyn_smem_size, stream>>>(
+        logits, bias, pTemp, endIds, finished, nV, nVocabChunk, batchSlots, dyn_smem_size);
+
     sync_check_cuda_error();
 
     beamStage2KernelLauncher<T, 2 * PAD_K>(
-        pTemp, bh.cumLogProbs, pTempId, pTempVal, nBS, nBM, nVPart, nV, max_smem_per_block, stream);
-
-#else
-    beamKernel<T, items_per_thread, PAD_K, nBlockSize>
-        <<<nBS * nBM, nBlockSize, 0, stream>>>(logits, bias, pTempId, pTempVal, bh);
-#endif
+        pTemp, bh.cumLogProbs, pTempId, pTempVal, nBS, nBM, nVPart, nV, max_smem_per_block, stream, batchSlots);
 
     sync_check_cuda_error();
 

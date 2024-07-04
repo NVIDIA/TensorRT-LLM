@@ -18,7 +18,7 @@ import math
 import os
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Union
 
@@ -458,10 +458,11 @@ class BuildConfig:
     input_timing_cache: str = None
     output_timing_cache: str = None
     lora_config: LoraConfig = LoraConfig()
-    auto_parallel_config: AutoParallelConfig = AutoParallelConfig()
+    auto_parallel_config: AutoParallelConfig = field(
+        default_factory=AutoParallelConfig)
     weight_sparsity: bool = False
     weight_streaming: bool = False
-    plugin_config: PluginConfig = PluginConfig()
+    plugin_config: PluginConfig = field(default_factory=PluginConfig)
     use_strip_plan: bool = False
     max_encoder_input_len: int = 1  # for enc-dec DecoderModel
     use_fused_mlp: bool = False
@@ -485,6 +486,16 @@ class BuildConfig:
             multiple_profiles=self.plugin_config.multiple_profiles,
         )
         self.max_num_tokens, self.opt_num_tokens = max_num_tokens, opt_num_tokens
+
+        if self.plugin_config.remove_input_padding and self.plugin_config.context_fmha:
+            if self.max_input_len:
+                logger.warning(
+                    'padding removal and fMHA are both enabled, max_input_len is not required and will be ignored'
+                )
+        else:
+            assert self.max_input_len is not None, 'padding removal and fMHA aren\'t both enabled, max_input_len is required'
+            if self.max_seq_len:
+                assert self.max_input_len <= self.max_seq_len, 'max_input_len should not be larger than max_seq_len'
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
@@ -720,7 +731,9 @@ def optimize_model_with_config(model: PretrainedModel,
     return model
 
 
-def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
+def build(model: PretrainedModel,
+          build_config: BuildConfig,
+          return_build_config: bool = False) -> Engine | BuildConfig:
     '''Build engine from given model and optimization options specified in the build_config
        WARNING: this function may change the given \p model object state in some optimization passes
        to avoid cloning a model since normally the LLM models consumes large memory.
@@ -819,6 +832,11 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(
         nccl_plugin, network.plugin_config.use_custom_all_reduce)
+
+    # NOTE: Please never change the build_config object after this point!
+    if return_build_config:
+        # Get an modified build_config that is the same as the one in the final engine dir
+        return build_config
 
     with net_guard(network):
         # Prepare

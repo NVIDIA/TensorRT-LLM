@@ -2662,7 +2662,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 // This makes sure we have coalesced memory access.
                 V_vec_k final_out;
                 convert_from_float(&final_out, out);
-                *reinterpret_cast<V_vec_k*>(&params.out[bhvi]) = final_out;
+                *reinterpret_cast<V_vec_k*>(static_cast<T*>(params.out) + bhvi) = final_out;
             }
         }
         else
@@ -2680,7 +2680,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             convert_from_float(reinterpret_cast<float*>(&params.partial_sum[partial_stats_offset]), sum);
         }
 #else  // MMHA_USE_FP32_ACCUM_FOR_OUT
-        *reinterpret_cast<V_vec_accum*>(&params.out[bhvi]) = out;
+        *reinterpret_cast<V_vec_accum*>(static_cast<T*>(params.out) + bhvi) = out;
 #endif // MMHA_USE_FP32_ACCUM_FOR_OUT
     }
 
@@ -2838,7 +2838,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
                 else
                 {
-                    *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_accumulated_out;
+                    *reinterpret_cast<V_vec_k*>(static_cast<T*>(params.out) + (bhi * Dh + oi)) = thread_accumulated_out;
                 }
             }
 

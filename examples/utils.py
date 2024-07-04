@@ -18,6 +18,7 @@ from typing import Optional
 
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
+from tensorrt_llm.bindings import GptJsonConfig
 from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
@@ -52,6 +53,19 @@ DEFAULT_PROMPT_TEMPLATES = {
     'QWenForCausalLM':
     "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
 }
+
+
+def supports_inflight_batching(engine_dir):
+    config_path = Path(engine_dir) / "config.json"
+    json_config = GptJsonConfig.parse_file(config_path)
+    model_config = json_config.model_config
+    return model_config.supports_inflight_batching
+
+
+def read_decoder_start_token_id(engine_dir):
+    with open(Path(engine_dir) / "config.json", 'r') as f:
+        config = json.load(f)
+    return config['pretrained_config']['decoder_start_token_id']
 
 
 def read_model_name(engine_dir: str):
@@ -315,4 +329,16 @@ def add_common_args(parser):
         action='store_true',
         help="Use device map 'auto' to load a pretrained HF model. This may "
         "help to test a large model that cannot fit into a singlue GPU.")
+
+    parser.add_argument(
+        "--return_all_generated_tokens",
+        default=False,
+        action="store_true",
+        help="if false, return only generated tokens at each streaming step."
+        "If true, return the full beams/outputs at each step"
+        "Overwritten to True if num_beams>1 and streaming"
+        "(only available with cpp session). "
+        "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
+    )
+
     return parser

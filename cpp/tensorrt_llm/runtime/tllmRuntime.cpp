@@ -62,7 +62,7 @@ class StreamReader final : public nvinfer1::IStreamReader
 public:
     StreamReader(std::filesystem::path fp)
     {
-        mFile.open(fp.string());
+        mFile.open(fp.string(), std::ios::binary | std::ios::in);
         TLLM_CHECK_WITH_INFO(mFile.good(), std::string("Error opening engine file: " + fp.string()));
     }
 

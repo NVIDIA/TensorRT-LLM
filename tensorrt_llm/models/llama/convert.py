@@ -1266,6 +1266,8 @@ class QkvWeightHelper:
         self.tp_size = config.mapping.tp_size
         self.tp_rank = config.mapping.tp_rank
         self.is_mha = self.num_heads == self.num_kv_heads
+        self.head_size = None if not hasattr(config,
+                                             "head_size") else config.head_size
         self._qkv_weights = {}
 
     @staticmethod
@@ -1301,7 +1303,7 @@ class QkvWeightHelper:
         q, k, v = (torch.tensor(weights[t]) for t in ['q', 'k', 'v'])
 
         if not self.is_mha:
-            head_size = self.hidden_size // self.num_heads
+            head_size = self.hidden_size // self.num_heads if self.head_size is None else self.head_size
             if self.num_kv_heads < self.tp_size:
                 # duplicate the KV heads up to tensor_parallel
                 k = dup_kv_weight(k, self.num_kv_heads, self.tp_size)

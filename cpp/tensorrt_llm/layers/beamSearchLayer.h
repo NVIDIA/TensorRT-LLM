@@ -20,6 +20,7 @@
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/decodingOutput.h"
 
 #include <optional>
 #include <utility>
@@ -28,30 +29,6 @@ namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm::layers
 {
-
-class BeamSearchInputParams : public DecodingInputs
-{
-public:
-    explicit BeamSearchInputParams(runtime::SizeType32 step, runtime::SizeType32 ite, tc::Tensor logits,
-        tc::Tensor endIds, tc::Tensor srcCacheIndirection, runtime::SizeType32 maxAttentionWindow,
-        runtime::SizeType32 sinkTokenLength, runtime::SizeType32 maxSeqLen, runtime::SizeType32 localBatchSize)
-        : DecodingInputs(std::move(endIds), step, ite, localBatchSize)
-        , logits{std::move(logits)}
-        , maxAttentionWindow{maxAttentionWindow}
-        , sinkTokenLength{sinkTokenLength}
-        , maxSeqLen{maxSeqLen}
-        , srcCacheIndirection{std::move(srcCacheIndirection)}
-    {
-    }
-
-    // mandatory parameters
-    tc::Tensor logits; // [maxBatchSize, beamWidth, vocabSizePadded]
-    runtime::SizeType32 maxAttentionWindow;
-    runtime::SizeType32 sinkTokenLength;
-    runtime::SizeType32 maxSeqLen;
-    tc::Tensor srcCacheIndirection;         // [BS, BM, mSL]
-    std::optional<tc::Tensor> inputLengths; // [BS, BM]
-};
 
 template <typename T>
 class BeamSearchLayer : public BaseLayer
@@ -70,13 +47,9 @@ public:
         std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
 private:
-    void forwardAsyncSingleRequest(
-        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs);
-
     void allocateBuffer(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth);
     void freeBuffer();
 
-private:
     using Base::mAllocator;
     using Base::mStream;
 
@@ -94,7 +67,6 @@ private:
     std::vector<float> mDiversityRateHost;
     std::vector<float> mLengthPenaltyHost;
     std::vector<int> mEarlyStoppingHost;
-    bool mHasDiffRuntimeArgs{false};
 };
 
 } // namespace tensorrt_llm::layers

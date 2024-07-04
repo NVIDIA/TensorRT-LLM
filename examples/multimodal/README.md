@@ -7,8 +7,7 @@ Multimodal models' LLM part has an additional parameter `--max_multimodal_len` c
 
 We first describe how to run each model on a single GPU. We then provide general guidelines on using tensor parallelism for the LLM part of the pipeline.
 
-- [BLIP2-T5](#blip2-t5)
-- [BLIP2-OPT](#blip2-opt)
+- [BLIP2](#blip2)
 - [CogVLM](#cogvlm)
 - [Deplot](#deplot)
 - [Fuyu](#fuyu)
@@ -20,29 +19,55 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Video NeVA](#video-neva)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
-## BLIP2-T5
+## BLIP2
+
+This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed when switching the LLM backbone.
 
 1. Download Huggingface weights and convert original checkpoint to TRT-LLM checkpoint format
-   following example in `examples/enc_dec/README.md`.
+   following example in `examples/opt/README.md` and `examples/enc_dec/README.md`.
 
     ```bash
-    export MODEL_NAME="flan-t5-xl" # also flan-t5-xxl
-    git clone https://huggingface.co/google/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    export MODEL_NAME="blip2-opt-2.7b" # options: blip2-opt-6.7b, blip2-flan-t5-xl, blip2-flan-t5-xxl
+    git clone https://huggingface.co/Salesforce/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
 
-    python ../enc_dec/convert_checkpoint.py --model_type t5 \
+    For BLIP2-OPT family,
+    ```bash
+    python ../opt/convert_checkpoint.py --model_type blip2 \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --dtype float16
+    ```
+
+    For BLIP2-T5 family,
+    ```bash
+    python ../enc_dec/convert_checkpoint.py --model_type blip2 \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
         --tp_size 1 \
         --pp_size 1 \
-        --dtype bfloat16 \
-        --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
+        --dtype bfloat16
     ```
 
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
+    For BLIP2-OPT family,
+    ```bash
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin float16 \
+        --max_beam_width 1 \
+        --max_batch_size 8 \
+        --max_seq_len 1024 \
+        --max_input_len 924 \
+        --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
+    ```
+
+    For BLIP2-T5 family,
     ```bash
     trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/encoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/encoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/encoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -54,13 +79,11 @@ We first describe how to run each model on a single GPU. We then provide general
         --context_fmha disable \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_seq_len 1024 \
         --max_input_len 924 \
         --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
 
-    # Same command for decoder but don't set --max_multimodal_len
     trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -74,17 +97,15 @@ We first describe how to run each model on a single GPU. We then provide general
         --max_batch_size 8 \
         --max_seq_len 1024 \
         --max_encoder_input_len 924 \
-        --max_input_len 1
+        --max_input_len 1 # Same command for decoder but don't set --max_multimodal_len
     ```
 
     **NOTE**: `max_multimodal_len = max_batch_size * num_visual_features`, so if you change max_batch_size, max multimodal length **MUST** be changed accordingly.
 
-    The built T5 engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16`.
-
-3. Build TensorRT engines for visual components
+3. Build TensorRT engines for vision encoders
 
     ```bash
-    python build_visual_engine.py --model_type ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8
+    python build_visual_engine.py --model_type blip2 --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8
     ```
 
     The built engines are located in `./visual_engines/${MODEL_NAME}`.
@@ -93,46 +114,8 @@ We first describe how to run each model on a single GPU. We then provide general
 
 4. Assemble everything into BLIP2 pipeline
 
+    For BLIP2-OPT family,
     ```bash
-    python run.py \
-        --max_new_tokens 30 \
-        --input_text "Question: which city is this? Answer:" \
-        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
-        --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16
-    ```
-
-## BLIP2-OPT
-
-OPT pipeline needs few minor changes from T5 pipeline
-
-1. Convert Huggingface weights to TRT-LLM checkpoint format following `examples/opt/README.md`.
-
-2. Use `trtllm-build` command to build TRT-LLM engine for OPT.
-
-3. The full list of commands is as follows:
-
-    ```bash
-    export MODEL_NAME="opt-2.7b" # also opt-6.7b
-    git clone https://huggingface.co/facebook/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-
-    python ../opt/convert_checkpoint.py \
-        --model_dir tmp/hf_models/${MODEL_NAME} \
-        --dtype float16 \
-        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu
-
-    trtllm-build \
-        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
-        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --gemm_plugin float16 \
-        --max_beam_width 1 \
-        --max_batch_size 8 \
-        --max_multimodal_len 256 \
-        --max_input_len 924 \
-        --max_seq_len 1024
-
-    python build_visual_engine.py --model_type ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
-
     python run.py \
         --max_new_tokens 30 \
         --input_text "Question: which city is this? Answer:" \
@@ -141,7 +124,17 @@ OPT pipeline needs few minor changes from T5 pipeline
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
-4. INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
+    For BLIP2-T5 family,
+    ```bash
+    python run.py \
+        --max_new_tokens 30 \
+        --input_text "Question: which city is this? Answer:" \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/bfloat16
+    ```
+
+5. (Optional) INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
     python ../opt/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
@@ -640,7 +633,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16 \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16
     ```
 
     Note: Nougat models usually do not need a text prompt.
@@ -681,7 +674,8 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu/
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
+        --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
     ```
 
 ## Video NeVA

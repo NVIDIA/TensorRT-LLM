@@ -279,6 +279,8 @@ struct IterationStats
     double iterLatencyMS;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
+    /// @brief Number of queued requests
+    SizeType32 numQueuedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
     /// @brief GPU memory usage in bytes
@@ -375,7 +377,7 @@ public:
 
     static auto constexpr Medusa()
     {
-        return DecodingMode{kMedusa | kUseMinLength | kStandardStopCriteria};
+        return DecodingMode{kMedusa | kUseMinLength | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr Lookahead()

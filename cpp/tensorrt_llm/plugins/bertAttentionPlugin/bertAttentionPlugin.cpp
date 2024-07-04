@@ -32,13 +32,12 @@ static char const* BERT_ATTENTION_PLUGIN_NAME{"BertAttention"};
 PluginFieldCollection BertAttentionPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> BertAttentionPluginCreator::mPluginAttributes;
 
-BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_scaling, bool qk_half_accum,
+BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_scaling,
     ContextFMHAType context_fmha_type, nvinfer1::DataType type, bool do_relative_attention, int max_distance,
     bool remove_padding)
     : mNumHeads(num_heads)
     , mHeadSize(head_size)
     , mQScaling(q_scaling)
-    , mQKHalfAccum(qk_half_accum)
     , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
     , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC)
     , mType(type)
@@ -539,7 +538,6 @@ BertAttentionPluginCreator::BertAttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, -1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, -1));
     mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("enable_qk_half_accum", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("do_relative_attention", nullptr, PluginFieldType::kINT8, 0));
@@ -569,7 +567,6 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(char const* name, PluginFiel
     PluginField const* fields = fc->fields;
     int num_heads, head_size;
     ContextFMHAType context_fmha_type;
-    bool qk_half_accum;
     float q_scaling;
     nvinfer1::DataType type;
     bool do_relative_attention;
@@ -593,11 +590,6 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(char const* name, PluginFiel
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
             q_scaling = static_cast<float>(*(static_cast<float const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "enable_qk_half_accum"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            qk_half_accum = static_cast<bool>(*(static_cast<int8_t const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "context_fmha_type"))
         {
@@ -627,7 +619,7 @@ IPluginV2* BertAttentionPluginCreator::createPlugin(char const* name, PluginFiel
     }
     try
     {
-        auto* obj = new BertAttentionPlugin(num_heads, head_size, q_scaling, qk_half_accum, context_fmha_type, type,
+        auto* obj = new BertAttentionPlugin(num_heads, head_size, q_scaling, context_fmha_type, type,
             do_relative_attention, max_distance, remove_padding);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

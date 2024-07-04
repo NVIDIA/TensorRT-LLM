@@ -27,6 +27,9 @@
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include <cuda/atomic>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
 #include <cuda/std/limits>
 #include <cuda_fp16.h>
 
@@ -74,8 +77,7 @@ struct alignas(128) Counter
     alignas(128) IdxT filterCnt;
 
     // For a row inside a batch, we may launch multiple thread blocks. This counter is
-    // used to determine if the current block is the last running block. If so, this block
-    // will execute scan() and chooseBucket().
+    // used to determine if the current block is the last running block.
     alignas(128) uint32_t finishedBlockCnt;
 };
 
@@ -699,37 +701,6 @@ __device__ void scan(IdxT volatile* histogram, IdxT* histogramOut)
 }
 
 /**
- * Calculate in which bucket the k-th value will fall
- *  (steps 3 in `airTopPSampling` description)
- */
-template <typename T, typename IdxT, typename AccT, int BitsPerPass>
-__device__ void chooseBucket(
-    Counter<T, IdxT, AccT>* counter, AccT const* histogram, IdxT const* countHistogram, AccT const sum, int const pass)
-{
-    int constexpr numBuckets = calcNumBuckets<BitsPerPass>();
-    for (int i = threadIdx.x; i < numBuckets; i += blockDim.x)
-    {
-        AccT prev = (i == 0) ? 0 : histogram[i - 1];
-        AccT cur = histogram[i];
-
-        // one and only one thread will satisfy this condition, so counter is
-        // written by only one thread
-        // Add strict check for negetive cases.
-        if ((sum > 0 && prev < sum && cur >= sum) || (sum <= 0 && prev == 0 && cur != 0))
-        {
-            if (countHistogram[i])                // Only check meaningful ones
-            {
-                counter->sum = sum - prev;        // how many values still are there to find
-                counter->len = countHistogram[i]; // cur - prev; // number of values in next pass
-                typename cub::Traits<T>::UnsignedBits bucket = i;
-                int startBit = calcStartBit<T, BitsPerPass>(pass);
-                counter->kthValueBits |= bucket << startBit;
-            }
-        }
-    }
-}
-
-/**
  * Computes sequenceLength, finished state, outputLogProbs, and cumLogProbs.
  */
 template <typename T, typename IdxT>
@@ -1135,44 +1106,89 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
                 }
             }
         }
-        __shared__ IdxT maxBucket;
-        if (pass > 0)
-        {
-            // Avoid the scenario where currentSum is larger than the meaningful maximum prefix sum.
-            // This situation happens because these two values are calculted in different ways.
-            // So the precision loss during the calculation is also different.
 
-            if (threadIdx.x == 0)
+        // To avoid the error related to the prefix sum from cub, we find the bucket sequentially.
+        int constexpr WARP_SIZE = 32;
+        int constexpr WARP_COUNT = numBuckets / WARP_SIZE;
+        namespace cg = cooperative_groups;
+        cg::thread_block block = cg::this_thread_block();
+        cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+        AccT* histPtr = isDeterministic ? histValueSmem : reinterpret_cast<AccT*>(histogram);
+        __shared__ AccT warpSum[WARP_COUNT];
+        __shared__ cuda::atomic<AccT, cuda::thread_scope_block> blockSum;
+        if constexpr (BitsPerPass != 11)
+        {
+            for (int i = threadIdx.x; i < numBuckets; i += BlockSize)
             {
-                maxBucket = 0;
+                warpSum[i] = 0;
             }
             __syncthreads();
-            for (int i = threadIdx.x; i < numBuckets; i += blockDim.x)
+        }
+
+        // Acquire the summation of each 32 buckets
+        for (int i = threadIdx.x; i < numBuckets; i += BlockSize)
+        {
+            reduce_store_async(warp, warpSum + i / WARP_SIZE, histPtr[i], cg::plus<float>{});
+        }
+        __syncthreads();
+
+        // Acquire the summation of all the 2048 buckets
+        if (threadIdx.x < WARP_SIZE)
+        {
+            reduce_store_async(warp, blockSum, warpSum[threadIdx.x], cg::plus<float>{});
+            if constexpr (BitsPerPass == 11)
+            {
+                reduce_update_async(warp, blockSum, warpSum[threadIdx.x + WARP_SIZE], cg::plus<float>{});
+            }
+        }
+        __syncthreads();
+
+        // Update currentSum
+        if (pass == 0)
+        {
+            currentSum = blockSum * counter->p;
+        }
+
+        if (threadIdx.x == 0)
+        {
+            AccT prev = 0;
+
+            // Add 32 elements each step
+            int iStep = 0;
+            int targetStep = 0;
+            for (; iStep < WARP_COUNT; iStep++)
+            {
+                if (warpSum[iStep])
+                {
+                    targetStep = iStep;
+                    if ((prev + warpSum[iStep]) >= currentSum)
+                    {
+                        break;
+                    }
+                    prev += warpSum[iStep];
+                }
+            }
+
+            int targetIdx = 0;
+            for (int i = targetStep * WARP_SIZE; i < numBuckets; i++)
             {
                 if (countHistogram[i])
                 {
-                    atomicMax(&maxBucket, i);
+                    targetIdx = i;
+                    if ((prev + histPtr[i]) >= currentSum)
+                    {
+                        break;
+                    }
+                    prev += histPtr[i];
                 }
             }
-            __syncthreads();
-        }
 
-        scan<AccT, BitsPerPass, BlockSize>(
-            isDeterministic ? histValueSmem : reinterpret_cast<AccT*>(histogram), histValueSmem);
-        __syncthreads();
-        if (pass == 0)
-        {
-            currentSum = histValueSmem[numBuckets - 1] * counter->p;
+            counter->sum = currentSum - prev;         // how many values still are there to find
+            counter->len = countHistogram[targetIdx]; // cur - prev; // number of values in next pass
+            typename cub::Traits<T>::UnsignedBits bucket = targetIdx;
+            int startBit = calcStartBit<T, BitsPerPass>(pass);
+            counter->kthValueBits |= bucket << startBit;
         }
-        else
-        {
-            if (currentSum > histValueSmem[maxBucket])
-            {
-                currentSum = histValueSmem[maxBucket];
-            }
-        }
-
-        chooseBucket<T, IdxT, AccT, BitsPerPass>(counter, histValueSmem, countHistogram, currentSum, pass);
         __syncthreads();
 
         int constexpr numPasses = calcNumPasses<T, BitsPerPass>();

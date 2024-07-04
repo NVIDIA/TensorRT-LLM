@@ -7,8 +7,8 @@ import pytest
 import torch
 from parameterized import parameterized
 
-from tensorrt_llm.hlapi.llm import (LLM, KvCacheConfig, ModelConfig,
-                                    SamplingParams)
+from tensorrt_llm.hlapi.llm import LLM, SamplingParams
+from tensorrt_llm.hlapi.llm_utils import KvCacheConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -45,13 +45,12 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
             llama.save_checkpoint(ckpt_dir, save_config=(rank == 0))
             del llama
 
-        config = ModelConfig(ckpt_dir)
-        assert config.parallel_config.tp_size == tp_size
         llm = LLM(
-            config,
+            ckpt_dir,
             tokenizer=tokenizer,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         )
+        assert llm.args.parallel_config.tp_size == tp_size
 
     tmpdir = tempfile.TemporaryDirectory()
     llm.save(tmpdir.name)
@@ -65,26 +64,26 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory,
         enable_executor: bool):
-    config = ModelConfig(engine_from_checkpoint.name)
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    llm = LLM(config, tokenizer=tokenizer, enable_executor=enable_executor)
+    llm = LLM(engine_from_checkpoint.name,
+              tokenizer=tokenizer,
+              enable_executor=enable_executor)
 
     sampling_params = SamplingParams(max_new_tokens=8)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
-        assert output.text == "D E F G H I J K"
+        assert output.outputs[0].text == "D E F G H I J K"
 
 
 @skip_single_gpu
 def test_llm_generate_tp2(engine_from_checkpoint):
     model_dir = engine_from_checkpoint.name
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    config = ModelConfig(model_dir)
-    config.parallel_config.tp_size = 2
 
     llm = LLM(
-        config,
+        model_dir,
+        tensor_parallel_size=2,
         tokenizer=tokenizer,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
@@ -131,10 +130,9 @@ def is_memory_enough_for_mixtral():
 @pytest.mark.skipif(not is_memory_enough_for_mixtral(),
                     reason="The test needs at least 160GB memory, skipping")
 def test_llm_generate_mixtral_for_tp2():
-    config = ModelConfig(get_model_path(mixtral_model_name))
-    config.parallel_config.tp_size = 2
     llm = LLM(
-        config,
+        get_model_path(mixtral_model_name),
+        tensor_parallel_size=2,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
     for output in llm.generate(prompts):
@@ -142,17 +140,16 @@ def test_llm_generate_mixtral_for_tp2():
 
 
 def test_llm_pp2():
-    config = ModelConfig(llama_model_path)
-    config.parallel_config.pp_size = 2
-    config.parallel_config.auto_parallel = False
     llm = LLM(
-        config,
+        llama_model_path,
+        pipeline_parallel_size=2,
+        auto_parallel=False,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
     sampling_params = SamplingParams(max_new_tokens=8, beam_width=1)
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
-        assert output.text == "D E F G H I J K"
+        assert output.outputs[0].text == "D E F G H I J K"
 
 
 def llm_end2end_tp2_cases():
@@ -169,35 +166,40 @@ def llm_end2end_tp2_cases():
 @parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
 def test_llm_end2end_tp2(llm_additional_options):
     model_path = get_model_path(default_model_name)
-    config = ModelConfig(model_path)
-    config.parallel_config.tp_size = 2
 
-    llm = LLM(config, **llm_additional_options)
+    llm = LLM(model_path, tensor_parallel_size=2, **llm_additional_options)
+    assert llm.args._convert_checkpoint_options
 
     embedding_parallel_mode = llm_additional_options.pop(
         'embedding_parallel_mode', 'SHARDING_ALONG_VOCAB')
     if embedding_parallel_mode == 'NONE':
-        assert llm._convert_checkpoint_options['use_parallel_embedding'] is False
+        assert llm.args._convert_checkpoint_options[
+            'use_parallel_embedding'] is False
     elif embedding_parallel_mode == 'SHARDING_ALONG_VOCAB':
-        assert llm._convert_checkpoint_options['use_parallel_embedding'] is True
-        assert llm._convert_checkpoint_options['embedding_sharding_dim'] == 0
+        assert llm.args._convert_checkpoint_options[
+            'use_parallel_embedding'] is True
+        assert llm.args._convert_checkpoint_options[
+            'embedding_sharding_dim'] == 0
     elif embedding_parallel_mode == 'SHARDING_ALONG_HIDDEN':
-        assert llm._convert_checkpoint_options['use_parallel_embedding'] is True
-        assert llm._convert_checkpoint_options['embedding_sharding_dim'] == 1
+        assert llm.args._convert_checkpoint_options[
+            'use_parallel_embedding'] is True
+        assert llm.args._convert_checkpoint_options[
+            'embedding_sharding_dim'] == 1
 
     if 'share_embedding_table' in llm_additional_options:
-        assert llm._convert_checkpoint_options[
+        assert llm.args._convert_checkpoint_options[
             'share_embedding_table'] == llm_additional_options.pop(
                 'share_embedding_table')
     else:
-        assert llm._convert_checkpoint_options['share_embedding_table'] is False
+        assert llm.args._convert_checkpoint_options[
+            'share_embedding_table'] is False
 
     assert len(llm_additional_options) == 0
 
     sampling_params = SamplingParams(max_new_tokens=8)
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
-        assert output.text == "D E F G H I J K"
+        assert output.outputs[0].text == "D E F G H I J K"
 
 
 @skip_single_gpu

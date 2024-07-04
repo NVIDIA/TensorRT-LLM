@@ -86,7 +86,6 @@ public:
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
-        , mMaxDraftLen(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
@@ -118,13 +117,11 @@ public:
 
     [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbAttentionLayers % pipelineParallelism == 0);
         return mNbAttentionLayers / pipelineParallelism;
     }
 
     [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbRnnLayers % pipelineParallelism == 0);
         return mNbRnnLayers / pipelineParallelism;
     }
 
@@ -364,19 +361,14 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
-    void constexpr setMaxDraftLen(SizeType32 maxDraftLen) noexcept
+    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
     {
-        mMaxDraftLen = maxDraftLen;
+        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
     }
 
-    [[nodiscard]] SizeType32 getMaxDraftLen() const
+    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
     {
-        return mMaxDraftLen;
-    }
-
-    [[nodiscard]] SizeType32 constexpr getMaxTokensPerStep() const noexcept
-    {
-        return mMaxDraftLen + 1;
+        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
     }
 
     void constexpr setContextFMHA(bool contextFMHA) noexcept
@@ -565,7 +557,7 @@ public:
         mLayerTypes = layerTypes;
     }
 
-    [[nodiscard]] SpeculativeDecodingMode getSpeculativeDecodingMode() const noexcept
+    [[nodiscard]] SpeculativeDecodingMode constexpr getSpeculativeDecodingMode() const noexcept
     {
         return mSpeculativeDecodingMode;
     }
@@ -618,8 +610,6 @@ private:
     bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
-    // TODO(rkobus): remove this from ModelConfig and use mSpeculativeDecodingModule
-    SizeType32 mMaxDraftLen;
 
     bool mContextFMHA;
     bool mPagedContextFMHA;

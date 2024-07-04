@@ -87,6 +87,23 @@ struct MOEParallelismConfig
     int ep_size = 1;
     int ep_rank = 0;
 
+    MOEParallelismConfig() = default;
+
+    MOEParallelismConfig(int tp_size, int tp_rank, int ep_size, int ep_rank)
+        : tp_size(tp_size)
+        , tp_rank(tp_rank)
+        , ep_size(ep_size)
+        , ep_rank(ep_rank)
+    {
+        // Do some basic sanity checks
+        TLLM_CHECK(tp_rank < tp_size);
+        TLLM_CHECK(tp_rank >= 0);
+        TLLM_CHECK(tp_size >= 1);
+        TLLM_CHECK(ep_rank < ep_size);
+        TLLM_CHECK(ep_rank >= 0);
+        TLLM_CHECK(ep_size >= 1);
+    }
+
     bool operator==(MOEParallelismConfig const& other) const
     {
         return tp_size == other.tp_size && tp_rank == other.tp_rank && ep_size == other.ep_size

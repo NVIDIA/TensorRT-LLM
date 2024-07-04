@@ -33,10 +33,9 @@ def parse_arguments():
                         type=str,
                         default=None,
                         choices=[
-                            'opt-2.7b', 'opt-6.7b', 'flan-t5-xl', 'flan-t5-xxl',
-                            'llava', 'vila', 'nougat', 'cogvlm', 'fuyu',
-                            'pix2struct', 'neva', 'kosmos-2', 'video-neva',
-                            'phi-3-vision'
+                            'blip2', 'llava', 'vila', 'nougat', 'cogvlm',
+                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
+                            'video-neva', 'phi-3-vision'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -77,7 +76,7 @@ class VisionEngineBuilder:
 
     def build(self):
         args = self.args
-        if 'opt' in args.model_type or 't5' in args.model_type:
+        if args.model_type == 'blip2':
             build_blip2_engine(args)
         elif args.model_type == 'pix2struct':
             build_pix2struct_engine(args)
@@ -208,8 +207,7 @@ def build_trt_engine(model_type,
 
 
 def build_blip2_engine(args):
-    model_type = 'Salesforce/blip2-' + args.model_type
-    processor = Blip2Processor.from_pretrained(model_type)
+    processor = Blip2Processor.from_pretrained(args.model_path)
 
     raw_image = Image.new('RGB', [10, 10])  # dummy image
     prompt = "Question: what is this? Answer:"
@@ -234,14 +232,22 @@ def build_blip2_engine(args):
             return self.projector(qformer_output.last_hidden_state)
 
     model = Blip2ForConditionalGeneration.from_pretrained(
-        model_type, torch_dtype=torch.float16)
+        args.model_path, torch_dtype=torch.float16)
+
+    blip2_llm = ""
+    if model.language_model.config.architectures[
+            0] == 'T5ForConditionalGeneration':
+        blip2_llm = "t5"
+    elif model.language_model.config.architectures[0] == 'OPTForCausalLM':
+        blip2_llm = "opt"
+
     wrapper = Blip2VisionWrapper(model.vision_model, model.qformer,
                                  model.language_projection, model.query_tokens)
     wrapper.to(args.device)
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
     build_trt_engine(
-        model_type,
+        args.model_type + "-" + blip2_llm,  # blip2-t5 or blip2-opt
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
         args.output_dir,
         args.max_batch_size)

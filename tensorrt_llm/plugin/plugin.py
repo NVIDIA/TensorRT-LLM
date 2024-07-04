@@ -165,7 +165,6 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _reduce_fusion: bool = field(default=False, init=False)
     _multi_block_mode: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
-    _attention_qk_half_accumulation: bool = field(default=False, init=False)
     _tokens_per_block: int = field(default=64, init=False)
     _use_paged_context_fmha: bool = field(default=False, init=False)
     _use_fp8_context_fmha: bool = field(default=False, init=False)
@@ -292,7 +291,6 @@ cli_plugin_args = [
     "use_custom_all_reduce",
     "multi_block_mode",
     "enable_xqa",
-    "attention_qk_half_accumulation",
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_fp8_context_fmha",

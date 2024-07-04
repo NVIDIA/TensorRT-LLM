@@ -84,6 +84,7 @@ public:
         , mSamplingConfig(samplingConfig)
         , mState(REQUEST_STATE_CONTEXT_INIT)
         , mIsStreaming(isStreaming)
+        , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.beamWidth > 1))
         , mEndId(endId)
         , mPadId(padId)
         , mLogitsPostProcessor(logitsPostProcessor)
@@ -126,6 +127,7 @@ public:
         , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
         , mState(REQUEST_STATE_CONTEXT_INIT)
         , mIsStreaming(req.getStreaming())
+        , mReturnAllGeneratedTokens(req.getReturnAllGeneratedTokens())
         , mEndId(req.getEndId())
         , mPadId(req.getPadId())
         , mOrigPromptLen(mPromptLen)
@@ -152,6 +154,16 @@ public:
         , mReturnEncoderOutput(req.getOutputConfig().returnEncoderOutput)
         , mDecodingIter(0)
     {
+        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnAllGeneratedTokens == false)
+        {
+            TLLM_LOG_WARNING(
+                "Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. "
+                "Returning the full beams at each streaming step is needed because beam search + streaming can change "
+                "previous outputs. Initialize request with mReturnAllGeneratedTokens = True to dismiss this error."
+                "WARNING: using this option may increase network usage significantly (quadratically w.r.t output "
+                "length).");
+            mReturnAllGeneratedTokens = true;
+        }
         if (req.getEncoderInputTokenIds())
         {
             mState = REQUEST_STATE_ENCODER_INIT;
@@ -224,7 +236,10 @@ public:
 
         if (mPromptLen > maxInputLen)
         {
-            TLLM_THROW("Prompt length (%d) exceeds maximum input length (%d).", mPromptLen, maxInputLen);
+            TLLM_THROW(
+                "Prompt length (%d) exceeds maximum input length (%d). Set log level to info and check "
+                "TRTGptModel logs for how maximum input length is set",
+                mPromptLen, maxInputLen);
         }
 
         // Maximum number of draft tokens per request we pass to the engine for single runtime iteration.
@@ -243,8 +258,13 @@ public:
 
             if (mPromptLen + draftLenPerEngineStep > maxInputLen)
             {
-                TLLM_THROW("Prompt length + number of draft tokens (%d + %d) exceeds maximum input length (%d).",
-                    mPromptLen, draftLenPerEngineStep, maxInputLen);
+                auto const newDraftLenPerEngineStep = maxInputLen - mPromptLen;
+                TLLM_LOG_WARNING(
+                    "Prompt length + number of draft tokens (%d + %d) exceeds maximum input length (%d)."
+                    "Number of draft tokens is changed to (%d)",
+                    mPromptLen, draftLenPerEngineStep, maxInputLen, newDraftLenPerEngineStep);
+                draftLenPerEngineStep = newDraftLenPerEngineStep;
+                mDraftTokens->resize(draftLenPerEngineStep);
             }
         }
 
@@ -570,6 +590,15 @@ public:
         return mDraftTokens->size();
     }
 
+    void discardDraftTokens(SizeType32 numTokensToDiscard)
+    {
+        TLLM_CHECK_WITH_INFO(
+            numTokensToDiscard > 0, "Can only discard a positive amount of draft tokens, got %d", numTokensToDiscard);
+        TLLM_CHECK_WITH_INFO(numTokensToDiscard <= getNumDraftTokens(),
+            "Can't discard more draft tokens (%d) than exists (%d).", numTokensToDiscard, getNumDraftTokens());
+        mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
+    }
+
     void setNumTokensPerIteration(SizeType32 numTokensPerIteration)
     {
         mNumTokensPerIteration = numTokensPerIteration;
@@ -854,16 +883,22 @@ public:
             // FIXME(nkorobov): For streaming we do not allow beam search and
             // streaming index calculation here applies only for sampling
             // getNumTokensPerIteration takes accepted draft tokens into account
-            int nbTokensOut = mIsStreaming ? std::max(getNumTokensPerIteration(), 1) : maxNbTokens;
+            auto nbTokensOut
+                = (mReturnAllGeneratedTokens || !mIsStreaming) ? maxNbTokens : std::max(getNumTokensPerIteration(), 1);
+
             if (mExcludeInputFromOutput && !mIsStreaming)
             {
                 nbTokensOut -= getOrigPromptLen();
             }
 
             result.outputTokenIds.resize(nbBeams);
-            SizeType32 tokenPos = maxNbTokens - nbTokensOut;
 
-            bool shouldSendResponse = isGenerationCompleteState() || (mIsStreaming && tokenPos > getMaxSentTokenPos());
+            // in the case of streaming + beam search
+            // we need to return the full beams at all iterations
+
+            SizeType32 tokenPos{maxNbTokens - nbTokensOut};
+            auto const shouldSendResponse = isGenerationCompleteState()
+                || (mIsStreaming && tokenPos > getMaxSentTokenPos()) || mReturnAllGeneratedTokens;
 
             if (!shouldSendResponse)
             {
@@ -874,7 +909,8 @@ public:
                 for (SizeType32 beam = 0; beam < nbBeams; ++beam)
                 {
                     auto tokens = getTokens(beam);
-                    auto nbTokens = mIsStreaming ? (tokenPos - getMaxSentTokenPos()) : tokens.size();
+                    auto nbTokens = (mReturnAllGeneratedTokens || !mIsStreaming) ? tokens.size()
+                                                                                 : (tokenPos - getMaxSentTokenPos());
 
                     // Take accepted draft tokens into account when streaming
                     auto const numAcceptedTokens = std::max(0, getNumTokensPerIteration() - 1);
@@ -946,6 +982,8 @@ public:
     runtime::SamplingConfig mSamplingConfig;
     LlmRequestState_t mState;
     bool mIsStreaming;
+    // whether to return the full beams on each iteration. True when doing streaming + beamsearch
+    bool mReturnAllGeneratedTokens;
     std::optional<TokenIdType> mEndId;
     std::optional<TokenIdType> mPadId;
     std::optional<SizeType32> mSeqSlot;

@@ -411,8 +411,6 @@ class PretrainedModel(Module,
         if rank is not None:
             config.set_rank(rank)
 
-        model = cls(config)
-        weights = None
         if config.architecture in WEIGHT_LOADER_MODELS:
             weights_path = os.path.join(ckpt_dir, 'rank0.safetensors')
         else:
@@ -423,12 +421,9 @@ class PretrainedModel(Module,
         weights = safetensors.torch.load_file(weights_path)
 
         is_checkpoint_pruned = getattr(config, 'is_pruned', False)
-        if weights is not None:
-            preprocess_weights(weights,
-                               config,
-                               from_pruned=is_checkpoint_pruned)
-            model.load(weights, from_pruned=is_checkpoint_pruned)
-
+        preprocess_weights(weights, config, from_pruned=is_checkpoint_pruned)
+        model = cls(config)
+        model.load(weights, from_pruned=is_checkpoint_pruned)
         return model
 
     def load(self, weights, from_pruned=False):
@@ -1002,7 +997,7 @@ def to_ootb_moe(model: PretrainedModel) -> PretrainedModel:
     for name, layer, parent in model.named_modules_with_parent():
         if isinstance(layer, MOE):
             layer_name = name.rsplit('.', 1)[-1]
-            ootb_layer = layer.to(MoeOOTB, model.config)
+            ootb_layer = layer.to(MoeOOTB, model.config.quantization)
             setattr(parent, layer_name, ootb_layer)
     return model
 
@@ -1095,7 +1090,14 @@ def optimize_model(
 
 def preprocess_weights(weights: Dict[str, torch.Tensor],
                        model_config: PretrainedConfig,
-                       from_pruned=False) -> Dict[str, torch.Tensor]:
+                       from_pruned=False) -> None:
+    """This function in-place modifies weights and model_config, making them compatible with each other.
+
+    Note: Typically, it should be called before model creation and weight loading. For example,
+        preprocess_weights(weights, model_config)
+        model = XXXForCausalLM(model_config)
+        model.load(weights)
+    """
     quant_algo = model_config.quantization.quant_algo
     kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
 
@@ -1174,6 +1176,11 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                     weights[name] = torch.zeros_like(param)
 
     # For share_embedding_table
+    check_share_embedding(weights, model_config)
+
+
+def check_share_embedding(weights: Dict[str, torch.Tensor],
+                          model_config: PretrainedConfig):
     if model_config.share_embedding_table:
         if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
             if (weights["lm_head.weight"] -

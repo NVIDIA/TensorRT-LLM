@@ -111,11 +111,11 @@ public:
     int enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
-    template <typename T, typename KVCacheBuffer>
+    template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    template <typename T>
+    template <typename T, typename AttentionOutT = T>
     int enqueueDispatchKVCacheType(nvinfer1::PluginTensorDesc const* inputDesc,
         nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
         cudaStream_t stream);
@@ -152,7 +152,7 @@ public:
     };
 
 private:
-    template <typename T, typename KVCacheBuffer>
+    template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
         nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);

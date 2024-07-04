@@ -171,6 +171,9 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
 
     if (messageSizeBytes <= maxWorkspaceSize)
     {
+        // In some instances, the two-shot strategy has exhibited significant performance issues.
+        // As a temporary measure, we have disabled the two-shot strategy.
+        // TODO: remove this WAR after https://nvbugspro.nvidia.com/bug/4718747 is fixed.
         if (!isAuto)
         {
             strat = mStrategy;
@@ -187,7 +190,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::TWOSHOT;
+                strat = AllReduceStrategyType::NCCL;
             }
         }
         else
@@ -198,7 +201,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::TWOSHOT;
+                strat = AllReduceStrategyType::NCCL;
             }
         }
 

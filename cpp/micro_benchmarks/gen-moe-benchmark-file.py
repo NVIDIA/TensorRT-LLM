@@ -27,13 +27,14 @@ def make_dtype_string(dtypes=None):
     return f'"dtypes": ["{join_term.join(dtypes)}"],'
 
 
-def make_routing_string(name=None, values=None):
+def make_routing_string(name=None, values=None, is_distribution=False):
     if values is None and name is None:
         return ""
+    values_field = "routing_distribution" if is_distribution else "routing_values"
     if values is None:
-        return f'"routing_values": "{name}",'
+        return f'"{values_field}": "{name}",'
 
-    values = f'"routing_values": [{",".join(values)}],'
+    values = f'"{values_field}": [{",".join(map(str, values))}],'
     if name is not None:
         values += f' "routing_values_name": "{name}",'
 

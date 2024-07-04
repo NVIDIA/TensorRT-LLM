@@ -5,6 +5,7 @@ import tempfile
 from contextlib import contextmanager
 
 from profile_utils import profile
+from transformers import AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig, build
@@ -18,11 +19,11 @@ from utils.util import force_ampere
 
 tensorrt_llm.logger.set_level('verbose')
 
-input_text = [
-    'Born in north-east France, Soyer trained as a',
+batch_input_text = [
+    "Born in north-east France, Soyer trained as a",
     "What is large language model?"
 ]
-expected_output = [
+batch_output_text_expected = [
     "chef in Paris and London before moving to New York",
     "\nLarge language model is a model that is"
 ]
@@ -50,32 +51,38 @@ def test_save_load():
         This is optional, but users can store the engine into any folder they want, and use later
     '''
     max_batch_size, max_isl, max_osl = 8, 256, 256
-    hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
-    tokenizer_dir = hf_model_dir
+    hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
 
     with workspace("llama-save-load") as engine_dir:
         # build and run by one llama object
-        llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir, 'float16')
+        llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir)
         build_config = BuildConfig(max_batch_size=max_batch_size,
                                    max_input_len=max_isl,
                                    max_seq_len=max_osl + max_isl,
                                    plugin_config=llama.default_plugin_config())
-        build_config.plugin_config.gemm_plugin = 'float16'  # faster build
+        build_config.plugin_config.gemm_plugin = 'auto'  # faster build
         engine = build(llama, build_config)
         engine.save(engine_dir)
 
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
+
         # use context manager to make sure the __exit__ can release the resources immediately
-        with GenerationExecutor.create(engine_dir, tokenizer_dir) as executor:
-            for idx, output in enumerate(
-                    executor.generate(
-                        input_text,
-                        sampling_params=SamplingParams(max_new_tokens=10))):
-                tensorrt_llm.logger.info(f"Input: {input_text[idx]}")
-                tensorrt_llm.logger.info(f'Output: {output.text}')
+        with GenerationExecutor.create(engine_dir) as executor:
+            batch_input_ids = [
+                tokenizer.encode(inp) for inp in batch_input_text
+            ]
+            outputs = executor.generate(
+                batch_input_ids,
+                sampling_params=SamplingParams(max_new_tokens=10))
+
+            for idx, output in enumerate(outputs):
+                tensorrt_llm.logger.info(f"Input: {batch_input_text[idx]}")
+                output_text = tokenizer.decode(output.outputs[0].token_ids)
+                tensorrt_llm.logger.info(f'Output: {output_text}')
                 # note the output.text contains everything from the input, so only compare the suffix here.
-                assert output.text.endswith(
-                    expected_output[idx]
-                ), f"Expecting and got:'{expected_output[idx]}' Got: '{output.text}'"
+                assert output_text.endswith(
+                    batch_output_text_expected[idx]
+                ), f"Expecting and got: {batch_output_text_expected[idx]!r} Got: {output_text!r}"
 
 
 @profile(tag="fake-weights")
@@ -83,35 +90,30 @@ def test_save_load():
 def test_high_level_fake_weights():
     '''sanity to make sure the flow works.
     '''
-    input_text = [
-        'Born in north-east France, Soyer trained as a',
-        "What is large language model?"
-    ]
     max_batch_size, max_isl, max_osl = 8, 256, 256
-    hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
+    hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
 
     # Fake weights, skipping save and load engine. Make it faster to sanity test
-    config = LLaMAConfig.from_hugging_face(hf_model_dir, dtype='float16')
+    config = LLaMAConfig.from_hugging_face(hf_model_dir)
     llama = LLaMAForCausalLM(config)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_input_len=max_isl,
                                max_seq_len=max_osl + max_isl,
                                plugin_config=llama.default_plugin_config())
-    build_config.plugin_config.gemm_plugin = 'float16'  # faster build
+    build_config.plugin_config.gemm_plugin = 'auto'  # faster build
     build(llama, build_config)
 
 
 @force_ampere
 def test_inflight_batching():
     max_batch_size, max_isl, max_osl = 8, 256, 256
-    hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
-    tokenizer_dir = hf_model_dir
+    hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
 
-    llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir, 'float16')
+    llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_input_len=max_isl,
                                max_seq_len=max_osl + max_isl)
-    build_config.plugin_config.gemm_plugin = 'float16'  # faster build
+    build_config.plugin_config.gemm_plugin = 'auto'  # faster build
     engine = build(llama, build_config)
 
     engine_dir = "llama-ifb"
@@ -119,32 +121,33 @@ def test_inflight_batching():
     engine_dir = engine_temp.name
     engine.save(engine_dir)
 
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
+
     async def main():
-        with GenerationExecutor.create(engine_dir,
-                                       tokenizer_dir) as async_engine:
+        with GenerationExecutor.create(engine_dir) as async_engine:
 
             async def generate_and_print(idx, inp):
                 result = async_engine.generate_async(
-                    inp,
-                    streaming=False,
-                    sampling_params=SamplingParams(max_new_tokens=10))
+                    tokenizer.encode(inp),
+                    sampling_params=SamplingParams(max_new_tokens=10),
+                    streaming=False)
                 await result.aresult()
-                tensorrt_llm.logger.info(result.text)
-                assert result.text.endswith(expected_output[idx])
+                output_text = tokenizer.decode(result.outputs[0].token_ids)
+                tensorrt_llm.logger.info(output_text)
+                assert output_text.endswith(batch_output_text_expected[idx])
 
-                output = ""
                 async for stream in async_engine.generate_async(
-                        inp,
-                        streaming=True,
-                        sampling_params=SamplingParams(max_new_tokens=10)):
-                    output += stream.text + ' '
+                        tokenizer.encode(inp),
+                        sampling_params=SamplingParams(max_new_tokens=10),
+                        streaming=True):
+                    output_text = tokenizer.decode(stream.outputs[0].token_ids)
                     tensorrt_llm.logger.info(
-                        f"prompt: '{inp}', generation: '{output}'")
+                        f"prompt: {inp!r}, generation: {output_text!r}")
 
             loop = asyncio.get_running_loop()
             tasks = []
             # submit many request concurrently
-            for idx, inp in enumerate(input_text):
+            for idx, inp in enumerate(batch_input_text):
                 task = loop.create_task(generate_and_print(idx, inp))
                 tasks.append(task)
 

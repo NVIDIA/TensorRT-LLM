@@ -48,18 +48,18 @@ if (-not $skipVSBuildTools) {
 # Install TensorRT 10.0.1 for TensorRT-LLM
 if (-not $skipTRT) {
     Write-Output "Downloading TensorRT"
-    Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip' -OutFile 'TensorRT-10.0.1.6.zip'
+    Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.1.0/zip/TensorRT-10.1.0.27.Windows.win10.cuda-12.4.zip' -OutFile 'TensorRT-10.1.0.27.zip'
     Write-Output "Extracting TensorRT"
     # Get path
     $absolutePath = Resolve-Path $TRTPath
-    Expand-Archive -Path '.\TensorRT-10.0.1.6.zip' -DestinationPath $absolutePath
+    Expand-Archive -Path '.\TensorRT-10.1.0.27.zip' -DestinationPath $absolutePath
     Write-Output "Removing TensorRT zip"
-    Remove-Item -Path 'TensorRT-10.0.1.6.zip' -Force
+    Remove-Item -Path 'TensorRT-10.1.0.27.zip' -Force
     Write-Output "Adding TensorRT to system Path"
-    [Environment]::SetEnvironmentVariable('Path', "$env:Path;$absolutePath\TensorRT-10.0.1.6\lib", [EnvironmentVariableTarget]::Machine)
+    [Environment]::SetEnvironmentVariable('Path', "$env:Path;$absolutePath\TensorRT-10.1.0.27\lib", [EnvironmentVariableTarget]::Machine)
     Write-Output "Installing TensorRT Python wheel"
-    python3 -m pip install $absolutePath\TensorRT-10.0.1.6\python\tensorrt-10.0.1-cp310-none-win_amd64.whl
-    Write-Output "Done TensorRT installation at '$absolutePath\TensorRT-10.0.1.6'"
+    python3 -m pip install $absolutePath\TensorRT-10.1.0.27\python\tensorrt-10.1.0-cp310-none-win_amd64.whl
+    Write-Output "Done TensorRT installation at '$absolutePath\TensorRT-10.1.0.27'"
 } else {
     Write-Output "Skipping TensorRT installation"
 }

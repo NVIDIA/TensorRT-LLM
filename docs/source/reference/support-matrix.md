@@ -104,7 +104,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-        - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) Nougat-small, Nougat-base
+        - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
         - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
@@ -114,7 +114,7 @@ The following table shows the supported software for TensorRT-LLM.
 (2) INT4 AWQ and GPTQ are not supported on SM < 75.<br>
 (3) INT4 AWQ and GPTQ with FP8 activations require SM >= 89.<br>
 (4) [Encoder-Decoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/main/examples/enc_dec) provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.
-(5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP family, LLaVA family, and so on.
+(5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP2 family, LLaVA family, and so on.
 (6) Only supports bfloat16 precision.
 
 

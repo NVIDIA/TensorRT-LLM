@@ -264,21 +264,6 @@ def build_gpt(args):
     max_input_len = build_config['max_input_len'] \
         if args.max_input_len is None else args.max_input_len
 
-    if args.max_output_len:
-        logger.warning(
-            '--max_output_len has been deprecated in favor of --max_seq_len')
-        if args.max_input_len:
-            if args.max_seq_len:
-                logger.warning(
-                    '--max_seq_len has been overwritten due to --max_output_len being specified'
-                )
-            args.max_seq_len = args.max_input_len + args.max_output_len
-        else:
-            raise Exception(
-                f"max_output_len is specified but not max_input_len")
-
-        del args.max_output_len
-
     max_seq_len = build_config['max_seq_len'] \
         if args.max_seq_len is None else args.max_seq_len
     max_beam_width = build_config['max_beam_width'] \
@@ -1113,7 +1098,6 @@ def build_bert(args):
     if args.mode == 'plugin':
         network.plugin_config.bert_attention_plugin = args.dtype
         network.plugin_config.gemm_plugin = args.dtype
-        network.plugin_config.attention_qk_half_accumulation = True
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
     elif args.mode == 'ootb-except-mha':
         network.plugin_config.bert_attention_plugin = args.dtype
@@ -1572,21 +1556,6 @@ def build_enc_dec(args):
     build_config['max_encoder_input_len'] = build_config['max_encoder_input_len'] \
         if args.max_input_len is None else args.max_input_len
     build_config['max_decoder_input_len'] = 1
-
-    if args.max_output_len:
-        logger.warning(
-            '--max_output_len has been deprecated in favor of --max_seq_len')
-        if args.max_input_len:
-            if args.max_seq_len:
-                logger.warning(
-                    '--max_seq_len has been overwritten due to --max_output_len being specified'
-                )
-            args.max_seq_len = args.max_input_len + args.max_output_len
-        else:
-            raise Exception(
-                f"max_output_len is specified but not max_input_len")
-
-        del args.max_output_len
 
     build_config['max_seq_len'] = build_config['max_seq_len'] \
         if args.max_seq_len is None else args.max_seq_len

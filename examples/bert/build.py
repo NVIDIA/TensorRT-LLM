@@ -82,9 +82,6 @@ def parse_arguments():
                         type=str,
                         default=False,
                         choices=['float16', 'float32'])
-    parser.add_argument('--enable_qk_half_accum',
-                        default=False,
-                        action='store_true')
     parser.add_argument('--enable_context_fmha',
                         default=False,
                         action='store_true')
@@ -235,8 +232,6 @@ if __name__ == '__main__':
         network.plugin_config.bert_attention_plugin = args.use_bert_attention_plugin
     if args.use_gemm_plugin:
         network.plugin_config.gemm_plugin = args.use_gemm_plugin
-    if args.enable_qk_half_accum:
-        network.plugin_config.attention_qk_half_accumulation = True
     assert not (args.enable_context_fmha and args.enable_context_fmha_fp32_acc)
     if args.enable_context_fmha:
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)

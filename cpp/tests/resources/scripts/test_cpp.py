@@ -595,6 +595,8 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                 run_command(benchmark, cwd=root_dir, timeout=600)
                 req_rate_benchmark = benchmark + ["--request_rate", "100"]
                 run_command(req_rate_benchmark, cwd=root_dir, timeout=600)
+                concurrency_benchmark = benchmark + ["--concurrency", "30"]
+                run_command(concurrency_benchmark, cwd=root_dir, timeout=600)
 
         benchmark = [
             str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",

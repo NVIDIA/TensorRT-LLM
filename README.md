@@ -7,7 +7,7 @@ TensorRT-LLM
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.4.1-green)](https://developer.nvidia.com/cuda-downloads)
-[![trt](https://img.shields.io/badge/TRT-10.0.1-green)](https://developer.nvidia.com/tensorrt)
+[![trt](https://img.shields.io/badge/TRT-10.1.0-green)](https://developer.nvidia.com/tensorrt)
 [![version](https://img.shields.io/badge/release-0.11.0.dev-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
@@ -17,7 +17,10 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [*Weekly*] Check out **[@NVIDIAAIDev](https://twitter.com/nvidiaaidev?lang=en)** & **[NVIDIA AI](https://www.linkedin.com/showcase/nvidia-ai/)** LinkedIn for the latest updates!
+* [2024/07/02] Let the @MistralAI MoE tokens fly 📈 🚀 #Mixtral 8x7B with NVIDIA #TensorRT #LLM on #H100.
+[➡️ Tech blog](https://developer.nvidia.com/blog/achieving-high-mixtral-8x7b-performance-with-nvidia-h100-tensor-core-gpus-and-tensorrt-llm?ncid=so-twit-928467)
+![Example Image](docs/source/media/picture-07-02-2024.png)
+
 * [2024/02/06] [🚀 Speed up inference with SOTA quantization techniques in TRT-LLM](./docs/source/blogs/quantization-in-TRT-LLM.md)
 * [2024/01/30] [ New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget](./docs/source/blogs/XQA-kernel.md)
 * [2023/12/04] [Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100](./docs/source/blogs/Falcon180B-H200.md)

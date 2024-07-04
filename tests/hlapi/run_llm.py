@@ -3,7 +3,7 @@ import os
 
 import click
 
-from tensorrt_llm.hlapi import LLM, ModelConfig, SamplingParams
+from tensorrt_llm.hlapi import LLM, SamplingParams
 
 
 @click.command()
@@ -12,10 +12,7 @@ from tensorrt_llm.hlapi import LLM, ModelConfig, SamplingParams
 @click.option("--engine_dir", type=str, default=None)
 @click.option("--prompt", type=str, default=None)
 def main(model_dir: str, tp_size: int, engine_dir: str, prompt: str):
-    config = ModelConfig(model_dir)
-    config.parallel_config.tp_size = tp_size
-
-    llm = LLM(config)
+    llm = LLM(model_dir, tensor_parallel_size=tp_size)
 
     if engine_dir is not None and os.path.abspath(
             engine_dir) != os.path.abspath(model_dir):

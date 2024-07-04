@@ -5,15 +5,16 @@ import sys
 import tempfile
 import traceback
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional
 
 import filelock
 import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
+from tqdm.auto import tqdm
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import Singleton, set_level
@@ -161,15 +162,6 @@ class SamplingParams:
                for f in expected_fields})
 
 
-@dataclass
-class GenerationOutput:
-    text: str = ""
-    token_ids: Union[List[int], List[List[int]]] = field(default_factory=list)
-    log_probs: Optional[List[float]] = None
-    context_logits: Optional[torch.Tensor] = None
-    generation_logits: Optional[torch.Tensor] = None
-
-
 def print_colored(message, color: str = None):
     colors = dict(
         grey="\x1b[38;20m",
@@ -208,6 +200,10 @@ def get_total_gpu_memory(device: int) -> float:
 
 
 class GpuArch:
+
+    @staticmethod
+    def get_arch() -> int:
+        return get_gpu_arch()
 
     @staticmethod
     def is_post_hopper() -> bool:
@@ -296,9 +292,29 @@ def get_file_lock(model_name: str,
     return filelock.FileLock(lock_file_path)
 
 
-def download_hf_model(model_name: str) -> Path:
-    with get_file_lock(model_name):
+class DisabledTqdm(tqdm):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, disable=True)
+
+
+def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
+    with get_file_lock(model):
         hf_folder = snapshot_download(
-            model_name,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE)
+            model,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            revision=revision,
+            tqdm_class=DisabledTqdm)
+    return Path(hf_folder)
+
+
+def download_hf_pretrained_config(model: str,
+                                  revision: Optional[str] = None) -> Path:
+    with get_file_lock(model):
+        hf_folder = snapshot_download(
+            model,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            revision=revision,
+            allow_patterns=["config.json"],
+            tqdm_class=DisabledTqdm)
     return Path(hf_folder)

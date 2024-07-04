@@ -57,9 +57,11 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
 }
 
 template <typename T>
-void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize,
-    std::optional<TensorPtr> const& batchSlots, std::optional<DecodingOutput> const& output)
+void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots,
+    std::optional<DecodingOutput> const& output)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mSamplingConfig = samplingConfig;
     auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
 
@@ -135,8 +137,9 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
-    auto const batchSlotsPtr = batchSlots.has_value() ? bufferCast<SizeType32>(*(batchSlots.value())) : nullptr;
-    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlotsPtr, setupParams);
+    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots, setupParams);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 namespace
@@ -543,7 +546,8 @@ void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& inp
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 template <typename T>
 void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-    DecodingInput const& decodingInput, BufferManager const& manager)
+    DecodingInput const& decodingInput, BufferManager const& manager,
+    std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
@@ -570,25 +574,26 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();
 
-    // Prepare length penalty, use the value from mSamplingConfig or 1.0f by default
+    // Prepare length penalty, use the value from samplingConfig or 1.0f by default
+    SamplingConfig const& samplingConf = samplingConfig ? (*samplingConfig).get() : mSamplingConfig;
     std::vector<float> lengthPenaltyVec;
     TensorPtr lengthPenaltyPtr
         = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
-    if (!mSamplingConfig.lengthPenalty.has_value() || mSamplingConfig.lengthPenalty.value().size() == 0)
+    if (!samplingConf.lengthPenalty.has_value() || samplingConf.lengthPenalty.value().size() == 0)
     {
         lengthPenaltyVec = std::vector<float>(batchSize, 1.0f);
     }
-    else if (long int const size = mSamplingConfig.lengthPenalty.value().size(); size == 1)
+    else if (long int const size = samplingConf.lengthPenalty.value().size(); size == 1)
     {
-        lengthPenaltyVec = std::vector<float>(batchSize, mSamplingConfig.lengthPenalty.value()[0]);
+        lengthPenaltyVec = std::vector<float>(batchSize, samplingConf.lengthPenalty.value()[0]);
     }
     else
     {
         TLLM_CHECK_WITH_INFO(size == batchSize,
-            common::fmtstr("Size of lengthPenalty in SimplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
+            common::fmtstr("Size of lengthPenalty in SamplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
                            ")",
                 size, batchSize));
-        lengthPenaltyVec = mSamplingConfig.lengthPenalty.value();
+        lengthPenaltyVec = samplingConf.lengthPenalty.value();
     }
 
     lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);

@@ -1,3 +1,4 @@
+import copy
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Union
@@ -68,6 +69,23 @@ _bandwidths = {
     "PCIe-5": 64,
 }
 
+_templates = {
+    "H100-SXM":
+    dict(
+        inter_node_bw_per_device=50,
+        intra_node_bw_per_device=450,
+        intra_node_sharp=True,
+        memory_bw=3350,
+        math_throughput=MathThroughput(
+            int8=1979,
+            fp8=1979,
+            float16=989,
+            bfloat16=989,
+            float32=495,
+        ),
+    ),
+}
+
 cluster_infos = {
     # from https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf
     "A100-SXM-80GB":
@@ -101,18 +119,18 @@ cluster_infos = {
     # from https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet
     "H100-SXM":
     ClusterInfo(
-        inter_node_bw_per_device=50,
-        intra_node_bw_per_device=450,
-        intra_node_sharp=True,
-        memory_bw=3350,
+        **_templates["H100-SXM"],
         memory_budget_per_device=80,
-        math_throughput=MathThroughput(
-            int8=1979,
-            fp8=1979,
-            float16=989,
-            bfloat16=989,
-            float32=495,
-        ),
+    ),
+    "H100-SXM-64G":
+    ClusterInfo(
+        **_templates["H100-SXM"],
+        memory_budget_per_device=64,
+    ),
+    "H100-SXM-94G":
+    ClusterInfo(
+        **_templates["H100-SXM"],
+        memory_budget_per_device=94,
     ),
     "H100-PCIe":
     ClusterInfo(
@@ -351,6 +369,12 @@ def infer_cluster_key() -> str:
             return "H100-SXM"
         else:
             return "H100-PCIe"
+    elif match("H100XS", device_name):
+        return "H100-SXM-64G"
+    elif match("H100XM", device_name):
+        return "H100-SXM"
+    elif match("H100XL", device_name):
+        return "H100-SXM-94G"
     elif match("L40S", device_name):
         return "L40S"
     elif match("L40", device_name):
@@ -454,7 +478,7 @@ def infer_cluster_info() -> ClusterInfo:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
         compute_cap = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
         logger.info(f"Compute capability: {compute_cap}")
-        err, properties = cudart.cudaGetDeviceProperties(0)
+        err, properties = cudart.cudaGetDeviceProperties(index)
         sm_count = properties.multiProcessorCount
         logger.info(f"SM count: {sm_count}")
         sm_clock = pynvml.nvmlDeviceGetMaxClockInfo(
@@ -533,9 +557,20 @@ def infer_cluster_config() -> Dict[str, Union[str, ClusterInfo]]:
     if cluster_key is not None:
         return dict(cluster_key=cluster_key)
     else:
+        try:
+            cluster_info = infer_cluster_info()
+        except pynvml.NVMLError:
+            fallback_cluster_key = "L40"
+            cluster_info = copy.copy(cluster_infos[fallback_cluster_key])
+            memory_budget = torch.cuda.mem_get_info()[1] // (1024**3)
+            cluster_info.memory_budget_per_device = memory_budget
+            logger.warning(
+                f"Failed to infer cluster info for {device_name}, "
+                f"treat it as a {fallback_cluster_key} node with {memory_budget} GB memory. "
+                "This setting makes no effect if you do not use auto parallel.")
         return dict(
             cluster_key=device_name.replace(" ", "-"),
-            cluster_info=infer_cluster_info(),
+            cluster_info=cluster_info,
         )
 
 

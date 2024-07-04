@@ -5,20 +5,17 @@ import tempfile
 import time
 from pathlib import Path
 
+from tensorrt_llm.hlapi import KvCacheConfig
 from tensorrt_llm.hlapi._perf_evaluator import (LLMPerfEvaluator,
                                                 MemoryContinuousMonitorThread)
-from tensorrt_llm.hlapi.llm import KvCacheConfig, ModelConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
-
-def get_model_path(model_name):
-    return str(llm_models_root() / model_name)
-
-
-llama_model_path = get_model_path("llama-models/llama-7b-hf")
+try:
+    from test_llm import llama_model_path
+except ImportError:
+    from .test_llm import llama_model_path
 
 
 def test_memory_thread():
@@ -45,8 +42,6 @@ def gen_fake_samples(samples_path: str, num_samples: int, sample_length: int):
 
 @force_ampere
 def test_perf_evaluator():
-    config = ModelConfig(llama_model_path)
-
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
         samples_path = workspace / "data.json"
@@ -56,7 +51,7 @@ def test_perf_evaluator():
         kvcache_config = KvCacheConfig(enable_block_reuse=True)
 
         evaluator = LLMPerfEvaluator.create(
-            config,
+            model=llama_model_path,
             num_samples=10,
             samples_path=samples_path,
             warmup=10,

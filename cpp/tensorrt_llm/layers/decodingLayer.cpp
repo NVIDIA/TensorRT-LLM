@@ -123,7 +123,7 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeTyp
     else if (mDecodingMode.isBeamSearch())
     { // beam search layer
         TLLM_CHECK_WITH_INFO(beamWidth > 1, "Decoding mode is beam search, but beamWidth <= 1 (%d <= 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, nullptr, setupParams->decodingParams);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
     }
     else if (mDecodingMode.isMedusa())
     {

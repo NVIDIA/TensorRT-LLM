@@ -62,18 +62,18 @@ struct __align__(16) Float8_
 #ifdef ENABLE_BF16
 struct __align__(8) bf16_4_t
 {
-    __nv_bfloat162 x;
-    __nv_bfloat162 y;
+    __nv_bfloat162_raw x;
+    __nv_bfloat162_raw y;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct __align__(16) bf16_8_t
 {
-    __nv_bfloat162 x;
-    __nv_bfloat162 y;
-    __nv_bfloat162 z;
-    __nv_bfloat162 w;
+    __nv_bfloat162_raw x;
+    __nv_bfloat162_raw y;
+    __nv_bfloat162_raw z;
+    __nv_bfloat162_raw w;
 };
 #endif
 
@@ -4050,25 +4050,25 @@ template <>
 __device__ __inline__ void write_smem_transpose(
     bf16_4_t const& vec, __nv_bfloat16* smem, int transpose_idx, int smem_pitch)
 {
-    smem[transpose_idx] = vec.x.x;
-    smem[transpose_idx + 1] = vec.y.x;
-    smem[smem_pitch + transpose_idx] = vec.x.y;
-    smem[smem_pitch + transpose_idx + 1] = vec.y.y;
+    smem[transpose_idx] = __nv_bfloat162(vec.x).x;
+    smem[transpose_idx + 1] = __nv_bfloat162(vec.y).x;
+    smem[smem_pitch + transpose_idx] = __nv_bfloat162(vec.x).y;
+    smem[smem_pitch + transpose_idx + 1] = __nv_bfloat162(vec.y).y;
 }
 
 template <>
 __device__ __inline__ void write_smem_transpose(
     bf16_8_t const& vec, __nv_bfloat16* smem, int transpose_idx, int smem_pitch)
 {
-    smem[transpose_idx] = vec.x.x;
-    smem[transpose_idx + 1] = vec.y.x;
-    smem[transpose_idx + 2] = vec.z.x;
-    smem[transpose_idx + 3] = vec.w.x;
+    smem[transpose_idx] = __nv_bfloat162(vec.x).x;
+    smem[transpose_idx + 1] = __nv_bfloat162(vec.y).x;
+    smem[transpose_idx + 2] = __nv_bfloat162(vec.z).x;
+    smem[transpose_idx + 3] = __nv_bfloat162(vec.w).x;
 
-    smem[smem_pitch + transpose_idx] = vec.x.y;
-    smem[smem_pitch + transpose_idx + 1] = vec.y.y;
-    smem[smem_pitch + transpose_idx + 2] = vec.z.y;
-    smem[smem_pitch + transpose_idx + 3] = vec.w.y;
+    smem[smem_pitch + transpose_idx] = __nv_bfloat162(vec.x).y;
+    smem[smem_pitch + transpose_idx + 1] = __nv_bfloat162(vec.y).y;
+    smem[smem_pitch + transpose_idx + 2] = __nv_bfloat162(vec.z).y;
+    smem[smem_pitch + transpose_idx + 3] = __nv_bfloat162(vec.w).y;
 }
 #endif
 

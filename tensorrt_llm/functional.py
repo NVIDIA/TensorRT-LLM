@@ -4072,11 +4072,6 @@ def bert_attention(tensor: Tensor,
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
                                 trt.PluginFieldType.FLOAT32)
-    enable_qk_half_accum = trt.PluginField(
-        "enable_qk_half_accum",
-        np.array(np.int8(
-            default_net().plugin_config.attention_qk_half_accumulation),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
     context_fmha_type = trt.PluginField(
         "context_fmha_type",
         np.array(np.int8(default_net().plugin_config.context_fmha_type),
@@ -4097,8 +4092,8 @@ def bert_attention(tensor: Tensor,
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
     pfc = trt.PluginFieldCollection([
-        nheads, head_size, q_scaling, enable_qk_half_accum, context_fmha_type,
-        pf_type, do_relative_attention, max_distance, remove_padding
+        nheads, head_size, q_scaling, context_fmha_type, pf_type,
+        do_relative_attention, max_distance, remove_padding
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -6008,3 +6003,26 @@ def topk(input: Tensor,
     indices = layer.get_output(1)
 
     return _create_tensor(values, layer), _create_tensor(indices, layer)
+
+
+def scatter_nd(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
+    '''
+    Scatter_nd is a tensor operation that writes or updates values in a tensor based on indices.
+
+    Parameters:
+        input: Tensor
+            The input tensor to be updated
+        mask: Tensor
+            A tensor of indices specifying the locations in data to be updated.
+        source: Tensor
+            A tensor of values to be written or scattered into data.
+    Returns:
+        New tensor with the same shape as the input tensor data,
+        where the values from the source tensor are scattered or written into the output tensor
+        at the locations specified by the mask tensor.
+    '''
+    scatter_layer = default_trtnet().add_scatter(input.trt_tensor,
+                                                 mask.trt_tensor,
+                                                 source.trt_tensor,
+                                                 mode=trt.ScatterMode.ND)
+    return _create_tensor(scatter_layer.get_output(0), scatter_layer)

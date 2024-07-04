@@ -162,7 +162,8 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
 
@@ -261,7 +262,15 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                    gather_output=True)
         else:
             lm_head = None
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_k": "k_proj",
+            "attn_v": "v_proj",
+            "attn_dense": "o_proj",
+            "mlp_h_to_4h": "c_fc",
+            "mlp_4h_to_h": "c_proj",
+        }
         super().__init__(config, transformer, lm_head)
 
     def use_lora(self, lora_config: LoraConfig):
-        use_lora(self, lora_config)
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

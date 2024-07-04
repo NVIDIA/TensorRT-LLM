@@ -81,7 +81,8 @@ __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdT
             // Break if path terminates
             if (tokenId == -1)
             {
-                acceptedLength = ti;
+                hasEnd = targetToken == endId; // check if last token is EOS when path terminates.
+                acceptedLength = hasEnd ? ti - 1 : ti;
                 break;
             }
             auto const targetTokenIdx = batchSlot * maxDecodingTokens + tokenId;

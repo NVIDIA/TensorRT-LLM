@@ -133,7 +133,7 @@ value for a given parameter, the vector can be limited to a single element
  * `frequencyPenalty`, a vector of float-point numbers to penalize tokens
    already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values `< 0.0f` encourage repetition, `> 0.0f` discourage it.
    The default value is `0.0f`(no effect).
- * `noRepeatNgramSize`, a vector of integers. If set to int > 0, all ngrams of that size can only occur once.
+ * `noRepeatNgramSize`, a vector of integers. It can have any value `> 0`. If set to int `> 0`, all ngrams of that size can only occur once.
 
 The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually
 exclusive.

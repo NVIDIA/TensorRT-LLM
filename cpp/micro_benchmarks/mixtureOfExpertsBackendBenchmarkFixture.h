@@ -22,6 +22,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -55,13 +56,23 @@ struct RoutingConfig
 {
     virtual void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) = 0;
     virtual std::string getName() = 0;
+    virtual bool isDeterministic() const = 0;
+    virtual bool supportsConfig(int64_t num_experts, int64_t k, int64_t num_tokens) const = 0;
 };
 
+/**
+ * Generates a perfectly balanced routing configuration
+ */
 struct LoadBalancedRoutingConfig : public RoutingConfig
 {
     std::string getName() override
     {
         return "balanced";
+    }
+
+    bool isDeterministic() const override
+    {
+        return true;
     }
 
     void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
@@ -70,8 +81,130 @@ struct LoadBalancedRoutingConfig : public RoutingConfig
         makeLoadBalancedRoutingConfiguration(routing_output, num_experts, num_tokens, k, type, streamPtr->get());
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
+
+    bool supportsConfig(int64_t, int64_t, int64_t) const override
+    {
+        return true;
+    }
 };
 
+/**
+ * Selects experts according to given random distribution
+ */
+struct RandomDistributionRoutingConfig : public RoutingConfig
+{
+    std::mt19937_64 twister{0xD5};
+    std::vector<float> probabilities;
+    std::pair<int64_t, int64_t> shape;
+    std::string name;
+
+    RandomDistributionRoutingConfig(std::vector<float> const& in_probabilities, std::pair<int64_t, int64_t> shape,
+        std::string name = "random_distribution")
+        : probabilities(std::move(in_probabilities))
+        , shape(std::move(shape))
+        , name(std::move(name))
+    {
+        TLLM_CHECK_WITH_INFO(shape.second == probabilities.size(),
+            "Cannot create random routing distribution. Number of experts does not match the number of weights");
+    }
+
+    std::string getName() override
+    {
+        return name;
+    }
+
+    bool isDeterministic() const override
+    {
+        return false;
+    }
+
+    void doSample(float& curr_max, std::vector<int>& selected)
+    {
+        std::uniform_real_distribution<float> dist(0, curr_max);
+        float value = dist(twister);
+        float running_sum = 0;
+        for (int expert = 0; expert < probabilities.size(); expert++)
+        {
+            if (std::find(selected.begin(), selected.end(), expert) != selected.end())
+                continue; // Already picked
+            float prob = probabilities[expert];
+            running_sum += prob;
+            if (value < running_sum)
+            {
+                curr_max -= prob;
+                selected.push_back(expert);
+                return;
+            }
+        }
+    }
+
+    void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
+    {
+        TLLM_CHECK(num_experts == probabilities.size());
+        std::vector<float> input(num_experts * num_tokens, 0);
+        std::vector<int> selected;
+        float max = std::accumulate(probabilities.begin(), probabilities.end(), 0.0f);
+        // TODO Put this on the GPU
+        for (int token = 0; token < num_tokens; token++)
+        {
+            selected.clear();
+            float curr_max = max;
+            for (int choice = 0; choice < k; choice++)
+            {
+                doSample(curr_max, selected);
+            }
+            for (auto selection : selected)
+            {
+                input[token * num_experts + selection] = 1.f;
+            }
+        }
+        check_cuda_error(cudaMemcpyAsync(
+            routing_output, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice, streamPtr->get()));
+        check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
+    }
+
+    bool supportsConfig(int64_t num_experts, int64_t, int64_t) const override
+    {
+        return num_experts == shape.second;
+    }
+};
+
+/**
+ * Generates routing values by sampling a uniform distribution [-1,1)
+ */
+struct UniformRoutingConfig : public RoutingConfig
+{
+    std::mt19937_64 twister{0xD5};
+
+    std::string getName() override
+    {
+        return "uniform";
+    }
+
+    bool isDeterministic() const override
+    {
+        return false;
+    }
+
+    void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
+    {
+        std::uniform_real_distribution<float> dist(-1, 1);
+        std::vector<float> input(num_experts * num_tokens);
+        std::generate(input.begin(), input.end(), [&] { return dist(twister); });
+        check_cuda_error(cudaMemcpyAsync(
+            routing_output, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice, streamPtr->get()));
+        check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
+    }
+
+    bool supportsConfig(int64_t, int64_t, int64_t) const override
+    {
+        return true;
+    }
+};
+
+/**
+ * Stores a specific routing configuration
+ */
 struct VectoredRoutingConfig : public RoutingConfig
 {
     std::vector<float> config;
@@ -90,6 +223,11 @@ struct VectoredRoutingConfig : public RoutingConfig
         return name;
     }
 
+    bool isDeterministic() const override
+    {
+        return true;
+    }
+
     void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
     {
         assert(shape.second == num_experts);
@@ -101,13 +239,21 @@ struct VectoredRoutingConfig : public RoutingConfig
         }
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
+
+    bool supportsConfig(int64_t num_experts, int64_t, int64_t) const override
+    {
+        return shape.second == num_experts;
+    }
 };
 
 }; // namespace
 
 constexpr int LOAD_BALANCED_ROUTING_CONFIG = 0;
+constexpr int UNIFORM_ROUTING_CONFIG = 1;
 std::vector<std::shared_ptr<RoutingConfig>> routingConfigCache{
-    std::static_pointer_cast<RoutingConfig>(std::make_shared<LoadBalancedRoutingConfig>())};
+    std::static_pointer_cast<RoutingConfig>(std::make_shared<LoadBalancedRoutingConfig>()),
+    std::static_pointer_cast<RoutingConfig>(std::make_shared<UniformRoutingConfig>()),
+};
 
 #ifdef ENABLE_FP8
 using SafeFP8 = __nv_fp8_e4m3;
@@ -222,6 +368,8 @@ public:
     int64_t mInterSize{};
     int64_t mTotalTokens{};
 
+    int mRoutingConfigIndex = 0;
+
     bool mUseBias = true;
 
     bool mIsGated = false;
@@ -246,7 +394,7 @@ public:
     }
 
     void initBuffersPermute(int64_t num_tokens, int64_t hidden_size, int64_t inter_size, int64_t num_experts, int64_t k,
-        int64_t routing_config)
+        int64_t routing_config, MOEParallelismConfig parallelism_config)
     {
         assert(hidden_size % BASE_HIDDEN_SIZE == 0);
 
@@ -254,7 +402,7 @@ public:
 
         mTotalTokens = num_tokens;
         mHiddenSize = hidden_size;
-        mInterSize = inter_size;
+        mInterSize = inter_size / parallelism_config.tp_size;
         mNumExperts = num_experts;
         mK = k;
         mIsGated = tensorrt_llm::isGatedActivation(mActType);
@@ -303,6 +451,7 @@ public:
         mSourceToExpandedMap = allocBuffer<int>(mTotalTokens * mK);
         mSelectedExpert = allocBuffer<int>(mTotalTokens * mK);
 
+        mRoutingConfigIndex = routing_config;
         auto tactic = routingConfigCache.at(routing_config);
         tactic->setRouting(mInputProbabilities, mNumExperts, mK, mTotalTokens);
 
@@ -311,10 +460,19 @@ public:
 
     float benchmarkLoop(MOEParallelismConfig parallelism_config)
     {
-        check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
-        runMoEPermute(parallelism_config);
-        check_cuda_error(cudaEventRecord(mEndEvent, streamPtr->get()));
-        check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
+        auto tactic = routingConfigCache.at(mRoutingConfigIndex);
+        if (!tactic->isDeterministic())
+        {
+            tactic->setRouting(mInputProbabilities, mNumExperts, mK, mTotalTokens);
+        }
+
+        {
+            NVTX3_SCOPED_RANGE(BenchmarkLoopIteration);
+            check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
+            runMoEPermute(parallelism_config);
+            check_cuda_error(cudaEventRecord(mEndEvent, streamPtr->get()));
+            check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
+        }
 
         float ms;
         check_cuda_error(cudaEventElapsedTime(&ms, mStartEvent, mEndEvent));
@@ -325,6 +483,7 @@ public:
     // Runs for 3 iterations or 1 second and picks the best option
     int pickBestTactic(MOEParallelismConfig parallelism_config)
     {
+        NVTX3_SCOPED_RANGE(WarmUpRun);
         auto tactics = mMoERunner.getTactics();
 
         float best_time = INFINITY;
@@ -411,6 +570,7 @@ public:
 template <class TypeTuple_>
 void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state)
 {
+    NVTX3_SCOPED_RANGE(FullBenchmark);
     int const num_experts = state.range(0);
     int const top_k = state.range(1);
     int const hidden_size = state.range(2);
@@ -448,10 +608,11 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     }
     ss << routingConfigCache.at(routing_config)->getName();
     // state.SetLabel(ss.str());
+    state.SetLabel(routingConfigCache.at(routing_config)->getName());
 
     // Always use EP size for moe config until we support TP+EP, we just divide the inter size for TP
-    MOEParallelismConfig parallelism_config = MOEParallelismConfig::ExpertParallelism(ep_size, world_rank / tp_size);
-    initBuffersPermute(num_tokens, hidden_size, inter_size / tp_size, num_experts, top_k, routing_config);
+    MOEParallelismConfig parallelism_config{tp_size, world_rank / ep_size, ep_size, world_rank % ep_size};
+    initBuffersPermute(num_tokens, hidden_size, inter_size, num_experts, top_k, routing_config, parallelism_config);
 
     // Parse the tactic, does checks for "auto" mode and out of range
     tactic_idx = setTactic(tactic_idx, parallelism_config);
@@ -468,10 +629,13 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     }
     state.counters["tactic_idx"] = tactic_idx;
 
-    for (auto _ : state)
     {
-        float ms = benchmarkLoop(parallelism_config);
-        state.SetIterationTime(ms / 1000.f);
+        NVTX3_SCOPED_RANGE(BenchmarkRun);
+        for (auto _ : state)
+        {
+            float ms = benchmarkLoop(parallelism_config);
+            state.SetIterationTime(ms / 1000.f);
+        }
     }
 
     state.SetItemsProcessed(state.iterations() * num_tokens);

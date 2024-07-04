@@ -888,9 +888,9 @@ class FP8Linear(Linear):
                 x.dtype,
                 self.dtype), f"Got input type {x.dtype}, expecting {self.dtype}"
 
-        activation_scaling_factor = constant(
-            self.activation_scaling_factor.raw_value.copy())
-        activation_scaling_factor = cast(activation_scaling_factor, self.dtype)
+        alpha = self.weights_scaling_factor.raw_value * self.activation_scaling_factor.raw_value
+        activation_scaling_factor = cast(self.activation_scaling_factor.value,
+                                         self.dtype)
         if x.dtype != trt.fp8:
             quantized_out = quantize(x, activation_scaling_factor, 'fp8')
             lora_hidden_state = x if lora_runtime_params is not None else None
@@ -901,9 +901,8 @@ class FP8Linear(Linear):
                 x, activation_scaling_factor, -1,
                 self.dtype) if lora_runtime_params is not None else None
 
-        weights_scaling_factor = constant(
-            self.weights_scaling_factor.raw_value.copy())
-        weights_scaling_factor = cast(weights_scaling_factor, self.dtype)
+        weights_scaling_factor = cast(self.weights_scaling_factor.value,
+                                      self.dtype)
         if self.weight.value.dtype != trt.fp8:
             w_quant_out = quantize(self.weight.value, weights_scaling_factor,
                                    'fp8')
@@ -912,7 +911,6 @@ class FP8Linear(Linear):
 
         gemm_plugin = default_net().plugin_config.gemm_plugin
         if gemm_plugin == 'fp8':
-            alpha = self.weights_scaling_factor.raw_value * self.activation_scaling_factor.raw_value
             ret = self.multiply_gather(quantized_out,
                                        w_quant_out,
                                        gemm_plugin=gemm_plugin,
@@ -960,9 +958,9 @@ class FP8RowLinear(RowLinear):
         assert lora_runtime_params is None or default_net(
         ).plugin_config.lora_plugin == self.dtype
 
-        activation_scaling_factor = constant(
-            self.activation_scaling_factor.raw_value.copy())
-        activation_scaling_factor = cast(activation_scaling_factor, self.dtype)
+        alpha = self.weights_scaling_factor.raw_value * self.activation_scaling_factor.raw_value
+        activation_scaling_factor = cast(self.activation_scaling_factor.value,
+                                         self.dtype)
         if x.dtype != trt.fp8:
             quantized_out = quantize(x, activation_scaling_factor, 'fp8')
             lora_hidden_state = x if lora_runtime_params is not None else None
@@ -973,9 +971,8 @@ class FP8RowLinear(RowLinear):
                 x, activation_scaling_factor, -1,
                 self.dtype) if lora_runtime_params is not None else None
 
-        weights_scaling_factor = constant(
-            self.weights_scaling_factor.raw_value.copy())
-        weights_scaling_factor = cast(weights_scaling_factor, self.dtype)
+        weights_scaling_factor = cast(self.weights_scaling_factor.value,
+                                      self.dtype)
         if self.weight.value.dtype != trt.fp8:
             w_quant_out = quantize(self.weight.value, weights_scaling_factor,
                                    'fp8')
@@ -984,7 +981,6 @@ class FP8RowLinear(RowLinear):
 
         gemm_plugin = default_net().plugin_config.gemm_plugin
         if gemm_plugin == 'fp8':
-            alpha = self.weights_scaling_factor.raw_value * self.activation_scaling_factor.raw_value
             ret = self.multiply_reduce(
                 quantized_out,
                 w_quant_out,
