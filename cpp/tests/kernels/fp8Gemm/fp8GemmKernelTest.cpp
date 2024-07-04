@@ -1,3 +1,4 @@
+#include <NvInferRuntime.h>
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_profiler_api.h>
@@ -178,7 +179,6 @@ void run_cpu(void* weight, void* activation, float scale, Params const& params, 
     }
 }
 
-template <typename InputType, typename OutputType>
 float run_cuda_kernel(Params& params, int warmup, int iter)
 {
     cudaStream_t s;
@@ -188,12 +188,12 @@ float run_cuda_kernel(Params& params, int warmup, int iter)
     cudaEventCreate(&end);
     for (int i = 0; i < warmup; ++i)
     {
-        tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<InputType, OutputType>(params, s);
+        tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher(params, s);
     }
     cudaEventRecord(begin, s);
     for (int i = 0; i < iter; ++i)
     {
-        tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<InputType, OutputType>(params, s);
+        tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher(params, s);
     }
     cudaEventRecord(end, s);
     cudaEventSynchronize(end);
@@ -317,11 +317,21 @@ template <typename InputType, typename OutputType>
 bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode const& quant_mode, int warmup, int iter,
     bool debug = false, bool run_cublas = false)
 {
+    constexpr nvinfer1::DataType kInputDatatype = std::is_same<InputType, float>::value ? nvinfer1::DataType::kFLOAT
+        : std::is_same<InputType, half>::value                                          ? nvinfer1::DataType::kHALF
+        : std::is_same<InputType, __nv_bfloat16>::value                                 ? nvinfer1::DataType::kBF16
+                                                                                        : nvinfer1::DataType::kFP8;
+
+    constexpr nvinfer1::DataType kOutputDatatype = std::is_same<OutputType, float>::value ? nvinfer1::DataType::kFLOAT
+        : std::is_same<OutputType, half>::value                                           ? nvinfer1::DataType::kHALF
+        : std::is_same<OutputType, __nv_bfloat16>::value                                  ? nvinfer1::DataType::kBF16
+                                                                                          : nvinfer1::DataType::kFP8;
+
     std::srand(20240123);
     simple_assert(m <= 4);
     printf("mnk (%d, %d, %d), output %s\n", m, n, k, typeid(OutputType).name());
-    CudaBuffer d_act(m * k);
-    CudaBuffer d_weight(k * n);
+    CudaBuffer d_act(m * k * sizeof(InputType));
+    CudaBuffer d_weight(k * n * sizeof(InputType));
     CudaBuffer d_out(m * n * sizeof(OutputType));
     std::vector<InputType> h_act(m * k);
     std::vector<InputType> h_weight(k * n);
@@ -342,12 +352,13 @@ bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode c
     d_act.copy_from(h_act.data());
     d_weight.copy_from(h_weight.data());
 
-    Params params{d_act.data(), d_weight.data(), h_alpha[0], d_out.data(), m, n, k, quant_mode};
+    Params params{
+        d_act.data(), d_weight.data(), h_alpha[0], d_out.data(), m, n, k, quant_mode, kInputDatatype, kOutputDatatype};
 
     run_cpu<InputType, OutputType>(h_weight.data(), h_act.data(), h_alpha[0], params, h_out_gt.data());
 
     float time1, time2;
-    time1 = run_cuda_kernel<InputType, OutputType>(params, warmup, iter);
+    time1 = run_cuda_kernel(params, warmup, iter);
     d_out.copy_to(h_out_cuda.data());
     bool pass_cuda_kernel = compare<OutputType>(h_out_cuda.data(), h_out_gt.data(), m * n);
 
@@ -378,7 +389,7 @@ bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode c
 }
 
 #ifdef ENABLE_FP8
-TEST(Kernel, Fp8Gemm)
+TEST(Kernel, Fp8Gemv)
 {
     int const arch = tensorrt_llm::common::getSMVersion();
     bool pass;
@@ -406,3 +417,31 @@ TEST(Kernel, Fp8Gemm)
     }
 }
 #endif
+
+TEST(Kernel, Fp16Gemv)
+{
+    int const arch = tensorrt_llm::common::getSMVersion();
+    bool pass;
+    int warmup = 10, iter = 30;
+    std::vector<int> ms{1, 2, 3, 4};
+    std::vector<int> ns{2047, 2048, 4096};
+    std::vector<int> ks{2048, 4096};
+    tensorrt_llm::common::QuantMode quant_mode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
+    for (auto m : ms)
+    {
+        for (auto n : ns)
+        {
+            for (auto k : ks)
+            {
+                pass = benchmark_and_verify<float, float>(m, n, k, quant_mode, warmup, iter);
+                EXPECT_TRUE(pass);
+                pass = benchmark_and_verify<half, half>(m, n, k, quant_mode, warmup, iter);
+                EXPECT_TRUE(pass);
+#if defined(ENABLE_BF16)
+                pass = benchmark_and_verify<__nv_bfloat16, __nv_bfloat16>(m, n, k, quant_mode, warmup, iter);
+                EXPECT_TRUE(pass);
+#endif
+            }
+        }
+    }
+}

@@ -23,7 +23,7 @@ Usage:
 
 # or
 
-./mixtureOfExpertsBackendBenchmark --benchmark_file <JSON benchmark definition>
+./mixtureOfExpertsBackendBenchmark --input_file <JSON benchmark definition>
 ```
 
 For more information see:

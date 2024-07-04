@@ -888,14 +888,14 @@ mpirun -n 8 --allow-run-as-root \
 
 ## Run models with LoRA
 
-* download the base model and lora model from HF
+Download the base model and lora model from HF:
 
 ```bash
 git-lfs clone https://huggingface.co/meta-llama/Llama-2-13b-hf
 git-lfs clone https://huggingface.co/hfl/chinese-llama-2-lora-13b
 ```
 
-* Build engine, setting `--lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
+Build engine, setting `--lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
 
 ```bash
 python convert_checkpoint.py --model_dir Llama-2-13b-hf \
@@ -913,7 +913,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu \
             --lora_dir chinese-llama-2-lora-13b
 ```
 
-* Run inference. Need to setup the `lora_dir`. Remember to use lora tokenizer because lora model has larger vocab size.
+Run inference. Remember to use lora tokenizer because lora model has larger vocab size.
 
 ```bash
 mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-gpu/" \
@@ -927,6 +927,7 @@ mpirun -n 2 python ../run.py --engine_dir "/tmp/new_lora_13b/trt_engines/fp16/2-
  Input: "今天天气很好，我到公园的时候，"
 Output: "发现公园里到处都是人，有的在跑步，有的在打羽毛球，还有的在跳绳，我和妈妈一起在公园里散步，我和妈妈在公园里散步的时候，看见了一位老爷爷在打羽毛球"
 ```
+
 Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
 In that case, the model will not run the LoRA module and the results will be
 different. Since the LoRA tokenizer, embedding and LM head are still used,

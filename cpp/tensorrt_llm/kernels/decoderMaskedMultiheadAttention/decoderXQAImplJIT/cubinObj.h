@@ -40,8 +40,9 @@ public:
     CubinObj& operator=(CubinObj const& other);
 
     // CubinObj can be move-constructed/assigned.
-    CubinObj(CubinObj&& other) = default;
-    CubinObj& operator=(CubinObj&& other) = default;
+    CubinObj(CubinObj&& other);
+    CubinObj& operator=(CubinObj&& other);
+    ~CubinObj();
 
     // Should be called at least once before calling launch().
     void initialize();

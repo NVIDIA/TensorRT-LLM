@@ -12,6 +12,8 @@ models using TensorRT-LLM and run on a single GPU.
     - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
       - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
     - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
+    - [4. Quantization](#4-quantization)
+    - [5. Run Phi-3 with LoRA](#5-run-phi-3-with-lora)
 
 ## Overview
 
@@ -25,12 +27,6 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-  * FP16
-  * BF16
-  * FP8
-  * INT8
-  * Tensor Parallel
-  ## Support Matrix
 
 |    Model Name    | FP16  | BF16  | FP8   | INT8  | TP   |
 | :--------------: | :---: | :---: | :---: | :---: | :---: |
@@ -128,7 +124,7 @@ python3 ../summarize.py --engine_dir ./phi-engine-tp2  \
 ```
 
 
-### 5. Quantization
+### 4. Quantization
 
 All Phi-3 variants support post-training quantization to FP8 and INT8 SmoothQuant formats.
 
@@ -156,3 +152,44 @@ python3 ../quantization/quantize.py \
 
 The commands to [build TensorRT engines](#2-build-tensorrt-engines) from quantized checkpoints
 and to run [summarization test](#3-summarization-using-the-phi-model) are same as those for unquantized checkpoints.
+
+### 5. Run Phi-3 with LoRA
+
+TensorRT-LLM supports running Phi-3-mini/small models with FP16/BF16/FP32 LoRA. In this section, we use Phi-3-mini as an example to show how to run an FP8 base model with FP16 LoRA module.
+
+* download the base model and lora model from HF
+
+```bash
+git-lfs clone https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
+git-lfs clone https://huggingface.co/sikoraaxd/Phi-3-mini-4k-instruct-ru-lora
+```
+
+* Quantize the Phi-3-mini model to fp8 from HF
+```bash
+BASE_PHI_3_MINI_MODEL=./Phi-3-mini-4k-instruct
+python ../quantization/quantize.py --model_dir ${BASE_PHI_3_MINI_MODEL} \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir phi3_mini_4k_instruct/trt_ckpt/fp8/1-gpu \
+                                   --calib_size 512
+```
+
+* Build engine and run inference.
+```
+trtllm-build --checkpoint_dir phi3_mini_4k_instruct/trt_ckpt/fp8/1-gpu \
+             --output_dir phi3_mini_4k_instruct/trt_engines/fp8_lora/1-gpu \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 1024 \
+             --max_seq_len 2048 \
+             --lora_plugin auto \
+             --lora_dir ./Phi-3-mini-4k-instruct-ru-lora
+
+python ../run.py --engine_dir phi3_mini_4k_instruct/trt_engines/fp8_lora/1-gpu \
+                 --max_output_len 500 \
+                 --tokenizer_dir ./Phi-3-mini-4k-instruct-ru-lora \
+                 --input_text "<|user|>\nCan you provide ways to eat combinations of bananas and dragonfruits?<|end|>\n<|assistant|>" \
+                 --lora_task_uids 0 \
+                 --use_py_session
+```

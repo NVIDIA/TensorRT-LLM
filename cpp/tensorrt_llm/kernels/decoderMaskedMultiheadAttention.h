@@ -78,7 +78,7 @@ struct Multihead_attention_params_base
 {
 
     // The output buffer. Dimensions B x D.
-    T* out = nullptr;
+    void* out = nullptr;
 
     // The input Qs and the associated bias. Dimensions B x D and D, resp.
     T const *q = nullptr, *q_bias = nullptr;

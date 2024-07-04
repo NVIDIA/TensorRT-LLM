@@ -122,24 +122,16 @@ __inline__ __device__ void multi_gpu_barrier(uint32_t** signals, uint32_t const 
         // Dimension 0 is the "listening" dimension, dimension 1 is "emitting" dimension
 
         // Block 0 broadcasts its flag (local_rank on emitting dimension) to all receivers
+        size_t offset = (flag % 2) ? world_size : 0;
+
         if (bidx == 0)
         {
-            st_flag_release(flag, signals[tidx] + local_rank);
+            st_flag_release(flag, signals[tidx] + offset + local_rank);
         }
 
         // All blocks check that corresponding block 0 on other GPUs have set the flag
         // No deadlock because block #0 is always the first block started
-        uint32_t* peer_barrier_d = signals[local_rank] + tidx;
-        while (ld_flag_acquire(peer_barrier_d) != flag)
-        {
-        }
-
-        if (bidx == 0)
-        {
-            st_flag_release(flag, signals[tidx] + world_size + local_rank);
-        }
-
-        peer_barrier_d = signals[local_rank] + world_size + tidx;
+        uint32_t* peer_barrier_d = signals[local_rank] + offset + tidx;
         while (ld_flag_acquire(peer_barrier_d) != flag)
         {
         }
@@ -160,20 +152,16 @@ __inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag
 
         // Block broadcast its flag (local_rank on emitting dimension) to all receivers
         uint32_t flag_block_offset = world_size + bidx * world_size;
+
+        if (flag % 2 == 1)
+        {
+            flag_block_offset += (grid_size + 1) * world_size;
+        }
+
         st_flag_release(flag, signals[tidx] + flag_block_offset + local_rank);
 
         // Blocks check that corresponding blocks on other GPUs have also set the flag
         uint32_t* peer_barrier_d = signals[local_rank] + flag_block_offset + tidx;
-
-        while (ld_flag_acquire(peer_barrier_d) != flag)
-        {
-        }
-
-        flag_block_offset += (grid_size + 1) * world_size;
-        st_flag_release(flag, signals[tidx] + flag_block_offset + local_rank);
-
-        // Blocks check that corresponding blocks on other GPUs have also set the flag
-        peer_barrier_d = signals[local_rank] + flag_block_offset + tidx;
 
         while (ld_flag_acquire(peer_barrier_d) != flag)
         {

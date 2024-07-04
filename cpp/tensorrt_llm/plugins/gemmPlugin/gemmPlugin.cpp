@@ -359,6 +359,16 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     int const K = static_cast<utils::DimType64>(
         mTransA ? inputDesc[0].dims.d[0] - padK : inputDesc[0].dims.d[nbDimsA - 1] - padK);
 
+    bool noPadDim = padM == 0 && padN == 0 && padK == 0;
+    bool cudaKernelSupportType = mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kFLOAT
+        || mType == nvinfer1::DataType::kBF16;
+
+    // skip computation for a TRT empty tensor
+    if (M == 0)
+    {
+        return 0;
+    }
+
     std::string mnkStr = "MNK={" + std::to_string(M) + ", " + std::to_string(N) + ", " + std::to_string(K) + "}";
     {
         std::string const activationStr = "GEMM layer's activation before GEMM with " + mnkStr;
@@ -367,31 +377,26 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
             "Found NaN in " + activationStr);
     }
 
+    bool cudaKernelFinished = false;
     // TODO: sub tensor matmul is not supported in fp8 gemm cuda kernel
-    if (M <= 4 && mUseFp8 && padM == 0 && padN == 0 && padK == 0)
+    if (M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
     {
         tensorrt_llm::common::QuantMode quantMode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
         tensorrt_llm::kernels::fp8_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
-            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode);
-        if (mType == nvinfer1::DataType::kHALF)
-        {
-            tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_fp8_e4m3, half>(params, stream);
-        }
-        else if (mType == nvinfer1::DataType::kFLOAT)
-        {
-            tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_fp8_e4m3, float>(params, stream);
-        }
-        else if (mType == nvinfer1::DataType::kBF16)
-        {
-            tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_fp8_e4m3, __nv_bfloat16>(params, stream);
-        }
-        else
-        {
-            TLLM_LOG_ERROR(
-                "tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher could only support dtype={half, bf16, float}");
-        }
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
+            nvinfer1::DataType::kFP8, mOutputType);
+        cudaKernelFinished = tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher(params, stream);
     }
-    else
+    else if (M <= 6 && N <= 128000 && !mUseFp8 && noPadDim && cudaKernelSupportType)
+    {
+        tensorrt_llm::common::QuantMode quantMode;
+        tensorrt_llm::kernels::fp8_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
+            mType, mOutputType);
+        cudaKernelFinished = tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher(params, stream);
+    }
+
+    if (!cudaKernelFinished)
     {
         auto bestTactic = mPluginProfiler->getBestConfig(M, mGemmId);
         runGemm(M, N, K, mTransA, mTransB, mPadLda, mPadLdb, mType, mCublasWrapper, inputs[0], inputs[1], mAlpha,

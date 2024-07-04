@@ -32,8 +32,9 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import (torch_to_numpy, trt_dtype_to_str,
                                  trt_dtype_to_torch)
-from tensorrt_llm.layers.moe import MoeConfig
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.layers.moe import MoeConfig, MoeOOTB
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import (create_session, getSMVersion, run_session,
@@ -630,8 +631,7 @@ class TestMoE(unittest.TestCase):
                            max_sizes=None):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        if use_plugin:
-            network.plugin_config.moe_plugin = trt_dtype_to_str(dtype)
+
         with tensorrt_llm.net_guard(network):
             if max_sizes:
                 dim_range = OrderedDict([("max_num_seq", [[1, 1,
@@ -647,10 +647,13 @@ class TestMoE(unittest.TestCase):
                              dim_range=dim_range,
                              dtype=dtype)
 
-            moe = tensorrt_llm.layers.MOE(moe_config=MoeConfig(
-                num_experts=num_experts,
-                top_k=top_k,
-                normalization_mode=norm_mode),
+            network.plugin_config.moe_plugin = trt_dtype_to_str(dtype)
+
+            moe_config = MoeConfig(num_experts=num_experts,
+                                   top_k=top_k,
+                                   normalization_mode=norm_mode)
+
+            moe = tensorrt_llm.layers.MOE(moe_config=moe_config,
                                           hidden_size=hidden_size,
                                           ffn_hidden_size=ffn_hidden_size,
                                           hidden_act=actfn,
@@ -680,6 +683,14 @@ class TestMoE(unittest.TestCase):
 
             if custom_network:
                 custom_network(network, trt_key)
+
+            if not use_plugin:
+                quant_config = None
+                if quant_mode.has_fp8_qdq():
+                    quant_config = QuantConfig(
+                        quant_algo=QuantAlgo.FP8,
+                        kv_cache_quant_algo=QuantAlgo.FP8)
+                moe = moe.to(MoeOOTB, quant_config=quant_config)
 
             output = moe(trt_key)
             output.mark_output('output', dtype)

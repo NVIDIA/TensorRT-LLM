@@ -552,6 +552,18 @@ class LoraManager(object):
         self.lora_target_modules = lora_target_modules
         self.missing_qkv_modules = missing_qkv_modules
 
+        def preprocess_lora_weights(lora_model):
+            # Swap weights of gate_up_proj
+            for key, value in lora_model.items():
+                if "gate_up_proj.lora_B.weight" in key:
+                    original_weights = value.contiguous().clone()
+                    half_split = original_weights.shape[0] // 2
+                    first_half = original_weights[:half_split, :]
+                    second_half = original_weights[half_split:, :]
+                    value = torch.cat((second_half, first_half), dim=0)
+                    lora_model[key] = value
+            return lora_model
+
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._lora_cpp_weights:
                 self._lora_cpp_weights[uid] = []
@@ -560,6 +572,7 @@ class LoraManager(object):
 
             lora_model = load_state_dict(
                 get_model_path(model_dir, "adapter_model"))
+            lora_model = preprocess_lora_weights(lora_model)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules,
                                                   component)
             rank = int(hf_config["r"])

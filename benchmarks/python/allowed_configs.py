@@ -41,7 +41,6 @@ class BuildConfig:
     type_vocab_size: Optional[int] = None
     pre_norm: Optional[bool] = None
     do_layer_norm_before: Optional[bool] = None
-    enable_qk_half_accum: bool = False
     enable_context_fmha: bool = True
     enable_multi_block_mode: bool = False
     # The enum name of PositionEmbeddingType
@@ -651,7 +650,6 @@ _allowed_configs = {
                     max_batch_size=256,
                     max_input_len=512,
                     builder_opt=None,
-                    enable_qk_half_accum=False,
                     enable_context_fmha=False,
                 )),
     "bert_large":
@@ -669,7 +667,6 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=512,
                     builder_opt=None,
-                    enable_qk_half_accum=False,
                     enable_context_fmha=False,
                 )),
     "roberta_base":
@@ -687,7 +684,6 @@ _allowed_configs = {
                     max_batch_size=64,
                     max_input_len=512,
                     builder_opt=None,
-                    enable_qk_half_accum=False,
                     enable_context_fmha=False,
                 )),
     "falcon_rw_1b":

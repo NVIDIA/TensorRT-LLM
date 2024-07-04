@@ -105,6 +105,7 @@ private:
     static std::optional<TokenIdType> const& checkTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
     static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
+    static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& penalty);
     static std::optional<SizeType32> const& checkMinLength(std::optional<SizeType32> const& minLength);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
@@ -251,6 +252,8 @@ public:
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
     /// name provided to the ExecutorConfig.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
+    /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
+    /// after every streaming step.
     Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -261,7 +264,7 @@ public:
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
-        std::optional<VecTokens> encoderInputTokenIds = std::nullopt);
+        std::optional<VecTokens> encoderInputTokenIds = std::nullopt, bool returnAllGeneratedTokens = false);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -287,6 +290,7 @@ public:
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
+    [[nodiscard]] bool getReturnAllGeneratedTokens() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -301,6 +305,7 @@ public:
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
+    void setReturnAllGeneratedTokens(bool returnAllGeneratedTokens);
 
 private:
     friend class Serialization;
@@ -648,6 +653,7 @@ public:
         bool normalizeLogProbs = true, SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
+        std::optional<SizeType32> maxNumTokens = std::nullopt,
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
@@ -663,6 +669,7 @@ public:
     [[nodiscard]] SizeType32 getRequestStatsMaxIterations() const;
     [[nodiscard]] BatchingType getBatchingType() const;
     [[nodiscard]] std::optional<SizeType32> getMaxBatchSize() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxNumTokens() const;
     [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
@@ -672,6 +679,7 @@ public:
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
+    void setMaxNumTokens(SizeType32 maxNumTokens);
     void setSchedulerConfig(SchedulerConfig const& schedulerConfig);
     void setKvCacheConfig(KvCacheConfig const& kvCacheConfig);
     void setEnableChunkedContext(bool enableChunkedContext);
@@ -715,6 +723,9 @@ private:
 
     /// @brief The max batch size of requests
     std::optional<SizeType32> mMaxBatchSize;
+
+    /// @brief The max number of tokens per batch
+    std::optional<SizeType32> mMaxNumTokens;
 
     /// @brief The parallel execution configuration.
     std::optional<ParallelConfig> mParallelConfig;

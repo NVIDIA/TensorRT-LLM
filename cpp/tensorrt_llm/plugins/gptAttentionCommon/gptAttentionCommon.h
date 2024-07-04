@@ -111,7 +111,7 @@ protected:
         float const* kv_scale_quant_orig;
         float const* attention_output_orig_quant;
         T const* alibi_slopes;
-        T* context_buf;
+        void* context_buf;
         void* key_value_cache;
         kernels::KVBlockArray::DataType* block_offsets;
         kernels::KVBlockArray::DataType* host_block_offsets;
@@ -195,7 +195,7 @@ protected:
         float const* attention_output_orig_quant;
         float const* rotary_embedding_scaling_factors;
         T const* alibi_slopes;
-        T* context_buf;
+        void* context_buf;
         void* key_value_cache;
         kernels::KVBlockArray::DataType* block_offsets;
         void* host_primary_pool_pointer;

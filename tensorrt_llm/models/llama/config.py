@@ -108,6 +108,8 @@ class LLaMAConfig(PretrainedConfig):
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
+        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = hf_config.hidden_act
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
@@ -153,6 +155,7 @@ class LLaMAConfig(PretrainedConfig):
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.intermediate_size,
             num_key_value_heads=num_key_value_heads,
+            head_size=head_size,
             vocab_size=hf_config.vocab_size,
             position_embedding_type='rope_gpt_neox',
             max_position_embeddings=hf_config.max_position_embeddings,

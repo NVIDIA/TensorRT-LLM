@@ -912,6 +912,8 @@ def test_speculative_decoding_config():
 def test_executor_config():
     config = trtllm.ExecutorConfig()
     assert config.max_beam_width == 1
+    assert config.max_batch_size is None
+    assert config.max_num_tokens is None
     assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
     assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
     assert config.enable_chunked_context == False
@@ -927,6 +929,10 @@ def test_executor_config():
     kwargs = {
         "max_beam_width":
         2,
+        "max_batch_size":
+        8,
+        "max_num_tokens":
+        128,
         "scheduler_config":
         trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
         "kv_cache_config":
@@ -1131,6 +1137,7 @@ def test_iteration_stats():
     stats.iter = 1
     stats.iter_latency_ms = 100
     stats.num_active_requests = 2
+    stats.num_queued_requests = 10
     stats.max_num_active_requests = 3
     stats.gpu_mem_usage = 1024
     stats.cpu_mem_usage = 2048
@@ -1140,6 +1147,7 @@ def test_iteration_stats():
     assert stats_json["iter"] == stats.iter
     assert stats_json["iterLatencyMS"] == stats.iter_latency_ms
     assert stats_json["numActiveRequests"] == stats.num_active_requests
+    assert stats_json["numQueuedRequests"] == stats.num_queued_requests
     assert stats_json["maxNumActiveRequests"] == stats.max_num_active_requests
     assert stats_json["gpuMemUsage"] == stats.gpu_mem_usage
     assert stats_json["cpuMemUsage"] == stats.cpu_mem_usage
@@ -1231,3 +1239,14 @@ def test_executor_config_pickle():
     assert config.max_beam_width == config_copy.max_beam_width
     assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
     assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
+
+
+def test_return_full_tokens():
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False,
+                             trtllm.SamplingConfig())
+    request.return_all_generated_tokens = True
+    assert request.return_all_generated_tokens == True
+    request.return_all_generated_tokens = False
+    assert request.return_all_generated_tokens == False

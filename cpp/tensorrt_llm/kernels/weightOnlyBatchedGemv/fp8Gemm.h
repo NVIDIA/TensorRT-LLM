@@ -15,8 +15,14 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/runtime/common.h"
+
+#include <NvInferRuntime.h>
+
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -43,9 +49,12 @@ struct Params
     void* output;
     SizeType32 m, n, k;
     tensorrt_llm::common::QuantMode quantMode;
+    nvinfer1::DataType inputType;
+    nvinfer1::DataType outputType;
 
     Params(void const* _act, void const* _weight, float _alpha, void* _output, SizeType32 _m, SizeType32 _n,
-        SizeType32 _k, tensorrt_llm::common::QuantMode _quant_mode)
+        SizeType32 _k, tensorrt_llm::common::QuantMode _quant_mode, nvinfer1::DataType _inputType,
+        nvinfer1::DataType _outputType)
         : act(_act)
         , weight(_weight)
         , alpha(_alpha)
@@ -54,12 +63,13 @@ struct Params
         , n(_n)
         , k(_k)
         , quantMode(_quant_mode)
+        , inputType(_inputType)
+        , outputType(_outputType)
     {
     }
 };
 
-template <typename InputType, typename OutputType>
-void fp8GemmLauncher(Params& params, cudaStream_t stream);
+bool fp8GemmDispatcher(Params const& params, cudaStream_t stream);
 } // namespace fp8_gemm
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -19,7 +19,7 @@ import platform
 from dataclasses import dataclass, field
 from functools import reduce, wraps
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import numpy as np
 import tensorrt as trt
@@ -201,6 +201,8 @@ class _Runtime(object):
     profiler: _Profiler
     engine_inspector: trt.EngineInspector
     cuda_graph_instances: List[cudart.cudaGraphExec_t]
+    input_tensor_names: Set[str]
+    output_tensor_names: Set[str]
 
     def __init__(self, engine_buffer, mapping: Mapping):
         self.address = None
@@ -243,6 +245,16 @@ class _Runtime(object):
 
         self.runtime = trt.Runtime(logger.trt_logger)
         self.engine = self.runtime.deserialize_cuda_engine(engine_buffer)
+
+        self.input_tensor_names = set()
+        self.output_tensor_names = set()
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
+                self.output_tensor_names.add(name)
+            else:
+                self.input_tensor_names.add(name)
+
         assert self.engine is not None
         # The device_memory_size stores the memory required by the largest profile
         address = CUASSERT(cudart.cudaMalloc(self.engine.device_memory_size))[0]
@@ -325,25 +337,30 @@ class _Runtime(object):
 
     def _set_tensors(self, context: trt.IExecutionContext,
                      tensors: Dict[str, "RuntimeTensor"]):
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
+        for name in self.input_tensor_names:
             # it's allowed to call set_tensors multi times with different tensors
             # each time only set some of the engine tensors, so it is valid to skip the ones not in the current given tensors dict
             if not name in tensors:
-                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
-                    dtype = self.engine.get_tensor_dtype(name)
-                    shape = context.get_tensor_shape(name)
-                    tensors[name] = RuntimeTensor.from_torch(
-                        name,
-                        torch.zeros(tuple(shape),
-                                    dtype=trt_dtype_to_torch(dtype),
-                                    device='cuda'))
-                else:
-                    continue
+                continue
+
+            tensor = tensors[name]
+            if context.get_tensor_address(name) != tensor.data:
+                context.set_tensor_address(name, tensor.data)
+
+            if list(context.get_tensor_shape(name)) != tensor.shape:
+                context.set_input_shape(name, tensor.shape)
+
+        for name in self.output_tensor_names:
+            if not name in tensors:
+                dtype = self.engine.get_tensor_dtype(name)
+                shape = context.get_tensor_shape(name)
+                tensors[name] = RuntimeTensor.from_torch(
+                    name,
+                    torch.zeros(tuple(shape),
+                                dtype=trt_dtype_to_torch(dtype),
+                                device='cuda'))
             t = tensors[name]
             # output's shape is inference by TRT, no need to set the shape here
-            if self.engine.get_tensor_mode(t.name) == trt.TensorIOMode.INPUT:
-                context.set_input_shape(t.name, t.shape)
             context.set_tensor_address(t.name, t.data)
 
     def _set_weight_streaming(self, gpu_weights_percent):
@@ -696,6 +713,13 @@ class GenerationSession(object):
                 model_config.max_batch_size, model_config.max_beam_width,
                 self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
                 self.mapping.pp_size, self.decoder_logits_dtype)
+
+        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
+            set_peer_access(self.mapping)
+            self.ipc_buffers, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
+                self.mapping,
+                CustomAllReduceHelper.max_workspace_size_auto(
+                    self.mapping.tp_size))
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
@@ -1645,13 +1669,6 @@ class GenerationSession(object):
                     self.buffer[f'conv_state_ptr_{i}'] = conv_state_ptr
                     self.buffer[f'rnn_state_ptr_{i}'] = rnn_state_ptr
 
-        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
-            set_peer_access(self.mapping)
-            self.ipc_buffers, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
-                self.mapping,
-                CustomAllReduceHelper.max_workspace_size_auto(
-                    self.mapping.tp_size))
-
         if self.use_lora_plugin and self.lora_manager is not None:
             lora_uids = lora_uids or ["-1"]
             self.buffer.update(
@@ -2203,7 +2220,9 @@ class GenerationSession(object):
         if self.use_custom_all_reduce and self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
-        if self.use_lora_plugin:
+        # Since we are using a ping-pong context design and the lora weight remains constant within the same request,
+        # it is only necessary to set the lora weight for the first two steps.
+        if self.use_lora_plugin and step < 2:
             for idx in range(self.num_layers):
                 layer_idx = idx + self.first_layer
                 for lora_module in (self.lora_target_modules +
@@ -3414,7 +3433,8 @@ class GenerationSession(object):
         stop_words_list_ptrs = None
         max_stop_words_len = 0
         if stop_words_list is not None:
-            stop_words_list = torch.from_numpy(stop_words_list).to('cuda')
+            stop_words_list = torch.from_numpy(stop_words_list).contiguous().to(
+                'cuda')
             max_stop_words_len = stop_words_list.shape[2]
             stop_words_lens = torch.full((batch_size, ),
                                          max_stop_words_len,
@@ -3432,7 +3452,8 @@ class GenerationSession(object):
         bad_words_list_ptrs = None
         max_bad_words_len = 0
         if bad_words_list is not None:
-            bad_words_list = torch.from_numpy(bad_words_list).to('cuda')
+            bad_words_list = torch.from_numpy(bad_words_list).contiguous().to(
+                'cuda')
             max_bad_words_len = bad_words_list.shape[2]
             bad_words_lens = torch.full((batch_size, ),
                                         max_bad_words_len,

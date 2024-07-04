@@ -220,6 +220,7 @@ def load_calib_dataset(dataset_name_or_dir: str,
                        config_name: Optional[str] = None,
                        split: Optional[str] = None,
                        key: Optional[str] = None,
+                       trust_remote_code=True,
                        **kwargs):
     if config_name is None:
         for name, meta in DEFAULT_HF_DATASET_META.items():

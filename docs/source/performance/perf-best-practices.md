@@ -142,6 +142,10 @@ to the runtime, and will possibly be removed in the future releases. We have sup
 an auto fallback mechanism so that native NCCL kernel is used when hardware requirements
 are not satisfied to get the best performance.
 
+If you use `CUDA_VISIBLE_DEVICES` or `NVIDIA_VISIBLE_DEVICES`, please provide the full device list
+instead of limiting to single device, otherwise custom all reduce will be disabled since its kernels
+rely on P2P access to peer devices, which is not allowed when only a single device is visible.
+
 In addition, there is an experimental feature called "Reduce Norm Fusion"
 available to extend the custom AllReduce functionality. It can be enabled by
 using the `--reduce_fusion enable` argument with `trtllm-build` when the

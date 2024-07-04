@@ -76,7 +76,7 @@ public:
                                      // within one beam for beam search, on gpu
     std::vector<std::vector<TensorConstPtr>>
         predictedDraftLogits; // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
-    TensorConstPtr seqSlots;  // [batchSize]
+    TensorPtr seqSlots;       // [batchSize]
 
     // explicit draft tokens data.
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
@@ -135,7 +135,7 @@ public:
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
-    [[nodiscard]] virtual CudaEvent finalize(SizeType32 batchIdx) const = 0;
+    [[nodiscard]] virtual CudaEvent finalize(SizeType32 batchIdx, SamplingConfig const& samplingConfig) const = 0;
 
     //! @returns [batchSize (actual)], marks finished requests (per batch)
     [[nodiscard]] virtual std::vector<bool> getFinished() const = 0;
@@ -155,6 +155,8 @@ public:
     [[nodiscard]] virtual TensorPtr getParentIds() const = 0;
 
     [[nodiscard]] virtual std::vector<SizeType32> getNbSteps() const = 0;
+
+    [[nodiscard]] virtual executor::DecodingMode getDecodingMode() const = 0;
 
     //! @brief Initialize batched decoder at seqSlots with a new `requests`.
     virtual void newRequests(std::vector<SizeType32> const& seqSlots,

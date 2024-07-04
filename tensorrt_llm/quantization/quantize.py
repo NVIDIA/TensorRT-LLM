@@ -22,7 +22,7 @@ def quantize_layers(
     preprocess_init_params=None,
 ):
     exclude_modules = quant_config.exclude_modules or [
-        'lm_head',
+        '*lm_head',
         '*router',
         '*vocab_embedding',
         '*position_embedding',

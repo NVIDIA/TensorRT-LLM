@@ -109,17 +109,21 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
         // non-medusa.
         return mPrecompiledImpl.get();
     }
-    if (tensorrt_llm::common::getEnvEnableXQAJIT())
+
+    std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
+
+    if (envEnableXQAJIT.has_value())
     {
-        return mJITImpl.get();
+        return envEnableXQAJIT.value() ? mJITImpl.get() : mPrecompiledImpl.get();
     }
     else
     {
-        return mPrecompiledImpl.get();
+        // If no env var set, default to JIT impl.
+        return mJITImpl.get();
     }
 }
 
-bool DecoderXQARunner::shouldUseImpl(XQAParams const& xqa_params, bool for_configure_plugin)
+bool DecoderXQARunner::shouldUse(XQAParams const& xqa_params, bool for_configure_plugin)
 {
     return getImplFromXQAParams(xqa_params)->shouldUse(xqa_params, for_configure_plugin);
 }

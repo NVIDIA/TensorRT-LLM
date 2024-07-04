@@ -70,6 +70,50 @@ CubinObj& CubinObj::operator=(CubinObj const& other)
     return *this;
 }
 
+CubinObj::CubinObj(CubinObj&& other)
+{
+    this->mContent = std::move(other.mContent);
+    if (other.mInitialized)
+    {
+        this->mInitialized = true;
+        this->mDriver = std::move(other.mDriver);
+        this->mModule = other.mModule;
+        this->mFunction = other.mFunction;
+        this->mSharedMemBytes = other.mSharedMemBytes;
+
+        other.mInitialized = false;
+    }
+    else
+    {
+        this->mInitialized = false;
+    }
+}
+
+CubinObj& CubinObj::operator=(CubinObj&& other)
+{
+    if (this == &other)
+    {
+        return *this;
+    }
+
+    this->mContent = std::move(other.mContent);
+    if (other.mInitialized)
+    {
+        this->mInitialized = true;
+        this->mDriver = std::move(other.mDriver);
+        this->mModule = other.mModule;
+        this->mFunction = other.mFunction;
+        this->mSharedMemBytes = other.mSharedMemBytes;
+
+        other.mInitialized = false;
+    }
+    else
+    {
+        this->mInitialized = false;
+    }
+    return *this;
+}
+
 size_t CubinObj::getSerializationSize() const noexcept
 {
     size_t result = sizeof(uint32_t) + mContent.size();
@@ -126,6 +170,15 @@ void CubinObj::initialize()
 
         sync_check_cuda_error();
         mInitialized = true;
+    }
+}
+
+CubinObj::~CubinObj()
+{
+    if (mInitialized)
+    {
+        cuErrCheck(mDriver->cuModuleUnload(mModule), mDriver);
+        mInitialized = false;
     }
 }
 

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import safetensors
 from helper import convert_weight_to_dtype, fuse_qkv_one_layer, reshape, split
-from transformers import (AutoModelForSeq2SeqLM, MBartForConditionalGeneration,
+from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
+                          MBartForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
@@ -133,6 +134,8 @@ def parse_t5_config(args, hf_model):
                 'encoder', 'num_heads')
             component_config.encoder_head_size = config.getint(
                 'encoder', 'd_kv')
+            component_config.decoder_start_token_id = config.getint(
+                'decoder', 'decoder_start_token_id')
 
         else:
             assert False, 'Unsupported component!'
@@ -310,6 +313,9 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
     return weights
 
 
+convert_blip2_weights_to_tllm_safetensors = convert_t5_weights_to_tllm_safetensors  # func alias
+
+
 def parse_nmt_config(args, model):
     config = configparser.ConfigParser()
     fairseq_config = vars(model.cfg.model)  # Namespace --> dict
@@ -420,6 +426,8 @@ def parse_nmt_config(args, model):
                 'd_kv',
                 fallback=component_config.encoder_hidden_size //
                 component_config.encoder_num_heads)
+            component_config.decoder_start_token_id = config.getint(
+                'decoder', 'decoder_start_token_id')
 
         return component_config
 
@@ -719,6 +727,13 @@ def parse_bart_config(args, hf_model):
                 fallback=component_config.encoder_hidden_size //
                 component_config.encoder_num_heads)
 
+            # nougat has decoder_start_token_id = None, special handling
+            decoder_start_token_id = config.get('decoder',
+                                                'decoder_start_token_id')
+            component_config.decoder_start_token_id = int(
+                decoder_start_token_id
+            ) if decoder_start_token_id != "None" else None
+
         return component_config
 
     encoder_config = None
@@ -1008,6 +1023,8 @@ def parse_pix2struct_config(args, hf_model):
             args.encoder_head_size = config.getint('decoder', 'd_kv')
             args.position_embedding_type = config.get(
                 'structure', 'position_embedding_type')
+            args.decoder_start_token_id = config.getint(
+                'decoder', 'decoder_start_token_id')
 
         else:
             assert False, 'Unsupported component!'
@@ -1180,6 +1197,9 @@ def get_model(args):
     elif args.model_type == "pix2struct":
         model = Pix2StructForConditionalGeneration.from_pretrained(
             args.model_dir)
+    elif args.model_type == "blip2":
+        model = Blip2ForConditionalGeneration.from_pretrained(
+            args.model_dir).language_model
     return model
 
 
@@ -1200,8 +1220,9 @@ def convert_checkpoint(args):
     kv_cache_quant_algo = None
     quant_algo = None
 
-    encoder_config, decoder_config = globals(
-    )[f'parse_{args.model_type}_config'](args, model)
+    model_type = args.model_type if args.model_type != "blip2" else "t5"
+    encoder_config, decoder_config = globals()[f'parse_{model_type}_config'](
+        args, model)
 
     additional_settings = ["gated_act"]
 
@@ -1308,6 +1329,7 @@ def convert_checkpoint(args):
         'encoder_head_size': decoder_config.encoder_head_size,
         'skip_cross_qkv': args.skip_cross_qkv,
         'use_implicit_relative_attention': args.use_implicit_relative_attention,
+        'decoder_start_token_id': decoder_config.decoder_start_token_id,
     }
     for additional_setting in additional_settings:
         if hasattr(decoder_config, additional_setting):
@@ -1374,11 +1396,13 @@ def convert(worker_rank, world_size, args, model_config, convert_args,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--model_type',
-                        type=str,
-                        default='t5',
-                        choices=['t5', 'nmt', 'bart', 'pix2struct'],
-                        help='Model to be converted.')
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        default='t5',
+        choices=['t5', 'nmt', 'bart', 'pix2struct', 'blip2'],
+        help=
+        'Multimodal type when this script is used for multimodal conversion.')
     parser.add_argument('--world_size',
                         type=int,
                         default=1,

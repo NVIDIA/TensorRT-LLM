@@ -5,6 +5,7 @@ import secrets
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from queue import Queue
@@ -14,23 +15,13 @@ import numpy as np
 import torch
 from janus import Queue as AsyncQueue
 
-from tensorrt_llm._utils import mpi_rank, mpi_world_size
-from tensorrt_llm.hlapi.mpi_session import (MpiPoolSession, MpiSession,
-                                            external_mpi_comm_available,
-                                            find_free_port,
-                                            need_spawn_mpi_workers)
-from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
-                                      print_traceback_on_error)
-
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
-from .hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from .hlapi.utils import (ContextManager, GenerationOutput, SamplingParams,
-                          exception_handler, print_traceback_on_error)
+from .hlapi.utils import (ContextManager, SamplingParams, exception_handler,
+                          print_traceback_on_error)
 
 
 def has_event_loop() -> bool:
@@ -45,34 +36,21 @@ class GenerationRequest:
 
     def __init__(
         self,
-        ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
-        streaming: bool = True,
-        tokenizer: Optional[TokenizerBase] = None,
-        sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None,
+        prompt_token_ids: Union[torch.Tensor, np.ndarray, list],
+        sampling_params: SamplingParams,
+        streaming: bool = False,
     ):
-        if isinstance(ids_or_prompt, str):
-            assert tokenizer is not None, "GenerationRequest constructor with str prompt requires a tokenizer argument"
-            self.input_ids = (tokenizer.encode(ids_or_prompt,
-                                               return_tensors="pt",
-                                               return_attention_mask=False).to(
-                                                   torch.int32).numpy())
+        if isinstance(prompt_token_ids, list):
+            self.prompt_token_ids = prompt_token_ids
+        elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
+            self.prompt_token_ids = prompt_token_ids.tolist()
         else:
-            if isinstance(ids_or_prompt, list):
-                self.input_ids = np.array(ids_or_prompt, dtype="int32")
-            elif isinstance(ids_or_prompt, torch.Tensor):
-                self.input_ids = ids_or_prompt.to(torch.int32).numpy()
-            elif isinstance(ids_or_prompt, np.ndarray):
-                self.input_ids = ids_or_prompt
-            else:
-                raise ValueError(
-                    f"ids_or_prompt (={ids_or_prompt}) should be an instance of str, torch.Tensor, np.ndarray or list"
-                )
+            raise TypeError(
+                f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+            )
 
-        self.tokenizer = tokenizer
+        self.sampling_params = sampling_params
         self.streaming = streaming
-        self.sampling_params = sampling_params or SamplingParams()
-
         self.id = -1
 
     def set_id(self, id):
@@ -80,27 +58,19 @@ class GenerationRequest:
         return self
 
     def as_executor_request(self) -> tllm.Request:
-        # Request
-        # TODO: Should we unify the pad_id/end_id logic?
-        end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
-        if end_id is None:
-            end_id = self.sampling_params.end_id
-        pad_id = end_id if pad_id is None else pad_id
-
         request_kwargs = {
             "input_token_ids":
-            self.input_ids.squeeze().tolist(),
+            self.prompt_token_ids,
             "max_new_tokens":
-            self.sampling_params.max_new_tokens or 32,
+            self.sampling_params.max_new_tokens,
             "streaming":
             self.streaming,
             "sampling_config":
             self.sampling_params._get_sampling_config(),
             "end_id":
-            end_id,
+            self.sampling_params.end_id,
             "pad_id":
-            pad_id,
+            self.sampling_params.pad_id,
             "output_config":
             self.sampling_params._get_output_config(),
             # The following options in the Executor API are not yet exposed by the HLAPI:
@@ -124,16 +94,43 @@ class GenerationRequest:
         return request
 
 
-class GenerationResult(GenerationOutput):
+@dataclass(slots=True)
+class CompletionOutput:
+    """The output data of one completion output of a request.
 
-    def __init__(self,
-                 generation_request: GenerationRequest,
-                 tokenizer: Optional[TokenizerBase] = None) -> None:
+    Args:
+        index (int): The index of the output in the request.
+        text (str): The generated output text.
+        token_ids (List[int]): The token ids of the generated output text.
+        cumulative_logprob (float): The cumulative log probability of the generated output text.
+        logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested.
+        generation_logits (torch.Tensor): The logits on the generated output token ids.
+    """
+    index: int
+    text: str = ""
+    token_ids: List[int] = field(default_factory=list)
+    cumulative_logprob: Optional[float] = None
+    logprobs: List[float] = field(default_factory=list)
+    generation_logits: Optional[torch.Tensor] = field(default=None, repr=False)
+    _last_text: str = field(default="", init=False, repr=False)
+
+    @property
+    def length(self):
+        return len(self.token_ids)
+
+    @property
+    def text_diff(self) -> str:
+        diff = self.text[len(self._last_text):]
+        self._last_text = self.text
+        return diff
+
+
+class GenerationResult:
+
+    def __init__(self, generation_request: GenerationRequest) -> None:
         self._done = False
         self._cancelled = False
-        self.generation_request = generation_request
-        self.tokenizer = tokenizer
-        self.streaming = generation_request.streaming
+        self._generation_request = generation_request
 
         if has_event_loop():
             aqueue = AsyncQueue()
@@ -143,32 +140,50 @@ class GenerationResult(GenerationOutput):
             self.queue = Queue()
             self.aqueue = None
 
-        beam_width = generation_request.sampling_params.beam_width
-
-        self.beam_search_enabled = beam_width > 1
-        self._token_ids = [[] for _ in range(beam_width)]
-
-        self.logprobs = []
-        self.last_text = ""
+        self.outputs: List[CompletionOutput] = [
+            CompletionOutput(i) for i in range(self.beam_width)
+        ]
+        self.context_logits: Optional[torch.Tensor] = None
 
     @property
-    def token_ids(self):
-        if not self.beam_search_enabled:
-            return self._token_ids[0]
-        return self._token_ids
+    def request_id(self) -> int:
+        return self._generation_request.id
+
+    @property
+    def prompt_token_ids(self) -> List[int]:
+        return self._generation_request.prompt_token_ids
+
+    @property
+    def finished(self) -> bool:
+        return self._done
+
+    @property
+    def streaming(self):
+        return self._generation_request.streaming
+
+    @property
+    def beam_width(self):
+        return self._generation_request.sampling_params.beam_width
 
     def handle_generation_msg(self, tensors: tuple, error: str):
         if error:
             raise RuntimeError(error)
 
-        output_token_ids, context_logits, generation_logits, log_probs = tensors
+        output_token_ids, context_logits, generation_logits, log_probs, cum_log_probs = tensors
 
-        for idx, beam_ids in enumerate(output_token_ids):
-            self._token_ids[idx] += beam_ids
+        for i, beam_ids in enumerate(output_token_ids):
+            self.outputs[i].token_ids.extend(beam_ids)
+            if cum_log_probs is not None:
+                self.outputs[i].cumulative_logprob = cum_log_probs[i]
+            if log_probs is not None:
+                self.outputs[i].logprobs = log_probs[i]
+                assert len(self.outputs[i].logprobs) == self.outputs[i].length
+            if generation_logits is not None:
+                self.outputs[i].generation_logits = generation_logits[
+                    i, :self.outputs[i].length]
 
-        self.context_logits = context_logits
-        self.generation_logits = generation_logits
-        self.log_probs = log_probs
+        if context_logits is not None:
+            self.context_logits = context_logits
 
     def result_step(self, timeout: Optional[float] = None):
         _, tensors, self._done, error = self.queue.get(timeout=timeout)
@@ -179,25 +194,6 @@ class GenerationResult(GenerationOutput):
         _, tensors, self._done, error = await self.aqueue.get()
         self.handle_generation_msg(tensors, error)
 
-    @property
-    def text_diff(self) -> str:
-        assert self.streaming is not None
-        assert not self.beam_search_enabled, "text_diff is not supported with beam_search"
-
-        new_txt = self.text
-        diff = new_txt[len(self.last_text):]
-        self.last_text = new_txt
-        return diff
-
-    @property
-    def text(self) -> Union[str, List[str]]:
-        if self.tokenizer is None:
-            return ''
-        texts = self.tokenizer.batch_decode(self._token_ids)
-        if not self.beam_search_enabled:
-            return texts[0]
-        return texts
-
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         while not self._done:
             self.result_step(timeout)
@@ -207,6 +203,9 @@ class GenerationResult(GenerationOutput):
         while not self._done:
             await self.aresult_step()
         return self
+
+    def __await__(self):
+        return self.aresult().__await__()
 
     def __iter__(self):
         return self
@@ -246,13 +245,27 @@ class GenerationResult(GenerationOutput):
         except RuntimeError as e:
             return e
 
+    def _repr_fields(self):
+        return ['request_id', 'prompt_token_ids', 'outputs', 'finished']
+
+    def __repr__(self) -> str:
+        repr = []
+        for field in self._repr_fields():
+            value = getattr(self, field)
+            if isinstance(value, str):
+                repr.append(f"{field}={value!r}")
+            else:
+                repr.append(f"{field}={value}")
+        repr = ", ".join(repr)
+        repr = f"{self.__class__.__name__}({repr})"
+        return repr
+
 
 class GenerationExecutor(ABC):
     TERMINATE_REQUEST_ID = 0
 
     def __init__(self):
         self.id_counter = GenerationExecutor.TERMINATE_REQUEST_ID + 1
-        self.tokenizer = None
         self._stats = None
         self.stats_queue = None
 
@@ -277,52 +290,48 @@ class GenerationExecutor(ABC):
 
     def generate_async(
         self,
-        prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool,
-        sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None,
-    ) -> Union[GenerationResult, List[GenerationResult]]:
-        unbatched = isinstance(prompt, str) or (isinstance(prompt, list)
-                                                and isinstance(prompt[0], int))
-        string_input = isinstance(
-            prompt, str) or (not unbatched and isinstance(prompt[0], str))
-        tokenizer = self.tokenizer if string_input else None
-
-        if unbatched:
-            results = self.submit(
-                GenerationRequest(prompt,
-                                  streaming,
-                                  tokenizer,
-                                  sampling_params=sampling_params))
-        else:
-            sampling_params = [sampling_params] * len(prompt) if not isinstance(
-                sampling_params, list) else sampling_params
-            results = []
-            for idx, p in enumerate(prompt):
-                results.append(
-                    self.submit(
-                        GenerationRequest(
-                            p,
-                            streaming,
-                            tokenizer,
-                            sampling_params=sampling_params[idx])))
-        return results
+        prompt_token_ids: List[int],
+        sampling_params: SamplingParams,
+        streaming: bool = False,
+    ) -> GenerationResult:
+        """Generate output for the given prompt token ids in the asynchronous mode.
+        Asynchronous generation accepts single prompt only.
+        """
+        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(sampling_params, SamplingParams)
+        result = self.submit(
+            GenerationRequest(prompt_token_ids,
+                              sampling_params=sampling_params,
+                              streaming=streaming))
+        return result
 
     def generate(
-        self,
-        prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool = False,
-        sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None,
+        self, prompt_token_ids: Union[List[int], List[List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]]
     ) -> Union[GenerationResult, List[GenerationResult]]:
-        futures = self.generate_async(prompt,
-                                      streaming=streaming,
-                                      sampling_params=sampling_params)
-        if isinstance(futures, GenerationRequest):
-            futures.result()
-        else:
-            for future in futures:
-                future.result()
+        """Generate output for the given prompt token ids in the synchronous mode.
+        Synchronous generation accepts either single prompt or batched prompts.
+        """
+        unbatched = isinstance(prompt_token_ids[0], int)
+
+        if unbatched:
+            prompt_token_ids = [prompt_token_ids]
+
+        futures = []
+        for i, p in enumerate(prompt_token_ids):
+            if isinstance(sampling_params, list):
+                sp = sampling_params[i]
+            else:
+                sp = sampling_params
+            future = self.generate_async(p, sampling_params=sp, streaming=False)
+            futures.append(future)
+
+        for future in futures:
+            future.result()
+
+        if unbatched:
+            futures = futures[0]
+
         return futures
 
     @abstractmethod
@@ -351,7 +360,6 @@ class GenerationExecutor(ABC):
     @staticmethod
     def create(
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
@@ -370,7 +378,6 @@ class GenerationExecutor(ABC):
 
         worker_kwargs = {
             "engine_dir": engine_dir,
-            "tokenizer": tokenizer,
             "executor_config": executor_config,
         }
 
@@ -396,13 +403,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def __init__(
         self,
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase, None],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
 
         self.engine = None
-        self.tokenizer = tokenizer_factory(tokenizer)
         self._results: Dict[int, GenerationResult] = {}
         self._pending: set = set()
         self.result_queue = None
@@ -475,6 +480,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                         response.result.context_logits,
                         response.result.generation_logits,
                         response.result.log_probs,
+                        response.result.cum_log_probs,
                     )
                     self.return_queue(req_id).put(
                         (response.request_id, tensors, response.result.is_final,
@@ -492,19 +498,23 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     self.stats_queue.get()
                 self.stats_queue.put(stats.to_json_str())
 
+    def start(self):
+        self.create_stats_queue()
+        self.start_awaiter_thread()
+        self.start_stats_thread()
+
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
             Low-level API to the executor. Return a "future" GenerationResult which can be waited.
         """
+        self.start()
+
         if self.rank != 0:
             raise NotImplementedError("Only rank 0 can submit requests.")
-        self.create_stats_queue()
-        self.start_awaiter_thread()
-        self.start_stats_thread()
         req_id = self.engine.enqueue_request(request.as_executor_request())
         request.set_id(req_id)
 
-        result = GenerationResult(request, request.tokenizer)
+        result = GenerationResult(request)
         self._results[req_id] = result
         self._pending.add(req_id)
         return result
@@ -540,12 +550,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def wait_first_completed(
         self, futures: List[GenerationResult]
     ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.generation_request.id for f in futures)
+        wait_set = set(f.request_id for f in futures)
 
         # clear already-finished requests
         for f in futures:
             if f._done:
-                wait_set.remove(f.generation_request.id)
+                wait_set.remove(f.request_id)
                 yield f
 
         # wait remaining active requests
@@ -597,7 +607,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         super().__init__()
 
         self.workers_started = False
-        self.tokenizer = tokenizer_factory(workers_kwargs["tokenizer"])
 
         request_queue_addr = ("127.0.0.1", find_free_port(),
                               secrets.token_bytes(512))
@@ -642,7 +651,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
     @staticmethod
     def workers_main(
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
@@ -663,8 +671,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # TODO[chunweiy]: fix the non-rank0 process failure
         init_ok = True
         try:
-            executor = ExecutorBindingsWorker(engine_dir, tokenizer,
-                                              executor_config)
+            executor = ExecutorBindingsWorker(engine_dir, executor_config)
         except Exception as e:
             init_ok = False
             raise e
@@ -678,7 +685,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 executor.set_stats_queue(mp_stats_queue)
                 while (req := request_queue.get()) is not None:
                     result = executor.submit(req)
-                    request_id_queue.put(result.generation_request.id)
+                    request_id_queue.put(result.request_id)
 
                 result_queue.put(None)
                 mp_stats_queue.put(None)
@@ -738,20 +745,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if not self.workers_started:
             self.start()
 
-        tokenizer = request.tokenizer
-        # no need to send the tokenizer to the executor,
-        # saves communication time
-        request.tokenizer = None
-
         self.request_queue.put(request)
 
         # Await req id.
         req_id = self.request_id_queue.get()
         request.set_id(req_id)
 
-        result = GenerationResult(request, tokenizer)
+        result = GenerationResult(request)
         self._results[req_id] = result
-        request.tokenizer = tokenizer
         self._request_id_dispatcher_queue.put(req_id)
 
         return result

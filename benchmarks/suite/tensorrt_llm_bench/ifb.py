@@ -285,7 +285,7 @@ def executor_benchmark(
         # the
         logger.info("Launching benchmark...")
         bench_cmd = \
-            ["mpirun", "-n", f"{benchmark_cfg.world_size}", "python"] +  \
+            ["mpiexec", "-n", f"{benchmark_cfg.world_size}", "python"] +  \
             sys.argv + ["--run"]
         process = subprocess.Popen(
             bench_cmd,

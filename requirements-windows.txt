@@ -6,7 +6,7 @@ cuda-python==12.4.0
 diffusers==0.27.0
 numpy<2
 onnx>=1.12.0
-polygraphy
+polygraphy==0.49.9
 psutil
 pynvml>=11.5.0
 pulp
@@ -15,11 +15,11 @@ h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.1.99
-tensorrt==10.0.1
+tensorrt-cu12==10.1.0
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
-torch @ https://download.pytorch.org/whl/cu121/torch-2.2.0%2Bcu121-cp310-cp310-win_amd64.whl#sha256=8f54c647ee19c8b4c0aad158c73b83b2c06cb62351e9cfa981540ce7295a9015
-nvidia-modelopt~=0.11,<0.12
+torch @ https://download.pytorch.org/whl/cu121/torch-2.3.1%2Bcu121-cp310-cp310-win_amd64.whl
+nvidia-modelopt~=0.13,<0.14
 transformers==4.38.2
 wheel
 optimum

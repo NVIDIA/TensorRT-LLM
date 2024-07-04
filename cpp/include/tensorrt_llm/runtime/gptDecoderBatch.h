@@ -95,9 +95,9 @@ public:
         return ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
     }
 
-    //! @brief Gather final beam search results for request `batchIdx`.
+    //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
-    [[nodiscard]] CudaEvent finalize(SizeType32 batchIdx) const override;
+    [[nodiscard]] CudaEvent finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig) const override;
 
     //! @brief Gather final beam search results for all requests.
     void finalize() const override;
@@ -196,12 +196,18 @@ public:
         return mJointDecodingOutput->speculativeDecodingOutputs->pathsOffsets;
     }
 
+    executor::DecodingMode getDecodingMode() const override
+    {
+        return mDecodingMode;
+    }
+
 private:
     //! @brief Gather final beam search results for request `batchIdx`.
-    [[nodiscard]] CudaEvent postProcessRequest(SizeType32 batchIdx) const;
+    [[nodiscard]] CudaEvent postProcessRequest(SizeType32 batchIdx,
+        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt) const;
 
-    //! @brief Initialize the decoder at `batchIdx` with a new `request`.
-    void newRequest(SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+    //! @brief Initialize the decoder at `batchSlot` with a new `request`.
+    void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
 
     //! @brief Allocate buffers for speculative decoding.
     void allocateSpeculativeDecodingBuffers();
@@ -303,5 +309,6 @@ private:
 
     bool mFusedDecoder{false};
     SpeculativeDecodingMode mSpeculativeDecodingMode;
+    executor::DecodingMode mDecodingMode{executor::DecodingMode::Auto()};
 };
 } // namespace tensorrt_llm::runtime

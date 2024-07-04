@@ -1,7 +1,8 @@
 import os
 import sys
 import tempfile
-from pathlib import Path
+
+from transformers import AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig, build
@@ -16,17 +17,18 @@ from utils.util import force_ampere, skip_no_modelopt, skip_pre_ada
 
 tensorrt_llm.logger.set_level('info')
 
+batch_input_text = [
+    "Born in north-east France, Soyer trained as a",
+    "What is large language model?"
+]
+
 
 @force_ampere
 @skip_no_modelopt
 def test_int4_awq_quantization():
-    input_text = [
-        'Born in north-east France, Soyer trained as a',
-        "What is large language model?"
-    ]
+
     max_batch_size, max_isl, max_osl = 8, 256, 256
     hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
-    tokenizer_dir = hf_model_dir
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
     quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
     LLaMAForCausalLM.quantize(hf_model_dir,
@@ -48,26 +50,24 @@ def test_int4_awq_quantization():
     engine_temp = tempfile.TemporaryDirectory(engine_dir)
     engine_dir = engine_temp.name
     engine.save(engine_dir)
-    with GenerationExecutor.create(Path(engine_dir), tokenizer_dir) as executor:
-        for idx, output in enumerate(
-                executor.generate(
-                    input_text,
-                    sampling_params=SamplingParams(max_new_tokens=10))):
-            print(f"Input: {input_text[idx]}")
-            print(f'Output: {output.text}')
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
+    with GenerationExecutor.create(engine_dir) as executor:
+        batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
+        outputs = executor.generate(
+            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
+        for idx, output in enumerate(outputs):
+            print(f"Input: {batch_input_text[idx]}")
+            output_text = tokenizer.decode(output.outputs[0].token_ids)
+            print(f'Output: {output_text}')
             # TODO: TRTLLM-185, check the score when the test infra is ready, hard coded value is not stable, cause flaky tests in L0
 
 
 @skip_pre_ada
 @skip_no_modelopt
 def test_fp8_quantization():
-    input_text = [
-        'Born in north-east France, Soyer trained as a',
-        "What is large language model?"
-    ]
     max_batch_size, max_isl, max_osl = 8, 256, 256
-    hf_model_dir = llm_models_root() / "llama-models/llama-7b-hf"
-    tokenizer_dir = hf_model_dir
+    hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
 
     checkpoint_dir = tempfile.TemporaryDirectory("llama-checkpoint").name
     quant_config = QuantConfig(QuantAlgo.FP8)
@@ -88,13 +88,17 @@ def test_fp8_quantization():
     engine_temp = tempfile.TemporaryDirectory(engine_dir)
     engine_dir = engine_temp.name
     engine.save(engine_dir)
-    with GenerationExecutor.create(Path(engine_dir), tokenizer_dir) as executor:
-        for idx, output in enumerate(
-                executor.generate(
-                    input_text,
-                    sampling_params=SamplingParams(max_new_tokens=10))):
-            print(f"Input: {input_text[idx]}")
-            print(f'Output: {output.text}')
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
+    with GenerationExecutor.create(engine_dir) as executor:
+        batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
+        outputs = executor.generate(
+            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
+
+        for idx, output in enumerate(outputs):
+            print(f"Input: {batch_input_text[idx]}")
+            output_text = tokenizer.decode(output.outputs[0].token_ids)
+            print(f'Output: {output_text}')
             # TODO: TRTLLM-185, check the score when the test infra is ready, hard coded value is not stable, cause flaky tests in L0
 
 

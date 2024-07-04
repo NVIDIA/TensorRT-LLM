@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -49,28 +51,12 @@ DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
     , mForceXQA(tensorrt_llm::common::forceXQAKernels())
     , mSM(tensorrt_llm::common::getSMVersion())
 {
-    initSupportedConfigs();
 }
 
-void DecoderXQAImplJIT::initSupportedConfigs()
+bool DecoderXQAImplJIT::supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const
 {
-    mSupportedConfigs.clear();
-
-    size_t nbConfigs = sizeof(sXqaKernelMetaInfo) / sizeof(sXqaKernelMetaInfo[0]);
-    for (size_t i = 0; i < nbConfigs; ++i)
-    {
-        XQAKernelMetaInfo const& kernelMeta = sXqaKernelMetaInfo[i];
-        if (!kernelMeta.mMultiQueryTokens)
-        {
-            // Exclude medusa kernels from JIT because they are compiled from a different CUDA source file.
-            mSupportedConfigs.insert(getRuntimeHashKeyFromKernelMeta(kernelMeta));
-        }
-    }
-}
-
-bool DecoderXQAImplJIT::supportConfig(XQAParams const& xqaParams) const
-{
-    return mSupportedConfigs.find(getRuntimeHashKeyFromXQAParams(xqaParams)) != mSupportedConfigs.end();
+    return jit::supportConfigQGMMA(xqaParams, mSM, forConfigurePlugin)
+        || jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin);
 }
 
 bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
@@ -92,16 +78,25 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
     return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(mRunner->mMultiProcessorCount);
 }
 
-bool DecoderXQAImplJIT::shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin)
+bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forConfigurePlugin)
 {
-    bool is_config_supported = supportConfig(xqaParams);
     if (forConfigurePlugin)
     {
-        return is_config_supported;
+        for (int beam_width = 1; beam_width <= umbrellaXQAParams.beam_width; ++beam_width)
+        {
+            XQAParams actualXQAParams = umbrellaXQAParams;
+            actualXQAParams.beam_width = beam_width;
+            if (supportConfig(actualXQAParams, forConfigurePlugin))
+            {
+                return true;
+            }
+        }
+        return false;
     }
     else
     {
-        return is_config_supported && mayHavePerfGain(xqaParams);
+        auto const& xqaParams = umbrellaXQAParams;
+        return supportConfig(xqaParams, forConfigurePlugin) && mayHavePerfGain(xqaParams);
     }
 }
 
@@ -115,29 +110,37 @@ jit::CubinObjKey DecoderXQAImplJIT::getCubinObjKeyFromXQAParams(XQAParams const&
     return {loadKey, runtimeKey};
 }
 
-void DecoderXQAImplJIT::prepare(XQAParams const& xqaParams)
+void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
 {
-    jit::CubinObjKey key = getCubinObjKeyFromXQAParams(xqaParams);
+    jit::CubinObjKey currentKey = getCubinObjKeyFromXQAParams(xqaParams);
 
     jit::CompileEngine compileEngine(mSM, xqaParams);
 
     auto registryGlobal = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry();
-    jit::CubinObj* uninitializedCubin = registryGlobal->getCubin(key);
-    if (uninitializedCubin != nullptr)
+
+    if (supportConfig(xqaParams, true))
     {
-        // Inference time. Prepare for the inference.
+        jit::CubinObjKey key = getCubinObjKeyFromXQAParams(xqaParams);
+        registryGlobal->insertCubinIfNotExists(key, &compileEngine);
         if (mInitializedCubinObjRegistry.getCubin(key) == nullptr)
         {
-            // Make a copy and initialize it.
+            // Get an unintiailized cubin from registryGlobal, initialize it, then put it in
+            // mInitializedCubinRegistry.
+            jit::CubinObj* uninitializedCubin = registryGlobal->getCubin(key);
             jit::CubinObj initializedCubin = *uninitializedCubin;
             initializedCubin.initialize();
             mInitializedCubinObjRegistry.insertCubin(key, std::move(initializedCubin));
         }
     }
-    else
+}
+
+void DecoderXQAImplJIT::prepare(XQAParams const& umbrellaXQAParams)
+{
+    for (int beam_width = 1; beam_width <= umbrellaXQAParams.beam_width; ++beam_width)
     {
-        // Engine-build time. Compile the cubin and place it into CubinObjRegistry.
-        registryGlobal->insertCubinIfNotExists(key, &compileEngine);
+        XQAParams actualXQAParams = umbrellaXQAParams;
+        actualXQAParams.beam_width = beam_width;
+        prepareForActualXQAParams(actualXQAParams);
     }
 }
 
@@ -279,10 +282,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     }
     else
     {
-        bool const isGmmaKernel = (mSM == kSM_90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3
-            && xqaParams.beam_width == 1);
+        bool const isGMMAKernel = jit::supportConfigQGMMA(xqaParams, mSM, false);
         constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 11;
-        uint32_t const maxNbKernelParams = (isGmmaKernel ? 11 : 10);
+        uint32_t const maxNbKernelParams = (isGMMAKernel ? 11 : 10);
         uint32_t idxNextParam = 0;
         void* kernelParams[kMAX_NB_KERNEL_PARAMS];
         auto appendParam = [&](auto* p) mutable
@@ -301,7 +303,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.batch_size);
         appendParam(&launchParams.kv_scale_quant_orig);
         CUtensorMap tensorMap{};
-        if (isGmmaKernel)
+        if (isGMMAKernel)
         {
             tensorMap = makeTensorMapForKVCache(mDriver, xqaParams, kv_cache_buffer);
             appendParam(&tensorMap);
@@ -316,7 +318,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         }
 
         dim3 gridDim(multi_block, xqaParams.num_kv_heads, xqaParams.batch_size);
-        dim3 blockDim(128, 1, isGmmaKernel ? 3 : 2);
+        dim3 blockDim(128, 1, isGMMAKernel ? 3 : 2);
         cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     }
 

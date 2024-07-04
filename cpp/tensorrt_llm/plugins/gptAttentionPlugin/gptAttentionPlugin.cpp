@@ -397,7 +397,7 @@ static size_t getStride(nvinfer1::Dims const& dims, int n)
     return std::accumulate(dims.d + n + 1, dims.d + dims.nbDims, 1, std::multiplies<size_t>{});
 }
 
-template <typename T, typename KVCacheBuffer>
+template <typename T, typename AttentionOutT, typename KVCacheBuffer>
 int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream)
@@ -437,8 +437,8 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         auto seqIdxBeg = 0;
         auto tokenIdxBeg = 0;
         auto localNbTokens = contextTokenIdxEnd;
-        enqueueSome<T, KVCacheBuffer>(seqIdxBeg, nbContextRequests, tokenIdxBeg, localNbTokens, inputDesc, outputDesc,
-            inputs, outputs, workspace, stream);
+        enqueueSome<T, AttentionOutT, KVCacheBuffer>(seqIdxBeg, nbContextRequests, tokenIdxBeg, localNbTokens,
+            inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
 
     if (auto nbGenerationSeq = nbSeq - nbContextRequests; nbGenerationSeq > 0)
@@ -451,8 +451,8 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         auto localNbTokens = mRemovePadding
             ? inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] - contextTokenIdxEnd
             : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] * inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
-        enqueueSome<T, KVCacheBuffer>(seqIdxBeg, nbGenerationSeq, tokenIdxBeg, localNbTokens, inputDesc, outputDesc,
-            inputs, outputs, workspace, stream);
+        enqueueSome<T, AttentionOutT, KVCacheBuffer>(seqIdxBeg, nbGenerationSeq, tokenIdxBeg, localNbTokens, inputDesc,
+            outputDesc, inputs, outputs, workspace, stream);
     }
 
     TLLM_LOG_TRACE("Attention plugin stop at layer %d", mLayerIdx);
@@ -460,7 +460,7 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-template <typename T, typename KVCacheBuffer>
+template <typename T, typename AttentionOutT, typename KVCacheBuffer>
 int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
     nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream)
@@ -621,10 +621,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         host_secondary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[1] + layerOffset);
     }
 
-    // FP8 output when fp8_context_fmha is enabled.
-    auto const outputElemSize = (mFP8ContextFMHA ? 1 : sizeof(T));
-    T* context_buf_ = reinterpret_cast<T*>(static_cast<char*>(outputs[0])
-        + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg * outputElemSize);
+    AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0])
+        + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg;
     void* key_value_cache = nullptr;
     if (useKVCache() && !mPagedKVCache)
     {
@@ -794,18 +792,18 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     return 0;
 }
 
-template <typename T>
+template <typename T, typename AttentionOutT>
 int GPTAttentionPlugin::enqueueDispatchKVCacheType(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream)
 {
     if (mPagedKVCache)
     {
-        return enqueueImpl<T, KVBlockArray>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        return enqueueImpl<T, AttentionOutT, KVBlockArray>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     else
     {
-        return enqueueImpl<T, KVLinearBuffer>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        return enqueueImpl<T, AttentionOutT, KVLinearBuffer>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     return 0;
 }
@@ -820,6 +818,13 @@ int GPTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
     if (mType == nvinfer1::DataType::kHALF)
     {
+#ifdef ENABLE_FP8
+        if (mFP8ContextFMHA)
+        {
+            return enqueueDispatchKVCacheType<half, __nv_fp8_e4m3>(
+                inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        }
+#endif
         return enqueueDispatchKVCacheType<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     else if (mType == nvinfer1::DataType::kFLOAT)
@@ -829,6 +834,13 @@ int GPTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 #ifdef ENABLE_BF16
     else if (mType == nvinfer1::DataType::kBF16)
     {
+#ifdef ENABLE_FP8
+        if (mFP8ContextFMHA)
+        {
+            return enqueueDispatchKVCacheType<__nv_bfloat16, __nv_fp8_e4m3>(
+                inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        }
+#endif
         return enqueueDispatchKVCacheType<__nv_bfloat16>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
 #endif

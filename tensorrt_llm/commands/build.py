@@ -20,7 +20,7 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.machinery import SourceFileLoader
 from multiprocessing import get_context
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
@@ -82,8 +82,10 @@ def parse_arguments():
         '--max_decoder_seq_len',
         dest='max_seq_len',
         type=int,
-        default=2048,
-        help="Max total length of context and generated sequence")
+        default=None,
+        help=
+        "Max total length of context and generated sequence. If unspecified, will try to deduce from the model config."
+    )
     parser.add_argument('--max_output_len', type=int, default=None)
     parser.add_argument('--max_beam_width', type=int, default=1)
     parser.add_argument('--max_num_tokens', type=int, default=8192)
@@ -253,12 +255,16 @@ def preprocess_model_config(model_config, **kwargs):
         model_config.mapping.world_size = kwargs['tp_size'] * kwargs['pp_size']
 
 
-def build_model(build_config: BuildConfig,
-                rank: int = 0,
-                ckpt_dir: str = None,
-                model_config: Union[str, PretrainedConfig] = None,
-                model_cls=None,
-                **kwargs) -> Engine:
+def build_model(
+    build_config: BuildConfig,
+    rank: int = 0,
+    ckpt_dir: str = None,
+    model_config: Union[str, PretrainedConfig] = None,
+    model_cls=None,
+    dry_run:
+    bool = False,  # return the modified BuildConfig without actually building the engine
+    **kwargs
+) -> Union[Engine, BuildConfig]:
     model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
@@ -314,6 +320,9 @@ def build_model(build_config: BuildConfig,
         build_config.use_strip_plan = True
     build_config.use_refit = kwargs.get('refit', False)
 
+    if dry_run:
+        return build_config
+
     return build(model, build_config)
 
 
@@ -332,22 +341,14 @@ def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
     return True
 
 
-def parallel_build(ckpt_dir_or_model_config: str,
+def parallel_build(model_config: PretrainedConfig,
+                   ckpt_dir: Optional[str],
                    build_config: BuildConfig,
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
                    model_cls=None,
                    **kwargs):
-    if ckpt_dir_or_model_config.lower().endswith('.json'):
-        config_path = ckpt_dir_or_model_config
-        ckpt_dir = None
-    else:
-        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
-        ckpt_dir = ckpt_dir_or_model_config
-
-    model_config = PretrainedConfig.from_json_file(config_path)
-    preprocess_model_config(model_config, **kwargs)
 
     if build_config.auto_parallel_config.enabled:
         if model_config.mapping.world_size > 1:
@@ -417,6 +418,18 @@ def main():
         'refit': False,
     }
     speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
+
+    ckpt_dir_or_model_config = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
+    if ckpt_dir_or_model_config.lower().endswith('.json'):
+        config_path = ckpt_dir_or_model_config
+        ckpt_dir = None
+    else:
+        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
+        ckpt_dir = ckpt_dir_or_model_config
+
+    model_config = PretrainedConfig.from_json_file(config_path)
+    preprocess_model_config(model_config, **kwargs)
+
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
             raise RuntimeError(
@@ -442,6 +455,38 @@ def main():
                     f"--max_output_len is specified but not --max_input_len")
 
             del args.max_output_len
+
+        # Extract rotary scaling which will be used for checks and default value of max_seq_len
+        rotary_scaling = getattr(model_config, "rotary_scaling", None)
+        if rotary_scaling is not None:
+            rotary_type = rotary_scaling['type']
+            rotary_factor = rotary_scaling[
+                'factor'] if rotary_type != 'su' else 1
+        else:
+            rotary_factor = 1
+
+        if args.max_seq_len is None:
+            # Step 1: Find the upper bound of max_seq_len
+            deduced_max_seq_len = 2048
+            if model_config.max_position_embeddings is not None:
+                deduced_max_seq_len = model_config.max_position_embeddings
+
+            # Step 2: Scale max_seq_len with rotary scaling
+            rotary_scaling = getattr(model_config, "rotary_scaling", None)
+            if rotary_factor != 1:
+                deduced_max_seq_len *= rotary_factor
+                logger.warning(
+                    f'max_seq_len is scaled to {deduced_max_seq_len} by rotary scaling {rotary_factor}'
+                )
+
+            # Step 3: Assign the new max_seq_len
+            args.max_seq_len = deduced_max_seq_len
+            logger.info(
+                f'max_seq_len is not specified, using value {deduced_max_seq_len}'
+            )
+        else:
+            if not plugin_config.streamingllm and model_config.max_position_embeddings is not None:
+                assert args.max_seq_len <= model_config.max_position_embeddings * rotary_factor, f'max_seq_len {args.max_seq_len} can\'t be larger than max_position_embeddings {model_config.max_position_embeddings} * rotary scaling {rotary_factor}'
 
         build_config = BuildConfig.from_dict(
             {
@@ -488,9 +533,8 @@ def main():
         build_config = BuildConfig.from_json_file(args.build_config,
                                                   plugin_config=plugin_config)
 
-    source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
-    parallel_build(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls, **kwargs)
+    parallel_build(model_config, ckpt_dir, build_config, args.output_dir,
+                   workers, args.log_level, model_cls, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

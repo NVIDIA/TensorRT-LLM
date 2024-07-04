@@ -1,8 +1,17 @@
-from .llm import (LLM, CapacitySchedulerPolicy, KvCacheConfig, ModelConfig,
-                  ParallelConfig, SamplingParams, StreamingLLMParam)
+from .llm import LLM, SamplingParams
+from .llm_utils import (BuildConfig, CapacitySchedulerPolicy, KvCacheConfig,
+                        LlmArgs, QuantAlgo, QuantConfig, SchedulerConfig)
 from .tokenizer import TokenizerBase
 
 __all__ = [
-    'LLM', 'ModelConfig', 'TokenizerBase', 'SamplingParams', 'ParallelConfig',
-    'StreamingLLMParam', 'KvCacheConfig', 'CapacitySchedulerPolicy'
+    'LLM',
+    'TokenizerBase',
+    'SamplingParams',
+    'KvCacheConfig',
+    'SchedulerConfig',
+    'CapacitySchedulerPolicy',
+    'BuildConfig',
+    'QuantConfig',
+    'QuantAlgo',
+    'LlmArgs',
 ]

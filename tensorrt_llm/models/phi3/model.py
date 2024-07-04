@@ -12,6 +12,7 @@ from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, BlockSparseAttnParams,
                        Embedding, LayerNorm, ParallelLMHead, RmsNorm)
+from ...lora_manager import LoraConfig, use_lora
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
@@ -69,8 +70,8 @@ class Phi3DecoderLayer(Module):
         local_layer_idx = layer_idx - layers_range[0]
         position_embedding_type = PositionEmbeddingType.rope_gpt_neox
 
-        rope_scaling_short_factors, rope_scaling_long_factors = 1.0, 1.0
-        rope_scaling_short_mscale, rope_scaling_long_mscale = 1.0, 1.0
+        rope_scaling_short_factors, rope_scaling_long_factors = None, None
+        rope_scaling_short_mscale, rope_scaling_long_mscale = None, None
         original_max_position_embeddings = config.max_position_embeddings
 
         if hasattr(config, "longrope_scaling_short_factors"):
@@ -124,6 +125,7 @@ class Phi3DecoderLayer(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
+        lora_layer_params=None,
     ):
 
         input_layernorm_output = self.input_layernorm(hidden_states)
@@ -134,6 +136,7 @@ class Phi3DecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             norm_before_bmm1=not self.small_variant,
+            lora_layer_params=lora_layer_params,
         )
 
         if use_cache:
@@ -141,8 +144,10 @@ class Phi3DecoderLayer(Module):
 
         post_attention_input = hidden_states + attention_output
         post_attention_output = self.post_layernorm(post_attention_input)
-        feed_forward_hidden_states = self.mlp(post_attention_output,
-                                              gegelu_limit=self.gegelu_limit)
+        feed_forward_hidden_states = self.mlp(
+            post_attention_output,
+            gegelu_limit=self.gegelu_limit,
+            lora_layer_params=lora_layer_params)
         hidden_states = post_attention_input + feed_forward_hidden_states
         if use_cache:
             return (hidden_states, presents)
@@ -179,6 +184,7 @@ class Phi3Model(Module):
         prompt_embedding_table=None,
         prompt_tasks=None,
         prompt_vocab_size=None,
+        lora_params=None,
     ):
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
                 ] if prompt_embedding_table is not None else []
@@ -193,6 +199,7 @@ class Phi3Model(Module):
             attention_mask=attention_mask,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
+            lora_params=lora_params,
         )
         if use_cache:
             hidden_states, presents = hidden_states
@@ -218,7 +225,12 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
                                  tp_group=config.mapping.tp_group,
                                  tp_size=config.mapping.tp_size,
                                  gather_output=True)
-
+        self.trtllm_modules_to_hf_modules = {
+            "attn_qkv": ["qkv_proj", "query_key_value"],
+            "attn_dense": ["o_proj", "dense"],
+            "mlp_h_to_4h": ["gate_up_proj", "up_proj"],
+            "mlp_4h_to_h": "down_proj",
+        }
         super().__init__(config, transformer, lm_head)
 
     @classmethod
@@ -266,3 +278,6 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
                 assert len(
                     exceptions
                 ) == 0, "Checkpoint conversion failed, please check error log."
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

@@ -237,7 +237,7 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> 
         if (beamWidth > 1)
         {
             idsPtrHost[mDecoderDomain.getBatchSize() + batchSlot]
-                = outputs->parentIds.value().template getPtrWithOffset<SizeType32>(bi * beamWidth * maxSeqLen);
+                = outputs->parentIds.value().template getPtrWithOffset<SizeType32>(batchSlot * beamWidth * maxSeqLen);
         }
         else
         {

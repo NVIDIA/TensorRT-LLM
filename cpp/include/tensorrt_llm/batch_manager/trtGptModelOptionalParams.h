@@ -42,6 +42,7 @@ public:
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
         executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
         std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
+        std::optional<SizeType32> maxNumTokens = std::nullopt,
         executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{})
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
@@ -53,6 +54,7 @@ public:
         , gpuWeightsPercent(gpuWeightsPercent)
         , maxBeamWidth(maxBeamWidth)
         , maxBatchSize(maxBatchSize)
+        , maxNumTokens(maxNumTokens)
         , schedulerConfig{schedulerConfig}
     {
     }
@@ -64,7 +66,7 @@ public:
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
-            executorConfig.getSchedulerConfig())
+            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig())
     {
     }
 
@@ -89,6 +91,7 @@ public:
     float gpuWeightsPercent;
     std::optional<SizeType32> maxBeamWidth;
     std::optional<SizeType32> maxBatchSize;
+    std::optional<SizeType32> maxNumTokens;
     executor::SchedulerConfig schedulerConfig;
 };
 

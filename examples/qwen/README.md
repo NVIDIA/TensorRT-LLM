@@ -14,6 +14,7 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
       - [INT4-GPTQ](#int4-gptq)
       - [INT4-AWQ](#int4-awq)
     - [Run](#run)
+    - [Run models with LoRA](#run-models-with-lora)
     - [Summarization using the Qwen model](#summarization-using-the-qwen-model)
   - [Credits](#credits)
 
@@ -409,6 +410,72 @@ What is your name?<|im_end|>
 <|im_start|>assistant
 "
 Output [Text 0 Beam 0]: "I am QianWen, a large language model created by Alibaba Cloud."
+```
+
+### Run models with LoRA
+
+Download the lora model from HF:
+
+```bash
+git clone https://huggingface.co/Jungwonchang/Ko-QWEN-7B-Chat-LoRA ./tmp/Ko-QWEN-7B-Chat-LoRA
+```
+
+Build engine, setting `--lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
+
+```bash
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                              --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/qwen/7B_lora/trt_engines/fp16/1-gpu \
+            --gemm_plugin auto \
+            --lora_plugin auto \
+            --lora_dir ./tmp/Ko-QWEN-7B-Chat-LoRA
+```
+
+Run inference:
+
+```bash
+python ../run.py --engine_dir ./tmp/qwen/7B_lora/trt_engines/fp16/1-gpu \
+              --max_output_len 50 \
+              --tokenizer_dir ./tmp/Qwen/7B/ \
+              --input_text "안녕하세요, 혹시 이름이 뭐에요?" \
+              --lora_task_uids 0 \
+              --use_py_session
+
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+안녕하세요, 혹시 이름이 뭐에요?<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "안녕하세요! 저는 인공지능 어시스턴트로, 여러분의 질문에 답하고 도움을 드리기 위해 여기 있습니다. 제가 무엇을 도와드릴까요?<|im_end|>
+<|im_start|>0
+<|im_start|><|im_end|>
+<|im_start|>"
+```
+
+Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
+In that case, the model will not run the LoRA module and the results will be
+different.
+
+```bash
+python ../run.py --engine_dir ./tmp/qwen/7B_lora/trt_engines/fp16/1-gpu \
+              --max_output_len 50 \
+              --tokenizer_dir ./tmp/Qwen/7B/ \
+              --input_text "안녕하세요, 혹시 이름이 뭐에요?" \
+              --lora_task_uids -1 \
+              --use_py_session
+
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+안녕하세요, 혹시 이름이 뭐에요?<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "안녕하세요! 저는 "QianWen"입니다.<|im_end|>
+"
 ```
 
 ### Summarization using the Qwen model

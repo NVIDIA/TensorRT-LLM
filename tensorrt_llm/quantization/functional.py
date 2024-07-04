@@ -236,6 +236,8 @@ def smooth_quant_layer_norm(input: Tensor,
             bias = constant(
                 np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
 
+        # LayerNorm plugin only supports float32 scale
+        scale = cast(scale, "float32")
         plug_inputs = [
             input.trt_tensor, weight.trt_tensor, bias.trt_tensor,
             scale.trt_tensor
@@ -287,6 +289,8 @@ def smooth_quant_rms_norm(input: Tensor,
             bias = constant(
                 np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
 
+        # RMS Norm Plugin only supports float32 scale
+        scale = cast(scale, "float32")
         plug_inputs = [
             input.trt_tensor, weight.trt_tensor, bias.trt_tensor,
             scale.trt_tensor

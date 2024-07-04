@@ -56,7 +56,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     T const* qkv_bias;
     T const* relative_attention_bias;
     int const* cache_indir;
-    T* context_buf;
+    void* context_buf;
     bool const* finished;
     int const* sequence_lengths;
     int max_batch_size;
@@ -273,7 +273,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     }
 
     // Set the output buffer.
-    params.out = reinterpret_cast<DataType*>(input_params.context_buf);
+    params.out = input_params.context_buf;
 
     // Set the input buffers.
     params.q = reinterpret_cast<DataType const*>(input_params.qkv_buf);
@@ -1250,12 +1250,12 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
 
         if (!mRemovePadding)
         {
-            invokeTransposeQKV(params.context_buf, qkv_buf_2_, params.batch_size, attention_seq_len_1, mNumHeads,
-                getHeadSize(), (float*) nullptr, 0, stream);
+            invokeTransposeQKV(static_cast<T*>(params.context_buf), qkv_buf_2_, params.batch_size, attention_seq_len_1,
+                mNumHeads, getHeadSize(), (float*) nullptr, 0, stream);
         }
         else
         {
-            invokeTransposeAttentionOutRemovePadding(qkv_buf_2_, params.context_buf, params.num_tokens,
+            invokeTransposeAttentionOutRemovePadding(qkv_buf_2_, static_cast<T*>(params.context_buf), params.num_tokens,
                 params.batch_size, attention_seq_len_1, mNumHeads, getHeadSize(), padding_offset, (float*) nullptr, 0,
                 stream);
         }
@@ -1350,7 +1350,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
         if (tensorrt_llm::kernels::XQADispatchHelper<T, KVCacheBuffer>::CanSupport && mDecoderXQARunner.get() != nullptr
             && this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(
                 xqaParams, params, /*forConfigurePlugin=*/false)
-            && mDecoderXQARunner->template shouldUse<T>(xqaParams, /*forConfigurePlugin=*/false))
+            && mDecoderXQARunner->shouldUse(xqaParams, /*forConfigurePlugin=*/false))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
             mDecoderXQARunner->template dispatch<KVCacheBuffer>(xqaParams, kv_cache_buffer, stream);
@@ -1529,7 +1529,7 @@ void GPTAttentionPluginCommon::prepareEnqueueGeneration(EnqueueGenerationParams<
     XQAParams xqaParams{};
     if (tensorrt_llm::kernels::XQADispatchHelper<T, KVCacheBuffer>::CanSupport && mDecoderXQARunner.get() != nullptr
         && this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/true)
-        && mDecoderXQARunner->template shouldUse<T>(xqaParams, /*forConfigurePlugin=*/true))
+        && mDecoderXQARunner->shouldUse(xqaParams, /*forConfigurePlugin=*/true))
     {
         mDecoderXQARunner->prepare(xqaParams);
     }

@@ -43,11 +43,12 @@ protected:
 private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
 
-    void initSupportedConfigs();
     //! Whether DecoderXQAImplJIT supports xqaParams.
-    bool supportConfig(XQAParams const& xqaParams) const;
+    bool supportConfig(XQAParams const& xqaParams, bool forConfigurePlugin) const;
     //! Whether DecoderXQAImplJIT has perf gain over the default (non-XQA-optimized) implementation.
     bool mayHavePerfGain(XQAParams const& xqaParams) const;
+
+    void prepareForActualXQAParams(XQAParams const& xqaParams);
 
     template <typename T, typename KVCacheBuffer>
     void runImpl(XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer, int multiprocessor_count,
@@ -63,9 +64,6 @@ private:
     jit::CubinObjRegistry mInitializedCubinObjRegistry;
 
     jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
-
-    //! The first prototype just takes whatever available from the Precompiled cubins.
-    std::unordered_set<XQAKernelRuntimeHashKey, XQAKernelRuntimeHasher> mSupportedConfigs;
 };
 
 } // namespace kernels

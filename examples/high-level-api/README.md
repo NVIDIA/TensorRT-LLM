@@ -40,7 +40,7 @@ The HLAPI supports three kinds of model formats:
 2. TensorRT-LLM engine built by trtllm-build tool or saved by the HLAPI
 3. TensorRT-LLM checkpoints, converted by `convert_checkpoint.py` in examples
 
-All kinds of models could be used directly by the HLAPI, and the `ModelConfig(<any-model-path>)` could accept any kind of them.
+All kinds of models could be used directly by the HLAPI, and the `LLM(model=<any-model-path>)` could accept any kind of them.
 
 Let's elaborate on the preparation of the three kinds of model formats.
 
@@ -72,8 +72,7 @@ There are two ways to build the TensorRT-LLM engine:
 2. Use the HLAPI to save one:
 
 ```python
-config = ModelConfig(<model-path>)
-llm = LLM(config)
+llm = LLM(<model-path>)
 
 # Save engine to local disk
 llm.save(<engine-dir>)
@@ -86,14 +85,13 @@ For step-by-step guidance on checkpoint conversion, please refer to the LLaMA's 
 
 
 ## Basic usage
-To use the API, import the `LLM` and `ModelConfig` from the `tensorrt_llm` package and create an LLM object with a HuggingFace model directly.
+To use the API, import the `LLM` from the `tensorrt_llm` package and create an LLM object with a HuggingFace model directly.
 For example:
 
 ``` python
-from tensorrt_llm import LLM, ModelConfig
+from tensorrt_llm import LLM
 
-config = ModelConfig(model_dir=<llama_model_path>)
-llm = LLM(config)
+llm = LLM(model=<llama_model_path>)
 ```
 
 It will trigger TRT-LLM engine building in the backend, and create a HuggingFace tokenizer by default to support an end-to-end generation.
@@ -109,7 +107,7 @@ for output in llm.generate(prompts):
 The output might be something like:
 
 ``` python
-GenerationOutput(text="with a picture.\nI'm a writer, but I'm also a photographer.")
+RequestOutput(request_id=2, prompt='To tell a story', prompt_token_ids=[1, 1763, 2649, 263, 5828], outputs=[CompletionOutput(index=0, text=', you need to have a beginning, a middle, and an end.\nThe beginning is the introduction of the characters and the setting.\nThe middle is', token_ids=[29892, 366, 817, 304, 505, 263, 6763, 29892, 263, 7256, 29892, 322, 385, 1095, 29889, 13, 1576, 6763, 338, 278, 18707, 310, 278, 4890, 322, 278, 4444, 29889, 13, 1576, 7256, 338], cumulative_logprob=None, logprobs=[])], finished=True)
 ```
 
 You can also dump the runtime engine to disk, and load from the engine file directly in the next run to save the engine building time from the HuggingFace model.
@@ -119,25 +117,22 @@ You can also dump the runtime engine to disk, and load from the engine file dire
 llm.save(<engine-path>)
 
 # next time
-config = ModelConfig(model_dir=<engine-path>)
-llm = LLM(config)
+llm = LLM(model=<engine-path>)
 ```
 
 In other words, the `model_dir` could accept either a HugggingFace model, a built TensorRT-LLM engine, or a TensorRT-LLM checkpoint, and the `LLM()` will do the rest work silently for end-to-end execution.
 
 ## Quantization
 
-By simply setting several flags in the ModelConfig, TensorRT-LLM can quantize the HuggingFace model automatically. For example, to perform an Int4 AWQ quantization, the following code will trigger the model quantization.
+By simply setting several flags in the `LLM`, TensorRT-LLM can quantize the HuggingFace model automatically. For example, to perform an Int4 AWQ quantization, the following code will trigger the model quantization.
 
 
 ``` python
-from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.hlapi import QuantConfig, QuantAlgo
 
-config = ModelConfig(model_dir=<llama_model_path>)
+quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
 
-config.quant_config.quant_algo = QuantAlgo.W4A16_AWQ
-
-llm = LLM(config)
+llm = LLM(<model-dir>, quant_config=quant_config)
 ```
 
 ## Parallelism
@@ -146,10 +141,9 @@ llm = LLM(config)
 It is easy to enable Tensor Parallelism in the HLAPI. For example, setting `parallel_config.tp_size=2` to perform a 2-way parallelism:
 
 ```python
-from tensorrt_llm import LLM, ModelConfig
+from tensorrt_llm.hlapi import LLM
 
-config = ModelConfig(model_dir=<llama_model_path>)
-config.parallel_config.tp_size = 2
+llm = LLM(<llama_model_path>, tensor_parallel_size=2)
 ```
 
 ### Pipeline Parallelism
@@ -163,14 +157,12 @@ config.parallel_config.pp_size = 4
 
 ### Automatic Parallelism (in preview)
 
-By simply enabling `parallel_config.auto_parallel` in the ModelConfig, TensorRT-LLM can parallelize the model automatically. For example, setting `parallel_config.world_size` to perform a 2-way parallelism:
+By simply enabling `auto_parallel` in the `LLM` class, TensorRT-LLM can parallelize the model automatically. For example, setting `world_size` to perform a 2-way parallelism:
 
 ``` python
-from tensorrt_llm import LLM, ModelConfig
+from tensorrt_llm import LLM
 
-config = ModelConfig(model_dir=<llama_model_path>)
-config.parallel_config.auto_parallel = True
-config.parallel_config.world_size = 2
+llm = LLM(<llama_model_path>, auto_parallel=True, world_size=2)
 ```
 
 ### Multi-GPU multi-node (MGMN) support
@@ -183,12 +175,8 @@ Firstly, it is suggested to build the engine offline with the `trtllm-build` too
 Secondly, you need to prepare a Python file containing the HLAPI task, a naive example is as below, note that, this Python script will be executed only once on MPI rank0, and it looks nothing special compared to the single-node-multi-gpu scenario, such as TP or PP.
 
 ```python
-config = ModelConfig(model_dir=<llama_model_path>)
-# Set the parallel_config to the number of GPUs you want to use
-config.parallel_config.tp_size = 4
-config.parallel_config.pp_size = 2
-
-llm = LLM(config)
+# Set the tensor_parallel_size and pipeline_parallel_size to the number of GPUs you want to use
+llm = LLM(model=<llama_model_path>, tensor_parallel_size=4, pipeline_parallel_size=2)
 for output in llm.generate([[32, 12]]):
     print(output)
 ```
@@ -218,9 +206,7 @@ Considering the Slurm or other cluster management systems may be highly customiz
 With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:
 
 ```python
-config = ModelConfig(model_dir=<llama_model_path>)
-
-llm = LLM(config, async_mode=True)
+llm = LLM(model=<llama_model_path>)
 
 async for output in llm.generate_async(<prompt>, streaming=True):
     print(output)
@@ -258,12 +244,12 @@ With SamplingParams, you can customize the sampling strategy, such as beam searc
 To enable beam search with a beam size of 4, set the `sampling_params` as follows:
 
 ```python
-from tensorrt_llm import ModelConfig, LLM
-from tensorrt_llm.hlapi import SamplingParams
+from tensorrt_llm.hlapi import LLM, SamplingParams, BuildConfig
 
-config = ModelConfig(model_dir=<llama_model_path>, max_beam_width=4)
+build_config = BuildConfig()
+build_config.max_beam_width = 4
 
-llm = LLM(config)
+llm = LLM(<llama_model_path>, build_config=build_config)
 # Let the LLM object generate text with the default sampling strategy, or
 # you can create a SamplingParams object as well with several fields set manually
 sampling_params = SamplingParams(beam_width=4) # current limitation: beam_width should be equal to max_beam_width
@@ -282,18 +268,15 @@ Please refer to these classes for more details.
 
 ### Runtime customization
 
-For `kv_cache_config`, `capacity_scheduling_policy` and `streaming_llm` features, please refer to LLaMA's [README](../llama/README.md) for more details, the high-level API supports these features as well by setting the corresponding fields in the `LLM()` constructor.
+For `kv_cache_config` and `streaming_llm` features, please refer to LLaMA's [README](../llama/README.md) for more details, the high-level API supports these features as well by setting the corresponding fields in the `LLM()` constructor.
 
 ```python
-from tensorrt_llm import ModelConfig, LLM
-from tensorrt_llm.hlapi import KvCacheConfig, CapacitySchedulerPolicy
+from tensorrt_llm.hlapi import LLM, KvCacheConfig
 
-config = ModelConfig(model_dir=<llama_model_path>)
-llm = LLM(config,
+llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(
                             max_new_tokens=128,
-                            free_gpu_memory_fraction=0.8),
-          capacity_scheduling_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
+                            free_gpu_memory_fraction=0.8))
 ```
 
 ### Tokenizer customization
@@ -301,7 +284,7 @@ llm = LLM(config,
 By default, the high-level API uses transformers’ `AutoTokenizer`. You can override it with your own tokenizer by passing it when creating the LLM object. For example:
 
 ```python
-llm = LLM(config, tokenizer=<my_faster_one>)
+llm = LLM(<llama_model_path>, tokenizer=<my_faster_one>)
 ```
 
 The LLM() workflow should use your tokenizer instead.
@@ -309,20 +292,24 @@ The LLM() workflow should use your tokenizer instead.
 It is also possible to input token IDs directly without Tokenizers with the following code, note that the result will be also IDs without text since the tokenizer is not used.
 
 ``` python
-llm = LLM(config)
+llm = LLM(<llama_model_path>)
 
-for output in llm.generate([32, 12]): ...
+for output in llm.generate([32, 12]):
+    ...
 ```
 
 ### Disabling tokenizer
-For performance considerations, you can disable the tokenizer by passing the token ID list to the `LLM.generate/_async` method. For example:
+For performance considerations, you can disable the tokenizer by passing `skip_tokenizer_init=True` when creating `LLM`. In this case, `LLM.generate` and `LLM.generate_async` will expect prompt token ids as input. For example:
 
 ```python
-config = ModelConfig(model_dir=<llama_model_path>)
-
-llm = LLM(config)
+llm = LLM(<llama_model_path>)
 for output in llm.generate([[32, 12]]):
     print(output)
 ```
 
-You will get something like `GenerationResult(text='', token_ids=[23, 14, 3, 29871, 3], ...)`, note that the `text` field is empty since the tokenizer is not activated.
+You will get something like:
+```python
+RequestOutput(request_id=1, prompt=None, prompt_token_ids=[1, 15043, 29892, 590, 1024, 338], outputs=[CompletionOutput(index=0, text='', token_ids=[518, 10858, 4408, 29962, 322, 306, 626, 263, 518, 10858, 20627, 29962, 472, 518, 10858, 6938, 1822, 306, 626, 5007, 304, 4653, 590, 4066, 297, 278, 518, 11947, 18527, 29962, 2602, 472], cumulative_logprob=None, logprobs=[])], finished=True)
+```
+
+Note that the `text` field in `CompletionOutput` is empty since the tokenizer is deactivated.

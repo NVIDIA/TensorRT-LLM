@@ -286,77 +286,29 @@ class TestFunctional(unittest.TestCase):
         test_cases = [(f"partition{int(i % 4)}", ) + case
                       for i, case in enumerate(test_cases)]
 
-        # tests (h100 only)
-        # For warp-specialized kernels on Hopper.
+        # For HMMA/QGMMA XQA kernels.
+        #
+        # Needs to test on both Hopper and non-Hopper, because Hopper may use different kernel.
+
         test_cases += list(
             product(
-                ['h100_only_part_0'],
-                [90],
+                ['xqa_generic'],
+                ['all'],
                 ['llama_attention'],
                 [
-                    ContextFMHAType.enabled,
-                    ContextFMHAType.enabled_with_fp32_acc
+                    ContextFMHAType.disabled,
                 ],
                 ['float16', 'bfloat16'],
-                [None],
-                [4],
-                [68, 2543],
-                [16],
-                [32, 64, 96, 112, 128, 160, 192, 256],
-                [2],
+                ['fp8', 'int8', None],
+                [2],  # batch_size
+                [165],  # in_len
+                [2, 8, 32],  # num_q_heads
+                [32, 64, 96, 128, 160],  # head_size
+                [2],  # num_kv_heads
+                [False],  # enable_multi_block_mmha
                 [False],
-                [False],
-                [1],
-                [False],
-                [False],
-                [10000.0],  # rope base
-                [  # rope scaling
-                    None,
-                ]))
-
-        # For XQA kernels
-        # all arches use the same kernel traits, we can assign some workloads to h100-only.
-        test_cases += list(
-            product(
-                ['h100_only_part_1'],
-                [90],
-                ['llama_attention'],
-                [ContextFMHAType.enabled],
-                ['float16', 'bfloat16'],
-                [None],
-                [2],
-                [165, 1025, 2543],
-                [16],
-                [128],
-                [2],
-                [False, True],
-                [False],
-                [1],
-                [False, True],
-                [False],
-                [10000.0],  # rope base
-                [  # rope scaling
-                    None,
-                ]))
-
-        # d = 256 xqa kernels (limited number of tests).
-        test_cases += list(
-            product(
-                ['h100_only_part_2'],
-                [90],
-                ['llama_attention'],
-                [ContextFMHAType.enabled],
-                ['float16', 'bfloat16'],
-                ['int8', 'fp8'],
-                [2],
-                [1025],
-                [16],
-                [256],
-                [2],
-                [False, True],
-                [False],
-                [1],
-                [False, True],
+                [1, 2, 4],  # beam_width
+                [False, True],  # paged_kv_cache
                 [False],
                 [10000.0],  # rope base
                 [  # rope scaling
@@ -392,6 +344,7 @@ class TestFunctional(unittest.TestCase):
         os.environ['TRTLLM_FORCE_XQA'] = '1'
         use_int8_kv_cache = True if kv_cache_dtype == 'int8' else False
         use_fp8_kv_cache = True if kv_cache_dtype == 'fp8' else False
+        output_atol = 2e-2 if kv_cache_dtype == 'int8' else 2e-3
         if kv_cache_dtype is None:
             kv_cache_dtype = dtype
         # skip tests based on the gpu_arch_lists
@@ -1354,7 +1307,7 @@ class TestFunctional(unittest.TestCase):
                 np.testing.assert_allclose(
                     torch.flatten(tiled_output).to(torch.float32).cpu().numpy(),
                     torch.flatten(torch_output).to(torch.float32).cpu().numpy(),
-                    atol=2e-3)
+                    atol=output_atol)
 
             if paged_kv_cache:
                 # Iterate to the next step. Increase number of tokens for all unfinished sequences

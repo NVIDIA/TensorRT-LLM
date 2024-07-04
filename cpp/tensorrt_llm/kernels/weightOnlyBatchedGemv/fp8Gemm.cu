@@ -38,8 +38,7 @@ __global__ void fp8Gemm(InputType const* __restrict__ act, InputType const* __re
     float acc[TILE_M * TILE_N];
 
     static_assert(kStepK % 4 == 0);
-    using CvtInputType
-        = std::conditional_t<std::is_same_v<InputType, __nv_fp8_e4m3>, cutlass::float_e4m3_t, cutlass::float_e5m2_t>;
+    using CvtInputType = typename tensorrt_llm::kernels::cutlass_kernels::TllmToCutlassTypeAdapter<InputType>::type;
     using Converter = cutlass::NumericArrayConverter<float, CvtInputType, 4>;
     using CvtSrcType = typename Converter::source_type;
     using CvtResType = typename Converter::result_type;
@@ -55,8 +54,7 @@ __global__ void fp8Gemm(InputType const* __restrict__ act, InputType const* __re
     output += tileIdM * n + tileIdN;
     for (SizeType32 idxK = tid * kStepK; idxK < k; idxK += kTileK)
     {
-#pragma unroll
-        for (SizeType32 i = 0; i < TILE_N; ++i)
+        for (SizeType32 i = 0; i < TILE_N && i + tileIdN < n; ++i)
         {
             auto tile_w_quantized = reinterpret_cast<VecType const*>(weight + i * k + idxK)[0];
 #pragma unroll
@@ -109,8 +107,7 @@ __global__ void fp8Gemm(InputType const* __restrict__ act, InputType const* __re
         }
     }
     __syncthreads();
-#pragma unroll
-    for (SizeType32 ii = tid; ii < TILE_M * TILE_N; ii += BLOCK_SIZE)
+    for (SizeType32 ii = tid; ii < TILE_M * TILE_N && ii % TILE_N + tileIdN < n; ii += BLOCK_SIZE)
     {
         SizeType32 mid = ii / TILE_N, nid = ii % TILE_N;
         float val = 0;
@@ -124,34 +121,135 @@ __global__ void fp8Gemm(InputType const* __restrict__ act, InputType const* __re
 }
 
 template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
-void fp8GemmKernel(Params& params, cudaStream_t stream)
+void fp8GemmKernel(Params const& params, cudaStream_t stream)
 {
     dim3 block(BLOCK_SIZE);
-    dim3 grid(params.m / TILE_M, params.n / TILE_N);
+    dim3 grid(params.m / TILE_M, (params.n + TILE_N - 1) / TILE_N);
     fp8Gemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
         reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight), params.alpha,
         reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
 }
 
-template <typename InputType, typename OutputType>
-void fp8GemmLauncher(Params& params, cudaStream_t stream)
+template <typename InputType, typename OutputType, int TILE_M, int TILE_N, int BLOCK_SIZE>
+bool fp8GemmTemplateCaller(Params const& params, cudaStream_t stream)
 {
-#define DISPATCH(TargetM, TILE_M, TILE_N, BLOCK_SIZE)                                                                  \
-    if (params.m == TargetM)                                                                                           \
-    {                                                                                                                  \
-        fp8GemmKernel<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>(params, stream);                              \
-        return;                                                                                                        \
+    constexpr int fp8GemmTemplateMaxM = 16;
+    if (params.m == TILE_M)
+    {
+        fp8GemmKernel<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>(params, stream);
+        return true;
     }
-    DISPATCH(1, 1, 2, 128);
-    DISPATCH(2, 2, 2, 128);
-    DISPATCH(3, 3, 2, 128);
-    DISPATCH(4, 4, 2, 128);
-#undef DISPATCH
+    if constexpr (TILE_M < fp8GemmTemplateMaxM)
+    {
+        return fp8GemmTemplateCaller<InputType, OutputType, TILE_M + 1, TILE_N, BLOCK_SIZE>(params, stream);
+    }
+    return false;
 }
 
-template void fp8GemmLauncher<__nv_fp8_e4m3, float>(Params& params, cudaStream_t stream);
-template void fp8GemmLauncher<__nv_fp8_e4m3, half>(Params& params, cudaStream_t stream);
-template void fp8GemmLauncher<__nv_fp8_e4m3, __nv_bfloat16>(Params& params, cudaStream_t stream);
+template <typename InputType, typename OutputType>
+bool fp8GemmLauncher(Params const& params, cudaStream_t stream)
+{
+    return fp8GemmTemplateCaller<InputType, OutputType, 1, 2, 128>(params, stream);
+}
+
+bool fp8GemmDispatcher(Params const& params, cudaStream_t stream)
+{
+    bool dispatched = true;
+    if (params.inputType == nvinfer1::DataType::kFP8)
+    {
+        if (params.k % 16 != 0)
+        {
+            // Expect k % 16 == 0 for 128 bits alignment
+            dispatched = false;
+        }
+        else if (params.outputType == nvinfer1::DataType::kHALF)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_fp8_e4m3, half>(params, stream);
+        }
+        else if (params.outputType == nvinfer1::DataType::kBF16)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_fp8_e4m3, __nv_bfloat16>(params, stream);
+        }
+        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_fp8_e4m3, float>(params, stream);
+        }
+        else
+        {
+            dispatched = false;
+        }
+    }
+    else if (params.inputType == nvinfer1::DataType::kHALF)
+    {
+        if (params.k % 8 != 0)
+        {
+            // Expect k % 8 == 0 for 128 bits alignment
+            dispatched = false;
+        }
+        else if (params.outputType == nvinfer1::DataType::kHALF)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<half, half>(params, stream);
+        }
+        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<half, float>(params, stream);
+        }
+        else
+        {
+            dispatched = false;
+        }
+    }
+    else if (params.inputType == nvinfer1::DataType::kBF16)
+    {
+        if (params.k % 8 != 0)
+        {
+            // Expect k % 8 == 0 for 128 bits alignment
+            dispatched = false;
+        }
+        else if (params.outputType == nvinfer1::DataType::kBF16)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_bfloat16, __nv_bfloat16>(params, stream);
+        }
+        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<__nv_bfloat16, float>(params, stream);
+        }
+        else
+        {
+            dispatched = false;
+        }
+    }
+    else if (params.inputType == nvinfer1::DataType::kFLOAT)
+    {
+        if (params.k % 4 != 0)
+        {
+            // Expect k % 4 == 0 for 128 bits alignment
+            dispatched = false;
+        }
+        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        {
+            dispatched = tensorrt_llm::kernels::fp8_gemm::fp8GemmLauncher<float, float>(params, stream);
+        }
+        else
+        {
+            dispatched = false;
+        }
+    }
+    else
+    {
+        dispatched = false;
+    }
+
+    if (!dispatched)
+    {
+        TLLM_LOG_DEBUG(
+            "tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher failed to dispatch: inputType=%d, outputType=%d, m=%d, "
+            "n=%d, k=%d",
+            params.inputType, params.outputType, params.m, params.n, params.k);
+    }
+    return dispatched;
+}
+
 } // namespace fp8_gemm
 } // namespace kernels
 } // namespace tensorrt_llm

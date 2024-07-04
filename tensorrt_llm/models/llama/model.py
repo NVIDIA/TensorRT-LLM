@@ -27,7 +27,7 @@ from ...plugin import init_all_reduce_helper
 from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..convert_utils import has_safetensors
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, preprocess_weights)
+                              QuantConfig, check_share_embedding)
 from .config import LLaMAConfig
 from .convert import (load_hf_llama, load_weights_from_hf_by_shard,
                       load_weights_from_hf_model,
@@ -323,8 +323,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         else:
             hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
             weights = load_weights_from_hf_model(hf_model, config)
-        preprocess_weights(weights, config)
 
+        check_share_embedding(weights, config)
         model = LLaMAForCausalLM(config)
         model.load(weights)
         return model
@@ -349,8 +349,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                             **kwargs)
 
         weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
-        preprocess_weights(weights, config)
 
+        check_share_embedding(weights, config)
         model = LLaMAForCausalLM(config)
         model.load(weights)
         return model

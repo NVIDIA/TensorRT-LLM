@@ -59,14 +59,34 @@ def get_all_lora_weights(lora_weights):
     return all_weights
 
 
+def preprocess_lora_weights(lora_model):
+    # Swap weights of gate_up_proj
+    for key, value in lora_model.items():
+        if "gate_up_proj.lora_B.weight" in key:
+            print("Swap {}".format(key))
+            original_weights = value.contiguous().clone()
+            half_split = original_weights.shape[0] // 2
+            first_half = original_weights[:half_split, :]
+            second_half = original_weights[half_split:, :]
+            value = torch.cat((second_half, first_half), dim=0)
+            lora_model[key] = value
+    return lora_model
+
+
 hf_modules_to_trtllm_modules = {
     "q_proj": "attn_q",
     "v_proj": "attn_v",
     "k_proj": "attn_k",
+    "qkv_proj": "attn_qkv",
+    "query_key_value": "attn_qkv",
     "o_proj": "attn_dense",
+    "dense": "attn_dense",
     "gate_proj": "mlp_h_to_4h",
     "down_proj": "mlp_4h_to_h",
-    "up_proj": "mlp_gate"
+    "up_proj": "mlp_gate",
+    "gate_up_proj": "mlp_h_to_4h",
+    "c_fc": "mlp_h_to_4h",
+    "c_proj": "mlp_4h_to_h",
 }  # lora modules on llama
 hf_modules_to_module_id = {
     k: LoraManager.LORA_MODULE_IDS[v]
@@ -89,6 +109,7 @@ def convert_hf_model(model_dir, dtype, out_dir):
         scale = alpha / rank
 
     lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
+    lora_model = preprocess_lora_weights(lora_model)
     all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
     converted_config = []

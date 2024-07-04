@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm
 {
@@ -40,7 +41,6 @@ struct BeamHypotheses
     int nMaxBatchSize{0};               // max batch size by model configuration
     int nBatchSize{0};                  // batch size by runtime input data
     int nBeamWidth{0};                  //
-    int nIte{0};                        // index of local_batch, always be 0 when pp_size==1
     int nMaxSeqLen{0};                  //
     int nVocabSize{0};                  // vocab_size_padded
 
@@ -52,6 +52,7 @@ struct BeamHypotheses
     // Pointers from input
     int const* inputLengths{nullptr};   // [BS, BM]         %% context_length
     int const* endIds{nullptr};         // [BS, BM]         %% self.end_ids
+    runtime::SizeType32 const* batchSlots{nullptr}; // [BS]
 
     // Pointers for output
     int* outputIds{nullptr};            // [BS, BM, MSL]    %% self.output_ids                      only used in gather_tree

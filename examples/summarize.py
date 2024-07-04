@@ -25,7 +25,7 @@ from datasets import load_dataset
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
 from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, load_tokenizer,
-                   read_model_name)
+                   read_model_name, supports_inflight_batching)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -404,11 +404,21 @@ def main(args):
         return output_lines_list, tokens_list, ppls
 
     if test_trt_llm:
+        if not supports_inflight_batching(args.engine_dir):
+            logger.warning(
+                "The given engine does not support in-flight batching, fallback to python session"
+            )
+            args.use_py_session = True
+
         if not PYTHON_BINDINGS and not args.use_py_session:
             logger.warning(
                 "Python bindings of C++ session is unavailable, fallback to Python session."
             )
             args.use_py_session = True
+        if args.return_all_generated_tokens:
+            raise ValueError(
+                "Returning all the generated tokens at each step is not supported in summarize.py"
+            )
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
