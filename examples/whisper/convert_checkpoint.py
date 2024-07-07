@@ -50,6 +50,10 @@ def parse_arguments():
                             "distil-medium.en",
                             "distil-small.en",
                         ])
+    parser.add_argument("--chunk_length",
+                        type=int,
+                        default=30,
+                        help="Chunk length in seconds for encoder input")
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -83,7 +87,7 @@ def parse_arguments():
     return args
 
 
-def get_encoder_config(model_metadata: dict, dtype: str,
+def get_encoder_config(model_metadata: dict, dtype: str, chunk_length: int,
                        quant_algo: QuantAlgo) -> dict:
     model_is_multilingual = (model_metadata['n_vocab'] >= 51865)
     num_languages = model_metadata['n_vocab'] - 51765 - int(
@@ -96,6 +100,7 @@ def get_encoder_config(model_metadata: dict, dtype: str,
         'hidden_size': model_metadata['n_audio_state'],
         'n_mels': model_metadata['n_mels'],
         'n_audio_ctx': model_metadata['n_audio_ctx'],
+        'chunk_length': chunk_length * 100,
         'vocab_size': model_metadata['n_vocab'],
         'hidden_act': "gelu",
         'num_languages': num_languages,
@@ -397,7 +402,9 @@ if __name__ == '__main__':
     def convert_and_save(component: str = "encoder"):
         # call get_encoder_config or get_decoder_config according to component
         if component == "encoder":
-            config = get_encoder_config(model_metadata, args.dtype, quant_algo)
+            config = get_encoder_config(
+                model_metadata, args.dtype, args.chunk_length, quant_algo
+            )
         else:
             config = get_decoder_config(model_metadata, args.dtype,
                                         args.logits_dtype, quant_algo)
