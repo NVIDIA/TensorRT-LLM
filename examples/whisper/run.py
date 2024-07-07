@@ -233,7 +233,7 @@ class WhisperTRTLLM(object):
             assert (Path(assets_dir) / "multilingual.tiktoken").exists(
             ), "multilingual.tiktoken file is not existed in assets_dir"
         else:
-            tokenizer_name == "gpt2"
+            tokenizer_name = "gpt2"
             assert (Path(assets_dir) / "gpt2.tiktoken").exists(
             ), "gpt2.tiktoken file is not existed in assets_dir"
         self.tokenizer = get_tokenizer(name=tokenizer_name,

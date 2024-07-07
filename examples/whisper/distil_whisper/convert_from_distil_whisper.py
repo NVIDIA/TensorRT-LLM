@@ -53,10 +53,10 @@ def main():
         print("Trying to load the model from the cache")
         model = AutoModel.from_pretrained(model_name,
                                           cache_dir=cache_dir,
-                                          use_safetensors=True)
+                                          use_safetensors=True).half()
     else:
         print("Downloading the model:")
-        model = AutoModel.from_pretrained(model_name, use_safetensors=True)
+        model = AutoModel.from_pretrained(model_name, use_safetensors=True).half()
 
     config = model.config
     model_dims = {
