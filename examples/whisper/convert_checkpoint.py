@@ -25,6 +25,7 @@ import tensorrt_llm
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
 from tensorrt_llm.quantization import QuantAlgo
+from whisper_utils import SAMPLE_RATE, HOP_LENGTH
 
 
 def parse_arguments():
@@ -100,7 +101,7 @@ def get_encoder_config(model_metadata: dict, dtype: str, chunk_length: int,
         'hidden_size': model_metadata['n_audio_state'],
         'n_mels': model_metadata['n_mels'],
         'n_audio_ctx': model_metadata['n_audio_ctx'],
-        'chunk_length': chunk_length * 100,
+        'chunk_length': chunk_length * SAMPLE_RATE / HOP_LENGTH,
         'vocab_size': model_metadata['n_vocab'],
         'hidden_act': "gelu",
         'num_languages': num_languages,

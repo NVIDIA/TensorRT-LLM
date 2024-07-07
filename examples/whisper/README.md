@@ -127,7 +127,8 @@ python3 convert_checkpoint.py \
                 --use_weight_only \
                 --weight_only_precision $WEIGHT_ONLY_PRECISION \
                 --output_dir $checkpoint_dir \
-                --model_name distil-medium.en
+                --model_name distil-medium.en \
+                --chunk_length 15
 ```
 
 <details><summary> Now, we can build and run the model like before: </summary><p>
