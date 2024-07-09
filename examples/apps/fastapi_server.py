@@ -79,11 +79,13 @@ class LlmServer:
 
 @click.command()
 @click.argument("model_dir")
+@click.argument("tokenizer_path")  
 @click.option("--host", type=str, default=None)
 @click.option("--port", type=int, default=8000)
 @click.option("--max_beam_width", type=int, default=1)
 @click.option("--tp_size", type=int, default=1)
 def entrypoint(model_dir: str,
+               tokenizer_path: str,
                host: Optional[str] = None,
                port: int = 8000,
                max_beam_width: int = 1,
@@ -95,6 +97,7 @@ def entrypoint(model_dir: str,
     build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
 
     llm = LLM(model_dir,
+              tokenizer_path,
               tensor_parallel_size=tp_size,
               build_config=build_config)
 
