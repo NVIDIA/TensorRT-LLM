@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 
 def geglu(x):
@@ -252,42 +253,261 @@ def selective_state_update_ref(state,
                                dt_softplus=False):
     """
     Argument:
-        state: (batch, dstate, dim)
-        x: (batch, dim)
-        dt: (batch, dim)
-        A: (dstate, dim)
-        B: (batch, dstate)
-        C: (batch, dstate)
-        D: (dim,)
-        z: (batch, dim)
-        dt_bias: (dim,)
+        state: (batch, dstate, dim) or (batch, nheads, dstate, dim)
+        x: (batch, dim) or (batch, nheads, dim)
+        dt: (batch, dim) or (batch, nheads, dim)
+        A: (dstate, dim) or (nheads, dstate, dim)
+        B: (batch, dstate) or (batch, ngroups, dstate)
+        C: (batch, dstate) or (batch, ngroups, dstate)
+        D: (dim,) or (nheads, dim)
+        z: (batch, dim) or (batch, nheads, dim)
+        dt_bias: (dim,) or (nheads, dim)
     Return:
-        out: (batch, dim)
+        out: (batch, dim) or (batch, nheads, dim)
     """
-    batch, dstate, dim = state.shape
-    assert x.shape == (batch, dim)
+    has_heads = state.dim() > 3
+    if state.dim() == 3:
+        state = state.unsqueeze(1)
+    if x.dim() == 2:
+        x = x.unsqueeze(1)
+    if dt.dim() == 2:
+        dt = dt.unsqueeze(1)
+    if A.dim() == 2:
+        A = A.unsqueeze(0)
+    if B.dim() == 2:
+        B = B.unsqueeze(1)
+    if C.dim() == 2:
+        C = C.unsqueeze(1)
+    if D is not None and D.dim() == 1:
+        D = D.unsqueeze(0)
+    if z is not None and z.dim() == 2:
+        z = z.unsqueeze(1)
+    if dt_bias is not None and dt_bias.dim() == 1:
+        dt_bias = dt_bias.unsqueeze(0)
+    batch, nheads, dstate, dim = state.shape
+
+    assert x.shape == (batch, nheads, dim)
     assert dt.shape == x.shape
-    assert A.shape == (dstate, dim)
-    assert B.shape == (batch, dstate)
+    assert A.shape == (nheads, dstate, dim)
+    ngroups = B.shape[1]
+    assert nheads % ngroups == 0, "nheads must be divisible by ngroups"
+    assert B.shape == (batch, ngroups, dstate)
     assert C.shape == B.shape
+
     if D is not None:
-        assert D.shape == (dim, )
+        assert D.shape == (nheads, dim)
     if z is not None:
         assert z.shape == x.shape
     if dt_bias is not None:
-        assert dt_bias.shape == (dim, )
+        assert dt_bias.shape == (nheads, dim)
         dt = dt + dt_bias
     dt = F.softplus(dt) if dt_softplus else dt
-    dA = torch.exp(rearrange(dt, "b d -> b 1 d") * A)  # (batch, dstate, dim)
-    dB = rearrange(dt, "b d -> b 1 d") * rearrange(
-        B.float(), "b n -> b n 1")  # (batch, dstate, dim)
-    state_new = state * dA + dB * rearrange(
-        x, "b d -> b 1 d")  # (batch, dstate, dim)
+    dA = torch.exp(rearrange(dt, "b h d -> b h 1 d") *
+                   A)  # (batch, nheads, dstate, dim)
+    B = repeat(B, "b g n -> b (g h) n",
+               h=nheads // ngroups)  # (batch, nheads, dstate)
+    C = repeat(C, "b g n -> b (g h) n",
+               h=nheads // ngroups)  # (batch, nheads, dstate)
+    dB = rearrange(dt, "b h d -> b h 1 d") * rearrange(
+        B.float(), "b h n -> b h n 1")  # (batch, nheads, dstate, dim)
+    state_new = state.float() * dA + dB * rearrange(
+        x.float(), "b h d -> b h 1 d")  # (batch, nheads, dstate, dim)
     state.copy_(state_new.to(state.dtype))
-    out = torch.einsum("bnd,bn->bd", state_new, C.float())
+    out = torch.einsum("bhnd,bhn->bhd", state_new, C.float())
     if D is not None:
-        out += x * D
-    return (out if z is None else out * F.silu(z.float())).to(x.dtype)
+        out += x.float() * D
+    out = (out if z is None else out * F.silu(z.float())).to(x.dtype)
+    if not has_heads:
+        out = out.squeeze(1)
+    return out
+
+
+def chunk_state_ref(B, x, dt, dA_cumsum):
+    """
+    Argument:
+        B: (batch, seqlen, ngroups, headdim)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size)
+        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+    Return:
+        states: (batch, nchunks, nheads, headdim, dstate)
+    """
+    # Check constraints.
+    batch, seqlen, nheads, headdim = x.shape
+    dstate = B.shape[-1]
+    _, _, nchunks, chunk_size = dt.shape
+    assert seqlen <= nchunks * chunk_size
+    assert x.shape == (batch, seqlen, nheads, headdim)
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    ngroups = B.shape[2]
+    assert nheads % ngroups == 0
+    assert B.shape == (batch, seqlen, ngroups, dstate)
+    B = repeat(B, "b l g d -> b l (g h) d", h=nheads // ngroups)
+    assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
+    if seqlen < nchunks * chunk_size:
+        x = F.pad(x, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+        B = F.pad(B, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+    x = rearrange(x, "b (c l) h p -> b c l h p", l=chunk_size)
+    B = rearrange(B, "b (c l) ... -> b c l ...", l=chunk_size)
+    decay_states = torch.exp((dA_cumsum[:, :, :, -1:] - dA_cumsum))
+    return torch.einsum("bclhn,bhcl,bhcl,bclhp->bchpn", B.to(x.dtype),
+                        decay_states.to(x.dtype), dt.to(x.dtype), x)
+
+
+def state_passing_ref(states, dA_chunk_cumsum, initial_states=None):
+    """
+    Argument:
+        states: (batch, nchunks, nheads, dim)
+        dA_chunk_cumsum: (batch, nheads, nchunks)
+        initial_states: (batch, nheads, dim)
+    Return:
+        out: (batch, nchunks, nheads, dim)
+        final_states: (batch, nheads, dim)
+    """
+    if initial_states is None:
+        initial_states = torch.zeros_like(states[:, 0])
+    states = torch.cat([rearrange(initial_states, "b h d -> b 1 h d"), states],
+                       dim=1)
+    dA_chunk_cumsum = F.pad(dA_chunk_cumsum, (1, 0))
+    dA_chunk_cumsum = torch.cumsum(dA_chunk_cumsum, dim=-1)
+    nchunks = dA_chunk_cumsum.shape[-1]
+    # (batch, nheads, nchunks, nchunks)
+    dt_chunk_segment_sum = dA_chunk_cumsum[:, :, :,
+                                           None] - dA_chunk_cumsum[:, :,
+                                                                   None, :]
+    # (batch, nheads, nchunks, nchunks)
+    decay_chunk = torch.exp(dt_chunk_segment_sum)
+    causal_mask = torch.tril(torch.ones(nchunks,
+                                        nchunks,
+                                        device=states.device,
+                                        dtype=bool),
+                             diagonal=0)
+    decay_chunk = decay_chunk.masked_fill(~causal_mask, 0)
+    out = torch.einsum("bhzc,bchd->bzhd", decay_chunk.to(dtype=states.dtype),
+                       states)
+    return out[:, :-1], out[:, -1]
+
+
+def chunk_scan_ref(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
+    """
+    Argument:
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size)
+        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+        prev_states: (batch, nchunks, nheads, headdim, dstate)
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    assert B.shape == (batch, seqlen, ngroups, dstate)
+    _, _, nchunks, chunk_size = dt.shape
+    assert seqlen <= nchunks * chunk_size
+    assert C.shape == B.shape
+    B = repeat(B, "b l g d -> b l (g h) d", h=nheads // ngroups)
+    C = repeat(C, "b l g d -> b l (g h) d", h=nheads // ngroups)
+    if seqlen < nchunks * chunk_size:
+        x = F.pad(x, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+        B = F.pad(B, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+        C = F.pad(C, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+        if z is not None:
+            z = F.pad(z, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+    CB = torch.einsum("bclhn,bcshn->bchls",
+                      rearrange(C, "b (c l) h n -> b c l h n", c=nchunks),
+                      rearrange(B, "b (c s) h n -> b c s h n", c=nchunks))
+    # (batch, nheads, nchunks, chunksize, chunksize)
+    dt_segment_sum = dA_cumsum[:, :, :, :, None] - dA_cumsum[:, :, :, None, :]
+    decay = torch.exp(dt_segment_sum)
+    scores_decay = CB * rearrange(decay, "b h c l s -> b c h l s")
+    causal_mask = torch.tril(torch.ones(chunk_size,
+                                        chunk_size,
+                                        device=x.device,
+                                        dtype=bool),
+                             diagonal=0)
+    scores_decay = scores_decay.masked_fill(~causal_mask, 0)
+    out = torch.einsum('bchls,bhcs,bcshp->bclhp', scores_decay.to(x.dtype),
+                       dt.to(x.dtype),
+                       rearrange(x, "b (c s) h p -> b c s h p", c=nchunks))
+    state_decay_out = torch.exp(rearrange(dA_cumsum, "b h c l -> b c l h 1"))
+    out_prev = torch.einsum('bclhn,bchpn->bclhp',
+                            rearrange(C, "b (c l) h n -> b c l h n", c=nchunks),
+                            prev_states.to(C.dtype)) * state_decay_out
+    out = out + out_prev
+    out = rearrange(out, "b c l h p -> b (c l) h p")
+    if D is not None:
+        if D.dim() == 1:
+            D = rearrange(D, "h -> h 1")
+        out = out + x * D
+    return (out if z is None else out * F.silu(z)).to(x.dtype)
+
+
+def ssd_chunk_scan_combined_ref(x,
+                                dt,
+                                A,
+                                B,
+                                C,
+                                chunk_size,
+                                D=None,
+                                z=None,
+                                dt_bias=None,
+                                dt_softplus=False):
+    """
+    Argument:
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, seqlen, nheads)
+        A: (nheads)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        chunk_size: int
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+        dt_bias: (nheads,)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+        final_states: (batch, nheads, dstate, headdim)
+    """
+    batch, seqlen, nheads, headdim = x.shape
+    dstate = B.shape[-1]
+    if seqlen % chunk_size != 0:
+        dt = F.pad(dt, (0, 0, 0, chunk_size - seqlen % chunk_size))
+    mask = torch.zeros_like(dt)
+    mask[:, 0:seqlen, :] = 1
+    dt = rearrange(dt, "b (c l) h -> b h c l", l=chunk_size)
+    mask = rearrange(mask, "b (c l) h -> b h c l", l=chunk_size)
+    dt = dt.float()  # We want high precision for this before cumsum
+    if dt_bias is not None:
+        dt = dt + rearrange(dt_bias, "h -> h 1 1")
+    if dt_softplus:
+        dt = F.softplus(dt)
+    dt = torch.clamp(dt, min=0)
+    dt = dt * mask
+    dA = dt * rearrange(A, "h -> h 1 1")
+    dA_cumsum = torch.cumsum(dA, dim=-1)
+    # 1. Compute the state for each chunk
+    states = chunk_state_ref(B, x, dt, dA_cumsum)
+    states_dtype = states.dtype
+    if states.dtype not in [torch.float32, torch.float64]:
+        states = states.to(torch.float32)
+    # 2. Pass the state to all the chunks by weighted cumsum.
+    # state_passing_ref is much less numerically stable
+    states, final_states = state_passing_ref(
+        rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])
+    states, final_states = [
+        rearrange(t, "... (p n) -> ... p n", n=dstate)
+        for t in [states, final_states]
+    ]
+    states = states.to(states_dtype)
+    final_states = final_states.to(states_dtype)
+    final_states = final_states.permute(0, 1, 3, 2).contiguous()
+    # 3. Compute the output for each chunk
+    out = chunk_scan_ref(B, C, x, dt, dA_cumsum, states, D=D, z=z)
+    if seqlen % chunk_size != 0:
+        out = out[:, 0:seqlen, :, :]
+    return out, final_states
 
 
 class mamba_ref(nn.Module):
@@ -481,6 +701,191 @@ class mamba_ref(nn.Module):
                                        z=z,
                                        dt_bias=self.dt_proj.bias.float(),
                                        dt_softplus=True)
+        out = self.out_proj(y)
+        return out.unsqueeze(1), conv_state, ssm_state
+
+
+class mamba2_ref(mamba_ref):
+
+    def __init__(self,
+                 d_model,
+                 d_state=128,
+                 d_conv=4,
+                 expand=2,
+                 headdim=64,
+                 ngroups=1,
+                 chunk_size=256,
+                 conv_bias=True,
+                 bias=False,
+                 rmsnorm=True,
+                 device=None,
+                 dtype=None):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__(d_model, d_state, d_conv, expand, "auto", conv_bias,
+                         bias, **factory_kwargs)
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.headdim = headdim
+        self.chunk_size = chunk_size
+        self.d_ssm = self.d_inner
+        self.ngroups = ngroups
+        assert self.d_ssm % self.headdim == 0
+        self.nheads = self.d_ssm // self.headdim
+        self.rmsnorm = rmsnorm
+        self.group_d_state = self.ngroups * self.d_state
+
+        d_in_proj = 2 * self.d_inner + 2 * self.group_d_state + self.nheads
+        self.in_proj = nn.Linear(self.d_model,
+                                 d_in_proj,
+                                 bias=bias,
+                                 **factory_kwargs)
+
+        self.conv_dim = self.d_ssm + 2 * self.group_d_state
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.conv_dim,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+        self.act = nn.SiLU()
+
+        self.out_proj = nn.Linear(self.d_inner,
+                                  self.d_model,
+                                  bias=bias,
+                                  **factory_kwargs)
+
+        # dt_bias
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(
+            torch.rand(self.nheads, **factory_kwargs) *
+            (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        dt = torch.clamp(dt, min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+
+        # A
+        A_init_range = (1, 16)
+        A = torch.empty(self.nheads, dtype=torch.float32,
+                        device=device).uniform_(*A_init_range)
+        A_log = torch.log(A)
+        self.A = nn.Parameter(-torch.exp(A_log.float()))
+
+        # D
+        self.D = nn.Parameter(torch.ones(self.nheads, device=device))
+
+        # norm
+        if rmsnorm:
+            self.norm = LlamaRMSNorm(self.d_inner, eps=1e-5)
+
+    def forward_impl(self,
+                     hidden_states,
+                     conv_state,
+                     ssm_state,
+                     seqlen_offset=0):
+        """
+        hidden_states: (B, L, D)
+        Returns: same shape as hidden_states
+        """
+        _, seqlen, _ = hidden_states.shape
+
+        if seqlen_offset > 0:
+            # The states are updated inplace
+            out, conv_state, ssm_state = self.step(hidden_states, conv_state,
+                                                   ssm_state)
+            return out, conv_state, ssm_state
+
+        # in_proj
+        zxbcdt = self.in_proj(hidden_states)
+        z, xBC, dt = torch.split(zxbcdt,
+                                 [self.d_ssm, self.conv_dim, self.nheads],
+                                 dim=-1)
+
+        # Conv
+        if conv_state is not None:
+            xBC_t = rearrange(xBC, "b l d -> b d l")
+            conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))
+        xBC = self.act(
+            self.conv1d(xBC.transpose(1, 2))[..., :seqlen].transpose(1, 2))
+        x, B, C = torch.split(
+            xBC, [self.d_ssm, self.group_d_state, self.group_d_state], dim=-1)
+
+        # chunk scan
+        y, last_state = ssd_chunk_scan_combined_ref(
+            rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+            dt,
+            self.A,
+            rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
+            rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+            chunk_size=self.chunk_size,
+            D=self.D,
+            z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim)
+            if not self.rmsnorm else None,
+            dt_bias=self.dt_bias,
+            dt_softplus=True)
+        y = rearrange(y, "b l h p -> b l (h p)")
+        ssm_state.copy_(last_state)
+
+        # norm
+        if self.rmsnorm:
+            y = (self.norm(y.float() * self.act(z.float()))).to(y.dtype)
+
+        # out_proj
+        out = self.out_proj(y)
+        return out, conv_state, ssm_state
+
+    def step(self, hidden_states, conv_state, ssm_state):
+        dtype = hidden_states.dtype
+        assert hidden_states.shape[1] == 1
+
+        # in_proj
+        zxbcdt = self.in_proj(hidden_states.squeeze(1))
+        z, xBC, dt = torch.split(zxbcdt,
+                                 [self.d_ssm, self.conv_dim, self.nheads],
+                                 dim=-1)
+
+        # Conv step
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+        conv_state[:, :, -1] = xBC
+        xBC = torch.sum(conv_state *
+                        rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        dim=-1)
+        if self.conv1d.bias is not None:
+            xBC = xBC + self.conv1d.bias
+        xBC = self.act(xBC).to(dtype=dtype)
+        x, B, C = torch.split(
+            xBC, [self.d_ssm, self.group_d_state, self.group_d_state], dim=-1)
+
+        # SSM step
+        A = repeat(self.A, "h -> h n p", p=self.headdim,
+                   n=self.d_state).to(dtype=torch.float32)
+        dt = repeat(dt, "b h -> b h p", p=self.headdim)
+        dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+        D = repeat(self.D, "h -> h p", p=self.headdim)
+        B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
+        C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
+        x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        if not self.rmsnorm:
+            z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+        y = selective_state_update_ref(ssm_state,
+                                       x_reshaped,
+                                       dt,
+                                       A,
+                                       B,
+                                       C,
+                                       D=D,
+                                       z=z if not self.rmsnorm else None,
+                                       dt_bias=dt_bias,
+                                       dt_softplus=True)
+        y = rearrange(y, "b h p -> b (h p)")
+        if self.rmsnorm:
+            y = (self.norm(y.float() * self.act(z.float()))).to(y.dtype)
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 

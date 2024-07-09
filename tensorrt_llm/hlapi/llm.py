@@ -14,13 +14,7 @@ from .mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (SamplingParams, exception_handler, get_device_count,
-                    init_log_level)
-
-# This should be called before importing the following cpp-runtime modules
-init_log_level()
-
-from ..executor import GenerationExecutor, GenerationResult
+from .utils import SamplingParams, exception_handler, get_device_count
 
 
 class RequestOutput(GenerationResult):
@@ -83,10 +77,6 @@ class LLM:
 
             kwargs: Contains the optional arguments for expert users, please refer to `llm_utils.LlmArgs` for more details.
         '''
-        # TODO[chunweiy]: Add API docs
-
-        # TODO[chunweiy]: Deal with model_dir
-
         try:
             self.args = LlmArgs.from_kwargs(
                 model=model,
@@ -230,12 +220,7 @@ class LLM:
                     raise ValueError(
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
-                sampling_params.end_id = self.tokenizer.eos_token_id
-                if self.tokenizer.pad_token_id is not None:
-                    sampling_params.pad_id = self.tokenizer.pad_token_id
-                else:
-                    sampling_params.pad_id = self.tokenizer.eos_token_id
-            return sampling_params
+            return sampling_params.setup(self.tokenizer)
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"

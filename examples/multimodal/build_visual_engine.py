@@ -11,13 +11,6 @@ import yaml
 import torch
 import tensorrt as trt
 from tensorrt_llm.builder import Builder
-# isort: on
-import json
-import math
-
-import torch.nn.functional as F
-from PIL import Image
-from safetensors.torch import save_file
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForVision2Seq, AutoProcessor,
                           Blip2ForConditionalGeneration, Blip2Processor,
@@ -25,6 +18,13 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           LlavaForConditionalGeneration, NougatProcessor,
                           Pix2StructForConditionalGeneration,
                           VisionEncoderDecoderModel)
+# isort: on
+import json
+import math
+
+import torch.nn.functional as F
+from PIL import Image
+from safetensors.torch import save_file
 
 
 def parse_arguments():
@@ -33,8 +33,8 @@ def parse_arguments():
                         type=str,
                         default=None,
                         choices=[
-                            'blip2', 'llava', 'vila', 'nougat', 'cogvlm',
-                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
+                            'blip2', 'llava', 'llava_next', 'vila', 'nougat',
+                            'cogvlm', 'fuyu', 'pix2struct', 'neva', 'kosmos-2',
                             'video-neva', 'phi-3-vision'
                         ],
                         help="Model type")
@@ -80,7 +80,7 @@ class VisionEngineBuilder:
             build_blip2_engine(args)
         elif args.model_type == 'pix2struct':
             build_pix2struct_engine(args)
-        elif args.model_type == 'llava':
+        elif 'llava' in args.model_type:
             build_llava_engine(args)
         elif args.model_type == 'vila':
             assert args.vila_path is not None, "Please clone and provide VILA source code path"
@@ -305,30 +305,59 @@ def build_pix2struct_engine(args):
 
 def build_llava_engine(args):
     processor = AutoProcessor.from_pretrained(args.model_path)
-    raw_image = Image.new('RGB', [10, 10])  # dummy image
-    image = processor(text="dummy", images=raw_image,
-                      return_tensors="pt")['pixel_values'].to(
-                          args.device, torch.float16)
+    if args.model_type == "llava":
+        raw_image = Image.new('RGB', [10, 10])  # dummy image
+        image = processor(text="dummy", images=raw_image,
+                          return_tensors="pt")['pixel_values'].to(
+                              args.device, torch.float16)
 
-    class LlavaVisionWrapper(torch.nn.Module):
+        class LlavaVisionWrapper(torch.nn.Module):
 
-        def __init__(self, tower, projector, feature_layer):
-            super().__init__()
-            self.tower = tower
-            self.projector = projector
-            self.feature_layer = feature_layer
+            def __init__(self, tower, projector, feature_layer):
+                super().__init__()
+                self.tower = tower
+                self.projector = projector
+                self.feature_layer = feature_layer
 
-        def forward(self, image):
-            all_hidden_states = self.tower(
-                image, output_hidden_states=True).hidden_states
-            features = all_hidden_states[self.feature_layer][:, 1:]
-            return self.projector(features)
+            def forward(self, image):
+                all_hidden_states = self.tower(
+                    image, output_hidden_states=True).hidden_states
+                features = all_hidden_states[self.feature_layer][:, 1:]
+                return self.projector(features)
 
-    model = LlavaForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.float16)
-    wrapper = LlavaVisionWrapper(model.vision_tower.to(args.device),
-                                 model.multi_modal_projector.to(args.device),
-                                 model.config.vision_feature_layer)
+        model = LlavaForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.float16)
+        wrapper = LlavaVisionWrapper(
+            model.vision_tower.to(args.device),
+            model.multi_modal_projector.to(args.device),
+            model.config.vision_feature_layer)
+    elif args.model_type == "llava_next":
+        from transformers import LlavaNextForConditionalGeneration
+        raw_image = Image.new('RGB', [512, 512])
+        image = processor(text="dummy", images=raw_image,
+                          return_tensors="pt")['pixel_values'].to(
+                              args.device, torch.float16)[0]
+
+        class LlavaNextVisionWrapper(torch.nn.Module):
+
+            def __init__(self, vision_tower, projector):
+                super().__init__()
+                self.vision_tower = vision_tower
+                self.projector = projector
+
+            def forward(self, pixel_values):
+                image_features = self.vision_tower(pixel_values,
+                                                   output_hidden_states=True)
+                selected_image_feature = image_features.hidden_states[-2][:, 1:]
+                image_features = self.projector(selected_image_feature)
+                return image_features  # (bs, 576, c)
+
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.float16)
+        wrapper = LlavaNextVisionWrapper(
+            model.vision_tower.vision_model.to(args.device),
+            model.multi_modal_projector.to(args.device),
+        )
 
     export_visual_wrapper_onnx(wrapper, image, args.output_dir)
     build_trt_engine(
@@ -336,6 +365,11 @@ def build_llava_engine(args):
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
         args.output_dir,
         args.max_batch_size)
+    if args.model_type == "llava_next":
+        image_newline = model.image_newline.data
+        tensor_img_newline = {"image_newline": image_newline}
+        save_file(tensor_img_newline,
+                  os.path.join(args.output_dir, "image_newline.safetensors"))
 
 
 def build_vila_engine(args):
@@ -517,7 +551,12 @@ def build_neva_engine(args):
             vision_x = self.connector(vision_x)
             return vision_x
 
-    encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
+    vision_path = vision_config["from_pretrained"]
+    joined_path = os.path.join(os.path.dirname(args.model_path),
+                               os.path.basename(vision_path))
+    if os.path.isdir(joined_path):
+        vision_path = joined_path
+    encoder = AutoModel.from_pretrained(vision_path,
                                         torch_dtype=torch.bfloat16,
                                         trust_remote_code=True)
     vision_encoder = encoder.vision_model

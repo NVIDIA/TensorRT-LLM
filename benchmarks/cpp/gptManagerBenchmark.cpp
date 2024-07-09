@@ -172,16 +172,16 @@ struct BenchmarkParams
     std::optional<std::vector<std::vector<SizeType32>>> medusaChoices;
 };
 
-class InferenceRequestsSyncSend
+class InferenceRequestsAsyncSend
 {
 public:
-    InferenceRequestsSyncSend(std::shared_ptr<tensorrt_llm::mpi::MpiComm> comm,
+    InferenceRequestsAsyncSend(std::shared_ptr<tensorrt_llm::mpi::MpiComm> comm,
         std::list<std::shared_ptr<InferenceRequest>> const& inferenceRequests, int const peer)
     {
         TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         TLLM_LOG_DEBUG("start send requests to rank %d", peer);
         mNumNewWorkItems = static_cast<int64_t>(inferenceRequests.size());
-        comm->send(&mNumNewWorkItems, 1, mpi::MpiType::kINT64, peer, 0);
+        mRequest1 = comm->sendAsync(&mNumNewWorkItems, 1, mpi::MpiType::kINT64, peer, 0);
         if (mNumNewWorkItems > 0)
         {
             for (auto const& infReq : inferenceRequests)
@@ -191,9 +191,21 @@ public:
                 mPacked.insert(mPacked.end(), std::move_iterator(vpacked.begin()), std::move_iterator(vpacked.end()));
             }
             mVecSize = static_cast<int64_t>(mPacked.size());
-            comm->send(&mVecSize, 1, mpi::MpiType::kINT64, peer, 1);
-            comm->send(mPacked.data(), mPacked.size(), mpi::MpiType::kINT64, peer, 2);
+            mRequest2 = comm->sendAsync(&mVecSize, 1, mpi::MpiType::kINT64, peer, 1);
+            mRequest3 = comm->sendAsync(mPacked.data(), mPacked.size(), mpi::MpiType::kINT64, peer, 2);
         }
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    }
+
+    ~InferenceRequestsAsyncSend()
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        mRequest1->wait();
+        if (mRequest2)
+            mRequest2->wait();
+        if (mRequest3)
+            mRequest3->wait();
+        TLLM_LOG_DEBUG("end send requests");
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
@@ -201,6 +213,9 @@ private:
     int64_t mNumNewWorkItems;
     int64_t mVecSize;
     std::vector<int64_t> mPacked;
+    std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest1;
+    std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest2;
+    std::shared_ptr<tensorrt_llm::mpi::MpiRequest> mRequest3;
 };
 } // namespace
 
@@ -930,7 +945,6 @@ public:
         , mStaticEmulatedBatchSize(staticEmulatedBatchSize)
         , mBatchTimeout(batchTimeout.value_or(std::chrono::milliseconds{0}))
         , mActiveCount(0)
-        , mInferReqSyncSndHdl(nullptr)
     {
         auto const jsonConfig = GptJsonConfig::parse(trtEnginePath / "config.json");
         mWorldConfig = WorldConfig::mpi(jsonConfig.getGpusPerNode(), jsonConfig.getTensorParallelism(),
@@ -966,6 +980,12 @@ public:
 
     ~GptServer()
     {
+        if (mInferReqWaitThread)
+        {
+            mInferReqWaitThread->join();
+            mInferReqWaitThread.reset(nullptr);
+        }
+
         mWorkItemsQueue.clear();
     }
 
@@ -1031,7 +1051,11 @@ public:
     // Return up to max_num_requests inference requests.
     std::list<std::shared_ptr<InferenceRequest>> getInferenceRequests(int const max_num_requests)
     {
-        mInferReqSyncSndHdl = nullptr;
+        if (mInferReqWaitThread)
+        {
+            mInferReqWaitThread->join();
+            mInferReqWaitThread.reset(nullptr);
+        }
         std::list<std::shared_ptr<InferenceRequest>> inferenceRequests;
         auto& comm = COMM_SESSION;
         if (max_num_requests > 0)
@@ -1134,8 +1158,9 @@ public:
             if (!mWorldConfig.isLastPipelineParallelRank())
             {
                 auto const peer = mWorldConfig.getPipelineParallelRank() + 1;
-                mInferReqSyncSndHdl
-                    = std::make_shared<InferenceRequestsSyncSend>(mCommPipelineParallel, inferenceRequests, peer);
+                auto inferReqAsyncSndHdl
+                    = std::make_unique<InferenceRequestsAsyncSend>(mCommPipelineParallel, inferenceRequests, peer);
+                mInferReqWaitThread = std::make_unique<std::thread>([handle = std::move(inferReqAsyncSndHdl)]() {});
             }
         }
         return inferenceRequests;
@@ -1184,7 +1209,7 @@ private:
     WorldConfig mWorldConfig;
     std::shared_ptr<tensorrt_llm::mpi::MpiComm> mCommTensorParallel;
     std::shared_ptr<tensorrt_llm::mpi::MpiComm> mCommPipelineParallel;
-    std::shared_ptr<InferenceRequestsSyncSend> mInferReqSyncSndHdl;
+    std::unique_ptr<std::thread> mInferReqWaitThread;
 
 }; // class GptServer
 

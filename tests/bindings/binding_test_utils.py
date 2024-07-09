@@ -40,6 +40,19 @@ def prepare_model_tests(
     run_command(generate_expected_output, cwd=llm_root, env=model_env)
 
 
+def prepare_lora_configs(llm_root: _pl.Path, resource_path: _pl.Path,
+                         lora_config_path: _pl.Path):
+    python_exe = _sys.executable
+    generate_lora_data_args_tp1 = [
+        python_exe,
+        str(resource_path / "scripts" / "generate_test_lora_weights.py"),
+        f"--out-dir={str(lora_config_path)}", "--tp-size=1",
+        "--hidden-size=768", "--num-layers=12", "--config-ids-filter=0",
+        "--no-generate-cache-pages"
+    ]
+    run_command(generate_lora_data_args_tp1, cwd=llm_root)
+
+
 def sequence_lengths(sequences: _np.ndarray, pad_id: int) -> _np.ndarray:
     return _np.apply_along_axis(lambda x: _np.searchsorted(x, True), 1,
                                 sequences == pad_id).astype("int32")

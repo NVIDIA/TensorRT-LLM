@@ -482,12 +482,11 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
 void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
 {
-    TLLM_LOG_TRACE("%s %s start", __FILE__, __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("%s %s start", __FILE__, __PRETTY_FUNCTION__);
 
     int const nBM = bh.nBeamWidth;
     size_t const smem_size = sizeof(int) * nBM * 2 + sizeof(float) * nBM * 2;
     finalizeKernel<<<bh.nBatchSize, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
-    TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
 }
 
 __global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const nMaxSeqLen)

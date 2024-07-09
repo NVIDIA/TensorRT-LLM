@@ -51,6 +51,8 @@ public:
         SizeType32 stateSize = 0;
         SizeType32 convKernel = 0;
         SizeType32 rnnHiddenSize = 0;
+        SizeType32 rnnHeadSize = 0;
+        SizeType32 rnnConvDimSize = 0;
     };
 
     enum class LayerType : std::int32_t

@@ -63,9 +63,11 @@ class TestMamba(unittest.TestCase):
             'hidden_act': 'silu',
             'num_attention_heads': 1,
             'rnn_hidden_size': hf_config.intermediate_size,
+            'rnn_conv_dim_size': hf_config.intermediate_size,
             'state_size': hf_config.state_size,
             'conv_kernel': hf_config.conv_kernel,
             'use_bias': hf_config.use_bias,
+            'mamba_version': 'Mamba1',
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         if load_mode == 'from_checkpoint':

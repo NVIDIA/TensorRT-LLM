@@ -385,7 +385,7 @@ private:
     bool mFreeComm;
 };
 
-void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_FUNNELED, bool forwardAbortToParent = false);
+void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
 
 } // namespace tensorrt_llm::mpi
 

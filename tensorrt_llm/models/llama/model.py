@@ -23,7 +23,6 @@ from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...plugin import init_all_reduce_helper
 from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..convert_utils import has_safetensors
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -200,7 +199,6 @@ class LLaMAModel(Module):
 
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
-        init_all_reduce_helper()
 
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():

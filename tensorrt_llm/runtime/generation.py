@@ -306,7 +306,7 @@ class _Runtime(object):
                    shape_dict: Dict[str, List[int]]):
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
-            if not name in shape_dict:
+            if name not in shape_dict:
                 # shape and buffer can be set by calling _set_tensors API
                 continue
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
@@ -340,7 +340,7 @@ class _Runtime(object):
         for name in self.input_tensor_names:
             # it's allowed to call set_tensors multi times with different tensors
             # each time only set some of the engine tensors, so it is valid to skip the ones not in the current given tensors dict
-            if not name in tensors:
+            if name not in tensors:
                 continue
 
             tensor = tensors[name]
@@ -351,7 +351,7 @@ class _Runtime(object):
                 context.set_input_shape(name, tensor.shape)
 
         for name in self.output_tensor_names:
-            if not name in tensors:
+            if name not in tensors:
                 dtype = self.engine.get_tensor_dtype(name)
                 shape = context.get_tensor_shape(name)
                 tensors[name] = RuntimeTensor.from_torch(
@@ -467,6 +467,8 @@ class ModelConfig:
     conv_kernel: int = 0
     layer_types: List[str] = field(default_factory=list)
     rnn_hidden_size: int = 0
+    rnn_head_size: int = 0
+    rnn_conv_dim_size: int = 0
     state_size: int = 0
     state_dtype: str = ""
     gpu_weights_percent: float = 1.0
@@ -1015,6 +1017,14 @@ class GenerationSession(object):
         return self._model_config.rnn_hidden_size
 
     @property
+    def rnn_head_size(self):
+        return self._model_config.rnn_head_size
+
+    @property
+    def rnn_conv_dim_size(self):
+        return self._model_config.rnn_conv_dim_size
+
+    @property
     def state_size(self):
         return self._model_config.state_size
 
@@ -1540,7 +1550,9 @@ class GenerationSession(object):
             kv_cache_type = torch.int8
         else:
             if self.has_attn_layers:
-                first_atten_layer = self.layer_types.index('attention')
+                first_atten_layer = self.layer_types[
+                    self.first_layer:self.last_layer].index(
+                        'attention') + self.first_layer
                 kv_cache_type = self.dtype if self.paged_kv_cache else self._tensor_dtype(
                     f'present_key_value_{first_atten_layer}')
             else:
@@ -1633,20 +1645,28 @@ class GenerationSession(object):
             conv_state_shape = (
                 batch_size,
                 self.conv_kernel - 1,
-                self.rnn_hidden_size,
+                self.rnn_conv_dim_size,
             )
         else:
             conv_state_shape = (
                 batch_size,
-                self.rnn_hidden_size,
+                self.rnn_conv_dim_size,
                 self.conv_kernel - 1,
             )
 
-        rnn_state_shape = (
-            batch_size,
-            self.state_size,
-            self.rnn_hidden_size,
-        )
+        if self.rnn_head_size > 1:
+            rnn_state_shape = (
+                batch_size,
+                self.rnn_hidden_size // self.rnn_head_size,
+                self.state_size,
+                self.rnn_head_size,
+            )
+        else:
+            rnn_state_shape = (
+                batch_size,
+                self.state_size,
+                self.rnn_hidden_size,
+            )
 
         for i in range(self.first_layer, self.last_layer):
             if self.layer_types[i] == 'recurrent':
@@ -1873,9 +1893,9 @@ class GenerationSession(object):
                 dtype = self._tensor_dtype(f'present_conv_state_{idx}')
                 if self.use_mamba_conv1d_plugin:
                     conv_state_shape = (batch_size, self.conv_kernel - 1,
-                                        self.rnn_hidden_size)
+                                        self.rnn_conv_dim_size)
                 else:
-                    conv_state_shape = (batch_size, self.rnn_hidden_size,
+                    conv_state_shape = (batch_size, self.rnn_conv_dim_size,
                                         self.conv_kernel - 1)
 
                 conv_state = torch.zeros(conv_state_shape,
@@ -1920,7 +1940,7 @@ class GenerationSession(object):
                 host_request_types = torch.zeros_like(context_lengths,
                                                       device='cpu').int()
                 add_tensor(host_request_types, 'host_request_types')
-                if self.use_mamba_conv1d_plugin and self.remove_input_padding:
+                if self.remove_input_padding:
                     add_tensor(host_context_lengths, 'host_context_lengths')
             if self.has_attn_layers:
                 add_tensor(attention_mask, 'attention_mask')
@@ -2151,9 +2171,9 @@ class GenerationSession(object):
                 # conv state
                 if self.use_mamba_conv1d_plugin:
                     conv_state_shape = (batch_size, self.conv_kernel - 1,
-                                        self.rnn_hidden_size)
+                                        self.rnn_conv_dim_size)
                 else:
-                    conv_state_shape = (batch_size, self.rnn_hidden_size,
+                    conv_state_shape = (batch_size, self.rnn_conv_dim_size,
                                         self.conv_kernel - 1)
                 if step % 2:
                     add_tensor_with_shape(
@@ -2211,7 +2231,7 @@ class GenerationSession(object):
                 host_request_types = torch.ones_like(context_lengths,
                                                      device='cpu').int()
                 add_tensor(host_request_types, 'host_request_types')
-                if self.use_mamba_conv1d_plugin and self.remove_input_padding:
+                if self.remove_input_padding:
                     add_tensor(host_context_lengths_local,
                                'host_context_lengths')
             if self.has_attn_layers:

@@ -120,13 +120,27 @@ def main():
     parser.add_argument('--tp-size', type=int, default=1)
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--num-loras', type=int, default=1)
+    parser.add_argument('--num-layers', type=int, default=2)
+    parser.add_argument('--adapter-size', type=int, default=8)
+    parser.add_argument('--hidden-size', type=int, default=16)
+    parser.add_argument('--mlp-hidden-size', type=int, default=32)
+    parser.add_argument('--no-generate-cache-pages',
+                        action='store_true',
+                        default=False)
+    parser.add_argument(
+        '--config-ids-filter',
+        type=str,
+        default=None,
+        help=
+        "Comma separated list of ids to include. For example, use --config-ids-filter=0 for attn_qkv only."
+    )
 
     args = parser.parse_args()
 
-    num_layers = 2
-    adapter_size = 8
-    hidden_size = 16
-    mlp_hidden_size = 32
+    num_layers = args.num_layers
+    adapter_size = args.adapter_size
+    hidden_size = args.hidden_size
+    mlp_hidden_size = args.mlp_hidden_size
     configs = [
         (0, num_layers, adapter_size, hidden_size, 3 * hidden_size),  # attn_qkv
         (1, num_layers, adapter_size // 2, hidden_size, hidden_size),  # attn_q
@@ -149,6 +163,9 @@ def main():
         (12, num_layers, adapter_size, hidden_size,
          hidden_size),  # cross_attn_dense
     ]
+    if args.config_ids_filter:
+        config_ids_filter = [int(x) for x in args.config_ids_filter.split(",")]
+        configs = [c for c in configs if c[0] in config_ids_filter]
 
     for lora_idx in range(args.num_loras):
         all_source = []
@@ -178,19 +195,20 @@ def main():
 
         os.makedirs(output_dir, exist_ok=True)
         # copy weights into cache pages
-        for rank in range(args.tp_size):
-            page_block = torch.zeros((8, 18, 128),
-                                     dtype=torch.float32,
-                                     device='cpu')
-            copy_to_cache_pages(all_source,
-                                all_config,
-                                page_block,
-                                configs,
-                                tp_rank=rank,
-                                tp_size=args.tp_size)
+        if not args.no_generate_cache_pages:
+            for rank in range(args.tp_size):
+                page_block = torch.zeros((8, 18, 128),
+                                         dtype=torch.float32,
+                                         device='cpu')
+                copy_to_cache_pages(all_source,
+                                    all_config,
+                                    page_block,
+                                    configs,
+                                    tp_rank=rank,
+                                    tp_size=args.tp_size)
 
-            out_path = output_dir / f'cache_pages_rank{rank}.npy'
-            np.save(out_path, page_block)
+                out_path = output_dir / f'cache_pages_rank{rank}.npy'
+                np.save(out_path, page_block)
 
         source_out_path = output_dir / 'source.npy'
         config_out_path = output_dir / 'config.npy'

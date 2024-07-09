@@ -41,6 +41,16 @@ def model_path_return_logits(engine_path):
     return engine_path / "gpt2/fp16-plugin-packed-paged-gather/tp1-pp1-gpu"
 
 
+@pytest.fixture
+def model_path_lora(engine_path: _pl.Path) -> _pl.Path:
+    return engine_path / "gpt2/fp16-plugin-packed-paged-lora/tp1-pp1-gpu"
+
+
+@pytest.fixture
+def lora_config_path(data_path: _pl.Path) -> _pl.Path:
+    return data_path / "lora-test-weights-gpt2-tp1"
+
+
 @pytest.fixture(scope="module")
 def results_data_path(data_path: _pl.Path) -> _pl.Path:
     return data_path / "gpt2/sampling/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"

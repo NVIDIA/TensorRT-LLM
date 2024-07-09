@@ -29,8 +29,10 @@ from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._ipc_utils import set_peer_access
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
 from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 
@@ -387,19 +389,27 @@ class TRTLLMEncDecModel:
             (max_input_length, ),
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
-        batch_size = input_lengths.size(0)
-        inputs['host_request_types'] = torch.IntTensor([0] *
-                                                       batch_size).to('cpu')
-        if self.encoder_model_config.remove_input_padding:
-            inputs['host_context_lengths'] = input_lengths.to('cpu')
 
-        if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
+        if self.encoder_model_config.use_custom_all_reduce and self.encoder_runtime_mapping.tp_size > 1:
+            set_peer_access(self.encoder_runtime_mapping)
+            ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
+                self.encoder_runtime_mapping,
+                CustomAllReduceHelper.max_workspace_size_auto(
+                    self.encoder_runtime_mapping.tp_size))
+            inputs['all_reduce_workspace'] = all_reduce_workspace
+
+        if self.encoder_model_config.lora_plugin:
             inputs.update(
                 self.encoder_lora_manager.input_buffers(
                     self.lora_task_uids,
                     self.encoder_runtime_mapping,
                     self.encoder_model_config.num_layers,
                 ))
+            batch_size = input_lengths.size(0)
+            inputs['host_request_types'] = torch.IntTensor([0] *
+                                                           batch_size).to('cpu')
+            if self.encoder_model_config.remove_input_padding:
+                inputs['host_context_lengths'] = input_lengths.to('cpu')
 
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)

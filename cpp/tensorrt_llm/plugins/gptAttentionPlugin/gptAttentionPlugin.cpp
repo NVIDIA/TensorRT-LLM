@@ -275,8 +275,23 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
 {
     TLLM_CHECK(mHeadSize > 0);
 
-    int const beamWidth
-        = isCrossAttention() ? 1 : (useKVCache() ? in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1] : 1);
+    int beamWidth = -1;
+    if (!isCrossAttention() && useKVCache())
+    {
+        // desc_val == -1 means beam_width is not static, we should look at min/max/opt.
+        //
+        // In prepareEnqueueGeneration, we'll prepare for all cases where beam_width doesn't exceed max.
+        // TODO(minwei): pass min AND max to prepareEnqueueGeneration instead of max only.
+        int desc_val = in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1];
+        int max_val = in[getIdx(IdxEntry::CACHE_INDIR)].max.d[1];
+        beamWidth = desc_val == -1 ? max_val : desc_val;
+    }
+    else
+    {
+        beamWidth = 1;
+    }
+    TLLM_CHECK(beamWidth != -1);
+
     // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
     // unless each layer has different attention window sizes.
     // the kv_cache capacity.

@@ -177,14 +177,21 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         raise NotImplementedError(f"Unknown dtype {dtype}")
 
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+    hf_config = AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
+    model_cls = AutoModelForCausalLM
+    if hf_config.model_type == "llava":
+        from transformers import LlavaForConditionalGeneration
+        model_cls = LlavaForConditionalGeneration
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     else:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = model_cls.from_pretrained(
             ckpt_path,
             device_map="auto" if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
+        if hf_config.model_type == "llava":
+            model = model.language_model
     model.eval()
 
     model_dtype = next(model.parameters()).dtype

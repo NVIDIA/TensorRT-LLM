@@ -20,7 +20,7 @@ tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch @ https://download.pytorch.org/whl/cu121/torch-2.3.1%2Bcu121-cp310-cp310-win_amd64.whl
 nvidia-modelopt~=0.13,<0.14
-transformers==4.38.2
+transformers>=4.38.2
 wheel
 optimum
 evaluate

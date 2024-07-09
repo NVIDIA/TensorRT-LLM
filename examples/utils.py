@@ -329,16 +329,4 @@ def add_common_args(parser):
         action='store_true',
         help="Use device map 'auto' to load a pretrained HF model. This may "
         "help to test a large model that cannot fit into a singlue GPU.")
-
-    parser.add_argument(
-        "--return_all_generated_tokens",
-        default=False,
-        action="store_true",
-        help="if false, return only generated tokens at each streaming step."
-        "If true, return the full beams/outputs at each step"
-        "Overwritten to True if num_beams>1 and streaming"
-        "(only available with cpp session). "
-        "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
-    )
-
     return parser

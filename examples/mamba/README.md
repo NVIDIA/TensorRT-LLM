@@ -2,6 +2,15 @@
 
 This document shows how to build and run a [Mamba](https://github.com/state-spaces/mamba) model in TensorRT-LLM on a single GPU.
 
+- [Mamba](#mamba)
+  - [Overview](#overview)
+  - [Support Matrix](#support-matrix)
+  - [Usage](#usage)
+    - [1. Download weights from HuggingFace Transformers](#1-download-weights-from-huggingface-transformers)
+    - [2. Convert weights from HF Transformers to TensorRT-LLM format](#2-convert-dweights-from-hf-transformers-to-tensorrt-llm-format)
+    - [3. Build TensorRT engine(s)](#3-build-tensorrt-engines)
+    - [4. Run summarization task with the TensorRT engine(s)](#4-run-summarization-task-with-the-tensorrt-engines)
+
 ## Overview
 
 The TensorRT-LLM Mamba implementation can be found in [`tensorrt_llm/models/mamba/model.py`](../../tensorrt_llm/models/mamba/model.py). The TensorRT-LLM Mamba example code is located in [`examples/mamba`](./). There is one main file:
@@ -15,8 +24,13 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 
 ## Support Matrix
-  * FP16
-  * BF16
+
+|    Model Name    | FP16  | BF16  |
+| :--------------: | :---: | :---: |
+|    Mamba1        |   Y   |   Y   |
+|    Mamba2        |   Y   |   Y   |
+
+* Mamba2: TensorRT-LLM can only support the pure Mamba model for now, will support the hybrid models later.
 
 ## Usage
 
@@ -32,23 +46,20 @@ pip install -r requirements.txt
 git lfs install
 ```
 
-There are five HF checkpoints available. Use one of the following commands to fetch the checkpoint you are interested in.
+There are different HF checkpoints available. For Mamba1, TensorRT-LLM can support those Transformers compatible models. Here're some examples to fetch the checkpoint.
 
 ```bash
 # mamba-2.8b
 git clone https://huggingface.co/state-spaces/mamba-2.8b-hf ./mamba_model/mamba-2.8b
 
-# mamba-1.4b
-git clone https://huggingface.co/state-spaces/mamba-1.4b-hf ./mamba_model/mamba-1.4b
-
-# mamba-790m
-git clone https://huggingface.co/state-spaces/mamba-790m-hf ./mamba_model/mamba-790m
-
-# mamba-370m
-git clone https://huggingface.co/state-spaces/mamba-370m-hf ./mamba_model/mamba-370m
-
 # mamba-130m
 git clone https://huggingface.co/state-spaces/mamba-130m-hf ./mamba_model/mamba-130m
+
+# mamba2-2.7b
+git clone https://huggingface.co/state-spaces/mamba2-2.7b ./mamba_model/mamba2-2.7b
+
+# mamba2-130m
+git clone https://huggingface.co/state-spaces/mamba2-130m ./mamba_model/mamba2-130m
 ```
 
 Since mamba models use tokenizer from gpt-neox-20b model, use the following command to fetch the checkpoint of gpt-neox-20b.
@@ -67,25 +78,20 @@ python convert_checkpoint.py --model_dir ./mamba_model/mamba-2.8b/ \
                              --dtype bfloat16 \
                              --output_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/
 
-# mamba-1.4b
-python convert_checkpoint.py --model_dir ./mamba_model/mamba-1.4b/ \
-                             --dtype float16 \
-                             --output_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/
-
-# mamba-790m
-python convert_checkpoint.py --model_dir ./mamba_model/mamba-790m/ \
-                             --dtype float16 \
-                             --output_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/
-
-# mamba-370m
-python convert_checkpoint.py --model_dir ./mamba_model/mamba-370m/ \
-                             --dtype float16 \
-                             --output_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/
-
 # mamba-130m
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-130m/ \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/
+
+# mamba2-2.7b
+python convert_checkpoint.py --model_dir ./mamba_model/mamba2-2.7b/ \
+                             --dtype float16 \
+                             --output_dir ./mamba_model/mamba2-2.7b/trt_ckpt/fp16/1-gpu/
+
+# mamba2-130m
+python convert_checkpoint.py --model_dir ./mamba_model/mamba2-130m/ \
+                             --dtype float16 \
+                             --output_dir ./mamba_model/mamba2-130m/trt_ckpt/fp16/1-gpu/
 ```
 
 ### 3. Build TensorRT engine(s)
@@ -101,33 +107,6 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/ \
              --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-2.8b/trt_engines/bf16/1-gpu/
 
-# mamba-1.4b
-trtllm-build --checkpoint_dir ./mamba_model/mamba-1.4b/trt_ckpt/fp16/1-gpu/ \
-             --paged_kv_cache disable \
-             --gemm_plugin auto \
-             --max_batch_size 8 \
-             --max_input_len 924 \
-             --max_seq_len 1024 \
-             --output_dir ./mamba_model/mamba-1.4b/trt_engines/fp16/1-gpu/
-
-# mamba-790m
-trtllm-build --checkpoint_dir ./mamba_model/mamba-790m/trt_ckpt/fp16/1-gpu/ \
-             --paged_kv_cache disable \
-             --gemm_plugin auto \
-             --max_batch_size 8 \
-             --max_input_len 924 \
-             --max_seq_len 1024 \
-             --output_dir ./mamba_model/mamba-790m/trt_engines/fp16/1-gpu/
-
-# mamba-370m
-trtllm-build --checkpoint_dir ./mamba_model/mamba-370m/trt_ckpt/fp16/1-gpu/ \
-             --paged_kv_cache disable \
-             --gemm_plugin auto \
-             --max_batch_size 8 \
-             --max_input_len 924 \
-             --max_seq_len 1024 \
-             --output_dir ./mamba_model/mamba-370m/trt_engines/fp16/1-gpu/
-
 # mamba-130m
 trtllm-build --checkpoint_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --paged_kv_cache disable \
@@ -136,6 +115,24 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/ \
              --max_input_len 924 \
              --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-130m/trt_engines/fp16/1-gpu/
+
+# mamba2-2.7b
+trtllm-build --checkpoint_dir ./mamba_model/mamba2-2.7b/trt_ckpt/fp16/1-gpu/ \
+             --paged_kv_cache disable \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 924 \
+             --max_seq_len 1024 \
+             --output_dir ./mamba_model/mamba2-2.7b/trt_engines/fp16/1-gpu/
+
+# mamba2-130m
+trtllm-build --checkpoint_dir ./mamba_model/mamba2-130m/trt_ckpt/fp16/1-gpu/ \
+             --paged_kv_cache disable \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 924 \
+             --max_seq_len 1024 \
+             --output_dir ./mamba_model/mamba2-130m/trt_engines/fp16/1-gpu/
 ```
 
 Note that when building Mamba models, you need to disable the `paged_kv_cache` as it is used for
@@ -148,7 +145,6 @@ The following section describes how to run a TensorRT-LLM Mamba model to summari
 [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset. For each summary, the script can compute the
 [ROUGE](https://en.wikipedia.org/wiki/ROUGE_(metric)) scores and use the `ROUGE-1` score to validate the implementation.
 
-### Run
 ```bash
 # mamba-2.8b
 python ../summarize.py --test_trt_llm \
@@ -157,31 +153,24 @@ python ../summarize.py --test_trt_llm \
                        --data_type bf16 \
                        --engine_dir ./mamba_model/mamba-2.8b/trt_engines/bf16/1-gpu/
 
-# mamba-1.4b
-python ../summarize.py --test_trt_llm \
-                       --hf_model_dir ./mamba_model/mamba-1.4b/ \
-                       --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
-                       --data_type fp16 \
-                       --engine_dir ./mamba_model/mamba-1.4b/trt_engines/fp16/1-gpu/
-
-# mamba-790m
-python ../summarize.py --test_trt_llm \
-                       --hf_model_dir ./mamba_model/mamba-790m/ \
-                       --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
-                       --data_type fp16 \
-                       --engine_dir ./mamba_model/mamba-790m/trt_engines/fp16/1-gpu/
-
-# mamba-370m
-python ../summarize.py --test_trt_llm \
-                       --hf_model_dir ./mamba_model/mamba-370m/ \
-                       --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
-                       --data_type fp16 \
-                       --engine_dir ./mamba_model/mamba-370m/trt_engines/fp16/1-gpu/
-
 # mamba-130m
 python ../summarize.py --test_trt_llm \
                        --hf_model_dir ./mamba_model/mamba-130m/ \
                        --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
                        --data_type fp16 \
                        --engine_dir ./mamba_model/mamba-130m/trt_engines/fp16/1-gpu/
+
+# mamba2-2.7b
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./mamba_model/mamba2-2.7b/ \
+                       --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
+                       --data_type fp16 \
+                       --engine_dir ./mamba_model/mamba2-2.7b/trt_engines/fp16/1-gpu/
+
+# mamba2-130m
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./mamba_model/mamba2-130m/ \
+                       --tokenizer_dir ./mamba_model/gpt-neox-20b/ \
+                       --data_type fp16 \
+                       --engine_dir ./mamba_model/mamba2-130m/trt_engines/fp16/1-gpu/
 ```

@@ -60,14 +60,20 @@ class BuildConfig:
     parallel_attention: bool = None
     new_decoder_architecture: bool = None
     state_size: int = 0
-    state_dtype: Optional[str] = None
+    state_dtype: Optional[str] = ""
     conv_kernel: int = 0
     layer_types: List[str] = field(default_factory=list)
     rnn_hidden_size: int = 0
+    rnn_head_size: int = 0
+    rnn_conv_dim_size: int = 0
     logits_soft_cap: float = 0.0
     opt_batch_size: Optional[int] = None
     opt_num_tokens: Optional[int] = None
     use_bias: bool = None
+    mamba_version: str = 'Mamba1'
+    ssm_rmsnorm: bool = True
+    ngroups: int = 1
+    chunk_size: int = 256
 
 
 @dataclass
@@ -1218,6 +1224,7 @@ _allowed_configs = {
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=5120,
+                    rnn_conv_dim_size=5120,
                     layer_types=["recurrent"],
                     use_bias=False,
                 )),
@@ -1238,6 +1245,7 @@ _allowed_configs = {
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=4096,
+                    rnn_conv_dim_size=4096,
                     layer_types=["recurrent"],
                     use_bias=False,
                 )),
@@ -1258,6 +1266,7 @@ _allowed_configs = {
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=3072,
+                    rnn_conv_dim_size=3072,
                     layer_types=["recurrent"],
                     use_bias=False,
                 )),
@@ -1278,6 +1287,7 @@ _allowed_configs = {
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=2048,
+                    rnn_conv_dim_size=2048,
                     layer_types=["recurrent"],
                     use_bias=False,
                 )),
@@ -1298,8 +1308,61 @@ _allowed_configs = {
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=1536,
+                    rnn_conv_dim_size=1536,
                     layer_types=["recurrent"],
                     use_bias=False,
+                )),
+    "mamba2_2.7b":
+    ModelConfig(name="mamba2_2.7b",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=64,
+                    num_heads=1,
+                    hidden_size=2560,
+                    vocab_size=50288,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_seq_len=2048,
+                    state_size=128,
+                    conv_kernel=4,
+                    rnn_hidden_size=5120,
+                    rnn_conv_dim_size=5376,
+                    rnn_head_size=64,
+                    layer_types=["recurrent"],
+                    use_bias=False,
+                    mamba_version='Mamba2',
+                    ssm_rmsnorm=True,
+                    ngroups=1,
+                    chunk_size=256,
+                )),
+    "mamba2_130m":
+    ModelConfig(name="mamba2_130m",
+                family="mamba",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=24,
+                    num_heads=1,
+                    hidden_size=768,
+                    vocab_size=50288,
+                    hidden_act="silu",
+                    n_positions=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_seq_len=2048,
+                    state_size=128,
+                    conv_kernel=4,
+                    rnn_hidden_size=1536,
+                    rnn_conv_dim_size=1792,
+                    rnn_head_size=64,
+                    layer_types=["recurrent"],
+                    use_bias=False,
+                    mamba_version='Mamba2',
+                    ssm_rmsnorm=True,
+                    ngroups=1,
+                    chunk_size=256,
                 )),
     "whisper_large_v3":
     ModelConfig(name="whisper_large_v3",
@@ -1344,6 +1407,7 @@ _allowed_configs = {
                     state_size=1,
                     layer_types=["recurrent", "recurrent", "attention"],
                     rnn_hidden_size=2560,
+                    rnn_conv_dim_size=2560,
                     logits_soft_cap=30.0,
                     state_dtype="float32",
                 )),

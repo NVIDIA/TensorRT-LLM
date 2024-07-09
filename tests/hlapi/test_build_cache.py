@@ -13,7 +13,7 @@ except ImportError:
 
 def test_BuildStep():
     with TemporaryDirectory() as tempdir:
-        build_cache = BuildCache(cache_root=Path(tempdir))
+        build_cache = BuildCache(BuildCacheConfig(Path(tempdir)))
         build_step = build_cache.get_engine_building_cache_stage(
             build_config=BuildConfig(), hf_model_name="test")
         assert not build_step.cache_hitted()
@@ -32,7 +32,7 @@ def test_BuildStep():
 def test_BuildCache_clean_untracked_path():
     # The BuildCache could cleanup the untracked files/dirs within the cache_root
     with TemporaryDirectory() as tempdir:
-        build_cache = BuildCache(cache_root=Path(tempdir))
+        build_cache = BuildCache(BuildCacheConfig(Path(tempdir)))
         (build_cache.cache_root / 'untracked').mkdir()
         (build_cache.cache_root / 'untracked_file').touch()
 
@@ -43,7 +43,7 @@ def test_BuildCache_clean_untracked_path():
 def test_BuildCache_clean_cache_exceed_record_limit():
     # The BuildCache could cleanup the cache if the number of records exceed the limit
     with TemporaryDirectory() as tempdir:
-        build_cache = BuildCache(cache_root=Path(tempdir), max_records=2)
+        build_cache = BuildCache(BuildCacheConfig(Path(tempdir), max_records=2))
         build_config = BuildConfig()
 
         def create_cache(hf_model_name: str):
@@ -81,7 +81,7 @@ def test_build_cache_prune_untracked_files():
     # The BuildCache could cleanup the untracked files/dirs within the cache_root
     # The broken cache such as empty cache record directory should be pruned as well
     with TemporaryDirectory() as tempdir:
-        build_cache = BuildCache(cache_root=Path(tempdir))
+        build_cache = BuildCache(BuildCacheConfig(cache_root=Path(tempdir)))
         (build_cache.cache_root / 'untracked').mkdir()
         (build_cache.cache_root / 'untracked_file').touch()
         (build_cache.cache_root / 'broken_cache').mkdir()

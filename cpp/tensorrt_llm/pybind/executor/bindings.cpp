@@ -228,15 +228,14 @@ void InitBindings(pybind11::module_& m)
                  std::optional<SizeType32> const&, std::optional<SizeType32> const&,
                  std::optional<std::list<VecTokens>>, std::optional<std::list<VecTokens>>, std::optional<Tensor>,
                  std::optional<tle::ExternalDraftTokensConfig>, std::optional<tle::PromptTuningConfig>,
-                 std::optional<tle::LoraConfig>, std::optional<std::string>, std::optional<VecTokens>, bool>(),
+                 std::optional<tle::LoraConfig>, std::optional<std::string>, std::optional<VecTokens>>(),
             py::arg("input_token_ids"), py::arg("max_new_tokens"), py::arg("streaming") = false,
             py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
             py::arg_v("output_config", tle::OutputConfig(), "OutputConfig()"), py::arg("end_id") = py::none(),
             py::arg("pad_id") = py::none(), py::arg("bad_words") = py::none(), py::arg("stop_words") = py::none(),
             py::arg("embedding_bias") = py::none(), py::arg("external_draft_tokens_config") = py::none(),
             py::arg("prompt_tuning_config") = py::none(), py::arg("lora_config") = py::none(),
-            py::arg("logits_post_processor_name") = py::none(), py::arg("encoder_input_token_ids") = py::none(),
-            py::arg("return_all_generated_tokens") = false)
+            py::arg("logits_post_processor_name") = py::none(), py::arg("encoder_input_token_ids") = py::none())
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)
         .def_property("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -255,9 +254,7 @@ void InitBindings(pybind11::module_& m)
         .def_property("logits_post_processor_name", &tle::Request::getLogitsPostProcessorName,
             &tle::Request::setLogitsPostProcessorName)
         .def_property(
-            "encoder_input_token_ids", &tle::Request::getEncoderInputTokenIds, &tle::Request::setEncoderInputTokenIds)
-        .def_property("return_all_generated_tokens", &tle::Request::getReturnAllGeneratedTokens,
-            &tle::Request::setReturnAllGeneratedTokens);
+            "encoder_input_token_ids", &tle::Request::getEncoderInputTokenIds, &tle::Request::setEncoderInputTokenIds);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 
     py::class_<tle::Result>(m, "Result")

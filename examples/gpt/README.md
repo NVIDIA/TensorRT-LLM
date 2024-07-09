@@ -414,6 +414,21 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq-ptpc/1-gpu \
 
 Note that GPT attention plugin is required to be enabled for SmoothQuant for now.
 
+User can also use `ModelOpt` to do INT8 quantization. Especially for gpt variant Starcoder2.
+```bash
+python3 example/quantization/quantize.py --model_dir starcoder2 \
+        --dtype float16 \
+        --qformat int8_sq \
+        --output_dir starcoder2/trt_ckpt/int8-sq/
+```
+Then, use `trtllm-build` to build engine(s).
+
+```bash
+trtllm-build --checkpoint_dir starcoder2/trt_ckpt/int8-sq/ \
+             --output_dir starcoder2/trt_engine/int8-sq/ \
+             --builder_opt 4
+```
+
 
 ### INT8 KV Cache
 

@@ -4,11 +4,48 @@ Here we show you a preview of how it works and how to use it.
 
 Note that the APIs are not stable and only support the LLaMA model. We appreciate your patience and understanding as we improve this API.
 
+## Quick start
+
 Please install the required packages first:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Here is a simple example to show how to use the HLAPI:
+
+Firstly, import the `LLM` and `SamplingParams` from the `tensorrt_llm` package, and create an LLM object with a HuggingFace (HF) model directly. Here we use the TinyLlama model as an example, `LLM` will download the model from the HuggingFace model hub automatically. You can also specify local models, either in HF format, TensorRT-LLM engine format or TensorRT-LLM checkpoint format.
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+
+llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+```
+
+Secondly, generate text with the `generate` method of the `LLM` object directly with a batch of prompts, the `sampling_params` is optional, and you can customize the sampling strategy with it.
+
+```python
+prompts = [
+    "Hello, my name is",
+    "The president of the United States is",
+    "The capital of France is",
+    "The future of AI is",
+]
+
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+
+outputs = llm.generate(prompts, sampling_params)
+
+# Print the outputs.
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+```
+
+Please refer to the [LLM quickstart](./quickstart_example.py) for the complete example.
+
+## Examples
 
 You can refer to [llm_examples.py](llm_examples.py) for all of the examples, and run it with the [run_examples.py](./run_examples.py) script, the command is as follows:
 
@@ -34,15 +71,16 @@ python3 llm_examples.py --task run_llm_on_tensor_parallel \
 ```
 
 ## Model preparation
-The HLAPI supports three kinds of model formats:
+The `LLM` class supports four kinds of model inputs:
 
-1. HuggingFace models
-2. TensorRT-LLM engine built by trtllm-build tool or saved by the HLAPI
-3. TensorRT-LLM checkpoints, converted by `convert_checkpoint.py` in examples
+1. **HuggingFace model name**: triggers a download from the HuggingFace model hub, e.g. `TinyLlama/TinyLlama-1.1B-Chat-v1.0` in the quickstart.
+1. **Local HuggingFace models**: uses a locally stored HuggingFace model.
+2. **Local TensorRT-LLM engine**: built by `trtllm-build` tool or saved by the HLAPI
+3. **Local TensorRT-LLM checkpoints**: converted by `convert_checkpoint.py` script in the examples
 
-All kinds of models could be used directly by the HLAPI, and the `LLM(model=<any-model-path>)` could accept any kind of them.
+All kinds of the model inputs can be seamlessly integrated with the HLAPI, and the `LLM(model=<any-model-path>)` construcotr can accommodate models in any of the above formats.
 
-Let's elaborate on the preparation of the three kinds of model formats.
+Let's delve into the preparation of the three kinds of local model formats.
 
 ### Option 1: From HuggingFace models
 
@@ -143,16 +181,16 @@ It is easy to enable Tensor Parallelism in the HLAPI. For example, setting `para
 ```python
 from tensorrt_llm.hlapi import LLM
 
-llm = LLM(<llama_model_path>, tensor_parallel_size=2)
+llm = LLM(<llama_model_path>,
+          tensor_parallel_size=2)
 ```
 
 ### Pipeline Parallelism
 Similar to Tensor Parallelism, you can enable Pipeline Parallelism in the HLAPI with following code:
 
 ```python
-config.parallel_config.pp_size = 4
-# you can also mix TP and PP
-# config.parallel_config.tp_size = 2
+llm = LLM(<llama_model_path>,
+          pipeline_parallel_size=4)
 ```
 
 ### Automatic Parallelism (in preview)
@@ -266,17 +304,28 @@ Please refer to these classes for more details.
 
 ## LLM pipeline configuration
 
-### Runtime customization
+### Build configuration
+Apart from the arguments mentioned above, you can also customize the build configuration with the `build_config` class and other arguments borrowed from the lower-level APIs. For example:
 
-For `kv_cache_config` and `streaming_llm` features, please refer to LLaMA's [README](../llama/README.md) for more details, the high-level API supports these features as well by setting the corresponding fields in the `LLM()` constructor.
+```python
+llm = LLM(<model-path>,
+          build_config=BuildConfig(
+            max_new_tokens=4096,
+            max_batch_size=128,
+            max_beam_width=4))
+```
+
+### Runtime customization
+Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other arguments borrowed from the lower-level APIs. For example:
+
 
 ```python
 from tensorrt_llm.hlapi import LLM, KvCacheConfig
 
 llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(
-                            max_new_tokens=128,
-                            free_gpu_memory_fraction=0.8))
+            max_new_tokens=128,
+            free_gpu_memory_fraction=0.8))
 ```
 
 ### Tokenizer customization
@@ -313,3 +362,13 @@ RequestOutput(request_id=1, prompt=None, prompt_token_ids=[1, 15043, 29892, 590,
 ```
 
 Note that the `text` field in `CompletionOutput` is empty since the tokenizer is deactivated.
+
+### Build caching
+Although the HLAPI runs the engine building in the background, you can also cache the built engine to disk and load it in the next run to save the engine building time.
+
+To enable the build cache, there are two ways to do it:
+
+1. Use the environment variable: `export TLLM_HLAPI_BUILD_CACHE=1` to enable the build cache globally, and optionally export `TLLM_HLAPI_BUILD_CACHE_ROOT` to specify the cache root directory.
+2. Pass the `build_cache_config` to the `LLM` constructor
+
+The build cache will reuse the built engine if all the building settings are the same, or it will rebuild the engine.

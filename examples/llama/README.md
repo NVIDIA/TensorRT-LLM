@@ -440,10 +440,16 @@ expected results:
 
 #### 1M long context test case
 
+- Prepare 1M needle-in-a-haystack datasets
+
+```bash
+python examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey --test_level 7
+```
+
+- Llama-3-8B example
+
 ```bash
 git-lfs clone https://huggingface.co/gradientai/Llama-3-8B-Instruct-Gradient-1048k/
-
-python examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey --test_level 7
 
 python examples/llama/convert_checkpoint.py --model_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
                               --output_dir /tmp/llama-3-8B-1048k/trt_ckpts \
@@ -454,8 +460,8 @@ python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt
             --output_dir /tmp/llama-3-8B-1048k/trt_engines \
             --gemm_plugin float16 \
             --max_num_tokens 4096 \
-            --max_input_len 1048576 \
-            --max_output_len 10 \
+            --max_input_len 1048566 \
+            --max_seq_len 1048576 \
             --use_paged_context_fmha enable \
             --workers 4
 
@@ -463,7 +469,37 @@ mpirun -n 4 --allow-run-as-root python examples/eval_long_context.py  --task pas
                                       --engine_dir /tmp/llama-3-8B-1048k/trt_engines \
                                       --tokenizer_dir ./Llama-3-8B-Instruct-Gradient-1048k/ \
                                       --stop_idx 1 \
-                                      --max_input_length 1048576 \
+                                      --max_input_length 1048566 \
+                                      --enable_chunked_context \
+                                      --max_tokens_in_paged_kv_cache 1100000
+```
+
+- Llama-3-70B example
+
+For the 70B model, at least 8 A100 80GB GPUs are required.
+
+```bash
+git-lfs clone https://huggingface.co/gradientai/Llama-3-70B-Instruct-Gradient-1048k/
+
+python examples/llama/convert_checkpoint.py --model_dir ./Llama-3-70B-Instruct-Gradient-1048k/ \
+                              --output_dir /tmp/llama-3-70B-1048k/trt_ckpts \
+                              --dtype float16 \
+                              --tp_size 8
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-70B-1048k/trt_ckpts \
+            --output_dir /tmp/llama-3-70B-1048k/trt_engines \
+            --gemm_plugin float16 \
+            --max_num_tokens 4096 \
+            --max_input_len 1048566 \
+            --max_seq_len 1048576 \
+            --use_paged_context_fmha enable \
+            --workers 8
+
+mpirun -n 8 --allow-run-as-root python examples/eval_long_context.py  --task passkey \
+                                      --engine_dir /tmp/llama-3-70B-1048k/trt_engines \
+                                      --tokenizer_dir ./Llama-3-70B-Instruct-Gradient-1048k/ \
+                                      --stop_idx 1 \
+                                      --max_input_length 1048566 \
                                       --enable_chunked_context \
                                       --max_tokens_in_paged_kv_cache 1100000
 ```

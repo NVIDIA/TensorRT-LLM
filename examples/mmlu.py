@@ -255,6 +255,7 @@ class Pipeline:
         self.pad_id = pad_id
         self.end_id = end_id
         self.max_attention_window_size = max_attention_window_size
+        self.output_len = 2
 
     def __call__(self, prompt):
         rank = tensorrt_llm.mpi_rank()
@@ -263,7 +264,7 @@ class Pipeline:
         batch_input_ids = [inputs]
 
         # For multi-choice tasks like MMLU, we don't need to adjust following parameters
-        output_len = 2
+        output_len = self.output_len
         top_k = 1
         top_p = 0.0
 
@@ -313,7 +314,8 @@ class Pipeline:
     def check_valid_length(self, prompt):
         if isinstance(self.model, nn.Module):
             return True
-        return len(self.tokenizer.encode(prompt)) <= self.model.max_input_len
+        input_len = len(self.tokenizer.encode(prompt))
+        return input_len <= self.model.max_input_len and input_len + self.output_len <= self.model.max_seq_len
 
 
 def parse_args():
@@ -391,7 +393,7 @@ def main():
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,
-            torch_dtype=DTYPE_STR_MAPPING[args.data_type],
+            torch_dtype=DTYPE_STR_MAPPING[args.hf_data_type],
             device_map="auto" if args.hf_device_map_auto else None,
         )
         if not args.hf_device_map_auto:

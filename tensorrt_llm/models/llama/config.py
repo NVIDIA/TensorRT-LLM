@@ -98,7 +98,12 @@ class LLaMAConfig(PretrainedConfig):
             if hf_config.model_type == "llava":
                 # LLaVA = Vision model + Llama LLM
                 # We load a llava config and use its' text config as llama config
+                from transformers import LlavaConfig
                 hf_config = LlavaConfig.from_pretrained(
+                    hf_config_dir).text_config
+            if hf_config.model_type == "llava_next":
+                from transformers import LlavaNextConfig
+                hf_config = LlavaNextConfig.from_pretrained(
                     hf_config_dir).text_config
             if hf_config.model_type == "llava_llama":
                 hf_config.llm_cfg["architecture"] = hf_config.llm_cfg[
