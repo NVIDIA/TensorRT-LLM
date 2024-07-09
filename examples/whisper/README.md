@@ -161,7 +161,7 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --gemm_plugin ${INFERENCE_PRECISION} \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
               --gpt_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable
+              --remove_input_padding enable
 
 python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --name librispeech_dummy_${output_dir}
 ```

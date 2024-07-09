@@ -163,42 +163,50 @@ class WhisperDecoding:
 
         return decoder_generation_session
 
-    def generate(self,
-                 decoder_input_ids,
-                 encoder_outputs,
-                 eot_id,
-                 max_new_tokens=40,
-                 num_beams=1):
+    def generate(
+        self, decoder_input_ids, encoder_outputs, eot_id, max_new_tokens=40, num_beams=1
+    ):
+
+        if torch.is_tensor(encoder_outputs):
+            encoder_outputs = list(encoder_outputs)
+        if torch.is_tensor(decoder_input_ids):
+            decoder_input_ids = list(decoder_input_ids)
+
         encoder_input_lengths = torch.tensor(
-            [encoder_outputs.shape[1] for x in range(encoder_outputs.shape[0])],
+            [encoder_output.shape[0] for encoder_output in encoder_outputs],
             dtype=torch.int32,
-            device='cuda')
-        decoder_input_lengths = torch.tensor([
-            decoder_input_ids.shape[-1]
-            for _ in range(decoder_input_ids.shape[0])
-        ],
-                                             dtype=torch.int32,
-                                             device='cuda')
+            device="cuda",
+        )
+        decoder_input_lengths = torch.tensor(
+            [decoder_input_id.shape[-1] for decoder_input_id in decoder_input_ids],
+            dtype=torch.int32,
+            device="cuda",
+        )
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
-        cross_attention_mask = torch.ones(
-            [encoder_outputs.shape[0], 1,
-             encoder_outputs.shape[1]]).int().cuda()
+        cross_attention_mask = (
+            torch.ones([len(encoder_outputs), 1, encoder_input_lengths.sum().item()])
+            .int()
+            .cuda()
+        )
+
+        encoder_outputs = torch.cat(encoder_outputs).half().cuda()
+        decoder_input_ids = torch.cat(decoder_input_ids).int().cuda()
 
         # generation config
-        sampling_config = SamplingConfig(end_id=eot_id,
-                                         pad_id=eot_id,
-                                         num_beams=num_beams)
+        sampling_config = SamplingConfig(
+            end_id=eot_id, pad_id=eot_id, num_beams=num_beams
+        )
         self.decoder_generation_session.setup(
             decoder_input_lengths.size(0),
             decoder_max_input_length,
             max_new_tokens,
             beam_width=num_beams,
-            encoder_max_input_length=encoder_outputs.shape[1])
+            encoder_max_input_length=encoder_input_lengths.max().item(),
+        )
 
         torch.cuda.synchronize()
 
-        decoder_input_ids = decoder_input_ids.type(torch.int32).cuda()
         output_ids = self.decoder_generation_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
