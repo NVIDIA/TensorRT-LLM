@@ -63,26 +63,28 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.world_config = world_config
 
     @classmethod
-    def from_dir(cls,
-                 engine_dir: str,
-                 *,
-                 lora_dir: Optional[str] = None,
-                 rank: int = 0,
-                 max_batch_size: Optional[int] = None,
-                 max_input_len: Optional[int] = None,
-                 max_output_len: Optional[int] = None,
-                 max_beam_width: Optional[int] = None,
-                 max_attention_window_size: Optional[int] = None,
-                 sink_token_length: Optional[int] = None,
-                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-                 medusa_choices: list[list[int]] | None = None,
-                 debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf",
-                 gpu_weights_percent: float = 1,
-                 max_tokens_in_paged_kv_cache: int | None = None,
-                 kv_cache_enable_block_reuse: bool = False,
-                 enable_chunked_context: bool = False,
-                 is_enc_dec: bool = False) -> 'ModelRunnerCpp':
+    def from_dir(
+        cls,
+        engine_dir: str,
+        *,
+        lora_dir: Optional[str] = None,
+        rank: int = 0,
+        max_batch_size: Optional[int] = None,
+        max_input_len: Optional[int] = None,
+        max_output_len: Optional[int] = None,
+        max_beam_width: Optional[int] = None,
+        max_attention_window_size: Optional[int] = None,
+        sink_token_length: Optional[int] = None,
+        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+        medusa_choices: list[list[int]] | None = None,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        gpu_weights_percent: float = 1,
+        max_tokens_in_paged_kv_cache: int | None = None,
+        kv_cache_enable_block_reuse: bool = False,
+        enable_chunked_context: bool = False,
+        is_enc_dec: bool = False,
+    ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -182,15 +184,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
 
-        if max_batch_size is None:
-            max_batch_size = model_config.max_batch_size
-        if max_input_len is None:
-            max_input_len = model_config.max_input_len
-        if max_output_len is None:
-            max_output_len = model_config.max_seq_len - model_config.max_input_len
-        if max_beam_width is None:
-            max_beam_width = model_config.max_beam_width
-
         # Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor
         # by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and
         # num_layers properties.
@@ -221,8 +214,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             assert max_batch_size <= model_config.max_batch_size
         if max_input_len is None:
             max_input_len = model_config.max_input_len
-        else:
-            assert max_input_len <= model_config.max_input_len
+        # NOTE{pengyunl}: remove assertion here for temp fix,
+        # model_config.max_input_len is not the upper bound of input length.
+        # If runtime max_input_len is not properly set,
+        # C++ runtime will throw an error when fetching new requests
         if max_output_len is None:
             max_seq_len = model_config.max_seq_len
         else:
@@ -341,7 +336,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  output_cum_log_probs: bool = False,
                  prompt_table: Optional[Union[str, torch.Tensor]] = None,
                  prompt_tasks: Optional[str] = None,
-                 return_all_generated_tokens: bool = False,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -367,8 +361,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Custom stopping criteria.
             logits_processor (LogitsProcessor):
                 Custom logits processors.
-            return_all_generated_tokens (bool):
-                Whether the full output is returned at each streaming step
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -443,20 +435,18 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                                   len(batch_input_ids_list))
 
         requests = [
-            trtllm.Request(
-                input_token_ids=input_ids,
-                encoder_input_token_ids=encoder_input_ids_list[i]
-                if encoder_input_ids is not None else None,
-                max_new_tokens=max_new_tokens,
-                pad_id=pad_id,
-                end_id=end_id,
-                stop_words=stop_words,
-                bad_words=bad_words,
-                sampling_config=sampling_config,
-                streaming=streaming,
-                output_config=output_config,
-                prompt_tuning_config=prompt_tuning_config,
-                return_all_generated_tokens=return_all_generated_tokens)
+            trtllm.Request(input_token_ids=input_ids,
+                           encoder_input_token_ids=encoder_input_ids_list[i]
+                           if encoder_input_ids is not None else None,
+                           max_new_tokens=max_new_tokens,
+                           pad_id=pad_id,
+                           end_id=end_id,
+                           stop_words=stop_words,
+                           bad_words=bad_words,
+                           sampling_config=sampling_config,
+                           streaming=streaming,
+                           output_config=output_config,
+                           prompt_tuning_config=prompt_tuning_config)
             for i, (input_ids, stop_words, bad_words,
                     prompt_tuning_config) in enumerate(
                         zip(batch_input_ids_list, stop_words_list,
@@ -466,16 +456,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
         request_ids = self.session.enqueue_requests(requests)
 
         if not streaming:
-            return self._initialize_and_fill_output(
-                request_ids, end_id, return_dict, output_sequence_lengths,
-                output_log_probs, output_cum_log_probs, batch_input_ids,
-                streaming, return_all_generated_tokens)
+            return self._initialize_and_fill_output(request_ids, end_id,
+                                                    return_dict,
+                                                    output_sequence_lengths,
+                                                    output_log_probs,
+                                                    output_cum_log_probs,
+                                                    batch_input_ids, streaming)
         else:
             return self._stream(request_ids, end_id, return_dict,
                                 output_sequence_lengths, output_log_probs,
                                 output_cum_log_probs, batch_input_ids,
-                                streaming, batch_input_ids_list,
-                                return_all_generated_tokens)
+                                streaming, batch_input_ids_list)
 
     def _prepare_words_list(self, words_list: List[List[List[int]]],
                             batch_size: int):
@@ -509,7 +500,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def _initialize_and_fill_output(self, request_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
-                                    streaming, return_all_generated_tokens):
+                                    streaming):
         output_ids = [[] for _ in range(len(request_ids))]
         for reqid_pos in range(len(request_ids)):
             output_ids[reqid_pos] = [[] for _ in range(self.max_beam_width)]
@@ -522,12 +513,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return self._fill_output(responses, output_ids, end_id, return_dict,
                                  output_sequence_lengths, output_log_probs,
                                  output_cum_log_probs, batch_input_ids,
-                                 streaming, request_ids,
-                                 return_all_generated_tokens)
+                                 streaming, request_ids)
 
     def _stream(self, request_ids, end_id, return_dict, output_sequence_lengths,
                 output_log_probs, output_cum_log_probs, batch_input_ids,
-                streaming, batch_input_ids_list, return_all_generated_tokens):
+                streaming, batch_input_ids_list):
         output_ids = [[] for _ in range(len(request_ids))]
         for reqid_pos in range(len(request_ids)):
             output_ids[reqid_pos] = [
@@ -546,13 +536,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
             yield self._fill_output(responses, output_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
-                                    streaming, request_ids,
-                                    return_all_generated_tokens)
+                                    streaming, request_ids)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
                      output_cum_log_probs, batch_input_ids, streaming,
-                     request_ids, return_all_generated_tokens):
+                     request_ids):
         cuda_device = torch.device("cuda")
 
         for response in responses:
@@ -562,10 +551,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             reqid_pos = request_ids.index(response.request_id)
             for beam, output_tokens in enumerate(
                     response.result.output_token_ids):
-                if return_all_generated_tokens:
-                    output_ids[reqid_pos][beam] = output_tokens
-                else:
-                    output_ids[reqid_pos][beam] += output_tokens
+                output_ids[reqid_pos][beam] += output_tokens
 
         sequence_lengths = []
         for output in output_ids:

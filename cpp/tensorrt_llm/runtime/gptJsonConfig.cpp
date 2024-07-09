@@ -46,8 +46,8 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     }
     catch (nlohmann::json::out_of_range& e)
     {
-        TLLM_LOG_INFO("Parameter %s cannot be read from json:", std::string(name).c_str());
-        TLLM_LOG_INFO(e.what());
+        TLLM_LOG_DEBUG("Parameter %s cannot be read from json:", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
     }
     return value;
 }
@@ -62,13 +62,13 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     }
     catch (nlohmann::json::out_of_range const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     catch (nlohmann::json::type_error const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     return value;
 }
@@ -427,10 +427,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = pretrainedConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = pretrainedConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = pretrainedConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = pretrainedConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (pretrainedConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = pretrainedConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
@@ -449,10 +456,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = builderConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = builderConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = builderConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = builderConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (builderConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = builderConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }

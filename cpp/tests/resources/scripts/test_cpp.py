@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import argparse as _arg
+import copy
 import logging as _log
 import os as _os
 import pathlib as _pl
@@ -135,9 +136,18 @@ def run_tests(build_dir: _pl.Path,
         "--num-loras=128",
     ]
 
+    generate_gpt2_lora_data_args_tp1 = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/lora-test-weights-gpt2-tp1",
+        "--tp-size=1", "--hidden-size=768", "--num-layers=12",
+        "--config-ids-filter=0", "--no-generate-cache-pages"
+    ]
+
     run_command(generate_lora_data_args_tp1, cwd=root_dir, timeout=100)
     run_command(generate_lora_data_args_tp2, cwd=root_dir, timeout=100)
     run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
+    run_command(generate_gpt2_lora_data_args_tp1, cwd=root_dir, timeout=100)
 
     if not skip_unit_tests:
         run_unit_tests(build_dir=build_dir, timeout=test_timeout)
@@ -484,9 +494,15 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
                 timeout=timeout)  # expecting ~ 1200s
+    cpp_blocking_env = copy.copy(cpp_env)
+    cpp_blocking_env["CUDA_LAUNCH_BLOCKING"] = '1'
+    run_command(trt_model_test,
+                cwd=tests_dir,
+                env=cpp_blocking_env,
+                timeout=timeout)  # expecting ~ 1200s
 
     #Executor test in leader mode
-    new_env = cpp_env
+    new_env = copy.copy(cpp_env)
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-leader-mode.xml"
     new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     trt_model_test = [
@@ -507,7 +523,7 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
     #EncDec test in leader mode
-    new_env = cpp_env
+    new_env = copy.copy(cpp_env)
     xml_output_file = build_dir / "results-multi-gpu-t5-exec-leader-mode.xml"
     trt_model_test = [
         "mpirun", "-n", "4", "--allow-run-as-root", "executor/executorTest",

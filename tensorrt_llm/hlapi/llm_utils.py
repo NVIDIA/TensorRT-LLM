@@ -13,6 +13,7 @@ __all__ = [
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
+    'BuildCacheConfig',
     'QuantConfig',
     'CachedModelLoader',
     'ConfigArbitrateError',
@@ -51,7 +52,7 @@ from ..mapping import Mapping
 from ..models import MODEL_MAP
 from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
-from .build_cache import (BuildCache, CachedStage,
+from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
@@ -223,7 +224,7 @@ class LlmArgs:
     batching_type (BatchingType, optional): The batching type for the model.
         Default is None.
 
-    enable_build_cache (str or bool, optional): Whether to enable build caching for the model.
+    enable_build_cache (bool or BuildCacheConfig, optional): Whether to enable build caching for the model.
         Default is None.
 
     enable_tqdm (bool, default=False): Whether to display a progress bar during model building.
@@ -279,7 +280,7 @@ class LlmArgs:
     batching_type: Optional[BatchingType] = None
 
     # Once set, the model will reuse the build_cache
-    enable_build_cache: Optional[str | bool] = None
+    enable_cache_config: Union[BuildCacheConfig, bool] = False
 
     # Display the model building progress bar
     enable_tqdm: bool = False
@@ -357,6 +358,13 @@ class LlmArgs:
         self._check_model_or_model_dir()
 
         self._setup_embedding_parallel_mode()
+
+        if self.enable_cache_config:
+            self.enable_cache_config = BuildCacheConfig() if isinstance(
+                self.enable_cache_config, bool) else self.enable_cache_config
+            if not isinstance(self.enable_cache_config, BuildCacheConfig):
+                raise ValueError(
+                    f"Invalid build_cache_config: {self.enable_cache_config}")
 
         if self.is_local_model:
             # Load parallel_config from the engine.
@@ -939,7 +947,6 @@ class ModelLoader:
     def model_format(self) -> _ModelFormatKind:
         return self._model_format
 
-    # TODO[tali]: Replace this with a lower-level API
     @staticmethod
     def save(
         model: _ModelRuntimeContext,
@@ -1131,9 +1138,6 @@ class ModelLoader:
         with open(Path(model_dir) / "config.json", "r") as f:
             engine_config = json.load(f)
 
-        # TODO[chunweiy]: Remove the following if-check after the engine config is unified.
-        if 'build_config' not in engine_config:
-            return None
         build_config = engine_config['build_config']
         build_config.pop("plugin_config")
         return Namespace(**build_config)
@@ -1223,18 +1227,16 @@ class CachedModelLoader:
     def build_cache_enabled(self) -> bool:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
-        return (self.llm_args.enable_build_cache or _enable_build_cache) and (
+        return (self.llm_args.enable_cache_config or _enable_build_cache) and (
             self.llm_args.model_format is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
         '''
         Get the cache stage fir engine building.
         '''
-        _, _build_cache_root = get_build_cache_config_from_env()
-        build_cache_root = Path(self.llm_args.enable_build_cache if isinstance(
-            self.llm_args.enable_build_cache, str) else _build_cache_root)
+        assert self.llm_args.enable_cache_config
 
-        build_cache = BuildCache(build_cache_root)
+        build_cache = BuildCache(self.llm_args.enable_cache_config)
 
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
         dummy_build_config = CachedModelLoader.get_final_build_config(

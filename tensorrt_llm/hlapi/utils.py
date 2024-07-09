@@ -5,10 +5,10 @@ import sys
 import tempfile
 import traceback
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Union
 
 import filelock
 import huggingface_hub
@@ -17,7 +17,7 @@ from huggingface_hub import snapshot_download
 from tqdm.auto import tqdm
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.logger import Singleton, set_level
+from tensorrt_llm.logger import Singleton
 
 
 def print_traceback_on_error(func):
@@ -42,8 +42,11 @@ class SamplingParams:
         end_id (int): The end token id.
         pad_id (int): The pad token id.
         max_new_tokens (int): The maximum number of tokens to generate.
-        bad_words (List[List[int]]): A list of bad words tokens. Each "word" can be composed of multiple tokens.
-        stop_words (List[List[int]]): A list of stop words tokens. Each "word" can be composed of multiple tokens.
+        bad (Union[str, List[str]]): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output.
+        bad_token_ids (List[int]): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output.
+        stop (Union[str, List[str]]): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True.
+        stop_token_ids (List[int]): A list of token ids that stop the generation when they are generated.
+        include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
         embedding_bias (torch.Tensor): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size].
         external_draft_tokens_config (ExternalDraftTokensConfig): The speculative decoding configuration.
         prompt_tuning_config (PromptTuningConfig): The prompt tuning configuration.
@@ -85,8 +88,19 @@ class SamplingParams:
     end_id: Optional[int] = None
     pad_id: Optional[int] = None
     max_new_tokens: int = 32
-    bad_words: Optional[List[List[int]]] = None
-    stop_words: Optional[List[List[int]]] = None
+
+    bad: Optional[Union[str, List[str]]] = None
+    bad_token_ids: Optional[List[int]] = None
+    _bad_word_ids: Optional[List[List[int]]] = field(default=None,
+                                                     init=False,
+                                                     repr=False)
+    stop: Optional[Union[str, List[str]]] = None
+    stop_token_ids: Optional[List[int]] = None
+    include_stop_str_in_output: bool = False
+    _stop_word_ids: Optional[List[List[int]]] = field(default=None,
+                                                      init=False,
+                                                      repr=False)
+
     embedding_bias: Optional[torch.Tensor] = None
     external_draft_tokens_config: Optional[
         tllme.ExternalDraftTokensConfig] = None
@@ -123,7 +137,60 @@ class SamplingParams:
         if self.pad_id is None:
             self.pad_id = self.end_id
 
-    def _get_sampling_config(self):
+    def setup(self,
+              tokenizer,
+              add_special_tokens: bool = False) -> 'SamplingParams':
+        if self.end_id is None:
+            self.end_id = tokenizer.eos_token_id
+            self.pad_id = tokenizer.pad_token_id
+            if self.pad_id is None:
+                self.pad_id = self.end_id
+
+        if self.bad is not None:
+            strs = [self.bad] if isinstance(self.bad, str) else self.bad
+            self._bad_word_ids = [
+                tokenizer.encode(s, add_special_tokens=add_special_tokens)
+                for s in strs
+            ]
+
+        if self.stop is not None:
+            strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            self._stop_word_ids = [
+                tokenizer.encode(s, add_special_tokens=add_special_tokens)
+                for s in strs
+            ]
+
+        return self
+
+    def _get_bad_words(self) -> List[List[int]]:
+        words = []
+        if self.bad_token_ids is not None:
+            words = [[i] for i in self.bad_token_ids]
+
+        if self.bad is None:
+            return words
+        else:
+            if self._bad_word_ids is None:
+                raise RuntimeError(
+                    f"{self.__class__.__name__}.bad ({self.bad}) is not processed by tokenizer, "
+                    "please call the setup method.")
+            return words + self._bad_word_ids
+
+    def _get_stop_words(self) -> List[List[int]]:
+        words = []
+        if self.stop_token_ids is not None:
+            words = [[i] for i in self.stop_token_ids]
+
+        if self.stop is None:
+            return words
+        else:
+            if self._stop_word_ids is None:
+                raise RuntimeError(
+                    f"{self.__class__.__name__}.stop ({self.stop}) is not processed by tokenizer, "
+                    "please call the setup method.")
+            return words + self._stop_word_ids
+
+    def _get_sampling_config(self) -> tllme.SamplingConfig:
         expected_fields = [
             "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
             "top_p_decay", "random_seed", "temperature", "min_length",
@@ -143,7 +210,7 @@ class SamplingParams:
             **{f: getattr(self, f)
                for f in expected_fields})
 
-    def _get_output_config(self):
+    def _get_output_config(self) -> tllme.OutputConfig:
         expected_fields = [
             "return_log_probs", "return_context_logits",
             "return_generation_logits", "exclude_input_from_output",
@@ -237,13 +304,6 @@ class ContextManager:
 
 def is_directory_empty(directory: Path) -> bool:
     return not any(directory.iterdir())
-
-
-def init_log_level():
-    ''' Set the log level if the environment variable is not set.  '''
-    if "TLLM_LOG_LEVEL" not in os.environ:
-        set_level("warning")
-        os.environ["TLLM_LOG_LEVEL"] = "WARNING"
 
 
 class ExceptionHandler(metaclass=Singleton):

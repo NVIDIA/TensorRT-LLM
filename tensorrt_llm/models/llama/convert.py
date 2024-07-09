@@ -649,13 +649,16 @@ def load_hf_llama(model_dir: str, load_model_on_cpu: bool = False):
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
         model_cls = LlavaForConditionalGeneration
+    if hf_config.model_type == "llava_next":
+        from transformers import LlavaNextForConditionalGeneration
+        model_cls = LlavaNextForConditionalGeneration
     model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
         torch_dtype='auto',
         trust_remote_code=True,
     )
-    if hf_config.model_type == "llava":
+    if hf_config.model_type in ["llava", "llava_next"]:
         model = model.language_model
     return model
 
@@ -1221,7 +1224,7 @@ def quantize(hf_model_dir: str,
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
-    assert "llava" not in hf_config.model_type, "Smooth quant llava/vila is not supported yet"
+    assert "llava" not in hf_config.model_type, "Smooth quant llava/vila/llava_next is not supported yet"
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
         device_map='auto',

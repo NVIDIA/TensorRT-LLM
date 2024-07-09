@@ -158,7 +158,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     common::check_cuda_error(cudaStreamCreate(&mStream));
 
     int const startMinMRounded = nextPowerOfTwo(dims.minM);
-    for (int m = startMinMRounded; m < maxM; m *= 2)
+    for (int m = std::max(1, startMinMRounded); m < maxM; m *= 2)
     {
         profileTactics(m, dims.n, dims.k);
     }
@@ -184,7 +184,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
         return std::nullopt;
     }
 
-    int const mRounded = std::min(nextPowerOfTwo(m), getMaxProfileM());
+    int const mRounded = std::min(std::max(1, nextPowerOfTwo(m)), getMaxProfileM());
     fflush(stdout);
     return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
 }

@@ -21,7 +21,7 @@ from ..._common import default_net
 from ..._utils import str_dtype_to_trt
 from ...functional import (Tensor, arange, cast, concat, expand,
                            gather_last_token_logits, shape, unsqueeze)
-from ...layers import Embedding, LayerNorm, Linear, Mamba, RmsNorm
+from ...layers import Embedding, LayerNorm, Linear, Mamba, Mamba2, RmsNorm
 from ...module import Module, ModuleList
 from ...plugin import current_all_reduce_helper
 from ..generation_mixin import GenerationMixin
@@ -30,18 +30,31 @@ from ..modeling_utils import PretrainedConfig, PretrainedModel
 
 class MambaLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, last_layer=False):
+    def __init__(self, config: PretrainedConfig, layer_idx: int):
         super().__init__()
         self.dtype = config.dtype
         self.residual_in_fp32 = config.residual_in_fp32
-        self.last_layer = last_layer
+        n_layer = config.num_hidden_layers
+        self.last_layer = layer_idx == n_layer - 1
 
-        self.ssm = Mamba(config.hidden_size,
-                         config.rnn_hidden_size,
-                         d_state=config.state_size,
-                         d_conv=config.conv_kernel,
-                         bias=config.use_bias,
-                         dtype=config.dtype)
+        if config.mamba_version == 'Mamba1':
+            self.ssm = Mamba(config.hidden_size,
+                             config.rnn_hidden_size,
+                             d_state=config.state_size,
+                             d_conv=config.conv_kernel,
+                             bias=config.use_bias,
+                             dtype=config.dtype)
+        elif config.mamba_version == 'Mamba2':
+            self.ssm = Mamba2(config.hidden_size,
+                              config.rnn_hidden_size,
+                              d_state=config.state_size,
+                              d_conv=config.conv_kernel,
+                              headdim=config.rnn_head_size,
+                              ngroups=config.ngroups,
+                              chunk_size=config.chunk_size,
+                              bias=config.use_bias,
+                              rmsnorm=config.ssm_rmsnorm,
+                              dtype=config.dtype)
         if config.rms_norm:
             self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                            eps=config.norm_epsilon,
@@ -101,10 +114,8 @@ class MambaModel(Module):
         self.vocab_embedding = Embedding(config.vocab_size,
                                          config.hidden_size,
                                          dtype=config.dtype)
-        self.layers = ModuleList([
-            MambaLayer(config, last_layer=i == n_layer - 1)
-            for i in range(n_layer)
-        ])
+        self.layers = ModuleList(
+            [MambaLayer(config, i) for i in range(n_layer)])
         if config.rms_norm:
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
                                 eps=config.norm_epsilon,
@@ -166,9 +177,11 @@ class MambaForCausalLM(PretrainedModel):
             self.dtype = dtype
 
         self.config = config
+        self.mamba_version = config.mamba_version
         self.d_inner = config.rnn_hidden_size
         self.d_conv = config.conv_kernel
         self.d_state = config.state_size
+        self.conv_dim = config.rnn_conv_dim_size
         self.gather_context_logits = False
 
         if isinstance(logits_dtype, str):
@@ -294,20 +307,32 @@ class MambaForCausalLM(PretrainedModel):
             conv_state_dim_range = OrderedDict([
                 ('batch_size', ranges['bb_range']),
                 ('kernel_size', [self.d_conv - 1] * num_profiles),
-                ('dim_size', [self.d_inner] * num_profiles),
+                ('dim_size', [self.conv_dim] * num_profiles),
             ])
         else:
             conv_state_dim_range = OrderedDict([
                 ('batch_size', ranges['bb_range']),
-                ('dim_size', [self.d_inner] * num_profiles),
+                ('dim_size', [self.conv_dim] * num_profiles),
                 ('kernel_size', [self.d_conv - 1] * num_profiles),
             ])
 
-        ssm_state_dim_range = OrderedDict([
-            ('batch_size', ranges['bb_range']),
-            ('state_size', [self.d_state] * num_profiles),
-            ('dim_size', [self.d_inner] * num_profiles),
-        ])
+        if self.mamba_version == 'Mamba2':
+            headdim = self.config.rnn_head_size
+            nheads = self.d_inner // headdim
+            ssm_state_dim_range = OrderedDict([
+                ('batch_size', ranges['bb_range']),
+                ('head_size', [nheads] * num_profiles),
+                ('state_size', [self.d_state] * num_profiles),
+                ('headdim_size', [headdim] * num_profiles),
+            ])
+            ssm_state_shape = [-1, nheads, self.d_state, headdim]
+        else:
+            ssm_state_dim_range = OrderedDict([
+                ('batch_size', ranges['bb_range']),
+                ('state_size', [self.d_state] * num_profiles),
+                ('dim_size', [self.d_inner] * num_profiles),
+            ])
+            ssm_state_shape = [-1, self.d_state, self.d_inner]
         one_dim_range = OrderedDict([
             ('buffer_count', [1] * num_profiles),
         ])
@@ -328,18 +353,18 @@ class MambaForCausalLM(PretrainedModel):
                     conv_state = Tensor(
                         name=f'past_conv_state_{i}',
                         dtype=self.dtype,
-                        shape=[-1, self.d_conv - 1, self.d_inner],
+                        shape=[-1, self.d_conv - 1, self.conv_dim],
                         dim_range=conv_state_dim_range)
                 else:
                     conv_state = Tensor(
                         name=f'past_conv_state_{i}',
                         dtype=self.dtype,
-                        shape=[-1, self.d_inner, self.d_conv - 1],
+                        shape=[-1, self.conv_dim, self.d_conv - 1],
                         dim_range=conv_state_dim_range)
 
                 ssm_state = Tensor(name=f'past_rnn_state_{i}',
                                    dtype=self.dtype,
-                                   shape=[-1, self.d_state, self.d_inner],
+                                   shape=ssm_state_shape,
                                    dim_range=ssm_state_dim_range)
 
             conv_states.append(conv_state)
@@ -352,7 +377,7 @@ class MambaForCausalLM(PretrainedModel):
             dim_range=OrderedDict([('batch_size', ranges['bb_range'])]),
         )
 
-        if use_mamba_conv1d_plugin and remove_input_padding:
+        if remove_input_padding:
             host_context_lengths = Tensor(
                 name='host_context_lengths',
                 dtype=trt.int32,

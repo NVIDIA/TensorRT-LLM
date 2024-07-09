@@ -23,8 +23,8 @@ import pytest
 import torch
 import tensorrt as trt
 # isort: on
-from functional.torch_ref import (attention_qkvpacked_ref, mamba_ref,
-                                  recurrent_ref)
+from functional.torch_ref import (attention_qkvpacked_ref, mamba2_ref,
+                                  mamba_ref, recurrent_ref)
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
                                     TrtRunner)
@@ -1035,26 +1035,10 @@ class TestLayer(unittest.TestCase):
                                    atol=a_tol,
                                    verbose=True)
 
-    @parameterized.expand([
-        (3, 16, 1, 1024, 16, 'context', 'float32', False, True),
-        (3, 16, 1, 1024, 16, 'context', 'float16', False, True),
-        (3, 16, 1, 1024, 16, 'context', 'bfloat16', False, True),
-        (3, 16, 1, 1024, 16, 'generation', 'float32', False, True),
-        (3, 16, 1, 1024, 16, 'generation', 'float16', False, True),
-        (3, 16, 1, 1024, 16, 'generation', 'bfloat16', False, True),
-        (3, 16, 1, 1024, 16, 'context', 'float32', False, False),
-        (3, 16, 1, 1024, 16, 'context', 'float16', False, False),
-        (3, 16, 1, 1024, 16, 'context', 'bfloat16', False, False),
-        (3, 16, 1, 1024, 16, 'generation', 'float32', False, False),
-        (3, 16, 1, 1024, 16, 'generation', 'float16', False, False),
-        (3, 16, 1, 1024, 16, 'generation', 'bfloat16', False, False),
-        (3, 16, 1, 1024, 16, 'context', 'float32', True, True),
-        (3, 16, 1, 1024, 16, 'context', 'float16', True, True),
-        (3, 16, 1, 1024, 16, 'context', 'bfloat16', True, True),
-        (3, 16, 1, 1024, 16, 'generation', 'float32', True, True),
-        (3, 16, 1, 1024, 16, 'generation', 'float16', True, True),
-        (3, 16, 1, 1024, 16, 'generation', 'bfloat16', True, True),
-    ],
+    @parameterized.expand(list(
+        product([3], [16], [1], [1024], [16], ['context', 'generation'],
+                ["float32", "float16", "bfloat16"], [True, False],
+                [True, False])),
                           name_func=unittest_name_func)
     def test_mamba(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
                    req_type, dtype, remove_padding, use_plugin):
@@ -1322,6 +1306,344 @@ class TestLayer(unittest.TestCase):
 
         # pytorch run
         out_ref, conv_state_ref, ssm_state_ref = mamba_torch(
+            hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
+            remove_padding, batch_size, seqlen_offset)
+
+        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+
+        if not remove_padding:
+            # get out_mask
+            if req_type == 'context':
+                out_mask = torch.zeros(batch_size, seq_len, device=device)
+                for i in range(batch_size):
+                    for j in range(last_token_ids[i]):
+                        out_mask[i, j] = 1
+                out_mask = out_mask.unsqueeze(2).expand(
+                    [batch_size, seq_len, d_model])
+            else:
+                out_mask = torch.ones(batch_size,
+                                      seq_len,
+                                      d_model,
+                                      device=device)
+
+            # compare out diff
+            out_ref = (out_ref * out_mask).detach().to(
+                torch.float32).cpu().numpy()
+            outputs['output'][out_mask == 0] = 0
+        else:
+            out_ref = out_ref.detach().to(torch.float32).cpu().numpy()
+
+        out_trt_llm = outputs['output'].to(torch.float32).cpu().numpy()
+        np.testing.assert_allclose(out_ref, out_trt_llm, atol=dtype_atol[dtype])
+
+        # compare conv state diff
+        conv_state_ref = conv_state_ref[:, :, 1:].detach().to(
+            torch.float32).cpu().numpy()
+        conv_state_trt_llm = outputs['present_conv_state']
+        if use_plugin:
+            conv_state_trt_llm = conv_state_trt_llm.permute(0, 2,
+                                                            1).contiguous()
+        conv_state_trt_llm = conv_state_trt_llm.to(torch.float32).cpu().numpy()
+        np.testing.assert_allclose(conv_state_ref,
+                                   conv_state_trt_llm,
+                                   atol=dtype_atol[dtype])
+
+        # compare ssm state diff
+        ssm_state_ref = ssm_state_ref.detach().to(torch.float32).cpu().numpy()
+        ssm_state_trt_llm = outputs['present_ssm_state']
+        ssm_state_trt_llm = ssm_state_trt_llm.to(torch.float32).cpu().numpy()
+        np.testing.assert_allclose(ssm_state_ref,
+                                   ssm_state_trt_llm,
+                                   atol=dtype_atol[dtype])
+
+    @parameterized.expand(list(
+        product([3], [16], [1], [1024], [128], [64], [256],
+                ['context', 'generation'], ["float32", "float16", "bfloat16"],
+                [True, False], [True, False])),
+                          name_func=unittest_name_func)
+    def test_mamba2(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
+                    headdim, chunk_size, req_type, dtype, remove_padding,
+                    use_plugin):
+
+        # Skip tests that are not supported in pre-ampere architecture
+        skip_bf16_pre_ampere(dtype)
+
+        if not use_plugin and remove_padding:
+            pytest.skip(
+                "Skipping remove input padding without mamba conv1d plugin")
+        if dtype == 'float32' and req_type == 'context':
+            pytest.skip(
+                "Mamba2 layer only support float16 and bfloat16 in context phase"
+            )
+        if getSMVersion() < 80:
+            pytest.skip(
+                "Mamba2 layer is not supported in pre-Ampere architecture")
+
+        # configs
+        device = "cuda"
+        d_conv = 4
+        expand = 2
+        ngroups = 1
+        bias = False
+        rmsnorm = True
+        d_inner = int(expand * d_model)
+        nheads = d_inner // headdim
+        conv_dim = d_inner + 2 * ngroups * d_state
+        seqlen_offset = 0 if req_type == 'context' else in_seq_len
+        seq_len = in_seq_len if req_type == 'context' else out_seq_len
+
+        # test data
+        torch_dtype = str_dtype_to_torch(dtype)
+        mean = 0.0
+        std_dev = 0.05 if dtype == "float32" else 0.02
+        torch.random.manual_seed(0)
+
+        if req_type == 'context':
+            last_token_ids = torch.randint(1,
+                                           in_seq_len + 1,
+                                           size=(batch_size, ),
+                                           dtype=torch.int32,
+                                           device=device)
+            last_token_ids[0] = in_seq_len
+            host_context_lengths = last_token_ids.detach().clone().cpu()
+        else:
+            last_token_ids = torch.ones(size=[batch_size],
+                                        dtype=torch.int32,
+                                        device=device)
+            host_context_lengths = last_token_ids.detach().clone().cpu()
+
+        if use_plugin:
+            trt_conv_state_shape = [batch_size, d_conv - 1, conv_dim]
+            conv_indices = torch.arange(0,
+                                        d_conv - 1,
+                                        dtype=torch.int32,
+                                        device=device).view([1, d_conv - 1, 1])
+        else:
+            trt_conv_state_shape = [batch_size, conv_dim, d_conv - 1]
+            conv_indices = torch.arange(0,
+                                        d_conv - 1,
+                                        dtype=torch.int32,
+                                        device=device).view([1, 1, d_conv - 1])
+        offsets = last_token_ids.view([batch_size, 1, 1])
+        conv_indices = conv_indices.expand(trt_conv_state_shape) + offsets
+
+        if remove_padding:
+            last_token_ids = torch.cumsum(last_token_ids,
+                                          dim=0,
+                                          dtype=torch.int32).to(device)
+            total_num_tokens = last_token_ids[batch_size - 1]
+        else:
+            total_num_tokens = batch_size * seq_len
+
+        if remove_padding:
+            hidden_states = torch.empty(size=[total_num_tokens, d_model],
+                                        dtype=torch_dtype,
+                                        device=device)
+            output = torch.zeros(size=[total_num_tokens, d_model],
+                                 dtype=torch_dtype,
+                                 device=device)
+        else:
+            hidden_states = torch.empty(size=[batch_size, seq_len, d_model],
+                                        dtype=torch_dtype,
+                                        device=device)
+            output = torch.zeros(size=[batch_size, seq_len, d_model],
+                                 dtype=torch_dtype,
+                                 device=device)
+        hidden_states.normal_(mean, std_dev)
+
+        if req_type == 'context':
+            conv_state = torch.zeros(size=[batch_size, conv_dim, d_conv - 1],
+                                     dtype=torch_dtype,
+                                     device=device)
+        else:
+            conv_state = torch.randn(size=[batch_size, conv_dim, d_conv - 1],
+                                     dtype=torch_dtype,
+                                     device=device)
+        if req_type == 'context':
+            ssm_state = torch.empty(size=[batch_size, nheads, d_state, headdim],
+                                    dtype=torch_dtype,
+                                    device=device)
+        else:
+            ssm_state = torch.randn(size=[batch_size, nheads, d_state, headdim],
+                                    dtype=torch_dtype,
+                                    device=device)
+
+        host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
+                                          batch_size,
+                                          dtype=torch.int32)
+
+        present_conv_state = torch.zeros(size=trt_conv_state_shape,
+                                         dtype=torch_dtype,
+                                         device=device)
+
+        hidden_states_ref = hidden_states.detach().clone()
+        out_ref = output.detach().clone()
+        if req_type == 'context':
+            conv_state_ref = torch.zeros(size=[batch_size, conv_dim, d_conv],
+                                         dtype=torch_dtype,
+                                         device=device).detach()
+        else:
+            conv_state_ref = torch.concat(
+                (torch.zeros(size=[batch_size, conv_dim, 1],
+                             dtype=torch_dtype,
+                             device=device), conv_state),
+                dim=2).detach().clone()
+        ssm_state_ref = ssm_state.detach().clone()
+
+        # get torch layer
+        mamba2_torch = mamba2_ref(d_model,
+                                  d_state,
+                                  d_conv,
+                                  expand,
+                                  headdim,
+                                  ngroups,
+                                  chunk_size,
+                                  True,
+                                  bias,
+                                  rmsnorm=rmsnorm,
+                                  device=device,
+                                  dtype=torch_dtype)
+
+        # init weights
+        for module in mamba2_torch.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
+                if module.bias is not None:
+                    torch.nn.init.normal_(module.bias, std=std_dev)
+                torch.nn.init.normal_(module.weight, std=std_dev)
+
+        A = -torch.rand(nheads, device=device) - 1.0
+        D = torch.randn(nheads, device=device)
+        dt_bias = torch.rand(nheads, device=device) - 4.0
+        norm_weight = torch.randn(d_inner, device=device)
+
+        mamba2_torch.A.data = A.detach().clone()
+        mamba2_torch.D.data = D.detach().clone()
+        mamba2_torch.dt_bias.data = dt_bias.detach().clone()
+        mamba2_torch.norm.weight.data = norm_weight.detach().clone()
+
+        # construct trt network
+        builder = tensorrt_llm.Builder()
+        net = builder.create_network()
+        if use_plugin:
+            net.plugin_config.mamba_conv1d_plugin = dtype
+        else:
+            net.plugin_config.mamba_conv1d_plugin = None
+        if remove_padding:
+            net.plugin_config.remove_input_padding = True
+        else:
+            net.plugin_config.remove_input_padding = False
+        net.plugin_config.paged_state = False
+
+        with tensorrt_llm.net_guard(net):
+            hidden_states_tensor = Tensor(
+                name='hidden_states',
+                shape=hidden_states.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            conv_state_tensor = Tensor(
+                name='conv_state',
+                shape=trt_conv_state_shape,
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            ssm_state_tensor = Tensor(
+                name='ssm_state',
+                shape=ssm_state.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            host_request_types_tensor = Tensor(
+                name='host_request_types',
+                shape=host_request_types.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            last_token_ids_tensor = Tensor(
+                name='last_token_ids',
+                shape=last_token_ids.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_context_lengths_tensor = Tensor(
+                name='host_context_lengths',
+                shape=host_context_lengths.shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            conv_indices_tensor = Tensor(
+                name='conv_indices',
+                shape=trt_conv_state_shape,
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            mamba2_layer = tensorrt_llm.layers.Mamba2(d_model=d_model,
+                                                      d_inner=d_inner,
+                                                      d_state=d_state,
+                                                      d_conv=d_conv,
+                                                      headdim=headdim,
+                                                      ngroups=ngroups,
+                                                      chunk_size=chunk_size,
+                                                      bias=bias,
+                                                      rmsnorm=rmsnorm,
+                                                      dtype=dtype)
+            mamba2_layer.A.value = torch_to_numpy(A.detach().cpu())
+            mamba2_layer.D.value = torch_to_numpy(D.detach().cpu())
+            mamba2_layer.dt_bias.value = torch_to_numpy(dt_bias.detach().cpu())
+            mamba2_layer.norm.weight.value = torch_to_numpy(
+                norm_weight.detach().cpu())
+            mamba2_layer.in_proj.weight.value = torch_to_numpy(
+                mamba2_torch.in_proj.weight.detach().cpu())
+            mamba2_layer.out_proj.weight.value = torch_to_numpy(
+                mamba2_torch.out_proj.weight.detach().cpu())
+            if bias:
+                mamba2_layer.in_proj.bias.value = torch_to_numpy(
+                    mamba2_torch.in_proj.bias.detach().cpu())
+                mamba2_layer.out_proj.bias.value = torch_to_numpy(
+                    mamba2_torch.out_proj.bias.detach().cpu())
+            mamba2_layer.conv1d.weight.value = torch_to_numpy(
+                mamba2_torch.conv1d.weight.detach().unsqueeze(3).cpu())
+            mamba2_layer.conv1d.bias.value = torch_to_numpy(
+                mamba2_torch.conv1d.bias.detach().cpu())
+            if rmsnorm:
+                mamba2_layer.norm.weight.value = torch_to_numpy(
+                    mamba2_torch.norm.weight.detach().cpu())
+
+            outputs = mamba2_layer(
+                hidden_states_tensor,
+                conv_state_tensor,
+                ssm_state_tensor,
+                host_request_types_tensor,
+                last_token_ids_tensor,
+                host_context_lengths=host_context_lengths_tensor,
+                conv_indices=conv_indices_tensor)
+            net._mark_output(outputs[0],
+                             'output',
+                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            net._mark_output(outputs[1],
+                             'present_conv_state',
+                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            net._mark_output(outputs[2],
+                             'present_ssm_state',
+                             dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+
+        if use_plugin:
+            trt_conv_state = conv_state.permute(0, 2, 1).contiguous()
+        else:
+            trt_conv_state = conv_state.clone().detach()
+        trt_conv_indices = conv_indices.clone().detach()
+        # trt run
+        inputs = {
+            'hidden_states': hidden_states,
+            'conv_state': trt_conv_state,
+            'ssm_state': ssm_state,
+            'host_request_types': host_request_types,
+            'last_token_ids': last_token_ids,
+            'host_context_lengths': host_context_lengths,
+            'conv_indices': trt_conv_indices,
+        }
+        outputs = {
+            'output': output,
+            'present_conv_state': present_conv_state,
+            'present_ssm_state': ssm_state,
+        }
+
+        stream = torch.cuda.current_stream()
+        builder_config = builder.create_builder_config(name='mamba2',
+                                                       opt_level=0,
+                                                       precision=dtype)
+        engine = builder.build_engine(net, builder_config)
+        session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+        session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
+
+        # pytorch run
+        out_ref, conv_state_ref, ssm_state_ref = mamba2_torch(
             hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
             remove_padding, batch_size, seqlen_offset)
 

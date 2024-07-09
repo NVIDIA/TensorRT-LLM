@@ -12,7 +12,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Deplot](#deplot)
 - [Fuyu](#fuyu)
 - [Kosmos-2](#kosmos-2)
-- [LLaVA and VILA](#llava-and-vila)
+- [LLaVA, LLaVa-NeXT and VILA](#llava-llava-next-and-vila)
 - [NeVA](#neva)
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
@@ -361,9 +361,9 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
-## LLaVA and VILA
+## LLaVA, LLaVa-NeXT and VILA
 
-[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options.
+[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT.
 
 1. Download Huggingface model weights. These models have both visual and LLM components
    unlike BLIP2 example which downloads only LLM components from Huggingface.
@@ -372,6 +372,12 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
 
     ```bash
         export MODEL_NAME="llava-1.5-7b-hf" # also llava-1.5-13b-hf
+        git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
+    For LLaVA-NeXT,
+
+     ```bash
+        export MODEL_NAME="llava-v1.6-mistral-7b-hf" #for 34b variant "llava-v1.6-34b-hf"
         git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
@@ -411,6 +417,18 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 5120 \
+        --max_num_tokens 4096 \  # 1 (max_batch_size) * 4096 (max_input_len)
+        --max_multimodal_len 4096 \  # 1 (max_batch_size) * 4096 (max_input_len)
+        --use_fused_mlp
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --gemm_plugin float16 \
         --use_fused_mlp \
         --max_batch_size 1 \
@@ -426,6 +444,8 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     ```bash
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # for LLaVA
 
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_next --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
+
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
 
@@ -435,7 +455,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --input_text "Question: which city is this? Answer:" # for LLaVA
+        --input_text "Question: which city is this? Answer:" # for LLaVA and for LLaVA-NeXT
     ```
 
     For VILA, you can use either local file or web url as input images.

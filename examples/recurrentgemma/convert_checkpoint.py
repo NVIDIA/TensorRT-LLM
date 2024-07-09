@@ -496,6 +496,7 @@ def main():
         rnn_hidden_size=ckpt_config["lru_width"],
         logits_soft_cap=ckpt_config["logits_soft_cap"],
         emb_scale_by_sqrt_dim=ckpt_config["embeddings_scale_by_sqrt_dim"],
+        rnn_conv_dim_size=ckpt_config["lru_width"],
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

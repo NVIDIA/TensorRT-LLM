@@ -76,9 +76,9 @@ class GenerationRequest:
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
             "bad_words":
-            self.sampling_params.bad_words or [],
+            self.sampling_params._get_bad_words(),
             "stop_words":
-            self.sampling_params.stop_words or [],
+            self.sampling_params._get_stop_words(),
             "embedding_bias":
             self.sampling_params.embedding_bias,
             "external_draft_tokens_config":
@@ -181,6 +181,15 @@ class GenerationResult:
             if generation_logits is not None:
                 self.outputs[i].generation_logits = generation_logits[
                     i, :self.outputs[i].length]
+
+        if self.finished and not self._generation_request.sampling_params.include_stop_str_in_output:
+            for beam_output in self.outputs:
+                for stop_ids in self._generation_request.sampling_params._get_stop_words(
+                ):
+                    if beam_output.token_ids[-len(stop_ids):] == stop_ids:
+                        beam_output.token_ids = beam_output.token_ids[:-len(
+                            stop_ids)]
+                        break
 
         if context_logits is not None:
             self.context_logits = context_logits

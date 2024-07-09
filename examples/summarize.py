@@ -415,10 +415,6 @@ def main(args):
                 "Python bindings of C++ session is unavailable, fallback to Python session."
             )
             args.use_py_session = True
-        if args.return_all_generated_tokens:
-            raise ValueError(
-                "Returning all the generated tokens at each step is not supported in summarize.py"
-            )
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,

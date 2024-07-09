@@ -76,6 +76,7 @@ class TestPhi(unittest.TestCase):
             'mapping': {
                 'world_size': tensor_parallel,
                 'tp_size': tensor_parallel,
+                'world_size': tensor_parallel,
             },
             'use_parallel_embedding': False,
             'embedding_sharding_dim': 0,

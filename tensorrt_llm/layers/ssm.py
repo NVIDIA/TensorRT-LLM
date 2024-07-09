@@ -22,6 +22,7 @@ from ..functional import (ACT2FN, Tensor, concat, conv2d, gather, mamba_conv1d,
 from ..module import Module
 from ..parameter import Parameter
 from .linear import Linear
+from .normalization import RmsNorm
 
 
 class MambaConv1d(Module):
@@ -197,17 +198,132 @@ class Mamba(Module):
                                       self.A.value,
                                       x_dbl,
                                       self.D.value,
-                                      z,
                                       host_request_types,
                                       last_token_ids,
                                       self.d_inner,
                                       self.d_state,
                                       self.dt_rank,
-                                      is_variable_B=True,
-                                      is_variable_C=True,
                                       delta_softplus=True,
                                       dtype=self.dtype,
+                                      z=z,
+                                      host_context_lengths=host_context_lengths,
                                       slot_mapping=slot_mapping)
+        # out_proj
+        out = self.out_proj(y)
+        return out, conv_state, ssm_state
+
+
+class Mamba2(Module):
+
+    def __init__(self,
+                 d_model,
+                 d_inner,
+                 d_state=16,
+                 d_conv=4,
+                 headdim=64,
+                 ngroups=1,
+                 chunk_size=256,
+                 bias=False,
+                 rmsnorm=True,
+                 dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.d_inner = d_inner
+        self.headdim = headdim
+        self.ngroups = ngroups
+        self.chunk_size = chunk_size
+        self.rmsnorm = rmsnorm
+        self.dtype = dtype
+        assert self.d_inner % self.headdim == 0
+        self.nheads = self.d_inner // self.headdim
+
+        self.A = Parameter(shape=(self.nheads, ), dtype="float32")
+        self.D = Parameter(shape=(self.nheads, ), dtype="float32")
+        self.dt_bias = Parameter(shape=(self.nheads, ), dtype="float32")
+
+        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+        self.in_proj = Linear(self.d_model,
+                              d_in_proj,
+                              bias=bias,
+                              dtype=dtype,
+                              gather_output=False)
+
+        self.conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
+        self.conv1d = MambaConv1d(self.conv_dim, self.d_conv, self.dtype)
+
+        if rmsnorm:
+            self.norm = RmsNorm(normalized_shape=self.d_inner,
+                                eps=1e-5,
+                                dtype=dtype)
+
+        self.out_proj = Linear(self.d_inner,
+                               self.d_model,
+                               bias=bias,
+                               dtype=dtype,
+                               gather_output=False)
+
+    def forward(self,
+                hidden_states: Tensor,
+                conv_state: Tensor,
+                ssm_state: Tensor,
+                host_request_types: Tensor,
+                last_token_ids: Tensor,
+                host_context_lengths: Optional[Tensor] = None,
+                slot_mapping: Optional[Tensor] = None,
+                conv_indices: Optional[Tensor] = None):
+        '''
+        Parameters:
+            hidden_states: [B, L, D] or [T, D]
+            conv_state: [B, W, D_conv] or [1] of type int64 for paged state
+            ssm_state: [B, H, N, D] or [1] of type int64 for paged state
+            host_request_types: [B]
+            last_token_ids: [B]
+            host_context_lengths: [B]
+            slot_mapping: [B]
+            conv_indices: [B]
+        '''
+        # in_proj
+        zxbcdt = self.in_proj(hidden_states)
+        z, xbc, dt = split(zxbcdt, [self.d_inner, self.conv_dim, self.nheads],
+                           dim=-1)
+
+        # conv1d
+        xbc_conv, conv_state = self.conv1d(xbc, conv_state, host_request_types,
+                                           last_token_ids, host_context_lengths,
+                                           slot_mapping, conv_indices)
+        x_conv, bc = split(xbc_conv,
+                           [self.d_inner, 2 * self.ngroups * self.d_state],
+                           dim=-1)
+
+        # mamba scan
+        y, ssm_state = selective_scan(x_conv,
+                                      ssm_state,
+                                      dt,
+                                      self.dt_bias.value,
+                                      self.A.value,
+                                      bc,
+                                      self.D.value,
+                                      host_request_types,
+                                      last_token_ids,
+                                      self.d_inner,
+                                      self.d_state,
+                                      dt_rank=0,
+                                      delta_softplus=True,
+                                      dtype=self.dtype,
+                                      z=z,
+                                      host_context_lengths=host_context_lengths,
+                                      slot_mapping=slot_mapping,
+                                      nheads=self.nheads,
+                                      ngroups=self.ngroups,
+                                      chunk_size=self.chunk_size,
+                                      mamba_version='Mamba2')
+
+        # norm
+        if self.rmsnorm:
+            y = self.norm(y)
+
         # out_proj
         out = self.out_proj(y)
         return out, conv_state, ssm_state

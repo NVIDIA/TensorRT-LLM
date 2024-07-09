@@ -300,6 +300,9 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[1]);
     int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
 
+    if (m == 0)
+        return 0;
+
     bool const use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
 #if defined(ENABLE_BF16)
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,

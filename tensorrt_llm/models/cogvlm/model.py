@@ -21,7 +21,6 @@ from ...layers import (AttentionMaskType, CogVLMAttention, ColumnLinear,
                        Embedding, GatedMLP, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ...plugin import init_all_reduce_helper
 # this is to use to module global algo string with a quant_algo prefix
 from ...quantization import QuantMode
 from ...top_model_mixin import TopModelMixin
@@ -141,7 +140,6 @@ class CogvlmModel(Module):
 
     def __init__(self, config: CogVLMConfig) -> None:
         super().__init__()
-        init_all_reduce_helper()
 
         self.mapping = config.mapping
         self.use_prompt_tuning = config.use_prompt_tuning

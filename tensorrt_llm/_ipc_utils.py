@@ -14,6 +14,7 @@
 # limitations under the License.
 import array
 import struct
+import sys
 from contextlib import contextmanager
 from typing import List, Tuple
 
@@ -83,7 +84,7 @@ class IpcMemory():
             self.local_ptr = 0
 
     def __del__(self):
-        if self.open_ipc:
+        if not sys.is_finalizing() and self.open_ipc:
             IpcMemory.close_ipc_memory(self.mapping, self.peer_ptrs)
 
     def serialize(self) -> List[int]:

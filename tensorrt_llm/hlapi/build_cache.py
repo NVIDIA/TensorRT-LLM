@@ -27,32 +27,59 @@ def get_build_cache_config_from_env() -> tuple[bool, str]:
     return build_cache_enabled, build_cache_root
 
 
-class BuildCache:
-    '''
-    The BuildCache class is a class that manages the intermediate products from the build steps.
+class BuildCacheConfig:
+    """
+    Configuration for the build cache.
 
-    NOTE: currently, only engine-building is supported
-    TODO[chunweiy]: add support for other build steps, such as quantization, convert_checkpoint, etc.
-    '''
-    # The version of the cache, will be used to determine if the cache is compatible
-    CACHE_VERSION = 0
+    Attributes:
+        cache_root (str): The root directory for the build cache.
+        max_records (int): The maximum number of records to store in the cache.
+        max_cache_storage_gb (float): The maximum amount of storage (in GB) to use for the cache.
+    """
 
     def __init__(self,
                  cache_root: Optional[Path] = None,
                  max_records: int = 10,
-                 max_cache_storage_gb: int = 256):
-        '''
-        Args:
-            cache_root (Path): The root directory of the cache
-            max_records (int): The maximum number of records to keep in the cache
-            max_cache_storage_gb (int): The maximum storage size of the cache
-        '''
-        _, default_cache_root = get_build_cache_config_from_env()
-        self.cache_root = cache_root or Path(default_cache_root)
-        self.max_records = max_records
-        self.max_cache_storage_gb = max_cache_storage_gb
+                 max_cache_storage_gb: float = 256):
+        self._cache_root = cache_root
+        self._max_records = max_records
+        self._max_cache_storage_gb = max_cache_storage_gb
 
-        if max_records < 1:
+    @property
+    def cache_root(self) -> Path:
+        _build_cache_enabled, _build_cache_root = get_build_cache_config_from_env(
+        )
+        return self._cache_root or Path(_build_cache_root)
+
+    @property
+    def max_records(self) -> int:
+        return self._max_records
+
+    @property
+    def max_cache_storage_gb(self) -> float:
+        return self._max_cache_storage_gb
+
+
+class BuildCache:
+    """
+    The BuildCache class is a class that manages the intermediate products from the build steps.
+
+    NOTE: currently, only engine-building is supported
+    TODO[chunweiy]: add support for other build steps, such as quantization, convert_checkpoint, etc.
+    """
+    # The version of the cache, will be used to determine if the cache is compatible
+    CACHE_VERSION = 0
+
+    def __init__(self, config: Optional[BuildCacheConfig] = None):
+
+        _, default_cache_root = get_build_cache_config_from_env()
+        config = config or BuildCacheConfig()
+
+        self.cache_root = config.cache_root or Path(default_cache_root)
+        self.max_records = config.max_records
+        self.max_cache_storage_gb = config.max_cache_storage_gb
+
+        if config.max_records < 1:
             raise ValueError("max_records should be greater than 0")
 
     def get_engine_building_cache_stage(self,

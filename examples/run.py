@@ -36,7 +36,6 @@ if PYTHON_BINDINGS:
 
 
 def parse_arguments(args=None):
-    # see `add_common_args` for extended list of arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_input_length', type=int, default=923)
     parser.add_argument('--max_output_len', type=int, required=True)
@@ -319,18 +318,6 @@ def main(args):
             "Debug mode is not supported in C++ session for now, fallback to Python session."
         )
         args.use_py_session = True
-    if args.return_all_generated_tokens and args.use_py_session:
-        raise ValueError(
-            "Returning all the generated tokens at each step is not supported in the Python session, use C++ session instead."
-        )
-    if (not args.return_all_generated_tokens) and args.streaming and (
-            args.num_beams > 1):
-        logger.warning(
-            "Setting return_all_generated_tokens to True since streaming AND beam search are done simultaneously. "
-            "Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. "
-            "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
-        )
-        args.return_all_generated_tokens = True
     runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
     runner_kwargs = dict(
         engine_dir=args.engine_dir,
@@ -360,7 +347,8 @@ def main(args):
             kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
             kv_cache_free_gpu_memory_fraction=args.
             kv_cache_free_gpu_memory_fraction,
-            enable_chunked_context=args.enable_chunked_context)
+            enable_chunked_context=args.enable_chunked_context,
+        )
     runner = runner_cls.from_dir(**runner_kwargs)
 
     with torch.no_grad():
@@ -394,8 +382,7 @@ def main(args):
             output_sequence_lengths=True,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
             return_dict=True,
-            medusa_choices=args.medusa_choices,
-            return_all_generated_tokens=args.return_all_generated_tokens)
+            medusa_choices=args.medusa_choices)
         torch.cuda.synchronize()
 
     if args.streaming:
@@ -482,9 +469,7 @@ def main(args):
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
-                    return_dict=True,
-                    return_all_generated_tokens=args.return_all_generated_tokens
-                )
+                    return_dict=True)
                 torch.cuda.synchronize()
 
         tensorrt_llm.profiler.start("tmp")
@@ -516,9 +501,7 @@ def main(args):
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
-                    return_dict=True,
-                    return_all_generated_tokens=args.return_all_generated_tokens
-                )
+                    return_dict=True)
                 torch.cuda.synchronize()
         tensorrt_llm.profiler.stop("tmp")
 

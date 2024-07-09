@@ -26,6 +26,7 @@ from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
+from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
 from ..quantization.layers import (WeightOnlyGroupwiseQuantLinear,
                                    WeightOnlyGroupwiseQuantRowLinear,
@@ -370,6 +371,7 @@ class PretrainedModel(Module,
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
+        init_all_reduce_helper()
         self.config = config
 
     def __post_init__(self):

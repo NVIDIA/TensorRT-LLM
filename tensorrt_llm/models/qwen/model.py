@@ -15,6 +15,7 @@
 
 from typing import Optional
 
+from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.lora_manager import LoraConfig, use_lora
 
 from ..._utils import pad_vocab_size
@@ -62,10 +63,13 @@ class QWenDecoderLayer(Module):
 
         ClsMLP = GatedMLP
         mlp_kwargs = {}
+
+        moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
+                               config.moe_normalization_mode).validate()
         if config.qwen_type == 'qwen2_moe':
             ClsMLP = MOE
             mlp_kwargs = {
-                "moe_config": config.moe,
+                "moe_config": moe_config,
                 "mapping": config.mapping,
             }
 

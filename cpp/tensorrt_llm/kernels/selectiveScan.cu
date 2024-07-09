@@ -28,6 +28,12 @@
 
 #include "selectiveScan.h"
 
+#include "chunkScan/bmmchunk.h"
+#include "chunkScan/chunkcumsum.h"
+#include "chunkScan/chunkscan.h"
+#include "chunkScan/chunkstate.h"
+#include "chunkScan/statepassing.h"
+
 namespace tensorrt_llm
 {
 namespace kernels
@@ -319,8 +325,6 @@ void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream)
     int samples = params.batch;
     int channels = params.dim;
 
-    TLLM_CHECK(params.is_variable_B);
-    TLLM_CHECK(params.is_variable_C);
     TLLM_CHECK(params.dstate == 16);
 
     int const threads = 128;
@@ -329,6 +333,107 @@ void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream)
     dim3 grid(blocks, samples);
     TLLM_CHECK((channels % block.x) == 0);
     selective_scan_loop_kernel<input_t, weight_t><<<grid, block, 0, stream>>>(params);
+}
+
+template <typename input_t, typename weight_t>
+void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
+{
+    int B = params.batch;
+    int L = params.max_seqlen;
+    int H = params.nheads;
+    int P = params.dim / H;
+    int G = params.ngroups;
+    int N = params.dstate;
+    int Q = params.chunk_size;
+
+    bool dtsp = params.delta_softplus;
+
+    if constexpr (std::is_same_v<input_t, half>)
+    {
+        dim3 bds[5], tds[5];
+        int shms[5];
+
+        ChunkCumsumKernelFuncFp16 chunk_cumsum = getChunkCumsumKernelFp16(B, L, H, Q, dtsp, &bds[0], &tds[0], &shms[0]);
+        ChunkStateKernelFuncFp16 chunk_state = getChunkStateKernelFp16(B, L, H, P, G, N, Q, &bds[1], &tds[1], &shms[1]);
+        StatePassingKernelFuncFp16 state_passing
+            = getStatePassingKernelFp16(B, L, H, P, N, Q, &bds[2], &tds[2], &shms[2]);
+        BmmChunkKernelFuncFp16 bmm_chunk = getBmmChunkKernelFp16(B, L, G, N, Q, &bds[3], &tds[3], &shms[3]);
+        ChunkScanKernelFuncFp16 chunk_scan = getChunkScanKernelFp16(B, L, H, P, G, N, Q, &bds[4], &tds[4], &shms[4]);
+
+        half* mxY = (half*) params.out_ptr;
+        half* mxOs = (half*) params.Os_ptr;
+        half* mxFs = (half*) params.x_ptr;
+        float* mxSt = (float*) params.St_ptr;
+        float* mxdc = (float*) params.dc_ptr;
+        float* mxdA = (float*) params.dA_ptr;
+        half const* mxdt = (half const*) params.delta_ptr;
+        float const* mxdb = (float const*) params.delta_bias_ptr;
+        float const* mxA = (float const*) params.A_ptr;
+        half* mxCB = (half*) params.CB_ptr;
+        half const* mxBC = (half const*) params.BC_ptr;
+        float const* mxD = (float const*) params.D_ptr;
+        half const* mxX = (half const*) params.u_ptr;
+        half const* mxZ = (half const*) params.z_ptr;
+
+        auto rp = params.remove_padding;
+        auto ltip = params.last_token_ids_ptr;
+        auto ssmp = params.slot_mapping_ptr;
+
+        cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
+        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, mxdc, mxdA, mxdt, mxdb, mxA, rp, ltip);
+        cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
+        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxBC, mxX, rp, ltip);
+        cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
+        state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
+        cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
+        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, G, N, mxCB, mxBC, rp, ltip);
+        cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
+        chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
+            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxBC, mxD, mxX, mxZ, rp, ltip);
+    }
+    else if constexpr (std::is_same_v<input_t, __nv_bfloat16>)
+    {
+        dim3 bds[5], tds[5];
+        int shms[5];
+
+        ChunkCumsumKernelFuncBf16 chunk_cumsum = getChunkCumsumKernelBf16(B, L, H, Q, dtsp, &bds[0], &tds[0], &shms[0]);
+        ChunkStateKernelFuncBf16 chunk_state = getChunkStateKernelBf16(B, L, H, P, G, N, Q, &bds[1], &tds[1], &shms[1]);
+        StatePassingKernelFuncBf16 state_passing
+            = getStatePassingKernelBf16(B, L, H, P, N, Q, &bds[2], &tds[2], &shms[2]);
+        BmmChunkKernelFuncBf16 bmm_chunk = getBmmChunkKernelBf16(B, L, G, N, Q, &bds[3], &tds[3], &shms[3]);
+        ChunkScanKernelFuncBf16 chunk_scan = getChunkScanKernelBf16(B, L, H, P, G, N, Q, &bds[4], &tds[4], &shms[4]);
+
+        __nv_bfloat16* mxY = (__nv_bfloat16*) params.out_ptr;
+        __nv_bfloat16* mxOs = (__nv_bfloat16*) params.Os_ptr;
+        __nv_bfloat16* mxFs = (__nv_bfloat16*) params.x_ptr;
+        float* mxSt = (float*) params.St_ptr;
+        float* mxdc = (float*) params.dc_ptr;
+        float* mxdA = (float*) params.dA_ptr;
+        __nv_bfloat16 const* mxdt = (__nv_bfloat16 const*) params.delta_ptr;
+        float const* mxdb = (float const*) params.delta_bias_ptr;
+        float const* mxA = (float const*) params.A_ptr;
+        __nv_bfloat16* mxCB = (__nv_bfloat16*) params.CB_ptr;
+        __nv_bfloat16 const* mxBC = (__nv_bfloat16 const*) params.BC_ptr;
+        float const* mxD = (float const*) params.D_ptr;
+        __nv_bfloat16 const* mxX = (__nv_bfloat16 const*) params.u_ptr;
+        __nv_bfloat16 const* mxZ = (__nv_bfloat16 const*) params.z_ptr;
+
+        auto rp = params.remove_padding;
+        auto ltip = params.last_token_ids_ptr;
+        auto ssmp = params.slot_mapping_ptr;
+
+        cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
+        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, mxdc, mxdA, mxdt, mxdb, mxA, rp, ltip);
+        cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
+        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxBC, mxX, rp, ltip);
+        cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
+        state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
+        cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
+        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, G, N, mxCB, mxBC, rp, ltip);
+        cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
+        chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
+            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxBC, mxD, mxX, mxZ, rp, ltip);
+    }
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(input_t, weight_t)                                                        \
@@ -341,9 +446,19 @@ INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(__nv_bfloat16, float);
 #endif
 #undef INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE
 
+#define INSTANTIATE_CHUNK_SCAN_DATA_TYPE(input_t, weight_t)                                                            \
+    template void invokeChunkScan<input_t, weight_t>(SSMParamsBase & params, cudaStream_t stream);
+
+INSTANTIATE_CHUNK_SCAN_DATA_TYPE(float, float);
+INSTANTIATE_CHUNK_SCAN_DATA_TYPE(half, float);
+#ifdef ENABLE_BF16
+INSTANTIATE_CHUNK_SCAN_DATA_TYPE(__nv_bfloat16, float);
+#endif
+#undef INSTANTIATE_CHUNK_SCAN_DATA_TYPE
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128>
+template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, bool MAMBA_V1 = true>
 __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParamsBase params)
 {
 
@@ -359,15 +474,21 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     weight_t* dt_bias = reinterpret_cast<weight_t*>(params.delta_bias_ptr);
     bool dt_softplus = params.delta_softplus;
     int num_channels = params.dim;
+    int nheads = params.nheads;
+    int ngroups = params.ngroups;
 
     int const channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= num_channels)
         return;
     int const sample = blockIdx.y;
+    int const head_dim = num_channels / nheads;
+    int const head = channel / head_dim;
+    int const head_chl = channel % head_dim;
+    int const group = head / (nheads / ngroups);
     int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
-    int const bc_cols = DSTATE * 2 + params.dt_rank;
-    int const b_offset = params.dt_rank;
-    int const c_offset = params.dt_rank + DSTATE;
+    int const bc_offset = MAMBA_V1 ? sample * (DSTATE * 2 + params.dt_rank) : sample * DSTATE * ngroups * 2;
+    int const b_offset = MAMBA_V1 ? params.dt_rank : DSTATE * group;
+    int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : DSTATE * (ngroups + group);
 
     input_t* my_state = &state[slot_idx * num_channels * DSTATE];
     input_t* my_output = &output[sample * num_channels];
@@ -375,30 +496,45 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     float rA[DSTATE];
     float rB[DSTATE];
     float rC[DSTATE];
-
     float rState[DSTATE];
-
-#pragma unroll
-    for (int i = 0; i < DSTATE; i++)
-    {
-        rA[i] = toFloat(A[i * num_channels + channel]);
-        rB[i] = toFloat(B[sample * bc_cols + b_offset + i]);
-        rC[i] = toFloat(C[sample * bc_cols + c_offset + i]);
-        rState[i] = toFloat(my_state[i * num_channels + channel]);
-    }
-
     float my_x, my_dt, my_z, my_dt_bias, my_D;
     my_x = toFloat(x[sample * num_channels + channel]);
-    my_dt = toFloat(dt[sample * num_channels + channel]);
     my_z = z ? toFloat(z[sample * num_channels + channel]) : 0.f;
-    my_dt_bias = dt_bias ? toFloat(dt_bias[channel]) : 0.f;
-    my_D = D ? toFloat(D[channel]) : 0.f;
+
+    if (MAMBA_V1)
+    {
+#pragma unroll
+        for (int i = 0; i < DSTATE; i++)
+        {
+            rA[i] = toFloat(A[i * num_channels + channel]);
+            rB[i] = toFloat(B[bc_offset + b_offset + i]);
+            rC[i] = toFloat(C[bc_offset + c_offset + i]);
+            rState[i] = toFloat(my_state[i * num_channels + channel]);
+        }
+        my_dt = toFloat(dt[sample * num_channels + channel]);
+        my_dt_bias = dt_bias ? toFloat(dt_bias[channel]) : 0.f;
+        my_D = D ? toFloat(D[channel]) : 0.f;
+    }
+    else
+    {
+        float A_tmp = toFloat(A[head]);
+#pragma unroll
+        for (int i = 0; i < DSTATE; i++)
+        {
+            rA[i] = A_tmp;
+            rB[i] = toFloat(B[bc_offset + b_offset + i]);
+            rC[i] = toFloat(C[bc_offset + c_offset + i]);
+            rState[i] = toFloat(my_state[(head * DSTATE + i) * head_dim + head_chl]);
+        }
+        my_dt = toFloat(dt[sample * nheads + head]);
+        my_dt_bias = dt_bias ? toFloat(dt_bias[head]) : 0.f;
+        my_D = D ? toFloat(D[head]) : 0.f;
+    }
 
     float dt_b = my_dt + my_dt_bias;
     float dt_b_sp;
     if (dt_softplus)
     {
-        // dt_b_sp = dt_b <= 20.f ? logf(1.f + expf(dt_b)) : dt_b; // softplus
         dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
     }
 
@@ -407,19 +543,21 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
 #pragma unroll
     for (int i = 0; i < DSTATE; i++)
     {
-        // float dA = expf(rA[i] * dt_b_sp);
         float dA = __expf(rA[i] * dt_b_sp);
         float dB = rB[i] * dt_b_sp;
         float sdA = rState[i] * dA;
         float dBx = dB * my_x;
         float newState = sdA + dBx;
-        convertAndStore(&my_state[i * num_channels + channel], newState); // Write the new state back out to the cache
+        // Write the new state back out to the cache
+        if (MAMBA_V1)
+            convertAndStore(&my_state[i * num_channels + channel], newState);
+        else
+            convertAndStore(&my_state[(head * DSTATE + i) * head_dim + head_chl], newState);
         out += newState * rC[i];
     }
 
     if (z)
     {
-        // float sig_z = 1.0 / (1.0 + exp(0.f - my_z));
         float sig_z = __fdividef(1.f, (1.f + __expf(0.f - my_z)));
         float silu_z = my_z * sig_z;
         out *= silu_z;
@@ -433,16 +571,25 @@ void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream)
 {
     int samples = params.batch;
     int channels = params.dim;
+    int nheads = params.nheads;
+    int ngroups = params.ngroups;
 
     int const threads = 128;
     int const blocks = (channels + threads - 1) / threads;
     dim3 block(threads, 1);
     dim3 grid(blocks, samples);
 
-    TLLM_CHECK(params.is_variable_B);
-    TLLM_CHECK(params.is_variable_C);
-    TLLM_CHECK(params.dstate == 16);
-    selective_scan_update_kernel<input_t, weight_t><<<grid, block, 0, stream>>>(params);
+    TLLM_CHECK_WITH_INFO(nheads % ngroups == 0, "nheads must be divisible by ngroups");
+    if (params.is_mamab2)
+    {
+        TLLM_CHECK(params.dstate == 128);
+        selective_scan_update_kernel<input_t, weight_t, 128, 128, false><<<grid, block, 0, stream>>>(params);
+    }
+    else
+    {
+        TLLM_CHECK(params.dstate == 16);
+        selective_scan_update_kernel<input_t, weight_t, 16, 128, true><<<grid, block, 0, stream>>>(params);
+    }
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_UPDATE_DATA_TYPE(input_t, weight_t)                                                 \

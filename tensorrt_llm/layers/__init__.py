@@ -28,7 +28,7 @@ from .moe import MOE, MoeConfig
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
-from .ssm import Mamba
+from .ssm import Mamba, Mamba2
 
 __all__ = [
     'LayerNorm',
@@ -65,6 +65,7 @@ __all__ = [
     'MOE',
     'MoeConfig',
     'Mamba',
+    'Mamba2',
     'Recurrent',
     'GroupedLinear',
     'RgLru',

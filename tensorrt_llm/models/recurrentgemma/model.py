@@ -554,7 +554,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
 
         if use_gpt_attention_plugin and remove_input_padding:
             host_context_lengths = attention_inputs['host_context_lengths']
-        elif use_mamba_conv1d_plugin and remove_input_padding:
+        elif remove_input_padding:
             host_context_lengths = Tensor(
                 name='host_context_lengths',
                 dtype=trt.int32,

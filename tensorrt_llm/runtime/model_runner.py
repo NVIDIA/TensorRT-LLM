@@ -439,7 +439,7 @@ class ModelRunner(ModelRunnerMixin):
 
         rnn_config_items = [
             'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
-            'state_dtype'
+            'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
         ]
         rnn_configs_kwargs = {}
         for item in rnn_config_items:

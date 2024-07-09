@@ -5637,17 +5637,20 @@ def selective_scan(input: Tensor,
                    A: Tensor,
                    BC: Tensor,
                    D: Tensor,
-                   z: Tensor,
                    host_request_types: Tensor,
                    last_token_ids: Tensor,
                    dim: int,
                    dstate: int,
                    dt_rank: int,
-                   is_variable_B: bool,
-                   is_variable_C: bool,
                    delta_softplus: bool,
                    dtype: str,
-                   slot_mapping: Optional[Tensor] = None):
+                   z: Optional[Tensor] = None,
+                   host_context_lengths: Optional[Tensor] = None,
+                   slot_mapping: Optional[Tensor] = None,
+                   nheads: int = 1,
+                   ngroups: int = 1,
+                   chunk_size: int = 256,
+                   mamba_version: str = 'Mamba1'):
     '''
     Parameters:
         input : Tensor (On GPU)
@@ -5658,27 +5661,34 @@ def selective_scan(input: Tensor,
             Or the CPU tensor of shape [1] for the pointer of paged states.
 
         delta : Tensor (On GPU)
-            The delta tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+            The delta tensor.
+            mamba: Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+            mamba2: Its shape is [batch_size, seq_len, nheads] or [num_tokens, nheads] for remove_input_padding
 
         delta_bias : Tensor (On GPU)
-            The delta bias tensor. Its shape is [dim]
+            The delta bias tensor.
+            mamba: Its shape is [dim]
+            mamba2: Its shape is [nheads]
 
         A : Tensor (On GPU)
-            A matrix. Its shape is [dstate, dim]
+            A matrix.
+            mamba: Its shape is [dstate, dim]
+            mamba2: Its shape is [nheads]
 
         BC : Tensor (On GPU)
-            B matrix. Its shape is [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding
+            B and C matrix.
+            mamba: Its shape is [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding
+            mamba2: Its shape is [batch_size, seq_len, ngroups * dstate * 2] or [num_tokens, ngroups * dstate * 2] for remove_input_padding
 
         D : Tensor (On GPU)
-            D matrix. Its shape is [dim]
-
-        z : Tensor (On GPU)
-            The z tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+            D matrix.
+            mamba: Its shape is [dim]
+            mamba2: Its shape is [nheads]
 
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/gpt_attention.md
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
@@ -5693,22 +5703,32 @@ def selective_scan(input: Tensor,
         dt_rank: int
             The rank dimension of dt_proj
 
-        is_variable_B : bool
-            Is the matrix B a variable? Set to 'True' if B is a dynamic matrix
-            during inference, 'False' otherwise
-
-        is_variable_C : bool
-            Is the matrix C a variable? Set to 'True' if C is a dynamic matrix
-            during inference, 'False' otherwise
-
         delta_softplus : bool
             Do we apply softplus to the delta.
 
         dtype: str
             data type
 
+        z : Tensor (On GPU) (Optional)
+            The z tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+
+        host_context_lengths: Tensor (On CPU) (Optional)
+            A host tensor that contains the lengths of the different inputs,
+
         slot_mapping: Tensor (On GPU) (Optional)
             Real page index in state. Its shape is [dim], used for paged state, each page shape is [dstate, dim]
+
+        nheads: int (Optional)
+            The number of heads.
+
+        ngroups: int (Optional)
+            The number of groups.
+
+        chunk_size: int (Optional)
+            The chunk_size is used for the chunk_scan kernel.
+
+        mamba_version: int (Optional)
+            Mamba version, support Mamba1 as default.
     '''
     assert host_request_types is not None
     selective_scan_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -5721,12 +5741,13 @@ def selective_scan(input: Tensor,
                              trt.PluginFieldType.INT32)
     dt_rank = trt.PluginField("dt_rank", np.array(dt_rank, dtype=np.int32),
                               trt.PluginFieldType.INT32)
-    is_variable_B = trt.PluginField(
-        "is_variable_B", np.array(np.int8(is_variable_B), dtype=np.int8),
-        trt.PluginFieldType.INT8)
-    is_variable_C = trt.PluginField(
-        "is_variable_C", np.array(np.int8(is_variable_C), dtype=np.int8),
-        trt.PluginFieldType.INT8)
+    nheads = trt.PluginField("nheads", np.array(nheads, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    ngroups = trt.PluginField("ngroups", np.array(ngroups, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    chunk_size = trt.PluginField("chunk_size",
+                                 np.array(chunk_size, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
     delta_softplus = trt.PluginField(
         "delta_softplus", np.array(np.int8(delta_softplus), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5741,20 +5762,34 @@ def selective_scan(input: Tensor,
         "paged_state",
         np.array(np.int8(default_net().plugin_config.paged_state),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+    if z is None:
+        z_enabled = trt.PluginField("z_enabled", np.array(0, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+    else:
+        z_enabled = trt.PluginField("z_enabled", np.array(1, dtype=np.int8),
+                                    trt.PluginFieldType.INT8)
+    is_mamba2 = trt.PluginField(
+        "is_mamba2",
+        np.array(1 if mamba_version == 'Mamba2' else 0, dtype=np.int8),
+        trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        dim, dstate, dt_rank, is_variable_B, is_variable_C, delta_softplus,
-        pf_type, remove_input_padding, paged_state
+        dim, dstate, dt_rank, nheads, ngroups, chunk_size, delta_softplus,
+        pf_type, remove_input_padding, paged_state, z_enabled, is_mamba2
     ])
     selective_scan_plug = selective_scan_plg_creator.create_plugin(
         "selective_scan", pfc)
 
     plug_inputs = [
-        input, state_or_ptr, delta, delta_bias, A, BC, D, z, host_request_types,
+        input, state_or_ptr, delta, delta_bias, A, BC, D, host_request_types,
         last_token_ids
     ]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
     if default_net().plugin_config.paged_state:
         plug_inputs += [slot_mapping]
+    if z is not None:
+        plug_inputs += [z]
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
     layer = default_trtnet().add_plugin_v2(plug_inputs, selective_scan_plug)

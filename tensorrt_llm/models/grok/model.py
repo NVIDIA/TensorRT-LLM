@@ -21,7 +21,6 @@ from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...plugin import init_all_reduce_helper
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, QuantConfig)
 
@@ -69,8 +68,10 @@ class GrokDecoderLayer(Module):
         mlp_kwargs = {}
         assert config.moe_num_experts > 1, "Grok model is a MoE model."
         ClsMLP = MOE
+        moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
+                               config.moe_normalization_mode).validate()
         mlp_kwargs = {
-            "moe_config": config.moe,
+            "moe_config": moe_config,
             "mapping": config.mapping,
         }
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
@@ -130,7 +131,6 @@ class GrokModel(Module):
 
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
-        init_all_reduce_helper()
 
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():

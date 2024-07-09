@@ -39,7 +39,8 @@ public:
     TensorPtr convStates;                // [layer_count * batch_beam, conv_kernel - 1, rnn_hidden_size]
     TensorPtr convStatesAlt;             // [layer_count * batch_beam, conv_kernel - 1, rnn_hidden_size]
 
-    std::vector<TensorPtr> rnnState;     // [batch_beam, state_size, rnn_hidden_size]
+    std::vector<TensorPtr> rnnState;     // [batch_beam, state_size, rnn_hidden_size] or
+                                         // [batch_beam, num_heads, rnn_hidden_size, rnn_head_size]
     std::vector<TensorPtr> convState;    // [batch_beam, conv_kernel - 1, rnn_hidden_size]
     std::vector<TensorPtr> convStateAlt; // [batch_beam, conv_kernel - 1, rnn_hidden_size]
 
@@ -83,6 +84,8 @@ private:
     SizeType32 mConvKernel = 0;
     SizeType32 mStateSize = 0;
     SizeType32 mRnnHiddenSize = 0;
+    SizeType32 mRnnHeadSize = 0;
+    SizeType32 mRnnConvDimSize = 0;
 
     int mLocalNbLayers = 0;
     int mMaxBeamWidth = 0;

@@ -61,9 +61,19 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         return false;
     }
-    if (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads)
+    if (xqaParams.num_kv_heads != 0 && xqaParams.num_q_heads % xqaParams.num_kv_heads != 0)
     {
-        // Do not use XQA kernel for MHA.
+        return false;
+    }
+    bool is_vanilla_mha = xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads;
+    if (is_vanilla_mha && xqaParams.beam_width == 1)
+    {
+        // Do not use XQA kernel for vanilla MHA case for performance reasons.
+        return false;
+    }
+    if (is_vanilla_mha && xqaParams.head_size <= 128)
+    {
+        // TODO(yaoy): remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
         return false;
     }
     if (xqaParams.multi_block_mode)
@@ -108,11 +118,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads % xqaParams.num_kv_heads != 0)
-    {
-        return false;
-    }
-    int32_t head_grp_size = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;
@@ -150,11 +156,7 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     {
         return false;
     }
-    if (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads % xqaParams.num_kv_heads != 0)
-    {
-        return false;
-    }
-    int32_t head_grp_size = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;
