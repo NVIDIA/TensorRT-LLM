@@ -87,7 +87,7 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --gemm_plugin ${INFERENCE_PRECISION} \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
               --gpt_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable
+              --remove_input_padding enable
 ```
 
 ### Run
@@ -121,7 +121,7 @@ WEIGHT_ONLY_PRECISION=int8
 MAX_BEAM_WIDTH=4
 MAX_BATCH_SIZE=8
 checkpoint_dir=distil_whisper_medium_en_weights_${WEIGHT_ONLY_PRECISION}
-output_dir=distil_whisper_medium_en${WEIGHT_ONLY_PRECISION}
+output_dir=distil_whisper_medium_en_${WEIGHT_ONLY_PRECISION}
 
 python3 convert_checkpoint.py \
                 --use_weight_only \
