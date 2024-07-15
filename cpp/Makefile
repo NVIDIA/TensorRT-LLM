@@ -39,6 +39,7 @@ ifeq ($(OS),Windows_NT)
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force ..\..\build\tensorrt_llm\plugins\nvinfer_plugin_tensorrt_llm.dll cortex.tensorrt-llm\;"
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force ..\..\build\tensorrt_llm\tensorrt_llm.dll cortex.tensorrt-llm\;"
 	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force .\build_deps\_install\bin\zlib.dll cortex.tensorrt-llm\;"
+	@powershell -Command "cd tensorrt_llm\cortex.tensorrt-llm\; cp -Force ..\..\..\.github\patches\windows\msmpi.dll cortex.tensorrt-llm\;"
 else
 	cd ./tensorrt_llm/cortex.tensorrt-llm && \
 	mkdir -p cortex.tensorrt-llm && \

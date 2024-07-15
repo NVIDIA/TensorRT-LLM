@@ -68,21 +68,33 @@ class Tokenizer {
 
 struct InferenceState {
   int prev_pos{0};
-  std::string prev_text;
   bool is_finished;
   std::queue<std::string> texts_to_stream;
   std::mutex queue_mutex; // Mutex to protect access to textsToStream
   size_t stop_word_match_len = 0;
-  std::vector<std::string> sequence{"<", "|", "im", "_", "end", "|", ">"};
+  std::vector<std::string> sequence_openhermes = {"<", "|", "im", "_", "end", "|", ">"};
+  std::vector<std::string> sequence_mistral = {"[", "INST", "]"};
   int token_gen_count = 0;
 
   void Reset() {
-      stop_word_match_len = 0;
-      prev_text = "";
+    stop_word_match_len = 0;
   }
 
-  bool IsComplete() const {
-      return stop_word_match_len >= sequence.size();
+  bool IsComplete(bool is_openhermes) const {
+    if(is_openhermes) {
+      return stop_word_match_len >= sequence_openhermes.size();
+    } else {
+      return stop_word_match_len >= sequence_mistral.size();
+    }
+  }
+
+  const std::string& GetSequence(bool is_openhermes, size_t index) {
+    if(is_openhermes) {
+      return sequence_openhermes[index];
+    } else {
+      return sequence_mistral[index];
+    }
+
   }
 };
 
@@ -125,19 +137,19 @@ class TensorrtllmEngine : public EngineI {
   bool CheckModelLoaded(
       std::function<void(Json::Value&&, Json::Value&&)>& callback);
 
-  GptSession::Config session_config{1, 1, 1};
-  SamplingConfig sampling_config{1};
-  std::unique_ptr<ModelConfig> model_config;
-  std::shared_ptr<TllmLogger> logger;
-  std::string user_prompt;
-  std::string ai_prompt;
-  std::string system_prompt;
-  std::string pre_prompt;
-  int batchSize = 1;
+  GptSession::Config session_config_{1, 1, 1};
+  std::unique_ptr<ModelConfig> model_config_;
+  std::shared_ptr<TllmLogger> logger_;
+  std::string user_prompt_;
+  std::string ai_prompt_;
+  std::string system_prompt_;
+  std::string pre_prompt_;
+  int batch_size_ = 1;
   std::string model_id_;
   uint64_t start_time_;
   std::atomic<bool> model_loaded_;
   std::unique_ptr<trantor::ConcurrentTaskQueue> q_;
+  bool is_openhermes_ = true;
 };
 
 } // namespace inferences
