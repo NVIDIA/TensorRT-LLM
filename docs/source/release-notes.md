@@ -8,7 +8,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ## TensorRT-LLM Release 0.10.0
 
 ### Announcements
-- TensorRT-LLM supports TensorRT 10.0.1 and NVIDIA NGC 24.03 containers.
+- TensorRT-LLM supports TensorRT 10.1.0 and NVIDIA NGC 24.03 containers.
 
 ### Key Features and Enhancements
 - The Python high level API
@@ -81,7 +81,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Infrastructure changes
   - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.03-py3`.
   - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.03-py3`.
-  - The dependent TensorRT version is updated to 10.0.1.
+  - The dependent TensorRT version is updated to 10.1.0.
   - The dependent CUDA version is updated to 12.4.0.
   - The dependent PyTorch version is updated to 2.2.2.
 

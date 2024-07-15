@@ -2,7 +2,7 @@
 
 set -ex
 
-TRT_VER="10.0.1.6"
+TRT_VER="10.1.0.27"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-03.html#rel-24-03
 CUDA_VER="12.4" # 12.4.0
@@ -87,7 +87,7 @@ install_tensorrt() {
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
         if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04" && OS="ubuntu-22.04"; else OS1="Linux" && OS2="Linux" && OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.1.0/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
 
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
