@@ -1,0 +1,116 @@
+name: linux
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        cxx: [g++-4.8, g++-10, clang++-9]
+        build_type: [Debug, Release]
+        std: [11]
+        include:
+          - cxx: g++-4.8
+            install: sudo apt install g++-4.8
+          - cxx: g++-8
+            build_type: Debug
+            std: 14
+            install: sudo apt install g++-8
+          - cxx: g++-8
+            build_type: Debug
+            std: 17
+            install: sudo apt install g++-8
+          - cxx: g++-9
+            build_type: Debug
+            std: 17
+          - cxx: g++-10
+            build_type: Debug
+            std: 17
+          - cxx: g++-11
+            build_type: Debug
+            std: 20
+            install: sudo apt install g++-11
+          - cxx: clang++-8
+            build_type: Debug
+            std: 17
+            cxxflags: -stdlib=libc++
+            install: sudo apt install clang-8 libc++-8-dev libc++abi-8-dev
+          - cxx: clang++-9
+            install: sudo apt install clang-9
+          - cxx: clang++-9
+            build_type: Debug
+            fuzz: -DFMT_FUZZ=ON -DFMT_FUZZ_LINKMAIN=ON
+            std: 17
+            install: sudo apt install clang-9
+          - cxx: clang++-11
+            build_type: Debug
+            std: 20
+          - cxx: clang++-11
+            build_type: Debug
+            std: 20
+            cxxflags: -stdlib=libc++
+            install: sudo apt install libc++-11-dev libc++abi-11-dev
+          - shared: -DBUILD_SHARED_LIBS=ON
+
+    steps:
+    - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+
+    - name: Set timezone
+      run: sudo timedatectl set-timezone 'Asia/Yekaterinburg'
+
+    - name: Add repositories for older GCC
+      run: |
+        # Below two repos provide GCC 4.8, 5.5 and 6.4
+        sudo apt-add-repository 'deb http://azure.archive.ubuntu.com/ubuntu/ bionic main'
+        sudo apt-add-repository 'deb http://azure.archive.ubuntu.com/ubuntu/ bionic universe'
+        # Below two repos additionally update GCC 6 to 6.5
+        # sudo apt-add-repository 'deb http://azure.archive.ubuntu.com/ubuntu/ bionic-updates main'
+        # sudo apt-add-repository 'deb http://azure.archive.ubuntu.com/ubuntu/ bionic-updates universe'
+      if: ${{ matrix.cxx == 'g++-4.8' }}
+
+    - name: Add repositories for newer GCC
+      run: |
+        sudo apt-add-repository ppa:ubuntu-toolchain-r/test
+      if: ${{ matrix.cxx == 'g++-11' }}
+
+    - name: Add Ubuntu mirrors
+      run: |
+        # Github Actions caching proxy is at times unreliable
+        # see https://github.com/actions/runner-images/issues/7048
+        printf 'http://azure.archive.ubuntu.com/ubuntu\tpriority:1\n' | sudo tee /etc/apt/mirrors.txt
+        curl http://mirrors.ubuntu.com/mirrors.txt | sudo tee --append /etc/apt/mirrors.txt
+        sudo sed -i 's~http://azure.archive.ubuntu.com/ubuntu/~mirror+file:/etc/apt/mirrors.txt~' /etc/apt/sources.list
+
+    - name: Create Build Environment
+      run: |
+        sudo apt update
+        ${{matrix.install}}
+        sudo apt install locales-all
+        cmake -E make_directory ${{runner.workspace}}/build
+
+    - name: Configure
+      working-directory: ${{runner.workspace}}/build
+      env:
+        CXX: ${{matrix.cxx}}
+        CXXFLAGS: ${{matrix.cxxflags}}
+      run: |
+        cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} ${{matrix.fuzz}} ${{matrix.shared}} \
+              -DCMAKE_CXX_STANDARD=${{matrix.std}} -DFMT_DOC=OFF \
+              -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+              -DFMT_PEDANTIC=ON -DFMT_WERROR=ON $GITHUB_WORKSPACE
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      run: |
+        threads=`nproc`
+        cmake --build . --config ${{matrix.build_type}} --parallel $threads
+
+    - name: Test
+      working-directory: ${{runner.workspace}}/build
+      run: ctest -C ${{matrix.build_type}}
+      env:
+        CTEST_OUTPUT_ON_FAILURE: True

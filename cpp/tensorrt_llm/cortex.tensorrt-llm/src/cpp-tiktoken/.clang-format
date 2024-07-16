@@ -1,0 +1,11 @@
+---
+BasedOnStyle: WebKit
+BreakConstructorInitializers: AfterColon
+FixNamespaceComments: true
+IndentCaseLabels: true
+NamespaceIndentation: None
+PointerAlignment: Right
+SpaceAfterTemplateKeyword: false
+SpaceBeforeInheritanceColon: false
+SpaceBeforeRangeBasedForLoopColon: false
+...
