@@ -477,10 +477,10 @@ __global__ void packExplicitDraftTokens(PackExplicitDraftTokensParams<T> params)
         params.outputTemperatures[batchIdx] = params.inputTemperatures[batchSlot];
     }
 
-    // Copy random validation data.
-    auto const numDecodingDraftTokens = params.numPaths * (params.maxPathLength - 1);
     if (isGenerationRequest)
     {
+        // Copy random validation data.
+        auto const numDecodingDraftTokens = params.numPaths * (params.maxPathLength - 1);
         auto outputRandomDataValidation = params.outputRandomDataValidation + genIdx * numDecodingDraftTokens;
         auto const inputRandomDataValidation = params.inputRandomDataValidation + batchSlot * numDecodingDraftTokens;
         for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < numDecodingDraftTokens;
@@ -488,11 +488,8 @@ __global__ void packExplicitDraftTokens(PackExplicitDraftTokensParams<T> params)
         {
             outputRandomDataValidation[ti] = inputRandomDataValidation[ti];
         }
-    }
 
-    // Copy draft tokens and indices
-    if (isGenerationRequest)
-    {
+        // Copy draft tokens and indices
         auto const numUnpackedTokens = numDecodingDraftTokens + params.numPaths;
         auto outputNextDraftTokens = params.outputNextDraftTokens + genIdx * numUnpackedTokens;
         auto outputNextDraftIndices = params.outputNextDraftIndices + genIdx * numUnpackedTokens;
@@ -504,41 +501,37 @@ __global__ void packExplicitDraftTokens(PackExplicitDraftTokensParams<T> params)
             outputNextDraftTokens[ti] = inputNextDraftTokens[ti];
             outputNextDraftIndices[ti] = inputNextDraftIndices[ti];
         }
-    }
 
-    auto const maxGenerationLength = params.maxGenerationLength[0];
-    auto const maxDecodingTokens = numDecodingDraftTokens + 1;
-    auto const numPackedMasks = divUp(maxGenerationLength, 32);
-    auto const outputMaskStartId = (genIdx == 0) ? 0 : params.cumSumGenerationLengths[genIdx - 1];
-    auto const numTokens = (genIdx == 0)
-        ? params.cumSumGenerationLengths[0]
-        : params.cumSumGenerationLengths[genIdx] - params.cumSumGenerationLengths[genIdx - 1];
-    // Copy packed masks.
-    // Masks are placed next to each other with offsets of cumSumGenerationLengths[bi-1]
-    if (isGenerationRequest)
-    {
+        auto const maxGenerationLength = params.maxGenerationLength[0];
+        auto const maxDecodingTokens = numDecodingDraftTokens + 1;
+        auto const numPackedMasks = divUp(maxGenerationLength, 32);
+        auto const outputStartId = (genIdx == 0) ? 0 : params.cumSumGenerationLengths[genIdx - 1];
+        auto const numTokens = (genIdx == 0)
+            ? params.cumSumGenerationLengths[0]
+            : params.cumSumGenerationLengths[genIdx] - params.cumSumGenerationLengths[genIdx - 1];
+        // Copy packed masks.
+        // Masks are placed next to each other with offsets of cumSumGenerationLengths[bi-1]
         auto const inputPackedMask = params.inputPackedMask + batchSlot * numPackedMasks * maxDecodingTokens;
-        auto outputPackedMask = params.outputPackedMask + outputMaskStartId * numPackedMasks;
+        auto outputPackedMask = params.outputPackedMask + outputStartId * numPackedMasks;
         for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < numTokens * numPackedMasks;
              ti += static_cast<SizeType32>(blockDim.x))
         {
             outputPackedMask[ti] = inputPackedMask[ti];
         }
-    }
+        auto const inputPositionIds = params.inputPositionIds + batchSlot * maxDecodingTokens;
+        auto outputPositionIds = params.outputPositionIds + params.numContextTokens + outputStartId;
+        for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < numTokens; ti += static_cast<SizeType32>(blockDim.x))
+        {
+            outputPositionIds[ti] = inputPositionIds[ti];
+        }
 
-    // Copy pos offsets. Copy only for maxGenerationLength
-    if (isGenerationRequest)
-    {
+        // Copy pos offsets. Copy only for maxGenerationLength
         auto const basePosId = params.outputPositionIdsBase[batchIdx];
         auto outputPositionOffsets = params.outputPositionOffsets + genIdx * maxGenerationLength;
-        auto outputPositionIds = params.outputPositionIds + genIdx * maxGenerationLength;
-        auto const inputPositionIds = params.inputPositionIds + batchSlot * maxDecodingTokens;
         for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < maxGenerationLength;
              ti += static_cast<SizeType32>(blockDim.x))
         {
-            auto const posId = inputPositionIds[ti];
-            outputPositionIds[params.numContextTokens + ti] = posId;
-            outputPositionOffsets[ti] = posId - basePosId + 1;
+            outputPositionOffsets[ti] = inputPositionIds[ti] - basePosId + 1;
         }
     }
 }

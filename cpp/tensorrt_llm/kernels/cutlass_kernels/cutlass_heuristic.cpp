@@ -70,8 +70,8 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config)
     }
 }
 
-bool is_valid_split_k_factor(const int64_t m, const int64_t n, const int64_t k, const TileShape tile_shape,
-    int const split_k_factor, const size_t workspace_bytes, bool const is_weight_only)
+bool is_valid_split_k_factor(int64_t const m, int64_t const n, int64_t const k, TileShape const tile_shape,
+    int const split_k_factor, size_t const workspace_bytes, bool const is_weight_only)
 {
 
     // All tile sizes have a k_tile of 64.
@@ -181,7 +181,7 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
     {
         return {CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
             CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
-            CutlassTileConfigSM90::CtaShape128x256x128B};
+            CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
     }
     else
     {
@@ -196,28 +196,29 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
 
 // We only compile CUTLASS kernels with multi-cast along M if the M tile is >= 128. This is purely to improve
 // compilation speed.
-bool supports_mcast_along_m(const CutlassTileConfigSM90 tile)
+bool supports_mcast_along_m(CutlassTileConfigSM90 const tile)
 {
 #ifdef FAST_BUILD
     return false;
 #else
     std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape128x16x128B,
         CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
-        CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B};
+        CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B,
+        CutlassTileConfigSM90::CtaShape256x128x128B};
     return valid_tiles.count(tile) == 1;
 #endif
 }
 
 // We only compile CUTLASS kernels with multi-cast along N if the N tile is >= 128. This is purely to improve
 // compilation speed.
-bool supports_mcast_along_n(const CutlassTileConfigSM90 tile)
+bool supports_mcast_along_n(CutlassTileConfigSM90 const tile)
 {
 #ifdef FAST_BUILD
     return false;
 #else
     std::set<CutlassTileConfigSM90> valid_tiles{CutlassTileConfigSM90::CtaShape64x128x128B,
         CutlassTileConfigSM90::CtaShape64x256x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
-        CutlassTileConfigSM90::CtaShape128x256x128B};
+        CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
     return valid_tiles.count(tile) == 1;
 #endif
 }
@@ -288,8 +289,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
 }
 
 CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmConfig> const& candidate_configs,
-    std::vector<int> const& occupancies, const int64_t m, const int64_t n, const int64_t k, const int64_t num_experts,
-    int const split_k_limit, const size_t workspace_bytes, int const multi_processor_count, int const is_weight_only)
+    std::vector<int> const& occupancies, int64_t const m, int64_t const n, int64_t const k, int64_t const num_experts,
+    int const split_k_limit, size_t const workspace_bytes, int const multi_processor_count, int const is_weight_only)
 {
 
     if (occupancies.size() != candidate_configs.size())

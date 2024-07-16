@@ -128,6 +128,27 @@ if(INDEX_RANGE_CHECK)
   message(WARNING "Check index range to detect OOB accesses")
 endif()
 
+# Read the project version
+set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
+set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
+                                    ${TRTLLM_VERSION_DIR}/version.py)
+execute_process(
+  COMMAND python3 -c "import version; print(version.__version__)"
+  WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
+  OUTPUT_VARIABLE TRTLLM_VERSION
+  RESULT_VARIABLE TRTLLM_VERSION_RESULT
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if(TRTLLM_VERSION_RESULT EQUAL 0)
+  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
+else()
+  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
+endif()
+
+configure_file(
+  cmake/templates/version.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+
 # Determine CUDA version before enabling the language extension
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
@@ -139,7 +160,7 @@ if(CMAKE_CUDA_COMPILER)
         "${CMAKE_CUDA_COMPILER} --version | egrep -o 'V[0-9]+.[0-9]+.[0-9]+' | cut -c2-"
       RESULT_VARIABLE _BASH_SUCCESS
       OUTPUT_VARIABLE CMAKE_CUDA_COMPILER_VERSION
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     if(NOT _BASH_SUCCESS EQUAL 0)
       message(FATAL_ERROR "Failed to determine CUDA version")

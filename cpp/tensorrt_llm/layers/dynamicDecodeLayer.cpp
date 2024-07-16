@@ -245,14 +245,10 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> 
         }
     }
 
-    outputs->outputIdsPtr = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR,
-        {static_cast<size_t>(mDecoderDomain.getBatchSize()), static_cast<size_t>(beamWidth),
-            static_cast<size_t>(maxSeqLen)},
-        idsPtrHost);
+    outputs->outputIdsPtr = Tensor(
+        MEMORY_GPU, DataType::TYPE_INT32_PTR, {static_cast<size_t>(mDecoderDomain.getBatchSize())}, idsPtrHost);
     outputs->parentIdsPtr = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR,
-        {static_cast<size_t>(mDecoderDomain.getBatchSize()), static_cast<size_t>(beamWidth),
-            static_cast<size_t>(maxSeqLen)},
-        idsPtrHost + mDecoderDomain.getBatchSize());
+        {static_cast<size_t>(mDecoderDomain.getBatchSize())}, idsPtrHost + mDecoderDomain.getBatchSize());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

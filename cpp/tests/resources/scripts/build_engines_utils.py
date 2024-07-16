@@ -62,3 +62,37 @@ def wincopy(source: str, dest: str, isdir: bool, cwd=None) -> None:
             raise _sp.CalledProcessError(returncode=result.returncode,
                                          cmd=copy_cmd,
                                          output=result.stderr)
+
+
+# Helper function to locate model_spec module.
+def init_model_spec_module():
+    import os
+
+    # Rely on unique built model_spec to locate the module.
+    cpp_root_dir = _pl.Path(__file__).parent.resolve().parent.parent.parent
+
+    found_locations = []
+
+    def find_model_spec_module(directory, found_locations):
+        for root, d, files in os.walk(directory):
+            for item in files:
+                if item == 'model_spec.so':
+                    found_locations.append(root)
+
+    for d in os.listdir(cpp_root_dir):
+        if d.startswith("build"):
+            find_model_spec_module(os.path.join(cpp_root_dir, d),
+                                   found_locations)
+
+    if len(found_locations) == 0:
+        # In CI package, model_spec module is copied to its source directory.
+        find_model_spec_module(
+            os.path.join(cpp_root_dir, 'tests', 'batch_manager'),
+            found_locations)
+
+    assert len(
+        found_locations
+    ) == 1, f'Can\'t uniquely locate model_spec module, found {found_locations}'
+
+    import sys
+    sys.path.insert(0, found_locations[0])

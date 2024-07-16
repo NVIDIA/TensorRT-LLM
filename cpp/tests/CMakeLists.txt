@@ -35,8 +35,10 @@ find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
-  ${PROJECT_SOURCE_DIR}/include ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include)
+  ${PROJECT_SOURCE_DIR}/include
+  ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${PROJECT_SOURCE_DIR}/tests/batch_manager)
 
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
@@ -77,6 +79,7 @@ add_gtest(transposeKVKernelTest runtime/transposeKVKernelTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
+target_link_libraries(gptSessionTest PRIVATE modelSpecStatic)
 add_gtest(allocatorTest common/allocatorTest.cpp)
 add_gtest(memoryUtilsTest common/memoryUtilsTest.cu)
 if(ENABLE_MULTI_DEVICE EQUAL 1)
@@ -87,6 +90,8 @@ add_gtest(stringUtilsTest common/stringUtilsTest.cpp)
 add_gtest(tllmExceptionTest common/tllmExceptionTest.cpp)
 add_gtest(tensorTest common/tensorTest.cpp)
 add_gtest(stlUtilsTest common/stlUtilsTest.cpp)
+add_gtest(cudaProfilerUtilsTest common/cudaProfilerUtilsTest.cpp)
+add_gtest(timestampUtilsTest common/timestampUtilsTest.cpp)
 add_gtest(tllmRuntimeTest runtime/tllmRuntimeTest.cpp)
 add_gtest(tllmBuffersTest runtime/tllmBuffersTest.cpp)
 add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)

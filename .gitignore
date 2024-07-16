@@ -40,3 +40,11 @@ tensorrt_llm/bindings/*.pyi
 # Testing
 .coverage.*
 results_trt/
+
+# build/debug
+*.safetensors
+*/tllm_debug/**
+*.patch
+
+# Generated files
+cpp/include/tensorrt_llm/executor/version.h

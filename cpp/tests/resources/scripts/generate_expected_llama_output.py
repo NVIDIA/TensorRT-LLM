@@ -18,11 +18,19 @@ import argparse as _arg
 from pathlib import Path
 
 import run
+from build_engines_utils import init_model_spec_module
+
+init_model_spec_module()
+import os
+
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
 def generate_output(engine: str,
                     num_beams: int,
-                    output_name: str,
+                    model_spec_obj: model_spec.ModelSpec,
                     tp_size: int = 1,
                     pp_size: int = 1,
                     max_output_len: int = 8):
@@ -42,15 +50,15 @@ def generate_output(engine: str,
     else:
         output_dir = model_data_dir / ('beam_search_' + str(num_beams))
 
-    output_name += '_tp' + str(tp_size) + '_pp' + str(pp_size)
+    base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
     args = run.parse_arguments([
         '--engine_dir',
         str(engine_dir), '--input_file',
         str(input_file), '--tokenizer_dir',
         str(hf_dir), '--output_npy',
-        str(output_dir / (output_name + '.npy')), '--output_csv',
-        str(output_dir / (output_name + '.csv')), '--max_output_len',
+        str(output_dir / (base_output_name + '.npy')), '--output_csv',
+        str(output_dir / (base_output_name + '.csv')), '--max_output_len',
         str(max_output_len), '--num_beams',
         str(num_beams), '--use_py_session'
     ])
@@ -59,15 +67,22 @@ def generate_output(engine: str,
 
 def generate_outputs(num_beams, only_multi_gpu=False):
     tp_pp_sizes = [(1, 1)] if not only_multi_gpu else [(4, 1), (2, 2), (1, 4)]
+    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
+
     for tp_size, pp_size in tp_pp_sizes:
         print(
             f'Generating outputs for Llama FP16 with TP={tp_size} and PP={pp_size}'
         )
-        generate_output(engine='fp16-plugin-packed-paged',
+        model_spec_obj.use_tensor_parallelism(tp_size)
+        model_spec_obj.use_pipeline_parallelism(pp_size)
+        generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
                         tp_size=tp_size,
                         pp_size=pp_size,
-                        output_name='output_tokens_fp16_plugin_packed_paged')
+                        model_spec_obj=model_spec_obj)
 
 
 if __name__ == '__main__':

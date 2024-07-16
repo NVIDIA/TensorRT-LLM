@@ -122,13 +122,15 @@ When using V1 batching, the following additional statistics are reported per V1 
 Users can alter the logits produced the network, with a callback attached to an `InferenceRequest`:
 
 ```
-  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream const&)>;
+  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
 ```
 
-The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.
+The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id.
 
 Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
+
+Multiple requests can share same client id and callback can use different logic based on client id.
 
 Note: this feature isn't supported with the `V1` batching scheme for the moment.
 

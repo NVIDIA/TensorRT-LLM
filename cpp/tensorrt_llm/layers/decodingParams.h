@@ -548,6 +548,8 @@ public:
     tc::Tensor temperatures; // [maxBatchSize] on gpu
     //! Next generation lengths.
     tc::Tensor generationLengths; // [maxBatchSize] on gpu
+    //! Next generation lengths on host.
+    tc::Tensor generationLengthsHost; // [maxBatchSize] on pinned
     //! Maximum number of generated tokens for the next step across whole batch
     tc::Tensor maxGenLengthHost; // [1] on pinned
 };

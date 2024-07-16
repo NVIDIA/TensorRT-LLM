@@ -23,8 +23,8 @@ import pytest
 import torch
 import tensorrt as trt
 # isort: on
-from functional.torch_ref import (attention_qkvpacked_ref, mamba2_ref,
-                                  mamba_ref, recurrent_ref)
+from functional.torch_ref import (attention_qkvpacked_ref, group_rms_norm_ref,
+                                  mamba2_ref, mamba_ref, recurrent_ref)
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
                                     TrtRunner)
@@ -154,6 +154,50 @@ class TestLayer(unittest.TestCase):
         # pytorch run
         with torch.no_grad():
             ref = m(x_data)
+
+        # compare diff
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-6)
+
+    def test_group_rms_norm_float32(self):
+        # test data
+        test_shape = [2, 5, 10, 16]
+        num_groups = 4
+        dtype = 'float32'
+        device = 'cuda'
+        torch_dtype = str_dtype_to_torch(dtype)
+        x_data = torch.randn(*test_shape, dtype=torch_dtype, device=device)
+        weight_data = torch.randn(test_shape[-1],
+                                  dtype=torch_dtype,
+                                  device=device)
+
+        # construct trt network
+        builder = tensorrt_llm.Builder()
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
+            x = Tensor(name='x',
+                       shape=x_data.shape,
+                       dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+
+            gm = tensorrt_llm.layers.RmsNorm(test_shape[-1], num_groups=4)
+
+            gm.weight.value = weight_data.detach().cpu().numpy()
+            output = gm.forward(x).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
+
+        # trt run
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'x': x_data.cpu().numpy()})
+
+        # pytorch run
+        with torch.no_grad():
+            ref = group_rms_norm_ref(x_data,
+                                     weight_data,
+                                     group_size=test_shape[-1] // num_groups)
 
         # compare diff
         np.testing.assert_allclose(ref.cpu().numpy(),
@@ -1357,13 +1401,13 @@ class TestLayer(unittest.TestCase):
                                    atol=dtype_atol[dtype])
 
     @parameterized.expand(list(
-        product([3], [16], [1], [1024], [128], [64], [256],
+        product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
                 ['context', 'generation'], ["float32", "float16", "bfloat16"],
                 [True, False], [True, False])),
                           name_func=unittest_name_func)
     def test_mamba2(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
-                    headdim, chunk_size, req_type, dtype, remove_padding,
-                    use_plugin):
+                    headdim, chunk_size, ngroups, req_type, dtype,
+                    remove_padding, use_plugin):
 
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
@@ -1383,7 +1427,6 @@ class TestLayer(unittest.TestCase):
         device = "cuda"
         d_conv = 4
         expand = 2
-        ngroups = 1
         bias = False
         rmsnorm = True
         d_inner = int(expand * d_model)
@@ -1519,7 +1562,8 @@ class TestLayer(unittest.TestCase):
         mamba2_torch.A.data = A.detach().clone()
         mamba2_torch.D.data = D.detach().clone()
         mamba2_torch.dt_bias.data = dt_bias.detach().clone()
-        mamba2_torch.norm.weight.data = norm_weight.detach().clone()
+        if rmsnorm:
+            mamba2_torch.norm_weight.data = norm_weight.detach().clone()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -1591,9 +1635,6 @@ class TestLayer(unittest.TestCase):
                 mamba2_torch.conv1d.weight.detach().unsqueeze(3).cpu())
             mamba2_layer.conv1d.bias.value = torch_to_numpy(
                 mamba2_torch.conv1d.bias.detach().cpu())
-            if rmsnorm:
-                mamba2_layer.norm.weight.value = torch_to_numpy(
-                    mamba2_torch.norm.weight.detach().cpu())
 
             outputs = mamba2_layer(
                 hidden_states_tensor,
@@ -1719,7 +1760,7 @@ class TestLayer(unittest.TestCase):
         # test data
         torch_dtype = str_dtype_to_torch(dtype)
         mean = 0.0
-        std_dev = 0.1 if dtype == "float32" else 0.05
+        std_dev = 0.1 if dtype == "float32" else 0.02
 
         if req_type == 'context':
             last_token_ids = torch.randint(1,

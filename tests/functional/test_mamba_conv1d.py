@@ -18,7 +18,6 @@ import unittest
 from itertools import product
 
 import numpy as np
-import pytest
 import torch
 from parameterized import parameterized
 
@@ -42,17 +41,14 @@ class TestFunctional(unittest.TestCase):
                 [False, True], [False, True])),
                           name_func=unittest_name_func)
     def test_mamba_conv1d(self, dim, dconv, req_type, dtype, batch_size,
-                          max_seq_len, remove_padding, use_mamba_conv1d_plugin,
-                          apply_silu):
+                          max_seq_len, remove_padding, apply_silu, with_stride):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
-        if not use_mamba_conv1d_plugin and remove_padding:
-            pytest.skip(
-                "Skipping remove input padding without mamba conv1d plugin")
-
         device = "cuda"
         seq_len = max_seq_len if req_type == 'context' else 1
+        pre_stride = 64 if with_stride else 0
+        post_stride = 64 if with_stride else 0
 
         # test data
         last_token_ids_trt = None
@@ -106,14 +102,21 @@ class TestFunctional(unittest.TestCase):
 
         output_trt = torch.zeros_like(x_trt)
         present_conv_state_trt = torch.zeros_like(past_conv_state_trt)
+        if with_stride:
+            base_shape = [x_trt.shape[i] for i in range(len(x_trt.shape) - 1)]
+            pad_pre_shape = base_shape + [pre_stride]
+            pad_post_shape = base_shape + [post_stride]
+            pad_pre = torch.randn(pad_pre_shape,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
+            pad_post = torch.randn(pad_post_shape,
+                                   device=device,
+                                   dtype=str_dtype_to_torch(dtype))
+            x_trt = torch.cat([pad_pre, x_trt, pad_post], dim=-1).contiguous()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
-        if use_mamba_conv1d_plugin:
-            net.plugin_config.mamba_conv1d_plugin = dtype
-        else:
-            net.plugin_config.mamba_conv1d_plugin = None
         if remove_padding:
             net.plugin_config.remove_input_padding = True
         else:
@@ -159,6 +162,8 @@ class TestFunctional(unittest.TestCase):
                 dim,
                 dconv,
                 dtype,
+                pre_stride=pre_stride,
+                post_stride=post_stride,
                 host_context_lengths=host_context_length_tensor,
                 apply_silu=apply_silu)
             net._mark_output(outputs[0],

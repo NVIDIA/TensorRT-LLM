@@ -90,7 +90,16 @@ nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
 {
     if (outputIndex == 0)
     {
-        return inputs[getInputTensorIdx()];
+        if (mIsMamba2)
+        {
+            auto ret = inputs[getInputTensorIdx()];
+            ret.d[mRemovePadding ? 1 : 2] = exprBuilder.constant(mDim);
+            return ret;
+        }
+        else
+        {
+            return inputs[getInputTensorIdx()];
+        }
     }
     return inputs[getStateIdx()];
 }
@@ -136,9 +145,9 @@ size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         int B = inputs[getLastTokenIdsIdx()].dims.d[0];
         int BxL = inputs[getInputTensorIdx()].dims.d[0]; // num_tokens
         int H = mNHeads;
-        int P = inputs[getInputTensorIdx()].dims.d[1] / H;
+        int P = mDim / H;
         int G = mNGroups;
-        int N = inputs[getBCIdx()].dims.d[1] / G / 2;
+        int N = mDState;
         int Q = mChunkSize;
         int BxC = (BxL + Q - 1) / Q + B;
 
@@ -153,9 +162,9 @@ size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         int B = inputs[getInputTensorIdx()].dims.d[0];
         int L = inputs[getInputTensorIdx()].dims.d[1];
         int H = mNHeads;
-        int P = inputs[getInputTensorIdx()].dims.d[2] / H;
+        int P = mDim / H;
         int G = mNGroups;
-        int N = inputs[getBCIdx()].dims.d[2] / G / 2;
+        int N = mDState;
         int Q = mChunkSize;
         int C = (L + Q - 1) / Q;
 
@@ -268,16 +277,16 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     float* mxdA = nullptr;
     T* mxCB = nullptr;
 
-    if (!mIsMamba2) /* no workspace needed */
+    if (!mIsMamba2 || reqTypes[0] == RequestType::kGENERATION) /* no workspace needed */
         ;
     else if (mRemovePadding)
     {
         int B = inputDesc[getLastTokenIdsIdx()].dims.d[0];
         int BxL = inputDesc[getInputTensorIdx()].dims.d[0]; // num_tokens
         int H = mNHeads;
-        int P = inputDesc[getInputTensorIdx()].dims.d[1] / H;
+        int P = mDim / H;
         int G = mNGroups;
-        int N = inputDesc[getBCIdx()].dims.d[1] / G / 2;
+        int N = mDState;
         int Q = mChunkSize;
         int BxC = (BxL + Q - 1) / Q + B;
 
@@ -292,9 +301,9 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         int B = inputDesc[getInputTensorIdx()].dims.d[0];
         int L = inputDesc[getInputTensorIdx()].dims.d[1];
         int H = mNHeads;
-        int P = inputDesc[getInputTensorIdx()].dims.d[2] / H;
+        int P = mDim / H;
         int G = mNGroups;
-        int N = inputDesc[getBCIdx()].dims.d[2] / G / 2;
+        int N = mDState;
         int Q = mChunkSize;
         int C = (L + Q - 1) / Q;
 

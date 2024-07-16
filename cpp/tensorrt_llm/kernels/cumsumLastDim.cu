@@ -91,6 +91,7 @@ __global__ void cumsum_last_dim(T const* d_in, T* d_out, int length)
 
         // Store items from a blocked arrangement
         BlockStoreT(temp_storage.store).Store(cur_d_out, data, cur_tile_size);
+        __syncthreads();
     }
 }
 

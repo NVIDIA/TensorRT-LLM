@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
+#include <iostream>
 #include <string>
 
 namespace tensorrt_llm::common
@@ -52,6 +53,24 @@ std::string fmtstr(char const* format, ...)
     std::string result = vformat(format, args);
     va_end(args);
     return result;
+};
+
+std::unordered_set<std::string> str2set(std::string const& input, char delimiter)
+{
+    std::unordered_set<std::string> values;
+    if (!input.empty())
+    {
+        std::stringstream valStream(input);
+        std::string val;
+        while (std::getline(valStream, val, delimiter))
+        {
+            if (!val.empty())
+            {
+                values.insert(val);
+            }
+        }
+    }
+    return values;
 };
 
 } // namespace tensorrt_llm::common

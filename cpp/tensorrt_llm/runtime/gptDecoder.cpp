@@ -438,6 +438,7 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         outputParams->randomDataValidation = tcc::toTllmTensor(*explicitDraftTokensBuffers->randomDataValidation);
         outputParams->temperatures = tcc::toTllmTensor(*explicitDraftTokensBuffers->temperatures);
         outputParams->generationLengths = tcc::toTllmTensor(*explicitDraftTokensBuffers->generationLengths);
+        outputParams->generationLengthsHost = tcc::toTllmTensor(*explicitDraftTokensBuffers->generationLengthsHost);
         outputParams->maxGenLengthHost = tcc::toTllmTensor(*explicitDraftTokensBuffers->maxGenLengthHost);
     }
 

@@ -231,8 +231,11 @@ public:
             unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
             int const* maskPtr = xqaParams.spec_decoding_packed_mask;
             int const* cuQSeqLens = launchParams.cu_seq_lens;
+            unsigned int maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable ? // true for ReDrafter
+                xqaParams.spec_decoding_max_generation_length
+                                                                                            : qSeqLen;
             // TODO: merge SingleQueryToken params and MultiQueryTokens params into one kernelParams.
-            void* kernelParams[] = {&qSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
+            void* kernelParams[] = {&maxQSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
                 &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
                 &launchParams.kv_scale_quant_orig, &launchParams.scratch};
             int multi_block = 1;

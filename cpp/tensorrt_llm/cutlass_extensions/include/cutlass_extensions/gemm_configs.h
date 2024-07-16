@@ -93,6 +93,8 @@ enum class CutlassTileConfigSM90
     CtaShape128x128x128B,
     CtaShape128x256x128B,
 
+    // CTA configs for M=128
+    CtaShape256x128x128B,
 };
 
 enum class MainloopScheduleType

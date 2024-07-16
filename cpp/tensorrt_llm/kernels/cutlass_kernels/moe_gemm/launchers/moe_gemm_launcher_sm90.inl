@@ -247,7 +247,7 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
         TLLM_CHECK(hopper_input.ptr_b);
         TLLM_CHECK(hopper_input.ptr_d);
 
-        const MainloopArguments mainloop_params = {reinterpret_cast<ElementB const**>(hopper_input.ptr_b),
+        MainloopArguments const mainloop_params = {reinterpret_cast<ElementB const**>(hopper_input.ptr_b),
             hopper_input.stride_b, reinterpret_cast<ElementA const**>(hopper_input.ptr_a), hopper_input.stride_a};
 
         typename GemmGrouped::EpilogueOutputOp::Params epilogue_scalars{
@@ -255,12 +255,15 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
         epilogue_scalars.alpha_ptr_array = hopper_input.alpha_scale_ptr_array;
         using EpilogueArguments = typename CollectiveEpilogue::Arguments;
         // TODO(dastokes) ptr_c casts to ElementCNoVoid** because there is a workaround in CUTLASS
-        const EpilogueArguments epilogue_params
+        EpilogueArguments const epilogue_params
             = {epilogue_scalars, reinterpret_cast<ElementCNoVoid const**>(hopper_input.ptr_c), hopper_input.stride_c,
                 reinterpret_cast<ElementD**>(hopper_input.ptr_d), hopper_input.stride_d};
 
+        typename GemmKernel::TileScheduler::Arguments scheduler_args{
+            1, GemmKernel::TileScheduler::RasterOrderOptions::AlongN};
+
         typename GemmGrouped::Arguments args{cutlass::gemm::GemmUniversalMode::kGrouped, hopper_input.shape_info,
-            mainloop_params, epilogue_params, hw_info};
+            mainloop_params, epilogue_params, hw_info, scheduler_args};
 
         size_t calculated_ws_size = gemm.get_workspace_size(args);
         TLLM_CHECK_WITH_INFO(calculated_ws_size <= hopper_input.gemm_workspace_size,

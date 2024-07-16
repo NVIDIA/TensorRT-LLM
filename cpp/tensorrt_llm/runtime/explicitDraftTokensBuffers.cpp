@@ -46,6 +46,7 @@ void ExplicitDraftTokensBuffers::Inputs::create(SizeType32 maxNumSequences, Tllm
     temperatures = manager.gpu(ITensor::makeShape({maxNumSequences}), dtype);
     positionIdsBase = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     generationLengths = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    generationLengthsHost = manager.pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     randomDataSample = manager.gpu(ITensor::makeShape({maxNumSequences}), dtype);
     randomDataValidation = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxDraftPathLen}), dtype);
     draftTokens = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxPathLen}), TRTTokenIdType);
@@ -270,6 +271,20 @@ void ExplicitDraftTokensBuffers::setFromInputs(SizeType32 numCtxSequences, SizeT
     auto const& manager = runtime.getBufferManager();
     auto const& stream = runtime.getStream();
 
+    auto const explicitDraftTokensModule = std::dynamic_pointer_cast<runtime::ExplicitDraftTokensModule const>(
+        modelConfig.getSpeculativeDecodingModulePtr());
+
+    auto const seqSlotsPtr = bufferCast<SizeType32>(seqSlots);
+    auto const generationLengthsPtr = bufferCast<SizeType32>(*draftBuffers.generationLengthsHost);
+    SizeType32 totalGenLengths = 0;
+    for (SizeType32 si = 0; si < numGenSequences; ++si)
+    {
+        auto const slot = seqSlotsPtr[numCtxSequences + si];
+        totalGenLengths += generationLengthsPtr[slot];
+    }
+
+    // Reshape position ids.
+    engineInputs.positionIds->reshape(ITensor::makeShape({contextPositionIds.getShape().d[0] + totalGenLengths}));
     // Copy position ids -- hacky solution to avoid filling them for the context requests.
     TensorPtr posIdsSlice = ITensor::slice(engineInputs.positionIds, 0, contextPositionIds.getShape().d[0]);
     manager.copy(contextPositionIds, *posIdsSlice);
@@ -278,9 +293,6 @@ void ExplicitDraftTokensBuffers::setFromInputs(SizeType32 numCtxSequences, SizeT
 
     auto const numSequences = numCtxSequences + numGenSequences;
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-
-    auto const explicitDraftTokensModule = std::dynamic_pointer_cast<runtime::ExplicitDraftTokensModule const>(
-        modelConfig.getSpeculativeDecodingModulePtr());
 
     auto const dtype = modelConfig.getDataType();
 
@@ -327,7 +339,7 @@ void ExplicitDraftTokensBuffers::insertInputTensors(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // inputs
-    inputBuffers.insert_or_assign("explicit_inverted_temperature", engineInputs.temperatures);
+    inputBuffers.insert_or_assign("redrafter_inverted_temperature", engineInputs.temperatures);
     inputBuffers.insert_or_assign("device_request_types", engineInputs.requestTypesDevice);
 
     inputBuffers.insert_or_assign("spec_decoding_generation_lengths", engineInputs.generationLengths);

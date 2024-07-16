@@ -106,6 +106,7 @@ int parseTacticToId(nlohmann::json tactic_config)
                     {K(128, 64), CutlassTileConfigSM90::CtaShape128x64x128B},
                     {K(128, 128), CutlassTileConfigSM90::CtaShape128x128x128B},
                     {K(128, 256), CutlassTileConfigSM90::CtaShape128x256x128B},
+                    {K(256, 128), CutlassTileConfigSM90::CtaShape256x128x128B},
                 };
 
                 if (c.tile_config_sm90 != tile_map.at(K(tile_shape[0], tile_shape[1])))

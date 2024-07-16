@@ -268,7 +268,7 @@ def load_config_hf(model_name):
         hf_config.hidden_size = hf_config.d_model
         hf_config.num_hidden_layers = hf_config.n_layer
         if 'expand' in hf_config.ssm_cfg:
-            expand = hf_config.ssm_cfg['hf_config']
+            expand = hf_config.ssm_cfg['expand']
             hf_config.intermediate_size = expand * hf_config.d_model
         else:
             hf_config.intermediate_size = 2 * hf_config.d_model

@@ -21,7 +21,12 @@ import sys
 import typing
 from pathlib import Path
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 resources_dir = Path(__file__).parent.resolve().parent
 model_dir = resources_dir / "models"
@@ -42,7 +47,7 @@ def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
 def build_engine(ckpt_dir: str,
                  engine_dir: str,
                  is_ifb: bool = False,
-                 is_chatglm_6b: bool = False):
+                 is_chatglm_6b_or_glm_10b: bool = False):
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={ckpt_dir}",
@@ -70,8 +75,8 @@ def build_engine(ckpt_dir: str,
             "--paged_kv_cache=disable",
         ])
 
-    if is_chatglm_6b:
-        print("Disable Context FMHA for ChatGLM-6B")
+    if is_chatglm_6b_or_glm_10b:
+        print("Disable Context FMHA for ChatGLM-6B and GLM-10B")
         build_cmd.extend(
             ["--context_fmha=disable", "--context_fmha_fp32_acc=disable"])
 
@@ -81,7 +86,8 @@ def build_engine(ckpt_dir: str,
 def build_engines(model_cache: typing.Optional[str] = None,
                   world_size: int = 1):
 
-    for model_name in ["chatglm-6b", "chatglm2-6b", "chatglm3-6b"]:
+    for model_name in ["chatglm-6b", "chatglm2-6b", "chatglm3-6b", "glm-10b"]:
+        is_chatglm_6b_or_glm_10b = model_name in ["chatglm-6b", "glm-10b"]
         if model_cache and (Path(model_cache) / model_name).is_dir():
             model_cache_dir = Path(model_cache) / model_name
             if bCopyModel or model_name == "chatglm-6b":
@@ -101,15 +107,16 @@ def build_engines(model_cache: typing.Optional[str] = None,
                 hf_dir = Path(model_cache)
 
         else:
-            print("Clone model from HF")
             hf_dir = model_dir / model_name
-            run_command(
-                [
-                    "git", "clone",
-                    f"https://huggingface.co/THUDM/{model_name}", model_name
-                ],
-                cwd=model_dir,
-            )
+            if not hf_dir.is_dir():
+                print("Clone model from HF")
+                run_command(
+                    [
+                        "git", "clone",
+                        f"https://huggingface.co/THUDM/{model_name}", model_name
+                    ],
+                    cwd=model_dir,
+                )
 
         # Build engines
         print(f"Building {model_name}")
@@ -125,14 +132,25 @@ def build_engines(model_cache: typing.Optional[str] = None,
 
         convert_ckpt(hf_dir, ckpt_dir, world_size)
 
-        for engine_kind in ["fp16-plugin", "fp16-plugin-packed-paged"]:
-            engine_dir = Path(
-                model_dir
-            ) / "rt_engine" / model_name / engine_kind / "tp1-pp1-gpu"
-            engine_dir.mkdir(parents=True, exist_ok=True)
+        model_spec_obj = model_spec.ModelSpec('input_tokens.npy',
+                                              _tb.DataType.HALF)
+        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+        model_spec_obj.use_gpt_plugin()
+        engine_dir = Path(
+            model_dir
+        ) / "rt_engine" / model_name / model_spec_obj.get_model_path(
+        ) / "tp1-pp1-gpu"
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        build_engine(ckpt_dir, engine_dir, False, is_chatglm_6b_or_glm_10b)
 
-            build_engine(ckpt_dir, engine_dir, "paged" in engine_kind,
-                         model_name == "chatglm-6b")
+        model_spec_obj.use_packed_input()
+        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        engine_dir = Path(
+            model_dir
+        ) / "rt_engine" / model_name / model_spec_obj.get_model_path(
+        ) / "tp1-pp1-gpu"
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        build_engine(ckpt_dir, engine_dir, True, is_chatglm_6b_or_glm_10b)
 
     print("Done")
 

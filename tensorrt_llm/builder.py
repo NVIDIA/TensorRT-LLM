@@ -131,6 +131,7 @@ class Builder():
                               int8: bool = False,
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
+                              force_num_profiles: Optional[int] = None,
                               profiling_verbosity: str = "layer_names_only",
                               use_strip_plan: bool = False,
                               weight_streaming: bool = False,
@@ -240,6 +241,7 @@ class Builder():
                                      tensor_parallel=tensor_parallel,
                                      use_refit=use_refit,
                                      int8=int8,
+                                     force_num_profiles=force_num_profiles,
                                      strongly_typed=self.strongly_typed,
                                      use_strip_plan=use_strip_plan,
                                      **kwargs)
@@ -253,6 +255,9 @@ class Builder():
             logger.warning("There are no inputs in the network!")
             return
         num_profiles = len(list(input_tensors.values())[0].profiles)
+        force_num_profiles = getattr(
+            builder_config, "force_num_profiles") if hasattr(
+                builder_config, "force_num_profiles") else None
         for i in range(num_profiles):
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
             profile = self.trt_builder.create_optimization_profile()
@@ -276,7 +281,16 @@ class Builder():
                 logger.debug(
                     f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
                 )
-            builder_config.trt_builder_config.add_optimization_profile(profile)
+            ret = builder_config.trt_builder_config.add_optimization_profile(
+                profile)
+            logger.debug(f"Added optimization profile: #{ret}")
+            if force_num_profiles is not None and (
+                    i + 1
+            ) == force_num_profiles and force_num_profiles < num_profiles:
+                logger.warning(
+                    f"Only adding {force_num_profiles} profiles instead of {num_profiles}."
+                )
+                break
         assert self._validate_named_dimensions(
             network, builder_config
         ), "Validation of the tensor dimension ranges failed, please check the dimension ranges, find the offensive tensor and dimension name in above the error log"
@@ -378,6 +392,9 @@ class Builder():
             builder_config.moe_expert_parallel = mapping.moe_ep_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
+        logger.info(
+            f"Total optimization profiles added: {builder_config.trt_builder_config.num_optimization_profiles}"
+        )
         engine = None
 
         # Rename weights
@@ -450,6 +467,7 @@ class BuildConfig:
     gather_generation_logits: int = False
     strongly_typed: bool = False
     builder_opt: Optional[int] = None
+    force_num_profiles: Optional[int] = None
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
     max_draft_len: int = 0
@@ -512,6 +530,7 @@ class BuildConfig:
         gather_generation_logits = config.pop('gather_generation_logits', False)
         strongly_typed = config.pop('strongly_typed', False)
         builder_opt = config.pop('builder_opt', None)
+        force_num_profiles = config.pop('force_num_profiles', None)
         weight_sparsity = config.pop('weight_sparsity', False)
         profiling_verbosity = config.pop('profiling_verbosity',
                                          'layer_names_only')
@@ -551,6 +570,7 @@ class BuildConfig:
             gather_generation_logits=gather_generation_logits,
             strongly_typed=strongly_typed,
             builder_opt=builder_opt,
+            force_num_profiles=force_num_profiles,
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
             max_draft_len=max_draft_len,
@@ -756,6 +776,15 @@ def build(model: PretrainedModel,
             )
         build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
 
+    if hasattr(model.config, 'redrafter_num_beams') and hasattr(
+            model.config, 'redrafter_draft_len_per_beam'):
+        build_config.max_draft_len = model.config.redrafter_num_beams * model.config.redrafter_draft_len_per_beam
+        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS:
+            logger.warning(
+                'speculative_decoding_mode is not EXPLICIT_DRAFT_TOKENS for ReDrafter model. Overwriting speculative_decoding_mode'
+            )
+        build_config.speculative_decoding_mode = SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
+
     if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
         logger.info(
             f'Increasing max_seq_len ({build_config.max_seq_len}) '
@@ -805,6 +834,7 @@ def build(model: PretrainedModel,
         or model.config.quant_mode.has_int8_kv_cache(),
         strongly_typed=build_config.strongly_typed,
         opt_level=build_config.builder_opt,
+        force_num_profiles=build_config.force_num_profiles,
         profiling_verbosity=build_config.profiling_verbosity,
         quant_mode=model.config.quant_mode,
         use_strip_plan=build_config.use_strip_plan,

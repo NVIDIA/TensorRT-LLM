@@ -710,6 +710,9 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     mOutputGenerationLengths
         = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
+    mOutputGenerationLengthsHost
+        = BufferManager::pinned(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
+
     mMaxGenLengthHost = BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     // inputs
@@ -1011,6 +1014,8 @@ std::shared_ptr<ExplicitDraftTokensOutputs> ExplicitDraftTokensLayerTest<T>::cre
     outputParams->temperatures = tcc::toTllmTensor(*mOutputTemperatures);
 
     outputParams->generationLengths = tcc::toTllmTensor(*mOutputGenerationLengths);
+
+    outputParams->generationLengthsHost = tcc::toTllmTensor(*mOutputGenerationLengthsHost);
 
     outputParams->maxGenLengthHost = tcc::toTllmTensor(*mMaxGenLengthHost);
 

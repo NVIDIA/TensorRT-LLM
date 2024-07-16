@@ -130,13 +130,6 @@ def parse_arguments():
         ('If this option is specified, it will override the max input len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
-        '--max_output_len',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max output len of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',

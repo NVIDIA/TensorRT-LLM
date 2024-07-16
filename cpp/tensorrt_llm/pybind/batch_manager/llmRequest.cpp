@@ -57,10 +57,10 @@ std::optional<tb::LlmRequest::LogitsPostProcessor> LlmRequest::callbackAdapter(
 
     return [callback](RequestIdType reqId, tensorrt_llm::runtime::ITensor::SharedPtr& tensor,
                tensorrt_llm::batch_manager::LlmRequest::BeamTokens const& tokens,
-               tensorrt_llm::runtime::BufferManager::CudaStreamPtr stream)
+               tensorrt_llm::runtime::BufferManager::CudaStreamPtr stream, std::optional<RequestIdType> clientId)
     {
         at::Tensor atTensor = tr::Torch::tensor(tensor);
-        callback.value()(reqId, atTensor, tokens, runtime::TorchUtils::stream(*stream).unwrap());
+        callback.value()(reqId, atTensor, tokens, runtime::TorchUtils::stream(*stream).unwrap(), clientId);
     };
 }
 
@@ -112,7 +112,7 @@ void LlmRequest::initBindings(py::module_& m)
         .def("add_new_tokens", &LlmRequest::addNewTokens, py::arg("beam_tokens"))
         .def("set_generated_tokens", &LlmRequest::setGeneratedTokens, py::arg("generated_beam_tokens"))
         .def("pause", &LlmRequest::pause, py::arg("max_input_len"))
-        .def_property("max_sent_token_pos", &LlmRequest::getMaxSentTokenPos, &LlmRequest::setMaxSentTokenPos)
+        .def_property("max_sent_token_len", &LlmRequest::getMaxSentTokenLen, &LlmRequest::setMaxSentTokenLen)
         .def_property_readonly("prompt_embedding_table", &LlmRequest::getPromptEmbeddingTable)
         .def_property_readonly("prompt_vocab_size", &LlmRequest::getPromptVocabSize)
         .def_property_readonly("lora_task_id", &LlmRequest::getLoraTaskId)

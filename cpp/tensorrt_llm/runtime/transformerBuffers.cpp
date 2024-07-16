@@ -308,7 +308,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
             }
             positionIds = manager.copyFrom(positionIdsVec, inputShape, MemoryType::kGPU);
         }
-        else if (modelVariant == ModelConfig::ModelVariant::kGlm)
+        else if (modelVariant == ModelConfig::ModelVariant::kChatGlm)
         {
             auto const positionIdsVec = getPositionIdsContextPhaseGlm(batchSize, maxInputLength, contextLengthsHostPtr,
                 modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
@@ -578,7 +578,7 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
             manager.copy(*contextLengthsDevice, *positionIds);
             kernels::invokeAdd(*positionIds, step, stream);
         }
-        else if (modelVariant == ModelConfig::ModelVariant::kGlm)
+        else if (modelVariant == ModelConfig::ModelVariant::kChatGlm)
         {
             auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(batchSize, beamWidth, step,
                 contextLengthsHostPtr, modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());

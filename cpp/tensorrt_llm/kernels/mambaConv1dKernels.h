@@ -26,7 +26,7 @@ namespace kernels
 
 struct MambaConv1dParamsBase
 {
-    int batch, dim, max_seqlen, dconv;
+    int batch, dim, max_seqlen, dconv, pre_stride, post_stride;
     bool remove_padding;
     bool apply_silu;
     void* __restrict__ in_ptr;

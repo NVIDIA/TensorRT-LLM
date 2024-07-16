@@ -14,6 +14,7 @@ import torch
 from binding_test_utils import *
 
 import tensorrt_llm.bindings.executor as trtllm
+import tensorrt_llm.version as trtllm_version
 
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
 from utils.cpp_paths import *
@@ -1089,7 +1090,9 @@ def test_logits_post_processor(model_files, model_path):
 
     # Define the logits post-processor callback
     def logits_post_processor(req_id: int, logits: torch.Tensor,
-                              ids: tp.List[tp.List[int]], stream_ptr: int):
+                              ids: tp.List[tp.List[int]], stream_ptr: int,
+                              client_id: tp.Optional[int]):
+        assert client_id == 123
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             logits[:] = float("-inf")
             logits[..., 42] = 0
@@ -1106,7 +1109,7 @@ def test_logits_post_processor(model_files, model_path):
     # Create the request
     max_new_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False)
+    request = trtllm.Request(input_tokens, max_new_tokens, False, client_id=123)
     request.logits_post_processor_name = "my_logits_pp"
 
     # Enqueue the request
@@ -1142,10 +1145,12 @@ def test_logits_post_processor(model_files, model_path):
 def test_logits_post_processor_batched(model_files, model_path):
 
     # Define the logits post-processor callback
-    def logits_post_processor_batched(req_id_batch: tp.List[int],
-                                      logits_batch: tp.List[torch.Tensor],
-                                      ids_batch: tp.List[tp.List[tp.List[int]]],
-                                      stream_ptr: int):
+    def logits_post_processor_batched(
+            req_id_batch: tp.List[int], logits_batch: tp.List[torch.Tensor],
+            ids_batch: tp.List[tp.List[tp.List[int]]], stream_ptr: int,
+            client_id_batch: tp.List[tp.Optional[int]]):
+        for client_id in client_id_batch:
+            assert client_id == 123
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             for logits in logits_batch:
                 logits[:] = float("-inf")
@@ -1161,7 +1166,7 @@ def test_logits_post_processor_batched(model_files, model_path):
     # Create the request
     max_new_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False)
+    request = trtllm.Request(input_tokens, max_new_tokens, False, client_id=123)
     request.logits_post_processor_name = request.BATCHED_POST_PROCESSOR_NAME
 
     batch_size = 4
@@ -1302,3 +1307,18 @@ def test_executor_config_pickle():
     assert config.max_beam_width == config_copy.max_beam_width
     assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
     assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
+
+
+def test_return_full_tokens():
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False,
+                             trtllm.SamplingConfig())
+    request.return_all_generated_tokens = True
+    assert request.return_all_generated_tokens == True
+    request.return_all_generated_tokens = False
+    assert request.return_all_generated_tokens == False
+
+
+def test_executor_version():
+    assert trtllm.__version__ == trtllm_version.__version__

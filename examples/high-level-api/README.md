@@ -86,7 +86,7 @@ Let's delve into the preparation of the three kinds of local model formats.
 
 Given its popularity, the TRT-LLM HLAPI chooses to support HuggingFace format as one of the start points, to use the HLAPI on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
 
-For instance, when targeting the LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 7B model page](https://huggingface.co/transformers/llama2-7B), normally you need to submit a request for the model file.
+For instance, when targeting the LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 model page](https://huggingface.co/docs/transformers/main/en/model_doc/llama2), normally you need to submit a request for the model file.
 
 To convert the checkpoint files, a script from transformers is required, thus please also clone the transformers repo with the following code:
 

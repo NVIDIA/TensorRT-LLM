@@ -273,6 +273,7 @@ private:
     TensorPtr mOutputDraftProbs;
     TensorPtr mOutputTemperatures;
     TensorPtr mOutputGenerationLengths;
+    TensorPtr mOutputGenerationLengthsHost;
     TensorPtr mMaxGenLengthHost;
 
     // inputs

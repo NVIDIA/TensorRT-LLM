@@ -14,7 +14,7 @@
 # limitations under the License.
 from dataclasses import asdict, dataclass
 from enum import IntEnum
-from typing import List, Type, Union
+from typing import List, Optional, Type, Union
 
 import numpy as np
 import tensorrt as trt
@@ -26,11 +26,12 @@ from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
 from .._utils import int32_array
-from ..functional import (AllReduceStrategy, _add_plugin_info, _create_tensor,
-                          allreduce, cast, concat, constant, div, expand,
-                          gather_nd, is_gated_activation, non_gated_version,
-                          nonzero, repeat_interleave, scatter_nd, shape,
-                          softmax, split, sum, topk)
+from ..functional import (AllReduceFusionParams, AllReduceStrategy,
+                          _add_plugin_info, _create_tensor, allreduce, cast,
+                          concat, constant, div, expand, gather_nd,
+                          is_gated_activation, non_gated_version, nonzero,
+                          repeat_interleave, scatter_nd, shape, softmax, split,
+                          sum, topk)
 from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -62,6 +63,7 @@ class MoeConfig:
     num_experts: int = 0
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
+    tp_mode: int = 0
 
     def validate(self) -> "MoeConfig":
         if (self.num_experts == 0) != (self.top_k == 0):
@@ -359,7 +361,11 @@ class MixtureOfExperts(Module):
                                      self.experts_per_node, self.quant_mode,
                                      self.dtype, self.weight_dtype, self.bias)
 
-    def forward(self, hidden_states, finished=None, lora_layer_params=None):
+    def forward(self,
+                hidden_states,
+                finished=None,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
         moe_router_lora_params = None
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
@@ -367,10 +373,11 @@ class MixtureOfExperts(Module):
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
         return self.forward_experts(hidden_states, routing, finished,
-                                    lora_layer_params)
+                                    lora_layer_params, reduce_fusion_params)
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params):
+                        lora_layer_params,
+                        reduce_fusion_params: Optional[AllReduceFusionParams]):
         if lora_layer_params is not None:
             for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
                 if lora_layer_params.get_runtime_params(0, module) is not None:
@@ -444,7 +451,9 @@ class MixtureOfExperts(Module):
                              ep_rank=self.mapping.moe_ep_rank)
 
         if self.tp_size > 1 and self.tp_group is not None:
-            output = allreduce(output, self.tp_group)
+            output = allreduce(output,
+                               self.tp_group,
+                               reduce_fusion_params=reduce_fusion_params)
 
         return output
 
@@ -534,7 +543,8 @@ class MoeOOTB(MOE):
         )
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params):
+                        lora_layer_params,
+                        reduce_fusion_params: Optional[AllReduceFusionParams]):
 
         if self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
             topk_values, topk_indices = topk(routing, self.top_k, dim=-1)
@@ -650,7 +660,11 @@ class MoeOOTB(MOE):
         ) and self.mapping.moe_tp_group is not None
         if need_tp_reduce or need_ep_reduce:
             group = self.mapping.moe_ep_group if need_ep_reduce else self.mapping.moe_tp_group
-            output = allreduce(output, group, strategy=AllReduceStrategy.NCCL)
+            # TODO: remove this NCCL strategy WAR after fixed https://nvbugspro.nvidia.com/bug/4740067
+            output = allreduce(output,
+                               group,
+                               strategy=AllReduceStrategy.NCCL,
+                               reduce_fusion_params=reduce_fusion_params)
 
         return output
 

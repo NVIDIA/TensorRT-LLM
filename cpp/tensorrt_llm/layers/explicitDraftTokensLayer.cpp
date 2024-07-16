@@ -274,16 +274,14 @@ void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
         inputs.maxGenLengthDevice.template getPtr<SizeType32 const>(), sizeof(SizeType32), cudaMemcpyDeviceToHost,
         mStream);
 
-    params.checkParams();
-
-    // Copy max generation length
-    cudaMemcpyAsync(outputs.maxGenLengthHost.template getPtr<SizeType32>(),
-        inputs.maxGenLengthDevice.template getPtr<SizeType32 const>(), sizeof(SizeType32), cudaMemcpyDeviceToHost,
-        mStream);
-
     invokeExtractExplicitDraftTokens(params, mStream);
 
     invokeCopyProbs(params, mStream);
+
+    // Copy max generation length
+    cudaMemcpyAsync(outputs.generationLengthsHost.template getPtr<SizeType32>(),
+        outputs.generationLengths.template getPtr<SizeType32 const>(),
+        sizeof(SizeType32) * mDecoderDomain.getBatchSize(), cudaMemcpyDeviceToHost, mStream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

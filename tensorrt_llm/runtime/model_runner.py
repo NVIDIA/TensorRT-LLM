@@ -129,6 +129,12 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
+    # ReDrafter
+    redrafter_num_beams = config['pretrained_config'].get(
+        'redrafter_num_beams', 0)
+    redrafter_draft_len_per_beam = config['pretrained_config'].get(
+        'redrafter_draft_len_per_beam', 0)
+
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
     mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
@@ -169,6 +175,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
+        # ReDrafter
+        redrafter_num_beams=redrafter_num_beams,
+        redrafter_draft_len_per_beam=redrafter_draft_len_per_beam,
     )
 
     other_config = {
@@ -482,6 +491,11 @@ class ModelRunner(ModelRunnerMixin):
             use_custom_all_reduce,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
+            redrafter_num_beams=pretrained_config.redrafter_num_beams
+            if hasattr(pretrained_config, 'redrafter_num_beams') else 0,
+            redrafter_draft_len_per_beam=pretrained_config.
+            redrafter_draft_len_per_beam if hasattr(
+                pretrained_config, 'redrafter_draft_len_per_beam') else 0,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len

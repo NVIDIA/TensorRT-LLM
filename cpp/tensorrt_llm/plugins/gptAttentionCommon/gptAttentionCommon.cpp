@@ -242,6 +242,9 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.spec_decoding_packed_mask = generationsParams.spec_decoding_packed_mask;
     xqaParams.spec_decoding_position_offsets = generationsParams.spec_decoding_position_offsets;
     xqaParams.spec_decoding_generation_lengths = generationsParams.spec_decoding_generation_lengths;
+    xqaParams.spec_decoding_is_generation_length_variable
+        = generationsParams.spec_decoding_is_generation_length_variable;
+    xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
 
     xqaParams.total_num_input_tokens = generationsParams.total_num_input_tokens;
     xqaParams.fp8_out_scale = (mFP8ContextFMHA ? generationsParams.attention_output_orig_quant : nullptr);
@@ -399,7 +402,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
     nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention, int max_distance,
     bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
-    bool use_cache, bool is_spec_decoding_enabled)
+    bool use_cache, bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
+    int32_t spec_decoding_max_generation_length)
     : mLayerIdx(layer_idx)
     , mNumHeads(num_heads)
     , mVisionStart(vision_start)
@@ -443,6 +447,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mFP8ContextFMHA(use_fp8_context_fmha)
     , mUseKVCache(use_cache)
     , mIsSpecDecodingEnabled(is_spec_decoding_enabled)
+    , mSpecDecodingIsGenerationLengthVariable(spec_decoding_is_generation_length_variable)
+    , mSpecDecodingMaxGenerationLength(spec_decoding_max_generation_length)
     , mDriver(CUDADriverWrapper::getInstance())
 {
     // Pre-check whether FMHA is supported in order to save memory allocation.
@@ -559,6 +565,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mFP8ContextFMHA);
     read(d, mUseKVCache);
     read(d, mIsSpecDecodingEnabled);
+    read(d, mSpecDecodingIsGenerationLengthVariable);
+    read(d, mSpecDecodingMaxGenerationLength);
     read(d, mNbMultiBlockSemaphores);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
@@ -1655,7 +1663,8 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
         + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mUseKVCache) + sizeof(mUnfuseQkvGemm)
-        + sizeof(mIsSpecDecodingEnabled) + sizeof(mNbMultiBlockSemaphores)
+        + sizeof(mIsSpecDecodingEnabled) + sizeof(mSpecDecodingIsGenerationLengthVariable)
+        + sizeof(mSpecDecodingMaxGenerationLength) + sizeof(mNbMultiBlockSemaphores)
         + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
         + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
 }
@@ -1705,6 +1714,8 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mFP8ContextFMHA);
     write(d, mUseKVCache);
     write(d, mIsSpecDecodingEnabled);
+    write(d, mSpecDecodingIsGenerationLengthVariable);
+    write(d, mSpecDecodingMaxGenerationLength);
     write(d, mNbMultiBlockSemaphores);
 
     // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
@@ -1797,6 +1808,10 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("use_fp8_context_fmha", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("use_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("is_spec_decoding_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(
+        PluginField("spec_decoding_is_generation_length_variable", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(
+        PluginField("spec_decoding_max_generation_length", nullptr, PluginFieldType::kINT32, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

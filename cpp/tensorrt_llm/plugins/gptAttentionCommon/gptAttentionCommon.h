@@ -52,7 +52,8 @@ public:
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
         bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
-        bool is_spec_decoding_enabled = false);
+        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
+        int32_t spec_decoding_max_generation_length = 1);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -224,6 +225,8 @@ protected:
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
         int32_t const* spec_decoding_generation_lengths = nullptr;
+        bool spec_decoding_is_generation_length_variable = false;
+        int32_t spec_decoding_max_generation_length = 1;
         int32_t total_num_input_tokens;
     };
 
@@ -324,6 +327,8 @@ protected:
     bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
     bool mIsSpecDecodingEnabled = false;
+    bool mSpecDecodingIsGenerationLengthVariable = false;
+    int32_t mSpecDecodingMaxGenerationLength = 1;
 
     // Speculative decoding packed mask.
     uint4* mSpecDecodingPackedMask;

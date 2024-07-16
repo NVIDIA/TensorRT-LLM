@@ -1,7 +1,18 @@
 import os as _os
 import pathlib as _pl
+import sys as _sys
 
 import pytest
+
+import tensorrt_llm.bindings as _tb
+
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..', '..'))
+from cpp.tests.resources.scripts.build_engines_utils import \
+    init_model_spec_module
+
+init_model_spec_module()
+
+import model_spec
 
 
 @pytest.fixture(scope="module")
@@ -31,19 +42,26 @@ def engine_path(resource_path: _pl.Path) -> _pl.Path:
     return resource_path / "models" / "rt_engine"
 
 
+def get_base_model_spec() -> model_spec.ModelSpec:
+    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin().set_kv_cache_type(
+        model_spec.KVCacheType.PAGED).use_packed_input()
+    return model_spec_obj
+
+
 @pytest.fixture(scope="module")
 def model_path(engine_path):
-    return engine_path / "gpt2/fp16-plugin-packed-paged/tp1-pp1-gpu"
+    return engine_path / f"gpt2/{get_base_model_spec().get_model_path()}/tp1-pp1-gpu"
 
 
 @pytest.fixture(scope="module")
 def model_path_return_logits(engine_path):
-    return engine_path / "gpt2/fp16-plugin-packed-paged-gather/tp1-pp1-gpu"
+    return engine_path / f"gpt2/{get_base_model_spec().gather_logits().get_model_path()}/tp1-pp1-gpu"
 
 
 @pytest.fixture
 def model_path_lora(engine_path: _pl.Path) -> _pl.Path:
-    return engine_path / "gpt2/fp16-plugin-packed-paged-lora/tp1-pp1-gpu"
+    return engine_path / f"gpt2/{get_base_model_spec().use_lora_plugin().get_model_path()}/tp1-pp1-gpu"
 
 
 @pytest.fixture
@@ -53,9 +71,9 @@ def lora_config_path(data_path: _pl.Path) -> _pl.Path:
 
 @pytest.fixture(scope="module")
 def results_data_path(data_path: _pl.Path) -> _pl.Path:
-    return data_path / "gpt2/sampling/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"
+    return data_path / f"gpt2/sampling/{get_base_model_spec().get_results_file()}"
 
 
 @pytest.fixture(scope="module")
 def results_data_path_beam_width_2(data_path: _pl.Path) -> _pl.Path:
-    return data_path / "gpt2/beam_search_2/output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"
+    return data_path / f"gpt2/beam_search_2/{get_base_model_spec().get_results_file()}"

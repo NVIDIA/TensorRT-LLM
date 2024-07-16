@@ -171,6 +171,11 @@ def add_common_args(parser):
                         'other values for stopping by length',
                         default=1)
     parser.add_argument(
+        '--end_id',
+        default=None,
+        type=int,
+        help="Override tokenizer end_id to stop on given end_id token.")
+    parser.add_argument(
         '--stop_words',
         default=None,
         type=str,
@@ -329,4 +334,16 @@ def add_common_args(parser):
         action='store_true',
         help="Use device map 'auto' to load a pretrained HF model. This may "
         "help to test a large model that cannot fit into a singlue GPU.")
+
+    parser.add_argument(
+        "--return_all_generated_tokens",
+        default=False,
+        action="store_true",
+        help="This option changes the token output only for streaming. "
+        "If not specified, return only generated tokens at each step. "
+        "If specified, return the full beams/outputs at each step. "
+        "It is automatically enabled for num_beams>1 (only available with cpp session). "
+        "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
+    )
+
     return parser

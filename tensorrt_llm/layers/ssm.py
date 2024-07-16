@@ -27,10 +27,18 @@ from .normalization import RmsNorm
 
 class MambaConv1d(Module):
 
-    def __init__(self, d_inner, d_conv=4, dtype=None, apply_silu=True):
+    def __init__(self,
+                 d_inner,
+                 d_conv=4,
+                 pre_stride=0,
+                 post_stride=0,
+                 dtype=None,
+                 apply_silu=True):
         super().__init__()
         self.d_inner = d_inner
         self.d_conv = d_conv
+        self.pre_stride = pre_stride
+        self.post_stride = post_stride
         self.dtype = dtype
         self.weight = Parameter(shape=(self.d_inner, 1, self.d_conv, 1),
                                 dtype=dtype)
@@ -62,12 +70,19 @@ class MambaConv1d(Module):
             x_conv, conv_state = mamba_conv1d(
                 x, conv_state, transposed_weight, self.bias.value,
                 host_request_types, last_token_ids, self.d_inner, self.d_conv,
-                self.dtype, host_context_lengths, slot_mapping, self.apply_silu)
+                self.dtype, self.pre_stride, self.post_stride,
+                host_context_lengths, slot_mapping, self.apply_silu)
         else:
             assert not default_net().plugin_config.paged_state
             assert len(
                 x.shape
             ) == 3, "remove_input_padding is not supported by OOTB for Mamba."
+            if self.pre_stride > 0:
+                _, x = split(x,
+                             [self.pre_stride, self.d_inner + self.post_stride],
+                             dim=-1)
+            if self.post_stride > 0:
+                x, _ = split(x, [self.d_inner, self.post_stride], dim=-1)
             x = x.permute([0, 2, 1])
 
             # In context phase, conv_state is a zero tensor, and it is used for padding
@@ -133,7 +148,7 @@ class Mamba(Module):
                                 dtype=dtype,
                                 gather_output=False)
 
-        self.conv1d = MambaConv1d(self.d_inner, self.d_conv, self.dtype)
+        self.conv1d = MambaConv1d(self.d_inner, self.d_conv, dtype=self.dtype)
 
         self.x_proj = Linear(self.d_inner,
                              self.dt_rank + self.d_state * 2,
@@ -251,10 +266,15 @@ class Mamba2(Module):
                               gather_output=False)
 
         self.conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
-        self.conv1d = MambaConv1d(self.conv_dim, self.d_conv, self.dtype)
+        self.conv1d = MambaConv1d(self.conv_dim,
+                                  self.d_conv,
+                                  pre_stride=self.d_inner,
+                                  post_stride=self.nheads,
+                                  dtype=self.dtype)
 
         if rmsnorm:
             self.norm = RmsNorm(normalized_shape=self.d_inner,
+                                num_groups=ngroups,
                                 eps=1e-5,
                                 dtype=dtype)
 
@@ -286,24 +306,20 @@ class Mamba2(Module):
         '''
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
-        z, xbc, dt = split(zxbcdt, [self.d_inner, self.conv_dim, self.nheads],
-                           dim=-1)
 
         # conv1d
-        xbc_conv, conv_state = self.conv1d(xbc, conv_state, host_request_types,
-                                           last_token_ids, host_context_lengths,
-                                           slot_mapping, conv_indices)
-        x_conv, bc = split(xbc_conv,
-                           [self.d_inner, 2 * self.ngroups * self.d_state],
-                           dim=-1)
+        xbc_conv, conv_state = self.conv1d(zxbcdt, conv_state,
+                                           host_request_types, last_token_ids,
+                                           host_context_lengths, slot_mapping,
+                                           conv_indices)
 
         # mamba scan
-        y, ssm_state = selective_scan(x_conv,
+        y, ssm_state = selective_scan(xbc_conv,
                                       ssm_state,
-                                      dt,
+                                      zxbcdt,
                                       self.dt_bias.value,
                                       self.A.value,
-                                      bc,
+                                      xbc_conv,
                                       self.D.value,
                                       host_request_types,
                                       last_token_ids,
@@ -312,7 +328,7 @@ class Mamba2(Module):
                                       dt_rank=0,
                                       delta_softplus=True,
                                       dtype=self.dtype,
-                                      z=z,
+                                      z=zxbcdt,
                                       host_context_lengths=host_context_lengths,
                                       slot_mapping=slot_mapping,
                                       nheads=self.nheads,

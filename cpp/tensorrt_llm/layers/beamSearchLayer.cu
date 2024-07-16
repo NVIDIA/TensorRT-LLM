@@ -148,8 +148,8 @@ void BeamSearchLayer<T>::forwardAsync(
     bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIdsPtr.shape[0]);
     bh.nBatchSize = ip->localBatchSize;
     bh.batchSlots = ip->batchSlots ? ip->batchSlots->template getPtr<SizeType32 const>() : nullptr;
-    bh.nBeamWidth = static_cast<std::int32_t>(op->outputIdsPtr.shape[1]);
-    bh.nMaxSeqLen = static_cast<std::int32_t>(op->outputIdsPtr.shape[2]);
+    bh.nBeamWidth = static_cast<std::int32_t>(op->outputIds.shape[1]);
+    bh.nMaxSeqLen = static_cast<std::int32_t>(op->outputIds.shape[2]);
     bh.nVocabSize = mVocabSizePadded;
     bh.diversityRates = mDiversityRateDevice;
     bh.lengthPenalties = mLengthPenaltyDevice;

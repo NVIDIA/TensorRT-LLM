@@ -496,22 +496,24 @@ class PretrainedModel(Module,
         if save_config:
             self.config.to_json_file(os.path.join(output_dir, 'config.json'))
 
-    def prepare_inputs(self,
-                       max_batch_size,
-                       max_input_len,
-                       max_seq_len,
-                       max_num_tokens,
-                       use_cache,
-                       max_beam_width: int = 1,
-                       opt_num_tokens: int = None,
-                       prompt_embedding_table_size: int = 0,
-                       position_encoding_2d: bool = False,
-                       max_draft_len: int = 0,
-                       speculative_decoding_draft_tokens_external: bool = False,
-                       gather_context_logits: bool = False,
-                       gather_generation_logits: bool = False,
-                       lora_target_modules: List[str] = None,
-                       opt_batch_size: int = 0):
+    def prepare_inputs(
+            self,
+            max_batch_size,
+            max_input_len,
+            max_seq_len,
+            max_num_tokens,
+            use_cache,
+            max_beam_width: int = 1,
+            opt_num_tokens: int = None,
+            prompt_embedding_table_size: int = 0,
+            position_encoding_2d: bool = False,
+            max_draft_len: int = 0,
+            speculative_decoding_draft_tokens_external: bool = False,
+            spec_decoding_is_generation_length_variable: bool = False,
+            gather_context_logits: bool = False,
+            gather_generation_logits: bool = False,
+            lora_target_modules: List[str] = None,
+            opt_batch_size: int = 0):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -560,6 +562,8 @@ class PretrainedModel(Module,
             max_draft_len=max_draft_len,
             speculative_decoding_draft_tokens_external=
             speculative_decoding_draft_tokens_external,
+            spec_decoding_is_generation_length_variable=
+            spec_decoding_is_generation_length_variable,
             lora_target_modules=lora_target_modules,
             multiple_profiles=multiple_profiles,
             streamingllm=streamingllm,

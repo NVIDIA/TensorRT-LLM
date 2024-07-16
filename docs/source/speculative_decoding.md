@@ -17,7 +17,9 @@ The combination of both these allows speculative decoding to result in reduced l
 TensorRT-LLM supports several approaches for generating draft tokens, including:
 
 1. Utilizing a smaller, auxiliary model, known as the draft model approach. For more information, refer to the [Fast Inference from Transformers via Speculative Decoding paper](https://arxiv.org/pdf/2211.17192.pdf).
-2. Implementing additional language model heads that predict tokens for future positions, as detailed in the [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper](https://arxiv.org/abs/2401.10774).
+2. Implementing additional language model heads that predict tokens for future positions:
+    1. [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper](https://arxiv.org/abs/2401.10774).
+    2. [Recurrent Drafter for Fast Speculative Decoding in Large Language Models](https://arxiv.org/html/2403.09919v1).
 
 ## Performance Improvements
 
@@ -74,7 +76,7 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
 
     ```bash
     export MAX_DRAFT_LENGTH=10
-    export COMMON_COMMAND="--max_batch_size=1 --max_input_len=2048 --max_output_len=1024 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits"
+    export COMMON_COMMAND="--max_batch_size=1 --max_input_len=2048 --max_seq_len=3072 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits"
     export DRAFT_COMMAND_FP16="$COMMON_COMMAND"
     export TARGET_COMMAND_FP16="$DRAFT_COMMAND_FP16 --max_draft_len=$MAX_DRAFT_LENGTH --speculative_decoding_mode draft_tokens_external"
     export DRAFT_COMMAND_FP8="$COMMON_COMMAND --strongly_typed --use_fp8_context_fmha=enable"
@@ -302,3 +304,10 @@ For guidance on constructing and executing Medusa with the Python runtime, consu
 However, similar to any new model, you can follow the same approach to define your own Medusa model and deploy with TensorRT-LLM.
 - We match only tokens during the validation phasem that is `medusa_temperature=0`.
 - Beam search is **not** compatible with Medusa.
+
+
+# ReDrafter
+
+This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read [the ReDrafter paper](https://arxiv.org/html/2403.09919v1).
+
+TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as `explicit_draft_tokens`. Please, visit the [ReDrafter README](../../examples/redrafter/README.md) for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.
