@@ -321,20 +321,13 @@ class MultimodalModelRunner:
         logger.info(f'Creating session from engine {vision_encoder_path}')
         self.visual_encoder_session = Session.from_serialized_engine(
             engine_buffer)
-        if self.model_type == "phi-3-vision":
+        if self.model_type in ["phi-3-vision", "llava_next"]:
             self.image_newlines = {}
             image_newlines_path = os.path.join(self.args.visual_engine_dir,
                                                'image_newlines.safetensors')
-            with safe_open(image_newlines_path, framework="pt",
-                           device="cuda") as f:
-                for k in f.keys():
-                    self.image_newlines[k] = f.get_tensor(k)
-        if self.model_type == "llava_next":
-            self.image_newlines = {}
-            image_newlines_path = os.path.join(self.args.visual_engine_dir,
-                                               'image_newline.safetensors')
-            with safe_open(image_newlines_path, framework="pt",
-                           device="cuda") as f:
+            with safe_open(image_newlines_path,
+                           framework="pt",
+                           device=self.device) as f:
                 for k in f.keys():
                     self.image_newlines[k] = f.get_tensor(k)
 

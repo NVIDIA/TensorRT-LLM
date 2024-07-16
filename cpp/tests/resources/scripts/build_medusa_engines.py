@@ -19,7 +19,12 @@ import pathlib as _pl
 import platform as _pf
 import sys as _sys
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
 def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
@@ -60,8 +65,8 @@ def build_engines(model_cache: str):
         print("Copy model from model_cache")
         model_cache_dir = _pl.Path(model_cache) / model_name
         medusa_cache_dir = _pl.Path(model_cache) / medusa_name
-        assert model_cache_dir.is_dir()
-        assert medusa_cache_dir.is_dir()
+        assert model_cache_dir.is_dir(), model_cache_dir
+        assert medusa_cache_dir.is_dir(), model_cache_dir
 
         if _pf.system() == "Windows":
             wincopy(source=str(model_cache_dir),
@@ -85,9 +90,15 @@ def build_engines(model_cache: str):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
+    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
+    model_spec_obj.use_medusa()
+
     print(f"\nBuilding fp16 engine")
     build_engine(model_dir, medusa_dir,
-                 engine_dir / 'fp16-plugin-packed-paged/tp1-pp1-gpu')
+                 engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-gpu')
 
     print("Done.")
 

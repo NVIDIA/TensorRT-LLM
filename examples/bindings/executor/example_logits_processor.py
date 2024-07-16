@@ -50,12 +50,13 @@ def enqueue_requests(args: argparse.Namespace,
     sampling_config = trtllm.SamplingConfig(args.beam_width)
 
     request_ids = []
-    for _ in range(args.batch_size):
+    for iter_id in range(args.batch_size):
         # Create the request.
         request = trtllm.Request(input_token_ids=prompt,
                                  max_new_tokens=25,
                                  end_id=tokenizer.eos_token_id,
-                                 sampling_config=sampling_config)
+                                 sampling_config=sampling_config,
+                                 client_id=iter_id % 2)
         request.logits_post_processor_name = request.BATCHED_POST_PROCESSOR_NAME if args.lpp_batched else "my_logits_pp"
 
         # Enqueue the request.
@@ -137,7 +138,8 @@ if __name__ == "__main__":
     parser = JsonSchemaParser(AnswerFormat.model_json_schema())
     token_enforcer = build_token_enforcer(tokenizer, parser)
 
-    def get_allowed_tokens(ids):
+    def get_allowed_tokens(ids, client_id):
+        if client_id is None or client_id == 0: return [42]
 
         def _trim(ids):
             return [x for x in ids if x != tokenizer.eos_token_id]
@@ -146,25 +148,28 @@ if __name__ == "__main__":
         return allowed
 
     def logits_post_processor(req_id: int, logits: _tor.Tensor,
-                              ids: _tp.List[_tp.List[int]], stream_ptr: int):
-        del req_id
+                              ids: _tp.List[_tp.List[int]], stream_ptr: int,
+                              client_id: _tp.Optional[int]):
         mask = _tor.full_like(logits, fill_value=float("-inf"), device="cpu")
-        allowed = get_allowed_tokens(ids)
+        allowed = get_allowed_tokens(ids, client_id)
         mask[:, :, allowed] = 0
 
         with _tor.cuda.stream(_tor.cuda.ExternalStream(stream_ptr)):
             mask = mask.to(logits.device, non_blocking=True)
             logits += mask
 
-    def logits_post_processor_batched(req_ids_batch, logits_batch, ids_batch,
-                                      stream_ptr: int):
+    def logits_post_processor_batched(
+            req_ids_batch: _tp.List[int], logits_batch: _tp.List[_tor.Tensor],
+            ids_batch: _tp.List[_tp.List[_tp.List[int]]], stream_ptr,
+            client_ids_batch: _tp.List[_tp.Optional[int]]):
         masks = []
-        for req_id, logits, ids in zip(req_ids_batch, logits_batch, ids_batch):
+        for req_id, logits, ids, client_id in zip(req_ids_batch, logits_batch,
+                                                  ids_batch, client_ids_batch):
             del req_id
             mask = _tor.full_like(logits,
                                   fill_value=float("-inf"),
                                   device="cpu")
-            allowed = get_allowed_tokens(ids)
+            allowed = get_allowed_tokens(ids, client_id)
             mask[:, :, allowed] = 0
             masks.append(mask)
 

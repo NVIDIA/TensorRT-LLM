@@ -20,31 +20,33 @@ The `Executor` class is responsible for receiving requests from the client, and 
 Users can alter the logits produced the network, by providing a map of named callbacks of the form:
 
 ```
-std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&)>>
+std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
 ```
 to the `ExecutorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
 
-The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor. The callback returns a modified tensor of logits.
+The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits.
 
 Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
 
+Multiple requests can share same client id and callback can use different logic based on client id.
+
 We also provide a batched version that allows altering logits of multiple requests in a batch. This allows further optimizations and reduces callback overheads.
 
 ```
-std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&)>
+std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&, std::vector<std::optional<IdType>> const&)>
 ```
 
 A single batched callback can be specified in `ExecutorConfig`. Each request can opt to apply this callback by specifying the name of the logits
 post-processor as `Request::kBatchedPostProcessorName`.
 
-Note: Both callback variants are not supported with the `STATIC` batching type for the moment.
+Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
 
 ### The Request Class
 
 The `Request` class is used to define properties of the request, such as the input token ids and the maximum number of tokens to generate. The `streaming` parameter can be used to indicate if the request should generate a response for each new generated tokens (`streaming = true`) or only after all tokens have been generated (`streaming = false`). Other mandatory parameters of the request include the sampling configuration (defined by the `SamplingConfig` class) which contains parameters controlling the decoding process and the output configuration (defined by the `OutputConfig` class) which controls what information should be included in the `Result` for a particular response.
 
-Optional parameters can also be provided when constructing a request such as a list of bad words, a list of stop words, or configurations objects for prompt tuning, LoRA, or speculative decoding for example.
+Optional parameters can also be provided when constructing a request such as a list of bad words, a list of stop words, a client id, or configurations objects for prompt tuning, LoRA, or speculative decoding for example.
 
 ### The Response Class
 

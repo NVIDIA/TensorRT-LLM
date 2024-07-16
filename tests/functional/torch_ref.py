@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 
 def geglu(x):
@@ -155,6 +154,23 @@ def attention_qkvpacked_ref(qkv,
                          causal=causal,
                          bias=bias,
                          reorder_ops=reorder_ops)
+
+
+def group_rms_norm_ref(x, weight, eps=1e-6, group_size=None, upcast=True):
+    dtype = x.dtype
+    x.shape[-1]
+    weight = weight.float()
+    if upcast:
+        x = x.float()
+    if group_size is None:
+        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+        out = x * rstd * weight
+    else:
+        x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) +
+                              eps)
+        out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+    return out.to(dtype)
 
 
 def mamba_conv1d_ref(x, past_conv_state, conv_weight, conv_bias, apply_silu):
@@ -736,6 +752,7 @@ class mamba2_ref(mamba_ref):
         self.nheads = self.d_ssm // self.headdim
         self.rmsnorm = rmsnorm
         self.group_d_state = self.ngroups * self.d_state
+        self.group_size = self.d_ssm // self.ngroups
 
         d_in_proj = 2 * self.d_inner + 2 * self.group_d_state + self.nheads
         self.in_proj = nn.Linear(self.d_model,
@@ -782,7 +799,8 @@ class mamba2_ref(mamba_ref):
 
         # norm
         if rmsnorm:
-            self.norm = LlamaRMSNorm(self.d_inner, eps=1e-5)
+            self.norm_weight = nn.Parameter(
+                torch.ones(self.d_inner, device=device))
 
     def forward_impl(self,
                      hidden_states,
@@ -834,7 +852,11 @@ class mamba2_ref(mamba_ref):
 
         # norm
         if self.rmsnorm:
-            y = (self.norm(y.float() * self.act(z.float()))).to(y.dtype)
+            y = group_rms_norm_ref(
+                (y.float() * self.act(z.float())).to(y.dtype),
+                self.norm_weight,
+                eps=1e-5,
+                group_size=self.group_size).to(y.dtype)
 
         # out_proj
         out = self.out_proj(y)
@@ -885,7 +907,11 @@ class mamba2_ref(mamba_ref):
                                        dt_softplus=True)
         y = rearrange(y, "b h p -> b (h p)")
         if self.rmsnorm:
-            y = (self.norm(y.float() * self.act(z.float()))).to(y.dtype)
+            y = group_rms_norm_ref(
+                (y.float() * self.act(z.float())).to(y.dtype),
+                self.norm_weight,
+                eps=1e-5,
+                group_size=self.group_size).to(y.dtype)
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 

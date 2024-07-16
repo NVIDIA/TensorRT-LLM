@@ -122,6 +122,12 @@ def trt_gte_10():
     return version.parse(trt_version()).major > 9
 
 
+# Check if TRT version >= 10.1
+def trt_gte_10_1():
+    trt_ver = version.parse(trt_version())
+    return trt_ver.major > 9 and trt_ver.minor > 0
+
+
 def torch_version():
     return torch.__version__
 

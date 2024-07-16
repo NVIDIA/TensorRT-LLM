@@ -36,14 +36,13 @@ typedef void (*StatePassingKernelFuncFp16)(int B_, int L_, int H_, int P_, int N
     float const* g_mxSt_, // B*C*H*N*P
                           //  const float *g_mxdc_, // B*C*H*Q
     float const* g_mxdA_, // B*C*H*Q
-                          //  const half  *g_mxdt_, // B*L*H
+                          //  const half  *g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
                           //  const float *g_mxdb_, //     H
                           //  const float *g_mxA_,  //     H
                           //  const half  *g_mxCB_, // B*C*G*Q*Q
-                          //  const half  *g_mxBC_, // B*L*2*G*N
                           //  const float *g_mxD_,  //     H
-                          //  const half  *g_mxX_,  // B*L*H*P
-                          //  const half  *g_mxZ_,  // B*L*H*P
+                          //  const half  *g_mxXBC_,  // B*L*(H*P+2*G*N)
+                          //  const half  *g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_);
 
 typedef void (*StatePassingKernelFuncBf16)(int B_, int L_, int H_, int P_, int N_,
@@ -53,14 +52,13 @@ typedef void (*StatePassingKernelFuncBf16)(int B_, int L_, int H_, int P_, int N
     float const* g_mxSt_, // B*C*H*N*P
                           //  const float *g_mxdc_, // B*C*H*Q
     float const* g_mxdA_, // B*C*H*Q
-                          //  const bf16  *g_mxdt_, // B*L*H
+                          //  const bf16  *g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
                           //  const float *g_mxdb_, //     H
                           //  const float *g_mxA_,  //     H
                           //  const bf16  *g_mxCB_, // B*C*G*Q*Q
-                          //  const bf16  *g_mxBC_, // B*L*2*G*N
                           //  const float *g_mxD_,  //     H
-                          //  const bf16  *g_mxX_,  // B*L*H*P
-                          //  const bf16  *g_mxZ_,  // B*L*H*P
+                          //  const bf16  *g_mxXBC_,  // B*L*(H*P+2*G*N)
+                          //  const bf16  *g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_);
 
 template <int Q_, int tileH_, int warpH_, class Tp_>
@@ -72,14 +70,13 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     float const* g_mxSt_, // B*C*H*N*P
                           //  const float *g_mxdc_, // B*C*H*Q
     float const* g_mxdA_, // B*C*H*Q
-                          //  const Tp_   *g_mxdt_, // B*L*H
+                          //  const Tp_   *g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
                           //  const Wt_   *g_mxdb_, //     H
                           //  const Wt_   *g_mxA_,  //     H
                           //  const Tp_   *g_mxCB_, // B*C*G*Q*Q
-                          //  const Tp_   *g_mxBC_, // B*L*2*G*N
                           //  const Wt_   *g_mxD_,  //     H
-                          //  const Tp_   *g_mxX_,  // B*L*H*P
-                          //  const Tp_   *g_mxZ_,  // B*L*H*P
+                          //  const Tp_   *g_mxXBC_,  // B*L*(H*P+2*G*N)
+                          //  const Tp_   *g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_)
 {
     using namespace tensorrt_llm::common;

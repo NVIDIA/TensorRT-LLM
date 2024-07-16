@@ -108,6 +108,11 @@ include_directories(${TRTLLM_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
 add_executable(executorExampleBasic executorExampleBasic.cpp)
 target_link_libraries(executorExampleBasic nvinfer_plugin_tensorrt_llm)
 
+add_executable(executorExampleLogitsProcessor
+               executorExampleLogitsProcessor.cpp)
+target_link_libraries(executorExampleLogitsProcessor
+                      nvinfer_plugin_tensorrt_llm)
+
 # Advanced
 if(NOT TARGET cxxopts::cxxopts)
   set(CXXOPTS_SRC_DIR ${TRTLLM_DIR}/3rdparty/cxxopts)

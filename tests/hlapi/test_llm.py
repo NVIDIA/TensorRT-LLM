@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import tempfile
-from typing import List
+from typing import List, Optional
 
 import pytest
 import torch
@@ -516,7 +516,8 @@ def test_generate_with_logits_post_processor():
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
 
     def logits_post_processor(req_id: int, logits: torch.Tensor,
-                              ids: List[List[int]], stream_ptr: int):
+                              ids: List[List[int]], stream_ptr: int,
+                              client_id: Optional[int]):
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             logits[:] = float("-inf")
             logits[..., biased_word_id] = 0

@@ -38,8 +38,10 @@ class GenerationMixin:
         return res
 
     @staticmethod
-    def default_range(max_range, offset=0, min_range=1):
-        result = [min_range, (max_range + min_range) // 2, max_range]
+    def default_range(max_range, offset=0, min_range=1, opt_offset=0):
+        result = [
+            min_range, (max_range + min_range + opt_offset) // 2, max_range
+        ]
         return [elem + offset for elem in result]
 
     @staticmethod
@@ -412,6 +414,7 @@ class GenerationMixin:
             use_lora_plugin: bool = False,
             lora_target_modules: List[str] = None,
             speculative_decoding_draft_tokens_external: bool = False,
+            spec_decoding_is_generation_length_variable: bool = False,
             max_draft_len=0,
             multiple_profiles: bool = False,
             streamingllm: bool = False,
@@ -680,8 +683,13 @@ class GenerationMixin:
                 ]),
             )
             spec_decoding_params = SpecDecodingParams(
+                spec_decoding_is_generation_length_variable=
+                spec_decoding_is_generation_length_variable,
+                spec_decoding_max_generation_length=tokens_per_engine_step,
+                spec_decoding_generation_lengths=
                 spec_decoding_generation_lengths,
-                spec_decoding_position_offsets, spec_decoding_packed_mask)
+                spec_decoding_position_offsets=spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_packed_mask)
 
         basic_inputs = {
             'input_ids': input_ids,

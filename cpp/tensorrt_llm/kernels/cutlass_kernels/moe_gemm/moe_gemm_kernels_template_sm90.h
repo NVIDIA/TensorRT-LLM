@@ -190,6 +190,7 @@ void dispatchMoeGemmSelectTileShapeSM90(HopperGroupedGemmInput hopper_input, int
         SHAPE_CASE(128, 64, 128)
         SHAPE_CASE(128, 128, 128)
         SHAPE_CASE(128, 256, 128)
+        SHAPE_CASE(256, 128, 128)
 
 #undef SHAPE_CASE
     case cutlass_extensions::CutlassTileConfigSM90::Undefined: TLLM_THROW("GEMM config undefined."); break;

@@ -369,7 +369,7 @@ def build_llava_engine(args):
         image_newline = model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
-                  os.path.join(args.output_dir, "image_newline.safetensors"))
+                  os.path.join(args.output_dir, "image_newlines.safetensors"))
 
 
 def build_vila_engine(args):

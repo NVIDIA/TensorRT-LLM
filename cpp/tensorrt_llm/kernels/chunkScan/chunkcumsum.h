@@ -29,57 +29,54 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-typedef void (*ChunkCumsumKernelFuncFp16)(int B_, int L_, int H_,
+typedef void (*ChunkCumsumKernelFuncFp16)(int B_, int L_, int H_, int P_, int G_, int N_,
     //  const half  *g_mxY_,  // B*L*H*P
     //  const half  *g_mxOs_, // B*C*H*N*P
     //  const half  *g_mxFs_, // B  *H*N*P
     //  const float *g_mxSt_, // B*C*H*N*P
     float* g_mxdc_,       // B*C*H*Q
     float* g_mxdA_,       // B*C*H*Q
-    half const* g_mxdt_,  // B*L*H
+    half const* g_mxdt_,  // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
     float const* g_mxdb_, //     H
     float const* g_mxA_,  //     H
-                          //  const half  *g_mxCB_, // B*C*G*Q*Q
-                          //  const half  *g_mxBC_, // B*L*2*G*N
-                          //  const float *g_mxD_,  //     H
-                          //  const half  *g_mxX_,  // B*L*H*P
-                          //  const half  *g_mxZ_,  // B*L*H*P
+                          //  const half  *g_mxCB_,  // B*C*G*Q*Q
+                          //  const float *g_mxD_,   //     H
+                          //  const half  *g_mxXBC_, // B*L*(H*P+2*G*N)
+    half const* g_mxZ_,   // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_);
 
-typedef void (*ChunkCumsumKernelFuncBf16)(int B_, int L_, int H_,
+typedef void (*ChunkCumsumKernelFuncBf16)(int B_, int L_, int H_, int P_, int G_, int N_,
     //  const bf16  *g_mxY_,  // B*L*H*P
     //  const bf16  *g_mxOs_, // B*C*H*N*P
     //  const bf16  *g_mxFs_, // B  *H*N*P
     //  const float *g_mxSt_, // B*C*H*N*P
     float* g_mxdc_,       // B*C*H*Q
     float* g_mxdA_,       // B*C*H*Q
-    bf16 const* g_mxdt_,  // B*L*H
+    bf16 const* g_mxdt_,  // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
     float const* g_mxdb_, //     H
     float const* g_mxA_,  //     H
-                          //  const bf16  *g_mxCB_, // B*C*G*Q*Q
-                          //  const bf16  *g_mxBC_, // B*L*2*G*N
-                          //  const float *g_mxD_,  //     H
-                          //  const bf16  *g_mxX_,  // B*L*H*P
-                          //  const bf16  *g_mxZ_,  // B*L*H*P
+                          //  const bf16  *g_mxCB_,  // B*C*G*Q*Q
+                          //  const float *g_mxD_,   //     H
+                          //  const bf16  *g_mxXBC_, // B*L*(H*P+2*G*N)
+    bf16 const* g_mxZ_,   // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_);
 
 template <int Q_, int tileH_, int warpH_, bool dtSoftplus_, class Tp_, class Wt_ = float>
 __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __nv_bfloat16>> chunk_cumsum_kernel(int B_,
-    int L_, int H_,
+    int L_, int H_, int P_, int G_, int N_,
     //  const Tp_   *g_mxY_,  // B*L*H*P
     //  const Tp_   *g_mxOs_, // B*C*H*N*P
     //  const Tp_   *g_mxFs_, // B  *H*N*P
     //  const float *g_mxSt_, // B*C*H*N*P
     float* g_mxdc_,     // B*C*H*Q
     float* g_mxdA_,     // B*C*H*Q
-    Tp_ const* g_mxdt_, // B*L*H
+    Tp_ const* g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
     Wt_ const* g_mxdb_, //     H
     Wt_ const* g_mxA_,  //     H
-                        //  const Tp_   *g_mxCB_, // B*C*G*Q*Q
-                        //  const Tp_   *g_mxBC_, // B*L*2*G*N
-                        //  const Wt_   *g_mxD_,  //     H
-                        //  const Tp_   *g_mxX_,  // B*L*H*P
-                        //  const Tp_   *g_mxZ_,  // B*L*H*P
+                        //  const Tp_   *g_mxCB_,  // B*C*G*Q*Q
+                        //  const Wt_   *g_mxD_,   //     H
+                        //  const Tp_   *g_mxXBC_, // B*L*(H*P+2*G*N)
+    Tp_ const* g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_)
 {
     using namespace tensorrt_llm::common;
@@ -94,11 +91,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     // auto B = Rn<ID>{B_};
     auto L = Rn<ID>{L_};
     auto H = Rn<ID>{H_};
-    // auto P = Rn<ID>{P_};
-    // auto G = Rn<ID>{G_};
-    // auto N = Rn<ID>{N_};
+    auto P = Rn<ID>{P_};
+    auto G = Rn<ID>{G_};
+    auto N = Rn<ID>{N_};
     auto Q = cn<Q_>;
     auto C = Rn<ID>{div_up(L.var, Q_)};
+    auto dt_dim = g_mxZ_ ? Rn<ID>{2 * H_ * P_ + 2 * G_ * N_ + H_} : Rn<ID>{H_ * P_ + 2 * G_ * N_ + H_};
 
     auto aStart = blockIdx_z * L;
     auto cStart = blockIdx_z * C;
@@ -138,7 +136,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
             if (thread(iStep) < cn<tileH_> && blockIdx_y * Q + iQ < L)
             {
-                r_dt = float(g_mxdt_[get((aStart + blockIdx_y * Q + iQ) * H + blockIdx_x * cn<tileH_> + thread(iStep))])
+                r_dt = float(g_mxdt_[get((aStart + blockIdx_y * Q + iQ) * dt_dim + dt_dim - H + blockIdx_x * cn<tileH_>
+                           + thread(iStep))])
                     + r_db;
 
                 if (dtSoftplus_)

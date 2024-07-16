@@ -126,6 +126,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     py::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
         .value("GPT", tr::ModelConfig::ModelVariant::kGpt)
         .value("GLM", tr::ModelConfig::ModelVariant::kGlm)
+        .value("CHATGLM", tr::ModelConfig::ModelVariant::kChatGlm)
         .value("MAMBA", tr::ModelConfig::ModelVariant::kMamba)
         .value("RECURRENTGEMMA", tr::ModelConfig::ModelVariant::kRecurrentGemma);
 

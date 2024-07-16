@@ -1837,18 +1837,23 @@ class WhisperEncoder(PretrainedModel):
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self._dtype = self.config.dtype
-
+        # Encoder conv needs to run in fp32 on Volta/Turing
+        major, minor = torch.cuda.get_device_capability()
+        if major >= 8:
+            self._conv_dtype = self._dtype
+        else:
+            self._conv_dtype = "float32"
         self.conv1 = Conv1d(config.n_mels,
                             config.hidden_size,
                             kernel_size=3,
                             padding=1,
-                            dtype=self._dtype)
+                            dtype=self._conv_dtype)
         self.conv2 = Conv1d(config.hidden_size,
                             config.hidden_size,
                             kernel_size=3,
                             stride=2,
                             padding=1,
-                            dtype=self._dtype)
+                            dtype=self._conv_dtype)
 
         self.positional_embedding = Parameter(shape=(config.n_audio_ctx,
                                                      config.hidden_size),
@@ -1871,13 +1876,16 @@ class WhisperEncoder(PretrainedModel):
         self.ln_post = LayerNorm(config.hidden_size, dtype=self._dtype)
 
     def forward(self, x: Tensor, input_lengths=None):
-
+        # Encoder conv needs to run in fp32 on Volta/Turing
+        x_type = x.dtype
+        x = cast(x, self._conv_dtype)
         x = self.conv1(x)
         x = gelu(x)
         x = self.conv2(x)
+        x = cast(x, x_type)
         x = gelu(x)
         x = transpose(x, 2, 1)
-        x = x + cast(self.positional_embedding.value, x.dtype)
+        x = x + cast(self.positional_embedding.value, x_type)
 
         hidden_states = x
         for encoder_layer in self.encoder_layers:
@@ -1909,3 +1917,6 @@ class WhisperEncoder(PretrainedModel):
         )
 
         return {'x': x, 'input_lengths': input_lengths}
+
+    def precompute_relative_attention_bias(self, build_config):
+        pass

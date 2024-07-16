@@ -29,38 +29,38 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-typedef void (*BmmChunkKernelFuncFp16)(int B_, int L_, int G_, int N_,
+typedef void (*BmmChunkKernelFuncFp16)(int B_, int L_, int H_, int P_, int G_, int N_,
     //  const half  *g_mxY_,  // B*L*H*P
     //  const half  *g_mxOs_, // B*C*H*N*P
     //  const half  *g_mxFs_, // B  *H*N*P
     //  const float *g_mxSt_, // B*C*H*N*P
     //  const float *g_mxdc_, // B*C*H*Q
     //  const float *g_mxdA_, // B*C*H*Q
-    //  const half  *g_mxdt_, // B*L*H
+    //  const half  *g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
     //  const float *g_mxdb_, //     H
     //  const float *g_mxA_,  //     H
-    half* g_mxCB_,       // B*C*G*Q*Q
-    half const* g_mxBC_, // B*L*2*G*N
-                         //  const float *g_mxD_,  //     H
-                         //  const half  *g_mxX_,  // B*L*H*P
-                         //  const half  *g_mxZ_,  // B*L*H*P
+    half* g_mxCB_,        // B*C*G*Q*Q
+    half const* g_mxXBC_, // B*L*(H*P+2*G*N)
+                          //  const float *g_mxD_,  //     H
+                          //  const half  *g_mxX_,  // B*L*H*P
+                          //  const half  *g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_);
 
-typedef void (*BmmChunkKernelFuncBf16)(int B_, int L_, int G_, int N_,
+typedef void (*BmmChunkKernelFuncBf16)(int B_, int L_, int H_, int P_, int G_, int N_,
     //  const bf16  *g_mxY_,  // B*L*H*P
     //  const bf16  *g_mxOs_, // B*C*H*N*P
     //  const bf16  *g_mxFs_, // B  *H*N*P
     //  const float *g_mxSt_, // B*C*H*N*P
     //  const float *g_mxdc_, // B*C*H*Q
     //  const float *g_mxdA_, // B*C*H*Q
-    //  const bf16  *g_mxdt_, // B*L*H
+    //  const bf16  *g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
     //  const float *g_mxdb_, //     H
     //  const float *g_mxA_,  //     H
-    bf16* g_mxCB_,       // B*C*G*Q*Q
-    bf16 const* g_mxBC_, // B*L*2*G*N
-                         //  const float *g_mxD_,  //     H
-                         //  const bf16  *g_mxX_,  // B*L*H*P
-                         //  const bf16  *g_mxZ_,  // B*L*H*P
+    bf16* g_mxCB_,        // B*C*G*Q*Q
+    bf16 const* g_mxXBC_, // B*L*(H*P+2*G*N)
+                          //  const float *g_mxD_,  //     H
+                          //  const bf16  *g_mxX_,  // B*L*H*P
+                          //  const bf16  *g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_);
 
 template <int Q_, int tileM_, int tileN_, int tileK_, // smem size, per sm
@@ -68,21 +68,21 @@ template <int Q_, int tileM_, int tileN_, int tileK_, // smem size, per sm
     int warpM_, int warpN_,                           // warp number
     int pipeS_, class Tp_>
 __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __nv_bfloat16>> bmm_chunk_kernel(int B_,
-    int L_, int G_, int N_,
+    int L_, int H_, int P_, int G_, int N_,
     //  const Tp_   *g_mxY_,  // B*L*H*P
     //  const Tp_   *g_mxOs_, // B*C*H*N*P
     //  const Tp_   *g_mxFs_, // B  *H*N*P
     //  const float *g_mxSt_, // B*C*H*N*P
     //  const float *g_mxdc_, // B*C*H*Q
     //  const float *g_mxdA_, // B*C*H*Q
-    //  const Tp_   *g_mxdt_, // B*L*H
+    //  const Tp_   *g_mxdt_, // B*L*(2*H*P+2*G*N+H) or B*L*(H*P+2*G*N+H)
     //  const Wt_   *g_mxdb_, //     H
     //  const Wt_   *g_mxA_,  //     H
-    Tp_* g_mxCB_,       // B*C*G*Q*Q
-    Tp_ const* g_mxBC_, // B*L*2*G*N
-                        //  const Wt_   *g_mxD_,  //     H
-                        //  const Tp_   *g_mxX_,  // B*L*H*P
-                        //  const Tp_   *g_mxZ_,  // B*L*H*P
+    Tp_* g_mxCB_,        // B*C*G*Q*Q
+    Tp_ const* g_mxXBC_, // B*L*(H*P+2*G*N)
+                         //  const Wt_   *g_mxD_,  //     H
+                         //  const Tp_   *g_mxX_,  // B*L*H*P
+                         //  const Tp_   *g_mxZ_,  // B*L*(2*H*P+2*G*N+H)
     bool removePadding_, int const* lastTokenIdsPtr_)
 {
 #if __CUDA_ARCH__ >= 800
@@ -98,12 +98,16 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     // auto B = Rn<ID>{B_};
     auto L = Rn<ID>{L_};
-    // auto H = Rn<ID>{H_};
-    // auto P = Rn<ID>{P_};
+    auto H = Rn<ID>{H_};
+    auto P = Rn<ID>{P_};
     auto G = Rn<ID>{G_};
     auto N = Rn<ID>{N_};
     auto Q = cn<Q_>;
     auto C = Rn<ID>{div_up(L.var, Q_)};
+
+    auto xbcDim = Rn<ID>{H_ * P_ + 2 * G_ * N_};
+    auto bOffset = Rn<ID>{H_ * P_};
+    auto cOffset = Rn<ID>{H_ * P_ + G_ * N_};
 
     auto aStart = blockIdx_z * L;
     auto cStart = blockIdx_z * C;
@@ -167,10 +171,9 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
             if (thread(iStep) < cn<tileM_ * tileK_>
                 && thread(iStep) / cn<tileK_> < L - blockIdx_y * Q - mStart * cn<tileM_>)
                 cp_shared_global<16>(b_mxC + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseC(iK) * cn<2>),
-                    g_mxBC_
-                        + get(
-                            (aStart + blockIdx_y * Q + mStart * cn<tileM_> + thread(iStep) / cn<tileK_>) *cn<2> * G * N
-                            + cn<1> * G * N + gStart * N + iK * cn<tileK_> + thread(iStep) % cn<tileK_>));
+                    g_mxXBC_
+                        + get((aStart + blockIdx_y * Q + mStart * cn<tileM_> + thread(iStep) / cn<tileK_>) *xbcDim
+                            + cOffset + gStart * N + iK * cn<tileK_> + thread(iStep) % cn<tileK_>));
             else if (thread(iStep) < cn<tileM_ * tileK_>)
                 *(int4*) ((char*) s_mxC + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseC(iK) * cn<2>))
                     = int4{0, 0, 0, 0};
@@ -180,10 +183,9 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
             if (thread(iStep) < cn<tileN_ * tileK_>
                 && thread(iStep) / cn<tileK_> < L - blockIdx_y * Q - nStart * cn<tileN_>)
                 cp_shared_global<16>(b_mxB + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseB(iK) * cn<2>),
-                    g_mxBC_
-                        + get(
-                            (aStart + blockIdx_y * Q + nStart * cn<tileN_> + thread(iStep) / cn<tileK_>) *cn<2> * G * N
-                            + cn<0> * G * N + gStart * N + iK * cn<tileK_> + thread(iStep) % cn<tileK_>));
+                    g_mxXBC_
+                        + get((aStart + blockIdx_y * Q + nStart * cn<tileN_> + thread(iStep) / cn<tileK_>) *xbcDim
+                            + bOffset + gStart * N + iK * cn<tileK_> + thread(iStep) % cn<tileK_>));
             else if (thread(iStep) < cn<tileN_ * tileK_>)
                 *(int4*) ((char*) s_mxB + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseB(iK) * cn<2>))
                     = int4{0, 0, 0, 0};
@@ -285,10 +287,9 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     && thread(iStep) / cn<tileK_> < L - blockIdx_y * Q - mStart * cn<tileM_>)
                     cp_shared_global<16>(
                         b_mxC + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseC(jK) * cn<2>),
-                        g_mxBC_
-                            + get((aStart + blockIdx_y * Q + mStart * cn<tileM_> + thread(iStep) / cn<tileK_>) *cn<2>
-                                    * G * N
-                                + cn<1> * G * N + gStart * N + jK * cn<tileK_> + thread(iStep) % cn<tileK_>));
+                        g_mxXBC_
+                            + get((aStart + blockIdx_y * Q + mStart * cn<tileM_> + thread(iStep) / cn<tileK_>) *xbcDim
+                                + cOffset + gStart * N + jK * cn<tileK_> + thread(iStep) % cn<tileK_>));
                 else if (thread(iStep) < cn<tileM_ * tileK_>)
                     *(int4*) ((char*) s_mxC + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseC(jK) * cn<2>))
                         = int4{0, 0, 0, 0};
@@ -299,10 +300,9 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     && thread(iStep) / cn<tileK_> < L - blockIdx_y * Q - nStart * cn<tileN_>)
                     cp_shared_global<16>(
                         b_mxB + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseB(jK) * cn<2>),
-                        g_mxBC_
-                            + get((aStart + blockIdx_y * Q + nStart * cn<tileN_> + thread(iStep) / cn<tileK_>) *cn<2>
-                                    * G * N
-                                + cn<0> * G * N + gStart * N + jK * cn<tileK_> + thread(iStep) % cn<tileK_>));
+                        g_mxXBC_
+                            + get((aStart + blockIdx_y * Q + nStart * cn<tileN_> + thread(iStep) / cn<tileK_>) *xbcDim
+                                + bOffset + gStart * N + jK * cn<tileK_> + thread(iStep) % cn<tileK_>));
                 else if (thread(iStep) < cn<tileN_ * tileK_>)
                     *(int4*) ((char*) s_mxB + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseB(jK) * cn<2>))
                         = int4{0, 0, 0, 0};

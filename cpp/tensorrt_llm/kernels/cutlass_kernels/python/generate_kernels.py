@@ -323,7 +323,7 @@ def generate_sm90_grouped_gemm_operations():
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     M_TILES = [128]  # Currently M tile must be 128 for Grouped GEMM
     N_TILES = [16, 32, 64, 128, 256]
-    cta_shapes_mn = product(M_TILES, N_TILES)
+    cta_shapes_mn = list(product(M_TILES, N_TILES)) + [(256, 128)]
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto

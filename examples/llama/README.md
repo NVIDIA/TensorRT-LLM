@@ -346,7 +346,7 @@ python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt
             --gather_all_token_logits \
             --max_num_tokens 4096 \
             --max_input_len 16384 \
-            --max_output_len 10 \
+            --max_seq_len 16394 \
             --use_paged_context_fmha enable
 
 python ./examples/summarize.py --test_trt_llm \
@@ -371,7 +371,7 @@ python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt
             --gemm_plugin float16 \
             --max_num_tokens 4096 \
             --max_input_len 131072 \
-            --max_output_len 10 \
+            --max_seq_len 131082 \
             --use_paged_context_fmha enable
 
 python examples/eval_long_context.py  --task passkey \
@@ -411,7 +411,7 @@ python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/llama-3-8B-1048k/trt
             --gemm_plugin float16 \
             --max_num_tokens 4096 \
             --max_input_len 131072 \
-            --max_output_len 10 \
+            --max_seq_len 131082 \
             --use_paged_context_fmha enable
 
 python examples/eval_long_context.py  --task kv_retrieval \
@@ -894,7 +894,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_codellama \
 NOTE: CodeLlama uses the `max_position_embeddings` of 16K.
 To build the engine for running similarly long input/output, you need to specify that during build.
 
-Use `--max_input_len` and `--max_output_len` (which defaults to `2048` and `512`, respectively) according to your use case, e.g.:
+Use `--max_input_len` (which defaults to `1024`) and `--max_seq_len` (which by default is deduced from `max_position_embeddings`) according to your use case, e.g.:
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \
                              --output_dir ./tllm_checkpoint_4gpu_codellama \
@@ -1135,7 +1135,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_awq \
             --lora_plugin auto \
             --max_batch_size 8 \
             --max_input_len 512 \
-            --max_output_len 50 \
+            --max_seq_len 562 \
             --lora_dir  "luotuo-lora-7b-0.1/" "Japanese-Alpaca-LoRA-7b-v0/" \
             --max_lora_rank 8 \
             --lora_target_modules attn_q attn_k attn_v

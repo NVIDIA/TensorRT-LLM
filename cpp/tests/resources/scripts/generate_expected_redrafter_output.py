@@ -21,8 +21,8 @@ import run
 
 
 def generate_output(engine: str, output_name: str, max_output_len: int = 8):
-
-    model = 'vicuna-explicit_draft'
+    # FIXME(nkorobov): rename model in the model cache dir
+    model = 'vicuna_redrafter'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / 'vicuna-7b-v1.3'
@@ -30,7 +30,7 @@ def generate_output(engine: str, output_name: str, max_output_len: int = 8):
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
     data_dir = resources_dir / 'data'
-    input_file = data_dir / 'input_tokens.npy'
+    input_file = data_dir / 'input_vicuna.npy'
     model_data_dir = data_dir / model
     output_dir = model_data_dir / 'sampling'
 
@@ -57,7 +57,7 @@ def generate_output(engine: str, output_name: str, max_output_len: int = 8):
 def generate_outputs():
     print(f'Generating outputs for FP16')
     generate_output(engine='fp16-plugin-packed-paged',
-                    output_name='output_tokens_fp16_plugin_packed_paged',
+                    output_name='output_tokens_long_fp16_plugin_packed_paged',
                     max_output_len=128)
 
 

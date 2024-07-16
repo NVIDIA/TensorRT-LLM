@@ -31,6 +31,7 @@ namespace tc = tensorrt_llm::common;
 
 ITensor::UniquePtr ITensor::slice(SharedPtr tensor, std::size_t offset, std::size_t size)
 {
+    TLLM_CHECK(tensor);
     return std::make_unique<TensorView>(std::move(tensor), offset, size);
 }
 

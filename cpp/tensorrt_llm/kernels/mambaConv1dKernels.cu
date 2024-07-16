@@ -197,9 +197,9 @@ __global__
         || std::is_same_v<T_, __nv_bfloat16>
 #endif
         >
-    mambaConv1dContextKernel(int B_, int L_, int D_, T_* g_mxYa_, T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_,
-        T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_,
-        int const* stateSlotMappingPtr_ = nullptr)
+    mambaConv1dContextKernel(int B_, int L_, int D_, int S_pre_, int S_post_, T_* g_mxYa_, T_* g_mxYs_,
+        T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_, bool applySilu_,
+        int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
 {
     using namespace tensorrt_llm::common;
 
@@ -262,17 +262,20 @@ __global__
     int STEP = 256 * warpL_ * warpD_;
 
     int L = L_;
+    int DS_ = (D_ + S_pre_ + S_post_);
 
-    int aStart = blockIdx.z * L_ * D_;
+    int aIStart = blockIdx.z * L_ * DS_;
+    int aOStart = blockIdx.z * L_ * D_;
     int sStart = blockIdx.z * (K_ - 1) * D_;
     int lStart = blockIdx.y * tileL_;
     int dStart = blockIdx.x * tileD_;
 
     if (removePadding_)
     {
-        aStart = blockIdx.z ? lastTokenIdsPtr_[blockIdx.z - 1] : 0;
-        L = lastTokenIdsPtr_[blockIdx.z] - aStart;
-        aStart = aStart * D_;
+        aIStart = blockIdx.z ? lastTokenIdsPtr_[blockIdx.z - 1] : 0;
+        L = lastTokenIdsPtr_[blockIdx.z] - aIStart;
+        aOStart = aIStart * D_;
+        aIStart = aIStart * DS_;
     }
     else
     {
@@ -295,8 +298,8 @@ __global__
                         + 2
                             * swizzle<tileD_ * 2, tileD_, T_>(
                                 i + thread * 8 + (warpL_ * laneL * pipe_ + 1 - K_) * tileD_),
-                    g_mxXa_ + aStart + (1 - K_ + lStart + thread * 8 / tileD_) * D_ + i * (D_ / tileD_) + dStart
-                        + thread * 8 % tileD_);
+                    g_mxXa_ + aIStart + (1 - K_ + lStart + thread * 8 / tileD_) * DS_ + S_pre_ + i * (D_ / tileD_)
+                        + dStart + thread * 8 % tileD_);
     }
     else if (g_mxXs_)
     {
@@ -331,7 +334,7 @@ __global__
                 if (i + STEP <= warpL_ * laneL * tileD_ || i + thread * 8 < warpL_ * laneL * tileD_)
                     cp_shared_global<16>(
                         b_mxX + 2 * swizzle<tileD_ * 2, tileD_, T_>(i + thread * 8 + iL * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + iL * warpL_ * laneL * D_ + (lStart + thread * 8 / tileD_) * D_
+                        g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 8 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 8 % tileD_);
         }
         else
@@ -341,7 +344,7 @@ __global__
                 if (i + thread * 8 < (L - lStart - iL * warpL_ * laneL) * tileD_)
                     cp_shared_global<16>(
                         b_mxX + 2 * swizzle<tileD_ * 2, tileD_, T_>(i + thread * 8 + iL * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + iL * warpL_ * laneL * D_ + (lStart + thread * 8 / tileD_) * D_
+                        g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 8 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 8 % tileD_);
         }
 
@@ -436,7 +439,7 @@ __global__
                             + 2
                                 * swizzle<tileD_ * 2, tileD_, T_>(
                                     i + thread * 8 + jL % pipe_ * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + jL * warpL_ * laneL * D_ + (lStart + thread * 8 / tileD_) * D_
+                        g_mxXa_ + aIStart + jL * warpL_ * laneL * DS_ + (lStart + thread * 8 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 8 % tileD_);
         }
         else if (jL < tileL_ / (warpL_ * laneL))
@@ -448,14 +451,14 @@ __global__
                             + 2
                                 * swizzle<tileD_ * 2, tileD_, T_>(
                                     i + thread * 8 + jL % pipe_ * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + jL * warpL_ * laneL * D_ + (lStart + thread * 8 / tileD_) * D_
+                        g_mxXa_ + aIStart + jL * warpL_ * laneL * DS_ + (lStart + thread * 8 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 8 % tileD_);
         }
 
         cp_commit_group();
 
         int offset
-            = aStart + iL * warpL_ * laneL * D_ + (lStart + thread * 8 / tileD_) * D_ + dStart + thread * 8 % tileD_;
+            = aOStart + iL * warpL_ * laneL * D_ + (lStart + thread * 8 / tileD_) * D_ + dStart + thread * 8 % tileD_;
 
         if (lStart + (iL + 1) * warpL_ * laneL <= L)
         {
@@ -501,9 +504,9 @@ __global__
 }
 
 template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, typename T_>
-__global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(int B_, int L_, int D_, T_* g_mxYa_,
-    T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_, bool removePadding_,
-    bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
+__global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(int B_, int L_, int D_, int S_pre_,
+    int S_post_, T_* g_mxYa_, T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_,
+    bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
 {
     static_assert(laneD_ >= 1 && laneD_ <= 32 && (laneD_ & (laneD_ - 1)) == 0);
 
@@ -542,17 +545,20 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
     int STEP = 128 * warpL_ * warpD_;
 
     int L = L_;
+    int DS_ = (D_ + S_pre_ + S_post_);
 
-    int aStart = blockIdx.z * L_ * D_;
+    int aIStart = blockIdx.z * L_ * DS_;
+    int aOStart = blockIdx.z * L_ * D_;
     int sStart = blockIdx.z * (K_ - 1) * D_;
     int lStart = blockIdx.y * tileL_;
     int dStart = blockIdx.x * tileD_;
 
     if (removePadding_)
     {
-        aStart = blockIdx.z ? lastTokenIdsPtr_[blockIdx.z - 1] : 0;
-        L = lastTokenIdsPtr_[blockIdx.z] - aStart;
-        aStart = aStart * D_;
+        aIStart = blockIdx.z ? lastTokenIdsPtr_[blockIdx.z - 1] : 0;
+        L = lastTokenIdsPtr_[blockIdx.z] - aIStart;
+        aOStart = aIStart * D_;
+        aIStart = aIStart * DS_;
     }
     else
     {
@@ -575,8 +581,8 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
                         + 4
                             * swizzle<tileD_ * 4, tileD_, T_>(
                                 i + thread * 4 + (warpL_ * laneL * pipe_ + 1 - K_) * tileD_),
-                    g_mxXa_ + aStart + (1 - K_ + lStart + thread * 4 / tileD_) * D_ + i * (D_ / tileD_) + dStart
-                        + thread * 4 % tileD_);
+                    g_mxXa_ + aIStart + (1 - K_ + lStart + thread * 4 / tileD_) * DS_ + S_pre_ + i * (D_ / tileD_)
+                        + dStart + thread * 4 % tileD_);
     }
     else if (g_mxXs_)
     {
@@ -611,7 +617,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
                 if (i + STEP <= warpL_ * laneL * tileD_ || i + thread * 4 < warpL_ * laneL * tileD_)
                     cp_shared_global<16>(
                         b_mxX + 4 * swizzle<tileD_ * 4, tileD_, T_>(i + thread * 4 + iL * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + iL * warpL_ * laneL * D_ + (lStart + thread * 4 / tileD_) * D_
+                        g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 4 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 4 % tileD_);
         }
         else
@@ -621,7 +627,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
                 if (i + thread * 4 < (L - lStart - iL * warpL_ * laneL) * tileD_)
                     cp_shared_global<16>(
                         b_mxX + 4 * swizzle<tileD_ * 4, tileD_, T_>(i + thread * 4 + iL * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + iL * warpL_ * laneL * D_ + (lStart + thread * 4 / tileD_) * D_
+                        g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 4 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 4 % tileD_);
         }
 
@@ -684,7 +690,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
                             + 4
                                 * swizzle<tileD_ * 4, tileD_, T_>(
                                     i + thread * 4 + jL % pipe_ * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + jL * warpL_ * laneL * D_ + (lStart + thread * 4 / tileD_) * D_
+                        g_mxXa_ + aIStart + jL * warpL_ * laneL * DS_ + (lStart + thread * 4 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 4 % tileD_);
         }
         else if (jL < tileL_ / (warpL_ * laneL))
@@ -696,14 +702,14 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
                             + 4
                                 * swizzle<tileD_ * 4, tileD_, T_>(
                                     i + thread * 4 + jL % pipe_ * warpL_ * laneL * tileD_),
-                        g_mxXa_ + aStart + jL * warpL_ * laneL * D_ + (lStart + thread * 4 / tileD_) * D_
+                        g_mxXa_ + aIStart + jL * warpL_ * laneL * DS_ + (lStart + thread * 4 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 4 % tileD_);
         }
 
         cp_commit_group();
 
         int offset
-            = aStart + iL * warpL_ * laneL * D_ + (lStart + thread * 4 / tileD_) * D_ + dStart + thread * 4 % tileD_;
+            = aOStart + iL * warpL_ * laneL * D_ + (lStart + thread * 4 / tileD_) * D_ + dStart + thread * 4 % tileD_;
 
         if (lStart + (iL + 1) * warpL_ * laneL <= L)
         {
@@ -755,6 +761,8 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     int L = params.max_seqlen;
     int D = params.dim;
     int K = params.dconv;
+    int S_pre = params.pre_stride;
+    int S_post = params.post_stride;
 
     int tileL = 32;
     int tileD = 128;
@@ -763,9 +771,9 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     int laneD = 4;
     int pipe = 4;
 
-    void (*f)(int B_, int L_, int D_, input_t* g_mxYa_, input_t* g_mxYs_, input_t const* g_mxXa_,
-        input_t const* g_mxXs_, input_t const* g_mxW_, input_t const* g_mxB_, bool removePadding_, bool applySilu_,
-        int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_);
+    void (*f)(int B_, int L_, int D_, int S_pre_, int S_post_, input_t* g_mxYa_, input_t* g_mxYs_,
+        input_t const* g_mxXa_, input_t const* g_mxXs_, input_t const* g_mxW_, input_t const* g_mxB_,
+        bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_);
 
     if (std::is_same_v<input_t, float>)
     {
@@ -1071,7 +1079,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
 
     cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
 
-    f<<<blks, thds, shmem, stream>>>(B, L, D, ya, ys, xa, xs, w, b, rmpd, silu, ltip, ssmp);
+    f<<<blks, thds, shmem, stream>>>(B, L, D, S_pre, S_post, ya, ys, xa, xs, w, b, rmpd, silu, ltip, ssmp);
 }
 
 template <typename input_t, int DCONV = 4, int CHANNELS_PER_THREAD = 4>
@@ -1088,6 +1096,7 @@ __launch_bounds__(64, 8) __global__
     int num_channels = params.dim;
     int const micro_batch = blockIdx.y;
     int const channel = (blockIdx.x * blockDim.x + threadIdx.x) * CHANNELS_PER_THREAD;
+    int const num_channels_in = num_channels + params.pre_stride + params.post_stride;
 
     if (channel >= num_channels)
     {
@@ -1096,7 +1105,7 @@ __launch_bounds__(64, 8) __global__
 
     weight += channel;
     bias += channel;
-    input += channel;
+    input += (channel + params.pre_stride);
     output += channel;
     state_in += channel;
     state_out += channel;
@@ -1119,7 +1128,7 @@ __launch_bounds__(64, 8) __global__
          ++sample)
     {
         int const slot_idx = params.state_slot_mapping_ptr == nullptr ? sample : params.state_slot_mapping_ptr[sample];
-        input_t* token_input = input + sample * params.dim;
+        input_t* token_input = input + sample * num_channels_in;
         input_t* token_output = output + sample * params.dim;
         input_t* token_state_in = state_in + slot_idx * (params.dconv - 1) * params.dim;
         input_t* token_state_out = state_out + slot_idx * (params.dconv - 1) * params.dim;

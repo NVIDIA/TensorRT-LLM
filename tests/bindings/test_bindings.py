@@ -2,7 +2,7 @@ import json
 import pickle
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -315,8 +315,8 @@ def test_llm_request():
     llm_request.pause(0)
     assert llm_request.state == _tb.LlmRequestState.REQUEST_STATE_CONTEXT_INIT
 
-    llm_request.max_sent_token_pos = 1
-    assert llm_request.max_sent_token_pos == 1
+    llm_request.max_sent_token_len = 1
+    assert llm_request.max_sent_token_len == 1
 
     assert llm_request.return_log_probs
     llm_request.set_log_probs([0.1], 0)
@@ -343,7 +343,7 @@ def test_inference_request():
     input_ids = torch.tensor((10, 10))
 
     def logits_post_processor(req_id: int, logits: torch.Tensor,
-                              ids: List[List[int]]):
+                              ids: List[List[int]], client_id: Optional[int]):
         del req_id, ids
 
     ir = _tb.InferenceRequest(42, logits_post_processor)

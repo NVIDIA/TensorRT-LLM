@@ -41,30 +41,32 @@ public:
     class Inputs
     {
     public:
-        //! [batchSize]
+        //! [maxBatchSize]
         TensorPtr temperatures;
-        //! [batchSize]
+        //! [maxBatchSize]
         TensorPtr positionIdsBase;
-        //! [batchSize] or [numGenSequences]
+        //! [maxBatchSize] or [numGenSequences]
         TensorPtr generationLengths;
-        //! [batchSize]
+        //! [maxBatchSize]
         TensorPtr randomDataSample;
-        //! [batchSize, maxNumPaths, maxPathDraftLen] or [numGenSequences, maxNumPaths, maxPathDraftLen]
+        //! [maxBatchSize, maxNumPaths, maxPathDraftLen] or [numGenSequences, maxNumPaths, maxPathDraftLen]
         TensorPtr randomDataValidation;
-        //! [batchSize, maxNumPaths, maxPathLen] or [numGenSequences, maxNumPaths, maxPathLen]
+        //! [maxBatchSize, maxNumPaths, maxPathLen] or [numGenSequences, maxNumPaths, maxPathLen]
         TensorPtr draftTokens;
-        //! [batchSize, maxNumPaths, maxPathLen] or [numGenSequences, maxNumPaths, maxPathLen]
+        //! [maxBatchSize, maxNumPaths, maxPathLen] or [numGenSequences, maxNumPaths, maxPathLen]
         TensorPtr draftIndices;
-        //! [batchSize, maxNumPaths, maxPathDraftLen, vocabSize]
+        //! [maxBatchSize, maxNumPaths, maxPathDraftLen, vocabSize]
         //! or [numGenSequences, maxNumPaths, maxPathDraftLen, vocabSize]
         TensorPtr draftProbs;
-        //! [batchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
+        //! [maxBatchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         //! or [numGenSequences, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         TensorPtr packedMasks;
-        //! [batchSize] or [numGenSequences]
+        //! [maxBatchSize] or [numGenSequences]
         TensorPtr positionIds;
         // [1], on pinned
         TensorPtr maxGenLengthHost;
+        // [maxBatchSize]
+        TensorPtr generationLengthsHost;
 
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);

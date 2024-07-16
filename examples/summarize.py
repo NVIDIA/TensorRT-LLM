@@ -119,6 +119,9 @@ def main(args):
     max_attention_window_size = args.max_attention_window_size
     sink_token_length = args.sink_token_length
 
+    if args.end_id:
+        end_id = args.end_id
+
     stop_words_list = None
     if args.stop_words:
         stop_words_list = tensorrt_llm.runtime.decode_words_list(
@@ -415,6 +418,10 @@ def main(args):
                 "Python bindings of C++ session is unavailable, fallback to Python session."
             )
             args.use_py_session = True
+        if args.return_all_generated_tokens:
+            raise ValueError(
+                "Returning all the generated tokens at each step is not supported in summarize.py"
+            )
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,

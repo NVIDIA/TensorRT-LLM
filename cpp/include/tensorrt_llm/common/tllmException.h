@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/stringUtils.h"
-
 #include <array>
 #include <cstddef>
 #include <stdexcept>

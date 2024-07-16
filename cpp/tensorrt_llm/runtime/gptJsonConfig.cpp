@@ -340,10 +340,15 @@ GptJsonConfig parseJson(InputType&& input)
 
     if (engineVersionNone)
     {
-        if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))
+        if (name == std::string("chatglm_6b"))
+        {
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kChatGlm);
+            // kChatGlm is only for ChatGLM-6B
+        }
+        if (name == std::string("glm_10b"))
         {
             modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
-            // kGlm is only for ChatGLM-6B and GLM-10B
+            // kGlm is only for GLM-10B
         }
     }
     else
@@ -352,10 +357,15 @@ GptJsonConfig parseJson(InputType&& input)
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
             auto const chatglmVersion = pretrainedConfig.at("chatglm_version").template get<std::string>();
-            if (chatglmVersion == "glm" || chatglmVersion == "chatglm")
+            if (chatglmVersion == "chatglm")
+            {
+                modelConfig.setModelVariant(ModelConfig::ModelVariant::kChatGlm);
+                // kChatGlm is only for ChatGLM-6B
+            }
+            if (chatglmVersion == "glm")
             {
                 modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
-                // kGlm is only for ChatGLM-6B and GLM-10B
+                // kGlm is only for GLM-10B
             }
         }
     }
@@ -368,8 +378,8 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& pretrainedConfig = json.at("pretrained_config");
 
             // TODO(rkobus): adjust param names
-            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "explicit_num_beams", 0);
-            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "explicit_draft_len_per_beam", 0);
+            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "redrafter_num_beams", 0);
+            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "redrafter_draft_len_per_beam", 0);
             auto const maxDraftLen = maxNumPaths * maxDraftPathLen;
 
             auto explicitDraftTokensModule

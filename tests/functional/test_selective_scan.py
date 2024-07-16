@@ -264,12 +264,12 @@ class TestFunctional(unittest.TestCase):
                                    atol=dtype_atol[dtype])
 
     @parameterized.expand(list(
-        product([2048], [64], ['context', 'generation'],
+        product([2048], [64], [1, 4], ['context', 'generation'],
                 ['float32', 'float16', 'bfloat16'], [3], [16], [True, False],
                 [True, False])),
                           name_func=unittest_name_func)
-    def test_selective_scan_v2(self, dim, headdim, req_type, dtype, batch_size,
-                               max_seq_len, has_z, remove_padding):
+    def test_selective_scan_v2(self, dim, headdim, ngroups, req_type, dtype,
+                               batch_size, max_seq_len, has_z, remove_padding):
 
         # Skip tests that are not supported
         skip_bf16_pre_ampere(dtype)
@@ -285,7 +285,6 @@ class TestFunctional(unittest.TestCase):
         dstate = 128
         chunk_size = 256
         nheads = dim // headdim
-        ngroups = 1
         delta_softplus = True
         mean = 0.0
         std_dev = 0.5 if dtype == "float32" else 0.1
@@ -340,6 +339,13 @@ class TestFunctional(unittest.TestCase):
             BC = BC.view(-1, seq_len, ngroups * dstate * 2)
             if has_z:
                 z = z.view(-1, seq_len, dim)
+        xBC = torch.concat([x, BC], dim=-1).contiguous()
+        if has_z:
+            zxBCdt = torch.concat([z, torch.randn_like(xBC), dt],
+                                  dim=-1).contiguous()
+        else:
+            zxBCdt = torch.concat([torch.randn_like(xBC), dt],
+                                  dim=-1).contiguous()
         output = torch.zeros(x.shape,
                              device=device,
                              dtype=str_dtype_to_torch(dtype))
@@ -364,13 +370,13 @@ class TestFunctional(unittest.TestCase):
         net.plugin_config.paged_state = False
         with tensorrt_llm.net_guard(net):
             x_tensor = Tensor(name='input',
-                              shape=x.shape,
+                              shape=xBC.shape,
                               dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             state_tensor = Tensor(name='state',
                                   shape=state.shape,
                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             dt_tensor = Tensor(name='delta',
-                               shape=dt.shape,
+                               shape=zxBCdt.shape,
                                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             dt_bias_tensor = Tensor(
                 name='delta_bias',
@@ -380,14 +386,14 @@ class TestFunctional(unittest.TestCase):
                               shape=A.shape,
                               dtype=tensorrt_llm.str_dtype_to_trt('float32'))
             BC_tensor = Tensor(name='BC',
-                               shape=BC.shape,
+                               shape=xBC.shape,
                                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             D_tensor = Tensor(name='D',
                               shape=D.shape,
                               dtype=tensorrt_llm.str_dtype_to_trt('float32'))
             if has_z:
                 z_tensor = Tensor(name='z',
-                                  shape=z.shape,
+                                  shape=zxBCdt.shape,
                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             host_request_types_tensor = Tensor(
                 name='host_request_types',
@@ -433,12 +439,12 @@ class TestFunctional(unittest.TestCase):
 
         # trt run
         inputs = {
-            'input': x,
+            'input': xBC,
             'state': state,
-            'delta': dt,
+            'delta': zxBCdt,
             'delta_bias': dt_bias,
             'A': A,
-            'BC': BC,
+            'BC': xBC,
             'D': D,
             'host_request_types': host_request_types,
             'last_token_ids': last_token_ids
@@ -446,7 +452,7 @@ class TestFunctional(unittest.TestCase):
         if remove_padding:
             inputs['host_context_lengths'] = host_context_lengths
         if has_z:
-            inputs['z'] = z
+            inputs['z'] = zxBCdt
         inputs
         outputs = {'output': output, 'present_state': state}
         stream = torch.cuda.current_stream()

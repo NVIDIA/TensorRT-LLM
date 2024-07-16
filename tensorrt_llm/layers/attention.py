@@ -177,10 +177,14 @@ class AttentionParams(object):
 class SpecDecodingParams:
 
     def __init__(self,
+                 spec_decoding_is_generation_length_variable: bool = False,
+                 spec_decoding_max_generation_length: int = 1,
                  spec_decoding_generation_lengths: Tensor = None,
                  spec_decoding_position_offsets: Tensor = None,
                  spec_decoding_packed_mask: Tensor = None):
 
+        self.spec_decoding_is_generation_length_variable = spec_decoding_is_generation_length_variable
+        self.spec_decoding_max_generation_length = spec_decoding_max_generation_length
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
@@ -827,6 +831,10 @@ class Attention(Module):
                 max_distance=self.max_distance,
                 host_context_lengths=attention_params.host_context_lengths,
                 use_cache=use_cache,
+                spec_decoding_is_generation_length_variable=spec_decoding_params
+                .spec_decoding_is_generation_length_variable,
+                spec_decoding_max_generation_length=spec_decoding_params.
+                spec_decoding_max_generation_length,
                 spec_decoding_generation_lengths=spec_decoding_params.
                 spec_decoding_generation_lengths,
                 spec_decoding_position_offsets=spec_decoding_params.
@@ -976,7 +984,9 @@ class Attention(Module):
             if past_key_value is not None and not self.cross_attention:
                 if self.kv_cache_scaling_factor is not None:
                     past_key_value = dequantize(
-                        past_key_value, self.kv_cache_scaling_factor.value)
+                        past_key_value,
+                        self.kv_cache_scaling_factor.value,
+                        output_type=self.dtype)
 
                 # past_key_value [bs, 2, num_heads, max_seq_len, head_dim]
                 past_key, past_value = split(past_key_value, 1, dim=1)

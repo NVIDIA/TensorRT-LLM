@@ -94,7 +94,8 @@ public:
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
         bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
-        bool is_spec_decoding_enabled = false);
+        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
+        int spec_decoding_max_generation_length = 1);
 
     GPTAttentionPlugin(void const* data, size_t length);
 

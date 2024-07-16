@@ -40,10 +40,11 @@ public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
-        kMamba = 2,          // https://github.com/state-spaces/mamba
-        kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
-        kEncDec = 4,
+        kChatGlm = 1,        // https://github.com/THUDM/ChatGLM-6B
+        kGlm = 2,            // https://github.com/THUDM/GLM
+        kMamba = 3,          // https://github.com/state-spaces/mamba
+        kRecurrentGemma = 4, // https://github.com/google-deepmind/recurrentgemma
+        kEncDec = 5,
     };
 
     struct RnnConfig
@@ -526,7 +527,7 @@ public:
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
     {
         return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm
-            || mModelVariant == ModelVariant::kRecurrentGemma;
+            || mModelVariant == ModelVariant::kChatGlm || mModelVariant == ModelVariant::kRecurrentGemma;
     }
 
     [[nodiscard]] bool hasRnnConfig() const noexcept

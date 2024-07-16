@@ -85,6 +85,8 @@ class GPTDecoderLayer(Module):
         local_layer_idx = layer_idx - layers_range[0]
         inner_layernorm = config.inner_layernorm if hasattr(
             config, "inner_layernorm") else False
+        attention_head_size = config.head_size if hasattr(config,
+                                                          "head_size") else None
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -96,6 +98,7 @@ class GPTDecoderLayer(Module):
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
+            attention_head_size=attention_head_size,
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_percentage=config.rotary_pct,
             rotary_embedding_base=config.rotary_base,

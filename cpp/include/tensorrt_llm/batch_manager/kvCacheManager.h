@@ -375,6 +375,11 @@ public:
         return mSecondaryPool;
     }
 
+    [[nodiscard]] SizeType32 getNumLayers() const
+    {
+        return mNumLayers;
+    }
+
     //! \brief Get index in pool to K or V block.
     //! \param blockId the blockId as returned by getBlockId()
     //! \param fieldIdx either 0 (K) or 1 (V),
@@ -592,6 +597,8 @@ public:
     void removeToken(SizeType32 seqSlotIdx);
     void rewindKVCache(SizeType32 seqSlotIdx, SizeType32 rewindLengths);
 
+    [[nodiscard]] GenerationRequest const& getSequence(SizeType32 seqSlotIdx) const;
+
     [[nodiscard]] bool isCrossKv() const
     {
         return mCacheType == CacheType::kCROSS;
@@ -634,4 +641,5 @@ private:
     // KV cache type (self or cross)
     CacheType mCacheType;
 };
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

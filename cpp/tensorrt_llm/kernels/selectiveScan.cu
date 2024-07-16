@@ -370,9 +370,8 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
         float const* mxdb = (float const*) params.delta_bias_ptr;
         float const* mxA = (float const*) params.A_ptr;
         half* mxCB = (half*) params.CB_ptr;
-        half const* mxBC = (half const*) params.BC_ptr;
         float const* mxD = (float const*) params.D_ptr;
-        half const* mxX = (half const*) params.u_ptr;
+        half const* mxXBC = (half const*) params.u_ptr;
         half const* mxZ = (half const*) params.z_ptr;
 
         auto rp = params.remove_padding;
@@ -380,16 +379,16 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
         auto ssmp = params.slot_mapping_ptr;
 
         cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
-        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, mxdc, mxdA, mxdt, mxdb, mxA, rp, ltip);
+        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, P, G, N, mxdc, mxdA, mxdt, mxdb, mxA, mxZ, rp, ltip);
         cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
-        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxBC, mxX, rp, ltip);
+        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxXBC, rp, ltip);
         cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
         state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
         cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
-        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, G, N, mxCB, mxBC, rp, ltip);
+        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, H, P, G, N, mxCB, mxXBC, rp, ltip);
         cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
         chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
-            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxBC, mxD, mxX, mxZ, rp, ltip);
+            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxD, mxXBC, mxZ, rp, ltip);
     }
     else if constexpr (std::is_same_v<input_t, __nv_bfloat16>)
     {
@@ -413,9 +412,8 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
         float const* mxdb = (float const*) params.delta_bias_ptr;
         float const* mxA = (float const*) params.A_ptr;
         __nv_bfloat16* mxCB = (__nv_bfloat16*) params.CB_ptr;
-        __nv_bfloat16 const* mxBC = (__nv_bfloat16 const*) params.BC_ptr;
         float const* mxD = (float const*) params.D_ptr;
-        __nv_bfloat16 const* mxX = (__nv_bfloat16 const*) params.u_ptr;
+        __nv_bfloat16 const* mxXBC = (__nv_bfloat16 const*) params.u_ptr;
         __nv_bfloat16 const* mxZ = (__nv_bfloat16 const*) params.z_ptr;
 
         auto rp = params.remove_padding;
@@ -423,16 +421,16 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
         auto ssmp = params.slot_mapping_ptr;
 
         cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
-        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, mxdc, mxdA, mxdt, mxdb, mxA, rp, ltip);
+        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, P, G, N, mxdc, mxdA, mxdt, mxdb, mxA, mxZ, rp, ltip);
         cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
-        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxBC, mxX, rp, ltip);
+        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxXBC, rp, ltip);
         cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
         state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
         cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
-        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, G, N, mxCB, mxBC, rp, ltip);
+        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, H, P, G, N, mxCB, mxXBC, rp, ltip);
         cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
         chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
-            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxBC, mxD, mxX, mxZ, rp, ltip);
+            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxD, mxXBC, mxZ, rp, ltip);
     }
 }
 
@@ -458,7 +456,8 @@ INSTANTIATE_CHUNK_SCAN_DATA_TYPE(__nv_bfloat16, float);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, bool MAMBA_V1 = true>
+template <typename input_t, typename weight_t, int DSTATE = 16, int CHANNELS_PER_BLOCK = 128, bool MAMBA_V1 = true,
+    int STATE_UNROLL = 16>
 __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParamsBase params)
 {
 
@@ -485,24 +484,43 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     int const head = channel / head_dim;
     int const head_chl = channel % head_dim;
     int const group = head / (nheads / ngroups);
+
     int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
-    int const bc_offset = MAMBA_V1 ? sample * (DSTATE * 2 + params.dt_rank) : sample * DSTATE * ngroups * 2;
-    int const b_offset = MAMBA_V1 ? params.dt_rank : DSTATE * group;
-    int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : DSTATE * (ngroups + group);
+    int const dt_d_idx = MAMBA_V1 ? channel : head;
+    int const bc_dim = MAMBA_V1 ? 2 * DSTATE : 2 * ngroups * DSTATE;
+    int const x_dim = MAMBA_V1 ? num_channels : num_channels + bc_dim;
+    int const z_dim = MAMBA_V1 ? num_channels : 2 * num_channels + bc_dim + nheads;
+    int const dt_dim = MAMBA_V1 ? num_channels : (z ? z_dim : z_dim - num_channels);
+    int const dt_offset = MAMBA_V1 ? sample * dt_dim : sample * dt_dim + dt_dim - nheads;
+    int const bc_offset = MAMBA_V1 ? sample * (bc_dim + params.dt_rank) : sample * (num_channels + bc_dim);
+    int const b_offset = MAMBA_V1 ? params.dt_rank : num_channels + DSTATE * group;
+    int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : num_channels + DSTATE * (ngroups + group);
 
     input_t* my_state = &state[slot_idx * num_channels * DSTATE];
     input_t* my_output = &output[sample * num_channels];
 
-    float rA[DSTATE];
-    float rB[DSTATE];
-    float rC[DSTATE];
-    float rState[DSTATE];
-    float my_x, my_dt, my_z, my_dt_bias, my_D;
-    my_x = toFloat(x[sample * num_channels + channel]);
-    my_z = z ? toFloat(z[sample * num_channels + channel]) : 0.f;
+    int const state_loops = (DSTATE + STATE_UNROLL - 1) / STATE_UNROLL;
+
+    float my_x, my_dt, my_z, my_dt_bias, out;
+    my_x = toFloat(x[sample * x_dim + channel]);
+    my_z = z ? toFloat(z[sample * z_dim + channel]) : 0.f;
+    my_dt = toFloat(dt[dt_offset + dt_d_idx]);
+    my_dt_bias = dt_bias ? toFloat(dt_bias[dt_d_idx]) : 0.f;
+    out = D ? toFloat(D[dt_d_idx]) * my_x : 0.f;
+
+    float dt_b = my_dt + my_dt_bias;
+    float dt_b_sp = 1.0f;
+    if (dt_softplus)
+    {
+        dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
+    }
 
     if (MAMBA_V1)
     {
+        float rA[DSTATE];
+        float rB[DSTATE];
+        float rC[DSTATE];
+        float rState[DSTATE];
 #pragma unroll
         for (int i = 0; i < DSTATE; i++)
         {
@@ -511,49 +529,48 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
             rC[i] = toFloat(C[bc_offset + c_offset + i]);
             rState[i] = toFloat(my_state[i * num_channels + channel]);
         }
-        my_dt = toFloat(dt[sample * num_channels + channel]);
-        my_dt_bias = dt_bias ? toFloat(dt_bias[channel]) : 0.f;
-        my_D = D ? toFloat(D[channel]) : 0.f;
+#pragma unroll
+        for (int i = 0; i < DSTATE; i++)
+        {
+            float dA = __expf(rA[i] * dt_b_sp);
+            float dB = rB[i] * dt_b_sp;
+            float sdA = rState[i] * dA;
+            float dBx = dB * my_x;
+            float newState = sdA + dBx;
+            // Write the new state back out to the cache
+            convertAndStore(&my_state[i * num_channels + channel], newState);
+            out += newState * rC[i];
+        }
     }
     else
     {
         float A_tmp = toFloat(A[head]);
-#pragma unroll
-        for (int i = 0; i < DSTATE; i++)
+        float rB[STATE_UNROLL];
+        float rC[STATE_UNROLL];
+        float rState[STATE_UNROLL];
+        for (int si = 0; si < state_loops; si++)
         {
-            rA[i] = A_tmp;
-            rB[i] = toFloat(B[bc_offset + b_offset + i]);
-            rC[i] = toFloat(C[bc_offset + c_offset + i]);
-            rState[i] = toFloat(my_state[(head * DSTATE + i) * head_dim + head_chl]);
-        }
-        my_dt = toFloat(dt[sample * nheads + head]);
-        my_dt_bias = dt_bias ? toFloat(dt_bias[head]) : 0.f;
-        my_D = D ? toFloat(D[head]) : 0.f;
-    }
-
-    float dt_b = my_dt + my_dt_bias;
-    float dt_b_sp;
-    if (dt_softplus)
-    {
-        dt_b_sp = dt_b <= 20.f ? __logf(1.f + __expf(dt_b)) : dt_b; // softplus
-    }
-
-    float out = D ? my_D * my_x : 0.f;
-
+            int i_offset = si * STATE_UNROLL;
 #pragma unroll
-    for (int i = 0; i < DSTATE; i++)
-    {
-        float dA = __expf(rA[i] * dt_b_sp);
-        float dB = rB[i] * dt_b_sp;
-        float sdA = rState[i] * dA;
-        float dBx = dB * my_x;
-        float newState = sdA + dBx;
-        // Write the new state back out to the cache
-        if (MAMBA_V1)
-            convertAndStore(&my_state[i * num_channels + channel], newState);
-        else
-            convertAndStore(&my_state[(head * DSTATE + i) * head_dim + head_chl], newState);
-        out += newState * rC[i];
+            for (int i = 0; i < STATE_UNROLL; i++)
+            {
+                rB[i] = toFloat(B[bc_offset + b_offset + i_offset + i]);
+                rC[i] = toFloat(C[bc_offset + c_offset + i_offset + i]);
+                rState[i] = toFloat(my_state[(head * DSTATE + i_offset + i) * head_dim + head_chl]);
+            }
+#pragma unroll
+            for (int i = 0; i < STATE_UNROLL; i++)
+            {
+                float dA = __expf(A_tmp * dt_b_sp);
+                float dB = rB[i] * dt_b_sp;
+                float sdA = rState[i] * dA;
+                float dBx = dB * my_x;
+                float newState = sdA + dBx;
+                // Write the new state back out to the cache
+                convertAndStore(&my_state[(head * DSTATE + i_offset + i) * head_dim + head_chl], newState);
+                out += newState * rC[i];
+            }
+        }
     }
 
     if (z)

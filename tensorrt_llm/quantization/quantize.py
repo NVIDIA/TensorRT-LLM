@@ -3,6 +3,7 @@ import fnmatch
 from .._utils import get_init_params
 from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
                       LayerNorm, RmsNorm, RowLinear)
+from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import QuantConfig
 from ..parameter import Parameter
 from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
@@ -12,7 +13,7 @@ from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
                      WeightOnlyQuantRowLinear)
-from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo
+from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
 
 
 def quantize_layers(
@@ -35,6 +36,16 @@ def quantize_layers(
         for exclude_module in exclude_modules:
             if fnmatch.fnmatchcase(name, exclude_module):
                 is_excluded = True
+                # MOE module will be quantize when initialization.
+                # We need to re-initialize a FP version of MOE module.
+                if isinstance(module, MixtureOfExperts):
+                    init_params = get_init_params(module, MixtureOfExperts)
+                    init_params["quant_mode"] = QuantMode(0)
+                    original_layer = MixtureOfExperts(**init_params)
+                    if parent is not None:
+                        setattr(parent, module_name, original_layer)
+                    else:
+                        model = original_layer
                 break
         if not is_excluded:
             quant_cls = None

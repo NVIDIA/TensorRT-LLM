@@ -720,6 +720,13 @@ def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def int_clip(input: Tensor, lower: int, upper: int) -> Tensor:
+    assert lower <= upper, f"Lower bound must be less than or equal to upper bound i.e. {lower} <= {upper}"
+    res = minimum(input, upper)
+    res = maximum(res, lower)
+    return res
+
+
 def clip(input: Tensor, alpha: float, beta: float) -> Tensor:
     '''
     Add a CLIP operation that sets the range to [alpha, beta].
@@ -1397,7 +1404,7 @@ def arange(start: Union[Tensor, int], end: Union[Tensor, int],
     step = constant_to_tensor_(1, dtype=start.dtype, to_array=True)
 
     num = end - start
-    num = num.view([1])
+    num = num.view([1]).cast(trt.int64)
 
     layer = default_trtnet().add_fill([0], trt.FillOperation.LINSPACE,
                                       start.dtype)
@@ -1669,7 +1676,9 @@ def flatten(input: Tensor, start_dim: int = 0, end_dim: int = -1):
     return view(input, new_shape)
 
 
-def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
+def expand_dims(input: Tensor,
+                dim: Union[int, Sequence[int]],
+                shape_cast_dtype=None) -> Tensor:
     '''
     Add an operation to expand the tensor shape with singleton dimensions.
 
@@ -1706,7 +1715,7 @@ def expand_dims(input: Tensor, dim: Union[int, Sequence[int]]) -> Tensor:
 
     out_ndim = len(dim) + input.ndim()
 
-    input_shape = cast(shape(input), 'int32')
+    input_shape = shape(input, cast_to_dtype=shape_cast_dtype)
     out_shapes = []
     j = 0
     for i in range(out_ndim):
@@ -1761,8 +1770,8 @@ def squeeze(input: Tensor,
             continue
         new_shape.append(shape(input, i))
 
-    input = input.view(concat(new_shape),
-                       zero_is_placeholder=zero_is_placeholder)
+    new_shape = concat(new_shape) if len(new_shape) > 0 else []
+    input = input.view(new_shape, zero_is_placeholder=zero_is_placeholder)
     return input
 
 
@@ -1892,7 +1901,10 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
 
 # If dim is None, return a 1-D TensorRT-LLM tensor of the size
 # If dim is not None, return a 0-D TensorRT-LLM tensor of the dimension size
-def shape(input: Tensor, dim: Optional[int] = None) -> Tensor:
+def shape(input: Tensor,
+          dim: Optional[int] = None,
+          cast_to_dtype: Optional[Union[str, trt.DataType]] = None,
+          clip_before_cast: Sequence[int] = None) -> Tensor:
     '''
     Add an operation to create a shape tensor.
 
@@ -1917,6 +1929,14 @@ def shape(input: Tensor, dim: Optional[int] = None) -> Tensor:
     '''
     layer = default_trtnet().add_shape(input.trt_tensor)
     res = _create_tensor(layer.get_output(0), layer)
+    if cast_to_dtype is not None:
+        if clip_before_cast is not None and (cast_to_dtype == 'int32'
+                                             or cast_to_dtype == trt.int32):
+            assert len(
+                clip_before_cast
+            ) == 2, f"This parameter only expects a tuple of 2 integers (lower, upper) but got {clip_before_cast}"
+            res = int_clip(res, clip_before_cast[0], clip_before_cast[1])
+        res = cast(res, cast_to_dtype)
 
     if dim is None:
         return res
@@ -2281,7 +2301,7 @@ def cumsum(input: Tensor, dim: int, prefer_plugin: bool = True) -> Tensor:
 
     dim = dim_resolve_negative(dim, input.ndim())[0]
 
-    if (dim == input.ndim() - 1):
+    if dim == input.ndim() - 1:
         if prefer_plugin:
             last_dim = input.size(-1)
             if last_dim == -1:  # dynamic?
@@ -2448,6 +2468,9 @@ def concat(inputs: Sequence[Union[Tensor, int]], dim: int = 0) -> Tensor:
     Returns:
         A tensor that contains the concatenation of the tensors.
     '''
+    assert len(
+        inputs
+    ) > 0, f"Number of inputs ({len(inputs)}) to the concatenation layer must be > 0."
     tmp = []
     inputs = constants_to_tensors_(*inputs)
     for i in inputs:
@@ -4478,6 +4501,8 @@ def gpt_attention(
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
     qkv_bias: Optional[Tensor] = None,
     use_cache: bool = True,
+    spec_decoding_is_generation_length_variable: bool = False,
+    spec_decoding_max_generation_length: int = 0,
     spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
@@ -4681,6 +4706,14 @@ def gpt_attention(
         use_cache: bool = False
             Do we need to store kv cache ? not needed if there is no generation phase.
 
+        spec_decoding_is_generation_length_variable: bool = False,
+            Whether the generation lengths can be different for each sequence in a batch.
+            For Medusa, this should be set False.
+            For Redrafter, this should be set to True.
+
+        spec_decoding_max_generation_length: int = 1,
+            The maximum number of tokens possible in the generation phase per sequence.
+
         spec_decoding_generation_lengths: Tensor = None,
             The generation phase tokens' lengths for each sequence.
             Shape: [batch_size]
@@ -4691,7 +4724,11 @@ def gpt_attention(
 
         spec_decoding_packed_mask: Tensor = None,
             The speculative decoding tokens's attention mask (packed into uint32_t bits).
-            Shape: [batch_size, num_draft_tokens + 1, divUp(num_draft_tokens + 1, 32)].
+            remove_input_padding is False:
+                Shape: [batch_size, num_draft_tokens + 1, divUp(num_draft_tokens + 1, 32)].
+            remove_input_padding is True:
+                Shape: [sum(spec_decoding_generation_lengths), divUp(num_draft_tokens + 1, 32)].
+
 
     Returns:
         The tensor produced by that layer.
@@ -4789,6 +4826,14 @@ def gpt_attention(
         "is_spec_decoding_enabled",
         np.array(np.int8(spec_decoding_packed_mask is not None), dtype=np.int8),
         trt.PluginFieldType.INT8)
+    spec_decoding_is_generation_length_variable = trt.PluginField(
+        "spec_decoding_is_generation_length_variable",
+        np.array(np.int8(spec_decoding_is_generation_length_variable),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    spec_decoding_max_generation_length = trt.PluginField(
+        "spec_decoding_max_generation_length",
+        np.array(spec_decoding_max_generation_length, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     p_dtype = default_net().plugin_config.gpt_attention_plugin
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -4887,7 +4932,9 @@ def gpt_attention(
         paged_kv_cache, tokens_per_block, pf_type, max_context_length,
         qkv_bias_enabled, do_cross_attention_field, max_distance,
         pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
-        use_fp8_context_fmha_field, use_cache_pf, is_spec_decoding_enabled
+        use_fp8_context_fmha_field, use_cache_pf, is_spec_decoding_enabled,
+        spec_decoding_is_generation_length_variable,
+        spec_decoding_max_generation_length
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5062,6 +5109,7 @@ def layer_norm(input: Tensor,
 
 def rms_norm(input: Tensor,
              normalized_shape: Union[int, Tuple[int]],
+             num_groups: int = 1,
              weight: Optional[Tensor] = None,
              eps: float = 1e-06) -> Tensor:
     '''
@@ -5084,6 +5132,9 @@ def rms_norm(input: Tensor,
             The shape of the sub-tensor that is normalized. Use 'hidden_dim' to
             normalize the inner-most dimension of an activation tensor in LLMs.
 
+        num_groups: int = 1
+            The group size.
+
         weight : Optional[Tensor] = None
             The 'gamma' term in layer-norm. Its shape must be
             'normalized_shape'.
@@ -5098,6 +5149,15 @@ def rms_norm(input: Tensor,
 
     dim = tuple([-i - 1 for i in range(len(normalized_shape))])
 
+    if num_groups > 1:
+        assert len(normalized_shape) == 1
+        num_channels = input.size()[-1]
+        ndim = input.ndim()
+        old_shape = shape(input)
+        new_shape = concat([input.size(i) for i in range(ndim - 1)] +
+                           [num_groups, num_channels // num_groups])
+        input = input.view(new_shape)
+
     with precision("float32"):
         input_dtype = input.dtype
         fp32_input = cast(input, "float32")
@@ -5108,6 +5168,9 @@ def rms_norm(input: Tensor,
         denom = denom.sqrt()
         fp32_y = fp32_input / denom
         y = cast(fp32_y, input_dtype)
+
+    if num_groups > 1:
+        y = y.view(old_shape)
 
     if weight is not None:
         y = y * weight
@@ -5536,6 +5599,8 @@ def mamba_conv1d(input: Tensor,
                  dim: int,
                  dconv: int,
                  dtype: str,
+                 pre_stride: int = 0,
+                 post_stride: int = 0,
                  host_context_lengths: Optional[Tensor] = None,
                  slot_mapping: Optional[Tensor] = None,
                  apply_silu: bool = True):
@@ -5572,6 +5637,14 @@ def mamba_conv1d(input: Tensor,
         dtype: str
             data type
 
+        pre_stride : int = 0
+            The (pre) stride size of the input tensor.
+            The valid values of the input tensor are input[..., pre_stride: dim-post_stride]
+
+        post_stride : int = 0
+            The (post) stride size of the input tensor.
+            The valid values of the input tensor are input[..., pre_stride: dim-post_stride]
+
         host_context_lengths: Tensor (On CPU) (Optional)
             A host tensor that contains the lengths of the different inputs,
 
@@ -5591,6 +5664,12 @@ def mamba_conv1d(input: Tensor,
                           trt.PluginFieldType.INT32)
     dconv = trt.PluginField("dconv", np.array(dconv, dtype=np.int32),
                             trt.PluginFieldType.INT32)
+    pre_stride = trt.PluginField("pre_stride",
+                                 np.array(pre_stride, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    post_stride = trt.PluginField("post_stride",
+                                  np.array(post_stride, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
         trt.PluginFieldType.INT32)
@@ -5606,8 +5685,10 @@ def mamba_conv1d(input: Tensor,
                                  np.array(np.int8(apply_silu), dtype=np.int8),
                                  trt.PluginFieldType.INT8)
 
-    pfc = trt.PluginFieldCollection(
-        [dim, dconv, pf_type, remove_input_padding, paged_state, apply_silu])
+    pfc = trt.PluginFieldCollection([
+        dim, dconv, pre_stride, post_stride, pf_type, remove_input_padding,
+        paged_state, apply_silu
+    ])
     mamba_conv1d_plug = mamba_conv1d_plg_creator.create_plugin(
         "mamba_conv1d", pfc)
     plug_inputs = [

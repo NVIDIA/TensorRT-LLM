@@ -19,7 +19,12 @@ import pathlib as _pl
 import platform as _pf
 import sys as _sys
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
 def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
@@ -61,7 +66,7 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
     if model_cache:
         print("Copy model from model_cache")
         model_cache_dir = _pl.Path(model_cache) / 'llama-models' / model_name
-        assert (model_cache_dir.is_dir())
+        assert (model_cache_dir.is_dir()), model_cache_dir
 
         if _pf.system() == "Windows":
             wincopy(source=str(model_cache_dir),
@@ -77,14 +82,22 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
+    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
+
     tp_pp_sizes = [(1, 1)]
     if only_multi_gpu:
         tp_pp_sizes = [(1, 4), (4, 1), (2, 2)]
     for tp_size, pp_size in tp_pp_sizes:
         tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
         print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
+        model_spec_obj.use_tensor_parallelism(tp_size)
+        model_spec_obj.use_pipeline_parallelism(pp_size)
+
         build_engine(hf_dir,
-                     engine_dir / f'fp16-plugin-packed-paged/{tp_pp_dir}',
+                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                      f'--tp_size={tp_size}', f'--pp_size={pp_size}')
 
     print("Done.")

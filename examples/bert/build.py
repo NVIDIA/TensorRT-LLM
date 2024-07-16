@@ -70,6 +70,10 @@ def parse_arguments():
     parser.add_argument('--max_input_len', type=int, default=512)
     parser.add_argument('--gpus_per_node', type=int, default=8)
     parser.add_argument('--output_dir', type=str, default='bert_outputs')
+
+    parser.add_argument('--remove_input_padding',
+                        default=False,
+                        action='store_true')
     parser.add_argument('--use_bert_attention_plugin',
                         nargs='?',
                         const='float16',
@@ -98,7 +102,76 @@ def parse_arguments():
                             'RobertaForQuestionAnswering',
                             'RobertaForSequenceClassification',
                         ])
+    parser.add_argument('--model_dir', type=str, required=False)
     return parser.parse_args()
+
+
+def prepare_inputs():
+    # opt_shape is set to half of max batch_size and seq_len by default
+    # tune this according to real data distribution
+    bs_range = [1, (args.max_batch_size + 1) // 2, args.max_batch_size]
+    inlen_range = [1, (args.max_input_len + 1) // 2, args.max_input_len]
+    num_tokens_range = [
+        1,
+        (args.max_input_len * args.max_batch_size + 1) // 2,
+        args.max_input_len * args.max_batch_size,
+    ]
+    if not args.remove_input_padding:
+        input_ids = tensorrt_llm.Tensor(
+            name='input_ids',
+            dtype=trt.int32,
+            shape=[-1, -1],
+            dim_range=OrderedDict([('batch_size', [bs_range]),
+                                   ('input_len', [inlen_range])]),
+        )
+        # also called segment_ids
+        token_type_ids = tensorrt_llm.Tensor(
+            name='token_type_ids',
+            dtype=trt.int32,
+            shape=[-1, -1],
+            dim_range=OrderedDict([('batch_size', [bs_range]),
+                                   ('input_len', [inlen_range])]),
+        )
+    else:
+        input_ids = tensorrt_llm.Tensor(
+            name="input_ids",
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([("num_tokens", [num_tokens_range])]),
+        )
+        token_type_ids = tensorrt_llm.Tensor(
+            name='token_type_ids',
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([('num_tokens', [num_tokens_range])]),
+        )
+        position_ids = tensorrt_llm.Tensor(
+            name='position_ids',
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([('num_tokens', [num_tokens_range])]),
+        )
+        max_input_length = tensorrt_llm.Tensor(
+            name="max_input_length",
+            dtype=trt.int32,
+            shape=[-1],
+            dim_range=OrderedDict([("max_input_length", [inlen_range])]),
+        )
+    input_lengths = tensorrt_llm.Tensor(name='input_lengths',
+                                        dtype=trt.int32,
+                                        shape=[-1],
+                                        dim_range=OrderedDict([('batch_size',
+                                                                [bs_range])]))
+
+    inputs = {
+        'input_ids': input_ids,
+        'input_lengths': input_lengths,
+        'token_type_ids': token_type_ids,
+        'position_ids': position_ids if args.remove_input_padding else None,
+        'max_input_length':
+        max_input_length if args.remove_input_padding else None,
+    }
+    return inputs
 
 
 if __name__ == '__main__':
@@ -107,8 +180,6 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    bs_range = [1, (args.max_batch_size + 1) // 2, args.max_batch_size]
-    inlen_range = [1, (args.max_input_len + 1) // 2, args.max_input_len]
     torch_dtype = torch.float16 if args.dtype == 'float16' else torch.float32
     trt_dtype = trt.float16 if args.dtype == 'float16' else trt.float32
 
@@ -123,22 +194,28 @@ if __name__ == '__main__':
         max_input_len=args.max_input_len,
     )
     # Initialize model
-
     if 'Roberta' in args.model:
         model_type = 'Roberta'
     else:
         model_type = 'Bert'
 
-    bert_config = globals()[f'{model_type}Config'](
+    # initialize config with input arguments and update from json
+    config_cls = globals()[f'{model_type}Config']
+    config = dict(
         vocab_size=args.vocab_size,
-        hidden_size=args.n_embd,
+        num_labels=args.n_labels,
         num_hidden_layers=args.n_layer,
-        num_attention_heads=args.n_head,
-        intermediate_size=4 * args.n_embd,
-        hidden_act=args.hidden_act,
         max_position_embeddings=args.n_positions,
+        hidden_size=args.n_embd,
+        num_attention_heads=args.n_head,
+        intermediate_size=4 * args.n_embd if args.n_embd else None,
+        hidden_act=args.hidden_act,
         torch_dtype=torch_dtype,
     )
+    if args.model_dir is not None:
+        json_config = config_cls.get_config_dict(args.model_dir)[0]
+        config.update((k, v) for k, v in json_config.items() if v is not None)
+    bert_config = config_cls.from_dict(config)
 
     output_name = 'hidden_states'
     if args.model == 'BertModel' or args.model == 'RobertaModel':
@@ -196,7 +273,13 @@ if __name__ == '__main__':
         output_name = 'logits'
     elif args.model == 'BertForSequenceClassification' or args.model == 'RobertaForSequenceClassification':
         hf_bert = globals()[f'{model_type}ForSequenceClassification'](
-            bert_config).cuda().to(torch_dtype).eval()
+            config=bert_config)
+        if args.model_dir is not None and os.path.exist(
+                os.path.join(args.model_dir, "pytorch_model.bin")):
+            state_dict = torch.load(
+                os.path.join(args.model_dir, "pytorch_model.bin"))
+            hf_bert.load_state_dict(state_dict, strict=False)
+
         tensorrt_llm_bert = tensorrt_llm.models.BertForSequenceClassification(
             num_layers=bert_config.num_hidden_layers,
             num_heads=bert_config.num_attention_heads,
@@ -207,8 +290,7 @@ if __name__ == '__main__':
             type_vocab_size=bert_config.type_vocab_size,
             pad_token_id=bert_config.pad_token_id,
             is_roberta=(model_type == 'Roberta'),
-            num_labels=args.
-            n_labels,  # TODO: this might just need to be a constant
+            num_labels=bert_config.num_labels,
             mapping=Mapping(world_size=args.world_size,
                             rank=args.rank,
                             tp_size=args.world_size),  # TP only
@@ -228,6 +310,10 @@ if __name__ == '__main__':
     # Module -> Network
     network = builder.create_network()
     network.plugin_config.to_legacy_setting()
+    if args.remove_input_padding:
+        assert args.model == "BertForSequenceClassification", \
+            "remove_input_padding is only supported for BertForSequenceClassification models"
+        network.plugin_config.remove_input_padding = True
     if args.use_bert_attention_plugin:
         network.plugin_config.bert_attention_plugin = args.use_bert_attention_plugin
     if args.use_gemm_plugin:
@@ -245,34 +331,10 @@ if __name__ == '__main__':
         network.set_named_parameters(tensorrt_llm_bert.named_parameters())
 
         # Forward
-        input_ids = tensorrt_llm.Tensor(
-            name='input_ids',
-            dtype=trt.int32,
-            shape=[-1, -1],
-            dim_range=OrderedDict([('batch_size', [bs_range]),
-                                   ('input_len', [inlen_range])]),
-        )
-
-        # also called segment_ids
-        token_type_ids = tensorrt_llm.Tensor(
-            name='token_type_ids',
-            dtype=trt.int32,
-            shape=[-1, -1],
-            dim_range=OrderedDict([('batch_size', [bs_range]),
-                                   ('input_len', [inlen_range])]),
-        )
-
-        input_lengths = tensorrt_llm.Tensor(name='input_lengths',
-                                            dtype=trt.int32,
-                                            shape=[-1],
-                                            dim_range=OrderedDict([
-                                                ('batch_size', [bs_range])
-                                            ]))
+        inputs = prepare_inputs()
 
         # logits for QA BERT, or hidden_state for vanilla BERT
-        output = tensorrt_llm_bert(input_ids=input_ids,
-                                   input_lengths=input_lengths,
-                                   token_type_ids=token_type_ids)
+        output = tensorrt_llm_bert(**inputs)
 
         # Mark outputs
         output_dtype = trt.float16 if args.dtype == 'float16' else trt.float32
