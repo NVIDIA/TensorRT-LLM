@@ -11,3 +11,6 @@
 [submodule "3rdparty/NVTX"]
 	path = 3rdparty/NVTX
 	url = https://github.com/NVIDIA/NVTX.git
+[submodule "cpp/cpp/tensorrt_llm/cortex.tensorrt-llm/src/cpp-tiktoken"]
+	path = cpp/cpp/tensorrt_llm/cortex.tensorrt-llm/src/cpp-tiktoken
+	url = https://github.com/fmtlib/fmt
