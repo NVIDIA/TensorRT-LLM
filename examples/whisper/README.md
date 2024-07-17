@@ -87,7 +87,7 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --gemm_plugin ${INFERENCE_PRECISION} \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
               --gpt_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable
+              --remove_input_padding enable
 ```
 
 ### Run
@@ -121,13 +121,14 @@ WEIGHT_ONLY_PRECISION=int8
 MAX_BEAM_WIDTH=4
 MAX_BATCH_SIZE=8
 checkpoint_dir=distil_whisper_medium_en_weights_${WEIGHT_ONLY_PRECISION}
-output_dir=distil_whisper_medium_en${WEIGHT_ONLY_PRECISION}
+output_dir=distil_whisper_medium_en_${WEIGHT_ONLY_PRECISION}
 
 python3 convert_checkpoint.py \
                 --use_weight_only \
                 --weight_only_precision $WEIGHT_ONLY_PRECISION \
                 --output_dir $checkpoint_dir \
-                --model_name distil-medium.en
+                --model_name distil-medium.en \
+                --chunk_length 15
 ```
 
 <details><summary> Now, we can build and run the model like before: </summary><p>
@@ -160,7 +161,7 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --gemm_plugin ${INFERENCE_PRECISION} \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
               --gpt_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable
+              --remove_input_padding enable
 
 python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --name librispeech_dummy_${output_dir}
 ```

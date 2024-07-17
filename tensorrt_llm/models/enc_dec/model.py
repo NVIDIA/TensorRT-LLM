@@ -25,7 +25,7 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
-                                     transpose)
+                                     transpose, slice)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
@@ -1885,7 +1885,11 @@ class WhisperEncoder(PretrainedModel):
         x = cast(x, x_type)
         x = gelu(x)
         x = transpose(x, 2, 1)
-        x = x + cast(self.positional_embedding.value, x_type)
+        x = x + cast(slice(input=self.positional_embedding.value,
+                           starts=[0,0],
+                           sizes=[x.shape[1], self.positional_embedding.shape[1]],
+                           strides=[1,1]),
+                     x.dtype)
 
         hidden_states = x
         for encoder_layer in self.encoder_layers:
@@ -1903,11 +1907,11 @@ class WhisperEncoder(PretrainedModel):
 
         x = Tensor(name="x",
                    dtype=self._dtype,
-                   shape=[-1, self.config.n_mels, 3000],
+                   shape=[-1, self.config.n_mels, self.config.chunk_length],
                    dim_range=OrderedDict([
                        ("batch_size", [bs_range]),
                        ("feature_dim", [self.config.n_mels]),
-                       ("feature_len_range", [3000]),
+                       ("feature_len_range", [self.config.chunk_length]),
                    ]))
         input_lengths = Tensor(
             name="input_lengths",

@@ -3393,10 +3393,8 @@ def conv1d(input: Tensor,
                             and bias.producer.type == trt.LayerType.CONSTANT)
         bias = bias.producer.weights if is_bias_constant else trt.Weights()
 
-    input_shuffle_layer = default_trtnet().add_shuffle(input.trt_tensor)
-    input_shuffle_layer.reshape_dims = trt.Dims([*(input.size()), 1])
-    input_shuffled = _create_tensor(input_shuffle_layer.get_output(0),
-                                    input_shuffle_layer)
+    # equivalent to expand_dims(input, -1) but supports multiple dynamic axes
+    input_shuffled = stack([input], dim=input.ndim())
 
     kernel_size = trt.Dims([kernel_size, 1])
 
@@ -3414,13 +3412,7 @@ def conv1d(input: Tensor,
         layer.set_input(2, bias.trt_tensor)
 
     output_2d = _create_tensor(layer.get_output(0), layer)
-    output_2d_shuffle_layer = default_trtnet().add_shuffle(output_2d.trt_tensor)
-    output_2d_shuffle_layer.reshape_dims = trt.Dims(
-        [output_2d.size()[0],
-         output_2d.size()[1],
-         output_2d.size()[2]])
-    output_1d = _create_tensor(output_2d_shuffle_layer.get_output(0),
-                               output_2d_shuffle_layer)
+    output_1d = squeeze(output_2d, dim=-1)
 
     return output_1d
 
