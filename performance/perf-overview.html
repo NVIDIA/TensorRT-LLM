@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -82,6 +82,10 @@
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#known-issues">Known Issues</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#fused-matmul-gated-silu-llama">Fused Matmul + Gated-SiLU (LLaMA)</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="#throughput-measurements">Throughput Measurements</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#reproducing-benchmarked-results">Reproducing Benchmarked Results</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#building-the-tensorrt-llm-container">Building the TensorRT-LLM Container</a></li>
@@ -112,6 +116,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -169,6 +174,18 @@ releases.</p>
 <p>The data in the following tables is provided as a reference point to help users
 validate observed performance. It should not be considered as the peak
 performance that can be delivered by TensorRT-LLM.</p>
+<section id="known-issues">
+<h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
+<p>The following issues are being addressed to improve the efficiency of TensorRT-LLM.</p>
+<section id="fused-matmul-gated-silu-llama">
+<h3>Fused Matmul + Gated-SiLU (LLaMA)<a class="headerlink" href="#fused-matmul-gated-silu-llama" title="Link to this heading"></a></h3>
+<p>The current implementation combines two Matmul operations into one Matmul followed by
+a separate SwiGLU kernel (when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span></code> is enabled). There is also a more
+efficient implementation that runs single Matmul + SwiGLU fused kernel for FP8 on Hopper
+(when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code> is enabled). The gemm_swiglu_plugin
+will support more data types and GPU architectures in the future release.</p>
+</section>
+</section>
 <section id="throughput-measurements">
 <h2>Throughput Measurements<a class="headerlink" href="#throughput-measurements" title="Link to this heading"></a></h2>
 <p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
@@ -887,7 +904,7 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
 <tbody>
 <tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#engine-building"><span class="xref myst">Build</span></a></p></td>
 <td><p>Build a TensorRT-LLM engine</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-build</span> <span class="pre">--model_config</span> <span class="pre">$model_cfg</span> <span class="pre">--strongly_typed</span> <span class="pre">--output_dir</span> <span class="pre">$engine_dir</span> <span class="pre">--max_batch_size</span> <span class="pre">2048</span> <span class="pre">--max_input_len</span> <span class="pre">2048</span> <span class="pre">--max_output_len</span> <span class="pre">4096</span> <span class="pre">--workers</span> <span class="pre">$tp_size</span> <span class="pre">--max_num_tokens</span> <span class="pre">2048</span> <span class="pre">--use_paged_context_fmha</span> <span class="pre">enable</span> <span class="pre">--multiple_profiles</span> <span class="pre">enable</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-build</span> <span class="pre">--model_config</span> <span class="pre">$model_cfg</span> <span class="pre">--strongly_typed</span> <span class="pre">--output_dir</span> <span class="pre">$engine_dir</span> <span class="pre">--max_batch_size</span> <span class="pre">2048</span> <span class="pre">--max_input_len</span> <span class="pre">2048</span> <span class="pre">--max_seq_len</span> <span class="pre">6144</span> <span class="pre">--workers</span> <span class="pre">$tp_size</span> <span class="pre">--max_num_tokens</span> <span class="pre">2048</span> <span class="pre">--use_paged_context_fmha</span> <span class="pre">enable</span> <span class="pre">--multiple_profiles</span> <span class="pre">enable</span></code></p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">Dataset</span></a></p></td>
 <td><p>Create a synthetic dataset</p></td>
@@ -946,14 +963,14 @@ KV cache and in-flight batching enabled. For more information see the
 <p>In order to build an engine you will need to run the following command by specifying a configuration file
 for the model that you would like to build (see <a class="reference internal" href="#network-configuration-files"><span class="xref myst">below</span></a>). The general build
 command is as follows:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-build<span class="w"> </span>--model_config<span class="w"> </span><span class="nv">$model_cfg</span><span class="w"> </span>--strongly_typed<span class="w"> </span>--output_dir<span class="w"> </span><span class="nv">$engine_dir</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--max_output_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--workers<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--use_paged_context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--multiple_profiles<span class="w"> </span><span class="nb">enable</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-build<span class="w"> </span>--model_config<span class="w"> </span><span class="nv">$model_cfg</span><span class="w"> </span>--strongly_typed<span class="w"> </span>--output_dir<span class="w"> </span><span class="nv">$engine_dir</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">6144</span><span class="w"> </span>--workers<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--use_paged_context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--multiple_profiles<span class="w"> </span><span class="nb">enable</span>
 </pre></div>
 </div>
 <p>Some notes about the command:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">--workers</span></code> affects the number of threads that build the engine file and does not necessarily need to match
 the TP size. Make sure to set the tensor parallelism in the <code class="docutils literal notranslate"><span class="pre">$model_cfg</span></code> JSON file. See <a class="reference internal" href="#network-configuration-files"><span class="xref myst">below</span></a></p></li>
-<li><p>You can run benchmarks for datasets that fit within the bounds of the <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_output_len</span></code> parameters.</p></li>
+<li><p>You can run benchmarks for datasets that fit within the bounds of the <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> parameters.</p></li>
 </ul>
 </section>
 <section id="engine-configuration-files">
@@ -1257,7 +1274,7 @@ that can be compared with the table in the <a class="reference internal" href="#
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f270271fd00>
+<jinja2.runtime.BlockReference object at 0x7ff8f48463e0>
 
 <div class="footer">
     <p>

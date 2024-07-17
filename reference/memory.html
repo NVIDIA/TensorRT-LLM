@@ -16,12 +16,12 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Runtime" href="../_cpp_gen/runtime.html" />
+    <link rel="next" title="Executor" href="../_cpp_gen/executor.html" />
     <link rel="prev" title="Numerical Precision" href="precision.html" /> 
 </head>
 
@@ -109,6 +109,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -213,8 +214,8 @@ If paged KV cache is used in <code class="docutils literal notranslate"><span cl
 </section>
 <section id="memory-pool">
 <h2>Memory pool<a class="headerlink" href="#memory-pool" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::initMemoryPool</a>, which uses the default memory pool managed by the CUDA driver. When a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object. Memory will be released from the pool if it is required for other memory allocations.
-However, <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> may still show high memory occupation after memory is returned to the CUDA driver’s memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolReserved())</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolFree())</a>, respectively.</p>
+<p>TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::initMemoryPool</a>, which uses the default memory pool managed by the CUDA driver. When a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object. Memory will be released from the pool if it is required for other memory allocations.
+However, <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> may still show high memory occupation after memory is returned to the CUDA driver’s memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolReserved())</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolFree())</a>, respectively.</p>
 </section>
 <section id="known-issues">
 <h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
@@ -253,13 +254,13 @@ You could just set the <code class="docutils literal notranslate"><span class="p
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="precision.html" class="btn btn-neutral float-left" title="Numerical Precision" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="../_cpp_gen/runtime.html" class="btn btn-neutral float-right" title="Runtime" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="../_cpp_gen/executor.html" class="btn btn-neutral float-right" title="Executor" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f2702999030>
+<jinja2.runtime.BlockReference object at 0x7ff8f48477f0>
 
 <div class="footer">
     <p>

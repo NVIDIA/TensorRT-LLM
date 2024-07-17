@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -92,6 +92,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -140,7 +141,7 @@
 <span id="weight-streaming"></span><h1>Running With Weight Streaming to Reduce GPU Memory Consumption<a class="headerlink" href="#running-with-weight-streaming-to-reduce-gpu-memory-consumption" title="Link to this heading"></a></h1>
 <p>TensorRT Weight Streaming can offload some weights to the CPU memory and stream them to the GPU memory during runtime.
 This can reduce the weights size in GPU memory, therefore, we can run larger models or larger batch sizes in the same GPU memory budget.</p>
-<p>During build time, build the engine with <code class="docutils literal notranslate"><span class="pre">--weight-streaming</span> <span class="pre">--strongly_typed</span> <span class="pre">--gemm_plugin</span> <span class="pre">disable</span></code> since Weight Streaming only supports strongly typed models and non-plugin weights. During runtime, run with <code class="docutils literal notranslate"><span class="pre">--gpu_weights_percent</span> <span class="pre">x</span></code> to config the percent of weights that remained on the GPU. <code class="docutils literal notranslate"><span class="pre">x</span></code> can be a value from <code class="docutils literal notranslate"><span class="pre">0.0</span></code> to <code class="docutils literal notranslate"><span class="pre">1.0</span></code>.</p>
+<p>During build time, build the engine with <code class="docutils literal notranslate"><span class="pre">--weight-streaming</span> <span class="pre">--gemm_plugin</span> <span class="pre">disable</span></code> since Weight Streaming only supports non-plugin weights. During runtime, run with <code class="docutils literal notranslate"><span class="pre">--gpu_weights_percent</span> <span class="pre">x</span></code> to config the percent of weights that remained on the GPU. <code class="docutils literal notranslate"><span class="pre">x</span></code> can be a value from <code class="docutils literal notranslate"><span class="pre">0.0</span></code> to <code class="docutils literal notranslate"><span class="pre">1.0</span></code>.</p>
 <p>Here is an example to run llama-7b with Weight Streaming:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Convert model as normal. Assume hugging face model is in llama-7b-hf/</span>
 python3<span class="w"> </span>examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
@@ -153,11 +154,10 @@ trtllm-build<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--checkpoint_dir<span class="w"> </span>/tmp/llama_7b/trt_ckpt/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--output_dir<span class="w"> </span>/tmp/llama_7b/trt_engines/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--weight_streaming<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--strongly_typed<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--gemm_plugin<span class="w"> </span>disable<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">50</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">562</span>
 
 <span class="c1"># Run the engine with 20% weights in GPU memory.</span>
 python3<span class="w"> </span>examples/summarize.py<span class="w"> </span><span class="se">\</span>
@@ -177,10 +177,9 @@ python3<span class="w"> </span>examples/summarize.py<span class="w"> </span><spa
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="s2">&quot;32&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--input_output_len<span class="w"> </span><span class="s2">&quot;256,32&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">256</span><span class="se">\</span>
-<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">288</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--gpu_weights_percent<span class="w"> </span><span class="s2">&quot;0.0;0.3;0.6;1.0&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--strongly_typed<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--csv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--log_level<span class="w"> </span>verbose
 </pre></div>
@@ -216,7 +215,7 @@ python3<span class="w"> </span>examples/summarize.py<span class="w"> </span><spa
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f27020c4790>
+<jinja2.runtime.BlockReference object at 0x7ff8f4d14400>
 
 <div class="footer">
     <p>

@@ -16,7 +16,7 @@
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="_static/doctools.js?v=888ff710"></script>
+        <script src="_static/doctools.js?v=9a2dae69"></script>
         <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
@@ -56,6 +56,7 @@
 <li class="toctree-l2"><a class="reference internal" href="#deploy-with-triton-inference-server">Deploy with Triton Inference Server</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#send-requests">Send Requests</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#next-steps">Next Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#links">Links</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
@@ -104,6 +105,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -168,19 +170,16 @@
 </section>
 <section id="compile-the-model-into-a-tensorrt-engine">
 <span id="quick-start-guide-compile"></span><h2>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading"></a></h2>
-<p>Use the included <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/models/llama/model.html#LLaMAModel">Llama model definition</a>. This is a minimal example that includes some of the optimizations available in TensorRT-LLM.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Get the source code required for running the example</span>
-git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
-<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
-git<span class="w"> </span>lfs<span class="w"> </span>install
+<p>Use the included <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama model definition</a>. This is a minimal example that includes some of the optimizations available in TensorRT-LLM.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Launch the Tensorrt-LLM container</span>
+make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
 
 <span class="c1"># Log in to huggingface-cli</span>
 <span class="c1"># You can get your token from huggingface.co/settings/token</span>
 huggingface-cli<span class="w"> </span>login<span class="w"> </span>--token<span class="w"> </span>*****
 
-<span class="c1"># Convert the model into TensorRT-LLM checkpoint format</span>
-<span class="nb">cd</span><span class="w"> </span>examples/llama
-pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>requirements.txt
+<span class="c1"># Convert the model into TensorrtLLM checkpoint format</span>
+<span class="nb">cd</span><span class="w"> </span>exammples/llama
 python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="w"> </span>meta-llama/Llama-2-7b-chat-hf<span class="w"> </span>--output_dir<span class="w"> </span>llama-2-7b-ckpt
 
 <span class="c1"># Compile model</span>
@@ -280,6 +279,13 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples">examples/</a> for showcases of how to run a quick benchmark on latest LLMs.</p></li>
 </ul>
 </section>
+<section id="links">
+<h2>Links<a class="headerlink" href="#links" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md">Best Practices Guide</a></p></li>
+<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html">Support Matrix</a></p></li>
+</ul>
+</section>
 </section>
 
 
@@ -293,7 +299,7 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f27027e05e0>
+<jinja2.runtime.BlockReference object at 0x7ff8f4c15de0>
 
 <div class="footer">
     <p>

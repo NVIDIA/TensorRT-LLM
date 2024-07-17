@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -94,6 +94,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -228,82 +229,87 @@ The mandatory input tensors to create a valid <code class="docutils literal notr
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
 <td class="text-center"><p>Sampling Config param: <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code></p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">random_seed</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">no_repeat_ngram_size</span></code></p></td>
+<td class="text-center"><p>[1]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
+<td class="text-center"><p>Sampling Config param: <code class="docutils literal notranslate"><span class="pre">noRepeatNgramSize</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">random_seed</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">uint64_t</span></code></p></td>
 <td class="text-center"><p>Sampling Config param: <code class="docutils literal notranslate"><span class="pre">randomSeed</span></code></p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">end_id</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">end_id</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>End token Id. If not specified, defaults to -1</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">pad_id</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">pad_id</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>Pad token Id</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">embedding_bias</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">embedding_bias</span></code></p></td>
 <td class="text-center"><p>[1, vocab_size]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
 <td class="text-center"><p>The bias is added to the logits for each token in the vocabulary before decoding occurs. Positive values in the bias encourage the sampling of tokens, while negative values discourage it. A value of <code class="docutils literal notranslate"><span class="pre">0.f</span></code> leaves the logit value unchanged.</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">bad_words_list</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">bad_words_list</span></code></p></td>
 <td class="text-center"><p>[2, num_bad_words]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>Bad words list</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">stop_words_list</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">stop_words_list</span></code></p></td>
 <td class="text-center"><p>[2, num_stop_words]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>Stop words list</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">prompt_embedding_table</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">prompt_embedding_table</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float16</span></code></p></td>
 <td class="text-center"><p>P-tuning prompt embedding table</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">prompt_vocab_size</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">prompt_vocab_size</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>P-tuning prompt vocab size</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lora_task_id</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lora_task_id</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">uint64_t</span></code></p></td>
 <td class="text-center"><p>Task ID for the given lora_weights.  This ID is expected to be globally unique.  To perform inference with a specific LoRA for the first time <code class="docutils literal notranslate"><span class="pre">lora_task_id</span></code> <code class="docutils literal notranslate"><span class="pre">lora_weights</span></code> and <code class="docutils literal notranslate"><span class="pre">lora_config</span></code> must all be given.  The LoRA will be cached, so that subsequent requests for the same task only require <code class="docutils literal notranslate"><span class="pre">lora_task_id</span></code>. If the cache is full the oldest LoRA will be evicted to make space for new ones.  An error is returned if <code class="docutils literal notranslate"><span class="pre">lora_task_id</span></code> is not cached</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lora_weights</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lora_weights</span></code></p></td>
 <td class="text-center"><p>[num_lora_modules_layers, D x Hi + Ho x D]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code> (model data type)</p></td>
 <td class="text-center"><p>weights for a LoRA adapter. Refer to <a class="reference internal" href="lora.html#lora"><span class="std std-ref">Run gpt-2b + LoRA using GptManager / cpp runtime</span></a> for more information.</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lora_config</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lora_config</span></code></p></td>
 <td class="text-center"><p>[num_lora_modules_layers, 3]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>LoRA configuration tensor. <code class="docutils literal notranslate"><span class="pre">[</span> <span class="pre">module_id,</span> <span class="pre">layer_idx,</span> <span class="pre">adapter_size</span> <span class="pre">(D</span> <span class="pre">aka</span> <span class="pre">R</span> <span class="pre">value)</span> <span class="pre">]</span></code> Refer to <a class="reference internal" href="lora.html#lora"><span class="std std-ref">Run gpt-2b + LoRA using GptManager / cpp runtime</span></a> for more information.</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">return_log_probs</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">return_log_probs</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
 <td class="text-center"><p>When <code class="docutils literal notranslate"><span class="pre">true</span></code>, include log probs in the output</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">return_context_logits</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">return_context_logits</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
 <td class="text-center"><p>When <code class="docutils literal notranslate"><span class="pre">true</span></code>, include context logits in the output</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">return_generation_logits</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">return_generation_logits</span></code></p></td>
 <td class="text-center"><p>[1]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
 <td class="text-center"><p>When <code class="docutils literal notranslate"><span class="pre">true</span></code>, include generation logits in the output</p></td>
 </tr>
-<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">draft_input_ids</span></code></p></td>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">draft_input_ids</span></code></p></td>
 <td class="text-center"><p>[num_draft_tokens]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">int32_t</span></code></p></td>
 <td class="text-center"><p>Draft tokens to be leveraged in generation phase to potentially generate multiple output tokens in one inflight batching iteration</p></td>
 </tr>
-<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">draft_logits</span></code></p></td>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">draft_logits</span></code></p></td>
 <td class="text-center"><p>[num_draft_tokens, vocab_size]</p></td>
 <td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">float</span></code></p></td>
 <td class="text-center"><p>Draft logits associated with <code class="docutils literal notranslate"><span class="pre">draft_input_ids</span></code> to be leveraged in generation phase to potentially generate multiple output tokens in one inflight batching iteration</p></td>
@@ -368,7 +374,7 @@ The mandatory input tensors to create a valid <code class="docutils literal notr
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f27020fa5f0>
+<jinja2.runtime.BlockReference object at 0x7ff8f4e92ec0>
 
 <div class="footer">
     <p>
