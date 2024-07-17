@@ -45,7 +45,7 @@ if (-not $skipVSBuildTools) {
     Write-Output "Skipping Visual Studio Build Tools installation"
 }
 
-# Install TensorRT 10.0.1 for TensorRT-LLM
+# Install TensorRT 10.1.0 for TensorRT-LLM
 if (-not $skipTRT) {
     Write-Output "Downloading TensorRT"
     Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.1.0/zip/TensorRT-10.1.0.27.Windows.win10.cuda-12.4.zip' -OutFile 'TensorRT-10.1.0.27.zip'
