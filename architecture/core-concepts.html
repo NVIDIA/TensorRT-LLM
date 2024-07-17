@@ -104,15 +104,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -155,7 +146,7 @@ to create graph representations of deep neural networks in TensorRT. To become
 familiar with the core concepts of the TensorRT API, refer to the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/coreConcepts.html">Core Concepts</a>
 section of the TensorRT documentation before proceeding further.</p>
-<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
+<p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
 contains a
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
 object. That instance is used in the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.create_network</span></code>
@@ -163,7 +154,7 @@ method to create an instance of the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>
 class. The <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> object can then be populated using the free
 functions defined in the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
 <p>A simple example of such a free function is <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.activation</span></code> that inserts a
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html#tensorrt.IActivationLayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.IActivationLayer</span></code></a>
 node in the graph of the model:</p>
@@ -298,14 +289,14 @@ limitation, TensorRT offers a powerful mechanism known as
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Plugin/pyPlugin.html">plugins</a>.</p>
 <p>The plugins are nodes inserted in the network graph definition that map to user-defined
 GPU kernels. TensorRT-LLM uses a number of such plugins. They can be found in
-the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
+the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel//cpp/tensorrt_llm/plugins"><code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/plugins</span></code></a> directory.</p>
 <p>Plugins are written in C++ and follow a well-defined interface described in the
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#extending">Extending TensorRT with Custom Layers</a>
 section of the TensorRT
 <a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html">Developer Guide</a>.
 When executed within a TensorRT engine, plugins trigger the execution of
 their encapsulated GPU kernels. A fairly simple example of plugins is the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel//cpp/tensorrt_llm/plugins/quantizeTensorPlugin"><code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin</span></code></a> that
 triggers a CUDA kernel in the <code class="docutils literal notranslate"><span class="pre">QuantizeTensorPlugin::enqueue</span></code> member function:</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// In cpp/tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.cpp:</span>
 
@@ -349,7 +340,7 @@ using TensorRT plugins that wrap communication primitives from the
 plugin that optimize the All-Reduce primitive in the presence of All-to-all
 connections between GPUs (through NVSwitch in DGX systems).</p>
 <p>The communication plugins can be found in
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/plugins/ncclPlugin">cpp/tensorrt_llm/plugins/ncclPlugin</a>
 and the multi-GPU functions are exposed in the TensorRT-LLM Python API
 as:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm/functional.py:</span>
@@ -386,7 +377,7 @@ issues and may be less efficient in terms of GPU utilization.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f4feae30>
+<jinja2.runtime.BlockReference object at 0x7fedf3044bb0>
 
 <div class="footer">
     <p>

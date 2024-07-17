@@ -92,13 +92,13 @@
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Memory Usage of TensorRT-LLM</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#understand-inference-time-gpu-memory-usage">Understand inference time GPU memory usage</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#weights-size">Weights size</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#activation-size">Activation size</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#weights-size">1. Weights size</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#activation-size">2. Activation size</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#i-o-tensors">3. I/O tensors</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#runtime-and-decoder-buffers-except-kv-cache-tensor">3.1 Runtime and decoder buffers except KV cache tensor</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#kv-cache-tensor">3.2 KV cache tensor</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#kv-cache-tensor">KV cache tensor</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#python-runtime">Python runtime</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#c-runtime">C++ runtime</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#memory-pool">Memory pool</a></li>
@@ -111,15 +111,6 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -159,30 +150,30 @@
 <p>This document summarizes the memory usage of TensorRT-LLM, and addresses common issues and questions reported by users.</p>
 <section id="understand-inference-time-gpu-memory-usage">
 <h2>Understand inference time GPU memory usage<a class="headerlink" href="#understand-inference-time-gpu-memory-usage" title="Link to this heading"></a></h2>
-<p>At inference time, there are 3 major contributors to GPU memory usage for a given TRT engine generated from a TensorRT-LLM model: weights, internal activation tensors, and IO tensors. For IO tensors, the major memory footprint comes from the KV cache tensor.</p>
+<p>At inference time, there are 3 major contributors to GPU memory usage for a given TRT engine generated from a TensorRT-LLM model: weights, internal activation tensors, and I/O tensors. For I/O tensors, the major memory footprint comes from the KV cache tensor.</p>
 <section id="weights-size">
-<h3>Weights size<a class="headerlink" href="#weights-size" title="Link to this heading"></a></h3>
+<h3>1. Weights size<a class="headerlink" href="#weights-size" title="Link to this heading"></a></h3>
 <p>Weights size is fixed depending on the model size, the chosen precision of the weights and the parallelization strategy.
 Using lower precision like INT8 or FP8 can reduce the weights size.
 When tensor parallelism or pipeline parallelism is used, each rank stores only some portion of the weights.
 For example, each rank typically uses just 1/8 of the model weights when using 8-way tensor parallelism or 8-stages pipeline parallelism.</p>
 </section>
 <section id="activation-size">
-<h3>Activation size<a class="headerlink" href="#activation-size" title="Link to this heading"></a></h3>
-<p>TensorRT can optimize the memory usage by reusing memory for different tensors based on live analysis and tensor size. To avoid out of memory errors at runtime and to reduce the runtime cost of switching optimization profiles and changing shapes, <strong>TensorRT pre-computes the activation tensors memory requirement at build time</strong>. The memory requirement is computed based on an optimized TensorRT graph, one profiles’ memory usage is computed by using the max tensor shape, and the memory requirement of one engine is computed by the maximum size between different profiles. There are external and internal factors that can affect the activation size returned by TensorRT, such as the network structure, kernel fusion, operation scheduling, etc.
-Once the TensorRT engine is built, the activation memory size of that engine can be queried by the API <code class="docutils literal notranslate"><span class="pre">trt.ICudaEngine.device_memory_size</span></code>.</p>
+<h3>2. Activation size<a class="headerlink" href="#activation-size" title="Link to this heading"></a></h3>
+<p>TensorRT can optimize the memory usage by reusing memory for different tensors based on live analysis and tensor size. To avoid out of memory errors at runtime and to reduce the runtime cost of switching optimization profiles and changing shapes, <strong>TensorRT pre-computes the activation tensors memory requirement at build time</strong>. The memory requirement is computed based on an optimized TensorRT graph, one profile’s memory usage is computed by using the max tensor shape, and the memory requirement of one engine is computed by the maximum size between different profiles. There are external and internal factors that can affect the activation size returned by TensorRT, such as the network structure, kernel fusion, operation scheduling, etc.</p>
+<p>Once the TensorRT engine is built, the activation memory size of that engine <strong>cannot be changed</strong>, and can be queried by the API <code class="docutils literal notranslate"><span class="pre">trt.ICudaEngine.device_memory_size</span></code>.</p>
 <p>Practically, for a given model, specified precision and parallelization strategy, one can tune the activation memory usage by adjusting the max batch size, max input length, max beam width, max number of tokens, padding removal on/off flag, context FMHA on/off flag.
 Here some explanations on how these values affect the memory:</p>
 <ol class="arabic">
-<li><p>Reduce build time max input tokens</p>
+<li><p>Reduce build time max number of input tokens (<code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>)</p>
 <p>Most of the tensors inside a transformer network have a linear relationship with number of input tokens, so activation size will be close to <code class="docutils literal notranslate"><span class="pre">max</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">input</span> <span class="pre">tokens</span> <span class="pre">*</span> <span class="pre">some</span> <span class="pre">constant</span> <span class="pre">factor</span></code>, the constant factor depends on the network structure and TRT internal optimization. The max number of input tokens is derived from build time arguments, one can change the parameters provided to the <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> function, like <code class="docutils literal notranslate"><span class="pre">PretrainedModel.prepare_inputs</span></code> to affect the memory usage, or one can change the command line options of the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command used in the examples.</p>
-<p>When using the <a class="reference internal" href="#./gpt_attention.md#padded-and-packed-tensors"><span class="xref myst">padded tensors</span></a> format, the max number of input tokens equals to <code class="docutils literal notranslate"><span class="pre">max_batch_size*max_input_len</span></code>, so reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> can almost linearly reduce the activation memory size.
-When using the <a class="reference internal" href="#./gpt_attention.md#padded-and-packed-tensors"><span class="xref myst">packed tensors</span></a> format and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is specified, reducing its value will also reduce activation memory size. If <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is not specified, the max number of input tokens will be derived as <code class="docutils literal notranslate"><span class="pre">max_batch_size*max_input_len</span></code>.</p>
-<p>The packed tensors format is recommended, because it saves both memory and compute.
-The beam width will be folded into the batch size dimension when passing the tensors range into TensorRT, so reducing <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code> can also reduce the memory usage.</p>
+<p>When using the <a class="reference internal" href="../advanced/gpt-attention.html#padded-and-packed-tensors"><span class="std std-ref">packed tensors</span></a> format and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is specified, reducing its value will also reduce activation memory size.</p>
+<p>When using the <a class="reference internal" href="../advanced/gpt-attention.html#padded-and-packed-tensors"><span class="std std-ref">padded tensors</span></a> format, the max number of input tokens equals to <code class="docutils literal notranslate"><span class="pre">max_batch_size*max_input_len</span></code>, so reducing <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> can almost linearly reduce the activation memory size.</p>
+<p>The packed tensors format is recommended, because it saves both memory and compute.</p>
+<p>The beam width will be folded into the batch size dimension when passing the tensors range into TensorRT, so reducing <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code> can also reduce the memory usage.</p>
 </li>
 <li><p>Turn on context FMHA</p>
-<p>When the GPT attention plugin is used, turning on the <code class="docutils literal notranslate"><span class="pre">context_fmha_type</span></code> of the plugin will reduce the memory footprint significantly. See the <a class="reference internal" href="#./gpt_attention.md#context-phase"><span class="xref myst">Context Phase</span></a> for details. When the <code class="docutils literal notranslate"><span class="pre">context_fmha_type</span></code> is set to disabled, a workspace size of the plugin will quadratically depend on the sequence length.</p>
+<p>When the GPT attention plugin is used, turning on the <code class="docutils literal notranslate"><span class="pre">context_fmha_type</span></code> of the plugin will reduce the memory footprint significantly. See the <a class="reference internal" href="../advanced/gpt-attention.html#context-phase"><span class="std std-ref">Context Phase</span></a> for details. When the <code class="docutils literal notranslate"><span class="pre">context_fmha_type</span></code> is set to disabled, a workspace size of the plugin will quadratically depend on the sequence length.</p>
 </li>
 <li><p>Tensor parallelism and pipeline parallelism</p>
 <p>TensorRT will reuse memory between layers as much as possible, for a typical example, given <em>N</em> decoder blocks in one transformer network, TRT will not allocate <em>N</em> copies of the activation memory for each block, since the memory of tensors in the 1st block can be released after the execution, memory can be reused for later blocks, only 1 block’s memory is needed.</p>
@@ -190,60 +181,85 @@ The beam width will be folded into the batch size dimension when passing the ten
 </li>
 </ol>
 </section>
+<section id="i-o-tensors">
+<h3>3. I/O tensors<a class="headerlink" href="#i-o-tensors" title="Link to this heading"></a></h3>
+<section id="runtime-and-decoder-buffers-except-kv-cache-tensor">
+<h4>3.1 Runtime and decoder buffers except KV cache tensor<a class="headerlink" href="#runtime-and-decoder-buffers-except-kv-cache-tensor" title="Link to this heading"></a></h4>
+<section id="c-runtime">
+<h5>C++ runtime<a class="headerlink" href="#c-runtime" title="Link to this heading"></a></h5>
+<p>Before KV cache blocks are allocated, some amount of GPU memory are pre-allocated by C++ runtime for storing I/O tensors of TensorRT engine and the decoupled dynamic decoder, it’s allocated based on runtime max_batch_size and max_seq_len so that OOM can be avoided when there are indeed that amount of requests scheduled.</p>
+</section>
 </section>
 <section id="kv-cache-tensor">
-<h2>KV cache tensor<a class="headerlink" href="#kv-cache-tensor" title="Link to this heading"></a></h2>
-<section id="python-runtime">
-<h3>Python runtime<a class="headerlink" href="#python-runtime" title="Link to this heading"></a></h3>
-<p>The Python runtime allocates KV cache tensors based on the parameters of the <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code> function, the KV cache size is linearly dependent on the <code class="docutils literal notranslate"><span class="pre">batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_context_length+max_new_tokens</span></code>. <strong>Note: This may change in the future, as the Python bindings of the C++ runtime may replace the current python runtime in the future. The Python bindings of C++ runtime behave like C++ runtime.</strong></p>
-</section>
-<section id="c-runtime">
-<h3>C++ runtime<a class="headerlink" href="#c-runtime" title="Link to this heading"></a></h3>
+<h4>3.2 KV cache tensor<a class="headerlink" href="#kv-cache-tensor" title="Link to this heading"></a></h4>
+<section id="id1">
+<h5>C++ runtime<a class="headerlink" href="#id1" title="Link to this heading"></a></h5>
 <ul>
 <li><p>When paged KV cache is enabled</p>
-<p>TensorRT-LLM runtime pre-allocates KV cache tensors during initialization for a configured number of blocks and distributes them at runtime.
-KV cache tensors are allocated based on the <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code> object when creating <code class="docutils literal notranslate"><span class="pre">GptSession</span></code>. If neither <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> nor <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> is specified, KV cache will by default allocate 85% of the remaining free GPU memory. When either <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> or <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> is specified, the specified value will be used to compute the KV cache memory size. And if both are specified, firstly the <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> is used to compute the number of tokens in KV cache, and then the minimum between this computed number of tokens and <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> is used.</p>
-<p>In in-flight batching the scheduler can automatically schedule requests as long as enough KV cache space is available (exact behavior depends on the scheduler policy).
-If paged KV cache is used in <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> without in-flight batching, TensorRT-LLM may report OOM errors with message “Can’t allocate new blocks. No free blocks left”, if the paged KV cache is not large enough for the whole batch.</p>
+<p>TensorRT-LLM runtime pre-allocates KV cache tensors during initialization for a configured number of blocks and distributes them at runtime.</p>
+<p>KV cache tensors are allocated based on the <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code> object when creating the <code class="docutils literal notranslate"><span class="pre">Executor</span></code>. If neither <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> nor <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> is specified, KV cache will by default allocate 90% of the remaining free GPU memory. When either <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> or <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> is specified, the specified value will be used to compute the KV cache memory size. And if both are specified, firstly the <code class="docutils literal notranslate"><span class="pre">freeGpuMemoryFraction</span></code> is used to compute the number of tokens in KV cache, and then the minimum between this computed number of tokens and <code class="docutils literal notranslate"><span class="pre">maxTokens</span></code> is used.</p>
+<p>In in-flight batching the scheduler can automatically schedule requests as long as enough KV cache space is available (exact behavior depends on the scheduler policy).</p>
+<p>If paged KV cache is used in <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> (already deprecated) without in-flight batching, TensorRT-LLM may report OOM errors with message “Can’t allocate new blocks. No free blocks left”, if the paged KV cache is not large enough for the whole batch.</p>
 </li>
-<li><p>When paged KV cache is disabled</p>
+<li><p>When paged KV cache is disabled (Not recommended and only allowed for deprecated <code class="docutils literal notranslate"><span class="pre">GptSession</span></code>)</p>
 <p>C++ runtime allocates the KV cache tensors for each layer with shape <code class="docutils literal notranslate"><span class="pre">[batch</span> <span class="pre">size,</span> <span class="pre">2,</span> <span class="pre">heads,</span>&#160; <span class="pre">max</span> <span class="pre">seq</span> <span class="pre">length,</span> <span class="pre">hidden</span> <span class="pre">dimension</span> <span class="pre">per</span> <span class="pre">head]</span></code>, where <code class="docutils literal notranslate"><span class="pre">max</span> <span class="pre">seq</span> <span class="pre">length</span></code> is specified by <code class="docutils literal notranslate"><span class="pre">GptSession::Config::maxSequenceLength</span></code> when creating <code class="docutils literal notranslate"><span class="pre">GptSession</span></code>.</p>
 </li>
 </ul>
 </section>
+<section id="python-runtime-not-recommended-to-be-used">
+<h5>Python runtime (Not recommended to be used)<a class="headerlink" href="#python-runtime-not-recommended-to-be-used" title="Link to this heading"></a></h5>
+<p>The Python runtime allocates KV cache tensors based on the parameters of the <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code> function, the KV cache size is linearly dependent on the <code class="docutils literal notranslate"><span class="pre">batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_context_length+max_new_tokens</span></code>. <strong>Note: This may change in the future, as the Python bindings of the C++ runtime may replace the current python runtime in the future. The Python bindings of C++ runtime behave like C++ runtime.</strong></p>
+</section>
+</section>
+</section>
 </section>
 <section id="memory-pool">
 <h2>Memory pool<a class="headerlink" href="#memory-pool" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::initMemoryPool</a>, which uses the default memory pool managed by the CUDA driver. When a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object. Memory will be released from the pool if it is required for other memory allocations.
-However, <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> may still show high memory occupation after memory is returned to the CUDA driver’s memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolReserved())</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolFree())</a>, respectively.</p>
+<p>TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::initMemoryPool</a>, which uses the default memory pool managed by the CUDA driver. When a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object. Memory will be released from the pool if it is required for other memory allocations.</p>
+<p>However, <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> may still show high memory occupation after memory is returned to the CUDA driver’s memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolReserved())</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolFree())</a>, respectively.</p>
 </section>
 <section id="known-issues">
 <h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
-<ol class="arabic simple">
-<li><p>When 2 optimization profiles are used, the weights memory size may be doubled in some cases if the underlying kernel choices require different weights layouts for different optimization profiles. This issue will be fixed in a future release.</p></li>
-<li><p>When FP8 GEMM is used, the activation memory might be larger than the theoretical optimized memory size, this will be enhanced in a future release.</p></li>
-</ol>
+<p>When FP8 GEMM is used, the activation memory might be larger than the theoretical optimized memory size, this will be enhanced in a future release.</p>
 </section>
 <section id="faq">
 <h2>FAQ<a class="headerlink" href="#faq" title="Link to this heading"></a></h2>
 <ol class="arabic">
+<li><p>How to debug the memory usage of TensorRT-LLM?</p>
+<p>When the <code class="docutils literal notranslate"><span class="pre">info</span></code> logging level is used, TensorRT and TensorRT-LLM will print messages about memory usage details. Here is part of a log example with <code class="docutils literal notranslate"><span class="pre">info</span></code> logging level at runtime:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="n">Loaded</span> <span class="n">engine</span> <span class="n">size</span><span class="p">:</span> <span class="mi">6695</span> <span class="n">MiB</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MemUsageChange</span><span class="p">]</span> <span class="n">Allocated</span> <span class="mf">1134.01</span> <span class="n">MiB</span> <span class="k">for</span> <span class="n">execution</span> <span class="n">context</span> <span class="n">memory</span><span class="o">.</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MS</span><span class="p">]</span> <span class="n">Running</span> <span class="n">engine</span> <span class="k">with</span> <span class="n">multi</span> <span class="n">stream</span> <span class="n">info</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MS</span><span class="p">]</span> <span class="n">Number</span> <span class="n">of</span> <span class="n">aux</span> <span class="n">streams</span> <span class="ow">is</span> <span class="mi">1</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MS</span><span class="p">]</span> <span class="n">Number</span> <span class="n">of</span> <span class="n">total</span> <span class="n">worker</span> <span class="n">streams</span> <span class="ow">is</span> <span class="mi">2</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MS</span><span class="p">]</span> <span class="n">The</span> <span class="n">main</span> <span class="n">stream</span> <span class="n">provided</span> <span class="n">by</span> <span class="n">execute</span><span class="o">/</span><span class="n">enqueue</span> <span class="n">calls</span> <span class="ow">is</span> <span class="n">the</span> <span class="n">first</span> <span class="n">worker</span> <span class="n">stream</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MemUsageChange</span><span class="p">]</span> <span class="n">TensorRT</span><span class="o">-</span><span class="n">managed</span> <span class="n">allocation</span> <span class="ow">in</span> <span class="n">IExecutionContext</span> <span class="n">creation</span><span class="p">:</span> <span class="n">CPU</span> <span class="o">+</span><span class="mi">0</span><span class="p">,</span> <span class="n">GPU</span> <span class="o">+</span><span class="mi">0</span><span class="p">,</span> <span class="n">now</span><span class="p">:</span> <span class="n">CPU</span> <span class="mi">0</span><span class="p">,</span> <span class="n">GPU</span> <span class="mi">6678</span> <span class="p">(</span><span class="n">MiB</span><span class="p">)</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MemUsageChange</span><span class="p">]</span> <span class="n">Allocated</span> <span class="mf">43.29</span> <span class="n">MB</span> <span class="n">GPU</span> <span class="n">memory</span> <span class="k">for</span> <span class="n">runtime</span> <span class="n">buffers</span><span class="o">.</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MemUsageChange</span><span class="p">]</span> <span class="n">Allocated</span> <span class="mf">180.30</span> <span class="n">MB</span> <span class="n">GPU</span> <span class="n">memory</span> <span class="k">for</span> <span class="n">decoder</span><span class="o">.</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="n">Memory</span> <span class="n">usage</span> <span class="n">when</span> <span class="n">calculating</span> <span class="nb">max</span> <span class="n">tokens</span> <span class="ow">in</span> <span class="n">paged</span> <span class="n">kv</span> <span class="n">cache</span><span class="p">:</span> <span class="n">total</span><span class="p">:</span> <span class="mf">79.10</span> <span class="n">GiB</span><span class="p">,</span> <span class="n">available</span><span class="p">:</span> <span class="mf">70.48</span> <span class="n">GiB</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="n">Number</span> <span class="n">of</span> <span class="n">blocks</span> <span class="ow">in</span> <span class="n">KV</span> <span class="n">cache</span> <span class="n">primary</span> <span class="n">pool</span><span class="p">:</span> <span class="mi">4060</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="n">Number</span> <span class="n">of</span> <span class="n">blocks</span> <span class="ow">in</span> <span class="n">KV</span> <span class="n">cache</span> <span class="n">secondary</span> <span class="n">pool</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="n">onboard</span> <span class="n">blocks</span> <span class="n">to</span> <span class="n">primary</span> <span class="n">memory</span> <span class="n">before</span> <span class="n">reuse</span><span class="p">:</span> <span class="n">true</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="n">Max</span> <span class="n">KV</span> <span class="n">cache</span> <span class="n">pages</span> <span class="n">per</span> <span class="n">sequence</span><span class="p">:</span> <span class="mi">32</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="n">Number</span> <span class="n">of</span> <span class="n">tokens</span> <span class="n">per</span> <span class="n">block</span><span class="p">:</span> <span class="mf">64.</span>
+<span class="p">[</span><span class="n">TensorRT</span><span class="o">-</span><span class="n">LLM</span><span class="p">][</span><span class="n">INFO</span><span class="p">]</span> <span class="p">[</span><span class="n">MemUsageChange</span><span class="p">]</span> <span class="n">Allocated</span> <span class="mf">63.44</span> <span class="n">GiB</span> <span class="k">for</span> <span class="nb">max</span> <span class="n">tokens</span> <span class="ow">in</span> <span class="n">paged</span> <span class="n">KV</span> <span class="n">cache</span> <span class="p">(</span><span class="mi">259840</span><span class="p">)</span><span class="o">.</span>
+</pre></div>
+</div>
+<p>You can see that there are several GPU memory allocation started with <code class="docutils literal notranslate"><span class="pre">[MemUsageChange]</span></code> keyword happened at runtime.</p>
+<p>The line showing “Total Weights Memory” indicates the weights memory size, and the line “Total Activation Memory” indicates the activation memory size.</p>
+<p>Normally the weights memory size is close to the TensorRT engine size, since most of the content in the engine is from weights for LLM networks.</p>
+</li>
 <li><p>Why is the memory size large even though a small batch size and sequence length are used in the runtime?</p>
-<p>As explained above, the activation memory size is computed based on the max tensor shapes at TensorRT engine building time, try to reduce the engine building time parameters like <code class="docutils literal notranslate"><span class="pre">max_num_token</span></code>, <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code>, see <a class="reference internal" href="#activation-size"><span class="xref myst">Activation size</span></a> for details.</p>
+<p>As explained above, the activation memory size is computed based on the max tensor shapes at TensorRT engine building time, try to reduce the engine building time parameters like <code class="docutils literal notranslate"><span class="pre">max_num_token</span></code>, see <a class="reference internal" href="#activation-size"><span class="xref myst">Activation size</span></a> for details.</p>
 </li>
 <li><p>Why can the engine be generated, but the inference will run out of memory (OOM) at runtime?</p>
 <p>At engine building time, TensorRT will tune the kernel selection layer by layer, it does not necessarily allocate all the memory required to run the entire engine. If the activation tensors required to run a single layer are small, while the I/O tensor (like KV cache) sizes required to run the engine are large, building will succeed since it may not need to allocate the large I/O tensors, runtime may fail with OOM errors on allocating large IO tensors.</p>
 <p>TensorRT-LLM has provided a <code class="docutils literal notranslate"><span class="pre">check_gpt_mem_usage</span></code> utility function to check the upper bound of the memory size given an engine, and the related batch size, I/O sequence length, etc., when the upper boundary check exceeded the GPU physical memory size, warning messages will be printed.</p>
 </li>
-<li><p>How to debug the memory usage of TensorRT-LLM?</p>
-<p>When the verbose logging level is used, TensorRT and TensorRT-LLM will print messages about memory usage details.
-The line showing “Total Weights Memory” indicates the weights memory size, and the line “Total Activation Memory” indicates the activation memory size.</p>
-<p>Normally the weights memory size is close to the TensorRT engine size, since most of the content in the engine is from weights for LLM networks.</p>
-</li>
 <li><p>For pipeline parallelism, is build time max batch size the limit of micro batch size?</p>
-<p>Yes, in pipeline parallel mode, TensorRT-LLM runtime will split the batch of requests into micro batches, and enqueue these micro batches into TRT engine sequentially.
-The <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> at build time means that batch size of one engine enqueue call shall be smaller than it. The total batch size before splitting into micro batches can be larger than the build time <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>.</p>
-<p>For example, if you have 4-stages pipeline parallelism, and intend to run the engine using micro batch size 2 and run 16 micro batches (total batch size 32) in one <code class="docutils literal notranslate"><span class="pre">generate</span></code> call.
-You could just set the <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> at building time to 2, instead of 32. Setting build time <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> 32 will occupy almost 16x more activation memory.</p>
+<p>Yes, in pipeline parallel mode, TensorRT-LLM runtime will split the batch of requests into micro batches, and enqueue these micro batches into TRT engine sequentially.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> at build time means that batch size of one engine enqueue call shall be smaller than it. The total batch size before splitting into micro batches can be larger than the build time <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>.</p>
+<p>For example, if you have 4-stages pipeline parallelism, and intend to run the engine using micro batch size 2 and run 16 micro batches (total batch size 32) in one <code class="docutils literal notranslate"><span class="pre">generate</span></code> call.</p>
+<p>You could just set the <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> at building time to 2, instead of 32. Setting build time <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> 32 will occupy almost 16x more activation memory.</p>
 </li>
 </ol>
 </section>
@@ -260,7 +276,7 @@ You could just set the <code class="docutils literal notranslate"><span class="p
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f48477f0>
+<jinja2.runtime.BlockReference object at 0x7fedf88ba200>
 
 <div class="footer">
     <p>

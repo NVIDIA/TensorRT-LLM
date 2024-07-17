@@ -84,10 +84,19 @@
 <li class="toctree-l1"><a class="reference internal" href="perf-overview.html">Overview</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Best Practices for Tuning the Performance of TensorRT-LLM</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#how-to-measure-performance">How To Measure Performance?</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#build-options-to-optimize-the-performance-of-tensorrt-llm-models">Build Options to Optimize the Performance of TensorRT-LLM Models?</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#gpt-attention-plugin-and-context-fused-multi-head-attention">GPT Attention Plugin and Context Fused Multi-Head Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#build-options-to-optimize-the-performance-of-tensorrt-llm-models">Build Options to Optimize the Performance of TensorRT-LLM Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#max-batch-size-max-seq-len-and-max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#max-batch-size"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#max-seq-len"><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#multiple-profiles">Multiple profiles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#gpt-attention-plugin-and-context-fused-multi-head-attention">GPT Attention Plugin and Context Fused Multi-Head Attention</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#fp8-context-fused-multi-head-attention">FP8 Context Fused Multi-Head Attention</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="#remove-input-padding">Remove Input Padding</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#maximum-number-of-tokens">Maximum Number of Tokens</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#paged-kv-cache">Paged KV Cache</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#in-flight-sequence-batching">In-flight Sequence Batching</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#multi-block-mode">Multi-Block Mode</a></li>
@@ -95,14 +104,14 @@
 <li class="toctree-l3"><a class="reference internal" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin">Embedding Parallelism, Embedding Sharing, and Look-Up Plugin</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#horizontal-fusion-in-gated-mlp">Horizontal Fusion in Gated-MLP</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#gemm-swiglu-fusion-in-gated-mlp">GEMM + SwiGLU Fusion in Gated-MLP</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#gemm-plugin">GEMM Plugin</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#multiple-profiles">Multiple profiles</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#fp8-context-fused-multi-head-attention">FP8 Context Fused Multi-Head Attention</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#bert-attention-plugin-and-context-fused-multi-head-attention">BERT Attention Plugin and Context Fused Multi-Head Attention</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#fp8-gemm-plugin-for-small-batch-size-performance-optimization">FP8 GEMM Plugin for Small Batch Size Performance Optimization</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#gemm-plugin">GEMM Plugin</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#fp8-gemm-plugin-for-small-batch-size-performance-optimization">FP8 GEMM Plugin for Small Batch Size Performance Optimization</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">Runtime Options to Optimize the Performance of TensorRT-LLM Models?</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#bert-attention-plugin-and-context-fused-multi-head-attention">BERT Attention Plugin and Context Fused Multi-Head Attention</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">Runtime Options to Optimize the Performance of TensorRT-LLM Models</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#gpt-model-type">GPT Model Type</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction">Max Tokens in Paged KV Cache and KV Cache Free GPU Memory Fraction</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#batch-scheduler-policy">Batch Scheduler Policy</a></li>
@@ -126,15 +135,6 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -185,49 +185,37 @@ The <a class="reference external" href="https://github.com/triton-inference-serv
 can also be used to measure the performance of TensorRT-LLM for online serving.</p>
 </section>
 <section id="build-options-to-optimize-the-performance-of-tensorrt-llm-models">
-<h2>Build Options to Optimize the Performance of TensorRT-LLM Models?<a class="headerlink" href="#build-options-to-optimize-the-performance-of-tensorrt-llm-models" title="Link to this heading"></a></h2>
+<h2>Build Options to Optimize the Performance of TensorRT-LLM Models<a class="headerlink" href="#build-options-to-optimize-the-performance-of-tensorrt-llm-models" title="Link to this heading"></a></h2>
 <p>This part summarizes how to build engines to enhance the performance of the
 runtime and, for some of them, decrease the engine build time.</p>
 <p><em><strong>Note that some of those features and how to enable them may change in the future.</strong></em></p>
-<section id="gpt-attention-plugin-and-context-fused-multi-head-attention">
-<h3>GPT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#gpt-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
-<p>The GPT attention plugin and fused  multi-head attention kernel are enabled by
-default. For the context phase, use the <code class="docutils literal notranslate"><span class="pre">--gpt_attention_plugin</span></code>
-and <code class="docutils literal notranslate"><span class="pre">--context_fmha</span></code> arguments with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to control.</p>
-<p>The TensorRT-LLM GPT attention plugin uses efficient kernels and enables an
-in-place update of the KV cache. It results in reduced memory consumption as
-well as the removal of unneeded memory copy operations (compared with the
-implementation that uses the <code class="docutils literal notranslate"><span class="pre">concat</span></code> operator to update the KV cache).</p>
-<p>Enabling the fused multi-head attention, during the context phase, will trigger
-a kernel that performs the MHA/MQA/GQA block using a single kernel, for more
-details, see this <a class="reference internal" href="../advanced/gpt-attention.html#context-phase"><span class="std std-ref">Document</span></a>.</p>
+<section id="max-batch-size-max-seq-len-and-max-num-tokens">
+<h3><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-batch-size-max-seq-len-and-max-num-tokens" title="Link to this heading"></a></h3>
+<p align="center">
+    <img src="../media/max_bs_toks_len.svg" alt="Explain `max_batch_size`, `max_seq_len` and `max_num_tokens`" width="30%" height="auto">
+</p>
+<p>Regarding the impacts of those three arguments to the GPU memory usage, please refer to <a class="reference internal" href="../reference/memory.html"><span class="std std-doc">memory.md</span></a></p>
+<section id="max-batch-size">
+<h4><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code><a class="headerlink" href="#max-batch-size" title="Link to this heading"></a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> defines the maximum number of requests that the engine can handle.​</p>
+<p>It controls the maximum number of requests that can be scheduled at runtime.</p>
+<p>Set high enough <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> when building the engine so that it does not become the bottleneck of the throughput, and use runtime <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> to tune it without re-building the engine if you want to get better user throughput or lower latency.</p>
 </section>
-<section id="remove-input-padding">
-<h3>Remove Input Padding<a class="headerlink" href="#remove-input-padding" title="Link to this heading"></a></h3>
-<p>The remove input padding feature is enabled by default, the <code class="docutils literal notranslate"><span class="pre">--remove_input_padding</span></code>
-argument in <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> is used to control it.</p>
-<p>When input padding is removed, the different tokens are packed together. It
-reduces both the amount of computations and memory consumption. For more details, see
-this <a class="reference internal" href="../advanced/gpt-attention.html#padded-and-packed-tensors"><span class="std std-ref">Document</span></a>.</p>
+<section id="max-seq-len">
+<h4><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code><a class="headerlink" href="#max-seq-len" title="Link to this heading"></a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> defines the maximum sequence length of single request​</p>
+<p>Starting from TensorRT-LLM v0.11, when <code class="docutils literal notranslate"><span class="pre">--remove_input_padding</span></code> and <code class="docutils literal notranslate"><span class="pre">--context_fmha</span></code> are enabled, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> can replace <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_output_len</span></code>, and is set to <code class="docutils literal notranslate"><span class="pre">max_position_embeddings</span></code> by default.</p>
+<p>Use default <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> (which is <code class="docutils literal notranslate"><span class="pre">max_position_embeddings</span></code>), no need to tune it unless you are very sure what max sequence lengths would be on your workloads. If the GPU memory is so limited that it cannot make sure even one request to reach <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, you’ll need to reduce it.</p>
 </section>
-<section id="maximum-number-of-tokens">
-<h3>Maximum Number of Tokens<a class="headerlink" href="#maximum-number-of-tokens" title="Link to this heading"></a></h3>
-<p>It is recommended to tune <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code> for better performance. The
-<code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code> could be roughly estimated as:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">max_batch_size</span> <span class="o">*</span> <span class="n">max_input_len</span> <span class="o">*</span> <span class="n">alpha</span> <span class="o">+</span> <span class="n">max_batch_size</span> <span class="o">*</span> <span class="n">max_beam_width</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">alpha</span><span class="p">)</span>
-</pre></div>
-</div>
-<p>where <code class="docutils literal notranslate"><span class="pre">alpha</span></code> is a floating-point value between <code class="docutils literal notranslate"><span class="pre">0.0</span></code> and <code class="docutils literal notranslate"><span class="pre">1.0</span></code>. It stands for
-a rough estimation of the number of requests in their context phase at each
-invocation of the forward function during inference. It is recommended to use a
-value between <code class="docutils literal notranslate"><span class="pre">0.05</span></code> and <code class="docutils literal notranslate"><span class="pre">0.20</span></code> (between 5%-20%) but it may depend on the
-actual scenario.</p>
+<section id="max-num-tokens">
+<h4><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-num-tokens" title="Link to this heading"></a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> defines the maximum number of batched input tokens after padding is removed in each batch.​</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is set to 8192 by default starting from v0.11, you can tune it using the runtime <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> without re-buliding the engine. It is recommended to tune <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code> for better performance.</p>
 <p>The maximum number of tokens equals will not take effects when input padding is
 not removed. When input padding is removed (see <a class="reference internal" href="#remove-input-padding"><span class="xref myst">Remove Input
 Padding</span></a>), the tokens from different sequences are
 packed together and the maximum number of the tokens can be set to a different
-(lower) value, which by default to be <code class="docutils literal notranslate"><span class="pre">max_input_len</span> <span class="pre">*</span> <span class="pre">max_batch_size</span></code>.
-Note that it has to be higher than <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code>.</p>
+(lower) value, which by default to be 8192.</p>
 <p>There are two aspects that must be considered. Firstly, some input sequences
 will be shorter than the maximum input length. Secondly, when in-flight
 sequence batching is enabled, requests in context phase will be executed with
@@ -240,14 +228,50 @@ It leads to an increased efficiency.</p>
 When increasing <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code> to some point, GPU utilization will plateau,
 going beyond that saturation point may hurt both first token latency as well as
 total end-to-end latency.</p>
-<p>See also <a class="reference internal" href="#chunked-context"><span class="xref myst">chunked context</span></a>.</p>
+<p>See also <a class="reference internal" href="../advanced/gpt-attention.html#chunked-context"><span class="std std-ref">chunked context</span></a>.</p>
+</section>
+</section>
+<section id="multiple-profiles">
+<h3>Multiple profiles<a class="headerlink" href="#multiple-profiles" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code> enables multiple TensorRT optimization profiles in the
+built engines, it will benefits the performance especially when GEMM plugin is
+disabled, because more optimization profiles help TensorRT have more chances to
+select better kernels.</p>
+<p>However, this feature will increase the engine build time.</p>
+</section>
+<section id="gpt-attention-plugin-and-context-fused-multi-head-attention">
+<h3>GPT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#gpt-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
+<p>The GPT attention plugin and fused  multi-head attention kernel are enabled by
+default. For the context phase, use the <code class="docutils literal notranslate"><span class="pre">--gpt_attention_plugin</span></code>
+and <code class="docutils literal notranslate"><span class="pre">--context_fmha</span></code> arguments with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> to control.</p>
+<p>The TensorRT-LLM GPT attention plugin uses efficient kernels and enables an
+in-place update of the KV cache. It results in reduced memory consumption as
+well as the removal of unneeded memory copy operations (compared with the
+implementation that uses the <code class="docutils literal notranslate"><span class="pre">concat</span></code> operator to update the KV cache).</p>
+<p>Enabling the fused multi-head attention, during the context phase, will trigger
+a kernel that performs the MHA/MQA/GQA block using a single kernel, for more
+details, see this <a class="reference internal" href="#../advanced/gpt-attention.html#context-phase"><span class="xref myst">Document</span></a>.</p>
+<section id="fp8-context-fused-multi-head-attention">
+<h4>FP8 Context Fused Multi-Head Attention<a class="headerlink" href="#fp8-context-fused-multi-head-attention" title="Link to this heading"></a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">--use_fp8_context_fmha</span></code> enables FP8 Context fused multi-head attention, which
+is recommended to be enabled when fp8 quantization is used to improve the
+performance. Note that only NVIDIA Hopper architecture is supported.</p>
+</section>
+</section>
+<section id="remove-input-padding">
+<h3>Remove Input Padding<a class="headerlink" href="#remove-input-padding" title="Link to this heading"></a></h3>
+<p>The remove input padding feature is enabled by default, the <code class="docutils literal notranslate"><span class="pre">--remove_input_padding</span></code>
+argument in <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> is used to control it.</p>
+<p>When input padding is removed, the different tokens are packed together. It
+reduces both the amount of computations and memory consumption. For more details, see
+this <a class="reference internal" href="../advanced/gpt-attention.html#padded-and-packed-tensors"><span class="std std-ref">Document</span></a>.</p>
 </section>
 <section id="paged-kv-cache">
 <h3>Paged KV Cache<a class="headerlink" href="#paged-kv-cache" title="Link to this heading"></a></h3>
 <p>Paged KV cache is enabled by default, the <code class="docutils literal notranslate"><span class="pre">--paged_kv_cache</span></code> argument in
 <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> is used to control it.</p>
 <p>The paged KV cache helps manage memory for the KV cache more efficiently (see
-this <a class="reference internal" href="../advanced/gpt-attention.html#paged-kv-cache"><span class="std std-ref">Document</span></a>). It usually leads to an
+this <a class="reference internal" href="#../advanced/gpt-attention.html#paged-kv-cache"><span class="xref myst">Document</span></a>). It usually leads to an
 increase in the batch size and an improved efficiency.</p>
 </section>
 <section id="in-flight-sequence-batching">
@@ -257,7 +281,7 @@ which requires that the GPT attention plugin, input padding removal and paged KV
 cache are all enabled together.</p>
 <p>In-flight sequence batching schedules sequences in context phase together with
 sequences in generation phase to increase efficiency and reduce latency, see
-this <a class="reference internal" href="../advanced/gpt-attention.html#inflight-batching"><span class="std std-ref">Document</span></a> for more details.</p>
+this <a class="reference internal" href="#../advanced/gpt-attention.html#in-flight-batching"><span class="xref myst">Document</span></a> for more details.</p>
 </section>
 <section id="multi-block-mode">
 <h3>Multi-Block Mode<a class="headerlink" href="#multi-block-mode" title="Link to this heading"></a></h3>
@@ -284,16 +308,14 @@ argument is disabled.</p>
 </section>
 <section id="custom-allreduce-plugin">
 <h3>Custom AllReduce Plugin<a class="headerlink" href="#custom-allreduce-plugin" title="Link to this heading"></a></h3>
-<p>On NVLink-based nodes, it is recommended to enable the custom AllReduce plugin
-by using the <code class="docutils literal notranslate"><span class="pre">--use_custom_all_reduce</span></code> argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. On PCIE-based
-nodes, it is not recommended to enabled that plugin.</p>
 <p>The custom AllReduce plugin activates a latency-optimized algorithm for
 the AllReduce operation instead of the native NCCL operator. However, the
 performance benefits may not be seen on PCIE-based systems.</p>
-<p>Note that, the <code class="docutils literal notranslate"><span class="pre">--use_custom_all_reduce</span></code> argument works more like a suggestion
-to the runtime, and will possibly be removed in the future releases. We have supported
-an auto fallback mechanism so that native NCCL kernel is used when hardware requirements
-are not satisfied to get the best performance.</p>
+<p>Starting from v0.10, an automatic fallback mechanism is supported for allreduce plugin, so that native NCCL kernel is used when hardware requirements are not satisfied to get the best performance. Currently, the <code class="docutils literal notranslate"><span class="pre">--use_custom_all_reduce</span></code> argument works more like a suggestion
+to the runtime, and will possibly be removed in the future releases.</p>
+<p>On NVLink-based nodes, it is recommended to enable the custom AllReduce plugin
+by using the <code class="docutils literal notranslate"><span class="pre">--use_custom_all_reduce</span></code> argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. On PCIE-based
+nodes, it is not recommended to enabled that plugin.</p>
 <p>If you use <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> or <code class="docutils literal notranslate"><span class="pre">NVIDIA_VISIBLE_DEVICES</span></code>, please provide the full device list
 instead of limiting to single device, otherwise custom all reduce will be disabled since its kernels
 rely on P2P access to peer devices, which is not allowed when only a single device is visible.</p>
@@ -325,7 +347,7 @@ improve throughput. However, the following conditions have to be satisfied:</p>
 <code class="docutils literal notranslate"><span class="pre">--use_embedding_sharing</span></code>, <code class="docutils literal notranslate"><span class="pre">--use_lookup_plugin</span></code>, <code class="docutils literal notranslate"><span class="pre">--use_gemm_plugin</span></code>
 arguments, and set correct dimension to <code class="docutils literal notranslate"><span class="pre">--embedding_sharding_dim</span></code> argument
 with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. See those
-<span class="xref myst">Examples</span>
+<a class="reference internal" href="#../../../examples/gpt#embedding-parallelism-and-sharing"><span class="xref myst">Examples</span></a>
 for details.</p>
 </section>
 <section id="horizontal-fusion-in-gated-mlp">
@@ -356,29 +378,8 @@ enable that feature.</p>
 <p>The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and
 BF16, it’s recommended to be enabled for better performance and smaller GPU
 memory usage. On FP8, it’s recommended to be disabled.</p>
-</section>
-<section id="multiple-profiles">
-<h3>Multiple profiles<a class="headerlink" href="#multiple-profiles" title="Link to this heading"></a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code> enables multiple TensorRT optimization profiles in the
-built engines, it will benefits the performance especially when GEMM plugin is
-disabled, because more optimization profiles help TensorRT have more chances to
-select better kernels. However, it’ll increase the engine build time.</p>
-</section>
-<section id="fp8-context-fused-multi-head-attention">
-<h3>FP8 Context Fused Multi-Head Attention<a class="headerlink" href="#fp8-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">--use_fp8_context_fmha</span></code> enables FP8 Context fused multi-head attention, which
-is recommended to be enabled when fp8 quantization is used to improve the
-performance. Note that only NVIDIA Hopper architecture is supported.</p>
-</section>
-<section id="bert-attention-plugin-and-context-fused-multi-head-attention">
-<h3>BERT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#bert-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
-<p>BERT attention plugin and context fused multi-head attention are both
-recommended for the BERT model. They are enabled by default using the
-<code class="docutils literal notranslate"><span class="pre">--bert_attention_plugin</span></code> and <code class="docutils literal notranslate"><span class="pre">--context_fmha</span></code> arguments with
-<code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
-</section>
 <section id="fp8-gemm-plugin-for-small-batch-size-performance-optimization">
-<h3>FP8 GEMM Plugin for Small Batch Size Performance Optimization<a class="headerlink" href="#fp8-gemm-plugin-for-small-batch-size-performance-optimization" title="Link to this heading"></a></h3>
+<h4>FP8 GEMM Plugin for Small Batch Size Performance Optimization<a class="headerlink" href="#fp8-gemm-plugin-for-small-batch-size-performance-optimization" title="Link to this heading"></a></h4>
 <p>FP8 gemm plugin is an experimental feature aimed to improve performance in
 small-batch-size cases(e.g. BS&lt;=4) and can be enabled by <code class="docutils literal notranslate"><span class="pre">--gemm_plugin</span> <span class="pre">fp8</span></code>
 when building FP8 models. Although inputs with larger batch size can be correctly
@@ -387,12 +388,20 @@ feature is only recommended for latency reduction in small-batch-size scenarios
 currently.</p>
 </section>
 </section>
+<section id="bert-attention-plugin-and-context-fused-multi-head-attention">
+<h3>BERT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#bert-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
+<p>BERT attention plugin and context fused multi-head attention are both
+recommended for the BERT model. They are enabled by default using the
+<code class="docutils literal notranslate"><span class="pre">--bert_attention_plugin</span></code> and <code class="docutils literal notranslate"><span class="pre">--context_fmha</span></code> arguments with
+<code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
+</section>
+</section>
 <section id="runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">
-<h2>Runtime Options to Optimize the Performance of TensorRT-LLM Models?<a class="headerlink" href="#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models" title="Link to this heading"></a></h2>
+<h2>Runtime Options to Optimize the Performance of TensorRT-LLM Models<a class="headerlink" href="#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models" title="Link to this heading"></a></h2>
 <p>This part summarizes the runtime configuration knobs that can be tweaked to
 enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
-<a class="reference internal" href="../advanced/batch-manager.html#the-batch-manager-api"><span class="std std-ref">Batch Manager API</span></a>
+<a class="reference internal" href="#../advanced/batch-manager.html#the-batch-manager-api"><span class="xref myst">Batch Manager API</span></a>
 as well as the
 <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">TensorRT-LLM backend</a>.</p>
 <section id="gpt-model-type">
@@ -433,7 +442,7 @@ inputs and outputs.</p>
 <h3>Batch Scheduler Policy<a class="headerlink" href="#batch-scheduler-policy" title="Link to this heading"></a></h3>
 <p>There currently are two batch scheduler policies: <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> and
 <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code>.</p>
-<p>As explained in the <a class="reference internal" href="../advanced/batch-manager.html#gptmanager-design"><span class="std std-ref">GPT Manager Design</span></a>
+<p>As explained in the <a class="reference internal" href="#../advanced/batch-manager.html#gptmanager-design"><span class="xref myst">GPT Manager Design</span></a>
 section, the scheduling policy can be set to <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> to pack as many
 requests as possible at each iteration of the forward loop, when in-flight
 sequence batching is enabled. It maximizes the utilization of the GPUs by
@@ -497,7 +506,7 @@ recommended to start from <code class="docutils literal notranslate"><span class
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f4c14940>
+<jinja2.runtime.BlockReference object at 0x7fef8e176200>
 
 <div class="footer">
     <p>
