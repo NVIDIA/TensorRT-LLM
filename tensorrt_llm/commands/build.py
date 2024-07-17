@@ -20,25 +20,24 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from importlib.machinery import SourceFileLoader
 from multiprocessing import get_context
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
-from .._common import check_max_num_tokens
 from ..auto_parallel import infer_cluster_config
 from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
+from ..functional import PositionEmbeddingType
 from ..logger import logger
 from ..lora_manager import LoraConfig, LoraManager
-from ..models import PretrainedConfig
-from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
-                                     SpeculativeDecodingMode, load_model)
+from ..models import MODEL_MAP, PretrainedConfig
+from ..models.modeling_utils import SpeculativeDecodingMode
 from ..plugin import PluginConfig, add_plugin_argument
-from ..quantization import QuantAlgo
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--checkpoint_dir', type=str, default=None)
     parser.add_argument('--model_config', type=str, default=None)
     parser.add_argument('--build_config', type=str, default=None)
@@ -76,11 +75,34 @@ def parse_arguments():
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=1)
-    parser.add_argument('--max_input_len', type=int, default=1024)
-    parser.add_argument('--max_output_len', type=int, default=1024)
+    parser.add_argument(
+        '--max_batch_size',
+        type=int,
+        default=256,
+        help="Max number of requests that the engine can handle.")
+    parser.add_argument('--max_input_len',
+                        type=int,
+                        default=1024,
+                        help="Max input length of one request.")
+    parser.add_argument('--max_output_len',
+                        type=int,
+                        default=None,
+                        help="Deprecated. Please use `--max_seq_len` instead.")
+    parser.add_argument(
+        '--max_seq_len',
+        '--max_decoder_seq_len',
+        dest='max_seq_len',
+        type=int,
+        default=None,
+        help="Max total length of one request, including prompt and outputs. "
+        "If unspecified, will try to deduce from the model config.")
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=None)
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=8192,
+        help="Max number of batched input tokens after padding is removed "
+        "(triggered by `--remove_input_padding`) in each batch.")
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
@@ -120,24 +142,12 @@ def parse_arguments():
                         action='store_true',
                         default=False,
                         help='Gather generation logits')
-    parser.add_argument(
-        '--strongly_typed',
-        action='store_true',
-        default=False,
-        help=
-        'This option is introduced with TensorRT 9.1.0.1+ and will reduce the engine building time. '
-        'It\'s not expected to see performance or accuracy regression after enable this flag. '
-        'Note that, we may remove this flag in the future, and enable the feature by default.'
-    )
+
     parser.add_argument('--builder_opt', type=int, default=None)
     parser.add_argument('--logits_dtype',
                         type=str,
                         default=None,
                         choices=['float16', 'float32'])
-    parser.add_argument('--weight_only_precision',
-                        type=str,
-                        default=None,
-                        choices=['int8', 'int4'])
     parser.add_argument('--weight_sparsity', default=False, action='store_true')
     parser.add_argument(
         '--max_draft_len',
@@ -224,6 +234,7 @@ def parse_arguments():
                         default=None,
                         choices=[
                             "draft_tokens_external",
+                            "lookahead_decoding",
                             "medusa",
                         ],
                         help='Mode of speculative decoding.')
@@ -251,47 +262,29 @@ def parse_arguments():
     return args
 
 
-def preprocess_model_config(model_config, **kwargs):
-    if model_config.architecture in WEIGHT_LOADER_MODELS:
-        model_config.mapping.tp_size = kwargs['tp_size']
-        model_config.mapping.pp_size = kwargs['pp_size']
-        model_config.mapping.world_size = kwargs['tp_size'] * kwargs['pp_size']
-
-
-def build_model(build_config: BuildConfig,
-                rank: int = 0,
-                ckpt_dir: str = None,
-                model_config: Union[str, PretrainedConfig] = None,
-                model_cls=None,
-                **kwargs) -> Engine:
-    if ckpt_dir is not None:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir, 'config.json'))
-    else:
-        assert model_config is not None
-        if isinstance(model_config, PretrainedConfig):
-            model_config = model_config
-        else:
-            model_config = PretrainedConfig.from_json_file(model_config)
-
-    preprocess_model_config(model_config, **kwargs)
+def build_model(
+    build_config: BuildConfig,
+    rank: int = 0,
+    ckpt_dir: str = None,
+    model_config: Union[str, PretrainedConfig] = None,
+    model_cls=None,
+    dry_run:
+    bool = False,  # return the modified BuildConfig without actually building the engine
+    **kwargs
+) -> Union[Engine, BuildConfig]:
+    model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
     if logits_dtype is not None:
         model_config.logits_dtype = logits_dtype
 
-    weight_only_precision = kwargs.get('weight_only_precision', None)
-    if not model_config.quant_mode.has_any_quant(
-    ) and weight_only_precision is not None:
-        if weight_only_precision == 'int4':
-            model_config.quantization = QuantConfig(QuantAlgo.W4A16)
-        else:
-            model_config.quantization = QuantConfig(QuantAlgo.W8A16)
-
     architecture = model_config.architecture
     assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
+
+    if build_config.plugin_config.reduce_fusion and model_config.mapping.tp_size == 1:
+        build_config.plugin_config.reduce_fusion = False
 
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
@@ -305,7 +298,15 @@ def build_model(build_config: BuildConfig,
 
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
-    model = load_model(rank_config, ckpt_dir, model_cls)
+
+    if model_cls is None:
+        assert architecture in MODEL_MAP, \
+            f"Unsupported model architecture: {architecture}"
+        model_cls = MODEL_MAP[architecture]
+    if ckpt_dir is None:
+        model = model_cls(rank_config)
+    else:
+        model = model_cls.from_checkpoint(ckpt_dir, config=rank_config)
     is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
 
     if build_config.plugin_config.lora_plugin is not None:
@@ -326,6 +327,9 @@ def build_model(build_config: BuildConfig,
         build_config.use_strip_plan = True
     build_config.use_refit = kwargs.get('refit', False)
 
+    if dry_run:
+        return build_config
+
     return build(model, build_config)
 
 
@@ -344,22 +348,14 @@ def build_and_save(rank, gpu_id, ckpt_dir, build_config, output_dir, log_level,
     return True
 
 
-def parallel_build(ckpt_dir_or_model_config: str,
+def parallel_build(model_config: PretrainedConfig,
+                   ckpt_dir: Optional[str],
                    build_config: BuildConfig,
                    output_dir: str,
                    workers: int = 1,
                    log_level: str = 'info',
                    model_cls=None,
                    **kwargs):
-    ckpt_dir = ckpt_dir_or_model_config
-    if ckpt_dir_or_model_config.lower().endswith('.json'):
-        model_config = PretrainedConfig.from_json_file(ckpt_dir_or_model_config)
-        ckpt_dir = None
-    else:
-        model_config = PretrainedConfig.from_json_file(
-            os.path.join(ckpt_dir_or_model_config, 'config.json'))
-
-    preprocess_model_config(model_config, **kwargs)
 
     if build_config.auto_parallel_config.enabled:
         if model_config.mapping.world_size > 1:
@@ -415,10 +411,10 @@ def main():
     workers = min(torch.cuda.device_count(), args.workers)
 
     plugin_config = PluginConfig.from_arguments(args)
+
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
-        'weight_only_precision': args.weight_only_precision,
         'tp_size': args.tp_size,
         'pp_size': args.pp_size,
         'lora_dir': args.lora_dir,
@@ -429,28 +425,88 @@ def main():
         'refit': False,
     }
     speculative_decoding_mode = SpeculativeDecodingMode.from_arguments(args)
+
+    ckpt_dir_or_model_config = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
+    if ckpt_dir_or_model_config.lower().endswith('.json'):
+        config_path = ckpt_dir_or_model_config
+        ckpt_dir = None
+    else:
+        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
+        ckpt_dir = ckpt_dir_or_model_config
+
+    model_config = PretrainedConfig.from_json_file(config_path)
+
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:
             raise RuntimeError(
                 "multiple_profiles is enabled, while opt_num_tokens is set. "
                 "They are not supposed to be working in the same time for now.")
-        args.max_num_tokens, args.opt_num_tokens = check_max_num_tokens(
-            max_num_tokens=args.max_num_tokens,
-            opt_num_tokens=args.opt_num_tokens,
-            max_batch_size=args.max_batch_size,
-            max_input_len=args.max_input_len,
-            max_beam_width=args.max_beam_width,
-            remove_input_padding=(args.remove_input_padding == "enable"),
-            enable_context_fmha=(args.context_fmha == "enable"),
-            tokens_per_block=args.tokens_per_block)
         if args.cluster_key is not None:
             cluster_config = dict(cluster_key=args.cluster_key)
         else:
             cluster_config = infer_cluster_config()
+
+        if args.max_output_len:
+            logger.warning(
+                '--max_output_len has been deprecated in favor of --max_seq_len'
+            )
+            if args.max_input_len:
+                if args.max_seq_len:
+                    logger.warning(
+                        '--max_seq_len has been overwritten due to --max_output_len being specified'
+                    )
+                args.max_seq_len = args.max_input_len + args.max_output_len
+            else:
+                raise Exception(
+                    f"--max_output_len is specified but not --max_input_len")
+
+            del args.max_output_len
+
+        # Extract rotary scaling which will be used for checks and default value of max_seq_len
+        rotary_scaling = getattr(model_config, "rotary_scaling", None)
+        if rotary_scaling is not None:
+            rotary_type = rotary_scaling['type']
+            rotary_factor = rotary_scaling[
+                'factor'] if rotary_type != 'su' else 1
+        else:
+            rotary_factor = 1
+
+        if args.max_seq_len is None:
+            # Step 1: Find the upper bound of max_seq_len
+            deduced_max_seq_len = 2048
+            if model_config.max_position_embeddings is not None:
+                deduced_max_seq_len = model_config.max_position_embeddings
+
+            # Step 2: Scale max_seq_len with rotary scaling
+            if rotary_factor != 1:
+                deduced_max_seq_len *= rotary_factor
+                logger.warning(
+                    f'max_seq_len is scaled to {deduced_max_seq_len} by rotary scaling {rotary_factor}'
+                )
+
+            # Step 3: Assign the new max_seq_len
+            args.max_seq_len = deduced_max_seq_len
+            logger.info(
+                f'max_seq_len is not specified, using value {deduced_max_seq_len}'
+            )
+        else:
+            if not plugin_config.streamingllm and model_config.max_position_embeddings is not None \
+                and model_config.position_embedding_type != PositionEmbeddingType.relative:
+                if args.max_seq_len > model_config.max_position_embeddings * rotary_factor:
+                    logger.warning(
+                        f'max_seq_len {args.max_seq_len} is larger than max_position_embeddings {model_config.max_position_embeddings} * rotary scaling {rotary_factor}, '
+                        'the model accuracy might be affected')
+
+        if args.max_input_len > args.max_seq_len:
+            logger.warning(
+                f'max_input_len is {args.max_input_len} is larger than max_seq_len {args.max_seq_len}, clipping it to max_seq_len'
+            )
+            args.max_input_len = args.max_seq_len
+
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
-                'max_output_len': args.max_output_len,
+                'max_seq_len': args.max_seq_len,
                 'max_batch_size': args.max_batch_size,
                 'max_beam_width': args.max_beam_width,
                 'max_num_tokens': args.max_num_tokens,
@@ -459,7 +515,7 @@ def main():
                 args.max_prompt_embedding_table_size,
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
-                'strongly_typed': args.strongly_typed,
+                'strongly_typed': True,
                 'builder_opt': args.builder_opt,
                 'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,
@@ -492,9 +548,8 @@ def main():
         build_config = BuildConfig.from_json_file(args.build_config,
                                                   plugin_config=plugin_config)
 
-    source = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_config
-    parallel_build(source, build_config, args.output_dir, workers,
-                   args.log_level, model_cls, **kwargs)
+    parallel_build(model_config, ckpt_dir, build_config, args.output_dir,
+                   workers, args.log_level, model_cls, **kwargs)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

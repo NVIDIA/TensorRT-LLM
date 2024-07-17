@@ -469,11 +469,9 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
         EXPECT_NE(it->tag, nullptr);
         EXPECT_EQ(it->size, expectedSize(c));
         it = std::next(it);
-        EXPECT_EQ(it->tag, nullptr);
-        secondChunkSize = expectedSize(c) + it->size;
-        EXPECT_EQ(secondChunkSize, pool.getChunkSize());
-        it = std::next(it);
         EXPECT_EQ(it, std::end(segments));
+        secondChunkSize = expectedSize(c);
+        EXPECT_EQ(secondChunkSize, pool.getChunkSize());
     }
 
     {

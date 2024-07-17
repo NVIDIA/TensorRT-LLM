@@ -32,6 +32,7 @@ option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
        ON)
 option(BUILD_TESTS "Build Google tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
@@ -111,6 +112,12 @@ else()
   message(STATUS "Not building benchmarks")
 endif()
 
+if(BUILD_MICRO_BENCHMARKS)
+  message(STATUS "Building C++ micro benchmarks")
+else()
+  message(STATUS "Not building C++ micro benchmarks")
+endif()
+
 if(FAST_BUILD)
   add_compile_definitions("FAST_BUILD")
   message(WARNING "Skip some kernels to accelerate compilation")
@@ -173,7 +180,31 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   endif()
 endif()
 
-message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+  # Detect highest available compute capability
+  set(OUTPUTFILE ${PROJECT_BINARY_DIR}/detect_cuda_arch)
+  set(CUDAFILE ${CMAKE_SOURCE_DIR}/cmake/utils/detect_cuda_arch.cu)
+  execute_process(COMMAND ${CMAKE_CUDA_COMPILER} -lcuda ${CUDAFILE} -o
+                          ${OUTPUTFILE})
+  message(VERBOSE "Detecting native CUDA compute capability")
+  execute_process(
+    COMMAND ${OUTPUTFILE}
+    RESULT_VARIABLE CUDA_RETURN_CODE
+    OUTPUT_VARIABLE CUDA_ARCH_OUTPUT)
+  if(NOT ${CUDA_RETURN_CODE} EQUAL 0)
+    message(WARNING "Detecting native CUDA compute capability - fail")
+    message(
+      WARNING "CUDA compute capability detection failed, compiling for 'all'")
+    set(CMAKE_CUDA_ARCHITECTURES_ORIG "all")
+  else()
+    message(STATUS "Detecting native CUDA compute capability - done")
+    set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CUDA_ARCH_OUTPUT}")
+  endif()
+else()
+  # Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
+  set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
 
 enable_language(C CXX CUDA)
 
@@ -504,6 +535,11 @@ endif()
 if(BUILD_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
                    ${CMAKE_BINARY_DIR}/benchmarks)
+endif()
+
+if(BUILD_MICRO_BENCHMARKS)
+  add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/micro_benchmarks
+                   ${CMAKE_BINARY_DIR}/micro_benchmarks)
 endif()
 
 # Measure the compile time

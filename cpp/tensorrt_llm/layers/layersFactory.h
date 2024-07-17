@@ -34,33 +34,38 @@ enum DecodingLayers_t
     STOP_CRITERIA_LAYER
 };
 
-static std::vector<DecodingLayers_t> createDecodingLayerTypes(runtime::DecodingMode const& mode)
+static std::vector<DecodingLayers_t> createDecodingLayerTypes(executor::DecodingMode const& mode)
 {
-    std::vector<DecodingLayers_t> types;
-    if (mode.isTopKorTopP() || mode.isBeamSearch())
+    std::vector<DecodingLayers_t> types = {};
+    if (mode.isUsePenalty())
     {
-        return {DecodingLayers_t::PENALTY_LAYER, DecodingLayers_t::BAN_WORDS_LAYER, DecodingLayers_t::DECODING_LAYER,
-            DecodingLayers_t::STOP_CRITERIA_LAYER};
+        types.push_back(DecodingLayers_t::PENALTY_LAYER);
     }
-    else if (mode.isMedusa())
+    if (mode.isUseBanWords())
     {
-        return {
-            DecodingLayers_t::PENALTY_LAYER, DecodingLayers_t::DECODING_LAYER, DecodingLayers_t::STOP_CRITERIA_LAYER};
+        types.push_back(DecodingLayers_t::BAN_WORDS_LAYER);
     }
-    TLLM_CHECK_WITH_INFO(false, "layer types are not defined for mode (%d)",
-        *reinterpret_cast<runtime::DecodingMode::UnderlyingType const*>(&mode));
-    return {};
+    types.push_back(DecodingLayers_t::DECODING_LAYER);
+    if (mode.isUseStopCriteria())
+    {
+        types.push_back(DecodingLayers_t::STOP_CRITERIA_LAYER);
+    }
+    return types;
 }
 
 template <typename T>
-static std::vector<std::unique_ptr<BaseLayer>> createLayers(runtime::DecodingMode const& mode,
+static std::vector<std::unique_ptr<BaseLayer>> createLayers(executor::DecodingMode const& mode,
     DecoderDomain const& decodingDomain, cudaStream_t stream,
     std::shared_ptr<tensorrt_llm::common::IAllocator> allocator)
 {
     std::vector<std::unique_ptr<BaseLayer>> layers;
     auto layerTypes = createDecodingLayerTypes(mode);
-    TLLM_CHECK_WITH_INFO(layerTypes.size() && layerTypes[0] == DecodingLayers_t::PENALTY_LAYER,
-        "Penalty layer is required to be the first layer for any decoder configuration");
+    // Only when draft tokens and predicted and decoded by the engine, we can skip penalty layer.
+    if (!mode.isExplicitDraftTokens())
+    {
+        TLLM_CHECK_WITH_INFO(layerTypes.size() && layerTypes[0] == DecodingLayers_t::PENALTY_LAYER,
+            "Penalty layer is required to be the first layer for any decoder configuration");
+    }
     for (auto&& type : layerTypes)
     {
         std::unique_ptr<BaseLayer> layer;

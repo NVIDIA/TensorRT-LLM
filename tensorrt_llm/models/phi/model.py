@@ -166,15 +166,15 @@ class PhiForCausalLM(DecoderModelForCausalLM):
                               hf_model_dir: str,
                               dtype: Optional[str] = "float16",
                               output_dir: Optional[str] = None,
-                              **kwargs):
+                              args=None):
         '''
         Convert Huggingface checkpoint to TRT-LLM checkpoint
         '''
         hf_model = AutoModelForCausalLM.from_pretrained(hf_model_dir,
                                                         torch_dtype="auto",
                                                         trust_remote_code=True)
-        config = convert_hf_config(hf_model.config, dtype=dtype, **kwargs)
-        weights = convert_hf_weights(hf_model, dtype=dtype, **kwargs)
+        config = convert_hf_config(hf_model.config, dtype, args)
+        weights = convert_hf_weights(hf_model, dtype, args)
 
         if output_dir:
             save_checkpoint(output_dir, config=config, weights=weights)

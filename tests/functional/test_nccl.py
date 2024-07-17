@@ -25,9 +25,8 @@ import sys
 
 from cuda import cudart
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
-import tensorrt_llm as tllm
+import tensorrt_llm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceStrategy,
@@ -35,15 +34,16 @@ from tensorrt_llm.functional import (AllReduceConfig, AllReduceStrategy,
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
+                        unittest_name_func)
 
 
 class TestCommunicationPlugin(unittest.TestCase):
 
     def setUp(self):
-        tllm.logger.set_level('error')
-        self.world_size = tllm.mpi_world_size()
-        self.rank = tllm.mpi_rank()
+        tensorrt_llm.logger.set_level('error')
+        self.world_size = tensorrt_llm.mpi_world_size()
+        self.rank = tensorrt_llm.mpi_rank()
 
         torch.cuda.set_device(self.rank)
         cudart.cudaSetDevice(self.rank)
@@ -67,6 +67,8 @@ class TestCommunicationPlugin(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_allreduce(self, dtype: str, strategy: AllReduceStrategy,
                        config: AllReduceConfig, size: int):
+
+        skip_bf16_pre_ampere(dtype)
         if self.world_size == 1:
             pytest.skip("Skip single GPU NCCL")
 
@@ -75,7 +77,7 @@ class TestCommunicationPlugin(unittest.TestCase):
 
         workspace = None
 
-        torch_dtype = tllm._utils.str_dtype_to_torch(dtype)
+        torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
         dtype_size = torch.finfo(torch_dtype).bits // 8
 
         allreduce_ref = torch.zeros(self.reference_tensors[0][:size].shape,
@@ -85,9 +87,10 @@ class TestCommunicationPlugin(unittest.TestCase):
             allreduce_ref = allreduce_ref + self.reference_tensors[i][:size].to(
                 torch_dtype)
 
-        builder = tllm.Builder()
-        net = builder.create_network()
-        net.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
+        # construct trt network
+        builder = tensorrt_llm.Builder()
+        network = builder.create_network()
+        network.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
         _, workspace = current_all_reduce_helper().allocate_workspace(
             self.mapping, size * dtype_size)
 
@@ -95,48 +98,26 @@ class TestCommunicationPlugin(unittest.TestCase):
         inner_loop = 5
 
         with peer_access(self.mapping):
-            with tllm.net_guard(net):
-                network = tllm.default_trtnet()
+            with tensorrt_llm.net_guard(network):
 
                 x = Tensor(name='x',
                            shape=input.shape,
-                           dtype=tllm.str_dtype_to_trt(dtype))
+                           dtype=tensorrt_llm.str_dtype_to_trt(dtype))
                 current_all_reduce_helper().set_workspace_tensor(self.mapping)
 
                 current = x
                 for i in range(inner_loop):
                     current = allreduce(current, self.mapping.tp_group,
                                         strategy, config)
-                output = current.trt_tensor
 
-                output.name = 'output'
-                output.dtype = tllm.str_dtype_to_trt(dtype)
-                network.mark_output(output)
+                current.mark_output('output', dtype)
 
-            build_engine = EngineFromNetwork(
-                (builder.trt_builder, net.trt_network),
-                config=CreateConfig(
-                    fp16=(dtype == 'float16'),
-                    bf16=(dtype == 'bfloat16'),
-                    precision_constraints='obey',
-                ))
+            # trt run
+            session = create_session(builder, network, precision=dtype)
+            inputs = {'x': input, 'all_reduce_workspace': workspace}
+            outputs = run_session(session, inputs)
 
-            output = torch.zeros_like(input)
-
-            stream = torch.cuda.current_stream()
-            feed_dict = {'x': input, 'all_reduce_workspace': workspace}
-
-            session = tllm.runtime.Session.from_engine(build_engine())
-            session.run(inputs=feed_dict,
-                        outputs={"output": output},
-                        stream=stream.cuda_stream)
-            torch.cuda.synchronize()
-
-        self.assertTrue(
-            torch.allclose(output.cpu(),
-                           (self.mapping.tp_size**(inner_loop - 1)) *
-                           allreduce_ref.cpu()))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        # compare diff
+        torch.testing.assert_close(outputs['output'],
+                                   (self.mapping.tp_size**(inner_loop - 1)) *
+                                   allreduce_ref)

@@ -78,7 +78,7 @@ struct Multihead_attention_params_base
 {
 
     // The output buffer. Dimensions B x D.
-    T* out = nullptr;
+    void* out = nullptr;
 
     // The input Qs and the associated bias. Dimensions B x D and D, resp.
     T const *q = nullptr, *q_bias = nullptr;
@@ -123,9 +123,11 @@ struct Multihead_attention_params_base
     float rotary_embedding_base = 0.0f;
     RotaryScalingType rotary_embedding_scale_type = RotaryScalingType::kNONE;
     float rotary_embedding_scale = 0.0f;
-    float rotary_embedding_m_scale = 0.0f;
+    float rotary_embedding_short_m_scale = 0.0f;
+    float rotary_embedding_long_m_scale = 0.0f;
     float const* rotary_embedding_scaling_factors = nullptr;
     int rotary_embedding_max_positions = 0;
+    int rotary_embedding_original_max_positions = 0;
     int rotary_cogvlm_vision_start = -1;
     int rotary_cogvlm_vision_length = -1;
     // Position shift for streamingllm
@@ -137,10 +139,18 @@ struct Multihead_attention_params_base
     // The 1.f / sqrt(Dh). Computed on the host.
     float inv_sqrt_dh = 0.0f;
 
+    // The tanh scale factor. (only used by Grok).
+    float qk_tanh_scale = 0.0f;
+    float qk_tanh_inverse_scale = 0.0f;
+
     // If relative position embedding is used
     T const* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;
     int max_distance = 0;
+
+    // block sparse config
+    bool block_sparse_attention = false;
+    BlockSparseParams block_sparse_params{64, false, 16, 8};
 
     // The slope per head of linear position bias to attention score (H).
     T const* linear_bias_slopes = nullptr;
@@ -166,11 +176,11 @@ struct Multihead_attention_params_base
     // Tune block size to maximum occupancy.
     int multi_processor_count = 1;
 
-    mutable int timesteps_per_block = -1;
-    mutable int seq_len_tile = -1;
+    mutable int timesteps_per_block = 1;
+    mutable int seq_len_tile = 1;
 
-    mutable int min_seq_len_tile = -1;
-    mutable int max_seq_len_tile = -1;
+    mutable int min_seq_len_tile = 1;
+    mutable int max_seq_len_tile = 1;
     // The partial output buffer. Dimensions max_seq_len_tile x B x D. (for each timestep only seq_len_tile x B x D is
     // needed)
     T* partial_out = nullptr;

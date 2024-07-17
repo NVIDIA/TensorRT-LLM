@@ -1,60 +1,98 @@
 #! /usr/bin/env python3
-import argparse
 import code
-import readline  # NOQA
-from argparse import ArgumentParser
-from pathlib import Path
 
-from tensorrt_llm.executor import GenerationExecutorWorker
+import click
+import colorama
+from transformers import AutoTokenizer, PreTrainedTokenizer
+
+from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 
 
-class LLMChat(code.InteractiveConsole):
+class LlmConsole(code.InteractiveConsole):
 
-    def __init__(self, executor):
-        super().__init__()
-        self.executor = executor
-        self.generation_kwargs = {
-            "max_new_tokens": 100,
-            "repetition_penalty": 1.05,
-        }
-        self.parser = ArgumentParser(prefix_chars="!")
-        self.parser.add_argument("!!max_new_tokens", type=int)
-        self.parser.add_argument("!!repetition_penalty", type=float)
+    def __init__(self,
+                 llm: LLM,
+                 tokenizer: PreTrainedTokenizer,
+                 sampling_params: SamplingParams,
+                 locals=None):
+        super().__init__(locals=locals)
+        self.llm = llm
+        self.tokenizer = tokenizer
+
+        self.sampling_params = sampling_params
+
+        self.history = []
 
     def runsource(self,
                   source: str,
                   filename: str = "<input>",
                   symbol: str = "single") -> bool:
-        del filename, symbol
+        prompt = source.strip()
+        if prompt == "quit":
+            self.llm.__exit__(None, None, None)
+            return True  # exit the console
 
-        if source.startswith("!"):
-            args = self.parser.parse_args(source.split(" "))
-            for k, v in vars(args).items():
-                if v is not None:
-                    self.generation_kwargs[k] = v
-            return False
+        message = {"role": "user", "content": prompt}
+        self.history.append(message)
 
-        future = self.executor.generate_async(source,
-                                              streaming=True,
-                                              **self.generation_kwargs)
-        for partial_result in future:
-            print(partial_result.text_diff, end="")
-        print("")
+        input = self.tokenizer.apply_chat_template(self.history,
+                                                   add_generation_prompt=True)
 
+        output = self.llm.generate([input],
+                                   sampling_params=self.sampling_params)[0]
+        generation = self.tokenizer.decode(output.outputs[0].token_ids,
+                                           skip_special_tokens=True)
+        print(colorama.Fore.CYAN + "AI: " + colorama.Style.RESET_ALL +
+              generation.strip())
+        print()
+
+        self.history.append({
+            "role": "assistant",
+            "content": generation.strip()
+        })
         return False
 
 
-def main(model_dir: Path, tokenizer: Path | str):
+@click.command()
+@click.option(
+    "--model",
+    required=True,
+    help=
+    "The model to use, either a path to a model or a model name from Hugging Face's model hub."
+)
+@click.option("--tokenizer", default=None, help="The tokenizer to use")
+@click.option("--tp_size",
+              default=1,
+              help="The number of devices for tensor parallelism to use")
+def main(model: str, tokenizer: str, tp_size: int):
+    kv_cache_config = KvCacheConfig(
+        # you can also set max_tokens instead
+        free_gpu_memory_fraction=0.8)
+    kv_cache_config.enable_block_reuse = True
 
-    with GenerationExecutorWorker(model_dir, tokenizer, 1) as executor:
-        executor.block_subordinates()
-        repl = LLMChat(executor)
-        repl.interact(banner="", exitmsg="")
+    build_config = BuildConfig()
+    build_config.max_batch_size = 1
+    build_config.max_input_len = 6000
+    build_config.max_num_tokens = 10240
+
+    sampling_params = SamplingParams()
+    sampling_params.beam_width = 1
+    sampling_params.max_new_tokens = 100
+    sampling_params.temperature = 0.5
+    sampling_params.top_p = 0.95
+
+    llm = LLM(model,
+              build_config=build_config,
+              kv_cache_config=kv_cache_config,
+              tensor_parallel_size=tp_size)
+
+    hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model)
+
+    console = LlmConsole(llm,
+                         tokenizer=hf_tokenizer,
+                         sampling_params=sampling_params)
+    console.interact(banner="Welcome to LLM Console!", exitmsg="Goodbye!")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir", type=Path)
-    parser.add_argument("tokenizer", type=Path)
-    args = parser.parse_args()
-    main(args.model_dir, args.tokenizer)
+if __name__ == '__main__':
+    main()

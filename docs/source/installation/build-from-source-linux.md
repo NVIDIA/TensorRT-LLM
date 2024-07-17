@@ -93,6 +93,7 @@ If you are looking for more flexibility, TensorRT-LLM has commands to create and
             --workdir /code/tensorrt_llm \
             tensorrt_llm/devel:latest
     ```
+    Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 
 #### Build TensorRT-LLM
 

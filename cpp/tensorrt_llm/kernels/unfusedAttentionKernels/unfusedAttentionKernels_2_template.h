@@ -307,17 +307,23 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
     // For q and k, also apply the rotary embedding.
 
     // NOTE:
-    // head_num == kv_head_num
-    //   QKV src shape (batch_size, seq_len, 3, head_num, size_per_head)
-    //                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
-    //                           m                        n
-    //   QKV dst shape (3, batch_size, head_num, seq_len, size_per_head)
-    // head_num != kv_head_num
-    //   QKV src shape: (batch_size, seq_len, head_num * size_per_head + 2 * kv_head_num * size_per_head)
-    //                   ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    //                             m                               n
+    // In the case of in-place modifications:
+    //      head_num == kv_head_num
+    //      QKV src shape (batch_size, seq_len, 3, head_num, size_per_head)
+    //                      ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                              m                        n
+    //      head_num != kv_head_num
+    //      QKV src shape: (batch_size, seq_len, head_num * size_per_head + 2 * kv_head_num * size_per_head)
+    //                      ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                                 m                               n
+    // Additionally, if there is no padding:
+    //      QKV src shape (num_tokens, 3, head_num, size_per_head)
+    //
+    //  In these above cases, output shape stays the same
+    //
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
+    // See QKVPreprocessingParams for further details
 
     // There are two kinds of output:
     //  1. Contiguous QKV output.
@@ -622,8 +628,12 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     //   QKV src shape: (batch_size, seq_len, head_num * size_per_head + 2 * kv_head_num * size_per_head)
     //                   ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     //                             m                               n
+    // Additionally, if there is no padding:
+    //   QKV src shape (num_tokens, 3, head_num, size_per_head)
+    //
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
+    // See QKVPreprocessingParams for further details
 
     // There are two kinds of output:
     //  1. Contiguous QKV output.
@@ -656,10 +666,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     int const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
     int const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
     bool const first_half = head_dim_idx < params.half_rotary_dim;
-    int const gptneox_rotary_dim_idx = first_half ? head_dim_idx : (head_dim_idx - params.half_rotary_dim);
-    int const gptj_rotary_dim_idx = head_dim_idx / 2;
+    [[maybe_unused]] int const gptneox_rotary_dim_idx
+        = first_half ? head_dim_idx : (head_dim_idx - params.half_rotary_dim);
+    [[maybe_unused]] int const gptj_rotary_dim_idx = head_dim_idx / 2;
     // Assume that either all vector elements are valid rotary idx or not.
-    int const valid_rotary_dim_idx = head_dim_idx < params.rotary_embedding_dim;
+    [[maybe_unused]] int const valid_rotary_dim_idx = head_dim_idx < params.rotary_embedding_dim;
     float2 const masked_rotary_cos_sin = make_float2(1.0f, 0.0f);
     int const hidden_idx = head_idx * params.size_per_head + head_dim_idx;
     int const kv_head_idx = head_idx / params.qheads_per_kv_head;
@@ -710,8 +721,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         auto q = *reinterpret_cast<VecT const*>(&params.QKV[src_q_idx]);
         auto k = *reinterpret_cast<VecT const*>(&params.QKV[src_k_idx]);
         auto v = *reinterpret_cast<VecT const*>(&params.QKV[src_v_idx]);
-        auto q_pair = *reinterpret_cast<VecT const*>(&params.QKV[src_q_idx + rotated_head_dim_offset]);
-        auto k_pair = *reinterpret_cast<VecT const*>(&params.QKV[src_k_idx + rotated_head_dim_offset]);
+        [[maybe_unused]] auto q_pair = *reinterpret_cast<VecT const*>(&params.QKV[src_q_idx + rotated_head_dim_offset]);
+        [[maybe_unused]] auto k_pair = *reinterpret_cast<VecT const*>(&params.QKV[src_k_idx + rotated_head_dim_offset]);
 
         // Bias should have been fused with QKV projection, but we keep the logic here for unit tests.
         if constexpr (ADD_BIAS)
@@ -732,7 +743,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
 
         // Cos/sin cache.
-        float2 const* rotary_coef_cache_buffer
+        [[maybe_unused]] float2 const* rotary_coef_cache_buffer
             = params.rotary_coef_cache_buffer + static_cast<size_t>(rotary_position) * params.half_rotary_dim;
         if constexpr (ROTARY_TYPE == RotaryPositionEmbeddingType::GPT_NEOX)
         {

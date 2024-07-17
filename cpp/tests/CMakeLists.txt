@@ -11,12 +11,15 @@
 # distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
-# the License. GoogleTest Preparation - Code block copied from
+# the License.
+
+# GoogleTest Preparation - Code block copied from
 # https://google.github.io/googletest/quickstart-cmake.html
 include(FetchContent)
 FetchContent_Declare(
   googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_REPOSITORY
+    https://github.com/google/googletest.git
   GIT_TAG release-1.12.1)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
@@ -32,18 +35,27 @@ find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
-  ${PROJECT_SOURCE_DIR}/include)
+  ${PROJECT_SOURCE_DIR}/include ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include)
 
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
 add_custom_target(google-tests)
 
 function(add_gtest test_name test_src)
+  set(options NO_GTEST_MAIN NO_TLLM_LINKAGE)
+  cmake_parse_arguments(ARGS "${options}" "${oneValueArgs}" "${multiValueArgs}"
+                        ${ARGN})
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(
-    ${test_name} PUBLIC ${SHARED_TARGET} gtest_main gmock_main nvonnxparser
-                        nvinfer_plugin_tensorrt_llm)
+  target_link_libraries(${test_name} PUBLIC gmock_main nvonnxparser)
+  if(NOT ARGS_NO_GTEST_MAIN)
+    target_link_libraries(${test_name} PUBLIC gtest_main)
+  endif()
+  if(NOT ARGS_NO_TLLM_LINKAGE)
+    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET}
+                                              nvinfer_plugin_tensorrt_llm)
+  endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
   target_compile_definitions(${test_name}
@@ -85,6 +97,7 @@ add_gtest(iTensorTest runtime/iTensorTest.cpp)
 add_gtest(worldConfigTest runtime/worldConfigTest.cpp)
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 add_gtest(mixtureOfExpertsTest kernels/mixtureOfExpertsTest.cu)
+add_gtest(ropeTest kernels/ropeTest.cu)
 if(${BUILD_PYT})
   add_gtest(torchTest runtime/torchTest.cpp)
   target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
@@ -99,6 +112,10 @@ set(SAMPLING_KERNEL_TEST_SRC
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(smoothQuantKernelTest kernels/smoothQuant/smoothQuantKernelTest.cpp)
+add_gtest(fp8GemmKernelTest kernels/fp8Gemm/fp8GemmKernelTest.cpp)
+if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
+  add_gtest(allReduceKernelTest kernels/allReduce/allReduceKernelTest.cu)
+endif()
 add_gtest(decodingKernelsTest kernels/decodingKernelTest.cpp)
 add_gtest(banRepeatNGramsKernelsTest kernels/banRepeatNGramsKernelsTest.cpp)
 add_gtest(stopCriteriaKernelsTest kernels/stopCriteriaKernelsTest.cpp)
@@ -109,7 +126,62 @@ set(SAMPLING_LAYER_TEST_SRC
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
-add_gtest(lookaheadPoolManagerTest layers/lookaheadPoolManagerTest.cpp)
+set(LOOKAHEAD_POOLMANAGER_TEST_SRC layers/randomLlm.cpp
+                                   layers/lookaheadPoolManagerTest.cpp)
+add_gtest(lookaheadPoolManagerTest "${LOOKAHEAD_POOLMANAGER_TEST_SRC}")
+set(LOOKAHEAD_ALGORITHM_TEST_SRC layers/randomLlm.cpp
+                                 layers/lookaheadAlgorithmTest.cpp)
+add_gtest(lookaheadAlgorithmTest "${LOOKAHEAD_ALGORITHM_TEST_SRC}")
+set(LOOKAHEAD_RANDOMLLM_TEST_SRC layers/randomLlm.cpp
+                                 layers/lookaheadRandomLlmTest.cpp)
+add_gtest(lookaheadRandomLlmTest "${LOOKAHEAD_RANDOMLLM_TEST_SRC}")
+add_gtest(explicitDraftTokensLayerTest layers/explicitDraftTokensLayerTest.cpp)
+set(LOOKAHEAD_DECODING_TEST_SRC layers/randomLlm.cpp
+                                layers/lookaheadDecodingLayerTest.cpp)
+add_gtest(lookaheadDecodingLayerTest "${LOOKAHEAD_DECODING_TEST_SRC}")
+
+add_gtest(
+  gemmSwigluRunnerTest
+  kernels/fused_gated_gemm/gemmSwigluRunnerTest.cu
+  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
+  NO_GTEST_MAIN)
+add_gtest(gemmSwigluKernelTestSm90Fp8
+          kernels/fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN
+          NO_TLLM_LINKAGE)
+
+foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
+  set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+  # Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
+  # specified). This is because sm_90a has arch conditional instructions that
+  # are not forward compatible. As a result, it does not make sense to embed PTX
+  # into the binary anyway.
+  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
+
+    message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
+    target_compile_options(
+      ${target_name}
+      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a
+              -res-usage>)
+
+    # Hopper kernels require cuda lib for TMA APIs
+    target_link_libraries(${target_name} PRIVATE CUDA::cuda_driver)
+
+    # No kernels should be parsed, unless hopper is specified. This is a build
+    # time improvement
+    target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
+  endif()
+
+  # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has
+  # changed in GCC 4.6 This note appears for kernels using TMA and clutters the
+  # compilation output.
+  if(NOT WIN32)
+    target_compile_options(
+      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
+  endif()
+endforeach()
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

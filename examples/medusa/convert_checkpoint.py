@@ -19,12 +19,13 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
-from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.convert_utils import load_calib_dataset
-from tensorrt_llm.models.llama.weight import load_from_hf_checkpoint
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
+from tensorrt_llm.models.medusa.weight import (get_tllm_linear_weight,
+                                               load_medusa_hf)
 from tensorrt_llm.quantization import QuantAlgo
 
 try:
@@ -108,11 +109,6 @@ def parse_arguments():
         help=
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
-    parser.add_argument(
-        '--modelopt_quant_ckpt_path',
-        type=str,
-        default=None,
-        help='Path of a quantized model checkpoint in .npz format')
 
     parser.add_argument(
         '--per_group',
@@ -182,13 +178,6 @@ def parse_arguments():
         help='The number of workers for converting checkpoint in parallel')
 
     parser.add_argument('--num_medusa_heads', type=int, default=4)
-    parser.add_argument(
-        '--fixed_num_medusa_heads',
-        type=int,
-        default=None,
-        help="If exist, fix medusa_num_heads from config.json."
-        "num_medusa_heads < medusa_num_heads in config.json < fixed_num_medusa_heads"
-    )
     parser.add_argument('--num_medusa_layers', type=int, default=1)
     parser.add_argument('--max_medusa_token_len', type=int, default=63)
     parser.add_argument('--medusa_hidden_act', type=str, default="silu")
@@ -568,29 +557,6 @@ def get_bias(config, prefix, dtype):
 
 def get_weight_and_bias(config, prefix, dtype):
     return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
-
-
-def get_tllm_linear_weight(weight,
-                           prefix,
-                           bias=None,
-                           use_weight_only=False,
-                           plugin_weight_only_quant_type=torch.int8,
-                           postfix='weight'):
-    results = {}
-    if use_weight_only:
-        v = weight.t().contiguous()
-        processed_torch_weights, torch_weight_scales = \
-            torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix(
-                v, plugin_weight_only_quant_type)
-        results[prefix + postfix] = processed_torch_weights
-        results[prefix + 'per_channel_scale'] = torch_weight_scales
-    else:
-        results[prefix + postfix] = weight.contiguous()
-
-    if bias is not None:
-        results[prefix + 'bias'] = bias
-
-    return results
 
 
 def dup_kv_weight(v, num_head, tp_size):
@@ -1129,17 +1095,18 @@ if __name__ == '__main__':
     if args.model_dir is not None:
         hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
 
-        model = hf_model.from_pretrained(args.model_dir,
-                                         torch_dtype='auto',
-                                         device_map="auto",
-                                         trust_remote_code=True)
+        model = hf_model.from_pretrained(
+            args.model_dir,
+            torch_dtype='auto',
+            device_map='auto' if not args.load_model_on_cpu else 'cpu',
+            trust_remote_code=True)
 
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
                 "TOKENIZERS_PARALLELISM", "false")
             if args.load_model_on_cpu:
                 logger.warning(
-                    "Note that running capture_activation_range on cpu would be very small."
+                    "Note that running capture_activation_range on cpu would be very slow."
                 )
             tokenizer = LlamaTokenizer.from_pretrained(args.model_dir,
                                                        padding_side='left')
@@ -1167,8 +1134,8 @@ if __name__ == '__main__':
             assert False, "Never supported"
         else:
             if args.load_by_shard:
-                weights = load_from_hf_checkpoint(
-                    args.model_dir, mapping, PretrainedConfig.from_dict(config))
+                weights = load_weights_from_hf_by_shard(
+                    args.model_dir, PretrainedConfig.from_dict(config))
 
             else:
                 weights = convert_hf_llama(
@@ -1189,61 +1156,28 @@ if __name__ == '__main__':
                     qkv_para=convert_args['llama_qkv_para'],
                     smoother=convert_args['llama_smoother'])
 
-                def load_medusa_hf(medusa_path: str,
-                                   mapping=Mapping(),
-                                   dtype='float32'):
-                    logger.info("Loading Medusa heads' weights ...")
-                    ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
-                    state_dict = torch.load(ckpt_file, map_location="cpu")
-                    torch_dtype = str_dtype_to_torch(dtype)
-                    weights = {}
-
-                    for h in range(args.num_medusa_heads):
-                        for l in range(args.num_medusa_layers):
-                            w = state_dict[f"{h}.{l}.linear.weight"].clone().to(
-                                torch_dtype)
-
-                            weights[
-                                'medusa_heads.{}.medusa_layers.{}.linear.weight'
-                                .format(h, l)] = split(w, mapping.tp_size,
-                                                       mapping.tp_rank)
-
-                            b = state_dict[f"{h}.{l}.linear.bias"].clone().to(
-                                torch_dtype)
-
-                            weights[
-                                'medusa_heads.{}.medusa_layers.{}.linear.bias'.
-                                format(h, l)] = split(b, mapping.tp_size,
-                                                      mapping.tp_rank)
-
-                        lm = state_dict[
-                            f"{h}.{args.num_medusa_layers}.weight"].clone().to(
-                                torch_dtype)  # LM Head
-
-                        weights['medusa_heads.{}.lm_head.weight'.format(
-                            h)] = split(lm, mapping.tp_size, mapping.tp_rank)
-
-                    return weights
-
                 if args.medusa_model_dir is not None:
                     config_file = Path(args.medusa_model_dir) / "config.json"
                     with open(config_file) as fp:
                         config = json.load(fp)
-                    args.num_medusa_heads = config.get('medusa_num_heads',
-                                                       args.num_medusa_heads)
+                    num_medusa_heads_from_config = config.get(
+                        'medusa_num_heads', args.num_medusa_heads)
                     args.num_medusa_layers = config.get('medusa_num_layers',
                                                         args.num_medusa_layers)
-                    if args.fixed_num_medusa_heads is not None and args.fixed_num_medusa_heads != args.num_medusa_heads:
-                        logger.info(
-                            f"fixing num_medusa_heads from {args.num_medusa_heads} to {args.fixed_num_medusa_heads}"
-                        )
-                        args.num_medusa_heads = args.fixed_num_medusa_heads
+                    if args.num_medusa_heads is None:
+                        args.num_medusa_heads = num_medusa_heads_from_config
 
                     assert args.max_medusa_token_len > 0, "should have max_medusa_token_len > 0"
 
-                    medusa_weights = load_medusa_hf(args.medusa_model_dir,
-                                                    mapping,
-                                                    dtype=args.dtype)
+                    medusa_weights = load_medusa_hf(
+                        medusa_path=args.medusa_model_dir,
+                        num_medusa_heads=args.num_medusa_heads,
+                        num_medusa_layers=args.num_medusa_layers,
+                        mapping=mapping,
+                        dtype=args.dtype,
+                        use_weight_only=args.use_weight_only,
+                        plugin_weight_only_quant_type=
+                        plugin_weight_only_quant_type)
                     weights.update(medusa_weights)
 
         safetensors.torch.save_file(

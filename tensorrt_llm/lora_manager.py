@@ -13,7 +13,6 @@ import yaml
 from ._utils import (DictConversion, pad_vocab_size, release_gc,
                      str_dtype_to_torch, torch_to_numpy)
 from .layers.linear import ColumnLinear
-from .layers.moe import MoeConfig
 from .logger import logger
 from .mapping import Mapping
 from .models.convert_utils import (get_model_path, load_state_dict,
@@ -546,13 +545,24 @@ class LoraManager(object):
 
         lora_target_modules = model_config.lora_target_modules
         dtype = model_config.dtype
-        moe_tp_mode = model_config.moe_tp_mode
         hf_modules_to_trtllm_modules = invert_module_mapping(
             model_config.trtllm_modules_to_hf_modules)
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
         missing_qkv_modules = self.get_missing_qkv_modules(lora_target_modules)
         self.lora_target_modules = lora_target_modules
         self.missing_qkv_modules = missing_qkv_modules
+
+        def preprocess_lora_weights(lora_model):
+            # Swap weights of gate_up_proj
+            for key, value in lora_model.items():
+                if "gate_up_proj.lora_B.weight" in key:
+                    original_weights = value.contiguous().clone()
+                    half_split = original_weights.shape[0] // 2
+                    first_half = original_weights[:half_split, :]
+                    second_half = original_weights[half_split:, :]
+                    value = torch.cat((second_half, first_half), dim=0)
+                    lora_model[key] = value
+            return lora_model
 
         def load_from_model_dir(uid, model_dir, hf_config):
             if uid not in self._lora_cpp_weights:
@@ -562,9 +572,11 @@ class LoraManager(object):
 
             lora_model = load_state_dict(
                 get_model_path(model_dir, "adapter_model"))
+            lora_model = preprocess_lora_weights(lora_model)
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules,
                                                   component)
             rank = int(hf_config["r"])
+            rs_lora = bool(hf_config.get("use_rslora", False))
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
@@ -605,7 +617,7 @@ class LoraManager(object):
                         t_out = module_weights["out"]
                     if lora_module in ["moe_router"]:
                         pass
-                    elif "moe" in lora_module and moe_tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
+                    elif "moe" in lora_module and runtime_mapping.has_moe_ep():
                         pass
                     elif lora_module in [
                             "attn_dense",
@@ -629,7 +641,10 @@ class LoraManager(object):
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
-                    scale = float(hf_config["lora_alpha"]) / rank
+                    if rs_lora:
+                        scale = float(hf_config["lora_alpha"]) / np.sqrt(rank)
+                    else:
+                        scale = float(hf_config["lora_alpha"]) / rank
                     t_out = t_out * scale
                     t_in = t_in.to(str_dtype_to_torch(dtype))
                     t_out = t_out.to(str_dtype_to_torch(dtype))

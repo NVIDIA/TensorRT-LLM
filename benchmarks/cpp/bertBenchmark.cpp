@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -78,11 +79,10 @@ void benchmarkBert(std::string const& modelName, std::filesystem::path const& da
 {
     auto const worldConfig = WorldConfig::mpi();
     auto const enginePath = dataPath / engineFilename(dataPath, worldConfig, modelName);
-    auto engineBlob = loadEngine(enginePath.string());
 
     for (float gpuWeightsPercent : gpuWeightsPercents)
     {
-        auto rt = std::make_shared<TllmRuntime>(engineBlob.data(), engineBlob.size(), gpuWeightsPercent, *logger);
+        auto rt = std::make_shared<TllmRuntime>(RawEngine(enginePath), logger.get(), gpuWeightsPercent);
         rt->addContext(0);
         for (auto inLen : inLens)
         {

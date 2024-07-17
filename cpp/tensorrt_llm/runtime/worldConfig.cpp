@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -92,12 +93,40 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
     auto& comm = COMM_SESSION;
     auto const mpiSize = comm.getSize();
     auto const mpiRank = comm.getRank();
-    TLLM_LOG_INFO("MPI size: %d, rank: %d", mpiSize, mpiRank);
+    auto const mpiLocalSize = LOCAL_COMM_SESSION.getSize();
+    TLLM_LOG_INFO("MPI size: %d, MPI local size: %d, rank: %d", mpiSize, mpiLocalSize, mpiRank);
     auto const pp = pipelineParallelism.value_or(1);
     auto const tp = tensorParallelism.value_or(mpiSize / pp);
-    TLLM_LOG_DEBUG("TP: %d, PP: %d", tp, pp);
-    TLLM_CHECK(mpiSize == tp * pp);
-    TLLM_CHECK(mpiSize <= gpusPerNode || LOCAL_COMM_SESSION.getSize() == gpusPerNode);
+    TLLM_LOG_DEBUG("TP: %d, PP: %d, gpusPerNode: %d", tp, pp, gpusPerNode);
+    TLLM_CHECK_WITH_INFO(mpiSize == tp * pp, "MPI size %d != TP size %d * PP size %d", mpiSize, tp, pp);
+    SizeType32 deviceCount{0};
+    TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if ((mpiSize < gpusPerNode && deviceCount < mpiSize) || (mpiSize >= gpusPerNode && deviceCount < gpusPerNode))
+    {
+        TLLM_CHECK_WITH_INFO(deviceCount == 1,
+            "Detect %d GPUs, the GPU number is incompatible with %d gpusPerNode when MPI size is %d", deviceCount,
+            gpusPerNode, mpiSize);
+        TLLM_LOG_WARNING("gpusPerNode is %d but only detect single GPU, will set gpusPerNode to 1", gpusPerNode);
+        if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr || std::getenv("NVIDIA_VISIBLE_DEVICES") != nullptr)
+        {
+            std::ostringstream oss;
+            if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr)
+            {
+                oss << " CUDA_VISIBLE_DEVICES=" << std::getenv("CUDA_VISIBLE_DEVICES");
+            }
+            if (std::getenv("NVIDIA_VISIBLE_DEVICES") != nullptr)
+            {
+                oss << " NVIDIA_VISIBLE_DEVICES=" << std::getenv("NVIDIA_VISIBLE_DEVICES");
+            }
+            std::string envStr = oss.str();
+            TLLM_LOG_WARNING(
+                "Detect%s, please provide the full device list instead of limiting to single device, "
+                "otherwise allreduce performance may be sub-optimal "
+                "since custom allreduce kernel relies on P2P access to peer devices.",
+                envStr);
+        }
+        gpusPerNode = 1;
+    }
 
     return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
 #else

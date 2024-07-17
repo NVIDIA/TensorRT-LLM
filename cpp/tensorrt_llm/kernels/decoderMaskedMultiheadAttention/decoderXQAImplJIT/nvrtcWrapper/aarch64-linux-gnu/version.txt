@@ -1,2 +1,2 @@
-aad91cb32c205a51d11feec431e82539 libtensorrt_llm_nvrtc_wrapper.so
-6371f7d2010f93c0a95fd06b8fa1863a0d218287 commit
+8b0f8deb35940359b39f876fc5e94e4f libtensorrt_llm_nvrtc_wrapper.so
+617331228635a51b9d431bae2e16ed2ee7da96f9 commit

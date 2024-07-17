@@ -17,17 +17,16 @@
 #include "llmRequest.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/torchView.h"
-#include <memory>
 
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
+
+#include <memory>
 
 namespace tb = tensorrt_llm::batch_manager;
 namespace tr = tensorrt_llm::runtime;
@@ -78,7 +77,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
         embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, mLoraTaskId, loraWeights,
-        loraConfig, mReturnLogProbs, mReturnContextLogits, mReturnGenerationLogits, mDraftTokens, draftLogits,
+        loraConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits, mDraftTokens, draftLogits,
         mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor));
 }
 

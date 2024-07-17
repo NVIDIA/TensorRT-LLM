@@ -32,14 +32,14 @@ class GptJsonConfig
 {
 public:
     GptJsonConfig(std::string name, std::string version, std::string precision, SizeType32 tensorParallelism,
-        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig const& modelConfig)
+        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig modelConfig)
         : mName(std::move(name))
         , mVersion(std::move(version))
         , mPrecision(std::move(precision))
         , mTensorParallelism{tensorParallelism}
         , mPipelineParallelism{pipelineParallelism}
         , mGpusPerNode{gpusPerNode}
-        , mModelConfig(modelConfig)
+        , mModelConfig(std::move(modelConfig))
     {
     }
 
@@ -49,7 +49,12 @@ public:
 
     static GptJsonConfig parse(std::filesystem::path const& path);
 
-    [[nodiscard]] ModelConfig getModelConfig() const
+    [[nodiscard]] ModelConfig const& getModelConfig() const
+    {
+        return mModelConfig;
+    }
+
+    [[nodiscard]] ModelConfig& getModelConfigMutable()
     {
         return mModelConfig;
     }
@@ -103,7 +108,7 @@ private:
     SizeType32 const mTensorParallelism;
     SizeType32 const mPipelineParallelism;
     SizeType32 const mGpusPerNode;
-    ModelConfig const mModelConfig;
+    ModelConfig mModelConfig; // remove const qualifier because config has to mutable after json parsing
 };
 
 } // namespace tensorrt_llm::runtime

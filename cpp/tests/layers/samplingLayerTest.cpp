@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/types.h"
 #include "tests/layers/baseSamplingLayerTest.h"
 
 namespace
 {
+
+namespace tle = tensorrt_llm::executor;
 
 using namespace tensorrt_llm::tests::layers::sampling;
 using namespace tensorrt_llm::runtime;
@@ -35,18 +38,18 @@ class SamplingLayerTest : public BaseSamplingLayerTest<T>
 
     void initLayer(TestSamplingParams const& params) override
     {
-        auto decodingMode = DecodingMode::None();
+        auto decodingMode = tle::DecodingMode::Auto();
         if (params.topKs.size() && params.topPs.size())
         {
-            decodingMode = DecodingMode::TopKTopP();
+            decodingMode = tle::DecodingMode::TopKTopP();
         }
         else if (params.topKs.size())
         {
-            decodingMode = DecodingMode::TopK();
+            decodingMode = tle::DecodingMode::TopK();
         }
         else if (params.topPs.size())
         {
-            decodingMode = DecodingMode::TopP();
+            decodingMode = tle::DecodingMode::TopP();
         }
 
         auto const decodingDomain

@@ -91,7 +91,12 @@ class TestQuant(unittest.TestCase):
         model = GPTForCausalLM(config)
 
         quant_model = quantize(
-            model, QuantConfig(quant_algo, exclude_modules=['fc', 'dense']))
+            model,
+            QuantConfig(quant_algo,
+                        exclude_modules=[
+                            'fc', 'dense', 'vocab_embedding',
+                            'position_embedding', 'block_embedding'
+                        ]))
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 

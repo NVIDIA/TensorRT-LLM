@@ -175,7 +175,7 @@ public:
         {
             TLLM_CHECK(data.size() <= std::numeric_limits<DimType64>::max());
         }
-        return of(data.data(), {static_cast<Shape::DimType64 const>(data.size())});
+        return of(data.data(), {static_cast<Shape::DimType64>(data.size())});
     }
 
     Tensor() noexcept = default;

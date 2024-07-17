@@ -36,11 +36,27 @@ Executor::Executor(
     mExecutor = std::make_unique<tle::Executor>(modelPath, modelType, executorConfig);
 }
 
+Executor::Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
+    tle::ModelType modelType, tle::ExecutorConfig const& executorConfig)
+{
+    mExecutor = std::make_unique<tle::Executor>(encoderModelPath, decoderModelPath, modelType, executorConfig);
+}
+
 Executor::Executor(std::string const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
     tle::ExecutorConfig const& executorConfig)
 {
     mExecutor = std::make_unique<tle::Executor>(
         std::vector<uint8_t>(engineBuffer.begin(), engineBuffer.end()), jsonConfigStr, modelType, executorConfig);
+}
+
+Executor::Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
+    std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,
+    tle::ExecutorConfig const& executorConfig)
+{
+    mExecutor
+        = std::make_unique<tle::Executor>(std::vector<uint8_t>(encoderEngineBuffer.begin(), encoderEngineBuffer.end()),
+            encoderJsonConfigStr, std::vector<uint8_t>(decoderEngineBuffer.begin(), decoderEngineBuffer.end()),
+            decoderJsonConfigStr, modelType, executorConfig);
 }
 
 py::object Executor::enter()
@@ -72,8 +88,16 @@ void Executor::initBindings(py::module_& m)
     py::class_<Executor>(m, "Executor")
         .def(py::init<std::filesystem::path const&, tle::ModelType, tle::ExecutorConfig const&>(),
             py::arg("model_path"), py::arg("model_type"), py::arg("executor_config"))
+        .def(py::init<std::filesystem::path const&, std::filesystem::path const&, tle::ModelType,
+                 tle::ExecutorConfig const&>(),
+            py::arg("encoder_model_path"), py::arg("decoder_model_path"), py::arg("model_type"),
+            py::arg("executor_config"))
         .def(py::init<std::string const&, std::string const&, tle::ModelType, tle::ExecutorConfig const&>(),
             py::arg("engine_buffer"), py::arg("json_config_str"), py::arg("model_type"), py::arg("executor_config"))
+        .def(py::init<std::string const&, std::string const&, std::string const&, std::string const&, tle::ModelType,
+                 tle::ExecutorConfig const&>(),
+            py::arg("encoder_engine_buffer"), py::arg("encoder_json_config_str"), py::arg("decoder_engine_buffer"),
+            py::arg("decoder_json_config_str"), py::arg("model_type"), py::arg("executor_config"))
         .def("shutdown", &Executor::shutdown)
         .def("__enter__", &Executor::enter)
         .def("__exit__", &Executor::exit)

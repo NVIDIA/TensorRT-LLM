@@ -56,20 +56,20 @@ public:
             auto const realloc = reallocType(ptr, sizeAligned);
             if (realloc == ReallocType::INCREASE)
             {
-                TLLM_LOG_DEBUG("ReMalloc the buffer %p since it is too small.", ptr);
+                TLLM_LOG_TRACE("ReMalloc the buffer %p since it is too small.", ptr);
                 free(&ptr);
                 return reinterpret_cast<T*>(malloc(sizeAligned, setZero));
             }
             else if (realloc == ReallocType::DECREASE)
             {
-                TLLM_LOG_DEBUG("ReMalloc the buffer %p to release unused memory to memory pools.", ptr);
+                TLLM_LOG_TRACE("ReMalloc the buffer %p to release unused memory to memory pools.", ptr);
                 free(&ptr);
                 return reinterpret_cast<T*>(malloc(sizeAligned, setZero));
             }
             else
             {
                 assert(realloc == ReallocType::REUSE);
-                TLLM_LOG_DEBUG("Reuse original buffer %p with size %lu and do nothing for reMalloc.", ptr, sizeAligned);
+                TLLM_LOG_TRACE("Reuse original buffer %p with size %lu and do nothing for reMalloc.", ptr, sizeAligned);
                 if (setZero)
                 {
                     memSet(ptr, 0, sizeAligned);
@@ -79,7 +79,7 @@ public:
         }
         else
         {
-            TLLM_LOG_DEBUG("Cannot find buffer %p, mallocing new one.", ptr);
+            TLLM_LOG_TRACE("Cannot find buffer %p, mallocing new one.", ptr);
             return reinterpret_cast<T*>(malloc(sizeAligned, setZero));
         }
     }

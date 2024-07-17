@@ -53,14 +53,16 @@ class GPTNeoXDecoderLayer(Module):
             attention_mask_type=AttentionMaskType.causal,
             bias=True,
             tp_group=tp_group,
-            tp_size=tp_size)
+            tp_size=tp_size,
+            quant_mode=config.quant_mode)
 
         self.mlp = MLP(hidden_size=hidden_size,
                        ffn_hidden_size=hidden_size * 4,
                        hidden_act=config.hidden_act,
                        dtype=dtype,
                        tp_group=tp_group,
-                       tp_size=tp_size)
+                       tp_size=tp_size,
+                       quant_mode=config.quant_mode)
 
     def forward(self,
                 hidden_states: Tensor,

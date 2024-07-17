@@ -34,7 +34,7 @@ class BertAttentionPlugin : public BasePlugin
 public:
     BertAttentionPlugin() = delete;
 
-    BertAttentionPlugin(int num_heads, int head_size, float q_scaling, bool qk_half_accum,
+    BertAttentionPlugin(int num_heads, int head_size, float q_scaling,
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, nvinfer1::DataType type,
         bool do_relative_attention = false, int max_distance = 0, bool remove_padding = false);
 

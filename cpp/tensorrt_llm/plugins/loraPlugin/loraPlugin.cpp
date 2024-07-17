@@ -321,6 +321,23 @@ void runCublasGemmEx(int const M, int const N, int const K, bool const transA, b
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+bool isEnableLora(int batchSize, int numLoraModules, void const* const* loraRanks)
+{
+    for (int batchIdx = 0; batchIdx < batchSize; batchIdx++)
+    {
+        for (int loraModuleIdx = 0; loraModuleIdx < numLoraModules; loraModuleIdx++)
+        {
+            auto const loraRank = static_cast<int32_t const*>(loraRanks[loraModuleIdx]);
+            if (loraRank[batchIdx] != 0)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
@@ -352,19 +369,26 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     void* groupGemmParamsWorkSpace = static_cast<char*>(lowRankWorkSpace)
         + getLowRankWorkSpaceSize(batch_size, mMaxContextLength, mNumLoraModules, mMaxLowRank, typeSize);
 
+    bool isWithLora = isEnableLora(batch_size, mNumLoraModules, &inputs[getLoraRanksIdx()]);
+
     int const nbDimsA = inputDesc[0].dims.nbDims;
-    for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
+    if (!isWithLora)
     {
-        size_t size = 1;
-        for (int i = 0; i < outputDesc[loraModuleIdx].dims.nbDims; i++)
+        for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
         {
-            size *= outputDesc[loraModuleIdx].dims.d[i];
+            size_t size = 1;
+            for (int i = 0; i < outputDesc[loraModuleIdx].dims.nbDims; i++)
+            {
+                size *= outputDesc[loraModuleIdx].dims.d[i];
+            }
+            cudaMemsetAsync(outputs[loraModuleIdx], 0, size * typeSize, stream);
         }
-        cudaMemsetAsync(outputs[loraModuleIdx], 0, size * typeSize, stream);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return 0;
     }
 
     char* useUnifiedGemmChar = std::getenv("LORA_USE_UNIFIED_GEMM");
-    bool useUnifiedGemm = (useUnifiedGemmChar != nullptr && std::string(useUnifiedGemmChar) == "ON");
+    bool useUnifiedGemm = (useUnifiedGemmChar == nullptr || std::string(useUnifiedGemmChar) != "OFF");
     for (int batchIdx = 0; batchIdx < batch_size; batchIdx++)
     {
         for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
@@ -372,7 +396,7 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
             auto const lora_ranks = static_cast<int32_t const*>(inputs[getLoraRanksIdx() + loraModuleIdx]);
             auto const lora_weights_ptr = static_cast<int64_t const*>(inputs[getLoraWeightsPtrsIdx() + loraModuleIdx]);
             if (lora_weights_ptr[batchIdx * 2] != lora_weights_ptr[0]
-                || lora_weights_ptr[batchIdx * 2 + 1] != lora_weights_ptr[1] || lora_ranks[batchIdx] == 0)
+                || lora_weights_ptr[batchIdx * 2 + 1] != lora_weights_ptr[1] || lora_ranks[batchIdx] != lora_ranks[0])
             {
                 useUnifiedGemm = false;
             }

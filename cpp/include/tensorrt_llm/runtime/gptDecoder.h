@@ -16,19 +16,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
-#include "tensorrt_llm/runtime/worldConfig.h"
+
+#include <NvInferRuntime.h>
 #include <curand_kernel.h>
 
 #include <memory>
-
-#include <NvInferRuntime.h>
 
 namespace tensorrt_llm
 {
@@ -43,6 +40,8 @@ class DynamicDecodeLayer;
 namespace runtime
 {
 
+class SpeculativeDecodingModule;
+
 class IGptDecoder
 {
 public:
@@ -50,16 +49,17 @@ public:
 
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 maxSequenceLength,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt)
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots = nullptr,
+        std::optional<DecodingOutput> const& output = std::nullopt)
         = 0;
-
-    virtual bool forward(DecodingOutput& output, DecodingInput const& input) = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
 
+    virtual void forwardSync(DecodingOutput& output, DecodingInput const& input) = 0;
+
     virtual void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-        DecodingInput const& decodingInput, BufferManager const& manager)
+        DecodingInput const& decodingInput, BufferManager const& manager,
+        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt)
         = 0;
 
     virtual SamplingConfig const& getSamplingConfig() = 0;
@@ -74,10 +74,10 @@ public:
         SizeType32 vocabSize, SizeType32 vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
         curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
 
-    static std::unique_ptr<IGptDecoder> create(DecodingMode const& mode, nvinfer1::DataType dtype, size_t maxBatchSize,
-        size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-        BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType32> maxNumMedusaHeads = std::nullopt);
+    static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
+        size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+        BufferManager::CudaStreamPtr const& stream,
+        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 };
 
 template <typename T>
@@ -88,20 +88,20 @@ public:
     using CudaStreamPtr = BufferManager::CudaStreamPtr;
     using TensorPtr = std::shared_ptr<ITensor>;
 
-    GptDecoder(DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
+    GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
         size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
-        std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
-        std::optional<runtime::SizeType32> maxNumMedusaHeads = std::nullopt);
+        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 maxSequenceLength,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt) override;
-
-    bool forward(DecodingOutput& output, DecodingInput const& input) override;
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots = nullptr,
+        std::optional<DecodingOutput> const& output = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
+    void forwardSync(DecodingOutput& output, DecodingInput const& input) override;
+
     void gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-        BufferManager const& manager) override;
+        BufferManager const& manager,
+        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt) override;
 
     SamplingConfig const& getSamplingConfig() override
     {
@@ -117,22 +117,26 @@ private:
     SamplingConfig mSamplingConfig;
 
     size_t mMaxBatchSize;
+
+    executor::DecodingMode mDecodingMode;
 };
 
-inline std::unique_ptr<IGptDecoder> IGptDecoder::create(DecodingMode const& mode, nvinfer1::DataType dtype,
+inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
     size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-    BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep,
-    std::optional<runtime::SizeType32> maxNumMedusaHeads)
+    BufferManager::CudaStreamPtr const& stream,
+    std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
 {
     switch (dtype)
     {
     case nvinfer1::DataType::kFLOAT:
         return std::make_unique<GptDecoder<float>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, maxTokensPerStep, maxNumMedusaHeads);
+            maxSequenceLength, stream, speculativeDecodingModule);
     case nvinfer1::DataType::kHALF:
         return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, maxTokensPerStep, maxNumMedusaHeads);
-    default: return nullptr;
+            maxSequenceLength, stream, speculativeDecodingModule);
+    default:
+        TLLM_THROW("Unsupported decoder data type: %d. Use either kFLOAT or kHALF.", static_cast<int>(dtype));
+        return nullptr;
     }
 }
 } // namespace runtime

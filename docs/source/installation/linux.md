@@ -8,8 +8,9 @@
 
     ```bash
     # Obtain and start the basic docker image environment (optional).
-    docker run --rm --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.4.0-devel-ubuntu22.04
+    docker run --rm --ipc=host --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.4.1-devel-ubuntu22.04
     ```
+    Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 
 2. Install TensorRT-LLM.
 
@@ -30,6 +31,13 @@
     overwriting an upgraded to a new version may require explicitly running `pip uninstall tensorrt`
     to uninstall the old version.
 
-Please refer to the [Quick Start Guide](../quick-start-guide.md) for more information.
+3. Install the requirements for running the example.
+
+    ```bash
+    git clone https://github.com/NVIDIA/TensorRT-LLM.git
+    cd TensorRT-LLM
+    pip install -r examples/bloom/requirements.txt
+    git lfs install
+    ```
 
 Beyond the local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/) blog.

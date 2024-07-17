@@ -43,7 +43,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
         '--gemm_plugin=float16',
         '--max_batch_size=32',
         '--max_input_len=40',
-        '--max_output_len=20',
+        '--max_seq_len=60',
         '--max_beam_width=2',
         '--log_level=error',
         '--paged_kv_cache=enable',

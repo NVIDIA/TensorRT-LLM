@@ -51,6 +51,12 @@ def parse_arguments():
         help=
         "help='Quantize weights for the various GEMMs to INT4/INT8. Define the precision for the weights.",
     )
+    parser.add_argument(
+        "--use-int8-weight-only-embedding",
+        action="store_true",
+        help=
+        "Use weight only on embedding table and lm_head. (Only supported on Hopper GPU)",
+    )
     parser.add_argument("--dtype",
                         type=str,
                         choices=["float32", "bfloat16", "float16"])
@@ -65,7 +71,7 @@ def parse_arguments():
         "By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV",
     )
     parser.add_argument(
-        "--modelopt_quant_ckpt_path",
+        "--quant_ckpt_path",
         default=None,
         help=
         "Path of a directory to quantized model checkpoints in .safetensors format or \
@@ -825,8 +831,35 @@ def convert_from_checkpoint(
                         tp_rank,
                         dim=trt_llm_config.embedding_sharding_dim,
                     )
-                add_trt_llm_weight(weights, trt_llm_name, param,
-                                   trt_llm_config.dtype)
+                if trt_llm_config.quant_mode.is_int8_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
+                    not trt_llm_config.quant_mode.has_int8_kv_cache() and trt_llm_config.quantization.exclude_modules is not None:
+
+                    # shape of embedding table: [V, K], V: vocab size, K: embedding dim
+
+                    # quantize will do following work:
+                    # 1. transpose the input from [V, K] to [K, V]
+                    # 2. compute V scales across dimension K
+                    # 3. quantize the input to int8_weight
+                    # 4. transpose the int8_weight to [V, K], but there is a bug in 'quantize' that the claimed shape is [K, V]
+                    param_quantized, param_scales = quantize(
+                        param, trt_llm_config.quant_mode)
+
+                    # Reshape the [K, V] to [V, K] to match the real data layout.
+                    param_quantized = np.ascontiguousarray(
+                        param_quantized.reshape([
+                            param_quantized.shape[1], param_quantized.shape[0]
+                        ]))
+
+                    add_trt_llm_weight(weights, trt_llm_name, param_quantized)
+                    add_trt_llm_weight(
+                        weights,
+                        trt_llm_name.replace(".weight", ".per_token_scale"),
+                        param_scales,
+                        trt_llm_config.dtype,
+                    )
+                else:
+                    add_trt_llm_weight(weights, trt_llm_name, param,
+                                       trt_llm_config.dtype)
             elif any(keyword in name for keyword in (
                     "pre_attention_norm.scale",
                     "pre_ffw_norm.scale",
@@ -911,7 +944,7 @@ def convert(worker_rank, args, convert_kwargs):
             weight_scales = quantize_fp8_weights(
                 weights, trt_llm_config.num_hidden_layers,
                 trt_llm_config.mapping)
-            scales = load_from_fp8_gemma(args.modelopt_quant_ckpt_path,
+            scales = load_from_fp8_gemma(args.quant_ckpt_path,
                                          trt_llm_config.num_hidden_layers,
                                          trt_llm_config.mapping,
                                          args.fp8_kv_cache, weight_scales)
@@ -973,20 +1006,22 @@ def main():
     quant_kwargs.update(quant_algo=quant_algo,
                         kv_cache_quant_algo=kv_cache_quant_algo)
     if args.use_weight_only_with_precision:
-        if args.use_weight_only_with_precision.endswith("awq"):
-            quant_kwargs.update(has_zero_point=False,
-                                pre_quant_scale=True,
-                                exclude_modules=["lm_head"])
+        if args.use_weight_only_with_precision.endswith(
+                "awq") or args.use_weight_only_with_precision.endswith(
+                    "int4") or not args.use_int8_weight_only_embedding:
+            quant_kwargs.update(has_zero_point=False, pre_quant_scale=True)
+        else:
+            quant_kwargs.update(exclude_modules=['router'])
 
     quant_config = tensorrt_llm.models.modeling_utils.QuantConfig()
     quant_config.quant_algo = quant_kwargs['quant_algo']
     quant_config.kv_cache_quant_algo = quant_kwargs['kv_cache_quant_algo']
-    if args.use_weight_only_with_precision and args.use_weight_only_with_precision.endswith(
-            "awq"):
-        quant_config.group_size = 128
-        quant_config.has_zero_point = quant_kwargs['has_zero_point']
-        quant_config.pre_quant_scale = quant_kwargs['pre_quant_scale']
-        quant_config.exclude_modules = quant_kwargs['exclude_modules']
+    if args.use_weight_only_with_precision:
+        quant_config.exclude_modules = quant_kwargs.get('exclude_modules')
+        if args.use_weight_only_with_precision.endswith("awq"):
+            quant_config.group_size = 128
+            quant_config.has_zero_point = quant_kwargs['has_zero_point']
+            quant_config.pre_quant_scale = quant_kwargs['pre_quant_scale']
 
     trt_llm_config = tensorrt_llm.models.modeling_utils.PretrainedConfig(
         architecture="GemmaForCausalLM",

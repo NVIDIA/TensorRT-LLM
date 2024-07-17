@@ -34,7 +34,8 @@ public:
         th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt)
+        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+        bool output_log_probs, bool cum_log_probs)
         = 0;
 
     virtual void forward(th::Tensor const& logits, int const step, int const max_input_length,
@@ -43,9 +44,9 @@ public:
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
         th::optional<th::Tensor> stop_words_lens_opt, int32_t const max_stop_words_len,
         th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
-        int32_t const max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids, th::Tensor& newTokens,
-        th::Tensor& should_stop, th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        int32_t const max_bad_words_len, th::optional<th::Tensor> src_cache_indirection_opt,
+        th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
         th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
@@ -71,7 +72,8 @@ public:
         th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt) override;
+        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+        bool output_log_probs, bool cum_log_probs) override;
 
     void forward(th::Tensor const& logits, int const step, int const max_input_length, int const max_attention_window,
         int const sink_token_length, uint64_t const ite, int const local_batch_size, th::Tensor end_id,
@@ -79,9 +81,9 @@ public:
         th::optional<th::Tensor> sequence_limit_length_opt, th::optional<th::Tensor> stop_words_list_ptrs_opt,
         th::optional<th::Tensor> stop_words_lens_opt, int32_t const max_stop_words_len,
         th::optional<th::Tensor> bad_words_list_ptrs_opt, th::optional<th::Tensor> bad_words_lens_opt,
-        int32_t const max_bad_words_len, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor& output_token_ids, th::Tensor& newTokens,
-        th::Tensor& should_stop, th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        int32_t const max_bad_words_len, th::optional<th::Tensor> src_cache_indirection_opt,
+        th::Tensor& output_token_ids, th::Tensor& newTokens, th::Tensor& should_stop,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
         th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
         th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
         th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
@@ -92,8 +94,9 @@ public:
         th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps) override;
 
 private:
-    tensorrt_llm::runtime::ITensor::SharedPtr finished_sum_; // [batch_size] pinned
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> dynamic_decode_layer_;
+    tensorrt_llm::runtime::ITensor::SharedPtr mFinishedSum; // [batch_size] pinned
+    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
+    std::optional<size_t> mBeamWidth;
 };
 
 class DynamicDecodeOp : public th::jit::CustomClassHolder
@@ -110,7 +113,8 @@ public:
         th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt);
+        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
+        bool output_log_probs, bool cum_log_probs);
 
     th::Tensor forward(th::Tensor const& logits, int64_t const step, int64_t const max_input_length,
         int64_t const max_attention_window, int64_t const sink_token_length, int64_t const ite,
@@ -119,27 +123,27 @@ public:
         th::optional<th::Tensor> stop_words_list_ptrs_opt, th::optional<th::Tensor> stop_words_lens_opt,
         int64_t const max_stop_words_len, th::optional<th::Tensor> bad_words_list_ptrs_opt,
         th::optional<th::Tensor> bad_words_lens_opt, int64_t const max_bad_words_len,
-        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> src_cache_indirection_opt,
-        th::Tensor output_token_ids, th::Tensor newTokens, th::optional<th::Tensor> finished_input,
-        th::optional<th::Tensor> finished_output, th::optional<th::Tensor> sequence_lengths_opt,
-        th::optional<th::Tensor> cum_log_probs_opt, th::optional<th::Tensor> output_log_probs_opt,
-        th::optional<th::Tensor> output_log_probs_tiled_opt, th::optional<th::Tensor> parent_ids_opt,
-        th::optional<th::Tensor> tgt_cache_indirection_opt, th::optional<th::Tensor> beam_hyps_output_ids_cba_opt,
-        th::optional<th::Tensor> beam_hyps_seq_len_cba_opt, th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
+        th::optional<th::Tensor> src_cache_indirection_opt, th::Tensor output_token_ids, th::Tensor newTokens,
+        th::optional<th::Tensor> finished_input, th::optional<th::Tensor> finished_output,
+        th::optional<th::Tensor> sequence_lengths_opt, th::optional<th::Tensor> cum_log_probs_opt,
+        th::optional<th::Tensor> output_log_probs_opt, th::optional<th::Tensor> output_log_probs_tiled_opt,
+        th::optional<th::Tensor> parent_ids_opt, th::optional<th::Tensor> tgt_cache_indirection_opt,
+        th::optional<th::Tensor> beam_hyps_output_ids_cba_opt, th::optional<th::Tensor> beam_hyps_seq_len_cba_opt,
+        th::optional<th::Tensor> beam_hyps_cum_log_probs_cba_opt,
         th::optional<th::Tensor> beam_hyps_normed_scores_cba_opt, th::optional<th::Tensor> beam_hyps_log_probs_cba_opt,
         th::optional<th::Tensor> beam_hyps_min_normed_scores_opt, th::optional<th::Tensor> beam_hyps_num_beams_opt,
         th::optional<th::Tensor> beam_hyps_is_done_opt, bool const use_beam_hyps);
 
 private:
     // Members initialized in constructor and used in call of createInstance()
-    size_t const max_batch_size_;
-    size_t const max_beam_width_;
-    size_t const vocab_size_;
-    size_t const vocab_size_padded_;
-    int const tensor_para_size_;
-    int const pipeline_para_size_;
-    at::ScalarType const scalar_type_;                 // Data type of expected input logits
-    std::unique_ptr<IFtDynamicDecode> dynamic_decode_; // FT Dynamic decode layer wrapper instance
+    size_t const maxBatchSize_;
+    size_t const maxBeamWidth_;
+    size_t const vocabSize_;
+    size_t const vocabSizePadded_;
+    int const tensorParaSize_;
+    int const pipelineParaSize_;
+    at::ScalarType const scalarType_;                 // Data type of expected input logits
+    std::unique_ptr<IFtDynamicDecode> dynamicDecode_; // FT Dynamic decode layer wrapper instance
 
     void createInstance();
 };

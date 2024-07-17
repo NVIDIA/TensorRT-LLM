@@ -17,22 +17,14 @@
 
 #pragma once
 
-#include <curand_kernel.h>
-
-#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/layers/samplingParams.h"
-#include "tensorrt_llm/layers/topKSamplingLayer.h"
-#include "tensorrt_llm/layers/topPSamplingLayer.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 
-namespace tc = tensorrt_llm::common;
+#include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 //! \brief Top class for sampling layers.
@@ -43,15 +35,16 @@ class SamplingLayer : public BaseLayer
 public:
     using Base = BaseLayer;
 
-    SamplingLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
+    SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
         std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
 
     ~SamplingLayer() override = default;
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
 private:
     using Base::mWorkspaceSize;
@@ -62,7 +55,7 @@ private:
 
     using Base::mDecoderDomain;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 
     void* mSamplingWorkspaceDevice{nullptr};
     curandState_t* mCurandStatesDevice{nullptr};
@@ -73,6 +66,9 @@ private:
     bool* mSkipDecodeHost{nullptr};
     bool mSkipAny{false};
 
+    bool mOutputLogProbs{false};
+    bool mCumLogProbs{false};
+
     std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 
 private:
@@ -80,5 +76,4 @@ private:
     void freeBuffer();
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

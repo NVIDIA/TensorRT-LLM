@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 
@@ -90,7 +91,7 @@ protected:
 TEST_F(TllmRuntimeTest, SinglePass)
 {
     EXPECT_TRUE(mSerializedEngine);
-    TllmRuntime rt{*mSerializedEngine, 1.0F, mLogger};
+    TllmRuntime rt{RawEngine(mSerializedEngine.get()), &mLogger, 1.0F};
     auto& engine = rt.getEngine();
     EXPECT_FALSE(engine.hasImplicitBatchDimension());
     EXPECT_EQ(rt.getNbProfiles(), engine.getNbOptimizationProfiles());

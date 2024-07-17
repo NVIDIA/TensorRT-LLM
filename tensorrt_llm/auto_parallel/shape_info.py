@@ -6,6 +6,7 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm._common import _is_building
 from tensorrt_llm._utils import (trt_dtype_to_np, trt_dtype_to_str,
                                  trt_dtype_to_torch)
 from tensorrt_llm.logger import logger
@@ -185,6 +186,7 @@ def get_per_layer_graph(
     return graph, output_mapping
 
 
+@_is_building
 def infer_shapes(network, shapes, values, profile=None):
     if network.num_outputs == 0:
         return

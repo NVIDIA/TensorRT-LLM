@@ -23,7 +23,7 @@ import torch
 import tensorrt as trt
 # isort: on
 
-from .._utils import preview_trt_version, trt_dtype_to_torch
+from .._utils import torch_dtype_to_trt, trt_dtype_to_torch, trt_gte_10
 from ..logger import logger
 
 
@@ -66,7 +66,7 @@ class Session(object):
             self._engine = self.runtime.deserialize_cuda_engine(engine_buffer)
 
         self._context = None
-        if not (preview_trt_version() and self.engine.streamable_weights_size):
+        if not (trt_gte_10() and self.engine.streamable_weights_size):
             self.__prepare_execution_contexts()
         return self
 
@@ -167,7 +167,7 @@ class Session(object):
                 if not ok:
                     raise ValueError(
                         f"Couldn't assign {name} with shape {tensor_dict[name].shape}, "
-                        f"engine supports [min, opt, max] = {self.engine.get_profile_shape(context.active_optimization_profile, name)}"
+                        f"engine supports [min, opt, max] = {self.engine.get_tensor_profile_shape(name, context.active_optimization_profile)}"
                     )
 
     def infer_shapes(
@@ -210,7 +210,7 @@ class Session(object):
 
         self._context = None
 
-        if not preview_trt_version():
+        if not trt_gte_10():
             assert gpu_weights_percent == 1, "Weight streaming is only supported by TensorRT 10.0 or later."
             return
         else:
@@ -274,13 +274,9 @@ class Session(object):
         '''Run the engine enqueue with allocated output tensors, for debug purpose, since it is a sync call and slower than run
         '''
         import torch
-        torch_dtype_to_trt = {
-            torch.float16: trt.float16,
-            torch.float32: trt.float32,
-            torch.int32: trt.int32
-        }
+
         inputs_info = [
-            TensorInfo(name, torch_dtype_to_trt[tensor.dtype], tensor.shape)
+            TensorInfo(name, torch_dtype_to_trt(tensor.dtype), tensor.shape)
             for name, tensor in inputs.items()
         ]
         outputs_info = self.infer_shapes(inputs_info)

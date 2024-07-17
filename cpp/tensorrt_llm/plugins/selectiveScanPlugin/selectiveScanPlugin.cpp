@@ -215,6 +215,10 @@ int SelectiveScanPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
+    if (isBuilding())
+    {
+        return 0;
+    }
     if (mType == DataType::kHALF)
     {
         return enqueueImpl<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);

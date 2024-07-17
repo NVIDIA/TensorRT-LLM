@@ -34,7 +34,9 @@ int32_t xqaMaxNbCtaPerKVHeadFactor();
 std::optional<int32_t> envXqaNbCtaPerKVHead();
 
 // Whether XQA JIT is enabled.
-bool getEnvEnableXQAJIT();
+//
+// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
+std::optional<bool> getEnvEnableXQAJIT();
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();

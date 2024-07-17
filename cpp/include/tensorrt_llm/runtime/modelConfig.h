@@ -19,8 +19,11 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/loraModule.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
+#include "tensorrt_llm/runtime/speculativeDecodingMode.h"
+#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
+
 #include <NvInferRuntime.h>
+#include <array>
 
 namespace tensorrt_llm::runtime
 {
@@ -28,12 +31,19 @@ namespace tensorrt_llm::runtime
 class ModelConfig
 {
 public:
+    // See `split_point` defined in `tensorrt_llm/models/generation_mixin.py`.
+    // The split points are tuned to get better perf, if we need to let
+    // users tune that, we can support that by writing and reading the
+    // points in `config.json`.
+    static constexpr std::array kOPT_PROFILES_SPLIT_POINTS{64, 128, 256, 512, 1024};
+
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
         kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
         kMamba = 2,          // https://github.com/state-spaces/mamba
         kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
+        kEncDec = 4,
     };
 
     struct RnnConfig
@@ -76,17 +86,23 @@ public:
         , mModelVariant(ModelVariant::kGpt)
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
-        , mMaxDraftLen(0)
-        , mUseContextFMHAForGeneration(false)
+        , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
-        , mMedusaModule(std::nullopt)
         , mUseCrossAttention(false)
-        , mUsePositionEmbedding(true) // TODO: remove these two properties?
+        , mUsePositionEmbedding(false)
         , mUseTokenTypeEmbedding(false)
+        , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
+        , mLogitsDtype(nvinfer1::DataType::kFLOAT)
+        , mUseShapeInference(true)
     {
+    }
+
+    [[nodiscard]] static std::vector<SizeType32> getOptProfilesSplitPoints() noexcept
+    {
+        return {kOPT_PROFILES_SPLIT_POINTS.begin(), kOPT_PROFILES_SPLIT_POINTS.end()};
     }
 
     [[nodiscard]] SizeType32 constexpr getVocabSize() const noexcept
@@ -101,13 +117,11 @@ public:
 
     [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbAttentionLayers % pipelineParallelism == 0);
         return mNbAttentionLayers / pipelineParallelism;
     }
 
     [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbRnnLayers % pipelineParallelism == 0);
         return mNbRnnLayers / pipelineParallelism;
     }
 
@@ -129,6 +143,16 @@ public:
     [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
     {
         return mHiddenSize;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getEncoderHiddenSize() const noexcept
+    {
+        return mEncoderHiddenSize;
+    }
+
+    void constexpr setEncoderHiddenSize(SizeType32 encoderHiddenSize) noexcept
+    {
+        mEncoderHiddenSize = encoderHiddenSize;
     }
 
     [[nodiscard]] SizeType32 constexpr getSizePerHead() const noexcept
@@ -272,6 +296,16 @@ public:
         mMaxNumTokens = maxNumTokens;
     }
 
+    [[nodiscard]] SizeType32 constexpr getMaxEncoderLen() const noexcept
+    {
+        return mMaxEncoderLen;
+    }
+
+    void constexpr setMaxEncoderLen(SizeType32 maxEncoderLen) noexcept
+    {
+        mMaxEncoderLen = maxEncoderLen;
+    }
+
     [[nodiscard]] bool constexpr usePromptTuning() const noexcept
     {
         return mMaxPromptEmbeddingTableSize > 0;
@@ -327,29 +361,24 @@ public:
         mUseCustomAllReduce = customAllReduce;
     }
 
-    void constexpr setMaxDraftLen(SizeType32 maxDraftLen) noexcept
+    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
     {
-        mMaxDraftLen = maxDraftLen;
+        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
     }
 
-    [[nodiscard]] SizeType32 getMaxDraftLen() const
+    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
     {
-        return mMaxDraftLen;
+        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
     }
 
-    [[nodiscard]] SizeType32 constexpr getMaxTokensPerStep() const noexcept
+    void constexpr setContextFMHA(bool contextFMHA) noexcept
     {
-        return mMaxDraftLen + 1;
+        mContextFMHA = contextFMHA;
     }
 
-    void constexpr setUseContextFMHAForGeneration(bool useContextFMHAForGeneration) noexcept
+    [[nodiscard]] bool constexpr getContextFMHA() const noexcept
     {
-        mUseContextFMHAForGeneration = useContextFMHAForGeneration;
-    }
-
-    [[nodiscard]] bool constexpr getContextFMHAForGeneration() const noexcept
-    {
-        return mUseContextFMHAForGeneration;
+        return mContextFMHA;
     }
 
     void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
@@ -407,9 +436,9 @@ public:
         return mUseCrossAttention;
     }
 
-    void constexpr useCrossAttention(bool newCrossAttention) noexcept
+    void constexpr setUseCrossAttention(bool useCrossAttention) noexcept
     {
-        mUseCrossAttention = newCrossAttention;
+        mUseCrossAttention = useCrossAttention;
     }
 
     [[nodiscard]] bool constexpr usePositionEmbedding() const noexcept
@@ -417,9 +446,9 @@ public:
         return mUsePositionEmbedding;
     }
 
-    void constexpr usePositionEmbedding(bool newPositionEmbedding) noexcept
+    void constexpr setUsePositionEmbedding(bool usePositionEmbedding) noexcept
     {
-        mUsePositionEmbedding = newPositionEmbedding;
+        mUsePositionEmbedding = usePositionEmbedding;
     }
 
     [[nodiscard]] bool constexpr useTokenTypeEmbedding() const noexcept
@@ -427,19 +456,9 @@ public:
         return mUseTokenTypeEmbedding;
     }
 
-    void constexpr useTokenTypeEmbedding(bool newTokenTypeEmbedding) noexcept
+    void constexpr setUseTokenTypeEmbedding(bool useTokenTypeEmbedding) noexcept
     {
-        mUseTokenTypeEmbedding = newTokenTypeEmbedding;
-    }
-
-    [[nodiscard]] SizeType32 constexpr getFfnHiddenSize() const noexcept
-    {
-        return mFfnHiddenSize;
-    }
-
-    void constexpr setFfnHiddenSize(SizeType32 ffnHiddenSize) noexcept
-    {
-        mFfnHiddenSize = ffnHiddenSize;
+        mUseTokenTypeEmbedding = useTokenTypeEmbedding;
     }
 
     [[nodiscard]] SizeType32 constexpr getMaxLoraRank() const noexcept
@@ -452,19 +471,38 @@ public:
         mMaxLoraRank = maxLoraRank;
     }
 
-    [[nodiscard]] bool constexpr useMedusa() const noexcept
+    void setSpeculativeDecodingMode(SpeculativeDecodingMode mode) noexcept
     {
-        return mMedusaModule.has_value();
+        mSpeculativeDecodingMode = mode;
     }
 
-    [[nodiscard]] std::optional<MedusaModule> getMedusaModule() const noexcept
+    [[nodiscard]] bool hasSpeculativeDecodingModule() const noexcept
     {
-        return mMedusaModule;
+        return mSpeculativeDecodingModule != nullptr;
     }
 
-    void setMedusaModule(MedusaModule const& medusaModule) noexcept
+    [[nodiscard]] SpeculativeDecodingModule const& getSpeculativeDecodingModule() const noexcept
     {
-        mMedusaModule = medusaModule;
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set");
+        return *mSpeculativeDecodingModule;
+    }
+
+    [[nodiscard]] std::shared_ptr<SpeculativeDecodingModule const> getSpeculativeDecodingModulePtr() const noexcept
+    {
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set");
+        return mSpeculativeDecodingModule;
+    }
+
+    [[nodiscard]] std::shared_ptr<SpeculativeDecodingModule> getSpeculativeDecodingModulePtr() noexcept
+    {
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set");
+        return mSpeculativeDecodingModule;
+    }
+
+    void setSpeculativeDecodingModule(
+        std::shared_ptr<SpeculativeDecodingModule> const& speculativeDecodingModule) noexcept
+    {
+        mSpeculativeDecodingModule = speculativeDecodingModule;
     }
 
     [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
@@ -519,6 +557,31 @@ public:
         mLayerTypes = layerTypes;
     }
 
+    [[nodiscard]] SpeculativeDecodingMode constexpr getSpeculativeDecodingMode() const noexcept
+    {
+        return mSpeculativeDecodingMode;
+    }
+
+    void setLogitsDtype(nvinfer1::DataType inputDtype) noexcept
+    {
+        mLogitsDtype = inputDtype;
+    }
+
+    [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
+    {
+        return mLogitsDtype;
+    }
+
+    void setUseShapeInference(bool useShapeInference) noexcept
+    {
+        mUseShapeInference = useShapeInference;
+    }
+
+    [[nodiscard]] bool useShapeInference() const noexcept
+    {
+        return mUseShapeInference;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbAttentionLayers;
@@ -547,9 +610,8 @@ private:
     bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
-    SizeType32 mMaxDraftLen;
 
-    bool mUseContextFMHAForGeneration;
+    bool mContextFMHA;
     bool mPagedContextFMHA;
     bool mUseXQA;
 
@@ -558,16 +620,23 @@ private:
     SizeType32 mMlpHiddenSize;
     SizeType32 mMaxLoraRank;
 
-    std::optional<MedusaModule> mMedusaModule;
     std::optional<RnnConfig> mRnnConfig;
 
     // Configs related to encoder / enc-dec models
+    SizeType32 mMaxEncoderLen{};
+    SizeType32 mEncoderHiddenSize{};
     bool mUseCrossAttention;
     bool mUsePositionEmbedding;
     bool mUseTokenTypeEmbedding;
-    SizeType32 mFfnHiddenSize; // indicates encoder output hidden size
 
     std::vector<LayerType> mLayerTypes;
+    // Speculative decoding members
+    std::shared_ptr<SpeculativeDecodingModule> mSpeculativeDecodingModule;
+    SpeculativeDecodingMode mSpeculativeDecodingMode;
+
+    // Logits datatype
+    nvinfer1::DataType mLogitsDtype;
+    bool mUseShapeInference;
 };
 
 } // namespace tensorrt_llm::runtime

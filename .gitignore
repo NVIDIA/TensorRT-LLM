@@ -6,9 +6,9 @@ __pycache__/
 *.nsys-rep
 .VSCodeCounter
 build*/
+!builders/
 *.egg-info/
 .coverage
-*.csv
 *.onnx
 tmp/
 venv/

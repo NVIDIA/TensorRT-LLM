@@ -48,13 +48,12 @@ public:
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType32 maxBeamWidth,
-        executor::SchedulerConfig const& schedulerConfig, GetInferenceRequestsCallback getInferenceRequestsCb,
-        SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
+    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType,
+        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
+        PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams(),
-        std::optional<uint64_t> terminateReqId = std::nullopt, std::optional<SizeType32> maxDraftTokens = std::nullopt,
-        bool excludeInputInOutput = false);
+        std::optional<uint64_t> terminateReqId = std::nullopt, bool excludeInputInOutput = false);
 
     /* Wraps the user-provided callback for requests.
        Adds requests to request table.
@@ -109,7 +108,6 @@ private:
 
     std::shared_ptr<TrtGptModel> mTrtGptModel;
     std::optional<uint64_t> mTerminateReqId;
-    std::optional<SizeType32> mMaxDraftTokens;
 
     // Iteration counter - incremented every iteration of the generation loop
     int64_t mIterationCounter;

@@ -1,0 +1,10 @@
+-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+--extra-index-url https://pypi.nvidia.com
+tensorrt_llm==0.11.0
+datasets==2.14.6
+evaluate~=0.4.1
+rouge_score~=0.1.2
+sentencepiece==0.2.0
+jax[cuda12-pip]==0.4.29
+jaxlib[cuda12-pip]==0.4.29
+dm_haiku==0.0.12

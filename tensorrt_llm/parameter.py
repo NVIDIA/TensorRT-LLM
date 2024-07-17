@@ -35,7 +35,8 @@ class Parameter:
     def __init__(self,
                  value: Optional[Union[np.ndarray, torch.Tensor]] = None,
                  shape: Sequence[int] = None,
-                 dtype: Union[str, trt.DataType] = None):
+                 dtype: Union[str, trt.DataType] = None,
+                 is_buffer: bool = False):
         if dtype is None:
             logger.warning(
                 f'Parameter dtype is None, using default dtype: {self._DEFAULT_DTYPE}, it is recommended to always specify dtype explicitly'
@@ -51,6 +52,7 @@ class Parameter:
         else:
             self._shape = value.shape
             self._value = self._regularize_value(value)
+        self.is_buffer = is_buffer
 
     @property
     def shape(self):
@@ -92,14 +94,14 @@ class Parameter:
                                   device='cuda')
             # value ~ U[int(-128 * v_range), int(128 * v_range)]
         elif dtype == trt.DataType.FP8:
-            value = torch.randn((shape), device='cuda') * 2 - 1
-            # value ~ N[-v_range, v_range]
+            value = torch.rand((shape), device='cuda') * 2 - 1
+            # value ~ U[-v_range, v_range]
             value = value * v_range
             value = value.to(trt_dtype_to_torch(dtype))
         else:
-            value = torch.randn(
+            value = torch.rand(
                 (shape), dtype=trt_dtype_to_torch(dtype), device='cuda') * 2 - 1
-            # value ~ N[-v_range, v_range]
+            # value ~ U[-v_range, v_range]
             value = value * v_range
 
         stream = torch.cuda.Stream()
@@ -123,6 +125,11 @@ class Parameter:
     @value.setter
     def value(self, v: Union[np.ndarray, torch.Tensor]):
         v = self._regularize_value(v)
+
+        if v.shape != self.shape and v.ndim == 0 and max(self.shape) == 1:
+            # convert the scalar into a tensor which each dim is 1.
+            v = v.reshape(self.shape)
+
         assert v.shape == self.shape, \
             f'The value updated is not the same shape as the original. ' \
             f'Updated: {v.shape}, original: {self.shape}'

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
 from ..._utils import pad_vocab_size
 from ...functional import (Tensor, is_gated_activation, non_gated_version, recv,
                            send)
@@ -22,10 +20,11 @@ from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, LayerNorm, MoeConfig,
                        PositionEmbeddingType)
 from ...lora_manager import LoraConfig, use_lora
+from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantMode
-from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from .config import GPTConfig
 
 
 def MLPFactory(hidden_size,
@@ -36,7 +35,7 @@ def MLPFactory(hidden_size,
                moe_config: MoeConfig = MoeConfig(),
                tp_group=None,
                tp_size=1,
-               tp_rank=0,
+               mapping=Mapping(),
                quant_mode=QuantMode(0),
                inner_layernorm=False,
                eps=1e-05):
@@ -45,11 +44,11 @@ def MLPFactory(hidden_size,
                    hidden_size,
                    ffn_hidden_size,
                    hidden_act,
-                   bias,
-                   dtype,
-                   tp_group,
-                   tp_size,
-                   tp_rank,
+                   mapping=mapping,
+                   bias=bias,
+                   dtype=dtype,
+                   tp_group=tp_group,
+                   tp_size=tp_size,
                    quant_mode=quant_mode)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
@@ -69,7 +68,7 @@ def MLPFactory(hidden_size,
 
 class GPTDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -93,6 +92,7 @@ class GPTDecoderLayer(Module):
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             num_layers=config.num_hidden_layers,
+            q_scaling=config.q_scaling,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
@@ -112,23 +112,16 @@ class GPTDecoderLayer(Module):
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
         self.norm_before_bmm1 = config.norm_before_bmm1 if hasattr(
             config, "norm_before_bmm1") else False
-        moe_config = MoeConfig()
-        if config.moe_num_experts > 1:
-            moe_config = MoeConfig(
-                config.moe_num_experts,
-                config.moe_top_k,
-                config.moe_tp_mode,
-                config.moe_normalization_mode,
-            )
+
         self.mlp = MLPFactory(hidden_size=config.hidden_size,
                               ffn_hidden_size=mlp_hidden_size,
                               hidden_act=config.hidden_act,
                               dtype=config.dtype,
                               bias=config.bias,
-                              moe_config=moe_config,
+                              moe_config=config.moe,
                               tp_group=tp_group,
                               tp_size=tp_size,
-                              tp_rank=tp_rank,
+                              mapping=config.mapping,
                               quant_mode=config.quant_mode,
                               inner_layernorm=inner_layernorm,
                               eps=config.norm_epsilon)
@@ -144,8 +137,7 @@ class GPTDecoderLayer(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 lora_layer_params=None,
-                spec_decoding_position_offsets=None,
-                spec_decoding_packed_mask=None):
+                spec_decoding_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -157,12 +149,11 @@ class GPTDecoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
-            norm_before_bmm1=self.norm_before_bmm1,
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
-            spec_decoding_packed_mask=spec_decoding_packed_mask)
+            norm_before_bmm1=self.norm_before_bmm1)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -172,7 +163,8 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
 
@@ -183,16 +175,16 @@ class GPTDecoderLayer(Module):
 
 class GPTModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.mapping = config.mapping
         self.position_embedding_type = config.position_embedding_type
-        self.embed_scale = math.sqrt(config.hidden_size) if hasattr(
-            config, "scale_embedding") and config.scale_embedding else 1.0
         if config.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
                                              dtype=config.dtype)
+
+            self.embedding_scale = config.embedding_scale
 
             if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 self.position_embedding = Embedding(
@@ -219,29 +211,27 @@ class GPTModel(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None,
                 lora_params=None,
-                spec_decoding_position_offsets=None,
-                spec_decoding_packed_mask=None):
+                spec_decoding_params=None):
         if self.mapping.is_first_pp_rank():
             ptuning_args = [
                 prompt_embedding_table, prompt_tasks, prompt_vocab_size
             ] if prompt_embedding_table is not None else []
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
-            hidden_states = hidden_states * self.embed_scale
+            if self.embedding_scale is not None:
+                hidden_states *= self.embedding_scale
             if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 hidden_states = hidden_states + self.position_embedding(
                     position_ids)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        hidden_states = self.layers(
-            hidden_states,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            lora_params=lora_params,
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
-            spec_decoding_packed_mask=spec_decoding_packed_mask)
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params,
+                                    lora_params=lora_params,
+                                    spec_decoding_params=spec_decoding_params)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -256,9 +246,9 @@ class GPTModel(Module):
 
 
 class GPTForCausalLM(DecoderModelForCausalLM):
+    config_class = GPTConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: GPTConfig):
         transformer = GPTModel(config)
 
         if config.mapping.is_last_pp_rank():
@@ -273,21 +263,15 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                    gather_output=True)
         else:
             lm_head = None
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_k": "k_proj",
+            "attn_v": "v_proj",
+            "attn_dense": "o_proj",
+            "mlp_h_to_4h": "c_fc",
+            "mlp_4h_to_h": "c_proj",
+        }
         super().__init__(config, transformer, lm_head)
 
-    def check_config(self, config: PretrainedConfig):
-        config.set_if_not_exist('bias', True)
-        config.set_if_not_exist('apply_query_key_layer_scaling', False)
-        config.set_if_not_exist('rotary_pct', 1.0)
-        config.set_if_not_exist('rotary_base', 10000.0)
-        config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('moe_num_experts', 0)
-        config.set_if_not_exist('moe_top_k', 0)
-        config.set_if_not_exist('moe_tp_mode',
-                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
-        config.set_if_not_exist(
-            'moe_normalization_mode',
-            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE)
-
     def use_lora(self, lora_config: LoraConfig):
-        use_lora(self, lora_config)
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

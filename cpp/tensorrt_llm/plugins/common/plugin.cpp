@@ -41,50 +41,60 @@ std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
     return &dtypeMap;
 }
 
-std::map<std::set<int>, ncclComm_t>* getCommMap()
+namespace
 {
-    static std::map<std::set<int>, ncclComm_t> commMap;
-    return &commMap;
-}
 
-void initCommMap(std::set<int> const& group)
+// Get NCCL unique ID for a group of ranks.
+ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
 {
-    auto& commMap = *getCommMap();
-    // [] operator inserts T() if it does not exist
-    if (isBuilding() || commMap[group] != nullptr)
-    {
-        return;
-    }
-    auto& comm = COMM_SESSION;
-    auto const myRank = comm.getRank();
-
-    int groupRank = 0;
-    for (int it : group)
-    {
-        if (it == myRank)
-        {
-            break;
-        }
-        ++groupRank;
-    }
-
+    auto const rank = COMM_SESSION.getRank();
     ncclUniqueId id;
-    if (myRank == *group.begin())
+    if (rank == *group.begin())
     {
-        ncclGetUniqueId(&id);
+        NCCLCHECK(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            comm.sendValue(id, *it, 0);
+            COMM_SESSION.sendValue(id, *it, 0);
         }
     }
     else
     {
-        comm.recvValue(id, *group.begin(), 0);
+        COMM_SESSION.recvValue(id, *group.begin(), 0);
+    }
+    return id;
+}
+} // namespace
+
+std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
+{
+    static std::map<std::set<int>, std::weak_ptr<ncclComm_t>> commMap;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = commMap.find(group);
+    if (it != commMap.end())
+    {
+        // If the weak_ptr can be locked, return the shared_ptr
+        auto ncclComm = it->second.lock();
+        if (ncclComm)
+        {
+            return ncclComm;
+        }
     }
 
-    commMap[group] = nullptr;
-    NCCLCHECK(ncclCommInitRank(&commMap[group], group.size(), id, groupRank));
+    ncclUniqueId id = getUniqueId(group);
+    auto const rank = COMM_SESSION.getRank();
+    auto const groupRank = rank % group.size();
+    std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
+        [](ncclComm_t* comm)
+        {
+            ncclCommDestroy(*comm);
+            delete comm;
+        });
+    NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+    commMap[group] = ncclComm;
+    return ncclComm;
 }
+#endif // ENABLE_MULTI_DEVICE
 
 void* tensorrt_llm::plugins::getCommSessionHandle()
 {
@@ -94,8 +104,6 @@ void* tensorrt_llm::plugins::getCommSessionHandle()
     return nullptr;
 #endif // ENABLE_MULTI_DEVICE
 }
-
-#endif // ENABLE_MULTI_DEVICE
 
 namespace
 {

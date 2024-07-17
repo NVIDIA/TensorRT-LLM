@@ -17,9 +17,11 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <stdio.h>
 
 using namespace tensorrt_llm::common;
+using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm
 {
@@ -45,21 +47,21 @@ void invokeCurandInitialize(
 }
 
 __global__ void curandBatchInitialize(
-    curandState_t* states, int const* batchSlots, int const size, uint64_t const* randomSeeds)
+    curandState_t* states, SizeType32 const* batchSlots, SizeType32 const size, uint64_t const* randomSeeds)
 {
-    int const idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < size)
+    SizeType32 const bid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (bid < size)
     {
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
-        curand_init(randomSeeds[batchSlot], 0, 0, &states[batchSlot]);
+        auto const batchSlot = batchSlots != nullptr ? batchSlots[bid] : bid;
+        curand_init(randomSeeds[bid], 0, 0, &states[batchSlot]);
     }
 }
 
-void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, const size_t batchSize,
+void invokeCurandBatchInitialize(curandState_t* states, SizeType32 const* batchSlots, const size_t batchSize,
     uint64_t const* randomSeeds, cudaStream_t stream)
 {
     dim3 block(256);
-    dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
+    dim3 grid(static_cast<SizeType32>(ceil(batchSize * 1.0 / 256)));
     curandBatchInitialize<<<grid, block, 0, stream>>>(states, batchSlots, batchSize, randomSeeds);
 }
 

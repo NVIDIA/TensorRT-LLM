@@ -1,30 +1,27 @@
 import asyncio
+import atexit
 import datetime
 import secrets
-import traceback
+import threading
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from queue import Queue
-from threading import Lock, Semaphore, Thread
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from janus import Queue as AsyncQueue
 
-from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
-from tensorrt_llm.hlapi.mpi_session import (MpiPoolSession, MpiSession,
-                                            external_mpi_comm_available,
-                                            find_free_port,
-                                            need_spawn_mpi_workers)
-from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
-                                      SamplingConfig, print_traceback_on_error)
-
-from . import bindings as tllm
-from .bindings import executor as tllme
+from ._utils import mpi_rank, mpi_world_size
+from .bindings import executor as tllm
+from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
+                                external_mpi_comm_available, find_free_port,
+                                need_spawn_mpi_workers)
+from .hlapi.utils import (ContextManager, SamplingParams, exception_handler,
+                          print_traceback_on_error)
 
 
 def has_event_loop() -> bool:
@@ -39,151 +36,101 @@ class GenerationRequest:
 
     def __init__(
         self,
-        ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
-        streaming: bool = True,
-        tokenizer: Optional[TokenizerBase] = None,
-        sampling_config: Optional[SamplingConfig] = None,
-        # TODO[chunweiy]: Remove this flag when gptManager path is cleaned
-        exclude_input_from_output: bool = False):
-        if isinstance(ids_or_prompt, str):
-            assert tokenizer is not None, "GenerationRequest constructor with str prompt requires a tokenizer argument"
-            self.input_ids = (tokenizer.encode(ids_or_prompt,
-                                               return_tensors="pt",
-                                               return_attention_mask=False).to(
-                                                   torch.int32).numpy())
+        prompt_token_ids: Union[torch.Tensor, np.ndarray, list],
+        sampling_params: SamplingParams,
+        streaming: bool = False,
+    ):
+        if isinstance(prompt_token_ids, list):
+            self.prompt_token_ids = prompt_token_ids
+        elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
+            self.prompt_token_ids = prompt_token_ids.tolist()
         else:
-            if isinstance(ids_or_prompt, list):
-                self.input_ids = np.array(ids_or_prompt, dtype="int32")
-            elif isinstance(ids_or_prompt, torch.Tensor):
-                self.input_ids = ids_or_prompt.to(torch.int32).numpy()
-            elif isinstance(ids_or_prompt, np.ndarray):
-                self.input_ids = ids_or_prompt
-            else:
-                raise ValueError(
-                    f"ids_or_prompt (={ids_or_prompt}) should be an instance of str, torch.Tensor, np.ndarray or list"
-                )
+            raise TypeError(
+                f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+            )
 
-        self.tokenizer = tokenizer
+        self.sampling_params = sampling_params
         self.streaming = streaming
-        self.exclude_input_from_output = exclude_input_from_output
-        self.sampling_config = sampling_config or SamplingConfig()
-
         self.id = -1
 
     def set_id(self, id):
         self.id = id
         return self
 
-    def as_inference_request(self) -> tllm.InferenceRequest:
-        ir = tllm.InferenceRequest(self.id)
-        ir.input_ids = torch.from_numpy(self.input_ids)
-        ir.is_streaming = self.streaming
-
-        def set_property(name: str,
-                         dtype: torch.dtype = torch.int32,
-                         default: Any = None,
-                         value=None):
-            if value is None:
-                value = getattr(self.sampling_config, name, None)
-                value = value if value is not None else default
-            if value is not None:
-                setattr(ir, name, torch.tensor([value], dtype=dtype))
-
-        top_k = self.sampling_config.top_k[
-            0] if self.sampling_config.top_k is not None else None
-
-        top_p = self.sampling_config.top_p[
-            0] if self.sampling_config.top_p is not None else None
-        temperature = self.sampling_config.temperature[
-            0] if self.sampling_config.temperature is not None else None
-        max_new_tokens = [
-            self.sampling_config.max_new_tokens
-        ] if self.sampling_config.max_new_tokens is not None else None
-        min_length = self.sampling_config.min_length[
-            0] if self.sampling_config.min_length is not None else None
-        end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
-        pad_id = end_id if pad_id is None else pad_id
-
-        set_property("beam_width")
-        set_property("max_new_tokens", default=[32], value=max_new_tokens)
-        set_property("end_id", value=end_id)
-        set_property("pad_id", value=pad_id)
-        set_property("min_length", value=min_length)
-        set_property("temperature", torch.float32, value=temperature)
-        set_property("runtime_top_k", torch.float32, value=top_k)
-        set_property("runtime_top_p", torch.float32, value=top_p)
-        set_property("random_seed", torch.int64)
-
-        return ir
-
-    def as_executor_request(self) -> tllme.Request:
-        # SamplingConfig
-        sampling_kwargs = {}
-
-        def set_property(name):
-            value = getattr(self.sampling_config, name, None)
-            if value:
-                sampling_kwargs[name] = value[0] if isinstance(value,
-                                                               list) else value
-
-        set_property("beam_width")
-        set_property("min_length")
-        set_property("top_k")
-        set_property("top_p")
-        set_property("temperature")
-        set_property("random_seed")
-        set_property("beam_search_diversity_rate")
-        set_property("early_stopping")
-        set_property("frequency_penalty")
-        set_property("length_penalty")
-        set_property("presence_penalty")
-        set_property("repetition_penalty")
-        set_property("top_p_decay")
-        set_property("top_p_min")
-        set_property("top_p_reset_ids")
-        sampling_config = tllme.SamplingConfig(**sampling_kwargs)
-        # Request
-        end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
-        pad_id = end_id if pad_id is None else pad_id
-
-        output_config = tllme.OutputConfig()
-        # Don't repeat prompt in the generation output
-        output_config.exclude_input_from_output = self.exclude_input_from_output
-
+    def as_executor_request(self) -> tllm.Request:
         request_kwargs = {
-            "input_token_ids": self.input_ids.squeeze().tolist(),
-            "max_new_tokens": self.sampling_config.max_new_tokens or 32,
-            "streaming": self.streaming,
-            "sampling_config": sampling_config,
-            "end_id": end_id,
-            "pad_id": pad_id,
+            "input_token_ids":
+            self.prompt_token_ids,
+            "max_new_tokens":
+            self.sampling_params.max_new_tokens,
+            "streaming":
+            self.streaming,
+            "sampling_config":
+            self.sampling_params._get_sampling_config(),
+            "end_id":
+            self.sampling_params.end_id,
+            "pad_id":
+            self.sampling_params.pad_id,
+            "output_config":
+            self.sampling_params._get_output_config(),
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "output_config": output_config,
-            "bad_words": None,  #TODO
-            "stop_words": None,  #TODO
-            "embedding_bias": None,  #TODO
-            "speculative_decoding_config": None,  #TODO
-            "prompt_tuning_config": None,  #TODO
-            "lora_config": None,  #TODO
-            "logits_post_processor_name": None,  #TODO
+            "bad_words":
+            self.sampling_params.bad_words or [],
+            "stop_words":
+            self.sampling_params.stop_words or [],
+            "embedding_bias":
+            self.sampling_params.embedding_bias,
+            "external_draft_tokens_config":
+            self.sampling_params.external_draft_tokens_config,
+            "prompt_tuning_config":
+            self.sampling_params.prompt_tuning_config,
+            "lora_config":
+            self.sampling_params.lora_config,
+            "logits_post_processor_name":
+            self.sampling_params.logits_post_processor_name,
         }
-        request = tllme.Request(**request_kwargs)
+        request = tllm.Request(**request_kwargs)
         return request
 
 
-class GenerationResult(GenerationOutput):
+@dataclass(slots=True)
+class CompletionOutput:
+    """The output data of one completion output of a request.
 
-    def __init__(self,
-                 generation_request: GenerationRequest,
-                 tokenizer: Optional[TokenizerBase] = None) -> None:
+    Args:
+        index (int): The index of the output in the request.
+        text (str): The generated output text.
+        token_ids (List[int]): The token ids of the generated output text.
+        cumulative_logprob (float): The cumulative log probability of the generated output text.
+        logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested.
+        generation_logits (torch.Tensor): The logits on the generated output token ids.
+    """
+    index: int
+    text: str = ""
+    token_ids: List[int] = field(default_factory=list)
+    cumulative_logprob: Optional[float] = None
+    logprobs: List[float] = field(default_factory=list)
+    generation_logits: Optional[torch.Tensor] = field(default=None, repr=False)
+    _last_text: str = field(default="", init=False, repr=False)
+
+    @property
+    def length(self):
+        return len(self.token_ids)
+
+    @property
+    def text_diff(self) -> str:
+        diff = self.text[len(self._last_text):]
+        self._last_text = self.text
+        return diff
+
+
+class GenerationResult:
+
+    def __init__(self, generation_request: GenerationRequest) -> None:
         self._done = False
         self._cancelled = False
-        self.generation_request = generation_request
-        self.tokenizer = tokenizer
-        self.streaming = generation_request.streaming
+        self._generation_request = generation_request
 
         if has_event_loop():
             aqueue = AsyncQueue()
@@ -193,60 +140,59 @@ class GenerationResult(GenerationOutput):
             self.queue = Queue()
             self.aqueue = None
 
-        beam_width = generation_request.sampling_config.beam_width
-
-        self.beam_search_enabled = beam_width > 1
-        self._token_ids = [[] for _ in range(beam_width)]
-
-        self.logprobs = []
-        self.last_text = ""
+        self.outputs: List[CompletionOutput] = [
+            CompletionOutput(i) for i in range(self.beam_width)
+        ]
+        self.context_logits: Optional[torch.Tensor] = None
 
     @property
-    def token_ids(self):
-        if not self.beam_search_enabled:
-            return self._token_ids[0]
-        return self._token_ids
+    def request_id(self) -> int:
+        return self._generation_request.id
 
-    def handle_generation_msg(self,
-                              tensors: Dict[str, np.ndarray] | List[List[int]],
-                              error: str):
+    @property
+    def prompt_token_ids(self) -> List[int]:
+        return self._generation_request.prompt_token_ids
+
+    @property
+    def finished(self) -> bool:
+        return self._done
+
+    @property
+    def streaming(self):
+        return self._generation_request.streaming
+
+    @property
+    def beam_width(self):
+        return self._generation_request.sampling_params.beam_width
+
+    def handle_generation_msg(self, tensors: tuple, error: str):
         if error:
             raise RuntimeError(error)
-        if isinstance(tensors, list):
-            # Executor API format.
-            new_ids = tensors
-        else:
-            new_ids = tensors["output_ids"].squeeze(0).tolist()
-        for idx, beam_ids in enumerate(new_ids):
-            self._token_ids[idx] += beam_ids
+
+        output_token_ids, context_logits, generation_logits, log_probs, cum_log_probs = tensors
+
+        for i, beam_ids in enumerate(output_token_ids):
+            self.outputs[i].token_ids.extend(beam_ids)
+            if cum_log_probs is not None:
+                self.outputs[i].cumulative_logprob = cum_log_probs[i]
+            if log_probs is not None:
+                self.outputs[i].logprobs = log_probs[i]
+                assert len(self.outputs[i].logprobs) == self.outputs[i].length
+            if generation_logits is not None:
+                self.outputs[i].generation_logits = generation_logits[
+                    i, :self.outputs[i].length]
+
+        if context_logits is not None:
+            self.context_logits = context_logits
 
     def result_step(self, timeout: Optional[float] = None):
         _, tensors, self._done, error = self.queue.get(timeout=timeout)
         self.handle_generation_msg(tensors, error)
 
     async def aresult_step(self):
-        assert self.aqueue is not None
+        assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         _, tensors, self._done, error = await self.aqueue.get()
         self.handle_generation_msg(tensors, error)
-
-    @property
-    def text_diff(self) -> str:
-        assert self.streaming is not None
-        assert not self.beam_search_enabled, "text_diff is not supported with beam_search"
-
-        new_txt = self.text
-        diff = new_txt[len(self.last_text):]
-        self.last_text = new_txt
-        return diff
-
-    @property
-    def text(self) -> Union[str, List[str]]:
-        if self.tokenizer is None:
-            return ''
-        texts = self.tokenizer.batch_decode(self._token_ids)
-        if not self.beam_search_enabled:
-            return texts[0]
-        return texts
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         while not self._done:
@@ -257,6 +203,9 @@ class GenerationResult(GenerationOutput):
         while not self._done:
             await self.aresult_step()
         return self
+
+    def __await__(self):
+        return self.aresult().__await__()
 
     def __iter__(self):
         return self
@@ -296,13 +245,32 @@ class GenerationResult(GenerationOutput):
         except RuntimeError as e:
             return e
 
+    def _repr_fields(self):
+        return ['request_id', 'prompt_token_ids', 'outputs', 'finished']
+
+    def __repr__(self) -> str:
+        repr = []
+        for field in self._repr_fields():
+            value = getattr(self, field)
+            if isinstance(value, str):
+                repr.append(f"{field}={value!r}")
+            else:
+                repr.append(f"{field}={value}")
+        repr = ", ".join(repr)
+        repr = f"{self.__class__.__name__}({repr})"
+        return repr
+
 
 class GenerationExecutor(ABC):
     TERMINATE_REQUEST_ID = 0
 
     def __init__(self):
         self.id_counter = GenerationExecutor.TERMINATE_REQUEST_ID + 1
-        self.tokenizer = None
+        self._stats = None
+        self.stats_queue = None
+
+        exception_handler.register(self)
+        atexit.register(self.shutdown)
 
     def generate_id(self) -> int:
         gen_id = self.id_counter
@@ -322,93 +290,82 @@ class GenerationExecutor(ABC):
 
     def generate_async(
         self,
-        prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool,
-        sampling_config: Union[SamplingConfig, List[SamplingConfig]],
-        # TODO[chunweiy]: Remove this flag when gptManager path is cleaned
-        exclude_input_from_output: bool = False,
-    ) -> Union[GenerationResult, List[GenerationResult]]:
-        unbatched = isinstance(prompt, str) or (isinstance(prompt, list)
-                                                and isinstance(prompt[0], int))
-        string_input = isinstance(
-            prompt, str) or (not unbatched and isinstance(prompt[0], str))
-        tokenizer = self.tokenizer if string_input else None
-
-        if unbatched:
-            results = self.submit(
-                GenerationRequest(
-                    prompt,
-                    streaming,
-                    tokenizer,
-                    sampling_config=sampling_config,
-                    exclude_input_from_output=exclude_input_from_output))
-        else:
-            sampling_config = [sampling_config] * len(prompt) if not isinstance(
-                sampling_config, list) else sampling_config
-            results = []
-            for idx, p in enumerate(prompt):
-                results.append(
-                    self.submit(
-                        GenerationRequest(
-                            p,
-                            streaming,
-                            tokenizer,
-                            sampling_config=sampling_config[idx],
-                            exclude_input_from_output=exclude_input_from_output)
-                    ))
-        return results
+        prompt_token_ids: List[int],
+        sampling_params: SamplingParams,
+        streaming: bool = False,
+    ) -> GenerationResult:
+        """Generate output for the given prompt token ids in the asynchronous mode.
+        Asynchronous generation accepts single prompt only.
+        """
+        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(sampling_params, SamplingParams)
+        result = self.submit(
+            GenerationRequest(prompt_token_ids,
+                              sampling_params=sampling_params,
+                              streaming=streaming))
+        return result
 
     def generate(
-        self,
-        prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool = False,
-        sampling_config: Optional[Union[SamplingConfig,
-                                        List[SamplingConfig]]] = None,
-        # TODO[chunweiy]: Remove this flag when gptManager path is cleaned
-        exclude_input_from_output: bool = False,
+        self, prompt_token_ids: Union[List[int], List[List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]]
     ) -> Union[GenerationResult, List[GenerationResult]]:
-        futures = self.generate_async(
-            prompt,
-            streaming=streaming,
-            sampling_config=sampling_config,
-            exclude_input_from_output=exclude_input_from_output)
-        if isinstance(futures, GenerationRequest):
-            futures.result()
-        else:
-            for future in futures:
-                future.result()
+        """Generate output for the given prompt token ids in the synchronous mode.
+        Synchronous generation accepts either single prompt or batched prompts.
+        """
+        unbatched = isinstance(prompt_token_ids[0], int)
+
+        if unbatched:
+            prompt_token_ids = [prompt_token_ids]
+
+        futures = []
+        for i, p in enumerate(prompt_token_ids):
+            if isinstance(sampling_params, list):
+                sp = sampling_params[i]
+            else:
+                sp = sampling_params
+            future = self.generate_async(p, sampling_params=sp, streaming=False)
+            futures.append(future)
+
+        for future in futures:
+            future.result()
+
+        if unbatched:
+            futures = futures[0]
+
         return futures
 
     @abstractmethod
     def shutdown(self):
         pass
 
-    @abstractmethod
-    def get_stats(self):
-        pass
+    def create_stats_queue(self):
+        # Stats queue is created during first submission to ensure event loop exists if it is needed.
+        if not self._stats:
+            if has_event_loop():
+                self._stats = AsyncQueue()
+                self.stats_queue = self._stats.sync_q
+                self.stats_aqueue = self._stats.async_q
+            else:
+                self._stats = Queue()
+                self.stats_queue = self._stats
+                self.stats_aqueue = None
 
-    @abstractmethod
+    def get_stats(self):
+        return self.stats_queue.get()
+
     async def aget_stats(self):
-        pass
+        assert self.stats_aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
+        return await self.stats_aqueue.get()
 
     @staticmethod
     def create(
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
-        use_executor_bindings: bool = False,
         reuse_mpi_comm: bool = False,
-    ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker",
-               "ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
+    ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
 
         if world_size == 0:
             world_size = mpi_world_size()
@@ -421,10 +378,6 @@ class GenerationExecutor(ABC):
 
         worker_kwargs = {
             "engine_dir": engine_dir,
-            "tokenizer": tokenizer,
-            "max_beam_width": max_beam_width,
-            "executor_type": executor_type,
-            "scheduler_config": scheduler_config,
             "executor_config": executor_config,
         }
 
@@ -435,164 +388,61 @@ class GenerationExecutor(ABC):
         if spawn_workers or (mpirun_launch and reuse_mpi_comm):
             if reuse_mpi_comm:
                 assert mpi_session is not None, "reuse_mpi_comm requires an external MPI session"
-            return ExecutorBindingsProxy(
-                worker_kwargs,
-                model_world_size=model_world_size,
-                mpi_session=mpi_session
-            ) if use_executor_bindings else GenerationExecutorProxy(
-                worker_kwargs,
-                model_world_size=model_world_size,
-                mpi_session=mpi_session)
+            return ExecutorBindingsProxy(worker_kwargs,
+                                         model_world_size=model_world_size,
+                                         mpi_session=mpi_session)
 
-        return ExecutorBindingsWorker(
-            **worker_kwargs
-        ) if use_executor_bindings else GenerationExecutorWorker(
-            **worker_kwargs)
+        return ExecutorBindingsWorker(**worker_kwargs)
 
 
-class GenerationExecutorWorker(GenerationExecutor):
+class ExecutorBindingsWorker(GenerationExecutor):
 
     class WorkerExit(GeneratorExit):
         pass
 
-    @dataclass
-    class WorkerInitStatus:
-        ok: bool
-        info: Optional[str] = None
-        rank: Optional[int] = None
-
     def __init__(
         self,
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase, None],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
 
         self.engine = None
-        self.tokenizer = tokenizer_factory(tokenizer)
-
-        # NOTE: underscore variables are used for communication with the C++ runtime
-        self._requests: List[tllm.InferenceRequest] = []
         self._results: Dict[int, GenerationResult] = {}
-        self._cancelled_ids: Set[int] = set()
         self._pending: set = set()
-        if has_event_loop():
-            self._stats = AsyncQueue()
-            self.stats_queue = self._stats.sync_q
-            self.stats_aqueue = self._stats.async_q
-        else:
-            self._stats = Queue()
-            self.stats_queue = self._stats
-            self.stats_aqueue = None
-        """
-            Note: in single-node only (when using .block_subordinates()) the termination
-            process is as follow:
-                0. Nodes > 0 (main threads) directly wait on termination_ack. Node 0 continues execution.
-                1. Node 0 (main thread) is finishing and must close GptManager.
-                2. Node 0 (main thread) sets _termination_requested and wait on termination_ack
-                3. Node 0 (BatchManager thread) exchange _termination_requested via MPI.bcast with all other nodes.
-                4. All nodes (BatchManager threads) signal the _termination_ack semaphore and set _termination_pending to avoid fetching new requests.
-                5. All nodes (main threads) go through _termination_ack and ask BatchManager to join its threads.
-        """
-        self._block_subordinates = False
-        self._termination_requested = False
-        self._termination_pending = False
-        self._termination_ack = Semaphore(0)
-        self._termination_lock = Lock()
         self.result_queue = None
-
-        self.comm = mpi_comm()
         self.rank = mpi_rank()
 
-        self.engine = tllm.GptManager(engine_dir, executor_type, max_beam_width,
-                                      scheduler_config, self.fetch_requests,
-                                      self.handle_response,
-                                      self.get_cancelled_ids, self.handle_stats,
-                                      executor_config,
-                                      GenerationExecutor.TERMINATE_REQUEST_ID)
+        self.engine = tllm.Executor(engine_dir,
+                                    tllm.ModelType.DECODER_ONLY,
+                                    executor_config=executor_config)
+        self.awaiter_stop_event = threading.Event()
+        self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
+                                               daemon=True)
+        self.stats_thread = threading.Thread(target=self.stats_loop,
+                                             daemon=True)
 
-    def shutdown(self):
-        if self.engine is not None:
-            self.engine.shutdown()
-            self.engine = None
-
-    def block_subordinates(self):
-        self._block_subordinates = True
-        if self.rank != 0:
-            self._termination_ack.acquire()
-            self.shutdown()
-            raise self.WorkerExit(
-                "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
-            )
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        del exc_value, traceback  # unused arguments
-
-        if self._block_subordinates and self.rank == 0:
-            if self.rank == 0:
-                self._termination_lock.acquire()
-                self._termination_requested = True
-                self._termination_lock.release()
-
-                self._termination_ack.acquire()
-
-        self.shutdown()
-
-        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
-
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult which can be waited.
-        """
-        result = GenerationResult(request, request.tokenizer)
-        req_id = self.generate_id()
-
-        request.set_id(req_id)
-        self._results[req_id] = result
-        self._pending.add(req_id)
-        self._requests.append(request.as_inference_request())
-
-        return result
-
-    def get_stats(self):
-        return self.stats_queue.get()
-
-    async def aget_stats(self):
-        assert self.stats_aqueue is not None
-        return await self.stats_aqueue.get()
-
-    def wait_first_completed(
-        self, futures: List[GenerationResult]
-    ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.generation_request.id for f in futures)
-
-        # clear already-finished requests
-        for f in futures:
-            if f._done:
-                wait_set.remove(f.generation_request.id)
-                yield f
-
-        # wait remaining active requests
-        while len(wait_set) > 0:
-            req_id = wait_set.pop()
-
-            if req_id not in self._pending:
-                yield self._results[req_id]
+    def create_stats_queue(self):
+        # Stats queue is created during first submission to ensure event loop exists if it is needed.
+        if not self._stats:
+            if has_event_loop():
+                self._stats = AsyncQueue()
+                self.stats_queue = self._stats.sync_q
+                self.stats_aqueue = self._stats.async_q
             else:
-                wait_set.add(req_id)
+                self._stats = Queue()
+                self.stats_queue = self._stats
+                self.stats_aqueue = None
 
     def set_result_queue(self, queue):
+        """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         self.result_queue = queue
+
+    def set_stats_queue(self, queue):
+        """In multi-gpu mode, stats_queue will be set here to communicate between the proxy and the worker 0 process."""
+        self._stats = queue
+        self.stats_queue = self._stats
+        self.stats_aqueue = None
 
     def return_queue(self, req_id: int):
         """ If a centralized result queue is registered (used for communication with the proxy)
@@ -604,55 +454,118 @@ class GenerationExecutorWorker(GenerationExecutor):
             return self.result_queue
         return self._results[req_id].queue
 
-    # Callbacks for BatchManager
-    def fetch_requests(self, max_num_sequences) -> List[tllm.InferenceRequest]:
-        if self._termination_pending:
-            return []
+    def start_awaiter_thread(self):
+        if self.engine.can_enqueue_requests(
+        ) and not self.awaiter_thread.is_alive():
+            self.awaiter_thread.start()
 
-        fetched = []
-        if not self._block_subordinates or self.rank == 0:
-            for _ in range(max_num_sequences):
-                if len(self._requests) == 0:
-                    break
-                fetched.append(self._requests.pop())
+    def start_stats_thread(self):
+        if self.engine.can_enqueue_requests(
+        ) and not self.stats_thread.is_alive():
+            self.stats_thread.start()
 
-        if self._block_subordinates:
-            self._termination_lock.acquire()
-            self._termination_requested = self.comm.bcast(
-                self._termination_requested)
+    def awaiter_loop(self):
+        """ Gets responses from executor and places in the return queue."""
+        while not self.awaiter_stop_event.is_set():
+            # Get responses and place in queue.
+            for response in self.engine.await_responses(
+                    timeout=datetime.timedelta(milliseconds=100)):
+                req_id = response.request_id
+                if response.has_error():
+                    self.return_queue(req_id).put(
+                        (req_id, None, None, response.error_msg))
+                else:
+                    tensors = (
+                        response.result.output_token_ids,
+                        response.result.context_logits,
+                        response.result.generation_logits,
+                        response.result.log_probs,
+                        response.result.cum_log_probs,
+                    )
+                    self.return_queue(req_id).put(
+                        (response.request_id, tensors, response.result.is_final,
+                         None))
+                    if response.result.is_final:
+                        self._pending.remove(req_id)
 
-            if self._termination_requested:
-                self._termination_ack.release()
-                self._termination_pending = True
-            self._termination_lock.release()
+    def stats_loop(self):
+        while not self.awaiter_stop_event.is_set():
+            time.sleep(0.1)
+            # Get stats and place in queue.
+            for stats in self.engine.get_latest_iteration_stats():
+                while hasattr(self.stats_queue,
+                              "full") and self.stats_queue.full():
+                    self.stats_queue.get()
+                self.stats_queue.put(stats.to_json_str())
 
-            fetched = self.comm.bcast(fetched)
+    def start(self):
+        self.create_stats_queue()
+        self.start_awaiter_thread()
+        self.start_stats_thread()
 
-        return fetched
+    def submit(self, request: GenerationRequest) -> GenerationResult:
+        """
+            Low-level API to the executor. Return a "future" GenerationResult which can be waited.
+        """
+        self.start()
 
-    def handle_response(self, req_id: int, tensors: List[tllm.NamedTensor],
-                        finished: bool, err: str) -> None:
-        if self._block_subordinates and self.rank != 0:
-            return
+        if self.rank != 0:
+            raise NotImplementedError("Only rank 0 can submit requests.")
+        req_id = self.engine.enqueue_request(request.as_executor_request())
+        request.set_id(req_id)
 
-        self.return_queue(req_id).put((req_id, {
-            t.name: t.tensor.numpy()
-            for t in tensors if t.tensor is not None
-        }, finished, err))
-        if finished:
-            self._pending.remove(req_id)
+        result = GenerationResult(request)
+        self._results[req_id] = result
+        self._pending.add(req_id)
+        return result
 
-    def get_cancelled_ids(self) -> Set[int]:
-        return self._cancelled_ids
+    def shutdown(self):
+        if self.engine is not None:
+            self.awaiter_stop_event.set()
+            if self.engine.can_enqueue_requests():
+                if self.awaiter_thread.is_alive():
+                    self.awaiter_thread.join()
+                if self.stats_thread.is_alive():
+                    self.stats_thread.join()
+            self.engine.shutdown()
+            self.engine = None
 
-    def handle_stats(self, stats: str):
-        while self.stats_queue.full():
-            self.stats_queue.get()
+    def block_subordinates(self):
+        if self.rank != 0:
+            self.shutdown()
+            raise self.WorkerExit(
+                "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
+            )
 
-        self.stats_queue.put(stats)
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self.shutdown()
+        return exc_type is None or exc_type == ExecutorBindingsWorker.WorkerExit
 
     def __del__(self):
         self.shutdown()
+
+    def wait_first_completed(
+        self, futures: List[GenerationResult]
+    ) -> Generator[GenerationResult, None, None]:
+        wait_set = set(f.request_id for f in futures)
+
+        # clear already-finished requests
+        for f in futures:
+            if f._done:
+                wait_set.remove(f.request_id)
+                yield f
+
+        # wait remaining active requests
+        while len(wait_set) > 0:
+            req_id = wait_set.pop()
+
+            if req_id not in self._pending:
+                yield self._results[req_id]
+            else:
+                wait_set.add(req_id)
 
 
 class Fifo:
@@ -683,373 +596,6 @@ class Fifo:
         return self.conn.recv()
 
 
-class GenerationExecutorProxy(GenerationExecutor):
-
-    def __init__(
-        self,
-        workers_kwargs,
-        model_world_size: int = 1,
-        mpi_session: Optional[MpiSession] = None,
-    ) -> None:
-        super().__init__()
-
-        self.workers_started = False
-        self.tokenizer = tokenizer_factory(workers_kwargs["tokenizer"])
-
-        request_queue_addr = ("127.0.0.1", find_free_port(),
-                              secrets.token_bytes(512))
-        self.request_queue = Fifo(request_queue_addr, is_server=True)
-        result_queue_addr = ("127.0.0.1", find_free_port(),
-                             secrets.token_bytes(512))
-        self.result_queue = Fifo(result_queue_addr, is_server=True)
-
-        self._results: Dict[int, GenerationResult] = {}
-
-        if mpi_session is None:
-            self.mpi_session = MpiPoolSession(n_workers=model_world_size)
-        else:
-            self.mpi_session = mpi_session
-        self.model_world_size = model_world_size
-
-        self.workers_kwargs = workers_kwargs
-        self.workers_kwargs.update({
-            "request_queue_addr": request_queue_addr,
-            "result_queue_addr": result_queue_addr,
-        })
-        self.dispatcher = Thread(target=self.dispatcher_thread)
-
-    @print_traceback_on_error
-    @staticmethod
-    def workers_main(
-        engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
-        request_queue_addr: Tuple[str, int, bytes],
-        result_queue_addr: Tuple[str, int, bytes],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams()
-    ) -> None:
-        result_queue = None
-
-        if mpi_rank() == 0:
-            # Only rank0 need to communicate with the Python main process
-            request_queue = Fifo(request_queue_addr, is_server=False)
-            result_queue = Fifo(result_queue_addr, is_server=False)
-
-        init_status = None
-        try:
-            executor = GenerationExecutorWorker(engine_dir, tokenizer,
-                                                max_beam_width, executor_type,
-                                                scheduler_config,
-                                                executor_config)
-        except Exception as e:
-            error_info = f"{str(e)}\nTraceback: {traceback.format_exc()}"
-            init_status = GenerationExecutorWorker.WorkerInitStatus(
-                ok=False, info=error_info, rank=mpi_rank())
-            # Either one of the failed rank will occupy the result_queue comm and make the Python main process raise exception
-            result_queue.put(init_status)
-            raise e
-
-        else:
-            init_status = GenerationExecutorWorker.WorkerInitStatus(ok=True)
-
-        finally:
-            init_statuses = mpi_comm().gather(init_status, root=0)
-
-            if mpi_rank() == 0 and all(status.ok for status in init_statuses):
-                result_queue.put(init_status)
-
-        with ContextManager(executor) as executor:
-            executor.block_subordinates()
-            if mpi_rank() == 0:
-                executor.set_result_queue(result_queue)
-            while (req := request_queue.get()) is not None:
-                executor.submit(req)
-
-        if mpi_rank() == 0:
-            result_queue.put(None)
-
-    def dispatcher_thread(self):
-        """ Collect centralized results from result queue and dispatch them in the
-            correct GenerationResult queues. """
-
-        while (res := self.result_queue.get()) is not None:
-            id, tensors, finished, err = res
-            self._results[id].queue.put(
-                (id,
-                 {name: torch.tensor(value)
-                  for name, value in tensors.items()}, finished, err))
-
-    def start(self):
-        self.mpi_futures = self.mpi_session.submit(
-            GenerationExecutorProxy.workers_main, **self.workers_kwargs)
-        self.workers_started = True
-
-        # It will get the first failure status or get a success status if all ranks are successful
-        ack: GenerationExecutorWorker.WorkerInitStatus = self.result_queue.get()
-        if not ack.ok:
-            raise RuntimeError(
-                f"#node-{ack.rank}: worker initialization failed: {ack.info}")
-
-        self.dispatcher.start()
-
-    def shutdown(self):
-        if not self.workers_started:
-            return
-        self.request_queue.put(None)
-        for f in self.mpi_futures:
-            f.result()
-        self.dispatcher.join()
-        self.workers_started = False
-
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult which can be waited.
-            Forwards the request to the workers through the request queue.
-        """
-        if not self.workers_started:
-            self.start()
-
-        req_id = self.generate_id()
-        request.set_id(req_id)
-
-        tokenizer = request.tokenizer
-        result = GenerationResult(request, tokenizer)
-        self._results[req_id] = result
-
-        # no need to send the tokenizer to the executor,
-        # saves communication time
-        request.tokenizer = None
-        self.request_queue.put(request)
-        request.tokenizer = tokenizer
-
-        return result
-
-    def get_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
-
-    async def aget_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
-
-    def __del__(self):
-        self.shutdown()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.shutdown()
-        return False
-
-
-class ExecutorBindingsWorker(GenerationExecutor):
-
-    class WorkerExit(GeneratorExit):
-        pass
-
-    def __init__(
-        self,
-        engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase, None],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
-    ) -> None:
-        super().__init__()
-
-        self.engine = None
-        self.tokenizer = tokenizer_factory(tokenizer)
-        self._stats = None
-        self._results: Dict[int, GenerationResult] = {}
-        self._pending: set = set()
-        self.result_queue = None
-        self.rank = mpi_rank()
-
-        # Convert config to Executor config.
-        config = tllme.ExecutorConfig(
-            max_beam_width,
-            batching_type=self.convert_executor_type(executor_type),
-            scheduler_config=scheduler_config)
-        # Translate additional options from TrtGptModelOptionalParams
-        config.kv_cache_config = tllme.KvCacheConfig(
-            enable_block_reuse=executor_config.kv_cache_config.
-            enable_block_reuse,
-            max_tokens=executor_config.kv_cache_config.max_tokens,
-            max_attention_window=executor_config.kv_cache_config.
-            max_attention_window,
-            sink_token_length=executor_config.kv_cache_config.sink_token_length,
-            free_gpu_memory_fraction=executor_config.kv_cache_config.
-            free_gpu_memory_fraction)
-        if executor_config.device_ids:
-            config.parallel_config = tllme.ParallelConfig(
-                device_ids=executor_config.device_ids)
-        config.enable_chunked_context = executor_config.enable_chunked_context
-        config.normalize_log_probs = executor_config.normalize_log_probs
-        if executor_config.decoding_mode:
-            config.decoding_mode = self.convert_decoding_mode(
-                executor_config.decoding_mode)
-        assert not executor_config.enable_trt_overlap, "enable_trt_overlap is not supported."
-        self.engine = tllme.Executor(engine_dir,
-                                     tllme.ModelType.DECODER_ONLY,
-                                     executor_config=config)
-        self.awaiter_thread = Thread(target=self.awaiter_loop)
-        self.running = True
-
-    def convert_executor_type(self, executor_type):
-        batching_type_map = {
-            tllm.TrtGptModelType.V1: tllme.BatchingType.STATIC,
-            tllm.TrtGptModelType.InflightFusedBatching:
-            tllme.BatchingType.INFLIGHT,
-        }
-        assert executor_type in batching_type_map, f"executor_type={executor_type} is not supported."
-        return batching_type_map[executor_type]
-
-    def convert_decoding_mode(self, decoding_mode):
-        if decoding_mode.is_none():
-            return tllme.DecodingMode.NONE
-        elif decoding_mode.is_top_k() and not decoding_mode.is_top_p():
-            return tllme.DecodingMode.TOP_K
-        elif decoding_mode.is_top_p() and not decoding_mode.is_top_k():
-            return tllme.DecodingMode.TOP_P
-        elif decoding_mode.is_beam_search():
-            return tllme.DecodingMode.BEAM_SEARCH
-        elif decoding_mode.is_medusa():
-            return tllme.DecodingMode.MEDUSA
-        elif decoding_mode.is_top_k_and_top_p():
-            return tllme.DecodingMode.TOP_K_TOP_P
-        raise ValueError(f"decoding_mode={decoding_mode} is not supported.")
-
-    def create_stats_queue(self):
-        # Stats queue is created during first submission to ensure event loop exists if it is needed.
-        if not self._stats:
-            if has_event_loop():
-                self._stats = AsyncQueue()
-                self.stats_queue = self._stats.sync_q
-                self.stats_aqueue = self._stats.async_q
-            else:
-                self._stats = Queue()
-                self.stats_queue = self._stats
-                self.stats_aqueue = None
-
-    def set_result_queue(self, queue):
-        self.result_queue = queue
-
-    def return_queue(self, req_id: int):
-        """ If a centralized result queue is registered (used for communication with the proxy)
-            send the message there.
-            Otherwise, push the result directly in the GenerationResult queue.
-        """
-
-        if self.result_queue is not None:
-            return self.result_queue
-        return self._results[req_id].queue
-
-    def start_awaiter_thread(self):
-        if self.engine.can_enqueue_requests(
-        ) and not self.awaiter_thread.is_alive():
-            self.awaiter_thread.start()
-
-    def awaiter_loop(self):
-        """ Gets responses from executor and places in the return queue."""
-        while self.running:
-            # Get responses and place in queue.
-            for response in self.engine.await_responses(
-                    timeout=datetime.timedelta(milliseconds=100)):
-                req_id = response.request_id
-                if response.has_error():
-                    self.return_queue(req_id).put(
-                        (req_id, None, None, response.error_msg))
-                else:
-                    self.return_queue(req_id).put(
-                        (response.request_id, response.result.output_token_ids,
-                         response.result.is_final, None))
-                    if response.result.is_final:
-                        self._pending.remove(req_id)
-            # Get stats and place in queue.
-            for stats in self.engine.get_latest_iteration_stats():
-                while self.stats_queue.full():
-                    self.stats_queue.get()
-                self.stats_queue.put(stats.to_json_str())
-
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult which can be waited.
-        """
-        if self.rank != 0:
-            raise NotImplementedError("Only rank 0 can submit requests.")
-        self.create_stats_queue()
-        self.start_awaiter_thread()
-        req_id = self.engine.enqueue_request(request.as_executor_request())
-        request.set_id(req_id)
-
-        result = GenerationResult(request, request.tokenizer)
-        self._results[req_id] = result
-        self._pending.add(req_id)
-        return result
-
-    def get_stats(self):
-        return self.stats_queue.get()
-
-    async def aget_stats(self):
-        assert self.stats_aqueue is not None
-        return await self.stats_aqueue.get()
-
-    def shutdown(self):
-        if self.engine is not None:
-            self.running = False
-            if self.engine.can_enqueue_requests():
-                if self.awaiter_thread.is_alive():
-                    self.awaiter_thread.join()
-            self.engine.shutdown()
-            self.engine = None
-
-    def block_subordinates(self):
-        if self.rank != 0:
-            raise self.WorkerExit(
-                "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
-            )
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        self.shutdown()
-        return exc_type is None or exc_type == ExecutorBindingsWorker.WorkerExit
-
-    def __del__(self):
-        self.shutdown()
-
-    def wait_first_completed(
-        self, futures: List[GenerationResult]
-    ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.generation_request.id for f in futures)
-
-        # clear already-finished requests
-        for f in futures:
-            if f._done:
-                wait_set.remove(f.generation_request.id)
-                yield f
-
-        # wait remaining active requests
-        while len(wait_set) > 0:
-            req_id = wait_set.pop()
-
-            if req_id not in self._pending:
-                yield self._results[req_id]
-            else:
-                wait_set.add(req_id)
-
-
 class ExecutorBindingsProxy(GenerationExecutor):
 
     def __init__(
@@ -1061,7 +607,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         super().__init__()
 
         self.workers_started = False
-        self.tokenizer = tokenizer_factory(workers_kwargs["tokenizer"])
 
         request_queue_addr = ("127.0.0.1", find_free_port(),
                               secrets.token_bytes(512))
@@ -1076,7 +621,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
                              secrets.token_bytes(512))
         self.result_queue = Fifo(result_queue_addr, is_server=True)
 
+        stats_queue_addr = ("127.0.0.1", find_free_port(),
+                            secrets.token_bytes(512))
+        self.mp_stats_queue = Fifo(stats_queue_addr, is_server=True)
+
         self._results: Dict[int, GenerationResult] = {}
+        self._request_id_dispatcher_queue = Queue()
 
         if mpi_session is None:
             self.mpi_session = MpiPoolSession(n_workers=model_world_size)
@@ -1089,24 +639,23 @@ class ExecutorBindingsProxy(GenerationExecutor):
             "request_queue_addr": request_queue_addr,
             "request_id_queue_addr": request_id_queue_addr,
             "result_queue_addr": result_queue_addr,
+            "stats_queue_addr": stats_queue_addr,
         })
-        self.dispatcher = Thread(target=self.dispatcher_thread)
+        self.workers_init_ok = False
+        self.dispatcher = threading.Thread(target=self.dispatcher_thread,
+                                           daemon=True)
+        self.stats_thread = threading.Thread(target=self.stats_main,
+                                             daemon=True)
 
     @print_traceback_on_error
     @staticmethod
     def workers_main(
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams()
+        stats_queue_addr: Tuple[str, int, bytes],
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1)
     ) -> None:
         result_queue = None
 
@@ -1114,6 +663,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             request_queue = Fifo(request_queue_addr, is_server=False)
             request_id_queue = Fifo(request_id_queue_addr, is_server=False)
             result_queue = Fifo(result_queue_addr, is_server=False)
+            mp_stats_queue = Fifo(stats_queue_addr, is_server=False)
 
         # Only the failure on rank0 can be captured here. All the non-rank0 process will hang once the executor runtime
         # is successfully initialized, that is controlled within cpp runtime.
@@ -1121,13 +671,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # TODO[chunweiy]: fix the non-rank0 process failure
         init_ok = True
         try:
-            executor = ExecutorBindingsWorker(engine_dir, tokenizer,
-                                              max_beam_width, executor_type,
-                                              scheduler_config, executor_config)
+            executor = ExecutorBindingsWorker(engine_dir, executor_config)
         except Exception as e:
             init_ok = False
             raise e
-
         finally:
             if mpi_rank() == 0:
                 result_queue.put(init_ok)
@@ -1135,11 +682,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
         with ContextManager(executor) as executor:
             if mpi_rank() == 0:
                 executor.set_result_queue(result_queue)
+                executor.set_stats_queue(mp_stats_queue)
                 while (req := request_queue.get()) is not None:
                     result = executor.submit(req)
-                    request_id_queue.put(result.generation_request.id)
+                    request_id_queue.put(result.request_id)
 
                 result_queue.put(None)
+                mp_stats_queue.put(None)
             else:
                 executor.block_subordinates()
 
@@ -1148,26 +697,45 @@ class ExecutorBindingsProxy(GenerationExecutor):
             correct GenerationResult queues. """
 
         while (res := self.result_queue.get()) is not None:
-            req_id = res[0]
+            req_id, *_ = res
+            # Wait for this result ready in self._results
+            while req_id not in self._results:
+                self._request_id_dispatcher_queue.get()
             self._results[req_id].queue.put(res)
+            while not self._request_id_dispatcher_queue.empty():
+                self._request_id_dispatcher_queue.get()
+
+    def stats_main(self):
+        while (stats := self.mp_stats_queue.get()) is not None:
+            time.sleep(0.1)
+            while self.stats_queue.full():
+                self.stats_queue.get()
+            self.stats_queue.put(stats)
 
     def start(self):
         self.mpi_futures = self.mpi_session.submit(
             ExecutorBindingsProxy.workers_main, **self.workers_kwargs)
         self.workers_started = True
-        ack = self.result_queue.get()
-        if not ack:
+        self.workers_init_ok = self.result_queue.get()
+        if not self.workers_init_ok:
             raise RuntimeError("worker initialization failed")
         self.dispatcher.start()
+        self.create_stats_queue()
+        self.stats_thread.start()
 
     def shutdown(self):
         if not self.workers_started:
             return
-        self.request_queue.put(None)
+        if self.workers_init_ok:
+            self.request_queue.put(None)
         for f in self.mpi_futures:
             f.result()
         if self.dispatcher.is_alive():
+            self.result_queue.put(None)
             self.dispatcher.join()
+        if self.stats_thread.is_alive():
+            self.mp_stats_queue.put(None)
+            self.stats_thread.join()
         self.workers_started = False
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -1178,29 +746,17 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if not self.workers_started:
             self.start()
 
-        tokenizer = request.tokenizer
-        # no need to send the tokenizer to the executor,
-        # saves communication time
-        request.tokenizer = None
         self.request_queue.put(request)
 
         # Await req id.
         req_id = self.request_id_queue.get()
         request.set_id(req_id)
 
-        result = GenerationResult(request, tokenizer)
+        result = GenerationResult(request)
         self._results[req_id] = result
-        request.tokenizer = tokenizer
+        self._request_id_dispatcher_queue.put(req_id)
 
         return result
-
-    def get_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
-
-    async def aget_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
 
     def __del__(self):
         self.shutdown()

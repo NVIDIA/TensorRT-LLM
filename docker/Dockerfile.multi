@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=24.03-py3
+ARG BASE_TAG=24.05-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
@@ -21,6 +21,10 @@ RUN bash ./install_cmake.sh && rm install_cmake.sh
 
 COPY docker/common/install_ccache.sh install_ccache.sh
 RUN bash ./install_ccache.sh && rm install_ccache.sh
+
+# Only take effect when the base image is 12.4.0-devel-centos7.
+COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
+RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
 
 # Download & install internal TRT release
 ARG TRT_VER
@@ -48,9 +52,7 @@ RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
 # Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
-# Apply PyTorch patch for supporting compiling with CUDA 12.4 from source codes
-COPY docker/common/pytorch_pr_116072.patch /tmp/pytorch_pr_116072.patch
-RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh /tmp/pytorch_pr_116072.patch
+RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
 FROM ${DEVEL_IMAGE} as wheel
 WORKDIR /src/tensorrt_llm
@@ -62,19 +64,30 @@ COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
 COPY setup.py requirements.txt requirements-dev.txt ./
 
+# Create cache directories for pip and ccache
+RUN mkdir -p /root/.cache/pip /root/.cache/ccache
+ENV CCACHE_DIR=/root/.cache/ccache
+# Build the TRT-LLM wheel
 ARG BUILD_WHEEL_ARGS="--clean --trt_root /usr/local/tensorrt --python_bindings --benchmarks"
-RUN python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=/root/.cache/ccache \
+    python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} as release
 
+# Create a cache directory for pip
+RUN mkdir -p /root/.cache/pip
+
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
-RUN pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
     rm tensorrt_llm*.whl
 COPY README.md ./
 COPY docs docs
 COPY cpp/include include
-RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
+RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
+    test -f bin/executorWorker && \
+    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
     ln -sv lib/libnvinfer_plugin_tensorrt_llm.so lib/libnvinfer_plugin_tensorrt_llm.so.9 && \
     echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \

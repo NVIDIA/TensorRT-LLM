@@ -78,12 +78,13 @@ class FusedMHARunnerV2::mhaImpl
 {
 public:
     mhaImpl(const Data_type data_type, bool const pagedKVFMHA, int const numHeads, int const headSize,
-        float const qScaling, int sm_)
+        float const qScaling, float const qkTanhScale, int sm_)
         : mDataType(data_type)
         , mPagedKVFMHA(pagedKVFMHA)
         , mNumHeads(numHeads)
         , mHeadSize(headSize)
         , mQScaling(qScaling)
+        , mQKTanhScale(qkTanhScale)
         , sm(sm_)
     {
         TLLM_CHECK_WITH_INFO(
@@ -91,6 +92,8 @@ public:
         TLLM_CHECK_WITH_INFO(
             (mDataType == DATA_TYPE_FP16 || mDataType == DATA_TYPE_BF16 || mDataType == DATA_TYPE_E4M3),
             "Unsupported data type");
+        TLLM_CHECK_WITH_INFO(
+            mHeadSize == 128 || !mQKTanhScale, "FMHA only supports head_size = 128 with QK Tanh Scale currently.");
 
         xmmaKernel = getXMMAKernelsV2(mDataType, sm);
 
@@ -173,6 +176,10 @@ public:
         // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
         mLaunchParams.set_default_kernel_selection_params();
 
+        // Grok tanh scale.
+        // FIXME: mQKTanhScale value (30.f) is fixed in fmha kernels.
+        mLaunchParams.enableQKTanhScale = mQKTanhScale > 0.f;
+
         // Next power of 2 head size.
         TLLM_CHECK_WITH_INFO(mHeadSize > 0, "Head size should be greater than 0.");
         mLaunchParams.padded_d = (mHeadSize & (mHeadSize - 1)) == 0 ? mHeadSize : pow(2, int(log2(mHeadSize)) + 1);
@@ -242,7 +249,8 @@ public:
             // Enable exp2f optimization (which helps improve performance).
             //    - note that this is not compatible with alibi bias due to the accuracy issues.
             //    - only hopper warp-specialized kernels have this optimization.
-            mLaunchParams.useBase2ExpTrick = true;
+            //    - it doesn't work with scale * tanh(qk / scale) operation (from Grok).
+            mLaunchParams.useBase2ExpTrick = !mLaunchParams.enableQKTanhScale;
         }
 
         // Sliding_window_causal mask.
@@ -264,6 +272,12 @@ public:
 
         // Determine launch parameters.
         mLaunchParams.set_default_kernel_selection_params();
+
+        // Grok tanh scale.
+        // FIXME: mQKTanhScale value (30.f) is fixed in fmha kernels.
+        mLaunchParams.enableQKTanhScale = mQKTanhScale > 0.f;
+        TLLM_CHECK_WITH_INFO(
+            !mLaunchParams.enableQKTanhScale, "Paged KV FMHA doesn't support qk_tanh_scale operation.");
 
         // Needed by TMA descriptors.
         mLaunchParams.blocks_per_context_sequence = blocks_per_context_sequence;
@@ -689,14 +703,16 @@ private:
     int const mNumHeads;
     int const mHeadSize;
     float const mQScaling;
+    float const mQKTanhScale;
     int mTotalSeqLen;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-FusedMHARunnerV2::FusedMHARunnerV2(
-    const Data_type data_type, bool const pagedKVFMHA, int const numHeads, int const headSize, float const qScaling)
-    : pimpl(new mhaImpl(data_type, pagedKVFMHA, numHeads, headSize, qScaling, tensorrt_llm::common::getSMVersion()))
+FusedMHARunnerV2::FusedMHARunnerV2(const Data_type data_type, bool const pagedKVFMHA, int const numHeads,
+    int const headSize, float const qScaling, float const qkTanhScale)
+    : pimpl(new mhaImpl(
+        data_type, pagedKVFMHA, numHeads, headSize, qScaling, qkTanhScale, tensorrt_llm::common::getSMVersion()))
 {
 }
 
@@ -751,8 +767,15 @@ bool FusedMHARunnerV2::isValid(int s) const
 // static function to check if fmha is supported when building plugins
 bool MHARunner::fmha_supported(int const headSize, int const sm)
 {
-    return (headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96 || headSize == 104
-        || headSize == 128 || headSize == 160 || headSize == 192 || headSize == 256);
+    // Check if the gpu architecture is supported or not.
+    if (sm == 70 || sm == 80 || sm == 86 || sm == 89 || sm == 90)
+    {
+        // Check if the head size is supported or not.
+        return (headSize == 32 || headSize == 40 || headSize == 64 || headSize == 80 || headSize == 96
+            || headSize == 104 || headSize == 128 || headSize == 160 || headSize == 192 || headSize == 256);
+    }
+    // The gpu architecture is not supported.
+    return false;
 }
 
 } // namespace kernels

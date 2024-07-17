@@ -134,23 +134,22 @@ This release of TensorRT-LLM contains the following examples:
 | GPT-NeMo       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT-NeoX       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
 | InternLM       |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| InternLM2      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | LLaMA          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | LLaMA-v2       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| LLaMA-v3       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Mamba          |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Mistral        |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | Mixtral        |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     .     |     .      |
 | MPT            |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     .      |
 | OPT            |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Phi            |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Phi-3          |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Qwen           |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | RecurrentGemma |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Replit Code    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | SantaCoder     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | Skywork        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | StarCoder1     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| StarCoder2     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| StarCoder2     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     .     |     .      |
 | T5             |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Whisper        |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | BLIP2-OPT      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
@@ -158,9 +157,6 @@ This release of TensorRT-LLM contains the following examples:
 | LLaVA          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | VILA           |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Nougat         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Deplot         |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Fuyu           |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
-| Kosmos-2       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 
 Note: The vision component of multi-modal models(BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat) uses FP16 by default.
 The language component decides which quantization methods are supported by a given multi-modal model.

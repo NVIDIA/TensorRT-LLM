@@ -84,10 +84,12 @@ class TestMamba(unittest.TestCase):
             hf_config, hf_path, hf_mamba, load_mode, dtype)
         with net_guard(network):
             network.set_named_parameters(tensorrt_llm_mamba.named_parameters())
-            inputs = tensorrt_llm_mamba.prepare_inputs(batch_size,
-                                                       input_len,
-                                                       input_len + output_len,
-                                                       use_cache=False)
+            inputs = tensorrt_llm_mamba.prepare_inputs(
+                batch_size,
+                input_len,
+                input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=False)
             # Prepare
             tensorrt_llm_mamba(**inputs)
         return network
@@ -108,11 +110,11 @@ class TestMamba(unittest.TestCase):
             network.plugin_config.remove_input_padding = remove_padding
             network.plugin_config.paged_state = False
             if gemm_plugin:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if mamba_conv1d_plugin:
-                network.plugin_config.set_mamba_conv1d_plugin(dtype)
+                network.plugin_config.mamba_conv1d_plugin = dtype
             else:
-                network.plugin_config.set_mamba_conv1d_plugin(None)
+                network.plugin_config.mamba_conv1d_plugin = None
 
             self._gen_tensorrt_llm_network(network, hf_config, hf_path,
                                            hf_mamba, load_mode, batch_size,

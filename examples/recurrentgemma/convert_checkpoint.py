@@ -58,7 +58,9 @@ class JAXParser:
 
     def get_config(self, checkpoint_path, ckpt_params):
         config = recurrentgemma_jax.GriffinConfig.from_flax_params_or_variables(
-            ckpt_params)._asdict()
+            ckpt_params,
+            preset=recurrentgemma_jax.Preset.RECURRENT_GEMMA_2B_V1,
+        )._asdict()
         if config["lru_width"] is None:
             config["lru_width"] = config["width"]
         layer_types = []
@@ -479,9 +481,11 @@ def main():
         intermediate_size=ckpt_config["intermediate_size"],
         norm_epsilon=1e-6,
         position_embedding_type="rope_gpt_neox",
-        world_size=args.world_size,
-        tp_size=args.world_size,
-        pp_size=1,
+        mapping={
+            'world_size': args.world_size,
+            'tp_size': args.world_size,
+            'pp_size': 1
+        },
         gpus_per_node=8,
         quantization=quant_config,
         conv_kernel=4,
