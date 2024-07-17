@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -106,6 +106,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -162,7 +163,7 @@
 <li><p>Install prerequisites listed in our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/windows.html">Installing on Windows</a> document.</p></li>
 <li><p>Install <a class="reference external" href="https://cmake.org/download/">CMake</a>, version 3.27.7 is recommended, and select the option to add it to the system path.</p></li>
 <li><p>Download and install <a class="reference external" href="https://visualstudio.microsoft.com/">Visual Studio 2022</a>.</p></li>
-<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip">TensorRT 10.0.1.6</a>.</p></li>
+<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.1.0/zip/TensorRT-10.1.0.27.Windows.win10.cuda-12.4.zip">TensorRT 10.1.0.27</a>.</p></li>
 </ol>
 </section>
 <section id="building-a-tensorrt-llm-docker-image">
@@ -214,7 +215,7 @@ git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w
 <ol class="arabic simple" start="2">
 <li><p>Build TensorRT-LLM. This command generates <code class="docutils literal notranslate"><span class="pre">build\tensorrt_llm-*.whl</span></code>.</p></li>
 </ol>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>.<span class="se">\s</span>cripts<span class="se">\b</span>uild_wheel.py<span class="w"> </span>-a<span class="w"> </span><span class="s2">&quot;89-real&quot;</span><span class="w"> </span>--trt_root<span class="w"> </span>C:<span class="se">\w</span>orkspace<span class="se">\T</span>ensorRT-10.0.1.6<span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>.<span class="se">\s</span>cripts<span class="se">\b</span>uild_wheel.py<span class="w"> </span>-a<span class="w"> </span><span class="s2">&quot;89-real&quot;</span><span class="w"> </span>--trt_root<span class="w"> </span>C:<span class="se">\w</span>orkspace<span class="se">\T</span>ensorRT-10.1.0.27<span class="se">\</span>
 </pre></div>
 </div>
 <ol class="arabic simple" start="3">
@@ -227,7 +228,7 @@ git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
 <li><p>Install all prerequisites (<code class="docutils literal notranslate"><span class="pre">git</span></code>, <code class="docutils literal notranslate"><span class="pre">python</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDA</span></code>) listed in our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/windows.html">Installing on Windows</a> document.</p></li>
-<li><p>Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.4 installer. To install these assets, download the <a class="reference external" href="https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 11.8 Toolkit</a>.</p>
+<li><p>Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.4.1 installer. To install these assets, download the <a class="reference external" href="https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 11.8 Toolkit</a>.</p>
 <ol class="arabic simple">
 <li><p>During installation, select <strong>Advanced installation</strong>.</p></li>
 <li><p>Nsight NVTX is located in the CUDA drop-down.</p></li>
@@ -252,7 +253,7 @@ git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w
 <ol class="arabic">
 <li><p>Install <a class="reference external" href="https://cmake.org/download/">CMake</a>, version 3.27.7 is recommended, and select the option to add it to the system path.</p></li>
 <li><p>Download and install <a class="reference external" href="https://visualstudio.microsoft.com/">Visual Studio 2022</a>. When prompted to select more Workloads, check <strong>Desktop development with C++</strong>.</p></li>
-<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows10.win10.cuda-12.4.zip">TensorRT 10.0.1.6</a>. Move the folder to a location you can reference later, such as <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\inference\TensorRT</span></code>.</p>
+<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.1.0/zip/TensorRT-10.1.0.27.Windows.win10.cuda-12.4.zip">TensorRT 10.1.0.27</a>. Move the folder to a location you can reference later, such as <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\inference\TensorRT</span></code>.</p>
 <ol class="arabic simple">
 <li><p>Add the libraries for TensorRT  to your system’s <code class="docutils literal notranslate"><span class="pre">Path</span></code> environment variable. Your <code class="docutils literal notranslate"><span class="pre">Path</span></code> should include a line like this:</p></li>
 </ol>
@@ -366,7 +367,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f27025c3670>
+<jinja2.runtime.BlockReference object at 0x7ff8f4a67a30>
 
 <div class="footer">
     <p>

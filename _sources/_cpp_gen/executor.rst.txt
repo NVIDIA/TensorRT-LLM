@@ -10,6 +10,12 @@ __________
 .. doxygenfile:: executor.h
    :project: TensorRT-LLM
 
+serialization.h
+_______________
+
+.. doxygenfile:: serialization.h
+   :project: TensorRT-LLM
+
 tensor.h
 ________
 
@@ -20,11 +26,5 @@ types.h
 _______
 
 .. doxygenfile:: types.h
-   :project: TensorRT-LLM
-
-serialization.h
-_______________
-
-.. doxygenfile:: serialization.h
    :project: TensorRT-LLM
 

@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -108,6 +108,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -271,7 +272,7 @@ value for a given parameter, the vector can be limited to a single element
 <p><em><strong>General</strong></em></p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code>, a vector of floating-point numbers to control the
-modulation of logits when sampling new tokens. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code>(no modulation). Note: the recommended way to enable greedy sampling is to set <code class="docutils literal notranslate"><span class="pre">temperature</span></code> to <code class="docutils literal notranslate"><span class="pre">1.0f</span></code> and <code class="docutils literal notranslate"><span class="pre">topK</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code>.</p></li>
+modulation of logits when sampling new tokens. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code>(no modulation).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">minLength</span></code>, a vector of integers to set a lower-bound on the number of tokens
 generated. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0</span></code>. Value <code class="docutils literal notranslate"><span class="pre">0</span></code> has no effect, the first generated token can be EOS. The default value is <code class="docutils literal notranslate"><span class="pre">1</span></code> (at least one non-EOS token is generated).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, a vector of float-point numbers to penalize tokens
@@ -282,6 +283,7 @@ It can have any value, values <code class="docutils literal notranslate"><span c
 <li><p><code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code>, a vector of float-point numbers to penalize tokens
 already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourage it.
 The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code>(no effect).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">noRepeatNgramSize</span></code>, a vector of integers. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code>. If set to int <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code>, all ngrams of that size can only occur once.</p></li>
 </ul>
 <p>The parameters <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> are not mutually
 exclusive.</p>
@@ -385,7 +387,7 @@ one.</p></li>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f270214e410>
+<jinja2.runtime.BlockReference object at 0x7ff8f4fac490>
 
 <div class="footer">
     <p>

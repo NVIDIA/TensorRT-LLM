@@ -229,7 +229,7 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/125M/trt_engines/fp16/2-gpu/
 ```
 

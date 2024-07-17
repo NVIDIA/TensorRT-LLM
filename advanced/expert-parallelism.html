@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -99,6 +99,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -153,13 +154,15 @@
 </section>
 <section id="tensor-parallel-vs-expert-parallel">
 <h2>Tensor Parallel vs Expert Parallel<a class="headerlink" href="#tensor-parallel-vs-expert-parallel" title="Link to this heading"></a></h2>
-<p>Parallelism on multi-GPUs is necessary if the MoE model can not be accommodated by a single GPU’s memory.  We have supported two kinds of parallel patterns for MoE structure, Tensor Parallel (default pattern) and Expert Parallel.</p>
+<p>Parallelism on multi-GPUs is necessary if the MoE model can not be accommodated by a single GPU’s memory.  We have supported two kinds of parallel patterns for MoE structure, Tensor Parallel (default pattern), Expert Parallel, and a hybrid of the two.</p>
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/tp_ep.png?raw=true" alt="tensor parallel vs expert parallel" width="500" height="auto">
 <p>Tensor Parallel evenly splits each expert’s weight and distributes them to different GPUs, which means each GPU holds partial weight of all experts, While Expert Parallel evenly distributes some of the experts’ full weight to different GPUs, which means each GPU holds part of the experts’ full weight. As a result, each GPU rank in the Tensor Parallel group receives all tokens’ hidden states for all experts, then computes using the partial weights, while for Expert Parallel, each GPU rank only receives part of tokens’ hidden states for experts on this rank, then computes using the full weights.</p>
+<p>When both Tensor Parallel and Expert Parallel are enabled, each GPU handles a portion of the expert weights matrices (as in EP mode) and these weights are further sliced across multiple GPUs (as in TP mode). This hybrid approach aims to balance the workload more evenly across GPUs, enhancing efficiency and reducing the likelihood of bottlenecks associated with EP mode alone.</p>
 </section>
 <section id="how-to-enable">
 <h2>How to Enable<a class="headerlink" href="#how-to-enable" title="Link to this heading"></a></h2>
-<p>The default parallel pattern is Tensor Parallel. You can enable Expert Parallel by setting <code class="docutils literal notranslate"><span class="pre">--moe_tp_mode</span> <span class="pre">1</span></code> when calling <code class="docutils literal notranslate"><span class="pre">convert_coneckpoint.py</span></code>, and <code class="docutils literal notranslate"><span class="pre">--tp_size</span></code> is used to set the Expert Parallel size.</p>
+<p>The default parallel pattern is Tensor Parallel. You can enable Expert Parallel or hybrid parallel by setting <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> when calling <code class="docutils literal notranslate"><span class="pre">convert_coneckpoint.py</span></code>. If only <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.</p>
+<p>Be sure that the product of <code class="docutils literal notranslate"><span class="pre">moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">moe_ep_size</span></code> should equal to <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, since the total number of MoE paralleism across all GPUs must match the total number of parallelism in other parts of the model.</p>
 <p>The other parameters related to MoE structure, such as <code class="docutils literal notranslate"><span class="pre">num_experts_per_tok</span></code> (TopK in previous context), and <code class="docutils literal notranslate"><span class="pre">num_local_experts</span></code>, can be find in the model’s configuration file, such as the one for <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mixtral 8x7B model</a>.</p>
 </section>
 </section>
@@ -175,7 +178,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f270211dba0>
+<jinja2.runtime.BlockReference object at 0x7ff8f50fbb20>
 
 <div class="footer">
     <p>

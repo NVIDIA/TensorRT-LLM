@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
+        <script src="../_static/doctools.js?v=9a2dae69"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -81,6 +81,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#example-lora-tensors">Example LoRA tensors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#lora-module-id-mapping">LoRA Module id mapping</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#loracache-configuration">LoraCache configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#lora-with-tensor-parallel">LoRA with tensor parallel</a></li>
 </ul>
 </li>
 </ul>
@@ -102,6 +103,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Python API</span></p>
@@ -167,7 +169,7 @@ trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span>/tmp
 <span class="w">    </span>--lora_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">50</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">562</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--lora_dir<span class="w"> </span>Japanese-Alpaca-LoRA-7b-v0<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_lora_rank<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--lora_target_modules<span class="w"> </span><span class="s2">&quot;attn_q&quot;</span><span class="w"> </span><span class="s2">&quot;attn_k&quot;</span><span class="w"> </span><span class="s2">&quot;attn_v&quot;</span>
@@ -310,6 +312,12 @@ The following tensors are for a LoRA which has a <code class="docutils literal n
 <p>The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.</p>
 <p>As requests are scheduled for execution LoRAs are loaded into the GPU cache. Refer to the <a class="reference internal" href="batch-manager.html#batch-manager"><span class="std std-ref">The Batch Manager in TensorRT-LLM</span></a> section for more information.</p>
 </section>
+<section id="lora-with-tensor-parallel">
+<h3>LoRA with tensor parallel<a class="headerlink" href="#lora-with-tensor-parallel" title="Link to this heading"></a></h3>
+<p>The partition of tensor parallel for LoRA is special. There are two cases: <code class="docutils literal notranslate"><span class="pre">RowLinear</span></code> and <code class="docutils literal notranslate"><span class="pre">ColumnLinear</span></code>. Assume we have a linear layer and the input feature size is <code class="docutils literal notranslate"><span class="pre">K</span></code> and the output feature size is <code class="docutils literal notranslate"><span class="pre">N</span></code>. Then, the shape of the weight is <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">N]</span></code>.</p>
+<p>First, consider this linear layer is a <code class="docutils literal notranslate"><span class="pre">ColumnLinear</span></code> layer. When we partition the weight, we split the weight by column with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>. Then, there are <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights and the shapes of these weights are <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">N</span> <span class="pre">//</span> <span class="pre">tp_size]</span></code>. When we apply LoRA adapter on such <code class="docutils literal notranslate"><span class="pre">ColumnLinear</span></code> layer, the shapes of original two weights are <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">lora_rank]</span></code> and <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N]</span></code>. So, we only partition the second weight and get <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights with shapes <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N</span> <span class="pre">//</span> <span class="pre">tp_size]</span></code>. For the first weight, each GPU maintains the same entire weight (with shape <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">lora_rank]</span></code>).</p>
+<p>Next, consider this linear layer is a <code class="docutils literal notranslate"><span class="pre">RowLinear</span></code> layer. When we partition the weight, we split the weight by row with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>. Then, there are <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights and the shapes of these weights are <code class="docutils literal notranslate"><span class="pre">[K</span> <span class="pre">//</span> <span class="pre">tp_size,</span> <span class="pre">N]</span></code>. When we apply LoRA adapter on such <code class="docutils literal notranslate"><span class="pre">RowLinear</span></code> layer, the shapes of original two weights are <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">lora_rank]</span></code> and <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N]</span></code>. So, we only partition the first weight and get <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> split weights with shapes <code class="docutils literal notranslate"><span class="pre">[K</span> <span class="pre">//</span> <span class="pre">tp_size,</span> <span class="pre">lora_rank]</span></code>. For the second weight, each GPU maintains the same entire weight (with shape <code class="docutils literal notranslate"><span class="pre">[lora_rank,</span> <span class="pre">N]</span></code>).</p>
+</section>
 </section>
 </section>
 
@@ -324,7 +332,7 @@ The following tensors are for a LoRA which has a <code class="docutils literal n
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f27020c4d90>
+<jinja2.runtime.BlockReference object at 0x7ff8f4d14670>
 
 <div class="footer">
     <p>

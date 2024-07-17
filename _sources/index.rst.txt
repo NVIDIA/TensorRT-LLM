@@ -81,6 +81,7 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: C++ API
    :hidden:
 
+   _cpp_gen/executor.rst
    _cpp_gen/runtime.rst
 
 

@@ -23,21 +23,18 @@ git clone https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
 (quick-start-guide-compile)=
 ## Compile the Model into a TensorRT Engine
 
-Use the included [Llama model definition](https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/models/llama/model.html#LLaMAModel). This is a minimal example that includes some of the optimizations available in TensorRT-LLM.
+Use the included [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama). This is a minimal example that includes some of the optimizations available in TensorRT-LLM.
 
 ```bash
-# Get the source code required for running the example
-git clone https://github.com/NVIDIA/TensorRT-LLM.git
-cd TensorRT-LLM
-git lfs install
+# Launch the Tensorrt-LLM container
+make -C docker release_run LOCAL_USER=1
 
 # Log in to huggingface-cli
 # You can get your token from huggingface.co/settings/token
 huggingface-cli login --token *****
 
-# Convert the model into TensorRT-LLM checkpoint format
-cd examples/llama
-pip install -r requirements.txt
+# Convert the model into TensorrtLLM checkpoint format
+cd exammples/llama
 python3 convert_checkpoint.py --model_dir meta-llama/Llama-2-7b-chat-hf --output_dir llama-2-7b-ckpt
 
 # Compile model
@@ -141,3 +138,7 @@ In this Quick Start Guide, you:
 For more examples, refer to:
 
 - [examples/](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for showcases of how to run a quick benchmark on latest LLMs.
+
+## Links
+ - [Best Practices Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md)
+ - [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
