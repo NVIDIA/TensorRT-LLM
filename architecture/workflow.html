@@ -104,15 +104,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -156,7 +147,7 @@
 <li><p>Build the TensorRT-LLM models to TensorRT-LLM engines.</p></li>
 </ol>
 <p>To generalize the TensorRT-LLM optimization features to all models, and to share the same workflow between different models for TensorRT-LLM users, TensorRT-LLM has conventions about how the models shall be defined and how the models shall be imported.</p>
-<p>TensorRT-LLM checkpoint convention is documented in <a class="reference internal" href="#../../docs/source/checkpoint.md"><span class="xref myst">checkpoint doc</span></a>, and all decoder-only models had been migrated to adopt the convention. Model-specific convert_checkpoint.py scripts are shipped as source code in example directories, and a trtllm-build CLI tool had been added. However, there are some disadvantages of providing convert checkpoint scripts outside the core TensorRT-LLM lib as example:</p>
+<p>TensorRT-LLM checkpoint convention is documented in <a class="reference internal" href="#/docs/source/architecture/checkpoint.md"><span class="xref myst">checkpoint doc</span></a>, and all decoder-only models had been migrated to adopt the convention. Model-specific convert_checkpoint.py scripts are shipped as source code in example directories, and a trtllm-build CLI tool had been added. However, there are some disadvantages of providing convert checkpoint scripts outside the core TensorRT-LLM lib as example:</p>
 <ol class="arabic simple">
 <li><p>TensorRT-LLM evolves so quickly that the model’s definition code might have changed for better performance; which means the <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code> is out of date.</p></li>
 <li><p>TensorRT-LLM is creating a new set of high-level APIs which handle model conversion, engine building, and inference in one class for easier-of-use. Thus, the high-level APIs need to call the weights conversion code, which shall be part of TensorRT-LLM core lib, not the example. And the conversion code of different models shall have same interface such that the high-level APIs do not need to add many ad-hoc code for different models.</p></li>
@@ -187,7 +178,7 @@
         <span class="c1"># Load the weights to llama model object</span>
 </pre></div>
 </div>
-<p>Then, in the <a class="reference internal" href="#../../examples/llama//convert_checkpoint.py"><span class="xref myst">convert_checkpoint.py</span></a> script, the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the <code class="docutils literal notranslate"><span class="pre">from_hugging_face</span></code> API will keep the same, thus the existing workflow using this interface will not be affected.</p>
+<p>Then, in the <a class="reference internal" href="#../../../../examples/llama/convert_checkpoint.py"><span class="xref myst">convert_checkpoint.py</span></a> script, the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the <code class="docutils literal notranslate"><span class="pre">from_hugging_face</span></code> API will keep the same, thus the existing workflow using this interface will not be affected.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1">#other args omitted for simplicity here.</span>
 <span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">)</span>
 <span class="n">llama</span><span class="o">.</span><span class="n">save_checkpoint</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">save_config</span><span class="o">=</span><span class="p">(</span><span class="n">rank</span><span class="o">==</span><span class="mi">0</span><span class="p">))</span>
@@ -196,7 +187,7 @@
 <p>The <code class="docutils literal notranslate"><span class="pre">from_hugging_face</span></code> API does not save the checkpoint into disk intentionally, instead it returns an in-memory object. Call <code class="docutils literal notranslate"><span class="pre">save_checkpoint</span></code> to save the models. This keeps the flexibility and makes the flow of convert-&gt;build in one process faster. Typically, saving and loading disk for large models are slower and thus should be avoided.</p>
 <p>Since LLaMA models were also released with different formats, such as the Meta checkpoint, the <code class="docutils literal notranslate"><span class="pre">LLaMAForCausalLM</span></code> class has a <code class="docutils literal notranslate"><span class="pre">from_meta_ckpt</span></code> function for that. This function is not declared in the <code class="docutils literal notranslate"><span class="pre">TopModelMixin</span></code> class due to it being LLaMA specific, and therefore, other models don’t use it.</p>
 <p>In the 0.9 release, only LLaMA is refactored. Since popular LLaMA (and its variants) models are released by Hugging Face and Meta checkpoint formats, only these two functions are implemented.</p>
-<p>In future releases, there might be <code class="docutils literal notranslate"><span class="pre">from_jax</span></code>, <code class="docutils literal notranslate"><span class="pre">from_nemo</span></code>, <code class="docutils literal notranslate"><span class="pre">from_keras</span></code> or other factory methods for different training checkpoints added, for example the TensorRT-LLM <a class="reference internal" href="#../../examples/gemma/README.md"><span class="xref myst">GEMMA</span></a> model supports JAX/Keras formats in addition to huggingface. The model developers can choose to implement <strong>any subset</strong> of these factory methods for the models they contributed to TensorRT-LLM.</p>
+<p>In future releases, there might be <code class="docutils literal notranslate"><span class="pre">from_jax</span></code>, <code class="docutils literal notranslate"><span class="pre">from_nemo</span></code>, <code class="docutils literal notranslate"><span class="pre">from_keras</span></code> or other factory methods for different training checkpoints added, for example the TensorRT-LLM <a class="reference internal" href="#../../../../examples/gemma/README.md"><span class="xref myst">GEMMA</span></a> model supports JAX/Keras formats in addition to huggingface. The model developers can choose to implement <strong>any subset</strong> of these factory methods for the models they contributed to TensorRT-LLM.</p>
 <p>For some formats which are not supported by TensorRT-LLM model developers, you still have the freedom to implement your own weights conversion outside the core lib; the flow will look like this:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">config</span> <span class="o">=</span> <span class="n">read_config_from_the_custom_training_checkpoint</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
 <span class="n">llama</span> <span class="o">=</span> <span class="n">LLaMAForCausalLM</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
@@ -219,7 +210,7 @@
 <p>TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantization like: FP8, W4A16_AWQ, W4A8_AWQ, while it also has some its own quantization implementation for Smooth Quant, INT8 KV cache, and INT4/INT8 weight only.</p>
 <p>In TensorRT-LLM 0.8 version:</p>
 <ul class="simple">
-<li><p>For Modelopt-supported quantization algorithms, a standalone script in the example folder <a class="reference internal" href="#../../examples/quantization/quantize.py"><span class="xref myst">quantize.py</span></a> shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.</p></li>
+<li><p>For Modelopt-supported quantization algorithms, a standalone script in the example folder <a class="reference internal" href="#../../../../examples/quantization/quantize.py"><span class="xref myst">quantize.py</span></a> shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.</p></li>
 <li><p>For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.</p></li>
 </ul>
 <p>Use the <code class="docutils literal notranslate"><span class="pre">quantize()</span></code> interface to unify the different quantization flows. The default implementation is added in the <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> class.</p>
@@ -345,7 +336,7 @@ The usage of this API looks like this:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f4c17730>
+<jinja2.runtime.BlockReference object at 0x7fedf3c0a6b0>
 
 <div class="footer">
     <p>

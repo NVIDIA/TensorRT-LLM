@@ -131,15 +131,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -321,7 +312,7 @@ which is expected to increase the total throughput. Chunking contexts also remov
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
 needs to be enabled. Except for the last one, the size of the context chunk needs
 to be an integer multiple of the kv-cache block size. Refer to
-<a class="reference internal" href="#perf_best_practices.md#chunked-context"><span class="xref myst">the performance best practices</span></a> for usage.</p>
+<a class="reference internal" href="../performance/perf-best-practices.html#chunked-context"><span class="std std-ref">the performance best practices</span></a> for usage.</p>
 </section>
 <section id="kv-cache">
 <h2>KV Cache<a class="headerlink" href="#kv-cache" title="Link to this heading"></a></h2>
@@ -349,9 +340,9 @@ reach that point).</p>
 the different requests by a cache manager during processing. That cache manager
 keeps track of the sequences, allocate new blocks from a pool and recycle those
 blocks when required. See the simplified implementation of
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/runtime/kv_cache_manager.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.runtime.KVCacheManager</span></code></a>.
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/runtime/kv_cache_manager.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.runtime.KVCacheManager</span></code></a>.
 A more efficient C++ implementation is included in the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/include/tensorrt_llm/batch_manager">Batch Manager</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/include/tensorrt_llm/batch_manager">Batch Manager</a>.</p>
 </section>
 </section>
 <section id="int8-fp8-kv-caches">
@@ -495,7 +486,7 @@ is computed as:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f4faf5e0>
+<jinja2.runtime.BlockReference object at 0x7fedf2fca320>
 
 <div class="footer">
     <p>

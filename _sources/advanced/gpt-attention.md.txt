@@ -165,7 +165,7 @@ which is expected to increase the total throughput. Chunking contexts also remov
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
 needs to be enabled. Except for the last one, the size of the context chunk needs
 to be an integer multiple of the kv-cache block size. Refer to
-[the performance best practices](perf_best_practices.md#chunked-context) for usage.
+[the performance best practices](../performance/perf-best-practices.md#chunked-context) for usage.
 
 ## KV Cache
 

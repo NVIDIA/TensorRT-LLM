@@ -112,15 +112,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -264,13 +255,12 @@ callback:</p>
 <section id="logits-post-processor-optional">
 <h3>Logits Post-Processor (optional)<a class="headerlink" href="#logits-post-processor-optional" title="Link to this heading"></a></h3>
 <p>Users can alter the logits produced the network, with a callback attached to an <code class="docutils literal notranslate"><span class="pre">InferenceRequest</span></code>:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>  <span class="n">using</span> <span class="n">LogitsPostProcessor</span> <span class="o">=</span> <span class="n">std</span><span class="p">::</span><span class="n">function</span><span class="o">&lt;</span><span class="n">TensorPtr</span><span class="p">(</span><span class="n">RequestIdType</span><span class="p">,</span> <span class="n">TensorPtr</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">BeamTokens</span> <span class="n">const</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">TStream</span> <span class="n">const</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">std</span><span class="p">::</span><span class="n">optional</span><span class="o">&lt;</span><span class="n">RequestIdType</span><span class="o">&gt;</span><span class="p">)</span><span class="o">&gt;</span><span class="p">;</span>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>  <span class="n">using</span> <span class="n">LogitsPostProcessor</span> <span class="o">=</span> <span class="n">std</span><span class="p">::</span><span class="n">function</span><span class="o">&lt;</span><span class="n">TensorPtr</span><span class="p">(</span><span class="n">RequestIdType</span><span class="p">,</span> <span class="n">TensorPtr</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">BeamTokens</span> <span class="n">const</span><span class="o">&amp;</span><span class="p">,</span> <span class="n">TStream</span> <span class="n">const</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span><span class="p">;</span>
 </pre></div>
 </div>
-<p>The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id.</p>
+<p>The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.</p>
 <p>Users <em>must</em> use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call <code class="docutils literal notranslate"><span class="pre">stream-&gt;synchronize()</span></code>, however, that will slow down the entire execution pipeline.</p>
-<p>Multiple requests can share same client id and callback can use different logic based on client id.</p>
 <p>Note: this feature isn’t supported with the <code class="docutils literal notranslate"><span class="pre">V1</span></code> batching scheme for the moment.</p>
 </section>
 <section id="other-mandatory-gptmanager-parameters">
@@ -421,7 +411,7 @@ the TensorRT-LLM batch manager.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f50fbb20>
+<jinja2.runtime.BlockReference object at 0x7fedf305c430>
 
 <div class="footer">
     <p>

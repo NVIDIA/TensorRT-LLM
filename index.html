@@ -96,15 +96,6 @@
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -161,7 +152,7 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-next">TensorRT-LLM Release Next</a></li>
+<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-11-0">TensorRT-LLM Release 0.11.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-10-0">TensorRT-LLM Release 0.10.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-9-0">TensorRT-LLM Release 0.9.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-8-0">TensorRT-LLM Release 0.8.0</a></li>
@@ -224,7 +215,14 @@
 <li class="toctree-l2"><a class="reference internal" href="architecture/workflow.html#cli-tools">CLI Tools</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="architecture/add-model.html">Adding a Model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="architecture/add-model.html">Adding a Model</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-1-write-modeling-part">Step 1. Write Modeling Part</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-2-implement-weight-conversion">Step 2. Implement Weight Conversion</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-3-register-new-model">Step 3. Register New Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#step-4-verify-new-model">Step 4. Verify New Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="architecture/add-model.html#reference">Reference</a></li>
+</ul>
+</li>
 </ul>
 </div>
 <div class="toctree-wrapper compound" id="advanced">
@@ -290,8 +288,8 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#how-to-measure-performance">How To Measure Performance?</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#build-options-to-optimize-the-performance-of-tensorrt-llm-models">Build Options to Optimize the Performance of TensorRT-LLM Models?</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">Runtime Options to Optimize the Performance of TensorRT-LLM Models?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#build-options-to-optimize-the-performance-of-tensorrt-llm-models">Build Options to Optimize the Performance of TensorRT-LLM Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">Runtime Options to Optimize the Performance of TensorRT-LLM Models</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a><ul>
@@ -335,15 +333,12 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="reference/memory.html#understand-inference-time-gpu-memory-usage">Understand inference time GPU memory usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/memory.html#kv-cache-tensor">KV cache tensor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/memory.html#memory-pool">Memory pool</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/memory.html#known-issues">Known Issues</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/memory.html#faq">FAQ</a></li>
 </ul>
 </li>
 </ul>
-</div>
-<div class="toctree-wrapper compound">
 </div>
 <div class="toctree-wrapper compound">
 </div>
@@ -369,7 +364,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7ff8f4be7a30>
+<jinja2.runtime.BlockReference object at 0x7fedf3c08ee0>
 
 <div class="footer">
     <p>
