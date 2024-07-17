@@ -26,7 +26,7 @@ runtime and, for some of them, decrease the engine build time.
 ### `max_batch_size`, `max_seq_len` and `max_num_tokens`
 
 <p align="center">
-    <img src="../media/max_bs_toks_len.svg" alt="Explain `max_batch_size`, `max_seq_len` and `max_num_tokens`" width="30%" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/media/max_bs_toks_len.svg?raw=true" alt="Explain `max_batch_size`, `max_seq_len` and `max_num_tokens`" width="30%" height="auto">
 </p>
 
 Regarding the impacts of those three arguments to the GPU memory usage, please refer to [memory.md](../reference/memory.md)
