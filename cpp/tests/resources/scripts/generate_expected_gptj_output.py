@@ -23,7 +23,7 @@ import run
 def generate_output(engine: str,
                     num_beams: int,
                     output_name: str,
-                    max_output_len: int = 8):
+                    max_output_len: int = 4):
 
     tp_size = 1
     pp_size = 1

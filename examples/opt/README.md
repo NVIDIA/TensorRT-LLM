@@ -95,7 +95,7 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/125M/trt_engines/fp16/1-gpu/
 
 # OPT-350M
@@ -103,7 +103,7 @@ trtllm-build --checkpoint_dir ./opt/350M/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/350M/trt_engines/fp16/1-gpu/
 
 # OPT-2.7B
@@ -111,7 +111,7 @@ trtllm-build --checkpoint_dir ./opt/2.7B/trt_ckpt/fp16/1-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/2.7B/trt_engines/fp16/1-gpu/
 
 # OPT-66B
@@ -119,7 +119,7 @@ trtllm-build --checkpoint_dir ./opt/66B/trt_ckpt/fp16/4-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/66B/trt_engines/fp16/4-gpu/ \
                 --workers 2
 ```
@@ -220,7 +220,7 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --lookup_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/125M/trt_engines/fp16/2-gpu/ \
                 --workers 2
 
@@ -241,7 +241,7 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/125M/trt_engines/fp16/2-gpu/ \
                 --workers 2
 ```

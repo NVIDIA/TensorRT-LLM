@@ -12,22 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 from itertools import product
-
-import numpy as np
 
 # isort: off
 import torch
 # isort: on
 from parameterized import parameterized
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import create_session, run_session
 
-class TestFunctional(unittest.TestCase):
+
+class TestArgmax(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -38,31 +40,28 @@ class TestFunctional(unittest.TestCase):
         # test data
         x_shape = (4, 12, 32)
         x_data = torch.rand(x_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                            device="cuda")
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
 
-            output = tensorrt_llm.functional.argmax(x, dim,
-                                                    keepdim=keep_dim).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.argmax(x, dim, keepdim=keep_dim)
+            output.mark_output('output')
 
         # trt run
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                'x': x_data.numpy(),
-            })
+        inputs = {'x': x_data}
+        session = create_session(builder, network, precision=dtype)
+        outputs = run_session(session, inputs)
 
         # pytorch run
         ref = x_data.argmax(dim=dim, keepdim=keep_dim)
 
         # compare diff
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
+        # ref is torch.int64, outputs is torch.int32
+        torch.testing.assert_close(ref.int(), outputs['output'].int())

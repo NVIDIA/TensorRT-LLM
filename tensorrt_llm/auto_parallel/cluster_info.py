@@ -1,3 +1,4 @@
+import copy
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Union
@@ -454,7 +455,7 @@ def infer_cluster_info() -> ClusterInfo:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
         compute_cap = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
         logger.info(f"Compute capability: {compute_cap}")
-        err, properties = cudart.cudaGetDeviceProperties(0)
+        err, properties = cudart.cudaGetDeviceProperties(index)
         sm_count = properties.multiProcessorCount
         logger.info(f"SM count: {sm_count}")
         sm_clock = pynvml.nvmlDeviceGetMaxClockInfo(
@@ -533,9 +534,20 @@ def infer_cluster_config() -> Dict[str, Union[str, ClusterInfo]]:
     if cluster_key is not None:
         return dict(cluster_key=cluster_key)
     else:
+        try:
+            cluster_info = infer_cluster_info()
+        except pynvml.NVMLError:
+            fallback_cluster_key = "L40"
+            cluster_info = copy.copy(cluster_infos[fallback_cluster_key])
+            memory_budget = torch.cuda.mem_get_info()[1] // (1024**3)
+            cluster_info.memory_budget_per_device = memory_budget
+            logger.warning(
+                f"Failed to infer cluster info for {device_name}, "
+                f"treat it as a {fallback_cluster_key} node with {memory_budget} GB memory. "
+                "This setting makes no effect if you do not use auto parallel.")
         return dict(
             cluster_key=device_name.replace(" ", "-"),
-            cluster_info=infer_cluster_info(),
+            cluster_info=cluster_info,
         )
 
 

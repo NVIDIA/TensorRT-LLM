@@ -68,10 +68,13 @@ def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
                                   'qkv.weight', 'dense.weight', 'fc.weight',
                                   'proj.weight', 'gate.weight'
                               ],
+                              exclude_weights=['shared_expert_gate.weight'],
                               plugin: bool = True):
     if quant_algo not in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         return weights
     for name in list(weights):
+        if any([_name in name for _name in exclude_weights]):
+            continue
         if any([_name in name for _name in quant_weights
                 ]) and weights[name].dtype != torch.int8:
             quant_weight, quant_scale = weight_only_quantize(
@@ -202,6 +205,10 @@ def iterate_shard_files(model_dir: Union[Path, str],
         yield shard_file
 
 
+def has_safetensors(model_dir: str):
+    return len(list(Path(model_dir).glob('*.safetensors'))) > 0
+
+
 DEFAULT_HF_DATASET_META = {
     'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
     'cnn_dailymail': ('3.0.0', 'train', 'article'),
@@ -213,6 +220,7 @@ def load_calib_dataset(dataset_name_or_dir: str,
                        config_name: Optional[str] = None,
                        split: Optional[str] = None,
                        key: Optional[str] = None,
+                       trust_remote_code=True,
                        **kwargs):
     if config_name is None:
         for name, meta in DEFAULT_HF_DATASET_META.items():

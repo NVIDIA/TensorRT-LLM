@@ -62,7 +62,7 @@ trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/fp16 \
                 --context_fmha enable \
                 --max_batch_size 32 \
                 --max_input_len 512 \
-                --max_output_len 512 \
+                --max_seq_len 1024 \
                 --output_dir ./skywork-13b-base/trt_engine/fp16
 
 # bf16
@@ -72,7 +72,7 @@ trtllm-build --checkpoint_dir ./skywork-13b-base/trt_ckpt/bf16 \
                 --context_fmha enable \
                 --max_batch_size 32 \
                 --max_input_len 512 \
-                --max_output_len 512 \
+                --max_seq_len 1024 \
                 --output_dir ./skywork-13b-base/trt_engine/bf16
 ```
 

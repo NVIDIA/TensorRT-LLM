@@ -253,10 +253,10 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
-    context_attention_src
     decoder_attention_src
     fpA_intB_gemm_src
     moe_gemm_src
+    gemm_swiglu_sm90_src
     cutlass_src
     layers_src
     runtime_src)

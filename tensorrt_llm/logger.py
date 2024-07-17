@@ -41,6 +41,7 @@ class Logger(metaclass=Singleton):
     WARNING = '[W]'
     INFO = '[I]'
     VERBOSE = '[V]'
+    DEBUG = '[D]'
 
     def __init__(self):
         environ_severity = os.environ.get('TLLM_LOG_LEVEL')
@@ -78,7 +79,7 @@ class Logger(metaclass=Singleton):
             return self._logger.warning
         elif severity == self.INFO:
             return self._logger.info
-        elif severity == self.VERBOSE:
+        elif severity == self.VERBOSE or severity == self.DEBUG:
             return self._logger.debug
         else:
             raise AttributeError(f'No such severity: {severity}')
@@ -132,6 +133,7 @@ severity_map = {
     'warning': [trt.Logger.WARNING, logging.WARNING],
     'info': [trt.Logger.INFO, logging.INFO],
     'verbose': [trt.Logger.VERBOSE, logging.DEBUG],
+    'debug': [trt.Logger.VERBOSE, logging.DEBUG],
 }
 
 if G_LOGGER is not None:
@@ -141,6 +143,7 @@ if G_LOGGER is not None:
         'warning': G_LOGGER.WARNING,
         'info': G_LOGGER.INFO,
         'verbose': G_LOGGER.SUPER_VERBOSE,
+        'debug': G_LOGGER.SUPER_VERBOSE,
     }
     for key, value in g_logger_severity_map.items():
         severity_map[key].append(value)

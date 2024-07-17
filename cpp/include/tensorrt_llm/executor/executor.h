@@ -58,7 +58,8 @@ public:
         std::optional<FloatType> const& presencePenalty = std::nullopt,
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
-        std::optional<SizeType32> const& earlyStopping = std::nullopt);
+        std::optional<SizeType32> const& earlyStopping = std::nullopt,
+        std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
@@ -77,8 +78,39 @@ public:
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
+    [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
+
+    void setBeamWidth(SizeType32 beamWidth);
+    void setTopK(std::optional<SizeType32> const& topK);
+    void setTopP(std::optional<FloatType> const& topP);
+    void setTopPMin(std::optional<FloatType> const& topPMin);
+    void setTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
+    void setTopPDecay(std::optional<FloatType> const& topPDecay);
+    void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
+    void setTemperature(std::optional<FloatType> const& temperature);
+    void setMinLength(std::optional<SizeType32> const& minLength);
+    void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
+    void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
+    void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
+    void setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty);
+    void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
+    void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
+    void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
 
 private:
+    static SizeType32 checkBeamWidth(SizeType32 beamWidth);
+    static std::optional<FloatType> const& checkTopK(std::optional<FloatType> const& topK);
+    static std::optional<FloatType> const& checkTopP(std::optional<FloatType> const& topP);
+    static std::optional<FloatType> const& checkTopPMin(std::optional<FloatType> const& topPMin);
+    static std::optional<TokenIdType> const& checkTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
+    static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
+    static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
+    static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& penalty);
+    static std::optional<SizeType32> const& checkMinLength(std::optional<SizeType32> const& minLength);
+    static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
+    static std::optional<FloatType> const& checkBeamSearchDiversityRate(
+        std::optional<FloatType> const& beamSearchDiversityRate);
+
     friend class Serialization;
 
     /// @brief The beam width. Default is 1 which disables beam search.
@@ -115,6 +147,8 @@ private:
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
     /// end_token)
     std::optional<SizeType32> mEarlyStopping;
+    /// @brief Controls how many repeat ngram size are acceptable. Default is 1 << 30.
+    std::optional<SizeType32> mNoRepeatNgramSize;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -122,7 +156,7 @@ class OutputConfig
 {
 public:
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
-        bool returnGenerationLogits = false, bool excludeInputFromOutput = false);
+        bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false);
 
     /// @brief Controls if Result should contain log probabilities. Default is false.
     bool returnLogProbs;
@@ -132,14 +166,17 @@ public:
     bool returnGenerationLogits;
     /// @brief Controls if output tokens in Result should include the input tokens. Default is false.
     bool excludeInputFromOutput;
+    /// @brief Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder
+    /// models). Default is false.
+    bool returnEncoderOutput;
 };
 
-/// @brief Configuration for speculative decoding. Allows to include draft tokens, draft logits and specify acceptance
-/// threshold
-class SpeculativeDecodingConfig
+/// @brief Configuration for speculative decoding with external draft tokens.
+/// Allows to include draft tokens, draft logits and specify acceptance threshold.
+class ExternalDraftTokensConfig
 {
 public:
-    explicit SpeculativeDecodingConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
+    explicit ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
         std::optional<FloatType> const& acceptanceThreshold = std::nullopt);
 
     [[nodiscard]] VecTokens getTokens() const;
@@ -209,21 +246,26 @@ public:
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]
-    /// @param speculativeDecodingConfig The speculative decoding configuration
+    /// @param externalDraftTokensConfig The speculative decoding configuration
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
     /// name provided to the ExecutorConfig.
+    /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
     Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
-        std::optional<SpeculativeDecodingConfig> speculativeDecodingConfig = std::nullopt,
+        std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
-        std::optional<std::string> logitsPostProcessorName = std::nullopt);
+        std::optional<std::string> logitsPostProcessorName = std::nullopt,
+        std::optional<VecTokens> encoderInputTokenIds = std::nullopt);
+
+    /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
+    static auto constexpr kBatchedPostProcessorName = "batched";
 
     Request(Request const& other);
     Request(Request&& other) noexcept;
@@ -241,10 +283,11 @@ public:
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
-    [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpeculativeDecodingConfig() const;
+    [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
+    [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -254,10 +297,11 @@ public:
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
-    void setSpeculativeDecodingConfig(SpeculativeDecodingConfig const& specDecodingConfig);
+    void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
+    void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
 
 private:
     friend class Serialization;
@@ -285,6 +329,9 @@ struct Result
 
     /// @brief The context logits. Size [beamSize, maxNewTokens, vocabSizePadded]
     std::optional<Tensor> generationLogits;
+
+    /// @brief The encoder output. Size [encoderLen, hiddenSize]
+    std::optional<Tensor> encoderOutput;
 };
 
 /// @brief Class that holds either an error or a result
@@ -359,6 +406,14 @@ public:
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
     [[nodiscard]] bool getOnboardBlocks() const;
+
+    void setEnableBlockReuse(bool enableBlockReuse);
+    void setMaxTokens(SizeType32 maxTokens);
+    void setMaxAttentionWindow(SizeType32 maxAttentionWindow);
+    void setSinkTokenLength(SizeType32 sinkTokenLength);
+    void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
+    void setHostCacheSize(size_t hostCacheSize);
+    void setOnboardBlocks(bool onboardBlocks);
 
 private:
     friend class Serialization;
@@ -514,6 +569,77 @@ private:
     std::optional<size_t> mHostCacheSize;
 };
 
+struct LookaheadDecodingConfig
+{
+    LookaheadDecodingConfig(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
+
+    explicit LookaheadDecodingConfig()
+        : LookaheadDecodingConfig(1, 1, 0)
+    {
+    }
+
+    bool operator==(LookaheadDecodingConfig const& other) const;
+    [[nodiscard]] std::tuple<SizeType32 const, SizeType32 const, SizeType32 const> get() const;
+    [[nodiscard]] SizeType32 getWindowSize() const;
+    [[nodiscard]] SizeType32 getNgramSize() const;
+    [[nodiscard]] SizeType32 getVerificationSetSize() const;
+
+    /// @brief return <maxDecodingTokens, maxPathLen, maxDraftTokens, maxDraftPathLen>
+    std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResource() const;
+
+    /// @brief return true when `this` can be executed on resources defined by `that`
+    bool isLE(LookaheadDecodingConfig const& that) const;
+
+    /// @brief return true when the parameter combination is valid.
+    static bool isLegal(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize) noexcept;
+
+private:
+    friend class Serialization;
+
+    // Number of NGrams in lookahead branch per step.
+    SizeType32 mWindowSize;
+    // Number of tokens per NGram.
+    SizeType32 mNgramSize;
+    // Number of NGrams in verification branch per step.
+    SizeType32 mVerificationSetSize;
+};
+
+/// @brief Configuration class for the speculative decoding.
+class DecodingConfig
+{
+public:
+    explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
+        std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
+        std::optional<MedusaChoices> medusaChoices = std::nullopt);
+
+    bool operator==(DecodingConfig const& other) const;
+
+    // Decoding mode.
+    /// @brief Sets decoding mode. Some modes require the use of their own setters.
+    void setDecodingMode(DecodingMode const&);
+    [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
+
+    // Lookahead methods.
+    /// @brief Sets lookahead decoding mode and config.
+    void setLookaheadDecoding(LookaheadDecodingConfig const& lookaheadDecodingConfig);
+    [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
+
+    // Medusa methods.
+    /// @brief Sets medusa mode and config.
+    void setMedusaChoices(MedusaChoices const&);
+    [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
+
+private:
+    friend class Serialization;
+
+    // Decoding mode.
+    std::optional<DecodingMode> mDecodingMode;
+    // Lookahead params.
+    std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
+    // Medusa params.
+    std::optional<MedusaChoices> mMedusaChoices;
+};
+
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
@@ -522,12 +648,13 @@ public:
         KvCacheConfig const& kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false,
         bool normalizeLogProbs = true, SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
-        BatchingType batchingType = BatchingType::kINFLIGHT,
+        BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
+        std::optional<SizeType32> maxNumTokens = std::nullopt,
         std::optional<ParallelConfig> parallelConfig = std::nullopt,
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt,
-        std::optional<DecodingMode> decodingMode = std::nullopt, float gpuWeightsPercent = 1);
+        std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt,
+        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -537,14 +664,18 @@ public:
     [[nodiscard]] SizeType32 getIterStatsMaxIterations() const;
     [[nodiscard]] SizeType32 getRequestStatsMaxIterations() const;
     [[nodiscard]] BatchingType getBatchingType() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxBatchSize() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxNumTokens() const;
     [[nodiscard]] std::optional<ParallelConfig> getParallelConfig() const;
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
-    [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
-    [[nodiscard]] std::optional<DecodingMode> getDecodingMode() const;
+    [[nodiscard]] std::optional<LogitsPostProcessorBatched> getLogitsPostProcessorBatched() const;
+    [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
+    void setMaxBatchSize(SizeType32 maxBatchSize);
+    void setMaxNumTokens(SizeType32 maxNumTokens);
     void setSchedulerConfig(SchedulerConfig const& schedulerConfig);
     void setKvCacheConfig(KvCacheConfig const& kvCacheConfig);
     void setEnableChunkedContext(bool enableChunkedContext);
@@ -555,8 +686,8 @@ public:
     void setParallelConfig(ParallelConfig const& parallelConfig);
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorMap(LogitsPostProcessorMap const& logitsPostProcessorMap);
-    void setMedusaChoices(MedusaChoices const& medusaChoices);
-    void setDecodingMode(DecodingMode decodingMode);
+    void setLogitsPostProcessorBatched(LogitsPostProcessorBatched const& logitsPostProcessorBatched);
+    void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
 
 private:
@@ -586,12 +717,19 @@ private:
     /// @brief The type of batching strategy to use. See BatchingType.
     BatchingType mBatchingType;
 
+    /// @brief The max batch size of requests
+    std::optional<SizeType32> mMaxBatchSize;
+
+    /// @brief The max number of tokens per batch
+    std::optional<SizeType32> mMaxNumTokens;
+
     /// @brief The parallel execution configuration.
     std::optional<ParallelConfig> mParallelConfig;
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
-    std::optional<MedusaChoices> mMedusaChoices;
-    std::optional<DecodingMode> mDecodingMode;
+    std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
+    /// @brief Decoding configuration.
+    std::optional<DecodingConfig> mDecodingConfig;
     float mGpuWeightsPercent;
 };
 
@@ -607,10 +745,20 @@ public:
     /// @param comm An optional inter-process communicator configuration
     Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig);
 
+    Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
+        ModelType modelType, ExecutorConfig const& executorConfig);
+
     Executor(std::vector<uint8_t> const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
         ExecutorConfig const& executorConfig);
 
+    Executor(std::vector<uint8_t> const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
+        std::vector<uint8_t> const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
+        ExecutorConfig const& executorConfig);
+
     Executor(std::shared_ptr<Model> model, ExecutorConfig const& executorConfig);
+
+    Executor(
+        std::shared_ptr<Model> encoderModel, std::shared_ptr<Model> decoderModel, ExecutorConfig const& executorConfig);
 
     ~Executor();
 

@@ -226,14 +226,14 @@ void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& f
         }
     }
     header_stream << ")}";
-    int base_length = 6 + 4 + header_stream.str().size();
+    int base_length = 6 + 4 + static_cast<int>(header_stream.str().size());
     int pad_length = 16 * ((base_length + 1 + 15) / 16); // Take ceiling of base_length + 1 (for '\n' ending)
     for (int i = 0; i < pad_length - base_length; ++i)
     {
         header_stream << ((i == pad_length - base_length - 1) ? "\n" : "\x20");
     }
     std::string header = header_stream.str();
-    const uint16_t header_len = header.size();
+    auto const header_len = static_cast<uint16_t>(header.size());
 
     FILE* f_ptr = fopen(filename.c_str(), "wb");
     TLLM_CHECK_WITH_INFO(f_ptr != nullptr, tc::fmtstr("Unable to open %s for writing.\n", filename.c_str()));

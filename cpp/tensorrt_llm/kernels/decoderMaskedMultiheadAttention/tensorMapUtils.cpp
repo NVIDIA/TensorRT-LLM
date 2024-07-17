@@ -59,7 +59,9 @@ CUtensorMap makeTensorMapForPagedKVCache(std::shared_ptr<CUDADriverWrapper> cons
     uint64_t const globalDims[] = {headElems, tokensPerPage, nbKHeads, 1U << 31};
     uint32_t const headBytes = elemBytes * headElems;
     uint64_t const globalStrides[] = {headBytes, headBytes * tokensPerPage, headBytes * tokensPerPage * nbKHeads};
-    uint32_t const partElems = std::min(headBytes, 128U) / elemBytes;
+    TLLM_CHECK(headElems <= 256);
+    uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
+    uint32_t const partElems = std::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
     uint32_t const boxDims[] = {partElems, std::min(tokensPerPage, nbTokensPerTile), 1, 1};
     uint32_t const elemStrides[] = {1, 1, 1, 1};
 
@@ -69,7 +71,7 @@ CUtensorMap makeTensorMapForPagedKVCache(std::shared_ptr<CUDADriverWrapper> cons
         {
         case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
         case 64: return CU_TENSOR_MAP_SWIZZLE_64B;
-        default: throw std::runtime_error("unsupported cache head size");
+        default: TLLM_THROW("unsupported cache head size");
         }
     }();
 
@@ -89,7 +91,9 @@ CUtensorMap makeTensorMapForContiguousKVCache(std::shared_ptr<CUDADriverWrapper>
     uint32_t elemBytes = getElemBytes(dataType);
     uint32_t const headBytes = elemBytes * headElems;
     uint64_t const globalStrides[] = {headBytes, headBytes * maxCacheLen, headBytes * maxCacheLen * nbKHeads};
-    uint32_t const partElems = std::min(headBytes, 128U) / elemBytes;
+    TLLM_CHECK(headElems <= 256);
+    uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
+    uint32_t const partElems = std::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
     uint32_t const boxDims[] = {partElems, nbTokensPerTile, 1, 1};
     uint32_t const elemStrides[] = {1, 1, 1, 1};
 
@@ -99,7 +103,7 @@ CUtensorMap makeTensorMapForContiguousKVCache(std::shared_ptr<CUDADriverWrapper>
         {
         case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
         case 64: return CU_TENSOR_MAP_SWIZZLE_64B;
-        default: throw std::runtime_error("unsupported cache head size");
+        default: TLLM_THROW("unsupported cache head size");
         }
     }();
 

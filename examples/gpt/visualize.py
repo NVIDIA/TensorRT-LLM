@@ -206,9 +206,9 @@ if __name__ == '__main__':
     network = builder.create_network()
     network.plugin_config.to_legacy_setting()
     if args.use_gpt_attention_plugin:
-        network.plugin_config.set_gpt_attention_plugin()
+        network.plugin_config.gpt_attention_plugin = args.dtype
     if args.use_gemm_plugin:
-        network.plugin_config.set_gemm_plugin()
+        network.plugin_config.gemm_plugin = args.dtype
     with net_guard(network):
         # Prepare
         network.set_named_parameters(tensorrt_llm_gpt.named_parameters())

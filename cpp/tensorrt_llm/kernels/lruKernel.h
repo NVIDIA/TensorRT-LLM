@@ -27,6 +27,7 @@ struct lruParams
 {
     int batch, width;
     int max_seqlen; // only valid for padded input.
+    int block_size; // used for the cases that enable fused gate
     bool remove_padding;
 
     // Common data pointers.
@@ -34,8 +35,12 @@ struct lruParams
     void* __restrict__ x_ptr;
     void* __restrict__ y_ptr;
     void* __restrict__ y_bias_ptr;
+    void* __restrict__ gate_ptr;
+    void* __restrict__ gate_bias_ptr;
     void* __restrict__ gate_x_ptr;
+    void* __restrict__ gate_x_bias_ptr;
     void* __restrict__ gate_a_ptr;
+    void* __restrict__ gate_a_bias_ptr;
     void* __restrict__ state_ptr;
     void* __restrict__ out_ptr;
     int const* __restrict__ last_token_ids_ptr;

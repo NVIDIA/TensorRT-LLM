@@ -25,6 +25,7 @@
 #include "cutlass_extensions/tile_interleaved_layout.h"
 
 #include "cutlass_extensions/gemm/threadblock/default_dq_mma.h"
+#include "cutlass_extensions/transform/threadblock/fine_grained_scale_zero_iterator.h"
 
 namespace cutlass
 {
@@ -39,11 +40,22 @@ template <typename MmaShape, typename Element, typename Layout, WeightOnlyQuantO
     typename Enable = void>
 struct DefaultScaleIteratorsPipelined;
 
-// TODO: Fine grained iterators
+// Fine grained iterators
 template <typename MmaShape, typename Element, typename Layout, WeightOnlyQuantOp QuantOp, int Alignment>
 struct DefaultScaleIteratorsPipelined<MmaShape, Element, Layout, QuantOp, Alignment,
     std::enable_if_t<isFinegrained(QuantOp)>>
 {
+private:
+    using SmemScaleType = half_t;
+
+public:
+    using IteratorScale
+        = cutlass::transform::threadblock::FineGrainedScaleZeroIterator<cutlass::MatrixShape<1, MmaShape::kN>, Element,
+            Layout, 0, Alignment>;
+
+    using SmemIteratorScale
+        = cutlass::transform::threadblock::FineGrainedScaleZeroIterator<cutlass::MatrixShape<1, MmaShape::kN>,
+            SmemScaleType, Layout, 0, Alignment>;
 };
 
 // Per column iterators
@@ -206,7 +218,6 @@ struct DqMma<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignmentB, Ele
 
     using OperatorInfo = arch::DetagOperator<Operator_>;
     using Operator = typename OperatorInfo::Operator;
-    static_assert(OperatorInfo::QuantOp == WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY, "");
 
     static constexpr bool DqAfterLDG = platform::is_same<arch::OpMultiplyAdd, Operator>::value;
     using MmaCoreElementA = half_t;

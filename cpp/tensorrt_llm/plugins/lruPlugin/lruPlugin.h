@@ -30,15 +30,19 @@ namespace tensorrt_llm::plugins
 
 // inputs
 //     0.  x [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-//     1.  gate_x [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-//     2.  gate_a [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-//     3.  A [dim]
-//     4.  state [batch_size, dim] or host [1] containing only pointer for paged_state
-//     5.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
-//     6.  last_token_ids [batch_size] int32
-//     7.  state_slot_mapping [batch_size] int32, optional for paged state
-//     8.  y [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
-//     9.  y_bias [dim]
+//     1.  A [dim]
+//     2.  state [batch_size, dim] or host [1] containing only pointer for paged_state
+//     3.  host_request_types [batch_size] int32. 0: context; 1: generation; 2: none.
+//     4.  last_token_ids [batch_size] int32
+//     5.  state_slot_mapping [batch_size] int32, optional for paged state
+//     6.  y [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+//     7.  y_bias [dim]
+//     8.  gate [batch_size, seq_len, 2 * dim] or [num_tokens, 2 * dim] for remove_input_padding
+//     9.  gate_bias [2 * dim]
+//    10.  gate_x [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+//    11.  gate_a [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+//    12.  gate_x_bias [2 * dim]
+//    13.  gate_a_bias [2 * dim]
 // outputs
 //     0. output_tensor [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 //     1. state [batch_size, dim]
@@ -46,7 +50,8 @@ namespace tensorrt_llm::plugins
 class lruPlugin : public BasePlugin
 {
 public:
-    lruPlugin(int dim, nvinfer1::DataType type, bool removePadding, bool pagedState, bool yEnabled, bool yBiasEnabled);
+    lruPlugin(int dim, int block_size, nvinfer1::DataType type, bool removePadding, bool pagedState, bool yEnabled,
+        bool yBiasEnabled, bool fuseGateEnabled, bool gateBiasEnabled);
 
     lruPlugin(void const* data, size_t length);
 
@@ -96,71 +101,116 @@ private:
         return 0;
     };
 
-    IndexType getGateXIdx() const
+    IndexType getAIdx() const
     {
         return 1;
     };
 
-    IndexType getGateAIdx() const
+    IndexType getStateIdx() const
     {
         return 2;
     };
 
-    IndexType getAIdx() const
+    IndexType getHostRequestTypesIdx() const
     {
         return 3;
     };
 
-    IndexType getStateIdx() const
+    IndexType getLastTokenIdsIdx() const
     {
         return 4;
     };
 
-    IndexType getHostRequestTypesIdx() const
-    {
-        return 5;
-    };
-
-    IndexType getLastTokenIdsIdx() const
-    {
-        return 6;
-    };
-
     IndexType getSlotMappingIdx() const
     {
-        return 7;
+        if (mPagedState)
+            return 5;
+        else
+            return 4;
     };
 
     IndexType getYIdx() const
     {
-        if (mPagedState)
-            return 8;
+        if (mYEnabled)
+            return getSlotMappingIdx() + 1;
         else
-            return 7;
+            return getSlotMappingIdx();
     };
 
     IndexType getYBiasIdx() const
     {
-        if (mPagedState)
-            return 9;
+        if (mYBiasEnabled)
+            return getYIdx() + 1;
         else
-            return 8;
+            return getYIdx();
+    };
+
+    IndexType getGateIdx() const
+    {
+        if (mFuseGateEnabled)
+            return getYBiasIdx() + 1;
+        else
+            return getYBiasIdx();
+    };
+
+    IndexType getGateBiasIdx() const
+    {
+        if (mFuseGateEnabled && mGateBiasEnabled)
+            return getGateIdx() + 1;
+        else
+            return getGateIdx();
+    };
+
+    IndexType getGateXIdx() const
+    {
+        if (mFuseGateEnabled)
+            return getGateBiasIdx();
+        else
+            return getGateBiasIdx() + 1;
+    };
+
+    IndexType getGateAIdx() const
+    {
+        if (mFuseGateEnabled)
+            return getGateXIdx();
+        else
+            return getGateXIdx() + 1;
+    };
+
+    IndexType getGateXBiasIdx() const
+    {
+        if (!mFuseGateEnabled && mGateBiasEnabled)
+            return getGateAIdx() + 1;
+        else
+            return getGateAIdx();
+    };
+
+    IndexType getGateABiasIdx() const
+    {
+        if (!mFuseGateEnabled && mGateBiasEnabled)
+            return getGateXBiasIdx() + 1;
+        else
+            return getGateXBiasIdx();
     };
 
     static void setLruParams(tensorrt_llm::kernels::lruParams& params,
         // sizes
-        const size_t batch, const size_t dim, const size_t maxSeqLen,
+        const size_t batch, const size_t dim, const size_t block_size, const size_t maxSeqLen,
         // device pointers
-        void* statePtr, void const* x, void const* gate_x, void const* gate_a, void const* y, void const* y_bias,
+        void* statePtr, void const* x, void const* gate, void const* gate_bias, void const* gate_x,
+        void const* gate_x_bias, void const* gate_a, void const* gate_a_bias, void const* y, void const* y_bias,
         void const* A, int const* lastTokenIds, int const* slotMapping, void* out, bool removePadding);
 
 private:
     int mDim;
+    int mBlockSize;
     nvinfer1::DataType mType;
     bool mRemovePadding = false;
     bool mPagedState = false;
     bool mYEnabled = false;
     bool mYBiasEnabled = false;
+    bool mFuseGateEnabled = false;
+    bool mGateBiasEnabled = false;
 };
 
 class lruPluginCreator : public BaseCreator

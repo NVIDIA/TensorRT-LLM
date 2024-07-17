@@ -39,10 +39,11 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(list(
         product([2560], ['context', 'generation'],
                 ['float32', 'float16', 'bfloat16'], [3], [16], [False, True],
-                [True, False], [True, False])),
+                [True, False], [True, False], [True, False], [True, False])),
                           name_func=unittest_name_func)
     def test_rg_lru(self, dim, req_type, dtype, batch_size, max_seq_len,
-                    remove_padding, has_y, has_y_bias):
+                    remove_padding, has_y, has_y_bias, enable_fuse_gate,
+                    has_gate_bias):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -56,6 +57,8 @@ class TestFunctional(unittest.TestCase):
         device = "cuda"
         seq_len = max_seq_len if req_type == 'context' else 1
         torch_dtype = str_dtype_to_torch(dtype)
+        block_num = 10
+        block_size = dim // block_num
 
         # test data
         torch.random.manual_seed(10)
@@ -90,9 +93,13 @@ class TestFunctional(unittest.TestCase):
                                           dtype=torch.int32).to(device)
             total_num_tokens = last_token_ids[batch_size - 1]
             x_shape = [total_num_tokens, dim]
+            block_gate_shape = [total_num_tokens, block_num, block_size]
+            fused_gate_shape = [total_num_tokens, dim * 2]
         else:
             total_num_tokens = batch_size * seq_len
             x_shape = [batch_size, seq_len, dim]
+            block_gate_shape = [batch_size, seq_len, block_num, block_size]
+            fused_gate_shape = [batch_size, seq_len, dim * 2]
 
         # init inputs
         x = torch.randn(size=x_shape, dtype=torch_dtype, device=device)
@@ -102,6 +109,21 @@ class TestFunctional(unittest.TestCase):
             y = torch.randn(size=x_shape, dtype=torch_dtype, device=device)
         if has_y_bias:
             y_bias = torch.randn(size=[dim], dtype=torch_dtype, device=device)
+        if has_gate_bias:
+            gate_x_bias = torch.randn(size=[block_num, dim // block_num],
+                                      dtype=torch_dtype,
+                                      device=device)
+            gate_a_bias = torch.randn(size=[block_num, dim // block_num],
+                                      dtype=torch_dtype,
+                                      device=device)
+        if enable_fuse_gate:
+            gate = torch.cat([
+                gate_x.reshape(block_gate_shape),
+                gate_a.reshape(block_gate_shape)
+            ],
+                             dim=-1).reshape(fused_gate_shape)
+            if has_gate_bias:
+                gate_bias = torch.cat([gate_x_bias, gate_a_bias], dim=-1)
         if req_type == 'context':
             lru_state = torch.empty(size=[batch_size, dim],
                                     dtype=torch.float32,
@@ -136,12 +158,16 @@ class TestFunctional(unittest.TestCase):
         y_ref = y.detach().clone() if has_y else None
         y_bias_ref = y_bias.view(1, 1,
                                  dim).detach().clone() if has_y_bias else None
+        gate_x_bias_ref = gate_x_bias.detach().clone(
+        ) if has_gate_bias else None
+        gate_a_bias_ref = gate_a_bias.detach().clone(
+        ) if has_gate_bias else None
 
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if remove_padding:
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
         else:
             net.plugin_config.remove_input_padding = False
         net.plugin_config.paged_state = False
@@ -149,12 +175,6 @@ class TestFunctional(unittest.TestCase):
             x_tensor = Tensor(name='x',
                               shape=x.shape,
                               dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            gate_x_tensor = Tensor(name='gate_x',
-                                   shape=gate_x.shape,
-                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            gate_a_tensor = Tensor(name='gate_a',
-                                   shape=gate_a.shape,
-                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             if has_y:
                 y_tensor = Tensor(name='y',
                                   shape=y.shape,
@@ -168,6 +188,41 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             else:
                 y_bias_tensor = None
+            if enable_fuse_gate:
+                gate_tensor = Tensor(name='gate',
+                                     shape=gate.shape,
+                                     dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                if has_gate_bias:
+                    gate_bias_tensor = Tensor(
+                        name='gate_bias',
+                        shape=gate_bias.shape,
+                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                else:
+                    gate_bias_tensor = None
+                gate_x_tensor, gate_x_bias_tensor = None, None
+                gate_a_tensor, gate_a_bias_tensor = None, None
+            else:
+                gate_tensor = None
+                gate_bias_tensor = None
+                gate_x_tensor = Tensor(
+                    name='gate_x',
+                    shape=gate_x.shape,
+                    dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                gate_a_tensor = Tensor(
+                    name='gate_a',
+                    shape=gate_a.shape,
+                    dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                if has_gate_bias:
+                    gate_x_bias_tensor = Tensor(
+                        name='gate_x_bias',
+                        shape=gate_x_bias.shape,
+                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                    gate_a_bias_tensor = Tensor(
+                        name='gate_a_bias',
+                        shape=gate_a_bias.shape,
+                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                else:
+                    gate_x_bias_tensor, gate_a_bias_tensor = None, None
             state_tensor = Tensor(
                 name='state',
                 shape=lru_state.shape,
@@ -183,17 +238,23 @@ class TestFunctional(unittest.TestCase):
                 name='last_token_ids',
                 shape=last_token_ids.shape,
                 dtype=tensorrt_llm.str_dtype_to_trt('int32'))
-            outputs = tensorrt_llm.functional.rg_lru(x_tensor,
-                                                     gate_x_tensor,
-                                                     gate_a_tensor,
-                                                     A_tensor,
-                                                     state_tensor,
-                                                     host_request_types_tensor,
-                                                     last_token_ids_tensor,
-                                                     dim,
-                                                     dtype,
-                                                     y=y_tensor,
-                                                     y_bias=y_bias_tensor)
+            outputs = tensorrt_llm.functional.rg_lru(
+                x_tensor,
+                A_tensor,
+                state_tensor,
+                host_request_types_tensor,
+                last_token_ids_tensor,
+                dim,
+                dtype,
+                block_size=block_size,
+                y=y_tensor,
+                y_bias=y_bias_tensor,
+                gate=gate_tensor,
+                gate_bias=gate_bias_tensor,
+                gate_x=gate_x_tensor,
+                gate_x_bias=gate_x_bias_tensor,
+                gate_a=gate_a_tensor,
+                gate_a_bias=gate_a_bias_tensor)
             net._mark_output(outputs[0],
                              'output',
                              dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -204,8 +265,6 @@ class TestFunctional(unittest.TestCase):
         # trt run
         inputs = {
             'x': x,
-            'gate_x': gate_x,
-            'gate_a': gate_a,
             'A': A,
             'state': lru_state,
             'host_request_types': host_request_types,
@@ -215,6 +274,16 @@ class TestFunctional(unittest.TestCase):
             inputs['y'] = y
         if has_y_bias:
             inputs['y_bias'] = y_bias
+        if enable_fuse_gate:
+            inputs['gate'] = gate
+            if has_gate_bias:
+                inputs['gate_bias'] = gate_bias
+        else:
+            inputs['gate_x'] = gate_x
+            inputs['gate_a'] = gate_a
+            if has_gate_bias:
+                inputs['gate_x_bias'] = gate_x_bias
+                inputs['gate_a_bias'] = gate_a_bias
         outputs = {'output': output, 'present_state': lru_state}
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(precision=dtype, )
@@ -225,7 +294,8 @@ class TestFunctional(unittest.TestCase):
         # pytorch run
         out_ref, present_state_ref = rg_lru_batch_ref(
             x_ref, gate_x_ref, gate_a_ref, y_ref, y_bias_ref, segment_pos,
-            lru_state_ref, A_ref, batch_size, remove_padding, last_token_ids)
+            lru_state_ref, A_ref, batch_size, remove_padding, last_token_ids,
+            gate_x_bias_ref, gate_a_bias_ref)
         dtype_atol = {"float16": 5e-2, "float32": 2e-3, "bfloat16": 5e-2}
 
         # get mask

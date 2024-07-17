@@ -69,18 +69,11 @@ struct XQADispatchHelper<__nv_bfloat16, KVBlockArray>
 };
 #endif
 
-#define SUPPORT_RETURN_FALSE(X)                                                                                        \
-    {                                                                                                                  \
-        return false;                                                                                                  \
-    }
-
 class DecoderXQARunner
 {
 public:
-    // Resources for constructing a DecoderXQARunner object.
-    class Resource;
-    DecoderXQARunner(Resource* resource, const XQADataType data_type, int num_heads, int num_kv_heads, int head_size,
-        bool multi_block_mode);
+    DecoderXQARunner(
+        const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode);
     ~DecoderXQARunner();
 
     /**
@@ -88,79 +81,7 @@ public:
      * \param[in] forConfigurePlugin indicates whether this method is called in configurePlugin, or in
      * enqueueGeneration.
      */
-    template <typename T>
-    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin)
-    {
-        if (!(xqaParams.data_type == DATA_TYPE_FP16 || xqaParams.data_type == DATA_TYPE_BF16))
-        {
-            SUPPORT_RETURN_FALSE("data type");
-        }
-        bool const isGPTJBeam4Kernel = (xqaParams.head_size == 256 && xqaParams.beam_width == 4
-            && xqaParams.paged_kv_cache && (xqaParams.tokens_per_block == 64 || xqaParams.tokens_per_block == 128));
-        if (xqaParams.head_size != 128 && xqaParams.head_size != 256 && !isGPTJBeam4Kernel)
-        {
-            SUPPORT_RETURN_FALSE("head_size");
-        }
-        if (xqaParams.unidirectional != 1)
-        {
-            SUPPORT_RETURN_FALSE("unidirectional");
-        }
-        if (xqaParams.q_scaling != 1.0f)
-        {
-            SUPPORT_RETURN_FALSE("q_scaling");
-        }
-        if (xqaParams.mask_type != tensorrt_llm::kernels::AttentionMaskType::CAUSAL)
-        {
-            SUPPORT_RETURN_FALSE("mask_type");
-        }
-        if (xqaParams.cross_attention)
-        {
-            SUPPORT_RETURN_FALSE("cross_attention");
-        }
-        // Only support 64/128 tokens per block.
-        if (xqaParams.paged_kv_cache && xqaParams.tokens_per_block != 64 && xqaParams.tokens_per_block != 128)
-        {
-            SUPPORT_RETURN_FALSE("paged_kv_cache");
-        }
-        if (!forConfigurePlugin && xqaParams.host_past_key_value_lengths == nullptr)
-        {
-            SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
-        }
-        if (xqaParams.beam_width != 1 && !isGPTJBeam4Kernel)
-        {
-            SUPPORT_RETURN_FALSE("beam_width");
-        }
-        if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
-        {
-            SUPPORT_RETURN_FALSE("cyclic_attention_window_size != max_attention_window_size");
-        }
-        if (xqaParams.position_shift_enabled || xqaParams.sink_token_length > 0)
-        {
-            SUPPORT_RETURN_FALSE("streaming-llm");
-        }
-
-        // OPTIMIZE: For the standard generation-phase MHA, there are still extra limitations.
-        // NOTE: Medusa mode = Multi_query_tokens > 1.
-        int const nbQHeads = xqaParams.num_q_heads;
-        int const nbKVHeads = xqaParams.num_kv_heads;
-        int const nbQHeadsPerKV = nbQHeads / nbKVHeads;
-        if (!xqaParams.multi_query_tokens)
-        {
-            if (nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
-            {
-                SUPPORT_RETURN_FALSE("nbHeads");
-            }
-        }
-        else
-        {
-            // Number of Q heads Per KV needs to be power of 2 or 1.
-            if (!(nbQHeadsPerKV % 2 == 0 || nbQHeadsPerKV == 1))
-            {
-                SUPPORT_RETURN_FALSE("nbHeads");
-            }
-        }
-        return shouldUseImpl(xqaParams, forConfigurePlugin);
-    }
+    bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
 
     size_t getWorkspaceSize(int max_batch_beam_size, int max_num_tokens);
 
@@ -176,16 +97,16 @@ public:
         this->run(xqa_params, kv_cache_buffer, stream);
     }
 
+    class Resource;
+    static Resource* getResourceGlobal();
+
 private:
-    bool shouldUseImpl(XQAParams const& xqa_params, bool for_configure_plugin);
     void prepareForRun(XQAParams const& xqa_params);
 
     template <typename KVCacheBuffer>
     void run(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream);
 
     static constexpr int kMaxBeamWidth = 4;
-
-    Resource* mResource;
 
     XQADataType mDataType;
     int mNumHeads;
@@ -213,7 +134,17 @@ public:
     Resource(void const* buffer, size_t buffer_size);
     ~Resource() = default;
 
+    void merge(Resource const& other)
+    {
+        getCubinObjRegistry()->merge(*other.getCubinObjRegistry());
+    }
+
     jit::CubinObjRegistry* getCubinObjRegistry()
+    {
+        return mCubinObjRegistry.get();
+    }
+
+    jit::CubinObjRegistry const* getCubinObjRegistry() const
     {
         return mCubinObjRegistry.get();
     }

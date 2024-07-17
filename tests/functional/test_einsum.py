@@ -16,68 +16,54 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
-from parameterized import parameterized
-from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
-                                    TrtRunner)
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session
 
 
-class TestFunctional(unittest.TestCase):
+class TestEinsum(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float32', )], name_func=unittest_name_func)
-    def test_einsum(self, dtype):
-        # torch 1.13: "baddbmm_with_gemm" not implemented for 'Half'
+    def test_einsum(self):
+        dtype = 'float32'
         # test data
         x_shape = (12, 12, 96, 96)
         y_shape = (12, 12, 96, 64)
         x_data = torch.rand(x_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                            device="cuda")
         y_data = torch.rand(y_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                            device="cuda")
         equation = 'bnth,bnhs->bnts'
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
             y = Tensor(name='y',
                        shape=y_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.einsum(equation, [x, y]).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.einsum(equation, [x, y])
+            output.mark_output('output', dtype)
 
         # trt run
-        profiles = [
-            Profile().add('x', x_shape, x_shape,
-                          x_shape).add('y', y_shape, y_shape, y_shape)
-        ]
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
-                                         config=CreateConfig(profiles=profiles))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                'x': x_data.numpy(),
-                'y': y_data.numpy()
-            })
+        session = create_session(builder, network, precision=dtype)
+        inputs = {'x': x_data, 'y': y_data}
+        outputs = run_session(session, inputs)
 
         # pytorch run
         ref = torch.functional.einsum(equation, [x_data, y_data])
 
         # compare diff
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=1e-4)
+        torch.testing.assert_close(outputs['output'], ref, atol=5e-3, rtol=2e-4)

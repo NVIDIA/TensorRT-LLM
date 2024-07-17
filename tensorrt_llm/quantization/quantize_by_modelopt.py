@@ -31,10 +31,12 @@ import numpy as np
 import safetensors
 import torch
 from datasets import load_dataset
+from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from ..logger import logger
+from ..mapping import Mapping
 from .mode import QuantAlgo
 
 EMPTY_CFG = {
@@ -122,6 +124,9 @@ MODEL_NAME_PATTERN_MAP = {
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
+    "Phi3SmallForCausalLM": "phi3small",
+    "Phi3ForCausalLM": "phi3",
+    "Starcoder2ForCausalLM": "gptnext",
 }
 
 
@@ -148,6 +153,18 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     return tokenizer
 
 
+def _get_vila_model(model_dir):
+    sys.path.append(model_dir + "/../VILA")
+    from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(
+        model_dir,
+        device_map='auto',
+        trust_remote_code=True,
+    )
+    return model.llm
+
+
 def get_model(ckpt_path, dtype="fp16", device="cuda"):
     print(f"Initializing model from {ckpt_path}")
     if dtype == "bf16" or dtype == "bfloat16":
@@ -161,17 +178,13 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
 
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
     if "vila" in ckpt_path:
-        sys.path.append(args.model_dir + "/../VILA")
-        from llava.model import LlavaConfig, LlavaLlamaForCausalLM
-        AutoConfig.register("llava_llama", LlavaConfig)
-        AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
-
-    model_kwargs = {"torch_dtype": "auto"}
-    model = AutoModelForCausalLM.from_pretrained(
-        ckpt_path,
-        device_map="auto" if device != "cpu" else "cpu",
-        torch_dtype="auto",
-        trust_remote_code=True)
+        model = _get_vila_model(ckpt_path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            ckpt_path,
+            device_map="auto" if device != "cpu" else "cpu",
+            torch_dtype="auto",
+            trust_remote_code=True)
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
@@ -205,8 +218,17 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         dataset = dataset["article"][:calib_size]
+    elif os.path.isdir(dataset_name_or_dir):
+        print(
+            f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
+            "assuming the calibration data are in the train split and text column."
+        )
+        dataset = load_dataset(dataset_name_or_dir, split="train")
+        dataset = dataset["text"][:calib_size]
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
+        )
 
     batch_encoded = tokenizer.batch_encode_plus(dataset,
                                                 return_tensors="pt",
@@ -245,10 +267,95 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
     return model
 
 
-def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
-                        kv_cache_dtype, calib_size, batch_size,
-                        calib_max_seq_length, awq_block_size, output_dir,
-                        tp_size, pp_size, seed, tokenizer_max_seq_length):
+def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
+                          num_medusa_heads, num_medusa_layers, max_draft_len,
+                          medusa_hidden_act, medusa_model_dir,
+                          quant_medusa_head):
+
+    with open(f"{medusa_model_dir}/config.json", "r") as fp:
+        medusa_config = json.load(fp)
+
+    num_medusa_heads_from_config = medusa_config.get('medusa_num_heads',
+                                                     num_medusa_heads)
+    num_medusa_layers = medusa_config.get('medusa_num_layers',
+                                          num_medusa_layers)
+    if num_medusa_heads is None:
+        num_medusa_heads = num_medusa_heads_from_config
+
+    assert max_draft_len > 0, "should have max_draft_len > 0"
+
+    world_size = tp_size * pp_size
+    # Process for each rank
+    for rank in range(world_size):
+        mapping = Mapping(world_size=world_size,
+                          rank=rank,
+                          tp_size=tp_size,
+                          pp_size=pp_size)
+        # 1. Load medusa weight for each rank
+        from tensorrt_llm.models.medusa.weight import load_medusa_hf
+        medusa_weights = load_medusa_hf(medusa_path=medusa_model_dir,
+                                        num_medusa_heads=num_medusa_heads,
+                                        num_medusa_layers=num_medusa_layers,
+                                        mapping=mapping,
+                                        dtype="float16")
+        # 2. Load base model safetensors (after quant)
+        base_model_weights = load_file(
+            f"{base_model_output_dir}/rank{rank}.safetensors")
+
+        # 3. Combine and save weight
+        base_model_weights.update(medusa_weights)
+        save_file(base_model_weights,
+                  f"{base_model_output_dir}/rank{rank}.safetensors")
+
+    # 4. Add medusa config into config.json
+    with open(f"{base_model_output_dir}/config.json", 'r') as f:
+        base_model_config = json.load(f)
+        f.close()
+
+    with open(f"{base_model_output_dir}/config.json", 'w') as f:
+        base_model_config['architecture'] = "MedusaForCausalLM"
+        base_model_config['quantization']['exclude_modules'] = [
+            'lm_head',
+            '*router',
+            '*vocab_embedding',
+            '*position_embedding',
+            '*block_embedding',
+        ]
+        if not quant_medusa_head:
+            base_model_config['quantization']['exclude_modules'].append(
+                '*medusa_heads*')
+
+        base_model_config['max_draft_len'] = max_draft_len
+        base_model_config['num_medusa_heads'] = num_medusa_heads
+        base_model_config['num_medusa_layers'] = num_medusa_layers
+        json.dump(base_model_config, f, indent=4)
+
+    torch.cuda.empty_cache()
+    print("Combine medusa heads' weight, done.")
+
+
+def quantize_and_export(*,
+                        model_dir,
+                        device,
+                        calib_dataset,
+                        dtype,
+                        qformat,
+                        kv_cache_dtype,
+                        calib_size,
+                        batch_size,
+                        calib_max_seq_length,
+                        awq_block_size,
+                        output_dir,
+                        tp_size,
+                        pp_size,
+                        seed,
+                        tokenizer_max_seq_length,
+                        num_medusa_heads=None,
+                        num_medusa_layers=None,
+                        max_draft_len=None,
+                        medusa_hidden_act=None,
+                        medusa_model_dir=None,
+                        quant_medusa_head=None):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -269,11 +376,16 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
     random.seed(seed)
     np.random.seed(seed)
 
-    model = get_model(model_dir, dtype)
+    model = get_model(model_dir, dtype, device=device)
     model_type = get_model_type(model)
-    tokenizer = get_tokenizer(model_dir,
-                              max_seq_length=tokenizer_max_seq_length,
-                              model_type=model_type)
+    if "vila" in model_dir:
+        tokenizer = get_tokenizer(model_dir + "/llm",
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
+    else:
+        tokenizer = get_tokenizer(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type)
 
     if qformat in ["full_prec", "int8_wo", "int4_wo"
                    ] and kv_cache_dtype is None:
@@ -351,17 +463,12 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             else:
                 tensorrt_llm_config["quantization"]["quant_algo"] = None
 
-        # Workaround for MOE router quantization
-        if "moe_num_experts" in tensorrt_llm_config and qformat != "full_prec":
-            if "exclude_modules" not in tensorrt_llm_config["quantization"]:
-                # Append router and lm_head because we need both excluded
-                tensorrt_llm_config["quantization"]["exclude_modules"] = [
-                    "router", "lm_head"
-                ]
-            else:
-                tensorrt_llm_config["quantization"]["exclude_modules"].append(
-                    "router")
-
+        # HF uses rope_scaling while tensorrt_llm uses rotary_scaling
+        if hasattr(
+                model.config,
+                "rope_scaling") and "rotary_scaling" not in tensorrt_llm_config:
+            tensorrt_llm_config["rotary_scaling"] = getattr(
+                model.config, "rope_scaling")
         with open(f"{export_path}/config.json", "w") as f:
             json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -393,6 +500,9 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
             qwen_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
             tensorrt_llm_config["qwen_type"] = qwen_config.model_type
+            if qwen_config.model_type == "qwen2":
+                tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
+                tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
             tensorrt_llm_config[
                 "intermediate_size"] = qwen_config.intermediate_size
             with open(f"{export_path}/config.json", "w") as f:
@@ -400,6 +510,14 @@ def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
 
         torch.cuda.empty_cache(
         )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
+
+        # Workaround for combining medusa head
+        # TODO: move these integration into modelopt to avoid redundant reading and writing
+        if medusa_model_dir is not None:
+            combine_medusa_weight(tp_size, pp_size, export_path,
+                                  num_medusa_heads, num_medusa_layers,
+                                  max_draft_len, medusa_hidden_act,
+                                  medusa_model_dir, quant_medusa_head)
         end_time = time.time()
         print(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
@@ -519,6 +637,17 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         text_column = "article"
+    elif os.path.isdir(dataset_name_or_dir):
+        print(
+            f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
+            "assuming the calibration data are in the train split and text column."
+        )
+        dataset = load_dataset(dataset_name_or_dir, split="train")
+        text_column = "text"
+    else:
+        raise NotImplementedError(
+            f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
+        )
     calib_size = max(min(len(dataset), calib_size), batch_size)
     for i in range(calib_size // batch_size):
         batch = dataset[i * batch_size:(i + 1) * batch_size][text_column]

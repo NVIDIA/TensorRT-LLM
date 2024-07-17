@@ -12,17 +12,16 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import tensorrt_llm
-from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.cogvlm.convert import convert_hf_cogvlm
 from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.llama.convert import (capture_activation_range,
+                                               load_weights_from_gptq,
+                                               load_weights_from_hf_by_shard,
+                                               load_weights_from_meta_ckpt,
                                                smooth_llama_model)
-from tensorrt_llm.models.llama.weight import (load_from_gptq_llama,
-                                              load_from_hf_checkpoint,
-                                              load_from_meta_llama)
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
 
 try:
     from transformers import LlavaConfig, LlavaForConditionalGeneration
@@ -120,7 +119,7 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
-        '--modelopt_quant_ckpt_path',
+        '--quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .npz format')
@@ -204,32 +203,6 @@ def parse_arguments():
         type=int,
         default=1,
         help='The number of workers for converting checkpoint in parallel')
-    parser.add_argument(
-        '--moe_num_experts',
-        default=0,
-        type=int,
-        help='Specify the number of experts to use for MOE layers')
-    parser.add_argument(
-        '--moe_top_k',
-        default=0,
-        type=int,
-        help=
-        'Specify the top_k value to use for MOE layers. Default to 1 if --moe_num_experts is set'
-    )
-    parser.add_argument(
-        '--moe_tp_mode',
-        default=MoeConfig.ParallelismMode.TENSOR_PARALLEL,
-        type=int,
-        help=
-        'Controls how to distribute experts in TP. Check layers/moe.py for accepted values',
-    )
-    parser.add_argument(
-        '--moe_renorm_mode',
-        default=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
-        type=int,
-        help=
-        'Controls renormalization after gate logits. Check layers/moe.py for accepted values',
-    )
     parser.add_argument('--enable_pos_shift',
                         default=False,
                         action='store_true',
@@ -271,9 +244,6 @@ def update_quantization_from_args(config: dict, args: argparse.Namespace):
                 config['quantization'][
                     'quant_algo'] = 'W8A8_SQ_PER_TENSOR_PLUGIN'
 
-    if args.use_weight_only and args.moe_config.has_moe():
-        config['quantization']['exclude_modules'].append('router')
-
     if args.int8_kv_cache:
         config['quantization']['kv_cache_quant_algo'] = 'INT8'
 
@@ -308,7 +278,6 @@ def create_config_from_args(args: argparse.Namespace):
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
-            'exclude_modules': ['lm_head'],
         },
         'mapping': {
             'world_size': args.tp_size * args.pp_size,
@@ -319,10 +288,6 @@ def create_config_from_args(args: argparse.Namespace):
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
-        'moe_num_experts': args.moe_num_experts,
-        'moe_top_k': args.moe_top_k,
-        'moe_tp_mode': args.moe_tp_mode,
-        'moe_normalization_mode': args.moe_renorm_mode,
         'enable_pos_shift': args.enable_pos_shift,
         'dense_context_fmha': args.dense_context_fmha,
     }
@@ -341,7 +306,7 @@ def smooth_quant(model, args):
         "TOKENIZERS_PARALLELISM", "false")
     if args.load_model_on_cpu:
         logger.warning(
-            "Note that running capture_activation_range on cpu would be very small."
+            "Note that running capture_activation_range on cpu would be very slow."
         )
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
                                               trust_remote_code=True,
@@ -400,16 +365,7 @@ def main():
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
-        if hf_config.model_type == "mixtral":
-            # HF LLaMA-type models are implicitly using gated activation.
-            # With our MoE implementation, we must make it explicit
-            args.hidden_act = "swiglu"
-            args.moe_num_experts = getattr(hf_config, "num_local_experts",
-                                           args.moe_num_experts)
-            args.moe_top_k = getattr(hf_config, "num_experts_per_tok",
-                                     args.moe_top_k)
-            args.rotary_base = getattr(hf_config, "rope_theta",
-                                       args.rotary_base)
+
         args.architecture = hf_config.architectures[0]
         args.vision_start = 1
         args.vision_length = hf_config.vision_config['num_positions'] - 1
@@ -432,19 +388,10 @@ def main():
                 (int(n_embd * args.ffn_dim_multiplier) + args.multiple_of - 1)
                 // args.multiple_of)
         args.rms_norm_eps = meta_config["norm_eps"]
-        args.moe_num_experts = meta_config.get("moe", {}).get("num_experts", 0)
-        args.moe_top_k = meta_config.get("moe", {}).get("num_experts_per_tok",
-                                                        0)
         args.architecture = "LlamaForCausalLM"
     else:
         args.n_kv_head = args.n_kv_head or args.n_head
         args.architecture = "LlamaForCausalLM"
-
-    if args.moe_num_experts and args.moe_top_k == 0:
-        args.moe_top_k = 1
-    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
-                                args.moe_tp_mode,
-                                args.moe_renorm_mode).validate()
 
     if args.rotary_scaling is not None:
         # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
@@ -490,22 +437,23 @@ def main():
                           pp_size=args.pp_size)
 
         if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-            weights = load_from_gptq_llama(args.modelopt_quant_ckpt_path,
-                                           args.n_layer,
-                                           args.vocab_size,
-                                           mapping,
-                                           dtype=args.dtype)
+            weights = load_weights_from_gptq(
+                args.quant_ckpt_path,
+                PretrainedConfig.from_dict(copy.deepcopy(config)),
+            )
 
         elif args.meta_ckpt_dir is not None:
-            weights = load_from_meta_llama(
-                args.meta_ckpt_dir, mapping,
-                PretrainedConfig.from_dict(copy.deepcopy(config)))
+            weights = load_weights_from_meta_ckpt(
+                args.meta_ckpt_dir,
+                PretrainedConfig.from_dict(copy.deepcopy(config)),
+            )
 
         else:
             if args.load_by_shard:
-                weights = load_from_hf_checkpoint(
-                    args.model_dir, mapping,
-                    PretrainedConfig.from_dict(copy.deepcopy(config)))
+                weights = load_weights_from_hf_by_shard(
+                    args.model_dir,
+                    PretrainedConfig.from_dict(copy.deepcopy(config)),
+                )
 
             else:
                 if args.weight_only_precision == 'int8':
@@ -530,8 +478,7 @@ def main():
                     int8_kv_cache=args.int8_kv_cache,
                     act_range=act_range,
                     qkv_para=llama_qkv_para,
-                    smoother=llama_smoother,
-                    moe_config=args.moe_config)
+                    smoother=llama_smoother)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

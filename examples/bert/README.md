@@ -32,9 +32,6 @@ python3 build.py --model RobertaModel --dtype=float16 --log_level=verbose
 
 # Build BertModel with TensorRT-LLM BERT Attention plugin for enhanced runtime performance
 python3 build.py --dtype=float16 --log_level=verbose --use_bert_attention_plugin float16
-
-# Build RobertaForSequenceClassification with half-precision accumulation for attention BMM1 (applied to unfused MHA plugins)
-python3 build.py --model RobertaForSequenceClassification --dtype=float16 --log_level=verbose --use_bert_attention_plugin float16 --enable_qk_half_accum
 ```
 
 The following command can be used to run the model on a single GPU:

@@ -1,7 +1,10 @@
-# Benchmark for Python Runtime
+# Benchmark Python Runtime
+
+> [!WARNING] Python benchmark is not recommended to be used for benchmarking, please use C++ benchmark instead
+> The Python benchmarking scripts can only benchmark the Python runtime, which do not support the latest features, such as in-flight batching.
 
 This document explains how to benchmark the models supported by TensorRT-LLM on a single GPU, a single node with
-multiple GPUs or multiple nodes with multiple GPUs.
+multiple GPUs or multiple nodes with multiple GPUs using the Python runtime.
 
 ## Overview
 

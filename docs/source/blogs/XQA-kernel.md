@@ -2,7 +2,7 @@
 
 XQA kernel provides optimization for [MQA](https://arxiv.org/abs/1911.02150) and [GQA](https://arxiv.org/abs/2305.13245v3) during generation phase. It also provides optimization for beam search. Using tensor cores for acceleration, reducing data loading and conversion, it delivers increased throughput within the same latency budget. Increased throughput allows serving greater number of user requests while providing the same experience.
 
-Support matrix and usage flags are described in [docs/source/gpt_attention](/docs/source/gpt_attention.md#xqa-optimization).
+Support matrix and usage flags are described in [docs/source/advanced/gpt_attention](/docs/source/advanced/gpt-attention.md#xqa-optimization).
 
 **Increased Throughput:**
 Looking at the Throughput-Latency curves below, we see that the enabling of XQA optimization increases throughput. Higher throughput equates to serving more users, and we can see that TPOT on the Y-axis flattens out when XQA gets enabled.

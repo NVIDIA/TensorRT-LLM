@@ -32,7 +32,7 @@ bCopyModel = True  # "False" to remove redundant copy of model from model_cache
 def convert_ckpt(model_dir: str, output_dir: str, world_size: int):
     convert_cmd = [
         sys.executable,
-        str(chatglm_example_dir / "convert_checkpoint.py"), "--dtype=float32",
+        str(chatglm_example_dir / "convert_checkpoint.py"), "--dtype=float16",
         f"--model_dir={model_dir}", f"--output_dir={output_dir}",
         f"--tp_size={world_size}"
     ]
@@ -51,9 +51,9 @@ def build_engine(ckpt_dir: str,
         "--max_batch_size=8",
         "--max_beam_width=2",
         "--max_input_len=256",
-        "--max_output_len=128",
-        "--gpt_attention_plugin=float32",
-        "--gemm_plugin=float32",
+        "--max_seq_len=384",
+        "--gpt_attention_plugin=float16",
+        "--gemm_plugin=float16",
         "--builder_opt=0",
     ]
     if is_ifb:
@@ -125,7 +125,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
 
         convert_ckpt(hf_dir, ckpt_dir, world_size)
 
-        for engine_kind in ["fp32-plugin", "fp32-plugin-packed-paged"]:
+        for engine_kind in ["fp16-plugin", "fp16-plugin-packed-paged"]:
             engine_dir = Path(
                 model_dir
             ) / "rt_engine" / model_name / engine_kind / "tp1-pp1-gpu"

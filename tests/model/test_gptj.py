@@ -92,12 +92,13 @@ class TestGPTJ(unittest.TestCase):
         with net_guard(network):
             # Initialize model
             network.set_named_parameters(trtllm_model.named_parameters())
-            inputs = trtllm_model.prepare_inputs(max_batch_size=batch_size,
-                                                 max_input_len=input_len,
-                                                 max_seq_len=input_len +
-                                                 output_len,
-                                                 use_cache=True,
-                                                 max_beam_width=beam_width)
+            inputs = trtllm_model.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Prepare
             trtllm_model(**inputs)
 
@@ -132,16 +133,16 @@ class TestGPTJ(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=(dtype == "float16"),
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_attention_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if use_ln_gemm_plugin:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, hf_gpt, gpt_config, dtype,

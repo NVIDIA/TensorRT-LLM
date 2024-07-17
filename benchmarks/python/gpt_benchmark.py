@@ -88,8 +88,8 @@ class GPTBenchmark(BaseBenchmark):
                 self.max_batch_size = args.max_batch_size
             if args.max_input_len is not None:
                 self.max_input_len = args.max_input_len
-            if args.max_output_len is not None:
-                self.max_output_len = args.max_output_len
+            if args.max_seq_len is not None:
+                self.max_seq_len = args.max_seq_len
 
             self.quant_config = get_quant_config(args.quantization)
             self.quant_mode = self.quant_config.quant_mode
@@ -174,6 +174,15 @@ class GPTBenchmark(BaseBenchmark):
                 top_p=args.top_p)
             self.decoder = tensorrt_llm.runtime.GenerationSession(
                 model_config, engine_buffer, self.runtime_mapping)
+        if args.model == 'glm_10b':
+            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
+                end_id=50258,
+                pad_id=50256,
+                num_beams=self.num_beams,
+                top_k=args.top_k,
+                top_p=args.top_p)
+            self.decoder = tensorrt_llm.runtime.ChatGLMGenerationSession(
+                model_config, engine_buffer, self.runtime_mapping)
         else:
             end_id = 50256
             pad_id = 50256
@@ -200,10 +209,10 @@ class GPTBenchmark(BaseBenchmark):
 
     def get_config(self):
         for inlen, outlen in self.in_out_lens:
-            if inlen > self.max_input_len or outlen > self.max_output_len:
+            if inlen > self.max_input_len or inlen + outlen > self.max_seq_len:
                 print(
-                    f'[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) and '
-                    f'outlen({outlen}) <= max_outlen({self.max_output_len}) failed, skipping.'
+                    f'[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) or '
+                    f'seqlen({inlen + outlen}) <= max_seq_len({self.max_seq_len}) failed, skipping.'
                 )
                 continue
             for batch_size in self.batch_sizes:
@@ -279,14 +288,10 @@ class GPTBenchmark(BaseBenchmark):
             self.kv_cache_elem_per_token(self.build_config, self.runtime_mapping.tp_size, self.runtime_mapping.pp_size) * element_size(self.kv_dtype)
         # when MHA is OOTB, it requires extra KV cache size, because OOTB don't support inplace updating KV cache.
         if not self.use_gpt_attention_plugin:
-            if os.getenv('TRTLLM_DISABLE_OOTB_KVCACHE_REUSE') != 'ON':
-                local_n_layer = ceil(self.build_config.num_layers /
-                                     self.runtime_mapping.pp_size)
-                kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
-                    local_n_layer + 1)
-            else:
-                # without reusing, we need one for past as engine inputs, one for present as engine outputs.
-                kv_cache_size_in_bytes *= 2
+            local_n_layer = ceil(self.build_config.num_layers /
+                                 self.runtime_mapping.pp_size)
+            kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
+                local_n_layer + 1)
 
         kv_cache_size_in_mb = bytes_to_target_unit(kv_cache_size_in_bytes,
                                                    "MiB")
@@ -309,7 +314,7 @@ class GPTBenchmark(BaseBenchmark):
                           output_length=outlen,
                           max_batch_size=self.build_config.max_batch_size,
                           max_input_len=self.build_config.max_input_len,
-                          max_output_len=self.build_config.max_output_len,
+                          max_seq_len=self.build_config.max_seq_len,
                           max_beam_width=self.build_config.max_beam_width)
         for k, v in build_args.items():
             tensorrt_llm.logger.info(f"{prefix} {k}:{v}")

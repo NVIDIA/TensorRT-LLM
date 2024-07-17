@@ -248,7 +248,6 @@ python ../quantization/quantize.py --model_dir ./falcon/180b \
 # Build trtllm engines from the trtllm checkpoint
 trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/fp8/tp8-pp1 \
                 --gemm_plugin float16 \
-                --strongly_typed \
                 --output_dir ./falcon/180b/trt_engines/fp8/tp8-pp1 \
                 --workers 8
 

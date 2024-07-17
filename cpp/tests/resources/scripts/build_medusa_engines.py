@@ -28,7 +28,7 @@ def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
     covert_cmd = [_sys.executable, "examples/medusa/convert_checkpoint.py"] + (
         ['--model_dir', str(weight_dir)] if weight_dir else []) + [
             '--medusa_model_dir', str(medusa_dir), \
-            '--output_dir', str(engine_dir), '--dtype=float16', '--fixed_num_medusa_heads=4'
+            '--output_dir', str(engine_dir), '--dtype=float16', '--num_medusa_heads=4'
         ] + list(args)
 
     run_command(covert_cmd)
@@ -39,8 +39,8 @@ def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
             str(engine_dir),
             '--gemm_plugin=float16',
             '--max_batch_size=8',
-            '--max_input_len=512',
-            '--max_output_len=20',
+            '--max_input_len=12',
+            '--max_seq_len=140',
             '--log_level=error',
             '--paged_kv_cache=enable',
             '--remove_input_padding=enable',

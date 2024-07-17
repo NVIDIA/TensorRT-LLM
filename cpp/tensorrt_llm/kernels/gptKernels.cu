@@ -84,7 +84,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
     // Allocate storage in shared memory to do the scan.
     __shared__ typename BlockScan::TempStorage tempQStorage;
-    __shared__ typename BlockScan::TempStorage tempKVStorage;
+    [[maybe_unused]] __shared__ typename BlockScan::TempStorage tempKVStorage;
 
     // This prefixOp operator keeps a running sum for when we need multiple iterations of the loop.
     BlockPrefixCallbackOp prefixQOp(0);
@@ -105,7 +105,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
         // Threads that correspond to valid sequences read the length.
         int seqQLength = 0;
-        int seqKVLength = 0;
+        [[maybe_unused]] int seqKVLength = 0;
         if (batchIdx < batchSizeBound)
         {
             seqQLength = fixed_q_seqlen ? maxQSeqLength : seqQLengths[batchIdx];
@@ -116,7 +116,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         }
 
         // Do the prefix-scan (it calls syncthreads internally).
-        int seqQOffset, seqKVOffset;
+        int seqQOffset;
+        [[maybe_unused]] int seqKVOffset;
         BlockScan(tempQStorage).ExclusiveSum(seqQLength, seqQOffset, prefixQOp);
         if constexpr (COMPUTE_KV_OFFSETS)
         {
@@ -188,7 +189,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
 template <typename AttentionMaskDataType>
 __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int const* seqLengths, int maxQSeqLength,
-    int attentionWindowSize, AttentionMaskType attentionMaskType)
+    int attentionWindowSize, AttentionMaskType attentionMaskType, BlockSparseParams blockSparseParams)
 {
     // The index of the sequence in the batch.
     int batchIdx = blockIdx.y;
@@ -242,8 +243,8 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int c
             break;
         case AttentionMaskType::BIDIRECTIONAL:
             // clang-format off
-             isValid = (rowIdx <  seqLength - 1 && colIdx < seqLength - 1) ||
-                       (rowIdx == seqLength - 1 && colIdx < seqLength);
+              isValid = (rowIdx <  seqLength - 1 && colIdx < seqLength - 1) ||
+                        (rowIdx == seqLength - 1 && colIdx < seqLength);
             // clang-format on
             // seq_length==4, max_seq_len==5
             // 1 1 1 0 0
@@ -253,8 +254,8 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int c
             // 0 0 0 0 0
         case AttentionMaskType::BIDIRECTIONALGLM:
             // clang-format off
-             isValid = (colIdx < seqLength - 1) ||
-                       (rowIdx == seqLength - 1 && colIdx == seqLength - 1);
+              isValid = (colIdx < seqLength - 1) ||
+                        (rowIdx == seqLength - 1 && colIdx == seqLength - 1);
             // clang-format on
             // seq_length==4, max_seq_len==5
             // 1 1 1 1 0
@@ -262,6 +263,9 @@ __global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int c
             // 1 1 1 1 0
             // 1 1 1 1 0
             // 1 1 1 1 1
+            break;
+        case AttentionMaskType::BLOCKSPARSE:
+            isValid = blockSparseParams.computeMask(rowIdx, colIdx, seqLength, 1 /*num_heads*/, 0 /*head_id*/);
             break;
         }
 
@@ -312,7 +316,7 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
         }
         dim3 grid(blocksPerSeq, params.batchSize);
         computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqQLengths,
-            params.maxQSeqLength, params.attentionWindowSize, params.attentionMaskType);
+            params.maxQSeqLength, params.attentionWindowSize, params.attentionMaskType, params.blockSparseParams);
     }
 }
 

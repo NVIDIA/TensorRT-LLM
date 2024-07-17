@@ -52,15 +52,6 @@ private:
     int num_bits_;
 };
 
-enum class MOEParallelismMode : int
-{
-    NONE = 0,           //!< Ignore parallelism and duplicate the work across all nodes
-    EXPERT_PARALLELISM, //!< Divide the experts between each node. The number of experts must be a multiple of
-                        //!< parallelism
-    TENSOR_PARALLELISM, //!< Divide the weight matrices between the nodes. The hidden dimension must be a multiple of
-                        //!< parallelism
-};
-
 enum class MOEExpertScaleNormalizationMode : int
 {
     NONE = 0,    //!< Run the softmax on all scales and select the topk
@@ -91,20 +82,40 @@ enum class MOEExpertScaleNormalizationMode : int
  */
 struct MOEParallelismConfig
 {
-    constexpr static MOEParallelismConfig TensorParallelism(int tp_size, int tp_rank)
+    int tp_size = 1;
+    int tp_rank = 0;
+    int ep_size = 1;
+    int ep_rank = 0;
+
+    MOEParallelismConfig() = default;
+
+    MOEParallelismConfig(int tp_size, int tp_rank, int ep_size, int ep_rank)
+        : tp_size(tp_size)
+        , tp_rank(tp_rank)
+        , ep_size(ep_size)
+        , ep_rank(ep_rank)
     {
-        return {tp_size, tp_rank, 1, 0};
+        // Do some basic sanity checks
+        TLLM_CHECK(tp_rank < tp_size);
+        TLLM_CHECK(tp_rank >= 0);
+        TLLM_CHECK(tp_size >= 1);
+        TLLM_CHECK(ep_rank < ep_size);
+        TLLM_CHECK(ep_rank >= 0);
+        TLLM_CHECK(ep_size >= 1);
     }
 
-    constexpr static MOEParallelismConfig ExpertParallelism(int ep_size, int ep_rank)
+    bool operator==(MOEParallelismConfig const& other) const
     {
-        return {1, 0, ep_size, ep_rank};
+        return tp_size == other.tp_size && tp_rank == other.tp_rank && ep_size == other.ep_size
+            && ep_rank == other.ep_rank;
     }
 
-    int const tp_size = 1;
-    int const tp_rank = 0;
-    int const ep_size = 1;
-    int const ep_rank = 0;
+    friend std::ostream& operator<<(std::ostream& os, MOEParallelismConfig const& config)
+    {
+        os << "tp_size: " << config.tp_size << ", tp_rank: " << config.tp_rank << ", ep_size: " << config.ep_size
+           << ", ep_rank: " << config.ep_rank;
+        return os;
+    }
 };
 
 struct QuantParams
@@ -184,6 +195,12 @@ public:
     std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() override
     {
         return moe_gemm_runner_.getConfigs();
+    }
+
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm)
+    {
+        using RunnerType = decltype(moe_gemm_runner_);
+        return RunnerType::getConfigs(sm);
     }
 
     void runMoe(void const* input_activations, float const* gating_output, void const* fc1_expert_weights,

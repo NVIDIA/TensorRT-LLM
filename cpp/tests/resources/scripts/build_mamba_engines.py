@@ -42,7 +42,7 @@ def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
                                          '--gemm_plugin=disable',
                                          '--max_batch_size=8',
                                          '--max_input_len=924',
-                                         '--max_output_len=100',
+                                         '--max_seq_len=1024',
                                          '--max_beam_width=1',
                                      ] + list(args)
     run_command(build_args)

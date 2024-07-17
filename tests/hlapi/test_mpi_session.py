@@ -1,6 +1,9 @@
 import os
 import subprocess  # nosec B404
 
+import pytest
+
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.hlapi.mpi_session import MPINodeState
 
 
@@ -11,6 +14,7 @@ def task0():
     return MPINodeState.state
 
 
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 def test_mpi_session_basic():
     from tensorrt_llm.hlapi.mpi_session import MpiPoolSession
 
@@ -23,6 +27,7 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 def test_mpi_session_multi_node():
     nworkers = 4
     test_case_file = os.path.join(os.path.dirname(__file__), "mpi_test_task.py")

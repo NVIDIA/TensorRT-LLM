@@ -29,7 +29,16 @@
 namespace mpi = tensorrt_llm::mpi;
 namespace tr = tensorrt_llm::runtime;
 
-TEST(MPIUtils, RankAndSize)
+TEST(MPIUtils, SessionRankAndSize)
+{
+    auto& session = mpi::MpiComm::session();
+    auto const rank = session.getRank();
+    EXPECT_LE(0, rank);
+    auto const size = session.getSize();
+    EXPECT_LE(rank, size);
+}
+
+TEST(MPIUtils, WorldRankAndSize)
 {
     auto& comm = mpi::MpiComm::world();
     auto const rank = comm.getRank();

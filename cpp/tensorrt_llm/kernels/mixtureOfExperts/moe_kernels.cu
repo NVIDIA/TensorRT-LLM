@@ -690,6 +690,20 @@ __global__ void computeStridesHopperKernel(int64_t const* total_rows_before_expe
 
 // ========================== Permutation things =======================================
 
+template <class T, class U>
+__host__ __device__ constexpr static U arrayConvert(T const& input)
+{
+    using Type = typename U::Element;
+    static_assert(T::kElements == U::kElements);
+    U u;
+#pragma unroll
+    for (int i = 0; i < U::kElements; i++)
+    {
+        u[i] = static_cast<Type>(input[i]);
+    }
+    return u;
+}
+
 // Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with finalizing routing.
 
 // "expanded_x_row" simply means that the number of values is num_rows x k. It is "expanded" since we will have to
@@ -700,6 +714,8 @@ __global__ void computeStridesHopperKernel(int64_t const* total_rows_before_expe
 // k*rows_in_input - 1). However, it is set up so that index 0, rows_in_input, 2*rows_in_input ... (k-1)*rows_in_input
 // all map to row 0 in the original matrix. Thus, to know where to read in the source matrix, we simply take the modulus
 // of the expanded index.
+
+constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
 template <typename T, bool CHECK_SKIPPED>
 __global__ void expandInputRowsKernel(T const* unpermuted_input, T* permuted_output,
@@ -721,15 +737,23 @@ __global__ void expandInputRowsKernel(T const* unpermuted_input, T* permuted_out
 
     if (!CHECK_SKIPPED || blockIdx.x < *num_dest_rows)
     {
+        // Load 128-bits per thread
+        constexpr int64_t ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<T>::value;
+        using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+
         // Duplicate and permute rows
         int64_t const source_row = expanded_source_row % num_rows;
 
-        T const* source_row_ptr = unpermuted_input + source_row * cols;
-        T* dest_row_ptr = permuted_output + expanded_dest_row * cols;
+        auto const* source_row_ptr = reinterpret_cast<DataElem const*>(unpermuted_input + source_row * cols);
+        auto* dest_row_ptr = reinterpret_cast<DataElem*>(permuted_output + expanded_dest_row * cols);
 
-        for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)
+        int64_t const start_offset = threadIdx.x;
+        int64_t const stride = EXPAND_THREADS_PER_BLOCK;
+        int64_t const num_elems_in_col = cols / ELEM_PER_THREAD;
+
+        for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
         {
-            dest_row_ptr[tid] = source_row_ptr[tid];
+            dest_row_ptr[elem_index] = source_row_ptr[elem_index];
         }
     }
 }
@@ -740,7 +764,7 @@ void expandInputRowsKernelLauncher(T const* unpermuted_input, T* permuted_output
     int64_t const num_rows, int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k, cudaStream_t stream)
 {
     int64_t const blocks = num_rows * k;
-    int64_t const threads = std::min(cols, int64_t{1024});
+    int64_t const threads = EXPAND_THREADS_PER_BLOCK;
     auto func = (num_valid_tokens_ptr != nullptr) ? expandInputRowsKernel<T, true> : expandInputRowsKernel<T, false>;
     func<<<blocks, threads, 0, stream>>>(unpermuted_input, permuted_output, expanded_dest_row_to_expanded_source_row,
         expanded_source_row_to_expanded_dest_row, num_rows, num_valid_tokens_ptr, cols);
@@ -753,22 +777,46 @@ enum class ScaleMode : int
     RENORM_SCALE = 2,
 };
 
+constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
+
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip connection.
 template <typename T, typename OutputType, class GemmOutputType, ScaleMode SCALE_MODE, bool CHECK_SKIPPED>
 __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted_rows,
     OutputType* reduced_unpermuted_output, T const* bias, float const* scales,
-    int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const cols,
+    int const* expanded_source_row_to_expanded_dest_row, int const* expert_for_source_row, int64_t const orig_cols,
     int64_t const k, int64_t const* num_valid_ptr)
 {
+    assert(orig_cols % 4 == 0);
     int64_t const original_row = blockIdx.x;
     int64_t const num_rows = gridDim.x;
-    auto const offset = original_row * cols;
+    auto const offset = original_row * orig_cols;
     OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
     int64_t const num_valid = *num_valid_ptr;
-    for (int tid = threadIdx.x; tid < cols; tid += blockDim.x)
+
+    // Load 128-bits per thread, according to the smallest data type we read/write
+    constexpr int64_t FINALIZE_ELEM_PER_THREAD
+        = 128 / std::min(cutlass::sizeof_bits<OutputType>::value, cutlass::sizeof_bits<GemmOutputType>::value);
+
+    int64_t const start_offset = threadIdx.x;
+    int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+    int64_t const num_elems_in_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
+
+    using BiasElem = cutlass::Array<T, FINALIZE_ELEM_PER_THREAD>;
+    using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+    using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+    using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+    using a = cutlass::Array<half, FINALIZE_ELEM_PER_THREAD>;
+    auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
+    auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+    auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+#pragma unroll
+    for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
-        float thread_output{0.f};
+        bool has_valid = false;
+        ComputeElem thread_output;
+        thread_output.fill(0);
         float row_rescale{0.f};
         for (int k_idx = 0; k_idx < k; ++k_idx)
         {
@@ -782,31 +830,45 @@ __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted
                 row_rescale = row_rescale + row_scale;
             }
 
-            // Check after row sum has accumulated
+            // Check after row_rescale has accumulated
             if (CHECK_SKIPPED && expanded_permuted_row >= num_valid)
             {
                 continue;
             }
 
-            auto const* expanded_permuted_rows_row_ptr = expanded_permuted_rows + expanded_permuted_row * cols;
+            auto const* expanded_permuted_rows_row_ptr
+                = expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_col;
 
             int64_t const expert_idx = expert_for_source_row[k_offset];
 
-            T const* bias_ptr = bias + expert_idx * cols;
-            float const bias_value = bias ? static_cast<float>(bias_ptr[tid]) : 0.f;
+            auto const* bias_ptr = bias_v + expert_idx * num_elems_in_col;
+            ComputeElem bias_value;
+            if (bias)
+            {
+                bias_value = arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+            }
+            else
+            {
+                bias_value.fill(0);
+            }
 
-            float const row_value = static_cast<float>(expanded_permuted_rows_row_ptr[tid]);
-
-            thread_output = static_cast<float>(thread_output) + row_scale * (row_value + bias_value);
+            ComputeElem expert_result
+                = arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+            thread_output = thread_output + row_scale * (expert_result + bias_value);
+            has_valid = true;
         }
 
-        if (SCALE_MODE == ScaleMode::RENORM_SCALE && (!CHECK_SKIPPED || thread_output != 0.f))
+        if (SCALE_MODE == ScaleMode::RENORM_SCALE && (!CHECK_SKIPPED || has_valid))
         {
             assert(row_rescale != 0.f);
-            thread_output = thread_output / row_rescale;
+            for (auto& elem : thread_output)
+            {
+                elem /= row_rescale;
+            }
         }
 
-        reduced_row_ptr[tid] = static_cast<OutputType>(thread_output);
+        OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+        reduced_row_ptr_v[elem_index] = output_elem;
     }
 }
 
@@ -818,7 +880,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     MOEExpertScaleNormalizationMode normalization_mode, cudaStream_t stream)
 {
     int64_t const blocks = num_rows;
-    int64_t const threads = std::min(cols, int64_t{1024});
+    int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
 
     // Only add bias on rank 0 for tensor parallelism
     bool const is_rank_0 = parallelism_config.tp_rank == 0;
@@ -975,7 +1037,8 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWo
     size_t const permuted_elems = num_moe_inputs * hidden_size;
     size_t const interbuf_elems = num_moe_inputs * inter_size;
     size_t glu_inter_elems = 0;
-    if (isGatedActivation(activation_type))
+    bool is_gated_activation = isGatedActivation(activation_type);
+    if (is_gated_activation)
     {
         glu_inter_elems = interbuf_elems * 2;
     }
@@ -1007,12 +1070,40 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWo
     size_t const sorter_size = CubKeyValueSorter::getWorkspaceSize(num_rows, num_experts);
     size_t const fc2_result_size = permuted_elems * gemm_output_dtype; // May be an intermediate type for quantization
     size_t const hopper_size = using_hopper ? HopperGroupedGemmInput::workspaceSize(num_experts_per_node) : 0;
-    size_t const gemm_workspace_size = moe_gemm_runner_.calcMaxWorkspaceSize(num_experts_per_node);
+    size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
 
-    std::vector<size_t> workspace{source_rows_size, permuted_rows_size, permuted_experts_size, permuted_data_size,
-        total_rows_before_expert_size, softmax_out_size, glu_inter_size,
+    // We do some overlapping of the large workspace buffers. Although we could overlap some of the other buffers, they
+    // are small enough (i.e no factor of hidden size) they will only be a couple MiB at most, so we don't bother
+    // in the case of fused activation we overlap permuted_data and fc2_result
+    // in the case of unfused activation we overlap permuted_data and fc1_result
+    // we need to calculate the max possible size, so use the max of all three
+    size_t overlapped_gemm1_gemm2_inputs = std::max(permuted_data_size, fc2_result_size);
+    // When glu_inter_elems is 0 we are always fused, otherwise we may need the un-fused case
+    if (glu_inter_elems > 0)
+    {
+        overlapped_gemm1_gemm2_inputs = std::max(overlapped_gemm1_gemm2_inputs, fc1_result_size);
+    }
+
+    // if we have glu_inter we overlap it with fc2_result, otherwise we use fc1_result by itself
+    size_t overlapped_gemm1_gemm2_outputs = fc1_result_size;
+    if (glu_inter_elems > 0)
+    {
+        overlapped_gemm1_gemm2_outputs
+            = std::max(std::max(glu_inter_size, fc2_result_size), overlapped_gemm1_gemm2_outputs);
+    }
+
+    std::vector<size_t> workspace{     //
+        source_rows_size,              //
+        permuted_rows_size,            //
+        permuted_experts_size,         //
+        total_rows_before_expert_size, //
+        softmax_out_size,              //
+        sorter_size,                   //
         // These pointers reuse the same memory
-        std::max(fc1_result_size, sorter_size), fc2_result_size, hopper_size, gemm_workspace_size};
+        overlapped_gemm1_gemm2_inputs,  //
+        overlapped_gemm1_gemm2_outputs, //
+        hopper_size,                    //
+        gemm_workspace_size};
     return workspace;
 }
 
@@ -1022,10 +1113,12 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::getWorkspaceSize(i
     ActivationType activation_type, MOEParallelismConfig parallelism_config) const
 {
     int const ep_size = parallelism_config.ep_size;
-    TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of tp size");
+    TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of ep size");
     auto workspace = getWorkspaceBufferSizes(
         num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type);
-    return tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
+    auto ws_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
+    TLLM_LOG_DEBUG("Mixture Of Experts Plugin requires workspace of %2f MiB", ws_size / 1024.f / 1024.f);
+    return ws_size;
 }
 
 template <class T, class WeightType, class OutputType, class Enable>
@@ -1046,29 +1139,38 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::configureWsPtrs(char
     source_rows_ = (int*) ws_sliced[0];
     permuted_rows_ = (int*) ws_sliced[1];
     permuted_experts_ = (int*) ws_sliced[2];
-    permuted_data_ = (T*) ws_sliced[3];
 
-    total_rows_before_expert_ = (int64_t*) ws_sliced[4];
+    total_rows_before_expert_ = (int64_t*) ws_sliced[3];
 
     softmax_out_ = nullptr;
     bool const is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     if (!is_pow_2 || num_experts > 256)
     {
-        softmax_out_ = (float*) ws_sliced[5];
+        softmax_out_ = (float*) ws_sliced[4];
     }
 
-    glu_inter_result_ = (T*) ws_sliced[6];
+    sorter_ws_ = (char*) ws_sliced[5];
 
-    // These pointers are aliased. Since the sort ws can be overwritten after it is finished
-    sorter_ws_ = (char*) ws_sliced[7];
-    fc1_result_ = (T*) ws_sliced[7];
+    // Always 6, but overlapped with either fc1_result_ or fc2_result_
+    permuted_data_ = (T*) ws_sliced[6];
 
-    fc2_result_ = (T*) ws_sliced[8];
+    bool const is_gated_activation = isGatedActivation(activation_type);
+    bool const use_fused_moe = moe_gemm_runner_.isFusedGatedActivation(is_gated_activation, inter_size, hidden_size);
+    bool const using_hopper = moe_gemm_runner_.isHopperSpecialised();
+    bool const hopper_has_glu = using_hopper && (mayHaveDifferentGEMMOutputType() || is_gated_activation);
+    bool const non_hopper_has_glu = !using_hopper && !use_fused_moe && is_gated_activation;
+    bool const has_glu_inter_result = hopper_has_glu || non_hopper_has_glu;
+    // Always 7, ignored if not needed
+    glu_inter_result_ = has_glu_inter_result ? (T*) ws_sliced[7] : nullptr;
+
+    // fc1 and fc2 alias one of the above pointers, but it depends on if actfn is fused/unfused which is overlapped
+    fc1_result_ = has_glu_inter_result ? (T*) ws_sliced[6] : (T*) ws_sliced[7];
+    fc2_result_ = has_glu_inter_result ? (T*) ws_sliced[7] : (T*) ws_sliced[6];
 
     hopper_grouped_gemm_input_ = {};
     if (moe_gemm_runner_.isHopperSpecialised())
     {
-        hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[9], num_experts_per_node, ws_sliced[10], ws_sizes[10]);
+        hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[8], num_experts_per_node, ws_sliced[9], ws_sizes[9]);
     }
 }
 
@@ -1111,6 +1213,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     TLLM_CHECK(num_experts % parallelism_config.ep_size == 0);
     TLLM_CHECK_WITH_INFO(hidden_size >= 128 / cutlass::sizeof_bits<WeightType>::value,
         "Hidden size is too small to meet alignment requirements for MOE GEMM");
+    TLLM_CHECK_WITH_INFO(hidden_size % (128 / cutlass::sizeof_bits<WeightType>::value) == 0,
+        "Hidden size does not meet minimum alignment requirements for MOE GEMM");
+    TLLM_CHECK_WITH_INFO(inter_size % (128 / cutlass::sizeof_bits<WeightType>::value) == 0,
+        "Inter size does not meet minimum alignment requirements for MOE GEMM");
 
     // These values must fit into an int for building the source maps
     TLLM_CHECK_WITH_INFO(num_rows <= std::numeric_limits<int>::max(), "Number of rows is too large");
@@ -1176,7 +1282,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     sync_check_cuda_error();
 
     bool const is_gated_activation = isGatedActivation(fc1_activation_type);
-    size_t const fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size;
+    bool const use_fused_moe = moe_gemm_runner_.isFusedGatedActivation(is_gated_activation, inter_size, hidden_size);
+    size_t const fc1_out_size = ((!use_fused_moe) && is_gated_activation) ? inter_size * 2 : inter_size;
 
     // Upper bound on number of expanded rows
     int64_t const expanded_active_expert_rows = k * active_rows;
@@ -1205,7 +1312,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
         sync_check_cuda_error();
 
         moe_gemm_runner_.moeGemm(permuted_data_, nullptr, nullptr, nullptr, total_rows_before_expert_, hopper_input,
-            expanded_active_expert_rows, fc1_out_size, hidden_size, num_experts_per_node, stream);
+            expanded_active_expert_rows, fc1_out_size, hidden_size, num_experts_per_node, false, stream);
 
         sync_check_cuda_error();
 
@@ -1219,24 +1326,28 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
     {
         moe_gemm_runner_.moeGemmBiasAct(permuted_data_, fc1_expert_weights, fc1_int_scales, fc1_expert_biases,
             fc1_result_, total_rows_before_expert_, HopperGroupedGemmInput{}, expanded_active_expert_rows, fc1_out_size,
-            hidden_size, num_experts_per_node, fc1_activation_type, stream);
+            hidden_size, num_experts_per_node, fc1_activation_type, use_fused_moe, stream);
 
         sync_check_cuda_error();
     }
     else
     {
+
         // Run the GEMM with activation function overridden with `Identity`, we do the activation separately
+        ActivationType activation_type = (use_fused_moe) ? fc1_activation_type : ActivationType::Identity;
+        T* gemm_result = (use_fused_moe) ? fc1_result_ : static_cast<T*>(glu_inter_result_);
         moe_gemm_runner_.moeGemmBiasAct(permuted_data_, fc1_expert_weights, fc1_int_scales, fc1_expert_biases,
-            static_cast<T*>(glu_inter_result_), total_rows_before_expert_, HopperGroupedGemmInput{},
-            expanded_active_expert_rows, fc1_out_size, hidden_size, num_experts_per_node, ActivationType::Identity,
-            stream);
+            gemm_result, total_rows_before_expert_, HopperGroupedGemmInput{}, expanded_active_expert_rows, fc1_out_size,
+            hidden_size, num_experts_per_node, activation_type, use_fused_moe, stream);
 
         sync_check_cuda_error();
+        if (!use_fused_moe)
+        {
+            doGatedActivation<T>(fc1_result_, static_cast<T const*>(glu_inter_result_), num_valid_tokens_ptr,
+                inter_size, num_rows * k, fc1_activation_type, stream);
 
-        doGatedActivation<T>(fc1_result_, static_cast<T const*>(glu_inter_result_), num_valid_tokens_ptr, inter_size,
-            num_rows * k, fc1_activation_type, stream);
-
-        sync_check_cuda_error();
+            sync_check_cuda_error();
+        }
     }
 
     sync_check_cuda_error();
@@ -1251,7 +1362,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, Enable>::runMoe(void const* i
 
     moe_gemm_runner_.moeGemm(fc1_result_, fc2_expert_weights, fc2_int_scales, static_cast<T*>(fc2_result_),
         total_rows_before_expert_, hopper_input, expanded_active_expert_rows, hidden_size, inter_size,
-        num_experts_per_node, stream);
+        num_experts_per_node, false, stream);
 
     sync_check_cuda_error();
 

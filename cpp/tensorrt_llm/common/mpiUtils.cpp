@@ -91,13 +91,18 @@ namespace
 {
 
 bool mpiInitialized = false;
-std::mutex mpiMutex;
+std::recursive_mutex mpiMutex;
 
 } // namespace
 
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 {
-    std::lock_guard<std::mutex> lk(mpiMutex);
+    // double-checked locking
+    if (mpiInitialized)
+    {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lk(mpiMutex);
     if (mpiInitialized)
     {
         return;
@@ -293,13 +298,19 @@ int MpiComm::getSize() const
 
 MpiComm const& MpiComm::world()
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     static MpiComm commWorld{MPI_COMM_WORLD, false};
+    initialize();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return commWorld;
 }
 
 MpiComm& MpiComm::session()
 {
-    static MpiComm commSession{world(), false};
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    static MpiComm commSession{MPI_COMM_WORLD, false};
+    initialize();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return commSession;
 }
 
@@ -307,17 +318,19 @@ MpiComm getLocalSession()
 {
 #if ENABLE_MULTI_DEVICE
     MPI_Comm localComm;
-    MPI_Comm_split_type(MPI_COMM_WORLD, OMPI_COMM_TYPE_HOST, 0, MPI_INFO_NULL, &localComm);
+    MPI_Comm_split_type(COMM_SESSION, OMPI_COMM_TYPE_HOST, 0, MPI_INFO_NULL, &localComm);
     MpiComm localSession{localComm, false};
 #else
-    MpiComm localSession{MPI_COMM_WORLD, false};
+    MpiComm localSession{COMM_SESSION, false};
 #endif // ENABLE_MULTI_DEVICE
     return localSession;
 }
 
 MpiComm& MpiComm::localSession()
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     static MpiComm localSession = getLocalSession();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return localSession;
 }
 
@@ -326,10 +339,6 @@ MpiComm::MpiComm(MPI_Comm g, bool freeComm)
     , mFreeComm{freeComm}
 {
     TLLM_CHECK(mComm != MPI_COMM_NULL);
-    if (g == MPI_COMM_WORLD)
-    {
-        initialize();
-    }
 }
 
 MpiComm::~MpiComm() noexcept

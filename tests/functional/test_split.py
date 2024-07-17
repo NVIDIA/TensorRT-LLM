@@ -16,19 +16,17 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session, unittest_name_func
 
 
-class TestFunctional(unittest.TestCase):
+class TestSplit(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -56,13 +54,14 @@ class TestFunctional(unittest.TestCase):
         # test data
         x_shape = (128, 256)
         x_data = torch.rand(x_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                            device="cuda")
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -70,16 +69,14 @@ class TestFunctional(unittest.TestCase):
             outputs = tensorrt_llm.functional.split(x, split_size_or_sections,
                                                     dim)
             for i in range(len(outputs)):
-                output = outputs[i].trt_tensor
-                output.name = f'output_{i}'
-                network.mark_output(output)
+                outputs[i].mark_output(f'output_{i}')
 
         # trt run
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                'x': x_data.numpy(),
-            })
+        session = create_session(builder, network, precision=dtype)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
         # pytorch run
         ref_outputs = torch.split(x_data, split_size_or_sections, dim)
@@ -87,5 +84,4 @@ class TestFunctional(unittest.TestCase):
         # compare diff
         assert len(outputs.keys()) == len(ref_outputs)
         for i in range(len(ref_outputs)):
-            np.testing.assert_allclose(ref_outputs[i].cpu().numpy(),
-                                       outputs[f'output_{i}'])
+            torch.testing.assert_close(ref_outputs[i], outputs[f'output_{i}'])

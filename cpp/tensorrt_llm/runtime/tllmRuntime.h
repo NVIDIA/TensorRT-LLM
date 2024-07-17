@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/layerProfiler.h"
+#include "tensorrt_llm/runtime/rawEngine.h"
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -32,26 +33,8 @@ class TllmRuntime
 public:
     using TensorMap = StringPtrMap<ITensor>;
 
-    explicit TllmRuntime(
-        void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger);
-
-    explicit TllmRuntime(void const* engineData, std::size_t engineSize, nvinfer1::ILogger& logger)
-        : TllmRuntime{engineData, engineSize, 1, logger}
-    {
-    }
-
-    explicit TllmRuntime(
-        nvinfer1::IHostMemory const& engineBuffer, float const gpuWeightsPercent, nvinfer1::ILogger& logger)
-        : TllmRuntime{engineBuffer.data(), engineBuffer.size(), gpuWeightsPercent, logger}
-    {
-    }
-
-    explicit TllmRuntime(void const* engineData, std::size_t engineSize, float const gpuWeightsPercent);
-
-    explicit TllmRuntime(nvinfer1::IHostMemory const& engineBuffer, float const gpuWeightsPercent)
-        : TllmRuntime{engineBuffer.data(), engineBuffer.size(), gpuWeightsPercent}
-    {
-    }
+    explicit TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent = 1.0f,
+        bool useShapeInference = true);
 
     SizeType32 getNbContexts() const
     {
@@ -73,14 +56,14 @@ public:
     /// multiple profiles on the num_tokens dimension, hence the profile index is selected based on which profile
     /// handles the actual num_tokens
     /// @return The index of the selected TensorRT optimization profile
-    [[nodiscard]] SizeType32 getOptProfileId(int numTokens, std::vector<SizeType32> const& splitPoint) const
+    [[nodiscard]] SizeType32 getOptProfileId(int numTokens, std::vector<SizeType32> const& splitPoints) const
     {
         if (getNbProfiles() == 1)
         {
             return 0;
         }
-        auto const it = std::lower_bound(splitPoint.begin(), splitPoint.end(), numTokens);
-        auto const optProfileId = std::distance(splitPoint.begin(), it);
+        auto const it = std::lower_bound(splitPoints.begin(), splitPoints.end(), numTokens);
+        auto const optProfileId = std::distance(splitPoints.begin(), it);
         return optProfileId;
     }
 
@@ -146,5 +129,6 @@ private:
     std::unique_ptr<ITensor> mDummyTensor;
     std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
     std::unique_ptr<LayerProfiler> mLayerProfiler;
+    bool mUseShapeInference;
 };
 } // namespace tensorrt_llm::runtime

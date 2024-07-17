@@ -171,9 +171,7 @@ inline bool isBuilding()
 
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
 
-std::map<std::set<int>, ncclComm_t>* getCommMap();
-
-void initCommMap(std::set<int> const& group);
+std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 
 #endif // ENABLE_MULTI_DEVICE
 

@@ -14,6 +14,7 @@
 # limitations under the License.
 import copy
 import gc
+import inspect
 import json
 import math
 import struct
@@ -111,13 +112,13 @@ def trt_version():
     return trt.__version__
 
 
-# TRT supports strongly_type in 9.1
+# TRT supports strongly_typed in 9.1
 def support_strongly_type():
     return version.parse(trt_version()) >= version.parse("9.1.0")
 
 
-# Preview change in TRT 10.0
-def preview_trt_version():
+# Check if TRT version >= 10
+def trt_gte_10():
     return version.parse(trt_version()).major > 9
 
 
@@ -159,6 +160,13 @@ def str_dtype_to_torch(dtype):
     ret = _str_to_torch_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
+
+
+_torch_dtype_to_str_dict = {v: k for k, v in _str_to_torch_dtype_dict.items()}
+
+
+def torch_dtype_to_str(dtype):
+    return _torch_dtype_to_str_dict[dtype]
 
 
 _str_to_trt_dtype_dict = dict(float16=trt.float16,
@@ -287,6 +295,7 @@ _torch_to_trt_dtype_dict = {
     torch.int64: trt.int64,
     torch.int32: trt.int32,
     torch.int8: trt.int8,
+    torch.qint8: trt.int8,
     torch.bool: trt.bool,
     torch.bfloat16: trt.bfloat16
 }
@@ -434,6 +443,21 @@ def set_obj_attrs(
         assert not hasattr(
             obj, key), (f"Overwriting existing tensor attribute: {key}")
         setattr(obj, key, value)
+
+
+def get_init_params(obj, cls=None):
+    """
+    Get all parameters in object's __init__.
+    Use cls's __init__ as filter if cls provided.
+    """
+    names = None
+    if cls is not None:
+        names = set(list(inspect.signature(cls.__init__).parameters)[1:])
+    return {
+        name: getattr(obj, name)
+        for name in list(inspect.signature(obj.__class__.__init__).parameters)
+        [1:] if names is None or name in names
+    }
 
 
 def release_gc():

@@ -22,6 +22,12 @@ if __name__ == "__main__":
         choices=['gptnext', 'llama'],
         help="Decoder type; effective for NeMo checkpoint only.")
     parser.add_argument(
+        '--device',
+        help=
+        "The device to run calibration; effective for HuggingFace model only.",
+        default='cuda',
+        choices=['cuda', 'cpu'])
+    parser.add_argument(
         '--calib_dataset',
         type=str,
         default='cnn_dailymail',
@@ -84,11 +90,23 @@ if __name__ == "__main__":
                         help="KV Cache dtype.",
                         default=None,
                         choices=["int8", "fp8", None])
+    # Medusa
+    parser.add_argument('--num_medusa_heads', type=int, default=4)
+    parser.add_argument('--num_medusa_layers', type=int, default=1)
+    parser.add_argument('--max_draft_len', type=int, default=63)
+    parser.add_argument('--medusa_hidden_act', type=str, default="silu")
+    parser.add_argument('--medusa_model_dir', type=str, default=None)
+    parser.add_argument('--quant_medusa_head',
+                        default=False,
+                        action='store_true',
+                        help="whether to quantize the weights of medusa heads")
+
     args = parser.parse_args()
 
     if args.model_dir is not None:
         quantize_and_export(
             model_dir=args.model_dir,
+            device=args.device,
             calib_dataset=args.calib_dataset,
             dtype=args.dtype,
             qformat=args.qformat,
@@ -101,7 +119,13 @@ if __name__ == "__main__":
             tp_size=args.tp_size,
             pp_size=args.pp_size,
             seed=args.seed,
-            tokenizer_max_seq_length=args.tokenizer_max_seq_length)
+            tokenizer_max_seq_length=args.tokenizer_max_seq_length,
+            num_medusa_heads=args.num_medusa_heads,
+            num_medusa_layers=args.num_medusa_layers,
+            max_draft_len=args.max_draft_len,
+            medusa_hidden_act=args.medusa_hidden_act,
+            medusa_model_dir=args.medusa_model_dir,
+            quant_medusa_head=args.quant_medusa_head)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

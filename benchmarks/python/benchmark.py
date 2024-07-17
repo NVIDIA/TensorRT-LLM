@@ -185,6 +185,15 @@ def parse_arguments():
         ('If this option is specified, it will override the max output len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
+        '--max_seq_len',
+        '--max_decoder_seq_len',
+        dest='max_seq_len',
+        type=int,
+        default=None,
+        help=
+        ('If this option is specified, it will override the max sequence len of '
+         'TRT engines to the specified value instead of using pre-defined one'))
+    parser.add_argument(
         '--max_batch_size',
         type=int,
         default=None,
@@ -198,10 +207,6 @@ def parse_arguments():
         help=
         'Quick sanity check with num_layer=1; will be silently ignored if --engine_dir is specified.'
     )
-    parser.add_argument('--strongly_typed',
-                        default=False,
-                        action='store_true',
-                        help='This option will reduce the building time.')
     parser.add_argument(
         '--gpu_weights_percent',
         type=str,
@@ -232,7 +237,8 @@ def parse_arguments():
         choices=[
             'fp8', 'fp8_gemm', 'fp8_kv_cache', 'int8_sq_per_tensor',
             'int8_sq_per_token_channel', 'int8_weight_only', 'int4_weight_only',
-            'int4_weight_only_awq', 'int4_weight_only_gptq'
+            'int4_weight_only_awq', 'int4_weight_only_gptq',
+            'int8_sq_per_channel_ootb'
         ],
         help="Optimize the model with specified quantization recipe")
     parser.add_argument(
@@ -353,6 +359,21 @@ def main(args):
     else:
         rank = tensorrt_llm.mpi_rank()
         world_size = tensorrt_llm.mpi_world_size()
+
+    if args.max_output_len:
+        logger.warning(
+            '--max_output_len has been deprecated in favor of --max_seq_len')
+        if args.max_input_len:
+            if args.max_seq_len:
+                logger.warning(
+                    '--max_seq_len has been overwritten due to --max_output_len being specified'
+                )
+            args.max_seq_len = args.max_input_len + args.max_output_len
+        else:
+            raise Exception(
+                f"--max_output_len is specified but not --max_input_len")
+
+        del args.max_output_len
 
     # TODO: Re-enable memory monitor for multi-gpu benchmarks.
     # Current Mem Monitor will cause benchmark script hang

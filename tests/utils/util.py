@@ -1,12 +1,18 @@
 import os
 import unittest
+from difflib import SequenceMatcher
 
 import pytest
+import tensorrt as trt
 import torch
 from cuda import cuda, nvrtc
 from parameterized import parameterized
 
+import tensorrt_llm
+from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.runtime import TensorInfo
 
 
 def ASSERT_DRV(err):
@@ -142,3 +148,80 @@ def unittest_name_func(testcase_func, param_num, param):
         testcase_func.__name__,
         parameterized.to_safe_name(name),
     )
+
+
+def create_session(builder,
+                   network,
+                   precision="float32",
+                   int8=False,
+                   opt_level=None,
+                   memory_pool_limit=None,
+                   optimization_profiles=[],
+                   quant_mode=QuantMode(0)):
+    """
+    This function creates an engine and a tensorrt_llm.runtime.Session for the engine.
+    Args:
+        network: a tensorrt_llm.Network object
+        precision: the precision of the network, choose from ["float32", "float16", "bfloat16"]
+        **kwargs: builder flags such as int8, fp8, builder_opt, etc.
+    Returns:
+        session: a tensorrt_llm.runtime.Session
+    """
+    builder_config = builder.create_builder_config(precision=precision,
+                                                   int8=int8,
+                                                   opt_level=opt_level,
+                                                   quant_mode=quant_mode)
+    # Some tests require to set mem pool limit to avoid OOM
+    if memory_pool_limit is not None:
+        builder_config.trt_builder_config.set_memory_pool_limit(
+            trt.MemoryPoolType.WORKSPACE, memory_pool_limit)
+    # Some tests include shape tensors, so the optimization profile needs to be feed in explicitly
+    if len(optimization_profiles) > 0:
+        for profile in optimization_profiles:
+            builder_config.trt_builder_config.add_optimization_profile(profile)
+    # Disable TF32 for accuracy in testing.
+    builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
+    engine = builder.build_engine(network, builder_config)
+    assert engine is not None, "Failed to build engine"
+    session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+    return session
+
+
+def run_session(session, inputs):
+    """
+    The current session object needs to pass in both inputs and outputs bindings.
+    For test convenience, create a function that infers output shapes automatically,
+    This function is similar to tensorrt_llm.runtime.Session._debug_run, and Polygraphy runner.infer,
+    where only input shape is required.
+    """
+
+    # Prepare output tensors.
+    output_info = session.infer_shapes([
+        TensorInfo(name, torch_dtype_to_trt(tensor.dtype), tensor.shape)
+        for name, tensor in inputs.items()
+    ])
+
+    outputs = {
+        t.name: torch.empty(tuple(t.shape),
+                            dtype=trt_dtype_to_torch(t.dtype),
+                            device='cuda')
+        for t in output_info
+    }
+
+    # Execute model inference
+    stream = torch.cuda.current_stream()
+    ok = session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
+    assert ok, 'Engine execution failed'
+    stream.synchronize()
+
+    return outputs
+
+
+def similarity_score(a, b):
+    "similar compare a and b "
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def similar(a, b, threshold=0.8):
+    "similar compare a and b "
+    return similarity_score(a, b) >= threshold

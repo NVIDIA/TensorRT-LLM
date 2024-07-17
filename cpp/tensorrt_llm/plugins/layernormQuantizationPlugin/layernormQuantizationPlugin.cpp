@@ -167,6 +167,16 @@ int LayernormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
         invokeGeneralLayerNorm(
             (float*) nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares, scale, dynamic_scale, output);
     }
+#ifdef ENABLE_BF16
+    else if (mType == DataType::kBF16)
+    {
+        __nv_bfloat16 const* input = reinterpret_cast<__nv_bfloat16 const*>(inputs[0]);
+        __nv_bfloat16 const* weight = reinterpret_cast<__nv_bfloat16 const*>(inputs[1]);
+        __nv_bfloat16 const* bias = reinterpret_cast<__nv_bfloat16 const*>(inputs[2]);
+        invokeGeneralLayerNorm((__nv_bfloat16*) nullptr, input, weight, bias, mEps, m, n, stream, mUseDiffOfSquares,
+            scale, dynamic_scale, output);
+    }
+#endif
 
     return 0;
 }

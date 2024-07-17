@@ -268,9 +268,9 @@ class TestBert(unittest.TestCase):
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_bert_attention_plugin(dtype)
+                network.plugin_config.bert_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             network.plugin_config.set_context_fmha(context_fmha_type)
             with net_guard(network):
                 # Prepare inputs

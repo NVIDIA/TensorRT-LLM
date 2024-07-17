@@ -114,7 +114,7 @@ class TestFunctional(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if remove_padding:
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
         else:
             net.plugin_config.remove_input_padding = False
         net.plugin_config.paged_state = False

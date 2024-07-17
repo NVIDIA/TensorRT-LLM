@@ -24,6 +24,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
@@ -35,10 +36,9 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-DecoderXQARunner::DecoderXQARunner(Resource* resource, const XQADataType data_type, int num_heads, int num_kv_heads,
-    int head_size, bool multi_block_mode)
-    : mResource(resource)
-    , mDataType(data_type)
+DecoderXQARunner::DecoderXQARunner(
+    const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode)
+    : mDataType(data_type)
     , mNumHeads(num_heads)
     , mNumKVHeads(num_kv_heads)
     , mHeadSize(head_size)
@@ -103,11 +103,6 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_t
 
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams)
 {
-    if (tensorrt_llm::common::getSMVersion() == kSM_90)
-    {
-        // Always use Precompiled impl for sm90 until Hopper XQA source gets integrated to JIT codepath.
-        return mPrecompiledImpl.get();
-    }
     if (xqaParams.multi_query_tokens)
     {
         // Use precompiled cubin for medusa, because medusa cubins are generated from a different CUDA source file than
@@ -115,17 +110,20 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
         return mPrecompiledImpl.get();
     }
 
-    if (tensorrt_llm::common::getEnvEnableXQAJIT())
+    std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
+
+    if (envEnableXQAJIT.has_value())
     {
-        return mJITImpl.get();
+        return envEnableXQAJIT.value() ? mJITImpl.get() : mPrecompiledImpl.get();
     }
     else
     {
-        return mPrecompiledImpl.get();
+        // If no env var set, default to JIT impl.
+        return mJITImpl.get();
     }
 }
 
-bool DecoderXQARunner::shouldUseImpl(XQAParams const& xqa_params, bool for_configure_plugin)
+bool DecoderXQARunner::shouldUse(XQAParams const& xqa_params, bool for_configure_plugin)
 {
     return getImplFromXQAParams(xqa_params)->shouldUse(xqa_params, for_configure_plugin);
 }
@@ -140,6 +138,12 @@ void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
     return getImplFromXQAParams(xqa_params)->run(xqa_params, kv_cache_buffer, stream);
+}
+
+DecoderXQARunner::Resource* DecoderXQARunner::getResourceGlobal()
+{
+    static DecoderXQARunner::Resource sResource;
+    return &sResource;
 }
 
 template void DecoderXQARunner::run(

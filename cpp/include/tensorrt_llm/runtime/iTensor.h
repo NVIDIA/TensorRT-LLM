@@ -107,6 +107,25 @@ public:
     }
 
     //!
+    //! \brief Returns the strides of each dimemsion in a Shape.
+    //!
+    static Shape strides(Shape const& dims)
+    {
+        auto const nbDims = dims.nbDims;
+        Shape strides{};
+        strides.nbDims = nbDims;
+        if (nbDims > 0)
+        {
+            strides.d[nbDims - 1] = 1;
+        }
+        for (int i = nbDims - 2; i >= 0; i--)
+        {
+            strides.d[i] = dims.d[i + 1] * strides.d[i + 1];
+        }
+        return strides;
+    }
+
+    //!
     //! \brief Removes the given *unit* dimension from `shape`.
     //!
     //! \param shape The shape to squeeze.
@@ -170,6 +189,95 @@ public:
     }
 
     //!
+    //! \param offsetDims The offset in multiple dimensions.
+    //!
+    //! \param tensor The tensor to view.
+    //! \param offsetDims The offset dimensions of the view.
+    //! \param size The size of the view w.r.t. the last dimension in offsetDims.
+    //! \return A view of shape [size, the rest dimensions]
+    //!         or [size] when \param offsetDims specifies all dimensions.
+    //! \throw Whenever offset overflows or the last dimension offset+size overflows.
+    //!
+    static UniquePtr slice(SharedPtr tensor, Shape const& offsetDims, DimType64 size);
+
+    static UniquePtr slice(SharedPtr tensor, std::initializer_list<DimType64> const& offsetDims, DimType64 size)
+    {
+        return slice(std::move(tensor), makeShape(offsetDims), size);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(TConstPtr&& tensor, Shape const& offsetDims, std::size_t size)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims, size);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(
+        TConstPtr&& tensor, std::initializer_list<DimType64> const& offsetDims, std::size_t size)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims, size);
+    }
+
+    //!
+    //! \brief return the rest slices at the last dimension when `size` omitted.
+    //!
+    static UniquePtr slice(SharedPtr tensor, Shape const& offsetDims)
+    {
+        auto const dims = tensor->getShape();
+        auto const nbDims = offsetDims.nbDims;
+        auto const size = (dims.nbDims > 0 && nbDims > 0) ? dims.d[nbDims - 1] - offsetDims.d[nbDims - 1] : 0;
+        return ITensor::slice(std::move(tensor), offsetDims, size);
+    }
+
+    static UniquePtr slice(SharedPtr tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return slice(std::move(tensor), makeShape(offsetDims));
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(TConstPtr&& tensor, Shape const& offsetDims)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(TConstPtr&& tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    //!
+    //! \return Just the block at the point, with shape of [the rest dimensions]
+    //!         or [1] when \param offsetDims specifies all dimensions.
+    //!
+    static UniquePtr at(SharedPtr tensor, Shape const& offsetDims)
+    {
+        auto result = slice(std::move(tensor), offsetDims, 1);
+        if (result->getShape().nbDims > 1)
+        {
+            result->squeeze(0);
+        }
+        return result;
+    }
+
+    static UniquePtr at(SharedPtr tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return at(std::move(tensor), makeShape(offsetDims));
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr at(TConstPtr&& tensor, Shape const& offsetDims)
+    {
+        return at(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static ITensor::UniqueConstPtr at(TConstPtr&& tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return at(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    //!
     //! \brief Returns a view on the underlying `buffer` (or tensor) with the given shape.
     //!
     //! \param tensor The tensor to view.
@@ -194,6 +302,23 @@ public:
     {
         auto shapes = tensor->getShape();
         return ITensor::view(std::move(tensor), shapes);
+    }
+
+    //!
+    //! \brief Returns a flattened view on the underlying `tensor` which can be independently reshaped.
+    //!
+    //! \param tensor The tensor to flatten.
+    //! \param sliceN Slice the first N elements after flattening. -1 means take the whole flattened tensor.
+    //! \return A flatten view on the `tensor`.
+    //!
+    static UniquePtr flattenN(SharedPtr tensor, std::int64_t sliceN = -1)
+    {
+        UniquePtr flatten = ITensor::view(tensor, ITensor::makeShape({ITensor::volume(tensor->getShape()), 1}));
+        if (sliceN > 0)
+        {
+            flatten = ITensor::slice(std::move(flatten), 0, sliceN);
+        }
+        return flatten;
     }
 
     //!

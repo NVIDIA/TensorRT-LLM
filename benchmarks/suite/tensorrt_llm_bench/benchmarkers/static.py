@@ -1,3 +1,4 @@
+import platform
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Dict, List
@@ -84,8 +85,8 @@ class gptSessionBenchmarker:
             max_batch_size,
             "--max_input_len",
             max_isl,
-            "--max_output_len",
-            max_osl,
+            "--max_seq_len",
+            max_osl + max_isl,
             "--context_fmha",
             "enable",
             # Set the attention plugin data type.
@@ -143,11 +144,9 @@ class gptSessionBenchmarker:
         """Benchmarks a TRT-LLM for a configured instance."""
 
         # Compile the command for running
-        cmd = [
-            "mpirun",
-            "-allow-run-as-root",
-            "-n",
-            self.config.world_size,
+        cmd = ["mpiexec", "-n", self.config.world_size]
+        cmd += ["-allow-run-as-root"] if platform.system() != "Windows" else ""
+        cmd += [
             self.gpt_session_path,
             "--engine_dir",
             self.config.engine_path,

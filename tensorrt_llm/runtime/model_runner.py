@@ -24,9 +24,8 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
-from .._utils import (mpi_comm, mpi_world_size, numpy_to_torch,
-                      preview_trt_version)
-from ..bindings import GptSession, MpiComm
+from .._utils import mpi_comm, mpi_world_size, numpy_to_torch, trt_gte_10
+from ..bindings import MpiComm
 from ..bindings.executor import Executor
 from ..builder import Engine, get_engine_version
 from ..logger import logger
@@ -35,7 +34,7 @@ from ..quantization import QuantMode
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LoraManager, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
-                         StoppingCriteria)
+                         StoppingCriteria, to_word_list_format)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -139,8 +138,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     tokens_per_block = plugin_config['tokens_per_block']
     use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
-    use_context_fmha_for_generation = plugin_config.get(
-        'use_context_fmha_for_generation')
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
@@ -169,7 +166,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
-        use_context_fmha_for_generation=use_context_fmha_for_generation,
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
@@ -257,8 +253,7 @@ class ModelRunnerMixin:
 
                 context_logits_output = []
                 if self.remove_input_padding:
-                    if (isinstance(self.session, GptSession) or isinstance(
-                            self.session, Executor)) and batch_size > 1:
+                    if isinstance(self.session, Executor) and batch_size > 1:
                         # The starting position of the context logits buffer of each micro batch is separated
                         num_batches = self.mapping.pp_size
                         micro_batch_size = math.ceil(batch_size /
@@ -346,7 +341,7 @@ class ModelRunnerMixin:
                 torch.Tensor), "Prompt table should be str or torch.Tensor"
             prompt_table_data = prompt_table.to(dtype=self.dtype)
 
-        return prompt_table_data.cuda()
+        return prompt_table_data
 
     def _prepare_ptuning(self, prompt_table: Union[str, torch.Tensor],
                          tasks: str, batch_size: int):
@@ -354,14 +349,7 @@ class ModelRunnerMixin:
             return {}
 
         if prompt_table is not None:
-            if isinstance(prompt_table, str):
-                prompt_table_data = numpy_to_torch(
-                    np.load(prompt_table)).to(dtype=self.dtype)
-            else:
-                assert isinstance(
-                    prompt_table,
-                    torch.Tensor), "Prompt table should be str or torch.Tensor"
-                prompt_table_data = prompt_table.to(dtype=self.dtype)
+            prompt_table_data = self._prepare_embedding_table(prompt_table)
             _, task_vocab_size, hidden_size = prompt_table_data.size()
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
@@ -492,14 +480,12 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'num_medusa_heads') else 0,
             use_custom_all_reduce=build_config.plugin_config.
             use_custom_all_reduce,
-            moe_tp_mode=pretrained_config.moe_tp_mode if hasattr(
-                pretrained_config, 'moe_tp_mode') else 0,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
-        max_output_len = build_config.max_output_len
+        max_seq_len = build_config.max_seq_len
         max_beam_width = build_config.max_beam_width
         if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
                 'glm', 'chatglm'
@@ -524,8 +510,7 @@ class ModelRunner(ModelRunnerMixin):
                               runtime_mapping,
                               debug_mode=debug_mode,
                               stream=stream)
-        if preview_trt_version(
-        ) and session.runtime.engine.streamable_weights_size:
+        if trt_gte_10() and session.runtime.engine.streamable_weights_size:
             session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
@@ -541,7 +526,7 @@ class ModelRunner(ModelRunnerMixin):
         return cls(session=session,
                    max_batch_size=max_batch_size,
                    max_input_len=max_input_len,
-                   max_seq_len=max_input_len + max_output_len,
+                   max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    lora_manager=lora_manager)
 
@@ -628,8 +613,7 @@ class ModelRunner(ModelRunnerMixin):
             else:
                 lora_manager = None
 
-            if preview_trt_version(
-            ) and session.runtime.engine.streamable_weights_size:
+            if trt_gte_10() and session.runtime.engine.streamable_weights_size:
                 session.runtime._set_weight_streaming(gpu_weights_percent)
 
             profiler.stop('load tensorrt_llm engine')
@@ -784,6 +768,13 @@ class ModelRunner(ModelRunnerMixin):
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
+
+        if sampling_config.bad_words_list is not None:
+            sampling_config.bad_words_list = to_word_list_format(
+                sampling_config.bad_words_list)
+        if sampling_config.stop_words_list is not None:
+            sampling_config.stop_words_list = to_word_list_format(
+                sampling_config.stop_words_list)
 
         self.session.setup(
             batch_size=batch_size,

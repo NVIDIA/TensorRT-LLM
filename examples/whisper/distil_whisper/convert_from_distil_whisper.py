@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name",
                         type=str,
-                        default="distil-whisper/distil-large-v2",
+                        default="distil-whisper/distil-large-v3",
                         help="Model name")
     parser.add_argument("--cache_dir",
                         type=str,
@@ -39,7 +39,7 @@ def main():
                         help='Store the "translated" model here')
     parser.add_argument("--output_name",
                         type=str,
-                        default="distil-large-v2",
+                        default="distil-large-v3",
                         help="Output model name")
 
     args = parser.parse_args()
@@ -53,10 +53,10 @@ def main():
         print("Trying to load the model from the cache")
         model = AutoModel.from_pretrained(model_name,
                                           cache_dir=cache_dir,
-                                          use_safetensors=False)
+                                          use_safetensors=True)
     else:
         print("Downloading the model:")
-        model = AutoModel.from_pretrained(model_name, use_safetensors=False)
+        model = AutoModel.from_pretrained(model_name, use_safetensors=True)
 
     config = model.config
     model_dims = {

@@ -1,4 +1,3 @@
-import inspect
 import json
 import pickle
 import tempfile
@@ -9,123 +8,6 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings as _tb
-
-
-def test_generation_output():
-    ids = torch.ones(1)
-    lengths = torch.ones(2)
-    gen_output = _tb.GenerationOutput(ids, lengths)
-    assert torch.equal(gen_output.ids, ids)
-    assert torch.equal(gen_output.lengths, lengths)
-
-    assert gen_output.log_probs is None
-    log_probs = torch.ones(1)
-    gen_output.log_probs = log_probs
-    assert gen_output.log_probs == log_probs
-
-    assert gen_output.context_logits is None
-    torch.ones(1)
-    gen_output.context_logits = log_probs
-    assert gen_output.context_logits == log_probs
-
-
-def test_generation_input():
-    end_id = 42
-    pad_id = 13
-    ids = torch.ones(1)
-    lengths = torch.ones(2)
-    packed = True
-    gen_input = _tb.GenerationInput(end_id, pad_id, ids, lengths, packed)
-    assert gen_input.end_id == end_id
-    assert gen_input.pad_id == pad_id
-    assert torch.equal(gen_input.ids, ids)
-    assert torch.equal(gen_input.lengths, lengths)
-    assert gen_input.packed == packed
-
-    assert gen_input.max_new_tokens is None
-    max_new_tokens = 100
-    gen_input.max_new_tokens = max_new_tokens
-    assert gen_input.max_new_tokens == max_new_tokens
-
-    assert gen_input.embedding_bias is None
-    embedding_bias = torch.ones(3)
-    gen_input.embedding_bias = embedding_bias
-    assert torch.equal(gen_input.embedding_bias, embedding_bias)
-
-    assert gen_input.prompt_tuning_params.embedding_table is None
-    assert gen_input.prompt_tuning_params.tasks is None
-    assert gen_input.prompt_tuning_params.vocab_size is None
-
-    embedding_table = torch.ones(3)
-    tasks = torch.ones(2)
-    vocab_size = torch.ones(1)
-    prompt_tuning_params = _tb.PromptTuningParams(
-        embedding_table=embedding_table, tasks=tasks, vocab_size=vocab_size)
-    assert len(prompt_tuning_params.prompt_tuning_enabled) == 0
-    prompt_tuning_enabled = [True, False]
-    prompt_tuning_params.prompt_tuning_enabled = prompt_tuning_enabled
-    assert len(prompt_tuning_params.prompt_tuning_enabled) == 2
-    assert prompt_tuning_params.prompt_tuning_enabled == prompt_tuning_enabled
-    gen_input.prompt_tuning_params = prompt_tuning_params
-    assert gen_input.prompt_tuning_params is not None
-    assert torch.equal(gen_input.prompt_tuning_params.embedding_table,
-                       embedding_table)
-    assert torch.equal(gen_input.prompt_tuning_params.tasks, tasks)
-    assert torch.equal(gen_input.prompt_tuning_params.vocab_size, vocab_size)
-    assert gen_input.prompt_tuning_params.prompt_tuning_enabled == prompt_tuning_enabled
-
-
-def test_gpt_session_config():
-    kv_cache_config = _tb.KvCacheConfig()
-    assert kv_cache_config.max_tokens is None
-    max_tokens = 13
-    kv_cache_config.max_tokens = max_tokens
-    assert kv_cache_config.max_tokens == max_tokens
-    assert kv_cache_config.free_gpu_memory_fraction is None
-    free_gpu_memory_fraction = 0.5
-    kv_cache_config.free_gpu_memory_fraction = free_gpu_memory_fraction
-    assert kv_cache_config.free_gpu_memory_fraction == free_gpu_memory_fraction
-
-    max_batch_size = 1000
-    max_beam_width = 64
-    max_sequence_length = 1 << 20
-    gpu_weights_percent = 0.5
-    gpt_session_config = _tb.GptSessionConfig(max_batch_size, max_beam_width,
-                                              max_sequence_length,
-                                              gpu_weights_percent)
-    assert gpt_session_config.max_batch_size == max_batch_size
-    assert gpt_session_config.max_beam_width == max_beam_width
-    assert gpt_session_config.max_sequence_length == max_sequence_length
-    assert gpt_session_config.gpu_weights_percent == gpu_weights_percent
-
-    assert gpt_session_config.kv_cache_config is not None
-    assert gpt_session_config.kv_cache_config.max_tokens is None
-    assert gpt_session_config.kv_cache_config.free_gpu_memory_fraction is None
-    gpt_session_config.kv_cache_config = kv_cache_config
-    assert gpt_session_config.kv_cache_config.max_tokens == max_tokens
-    assert gpt_session_config.kv_cache_config.free_gpu_memory_fraction == free_gpu_memory_fraction
-    gpt_session_config.kv_cache_config.max_tokens = None
-    assert gpt_session_config.kv_cache_config.max_tokens is None
-    gpt_session_config.kv_cache_config.free_gpu_memory_fraction = None
-    assert gpt_session_config.kv_cache_config.free_gpu_memory_fraction is None
-
-    assert not gpt_session_config.decoder_per_request
-    gpt_session_config.decoder_per_request = True
-    assert gpt_session_config.decoder_per_request
-
-    assert not gpt_session_config.cuda_graph_mode
-    gpt_session_config.cuda_graph_mode = True
-    assert gpt_session_config.cuda_graph_mode
-
-    assert gpt_session_config.ctx_micro_batch_size is None
-    ctx_micro_batch_size = 10
-    gpt_session_config.ctx_micro_batch_size = ctx_micro_batch_size
-    assert gpt_session_config.ctx_micro_batch_size == ctx_micro_batch_size
-
-    assert gpt_session_config.gen_micro_batch_size is None
-    gen_micro_batch_size = 20
-    gpt_session_config.gen_micro_batch_size = gen_micro_batch_size
-    assert gpt_session_config.gen_micro_batch_size == gen_micro_batch_size
 
 
 def test_quant_mode():
@@ -149,50 +31,6 @@ def test_quant_mode():
     assert quant_mode.has_int4_weights
 
     assert _tb.QuantMode.none() == _tb.QuantMode.none()
-
-
-def test_decoding_mode():
-    assert _tb.DecodingMode.none().is_none
-    assert not _tb.DecodingMode.none().is_top_k
-    assert not _tb.DecodingMode.none().is_top_p
-    assert not _tb.DecodingMode.none().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.top_k().is_top_k
-    assert _tb.DecodingMode.top_k().is_top_k_or_top_p
-    assert not _tb.DecodingMode.top_k().is_top_p
-    assert not _tb.DecodingMode.top_k().is_top_k_and_top_p
-    assert not _tb.DecodingMode.top_k().is_none
-    assert not _tb.DecodingMode.top_k().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.top_p().is_top_p
-    assert _tb.DecodingMode.top_p().is_top_k_or_top_p
-    assert not _tb.DecodingMode.top_p().is_top_k
-    assert not _tb.DecodingMode.top_p().is_top_k_and_top_p
-    assert not _tb.DecodingMode.top_p().is_none
-    assert not _tb.DecodingMode.top_p().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.top_k_top_p().is_top_p
-    assert _tb.DecodingMode.top_k_top_p().is_top_k
-    assert _tb.DecodingMode.top_k_top_p().is_top_k_or_top_p
-    assert _tb.DecodingMode.top_k_top_p().is_top_k_and_top_p
-    assert not _tb.DecodingMode.top_k_top_p().is_none
-    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.beam_search().is_beam_search
-    assert not _tb.DecodingMode.beam_search().is_none
-    assert not _tb.DecodingMode.beam_search().is_top_k
-    assert not _tb.DecodingMode.beam_search().is_top_p
-    assert not _tb.DecodingMode.none().is_medusa
-
-    assert _tb.DecodingMode.medusa().is_medusa
-    assert not _tb.DecodingMode.beam_search().is_none
-    assert not _tb.DecodingMode.beam_search().is_top_k
-    assert not _tb.DecodingMode.beam_search().is_top_p
-    assert not _tb.DecodingMode.top_k_top_p().is_beam_search
 
 
 def test_model_config():
@@ -394,7 +232,7 @@ def test_gpt_json_config():
             "gpt_attention_plugin": False,
             "remove_input_padding": False,
             "use_custom_all_reduce": False,
-            "use_context_fmha_for_generation": False,
+            "context_fmha": False,
             "use_paged_context_fmha": False,
             "lora_plugin": False,
         }
@@ -419,14 +257,6 @@ def test_gpt_json_config():
         world_config) == json_config["name"] + "_float32_tp1_rank3.engine"
     assert gpt_json_config.engine_filename(
         world_config, "llama") == "llama_float32_tp1_rank3.engine"
-
-
-def test_gpt_session():
-    members = {name: tpe for (name, tpe) in inspect.getmembers(_tb.GptSession)}
-    assert isinstance(members["model_config"], property)
-    assert isinstance(members["world_config"], property)
-    assert isinstance(members["device"], property)
-    assert "generate" in members
 
 
 def test_llm_request():
@@ -642,12 +472,38 @@ def test_trt_gpt_model_optional_params():
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
+    assert not opt_params.enable_trt_overlap
     opt_params.enable_trt_overlap = True
     assert opt_params.enable_trt_overlap
 
     assert opt_params.device_ids is None
     opt_params.device_ids = [0, 1]
     assert opt_params.device_ids == [0, 1]
+
+    assert not opt_params.enable_chunked_context
+    opt_params.enable_chunked_context = True
+    assert opt_params.enable_chunked_context
+
+    assert opt_params.normalize_log_probs
+    opt_params.normalize_log_probs = False
+    assert not opt_params.normalize_log_probs
+
+    assert not opt_params.decoding_config.decoding_mode
+    opt_params.decoding_config.decoding_mode = _tb.executor.DecodingMode.TopKTopP(
+    )
+    assert opt_params.decoding_config.decoding_mode.isTopKandTopP()
+
+    assert not opt_params.max_beam_width
+    opt_params.max_beam_width = 4
+    assert opt_params.max_beam_width == 4
+
+    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    assert opt_params.scheduler_config.context_chunking_policy == None
+    opt_params.scheduler_config = _tb.executor.SchedulerConfig(
+        _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    assert opt_params.scheduler_config.context_chunking_policy == _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
 
 
 def test_trt_gpt_model_optional_params_ctor():
@@ -656,19 +512,18 @@ def test_trt_gpt_model_optional_params_ctor():
     device_ids = [0, 1]
     normalize_log_probs = False
     enable_chunked_context = True
-    decoding_mode = _tb.DecodingMode.top_k()
     peft_cache_manager_config = _tb.PeftCacheManagerConfig()
 
-    opt_params = _tb.TrtGptModelOptionalParams(
-        kv_cache_config, enable_trt_overlap, device_ids, normalize_log_probs,
-        enable_chunked_context, decoding_mode, peft_cache_manager_config)
+    opt_params = _tb.TrtGptModelOptionalParams(kv_cache_config,
+                                               enable_trt_overlap, device_ids,
+                                               normalize_log_probs,
+                                               enable_chunked_context,
+                                               peft_cache_manager_config)
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
     assert opt_params.enable_trt_overlap
     assert opt_params.device_ids == device_ids
     assert opt_params.normalize_log_probs == normalize_log_probs
     assert opt_params.enable_chunked_context == enable_chunked_context
-    assert opt_params.decoding_mode.is_top_k
-    assert opt_params.medusa_choices == None
     assert opt_params.gpu_weights_percent == 1
 
 

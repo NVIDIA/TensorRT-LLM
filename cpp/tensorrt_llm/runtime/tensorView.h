@@ -78,7 +78,7 @@ private:
     static std::size_t sizeDim0(ITensor const& tensor)
     {
         auto& shape = tensor.getShape();
-        return shape.nbDims >= 0 ? ITensor::volume(shape) / shape.d[0] : 0;
+        return shape.nbDims > 0 && shape.d[0] > 0 ? ITensor::volume(shape) / shape.d[0] : 0;
     }
 
     nvinfer1::Dims mDims{};

@@ -16,21 +16,22 @@
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, LayerNorm, MoeConfig)
+                       Embedding, GatedMLP, LayerNorm)
 from ...module import Module
-from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from .config import DbrxConfig
 
 
 class DbrxDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: DbrxConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
 
         self.input_layernorm = LayerNorm(normalized_shape=config.hidden_size,
                                          eps=config.norm_epsilon,
+                                         bias=False,
                                          dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
@@ -54,18 +55,11 @@ class DbrxDecoderLayer(Module):
 
         ClsMLP = GatedMLP
         mlp_kwargs = {}
-        if config.moe_config['num_experts'] > 1:
+        if config.moe.has_moe():
             ClsMLP = MOE
             mlp_kwargs = {
-                "moe_config":
-                MoeConfig(
-                    config.moe_config['num_experts'],
-                    config.moe_config['top_k'],
-                    config.moe_config['tp_mode'],
-                    config.moe_config['normalization_mode'],
-                ),
-                "tp_rank":
-                config.mapping.tp_rank,
+                "moe_config": config.moe,
+                "mapping": config.mapping,
             }
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
@@ -79,6 +73,7 @@ class DbrxDecoderLayer(Module):
                           **mlp_kwargs)
         self.post_layernorm = LayerNorm(normalized_shape=config.hidden_size,
                                         eps=config.norm_epsilon,
+                                        bias=False,
                                         dtype=config.dtype)
 
     def forward(self,
@@ -119,7 +114,7 @@ class DbrxDecoderLayer(Module):
 
 class DbrxModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: DbrxConfig):
         super().__init__()
         self.config = config
 
@@ -133,6 +128,7 @@ class DbrxModel(Module):
         if config.mapping.is_last_pp_rank():
             self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
                                   eps=config.norm_epsilon,
+                                  bias=False,
                                   dtype=config.dtype)
 
     def forward(self,
@@ -171,9 +167,9 @@ class DbrxModel(Module):
 
 
 class DbrxForCausalLM(DecoderModelForCausalLM):
+    config_class = DbrxConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: DbrxConfig):
         transformer = DbrxModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -190,16 +186,3 @@ class DbrxForCausalLM(DecoderModelForCausalLM):
         self.quant_mode = config.quant_mode
         self.mapping = config.mapping
         super().__init__(config, transformer, lm_head)
-
-    def check_config(self, config):
-        config.set_if_not_exist('bias', False)
-        config.set_if_not_exist('clip_qkv', None)
-        config.set_if_not_exist('rotary_base', 500000.0)
-        config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('moe_num_experts', 0)
-        config.set_if_not_exist('moe_top_k', 0)
-        config.set_if_not_exist('moe_tp_mode',
-                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
-        config.set_if_not_exist(
-            'moe_normalization_mode',
-            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE)

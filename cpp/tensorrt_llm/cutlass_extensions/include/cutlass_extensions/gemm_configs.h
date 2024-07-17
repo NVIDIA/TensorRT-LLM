@@ -16,6 +16,11 @@
 
 #pragma once
 
+#include <cassert>
+#include <iostream>
+#include <sstream>
+#include <string>
+
 namespace tensorrt_llm
 {
 namespace cutlass_extensions
@@ -62,6 +67,7 @@ enum class SplitKStyle
 {
     NO_SPLIT_K,
     SPLIT_K_SERIAL,
+    STREAM_K, // Sm80+
     // SPLIT_K_PARALLEL // Not supported yet
 };
 
@@ -106,7 +112,9 @@ enum class ClusterShape
     ClusterShape_1x1x1,
     ClusterShape_2x1x1,
     ClusterShape_1x2x1,
-    ClusterShape_2x2x1
+    ClusterShape_2x2x1,
+    ClusterShape_1x8x1,
+    ClusterShape_8x1x1
 };
 
 struct CutlassGemmConfig
@@ -153,7 +161,54 @@ struct CutlassGemmConfig
         , is_sm90(true)
     {
     }
+
+    std::string toString() const
+    {
+        std::stringstream tactic;
+        tactic << "Cutlass GEMM Tactic";
+        if (tile_config_sm90 != tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::ChooseWithHeuristic)
+        {
+            assert(is_sm90 && "Invalid cutlass GEMM config");
+            tactic << "\n\tstyle=TMA"
+                   << "\n\ttile shape ID: " << (int) tile_config_sm90 << "\n\tcluster shape ID: " << (int) cluster_shape
+                   << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule;
+        }
+        else if (tile_config != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
+        {
+            assert(!is_sm90 && "Invalid cutlass GEMM config");
+            tactic << "\n\tstyle=compatible"
+                   << "\n\ttile shape ID: " << (int) tile_config << "\n\tstages: " << (int) stages
+                   << "\n\tsplit k: " << (int) split_k_factor;
+        }
+        else
+        {
+            tactic << "\n\tundefined";
+        }
+        tactic << "\n";
+        return tactic.str();
+    }
 };
+
+inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& config)
+{
+    // clang-format off
+    if (config.is_sm90)
+    {
+        out << "tile_config_sm90_enum: " << int(config.tile_config_sm90)
+            << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
+            << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
+            << ", cluster_shape_enum: " << int(config.cluster_shape);
+    }
+    else
+    {
+        out << "tile_config_enum: " << int(config.tile_config)
+            << ", split_k_style_enum: " << int(config.split_k_style)
+            << ", split_k_factor: " << config.split_k_factor
+            << ", stages: " << config.stages;
+    }
+    // clang-format on
+    return out;
+}
 
 } // namespace cutlass_extensions
 } // namespace tensorrt_llm

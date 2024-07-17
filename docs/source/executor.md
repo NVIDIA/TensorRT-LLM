@@ -20,7 +20,7 @@ The `Executor` class is responsible for receiving requests from the client, and 
 Users can alter the logits produced the network, by providing a map of named callbacks of the form:
 
 ```
-std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr&)>>
+std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&)>>
 ```
 to the `ExecutorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
 
@@ -29,7 +29,16 @@ The first argument to the callback is the request id, second is the logits tenso
 Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
 
-Note: this feature isn't supported with the `STATIC` batching type for the moment.
+We also provide a batched version that allows altering logits of multiple requests in a batch. This allows further optimizations and reduces callback overheads.
+
+```
+std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&)>
+```
+
+A single batched callback can be specified in `ExecutorConfig`. Each request can opt to apply this callback by specifying the name of the logits
+post-processor as `Request::kBatchedPostProcessorName`.
+
+Note: Both callback variants are not supported with the `STATIC` batching type for the moment.
 
 ### The Request Class
 
@@ -43,7 +52,7 @@ The `awaitResponses` method of the `Executor` class returns a vector of response
 
 ### The Result Class
 
-The `Result` class holds the result for a given request. It contains a Boolean parameter called `isFinal` that indicates if this is the last `Result` that will be returned for the given request id. It also contains the generated tokens. If the request is configured with `streaming = false`, the `isFinal` Boolean will be set to `true` and all generated tokens will be included in the `outputTokenIds`. If `streaming = false` is used, a `Result` will only include 1 token and the `isFinal` flag will be set to `true` for the last result associated with this request.
+The `Result` class holds the result for a given request. It contains a Boolean parameter called `isFinal` that indicates if this is the last `Result` that will be returned for the given request id. It also contains the generated tokens. If the request is configured with `streaming = false`, the `isFinal` Boolean will be set to `true` and all generated tokens will be included in the `outputTokenIds`. If `streaming = true` is used, a `Result` will only include 1 token and the `isFinal` flag will be set to `true` for the last result associated with this request.
 
 ## C++ Executor API Example
 

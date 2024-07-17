@@ -53,9 +53,11 @@ protected:
         std::cout << medusaHeads << " " << maxMedusaTokens << std::endl;
 
         MedusaModule medusaModule(medusaHeads, maxMedusaTokens);
-        auto const numPackedMasks = medusaModule.numPackedMasks();
-        auto const tokensPerStep = medusaModule.tokensPerStep();
+        auto const numPackedMasks = medusaModule.getNumPackedMasks();
+        auto const tokensPerStep = medusaModule.getMaxDecodingTokens();
 
+        // batch size = 1 here.
+        TensorPtr medusaGenerationLengthsHost = mManager->pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
         TensorPtr medusaPositionOffsetsHost
             = mManager->pinned(ITensor::makeShape({tokensPerStep}), nvinfer1::DataType::kINT32);
         TensorPtr medusaTreeIdsHost = mManager->pinned(ITensor::makeShape({tokensPerStep}), nvinfer1::DataType::kINT32);
@@ -66,8 +68,8 @@ protected:
 
         SizeType32 totalPaths = 0;
         std::vector<SizeType32> topKs;
-        medusaModule.initMedusaTensorsFromChoices(choices, topKs, medusaPositionOffsetsHost, medusaTreeIdsHost,
-            medusaPathsHost, attentionPackedMaskHost, totalPaths);
+        medusaModule.initMedusaTensorsFromChoices(choices, topKs, medusaGenerationLengthsHost,
+            medusaPositionOffsetsHost, medusaTreeIdsHost, medusaPathsHost, attentionPackedMaskHost, totalPaths);
 
         std::cout << "medusaPositionOffsetsHost " << *medusaPositionOffsetsHost << std::endl;
         std::cout << "medusaTreeIdsHost " << *medusaTreeIdsHost << std::endl;
@@ -76,6 +78,9 @@ protected:
         {
             EXPECT_EQ(topKs[hi], refTopKs[hi]);
         }
+
+        // batch size = 1 here.
+        EXPECT_EQ(bufferCast<SizeType32>(*medusaGenerationLengthsHost)[0], tokensPerStep);
 
         for (SizeType32 hi = 0; hi < tokensPerStep; ++hi)
         {

@@ -65,6 +65,13 @@ def parse_args():
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
                         default=15.0)
+    parser.add_argument(
+        '--rouge_dir',
+        default=None,
+        type=str,
+        help=
+        "datasets.load_metrics('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
+    )
 
     args = parser.parse_args()
     return args
@@ -352,8 +359,10 @@ def main(args):
     # no ground truth, compare with hf
     if runtime_rank == 0 and args.test_hf and args.test_trt_llm:
 
+        rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
+            args.rouge_dir) else "rouge"
         metric_tensorrt_llm = [
-            load_metric("rouge") for _ in range(args.num_beams)
+            load_metric(rouge_dir) for _ in range(args.num_beams)
         ]
 
         for i in range(args.num_beams):

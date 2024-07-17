@@ -11,19 +11,27 @@ from cutlass_library import *
 class TrtLlm_EpilogueTag(enum.Enum):
     epilogue_op_default = enum_auto()
     epilogue_op_bias = enum_auto()
+    epilogue_op_silu = enum_auto()
+    epilogue_op_gelu = enum_auto()
 
 
 EpiTagNames = {
     TrtLlm_EpilogueTag.epilogue_op_default: "lc",  # linear combination
     TrtLlm_EpilogueTag.epilogue_op_bias:
-    "lc_bias"  # linear combination with bias addition
+    "lc_bias",  # linear combination with bias addition
+    TrtLlm_EpilogueTag.epilogue_op_silu: "silu",  # silu or swiglu
+    TrtLlm_EpilogueTag.epilogue_op_gelu: "gelu"  # gelu or geglu
 }
 
 EpiTag = {
     TrtLlm_EpilogueTag.epilogue_op_default:
     "tensorrt_llm::cutlass_extensions::EpilogueOpDefault",
     TrtLlm_EpilogueTag.epilogue_op_bias:
-    "tensorrt_llm::cutlass_extensions::EpilogueOpBias"
+    "tensorrt_llm::cutlass_extensions::EpilogueOpBias",
+    TrtLlm_EpilogueTag.epilogue_op_silu:
+    "tensorrt_llm::cutlass_extensions::EpilogueOpDefaultSilu",
+    TrtLlm_EpilogueTag.epilogue_op_gelu:
+    "tensorrt_llm::cutlass_extensions::EpilogueOpDefaultFtGelu"
 }
 
 
@@ -350,6 +358,70 @@ def generate_sm90_operations():
     return operations
 
 
+def generate_sm80_fused_grouped_gemm_operations():
+    arch = 80
+    supported_dtypes = [DataType.f16, DataType.bf16]
+    epi_tags = [
+        TrtLlm_EpilogueTag.epilogue_op_silu, TrtLlm_EpilogueTag.epilogue_op_gelu
+    ]
+    cta_shapes_mnk = [(16, 128, 64), (16, 256, 64), (32, 128, 64),
+                      (64, 128, 64), (128, 128, 64)]
+
+    stages = [2, 3, 4]
+
+    partial_args = product(supported_dtypes, epi_tags, cta_shapes_mnk, stages)
+
+    operations = list()
+    for dtype, epi_tag, cta_shape_mnk, stage in partial_args:
+        item = {
+            "arch": arch,
+            "dtype": dtype,
+            "epi_tag": epi_tag,
+            "cta_shape": cta_shape_mnk,
+            "stage": stage
+        }
+        operations.append(item)
+    return operations
+
+
+def generate_sm80_operations():
+    operations = generate_sm80_fused_grouped_gemm_operations()
+    return operations
+
+
+def get_sm80_file_content(op_item):
+    includes = f"#include <tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl>"
+    act_tag = DataTypeTag[op_item['dtype']]
+    weight_tag = DataTypeTag[op_item['dtype']]
+    epi_tag = EpiTag[op_item['epi_tag']]
+
+    instantiations = f"""
+        template void sm80_generic_fused_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {op_item['cta_shape'][0]}, {op_item['cta_shape'][1]}, {op_item['cta_shape'][2]}, {op_item['stage']}, {epi_tag}>
+                ({act_tag} const* A, {weight_tag} const* B, {act_tag} const* biases, {act_tag}* C, int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream, int* kernel_occupancy);
+"""
+    file_content = f"""{includes}
+namespace tensorrt_llm
+{{
+namespace kernels
+{{
+namespace cutlass_kernels
+{{
+
+{instantiations}
+
+}} // namespace cutlass_kernels
+}} // namespace kernels
+}} // namespace tensorrt_llm
+"""
+    return file_content
+
+
+def write_sm80_file(op_item, file_path):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, mode="w") as f:
+        f.write(get_sm80_file_content(op_item))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Print the output directory')
 
@@ -389,3 +461,14 @@ if __name__ == "__main__":
             f"cutlass_kernel_file_{file_counter}.generated.cu")
         write_file(inl_map[gemm_kind], value, out_file)
         file_counter += 1
+
+    # Since GemmKind.Grouped is used for gen sm90 moe code.
+    sm80_operations = generate_sm80_operations()
+    for op_item in sm80_operations:
+        # print(op_item)
+        out_file_path = os.path.join(
+            output_dir, "gemm_grouped",
+            f"fused_moe_sm{op_item['arch']}_{op_item['cta_shape'][0]}_{op_item['cta_shape'][1]}_{op_item['cta_shape'][2]}_{op_item['stage']}_{DataTypeNames[op_item['dtype']]}_{EpiTagNames[op_item['epi_tag']]}.generated.cu"
+        )
+        write_sm80_file(op_item, out_file_path)
+        # print(out_file_path)

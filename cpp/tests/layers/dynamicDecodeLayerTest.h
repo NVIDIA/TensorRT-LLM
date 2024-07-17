@@ -36,6 +36,8 @@
 #include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/common/tllmException.h"
 
+#include "tensorrt_llm/executor/types.h"
+
 namespace tensorrt_llm::tests::layers::sampling
 {
 
@@ -53,10 +55,12 @@ struct TestSamplingParams
     std::vector<runtime::TokenIdType> topPResetIds;
     std::vector<std::vector<std::vector<runtime::TokenIdType>>> badWords;
     std::vector<std::vector<std::vector<runtime::TokenIdType>>> stopWords;
+    std::vector<runtime::SizeType32> repeatNGramSizes;
     bool useBias{false};
 
+    std::optional<executor::DecodingMode> decodingMode;
+
     // Medusa setup
-    bool useMedusa{false};
     std::optional<runtime::SizeType32> maxNumMedusaHeads{std::nullopt};
     std::optional<std::vector<std::vector<runtime::SizeType32>>> topKMedusaHeads{std::nullopt};
     std::optional<std::vector<runtime::SizeType32>> tokensPerStep{std::nullopt};
@@ -143,7 +147,7 @@ private:
     runtime::SizeType32 mMaxBadWordsLen{0};
     runtime::SizeType32 mMaxStopWordsLen{0};
 
-    bool mUseMedusa{false};
+    executor::DecodingMode mDecodingMode = executor::DecodingMode::Auto();
 
 private:
     void allocateMedusaData(TestSamplingParams const& params);
@@ -155,9 +159,9 @@ private:
         runtime::TokenIdType** wordsPtr, runtime::SizeType32* wordsLenData, runtime::SizeType32 maxWordsLen,
         std::vector<std::vector<std::vector<runtime::TokenIdType>>> const& inputWords);
 
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeInputParams> createInputTensors(runtime::SizeType32 step);
+    std::shared_ptr<tensorrt_llm::layers::DecodingInputs> createInputTensors(runtime::SizeType32 step);
 
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeOutputParams> createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::BaseDecodingOutputs> createOutputTensors();
 
     void batchCopy(runtime::SizeType32 step);
     bool checkResult(runtime::TokenIdType* outputIds, std::vector<std::set<runtime::TokenIdType>> const& expectedIds,
@@ -167,8 +171,8 @@ private:
     void fillRefLogits(runtime::SizeType32 const* seqLenHost,
         std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, runtime::SizeType32 step);
 
-    tensorrt_llm::layers::DynamicDecodeInputParams::MedusaInputs createMedusaInputs();
-    tensorrt_llm::layers::DynamicDecodeOutputParams::MedusaOutputs createMedusaOutputs();
+    void createMedusaInputs(std::shared_ptr<tensorrt_llm::layers::DecodingInputs>& baseInputs);
+    void createMedusaOutputs(std::shared_ptr<tensorrt_llm::layers::BaseDecodingOutputs>& baseOutputs);
 
 public:
     void runTest(std::vector<std::set<runtime::TokenIdType>> const& expectedOutputIds, TestSamplingParams const& params,

@@ -292,7 +292,7 @@ class TestLayer(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_gemm_plugin(dtype)
+            net.plugin_config.gemm_plugin = dtype
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
@@ -373,7 +373,7 @@ class TestLayer(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_gemm_plugin(dtype)
+            net.plugin_config.gemm_plugin = dtype
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
@@ -1203,11 +1203,11 @@ class TestLayer(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_mamba_conv1d_plugin(dtype)
+            net.plugin_config.mamba_conv1d_plugin = dtype
         else:
-            net.plugin_config.set_mamba_conv1d_plugin(None)
+            net.plugin_config.mamba_conv1d_plugin = None
         if remove_padding:
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
         else:
             net.plugin_config.remove_input_padding = False
         net.plugin_config.paged_state = False
@@ -1375,11 +1375,11 @@ class TestLayer(unittest.TestCase):
     @parameterized.expand(list(
         product([3], [16], [1], [1280], [1280], [10], ['context', 'generation'],
                 ["float32", "float16", "bfloat16"], [True, False],
-                [True, False])),
+                [True, False], [True, False])),
                           name_func=unittest_name_func)
     def test_recurrent(self, batch_size, in_seq_len, out_seq_len, width,
                        lru_width, num_heads, req_type, dtype, remove_padding,
-                       use_plugin):
+                       use_plugin, use_fused_rg_lru):
 
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
@@ -1526,17 +1526,34 @@ class TestLayer(unittest.TestCase):
         recurrent_param.neg_().exp_().sub_(1.0).log_()
         recurrent_torch.recurrent_param.data = recurrent_param.detach().clone()
 
+        def fuse_rg_lru(recurrent_layer):
+            fused_layer = tensorrt_llm.layers.FusedRgLru(lru_width=lru_width,
+                                                         num_heads=num_heads,
+                                                         dtype=dtype)
+            fused_layer.gate.weight.value = np.concatenate([
+                recurrent_layer.rg_lru.input_gate.weight.raw_value,
+                recurrent_layer.rg_lru.recurrent_gate.weight.raw_value
+            ],
+                                                           axis=-1)
+            fused_layer.gate.bias.value = np.concatenate([
+                recurrent_layer.rg_lru.input_gate.bias.raw_value,
+                recurrent_layer.rg_lru.recurrent_gate.bias.raw_value
+            ],
+                                                         axis=-1)
+            fused_layer.recurrent_param.value = recurrent_layer.rg_lru.recurrent_param.raw_value
+            recurrent_layer.rg_lru = fused_layer
+
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
         if use_plugin:
-            net.plugin_config.set_mamba_conv1d_plugin(dtype)
-            net.plugin_config.set_gemm_plugin(dtype)
+            net.plugin_config.mamba_conv1d_plugin = dtype
+            net.plugin_config.gemm_plugin = dtype
         else:
-            net.plugin_config.set_mamba_conv1d_plugin(None)
-            net.plugin_config.set_gemm_plugin(None)
+            net.plugin_config.mamba_conv1d_plugin = None
+            net.plugin_config.gemm_plugin = None
         if remove_padding:
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
         else:
             net.plugin_config.remove_input_padding = False
         net.plugin_config.paged_state = False
@@ -1601,6 +1618,9 @@ class TestLayer(unittest.TestCase):
                 recurrent_torch.linear_out.weight.detach().cpu())
             recurrent_layer.linear_out.bias.value = torch_to_numpy(
                 recurrent_torch.linear_out.bias.detach().cpu())
+
+            if use_fused_rg_lru:
+                fuse_rg_lru(recurrent_layer)
 
             outputs = recurrent_layer(
                 hidden_states_tensor,
