@@ -253,7 +253,7 @@ Consider the following diagram, which illustrates how the hidden states from the
 are passed to the base model's language model (LM) head and to four Medusa heads (MHs).
 
 <p align="center">
-    <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/media/medusa_tree.svg?raw=true" alt="Example Medusa Tree" width="auto" height="auto">
+    <img src="./media/medusa_tree.svg" alt="Example Medusa Tree" width="auto" height="auto">
 </p>
 
 In this example:

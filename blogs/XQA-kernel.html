@@ -96,6 +96,15 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Python API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -141,7 +150,7 @@
 <p>Support matrix and usage flags are described in <a class="reference internal" href="#/docs/source/advanced/gpt-attention.md#xqa-optimization"><span class="xref myst">docs/source/advanced/gpt_attention</span></a>.</p>
 <p><strong>Increased Throughput:</strong>
 Looking at the Throughput-Latency curves below, we see that the enabling of XQA optimization increases throughput. Higher throughput equates to serving more users, and we can see that TPOT on the Y-axis flattens out when XQA gets enabled.</p>
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/XQA_ThroughputvsLatency.png?raw=true" alt="XQA increased throughput within same latency budget" width="950" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/XQA_ThroughputvsLatency.png" alt="XQA increased throughput within same latency budget" width="950" height="auto">
 <p><sub>Preliminary measured Performance, subject to change. TPOT lower is better. FP8, 8xH100 GPUs, Single Engine, ISL/OSL: 512/2048, BS: 1 - 256, TensorRT-LLM v0.8a</sub></p>
 <section id="llama-70b-on-h200-up-to-2-4x-increased-throughput-with-xqa-within-same-latency-budget">
 <h2>Llama-70B on H200 up to 2.4x increased throughput with XQA within same latency budget<a class="headerlink" href="#llama-70b-on-h200-up-to-2-4x-increased-throughput-with-xqa-within-same-latency-budget" title="Link to this heading"></a></h2>
@@ -204,7 +213,7 @@ ISL = Input Sequence Length
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f8a08e203a0>
+<jinja2.runtime.BlockReference object at 0x7f81c632eec0>
 
 <div class="footer">
     <p>
