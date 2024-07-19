@@ -60,8 +60,8 @@ struct AlibiParams
     AlibiParams(int h, float scale_after_alibi)
         : scale_after_alibi(scale_after_alibi)
     {
-        h_pow_2 = round_down_to_power_two(h);
-        alibi_neg4_div_h = -4.0f / h_pow_2;
+        h_pow_2 = h;
+        alibi_neg4_div_h = -4.0f / h;
     }
 
     AlibiParams(int h, int s, int tp_size, int rank, float scale_after_alibi)
