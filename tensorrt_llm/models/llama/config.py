@@ -152,6 +152,13 @@ class LLaMAConfig(PretrainedConfig):
                 "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
             dtype = 'float16'
 
+        dense_ffn_hidden_size = None
+        if hasattr(hf_config, "dense_ffn_hidden_size"):
+            dense_ffn_hidden_size = hf_config.dense_ffn_hidden_size,
+        moe_layers = None
+        if hasattr(hf_config, "moe_layers"):
+            moe_layers = hf_config.moe_layers
+
         return cls(
             architecture='LlamaForCausalLM',
             dtype=dtype,
@@ -159,6 +166,8 @@ class LLaMAConfig(PretrainedConfig):
             num_attention_heads=hf_config.num_attention_heads,
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.intermediate_size,
+            moe_layers=moe_layers,
+            dense_ffn_hidden_size=dense_ffn_hidden_size,
             num_key_value_heads=num_key_value_heads,
             head_size=head_size,
             vocab_size=hf_config.vocab_size,

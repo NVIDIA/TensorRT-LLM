@@ -144,6 +144,8 @@ class PretrainedConfig:
                      str] = PositionEmbeddingType.learned_absolute,
                  max_position_embeddings: Optional[int] = None,
                  num_key_value_heads: Optional[int] = None,
+                 dense_ffn_hidden_size: Optional[int] = None,
+                 moe_layers: Optional[List] = None,
                  intermediate_size: Optional[int] = None,
                  mapping: Optional[Union[Mapping, dict]] = None,
                  quantization: Optional[Union[QuantConfig, dict]] = None,
@@ -175,6 +177,9 @@ class PretrainedConfig:
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
+
+        self.dense_ffn_hidden_size = dense_ffn_hidden_size
+        self.moe_layers = moe_layers
 
         if intermediate_size is None:
             intermediate_size = hidden_size * 4

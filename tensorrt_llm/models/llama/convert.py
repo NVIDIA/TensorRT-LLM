@@ -1450,7 +1450,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                         'attention.dense.per_channel_scale'] = torch_weight_scales
                 else:
                     weights[tllm_prex + 'attention.dense.weight'] = split_v
-            elif 'mlp.up_proj.weight' in name:
+            elif 'mlp.up_proj.weight' or 'mlp.w3.weight' in name:
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1462,7 +1462,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             'mlp.gate.per_channel_scale'] = torch_weight_scales
                 else:
                     weights[tllm_prex + 'mlp.gate.weight'] = split_v
-            elif 'mlp.down_proj.weight' in name:
+            elif 'mlp.down_proj.weight' or 'mlp.w2.weight' in name:
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1475,7 +1475,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                 else:
                     weights[tllm_prex + 'mlp.proj.weight'] = split_v
 
-            elif 'mlp.gate_proj.weight' in name:
+            elif 'mlp.gate_proj.weight' or 'mlp.w1.weight' in name:
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1539,6 +1539,7 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
     dtype = config.dtype
 
     moe_config = config.moe
+    is_interleaved_moe = False if config.moe_layers is None else True
 
     kv_tp_size = None
     kv_tp_rank = None
@@ -1559,6 +1560,9 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         "mlp.gate_proj.weight",  # mlp.fc
         "input_layernorm.weight",  # input_layernorm
         "post_attention_layernorm.weight",  # post_layernorm
+        "mlp.w3.weight",  # mlp.gate
+        "mlp.w2.weight",  # mlp.proj
+        "mlp.w1.weight",  # mlp.fc
     ]
 
     torch_dtype = str_dtype_to_torch(dtype)
@@ -1666,12 +1670,19 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                      prefix + key_list[5], 1)  # attention.dense
 
         # MLP
-        if not moe_config.has_moe():
+        if not moe_config.has_moe() and not is_interleaved_moe:
             load_and_set(f'{tllm_prex}.mlp.gate.weight', prefix + key_list[6],
                          0)  # mlp.gate
             load_and_set(f'{tllm_prex}.mlp.proj.weight', prefix + key_list[7],
                          1)  # mlp.proj
             load_and_set(f'{tllm_prex}.mlp.fc.weight', prefix + key_list[8],
+                         0)  # mlp.fc
+        elif is_interleaved_moe and int(layer_idx) % 2 == 0:
+            load_and_set(f'{tllm_prex}.mlp.gate.weight', prefix + key_list[11],
+                         0)  # mlp.gate
+            load_and_set(f'{tllm_prex}.mlp.proj.weight', prefix + key_list[12],
+                         1)  # mlp.proj
+            load_and_set(f'{tllm_prex}.mlp.fc.weight', prefix + key_list[13],
                          0)  # mlp.fc
 
         else:
