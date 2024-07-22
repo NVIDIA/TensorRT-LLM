@@ -31,8 +31,9 @@ def update_crossattn_downblock_2d_weight(src, dst):
     for index, value in enumerate(src.attentions):
         update_transformer_2d_model_weight(dst.attentions[index], value)
 
-    for index, value in enumerate(src.downsamplers):
-        dst.downsamplers[index].conv.update_parameters(value.conv)
+    if src.downsamplers:
+        for index, value in enumerate(src.downsamplers):
+            dst.downsamplers[index].conv.update_parameters(value.conv)
 
 
 def update_transformer_2d_model_weight(gm, m):
@@ -160,17 +161,25 @@ def update_unet_2d_condition_model_weights(src, dst):
     dst.conv_in.update_parameters(src.conv_in)
 
     dst.time_embedding.update_parameters(src.time_embedding)
+    if src.config.addition_embed_type:
+        dst.add_embedding.update_parameters(src.add_embedding)
 
-    for index, value in enumerate(src.down_blocks[:-1]):
-        update_crossattn_downblock_2d_weight(value, dst.down_blocks[index])
-
-    update_downblock_2d_weight(src.down_blocks[-1], dst.down_blocks[-1])
+    for index, type in enumerate(src.config.down_block_types):
+        if type == 'CrossAttnDownBlock2D':
+            update_crossattn_downblock_2d_weight(src.down_blocks[index],
+                                                 dst.down_blocks[index])
+        elif type == 'DownBlock2D':
+            update_downblock_2d_weight(src.down_blocks[index],
+                                       dst.down_blocks[index])
 
     update_unet_mid_block_2d_weight(src.mid_block, dst.mid_block)
 
-    update_upblock_2d_weight(src.up_blocks[0], dst.up_blocks[0])
-    for index, value in enumerate(src.up_blocks[1:]):
-        update_crossattn_upblock_2d_weight(value, dst.up_blocks[index + 1])
+    for index, type in enumerate(src.config.up_block_types):
+        if type == 'CrossAttnUpBlock2D':
+            update_crossattn_upblock_2d_weight(src.up_blocks[index],
+                                               dst.up_blocks[index])
+        elif type == 'UpBlock2D':
+            update_upblock_2d_weight(src.up_blocks[index], dst.up_blocks[index])
 
     dst.conv_norm_out.update_parameters(src.conv_norm_out)
 

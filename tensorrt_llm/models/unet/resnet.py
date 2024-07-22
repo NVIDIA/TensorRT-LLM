@@ -14,7 +14,7 @@
 # limitations under the License.
 from functools import partial
 
-from ...functional import avg_pool2d, interpolate, silu, view
+from ...functional import avg_pool2d, interpolate, silu
 from ...layers import (AvgPool2d, Conv2d, ConvTranspose2d, GroupNorm, Linear,
                        Mish)
 from ...module import Module
@@ -26,7 +26,8 @@ class Upsample2D(Module):
                  channels: int,
                  use_conv=False,
                  use_conv_transpose=False,
-                 out_channels=None) -> None:
+                 out_channels=None,
+                 dtype=None) -> None:
         super().__init__()
 
         self.channels = channels
@@ -35,11 +36,17 @@ class Upsample2D(Module):
         self.use_conv_transpose = use_conv_transpose
         self.use_conv = use_conv
         if self.use_conv_transpose:
-            self.conv = ConvTranspose2d(channels, self.out_channels, 4, 2, 1)
+            self.conv = ConvTranspose2d(channels,
+                                        self.out_channels,
+                                        4,
+                                        2,
+                                        1,
+                                        dtype=dtype)
         elif use_conv:
             self.conv = Conv2d(self.channels,
                                self.out_channels, (3, 3),
-                               padding=(1, 1))
+                               padding=(1, 1),
+                               dtype=dtype)
         else:
             self.conv = None
 
@@ -72,7 +79,8 @@ class Downsample2D(Module):
                  channels,
                  use_conv=False,
                  out_channels=None,
-                 padding=1) -> None:
+                 padding=1,
+                 dtype=None) -> None:
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
@@ -84,7 +92,8 @@ class Downsample2D(Module):
             self.conv = Conv2d(self.channels,
                                self.out_channels, (3, 3),
                                stride=stride,
-                               padding=(padding, padding))
+                               padding=(padding, padding),
+                               dtype=dtype)
         else:
             assert self.channels == self.out_channels
             self.conv = AvgPool2d(kernel_size=stride, stride=stride)
@@ -121,6 +130,7 @@ class ResnetBlock2D(Module):
         use_in_shortcut=None,
         up=False,
         down=False,
+        dtype=None,
     ):
         super().__init__()
         self.pre_norm = pre_norm
@@ -140,27 +150,33 @@ class ResnetBlock2D(Module):
         self.norm1 = GroupNorm(num_groups=groups,
                                num_channels=in_channels,
                                eps=eps,
-                               affine=True)
+                               affine=True,
+                               dtype=dtype)
         self.conv1 = Conv2d(in_channels,
                             out_channels,
                             kernel_size=(3, 3),
                             stride=(1, 1),
-                            padding=(1, 1))
+                            padding=(1, 1),
+                            dtype=dtype)
 
         if temb_channels is not None:
-            self.time_emb_proj = Linear(temb_channels, out_channels)
+            self.time_emb_proj = Linear(temb_channels,
+                                        out_channels,
+                                        dtype=dtype)
         else:
             self.time_emb_proj = None
 
         self.norm2 = GroupNorm(num_groups=groups_out,
                                num_channels=out_channels,
                                eps=eps,
-                               affine=True)
+                               affine=True,
+                               dtype=dtype)
         self.conv2 = Conv2d(out_channels,
                             out_channels,
                             kernel_size=(3, 3),
                             stride=(1, 1),
-                            padding=(1, 1))
+                            padding=(1, 1),
+                            dtype=dtype)
 
         if non_linearity == "swish":
             self.nonlinearity = lambda x: silu(x)
@@ -177,7 +193,9 @@ class ResnetBlock2D(Module):
                                         scale_factor=2.0,
                                         mode="nearest")
             else:
-                self.upsample = Upsample2D(in_channels, use_conv=False)
+                self.upsample = Upsample2D(in_channels,
+                                           use_conv=False,
+                                           dtype=dtype)
         elif self.down:
 
             if kernel == "sde_vp":
@@ -186,7 +204,8 @@ class ResnetBlock2D(Module):
                 self.downsample = Downsample2D(in_channels,
                                                use_conv=False,
                                                padding=1,
-                                               name="op")
+                                               name="op",
+                                               dtype=dtype)
 
         self.use_in_shortcut = self.in_channels != self.out_channels if use_in_shortcut is None else use_in_shortcut
 
@@ -195,7 +214,8 @@ class ResnetBlock2D(Module):
                                         out_channels,
                                         kernel_size=(1, 1),
                                         stride=(1, 1),
-                                        padding=(0, 0))
+                                        padding=(0, 0),
+                                        dtype=dtype)
         else:
             self.conv_shortcut = None
 
@@ -210,12 +230,17 @@ class ResnetBlock2D(Module):
         elif self.downsample is not None:
             input_tensor = self.downsample(input_tensor)
             hidden_states = self.downsample(hidden_states)
+
         hidden_states = self.conv1(hidden_states)
-        if temb is not None:
+        if self.time_emb_proj is not None:
             temb = self.time_emb_proj(self.nonlinearity(temb))
             new_shape = list(temb.size())
             new_shape.extend([1, 1])  #[:,:,None,None] ->view
-            hidden_states = hidden_states + view(temb, new_shape)
+            temb = temb.view(new_shape)
+
+        assert self.time_embedding_norm == "default"
+        if temb is not None:
+            hidden_states = hidden_states + temb
 
         hidden_states = self.norm2(hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
