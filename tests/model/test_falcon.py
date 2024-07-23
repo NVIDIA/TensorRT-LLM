@@ -351,6 +351,10 @@ class TestFalcon(unittest.TestCase):
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_input_ids.contiguous(),
             'position_ids': ctx_position_ids.contiguous(),
@@ -363,6 +367,7 @@ class TestFalcon(unittest.TestCase):
             'host_past_key_value_lengths':
             host_past_key_value_lengths.contiguous(),
             'host_sink_token_length': host_sink_token_length,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -437,6 +442,9 @@ class TestFalcon(unittest.TestCase):
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length = torch.add(sequence_length, 1)
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+
         step1_buffer = {
             'input_ids': gen_id,
             'context_lengths': gen_context_lengths.contiguous(),
@@ -449,6 +457,7 @@ class TestFalcon(unittest.TestCase):
             'host_past_key_value_lengths':
             host_past_key_value_lengths.contiguous(),
             'host_sink_token_length': host_sink_token_length,
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

@@ -157,27 +157,25 @@ class MoeGemmRunner
 public:
     MoeGemmRunner();
 
-    void setBestConfig(std::optional<cutlass_extensions::CutlassGemmConfig> best_config)
-    {
-        best_config_ = std::move(best_config);
-    }
-
     void moeGemmBiasAct(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
-        int64_t* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, ActivationType activation_type, bool use_fused_moe, cudaStream_t stream);
+        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
+        int64_t gemm_k, int num_experts, ActivationType activation_type, bool use_fused_moe, cudaStream_t stream,
+        cutlass_extensions::CutlassGemmConfig chosen_conf);
 
-    void moeGemm(T const* A, WeightType const* B, T const* weight_scales, T* C, int64_t* total_rows_before_expert,
+    void moeGemm(T const* A, WeightType const* B, T const* weight_scales, T* C, int64_t const* total_rows_before_expert,
         HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
-        bool use_fused_moe, cudaStream_t stream);
+        bool use_fused_moe, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
     static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
     static std::vector<cutlass_extensions::CutlassGemmConfig> getHopperConfigs(int sm);
     static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
-    bool isHopperSpecialised() const;
-    bool supportsHopperSpecialisation() const;
-    [[nodiscard]] bool isFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool isHopperSpecialised(cutlass_extensions::CutlassGemmConfig gemm_config) const;
+    [[nodiscard]] bool supportsHopperSpecialisation() const;
+    [[nodiscard]] bool isFusedGatedActivation(
+        cutlass_extensions::CutlassGemmConfig gemm_config, bool is_gated_activation, int gemm_n, int gemm_k) const;
+    [[nodiscard]] bool supportsFusedGatedActivation(bool is_gated_activation, int gemm_n, int gemm_k) const;
 
     size_t getMaxWorkspaceSize(int num_experts) const;
 
@@ -186,21 +184,21 @@ public:
 private:
     template <typename EpilogueTag>
     void dispatchToArch(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
-        int64_t* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
+        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
         int64_t gemm_k, int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe,
         cudaStream_t stream, int* occupancy = nullptr);
 
     template <typename EpilogueTag>
     void runGemm(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
-        int64_t* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, bool use_fused_moe, cudaStream_t stream);
+        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
+        int64_t gemm_k, int num_experts, bool use_fused_moe, cudaStream_t stream,
+        cutlass_extensions::CutlassGemmConfig chosen_conf);
 
 private:
     int sm_{};
     int multi_processor_count_{};
     mutable int num_experts_ = 0;
     mutable size_t gemm_workspace_size_ = 0;
-    std::optional<cutlass_extensions::CutlassGemmConfig> best_config_{};
     size_t calcMaxWorkspaceSize(int num_experts) const;
 };
 

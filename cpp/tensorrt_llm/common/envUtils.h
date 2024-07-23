@@ -45,4 +45,7 @@ int getEnvMmhaBlocksPerSequence();
 
 int getEnvMmhaKernelBlockSize();
 
+// Whether FDL is enabled.
+bool getEnvEnableFDL();
+
 } // namespace tensorrt_llm::common

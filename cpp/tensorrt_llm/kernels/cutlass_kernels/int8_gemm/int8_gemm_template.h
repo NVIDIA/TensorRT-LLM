@@ -40,7 +40,6 @@
 #pragma GCC diagnostic pop
 #endif // #ifndef _WIN32
 
-#include "tensorrt_llm/common/allocator.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
@@ -322,7 +321,7 @@ CutlassInt8GemmRunner<T>::~CutlassInt8GemmRunner()
 template <typename T>
 void CutlassInt8GemmRunner<T>::dispatchToArch(int8_t const* A, int8_t const* B, tk::QuantMode quantOption,
     float const* alphaCol, float const* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig,
-    char* workspacePtr, const size_t workspaceBytes, cudaStream_t stream, int* occupancy)
+    char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     if (mSm >= 70 && mSm < 72)
@@ -355,7 +354,7 @@ void CutlassInt8GemmRunner<T>::dispatchToArch(int8_t const* A, int8_t const* B, 
 template <typename T>
 void CutlassInt8GemmRunner<T>::gemm(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol,
     float const* alphaRow, void* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspacePtr,
-    const size_t workspaceBytes, cudaStream_t stream)
+    size_t const workspaceBytes, cudaStream_t stream)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     dispatchToArch(A, B, quantOption, alphaCol, alphaRow, reinterpret_cast<T*>(C), m, n, k, gemmConfig, workspacePtr,

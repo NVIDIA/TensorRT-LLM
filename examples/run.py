@@ -140,7 +140,7 @@ def parse_input(tokenizer,
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
 
-    if input_file is None and model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+    if input_file is None and 'GLM' in model_name and model_version == 'glm':
         for ids in batch_input_ids:
             ids.append(tokenizer.sop_token_id)
 
@@ -363,7 +363,8 @@ def main(args):
             kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
             kv_cache_free_gpu_memory_fraction=args.
             kv_cache_free_gpu_memory_fraction,
-            enable_chunked_context=args.enable_chunked_context)
+            enable_chunked_context=args.enable_chunked_context,
+            multi_block_mode=args.multi_block_mode)
     runner = runner_cls.from_dir(**runner_kwargs)
 
     with torch.no_grad():

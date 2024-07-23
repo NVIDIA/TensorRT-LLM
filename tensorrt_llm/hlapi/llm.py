@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Union
 
+from transformers import PreTrainedTokenizerBase
+
 from .. import bindings as tllm
 from ..bindings import executor as tllm
 from ..executor import GenerationExecutor, GenerationResult
@@ -54,9 +56,8 @@ class LLM:
 
     def __init__(self,
                  model: str,
-                 tokenizer: Optional[
-                     Union[str, Path, TokenizerBase,
-                           'transformers.PreTrainedTokenizerBase']] = None,
+                 tokenizer: Optional[Union[str, Path, TokenizerBase,
+                                           PreTrainedTokenizerBase]] = None,
                  skip_tokenizer_init: bool = False,
                  tensor_parallel_size: int = 1,
                  dtype: str = "auto",
@@ -67,7 +68,8 @@ class LLM:
         Args:
             model(str): The model name or a local path to the model directory. It could be a HuggingFace(HF) model name,
                 a local path to the HF model, or a local path to the TRT-LLM engine or checkpoint.
-            tokenizer(Optional[TokenizerBase]): The tokenizer for the model.
+            tokenizer(Optional[Union[str, Path, TokenizerBase, PreTrainedTokenizerBase]]): The tokenizer name or a local
+                path to the tokenizer directory.
             skip_tokenizer_init: If true, skip initialization of tokenizer and detokenizer. generate and generate_async
                 will accept prompt token ids as input only.
             tensor_parallel_size(int): The number of processes for tensor parallelism.

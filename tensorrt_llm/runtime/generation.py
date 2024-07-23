@@ -490,7 +490,6 @@ class ModelConfig:
     gather_context_logits: bool = False
     gather_generation_logits: bool = False
     dtype: str = ""
-    use_custom_all_reduce: bool = False
     lora_plugin: bool = False
     lora_target_modules: List[str] = field(default_factory=list)
     trtllm_modules_to_hf_modules: dict = None
@@ -754,7 +753,7 @@ class GenerationSession(object):
                 self.vocab_size, self.vocab_size_padded, self.mapping.tp_size,
                 self.mapping.pp_size, self.decoder_logits_dtype)
 
-        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1:
             set_peer_access(self.mapping)
             self.ipc_buffers, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
@@ -831,7 +830,8 @@ class GenerationSession(object):
         if model_config.gpt_attention_plugin and self.has_attn_layers:
             expected_tensor_names += [
                 'sequence_length', 'context_lengths', 'host_request_types',
-                'host_past_key_value_lengths', 'host_sink_token_length'
+                'host_past_key_value_lengths', 'host_sink_token_length',
+                'host_runtime_perf_knobs'
             ]
             expected_tensor_names += [f'host_max_attention_window_sizes']
             if model_config.remove_input_padding:
@@ -860,7 +860,7 @@ class GenerationSession(object):
             if self.skip_cross_qkv:
                 expected_tensor_names += ['cross_qkv_reuse']
 
-        if self.mapping.tp_size > 1 and model_config.use_custom_all_reduce:
+        if self.mapping.tp_size > 1:
             expected_tensor_names += ['all_reduce_workspace']
 
         self.lora_target_modules = model_config.lora_target_modules
@@ -990,10 +990,6 @@ class GenerationSession(object):
     @property
     def dtype(self):
         return str_dtype_to_torch(self._model_config.dtype)
-
-    @property
-    def use_custom_all_reduce(self):
-        return self._model_config.use_custom_all_reduce
 
     @property
     def profiler(self):
@@ -1497,7 +1493,8 @@ class GenerationSession(object):
               encoder_max_input_length: Optional[int] = None,
               lora_manager: LoraManager = None,
               lora_uids: List[str] = None,
-              medusa_choices: List[List[int]] = None):
+              medusa_choices: List[List[int]] = None,
+              multi_block_mode: bool = None):
         # Store these params related to buffer size to check against
         # the input shape with the params given in decode()
         self.batch_size = batch_size
@@ -1508,6 +1505,7 @@ class GenerationSession(object):
             self.max_seq_length += self.max_draft_tokens
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
+        self.multi_block_mode = multi_block_mode
         if max_attention_window_size is None:
             self.max_attention_window_size = self.max_seq_length
             logger.debug(
@@ -1799,7 +1797,9 @@ class GenerationSession(object):
             tasks: torch.Tensor = None,
             prompt_vocab_size: torch.Tensor = None,
             encoder_output: torch.Tensor = None,
-            encoder_input_lengths: torch.Tensor = None) -> List[RuntimeTensor]:
+            encoder_input_lengths: torch.Tensor = None,
+            host_runtime_perf_knobs: torch.Tensor = None
+    ) -> List[RuntimeTensor]:
         tensors = {}
 
         def sym(x, name):
@@ -1822,6 +1822,8 @@ class GenerationSession(object):
         if self.has_attn_layers:
             if self.use_gpt_attention_plugin:
                 add_tensor(context_lengths, 'context_lengths')
+                assert host_runtime_perf_knobs != None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
+                add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
             add_tensor(cache_indirection, 'cache_indirection')
 
             if self.has_position_embedding:
@@ -2030,7 +2032,7 @@ class GenerationSession(object):
             if self.has_attn_layers:
                 add_tensor(attention_mask, 'attention_mask')
 
-        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
         if self.use_lora_plugin:
@@ -2078,7 +2080,8 @@ class GenerationSession(object):
             tasks: torch.Tensor = None,
             prompt_vocab_size: torch.Tensor = None,
             encoder_output: torch.Tensor = None,
-            encoder_input_lengths: torch.Tensor = None):
+            encoder_input_lengths: torch.Tensor = None,
+            host_runtime_perf_knobs: torch.Tensor = None):
         torch.cuda.nvtx.range_push("_get_next_step_shape_buffer")
         tensors = {}  # Dict[str, RuntimeTensor]
 
@@ -2097,6 +2100,8 @@ class GenerationSession(object):
         if self.has_attn_layers:
             if self.use_gpt_attention_plugin:
                 add_tensor(context_lengths_local, 'context_lengths')
+                assert host_runtime_perf_knobs != None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
+                add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
             add_tensor(cache_indirection, 'cache_indirection')
             if self.has_position_embedding:
                 add_tensor(position_ids, 'position_ids')
@@ -2336,7 +2341,7 @@ class GenerationSession(object):
             if self.has_attn_layers:
                 add_tensor(attention_mask, 'attention_mask')
 
-        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
 
         # Since we are using a ping-pong context design and the lora weight remains constant within the same request,
@@ -2399,6 +2404,14 @@ class GenerationSession(object):
                                             device='cuda').reshape(
                                                 [1,
                                                  -1]).expand([batch_size, -1])
+
+            perf_knob_tensor_size = 16
+            context_runtime_perf_knobs = torch.tensor([-1] *
+                                                      perf_knob_tensor_size,
+                                                      dtype=torch.int64)
+            if self.multi_block_mode:
+                context_runtime_perf_knobs[0] = 1
+            ret['host_runtime_perf_knobs'] = context_runtime_perf_knobs
         else:
             if self.has_attn_layers:
                 input_ids = kwargs.pop('input_ids')
@@ -2471,6 +2484,13 @@ class GenerationSession(object):
             position_ids = context_lengths + step
             if not remove_input_padding:
                 position_ids = torch.unsqueeze(position_ids, 1)
+
+            perf_knob_tensor_size = 16
+            gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+            if self.multi_block_mode:
+                gen_runtime_perf_knobs[0] = 1
+            ret['host_runtime_perf_knobs'] = gen_runtime_perf_knobs
         elif self.has_attn_layers:
             attention_mask = kwargs.pop('attention_mask')
             num_beams = kwargs.pop('num_beams')
@@ -2923,6 +2943,8 @@ class GenerationSession(object):
             position_ids = model_inputs.get('position_ids', None)
             last_token_ids = model_inputs.get('last_token_ids')
             attention_mask = model_inputs.get('attention_mask', None)
+            context_runtime_perf_knobs = model_inputs.get(
+                'host_runtime_perf_knobs', None)
 
             if self.paged_kv_cache and self.has_attn_layers:
                 host_kv_cache_block_offsets = self.kv_cache_manager.get_block_offsets(
@@ -2935,13 +2957,25 @@ class GenerationSession(object):
                         'cuda')
 
             ctx_tensors = self._get_context_shape_buffer(
-                input_ids, context_lengths, host_context_lengths, position_ids,
-                last_token_ids, attention_mask, cross_attention_mask,
-                this_src_cache_indirection, kv_cache_block_offsets,
-                host_kv_cache_block_offsets, cross_kv_cache_block_offsets,
-                host_cross_kv_cache_block_offsets, hidden_states,
-                prompt_embedding_table, tasks, prompt_vocab_size,
-                encoder_output, encoder_input_lengths)
+                input_ids,
+                context_lengths,
+                host_context_lengths,
+                position_ids,
+                last_token_ids,
+                attention_mask,
+                cross_attention_mask,
+                this_src_cache_indirection,
+                kv_cache_block_offsets,
+                host_kv_cache_block_offsets,
+                cross_kv_cache_block_offsets,
+                host_cross_kv_cache_block_offsets,
+                hidden_states,
+                prompt_embedding_table,
+                tasks,
+                prompt_vocab_size,
+                encoder_output,
+                encoder_input_lengths,
+                host_runtime_perf_knobs=context_runtime_perf_knobs)
 
             context = self.runtime.ctx_context
             self.runtime._set_tensors(context, ctx_tensors)
@@ -3071,6 +3105,8 @@ class GenerationSession(object):
             position_ids = model_inputs.get('position_ids', None)
             last_token_ids = model_inputs.get('last_token_ids')
             attention_mask = model_inputs.get('attention_mask', None)
+            gen_runtime_perf_knobs = model_inputs.get('host_runtime_perf_knobs',
+                                                      None)
 
             # Prepare for the next step, and always allocate 1 token slot.
             if self.paged_kv_cache and self.has_attn_layers:
@@ -3113,14 +3149,28 @@ class GenerationSession(object):
 
             next_context = self.runtime.context_1 if step % 2 else self.runtime.context_0
             next_step_tensors = self._get_next_step_shape_buffer(
-                batch_size, beam_width, max_context_length, step,
-                context_lengths, host_context_lengths, position_ids,
-                last_token_ids, attention_mask, cross_attention_mask,
-                next_src_cache_indirection, kv_cache_block_offsets,
-                host_kv_cache_block_offsets, cross_kv_cache_block_offsets,
-                host_cross_kv_cache_block_offsets, hidden_states,
-                prompt_embedding_table, tasks, prompt_vocab_size,
-                encoder_output, encoder_input_lengths)
+                batch_size,
+                beam_width,
+                max_context_length,
+                step,
+                context_lengths,
+                host_context_lengths,
+                position_ids,
+                last_token_ids,
+                attention_mask,
+                cross_attention_mask,
+                next_src_cache_indirection,
+                kv_cache_block_offsets,
+                host_kv_cache_block_offsets,
+                cross_kv_cache_block_offsets,
+                host_cross_kv_cache_block_offsets,
+                hidden_states,
+                prompt_embedding_table,
+                tasks,
+                prompt_vocab_size,
+                encoder_output,
+                encoder_input_lengths,
+                host_runtime_perf_knobs=gen_runtime_perf_knobs)
 
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
             # needs to pro-long the life time of the tensors inside the next_step_tensors array
@@ -3846,9 +3896,14 @@ class ChatGLMGenerationSession(GenerationSession):
 
             position_ids = position_ids.cuda()
 
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         inputs = {
             'position_ids': position_ids,
-            'last_token_ids': last_token_ids
+            'last_token_ids': last_token_ids,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs
         }
         if not use_gpt_attention_plugin:
             attention_mask = torch.zeros((batch_size, 1))
@@ -3900,9 +3955,15 @@ class ChatGLMGenerationSession(GenerationSession):
             position_ids = torch.tensor(data, dtype=torch.int32, device='cuda')
             position_ids = _tile_beam_width(position_ids, num_beams)
 
+        perf_knob_tensor_size = 16
+        generation_runtime_perf_knobs = torch.tensor([-1] *
+                                                     perf_knob_tensor_size,
+                                                     dtype=torch.int64)
+
         inputs = {
             'position_ids': position_ids,
-            'last_token_ids': last_token_ids
+            'last_token_ids': last_token_ids,
+            'host_runtime_perf_knobs': generation_runtime_perf_knobs
         }
         if not use_gpt_attention_plugin:
             attention_mask = torch.zeros((batch_size, 1))

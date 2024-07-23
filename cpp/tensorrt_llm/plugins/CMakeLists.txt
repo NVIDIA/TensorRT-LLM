@@ -39,6 +39,7 @@ set(PLUGIN_LISTS
     identityPlugin
     gemmPlugin
     gemmSwigluPlugin
+    fp8RowwiseGemmPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin

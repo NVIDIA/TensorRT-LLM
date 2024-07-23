@@ -94,6 +94,7 @@ public:
     TensorPtr kvCacheBlockPoolPointers;
     TensorPtr kvCacheBlockOffsetsHost;         // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
     TensorPtr kvCacheBlockOffsetsDevice;       // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr runtimePerfKnobsHost;            // can hold max 16 perf knobs
 };
 
 } // namespace tensorrt_llm::runtime

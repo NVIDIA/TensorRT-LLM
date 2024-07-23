@@ -137,6 +137,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _gpt_attention_plugin: Optional[str] = field(default="auto", init=False)
     _gemm_plugin: Optional[str] = field(default=None, init=False)
     _gemm_swiglu_plugin: Optional[str] = field(default=None, init=False)
+    _fp8_rowwise_gemm_plugin: Optional[str] = field(default=None, init=False)
     _smooth_quant_gemm_plugin: Optional[str] = field(default=None, init=False)
     _identity_plugin: Optional[str] = field(default=None, init=False)
     _layernorm_quantization_plugin: Optional[str] = field(default=None,
@@ -161,9 +162,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
         default=False, init=False)  # will use fp16 if disabled
     _paged_kv_cache: bool = field(default=True, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
-    _use_custom_all_reduce: bool = field(default=True, init=False)
     _reduce_fusion: bool = field(default=False, init=False)
-    _multi_block_mode: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
     _tokens_per_block: int = field(default=64, init=False)
     _use_paged_context_fmha: bool = field(default=False, init=False)
@@ -247,6 +246,14 @@ class PluginConfig(metaclass=PluginConfigMeta):
         self.quantize_tensor_plugin = True
         return self
 
+    def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
+        self.fp8_rowwise_gemm_plugin = dtype
+        self.rmsnorm_quantization_plugin = dtype
+        # self.layernorm_quantization_plugin = dtype
+        self.quantize_per_token_plugin = True
+        self.quantize_tensor_plugin = True
+        return self
+
     def set_context_fmha(self, context_fmha_type=ContextFMHAType.enabled):
         assert type(context_fmha_type) == ContextFMHAType
         self.context_fmha_type = context_fmha_type
@@ -257,17 +264,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
         self.tokens_per_block = tokens_per_block
         return self
 
-    def set_nccl_plugin(self,
-                        dtype: str = "auto",
-                        use_custom_all_reduce: bool = True):
-        if not use_custom_all_reduce:
-            logger.warning(
-                "allreduce algorithm is selected automatically during execution now. "
-                "use_custom_all_reduce will be deprecated in future releases. ")
+    def set_nccl_plugin(self, dtype: str = "auto"):
         self.nccl_plugin = dtype
-        self.use_custom_all_reduce = use_custom_all_reduce
-        if use_custom_all_reduce:
-            init_all_reduce_helper()
+        init_all_reduce_helper()
         return self
 
 
@@ -277,6 +276,7 @@ cli_plugin_args = [
     "gpt_attention_plugin",
     "gemm_plugin",
     "gemm_swiglu_plugin",
+    "fp8_rowwise_gemm_plugin",
     "lookup_plugin",
     "lora_plugin",
     "moe_plugin",
@@ -288,8 +288,6 @@ cli_plugin_args = [
     "context_fmha_fp32_acc",
     "paged_kv_cache",
     "remove_input_padding",
-    "use_custom_all_reduce",
-    "multi_block_mode",
     "enable_xqa",
     "tokens_per_block",
     "use_paged_context_fmha",

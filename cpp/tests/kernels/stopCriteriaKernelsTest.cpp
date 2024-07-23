@@ -393,9 +393,8 @@ public:
 
         auto numNewTokens = tokensPerStep.size() ? bufferCast<SizeType32>(*mTokensPerStep) : nullptr;
 
-        tk::invokeStopWordsCriterion(reinterpret_cast<TokenIdType const**>(bufferCast<int64_t>(*mOutputIdsPtr)),
-            reinterpret_cast<SizeType32 const**>(bufferCast<int64_t>(*mParentIdsPtr)),
-            reinterpret_cast<TokenIdType const**>(bufferCast<int64_t>(*mStopWordsPtr)),
+        tk::invokeStopWordsCriterion(bufferCast<TokenIdType const*>(*mOutputIdsPtr),
+            bufferCast<TokenIdType const*>(*mParentIdsPtr), bufferCast<TokenIdType const*>(*mStopWordsPtr),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinished)),
             bufferCast<SizeType32>(*mSequenceLengths), bufferCast<SizeType32>(*mBatchSlots),
             bufferCast<SizeType32>(*mStopWordsLen), numNewTokens, maxStopWordsLen, batchSize, beamWidth, mMaxSeqLen,

@@ -464,20 +464,23 @@ class OrchestratorConfig
 {
 public:
     explicit OrchestratorConfig(bool isOrchestrator = true, std::string workerExecutablePath = "",
-        std::shared_ptr<mpi::MpiComm> orchLeaderComm = nullptr);
+        std::shared_ptr<mpi::MpiComm> orchLeaderComm = nullptr, bool spawnProcesses = true);
 
     [[nodiscard]] bool getIsOrchestrator() const;
     [[nodiscard]] std::string getWorkerExecutablePath() const;
     [[nodiscard]] std::shared_ptr<mpi::MpiComm> getOrchLeaderComm() const;
+    [[nodiscard]] bool getSpawnProcesses() const;
 
     void setIsOrchestrator(bool isOrchestrator);
     void setWorkerExecutablePath(std::string const& workerExecutablePath);
     void setOrchLeaderComm(std::shared_ptr<mpi::MpiComm> const& orchLeaderComm);
+    void setSpawnProcesses(bool spawnProcesses);
 
 private:
     bool mIsOrchestrator;
     std::string mWorkerExecutablePath;
     std::shared_ptr<mpi::MpiComm> mOrchLeaderComm;
+    bool mSpawnProcesses;
 };
 
 /// @brief A configuration class for the parallel execution parameters
@@ -664,7 +667,8 @@ public:
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt,
-        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1);
+        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1,
+        std::optional<SizeType32> maxQueueSize = std::nullopt, bool multiBlockMode = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -682,6 +686,8 @@ public:
     [[nodiscard]] std::optional<LogitsPostProcessorBatched> getLogitsPostProcessorBatched() const;
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
+    [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
+    [[nodiscard]] bool getMultiBlockMode() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -699,6 +705,8 @@ public:
     void setLogitsPostProcessorBatched(LogitsPostProcessorBatched const& logitsPostProcessorBatched);
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
+    void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
+    void setMultiBlockMode(bool const multiBlockMode);
 
 private:
     friend class Serialization;
@@ -738,9 +746,18 @@ private:
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
     std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
+
     /// @brief Decoding configuration.
     std::optional<DecodingConfig> mDecodingConfig;
+
+    /// @brief GPU weights percent for weight streaming.
     float mGpuWeightsPercent;
+
+    /// @brief The maximum number of requests allowed in queue before rejecting new requests.
+    std::optional<SizeType32> mMaxQueueSize;
+
+    /// @brief Control if multi block mode should be enabled or not.
+    bool mMultiBlockMode;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference

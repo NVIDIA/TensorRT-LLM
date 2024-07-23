@@ -10,6 +10,7 @@ from parameterized import parameterized
 from tensorrt_llm.hlapi.llm import LLM, SamplingParams
 from tensorrt_llm.hlapi.llm_utils import KvCacheConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -58,16 +59,11 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@pytest.fixture(scope="module")
 @skip_single_gpu
-@pytest.mark.parametrize("enable_executor", [True, False])
 def test_llm_loading_from_ckpt_for_tp2(
-        engine_from_checkpoint: tempfile.TemporaryDirectory,
-        enable_executor: bool):
+        engine_from_checkpoint: tempfile.TemporaryDirectory):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    llm = LLM(engine_from_checkpoint.name,
-              tokenizer=tokenizer,
-              enable_executor=enable_executor)
+    llm = LLM(engine_from_checkpoint.name, tokenizer=tokenizer)
 
     sampling_params = SamplingParams(max_new_tokens=8)
 

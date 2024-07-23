@@ -35,35 +35,30 @@ class SamplingLayer : public BaseLayer
 public:
     using Base = BaseLayer;
 
-    SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~SamplingLayer() override = default;
-
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
+
 private:
-    using Base::mWorkspaceSize;
-    using Base::mAllocatedSize;
-
-    using Base::mStream;
-    using Base::mAllocator;
-
     using Base::mDecoderDomain;
 
     executor::DecodingMode mDecodingMode;
 
-    void* mSamplingWorkspaceDevice{nullptr};
-    curandState_t* mCurandStatesDevice{nullptr};
-    uint64_t* mRandomSeedsDevice{nullptr};
+    BufferPtr mSamplingWorkspaceDevice;
+    TensorPtr mCurandStatesDevice;
+    TensorPtr mRandomSeedsDevice;
 
-    bool* mSkipDecodeDevice{nullptr};
+    TensorPtr mSkipDecodeDevice;
 
-    bool* mSkipDecodeHost{nullptr};
+    TensorPtr mSkipDecodeHost;
     bool mSkipAny{false};
 
     bool mOutputLogProbs{false};
@@ -73,7 +68,6 @@ private:
 
 private:
     void allocateBuffer(runtime::SizeType32 batchSize);
-    void freeBuffer();
 };
 
 } // namespace tensorrt_llm::layers

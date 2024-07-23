@@ -142,7 +142,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     paged_kv_cache = plugin_config['paged_kv_cache']
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
-    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
 
     model_config = ModelConfig(
@@ -169,7 +168,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         dtype=dtype,
-        use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
@@ -487,8 +485,6 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'max_draft_len') else 0,
             num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
                 pretrained_config, 'num_medusa_heads') else 0,
-            use_custom_all_reduce=build_config.plugin_config.
-            use_custom_all_reduce,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
             redrafter_num_beams=pretrained_config.redrafter_num_beams
@@ -501,7 +497,7 @@ class ModelRunner(ModelRunnerMixin):
         max_input_len = build_config.max_input_len
         max_seq_len = build_config.max_seq_len
         max_beam_width = build_config.max_beam_width
-        if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
+        if 'GLM' in pretrained_config.architecture and pretrained_config.chatglm_version in [
                 'glm', 'chatglm'
         ]:
             session_cls = ChatGLMGenerationSession

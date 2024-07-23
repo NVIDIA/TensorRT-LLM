@@ -1607,6 +1607,7 @@ def load_nemo_gpt_config(
     del model_00
 
     hf_config = GPT2Config(
+        architectures=['GPTForCausalLM'],
         vocab_size=vocab_size,
         n_positions=nemo_model_config['max_position_embeddings'],
         n_embd=nemo_model_config['hidden_size'],
@@ -1953,7 +1954,7 @@ if __name__ == '__main__':
 
     config = {
         'architecture':
-        'GPTForCausalLM',
+        hf_config.architectures[0],
         'dtype':
         args.dtype,
         'num_hidden_layers':

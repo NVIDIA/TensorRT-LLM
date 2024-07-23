@@ -114,6 +114,7 @@ setup(
             'libs/libth_common.so',
             'libs/libnvinfer_plugin_tensorrt_llm.so',
             'libs/libtensorrt_llm_nvrtc_wrapper.so',
+            'libs/libdecoder_attention.so',
             'bindings.*.so',
         ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
     },

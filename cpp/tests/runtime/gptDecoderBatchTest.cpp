@@ -249,7 +249,8 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // set up decoder
-    auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr, modelConfig.getSpeculativeDecodingMode());
+    auto decoder
+        = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr, modelConfig.getSpeculativeDecodingMode(), dataType);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
         maxGeneratedTokensPerStep, false, dataType, modelConfig);
 
@@ -368,7 +369,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // set up decoder
-    auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr, modelConfig.getSpeculativeDecodingMode());
+    auto decoder
+        = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr, modelConfig.getSpeculativeDecodingMode(), dataType);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
         maxGeneratedTokensPerStep, false, dataType, modelConfig);
 
@@ -487,7 +489,8 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
 
     // set up decoder
-    auto decoder = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr, modelConfig.getSpeculativeDecodingMode());
+    auto decoder
+        = GptDecoderBatch(vocabSize, vocabSizePadded, streamPtr, modelConfig.getSpeculativeDecodingMode(), dataType);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
         maxGeneratedTokensPerStep,
         /* fused decoder */ true, dataType, modelConfig);

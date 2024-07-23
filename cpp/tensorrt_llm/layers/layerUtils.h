@@ -28,6 +28,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 
 namespace tensorrt_llm
 {
@@ -38,18 +39,20 @@ namespace layers
 // As a workaround and to promote DRY, the fill logic is refactored into FillBuffers below.
 struct FillBuffers
 {
+    using BufferPtr = runtime::IBuffer::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::UniqueConstPtr;
+    using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
 
     template <typename T>
-    void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, std::vector<T>& hostBuffer,
-        T* deviceBuffer, runtime::SizeType32 const* batchSlots, std::pair<float, float> const& limits,
+    void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, BufferPtr hostBuffer,
+        BufferPtr deviceBuffer, BufferConstPtr batchSlots, std::pair<float, float> const& limits,
         std::string const& name) const
     {
-        using tensorrt_llm::common::cudaAutoCpy;
-
+        auto hostBufferRange = runtime::BufferRange<T>(*hostBuffer);
         for (size_t bi = 0; bi < batchSize; ++bi)
         {
             auto value = defaultValue;
-            auto const batchSlot = batchSlots ? batchSlots[bi] : bi;
+            auto batchSlot = batchSlots ? runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi] : bi;
             if (optParam)
             {
                 if (optParam->size() == 1)
@@ -65,22 +68,26 @@ struct FillBuffers
             TLLM_CHECK_WITH_INFO(limits.first < static_cast<float>(value) && static_cast<float>(value) <= limits.second,
                 "%s param (%f) is out of limits (%f, %f]", name.c_str(), static_cast<float>(value), limits.first,
                 limits.second);
-            hostBuffer[batchSlot] = value;
+            hostBufferRange[batchSlot] = value;
         }
 
         if (batchSlots)
         {
-            cudaAutoCpy(deviceBuffer, hostBuffer.data(), maxBatchSize, stream);
+            auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, maxBatchSize);
+            auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, maxBatchSize);
+            mBufferManager->copy(*hostSlice, *deviceSlice);
         }
         else
         {
-            cudaAutoCpy(deviceBuffer, hostBuffer.data(), batchSize, stream);
+            auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, batchSize);
+            auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, batchSize);
+            mBufferManager->copy(*hostSlice, *deviceSlice);
         }
     }
 
     runtime::SizeType32 batchSize;
     runtime::SizeType32 maxBatchSize;
-    cudaStream_t stream;
+    std::shared_ptr<runtime::BufferManager> mBufferManager;
 };
 
 template <typename T>
@@ -100,24 +107,21 @@ inline DecoderDomain getLocalDecoderDomain(
     runtime::SizeType32 vocabSize{0};
     if (inputs->logits)
     {
-        auto const& logitsShape = inputs->logits->shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        auto const idxOffset = logitsShape.size() - 3;
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
+        auto const& logitsShape = inputs->logits.value()->getShape();
+        TLLM_CHECK(logitsShape.nbDims == 3 || logitsShape.nbDims == 4);
+        beamWidth = inputs->logits.value()->getDimension<-2>();
+        vocabSize = inputs->logits.value()->getDimension<-1>();
     }
     else if (inputs->logitsVec)
     {
         TLLM_CHECK(inputs->logitsVec->size());
-        auto const& logitsShape = inputs->logitsVec.value()[0].shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        auto const idxOffset = logitsShape.size() - 3;
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
+        auto const& logitsShape = inputs->logitsVec.value()[0]->getShape();
+        TLLM_CHECK(logitsShape.nbDims == 3 || logitsShape.nbDims == 4);
+        beamWidth = inputs->logitsVec.value()[0]->getDimension<-2>();
+        vocabSize = inputs->logitsVec.value()[0]->getDimension<-1>();
     }
     else if (inputs->batchSlots)
     {
-        auto const& batchSlotsShape = inputs->batchSlots->shape;
         beamWidth = globalDecoderDomain.getBeamWidth();
         vocabSize = globalDecoderDomain.getVocabSize();
     }
@@ -126,6 +130,15 @@ inline DecoderDomain getLocalDecoderDomain(
         TLLM_THROW("Can't get local Decoder domain");
     }
     return DecoderDomain(batchSize, beamWidth, vocabSize);
+}
+
+inline TensorConstPtr getDefaultBatchSlots(runtime::SizeType32 batchSize, runtime::BufferManager const& bufferManager)
+{
+    auto defaultBatchSlots = bufferManager.pinnedPool(
+        runtime::ITensor::makeShape({batchSize}), runtime::TRTDataType<runtime::SizeType32>::value);
+    auto range = runtime::BufferRange<runtime::SizeType32>(*defaultBatchSlots);
+    std::iota(range.begin(), range.end(), 0);
+    return defaultBatchSlots;
 }
 
 } // namespace layers

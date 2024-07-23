@@ -38,7 +38,7 @@ namespace decoder
 class Input
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor const>;
+    using TensorPtr = ITensor::SharedPtr;
 
     explicit Input(TensorPtr logits)
         : logits{std::move(logits)}

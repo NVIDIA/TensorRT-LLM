@@ -29,6 +29,10 @@ if(ENABLE_MULTI_DEVICE EQUAL 1)
   include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
+if(NOT WIN32)
+  set(DECODER_SHARED_TARGET decoder_attention)
+endif()
+
 add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
@@ -256,10 +260,12 @@ set(TRTLLM_LINK_LIBS
     decoder_attention_src
     fpA_intB_gemm_src
     moe_gemm_src
+    fb_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
     layers_src
-    runtime_src)
+    runtime_src
+    ${DECODER_SHARED_TARGET})
 
 if(ENABLE_MULTI_DEVICE EQUAL 1)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})

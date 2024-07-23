@@ -306,7 +306,7 @@ def smooth_quant(model, args):
         "TOKENIZERS_PARALLELISM", "false")
     if args.load_model_on_cpu:
         logger.warning(
-            "Note that running capture_activation_range on cpu would be very small."
+            "Note that running capture_activation_range on cpu would be very slow."
         )
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir,
                                               trust_remote_code=True,

@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/dynamicDecodeLayer.h"
-#include "tensorrt_llm/common/tensor.h"
+#include "dynamicDecodeLayer.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/layers/layersFactory.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <optional>
 #include <utility>
@@ -33,8 +34,8 @@ namespace tensorrt_llm::layers
 
 template <typename T>
 DynamicDecodeLayer<T>::DynamicDecodeLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
-    : BaseLayer(decoderDomain, stream, std::move(allocator))
+    std::shared_ptr<BufferManager> bufferManager)
+    : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -45,21 +46,11 @@ DynamicDecodeLayer<T>::DynamicDecodeLayer(executor::DecodingMode const& mode, De
 }
 
 template <typename T>
-DynamicDecodeLayer<T>::~DynamicDecodeLayer()
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    freeBuffer();
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
 void DynamicDecodeLayer<T>::initialize()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mIdsPtrHost = runtime::BufferManager::pinned(ITensor::makeShape({}), runtime::TRTDataType<TokenIdType*>::value);
+    mIdsPtrHost = mBufferManager->pinnedPool(ITensor::makeShape({}), TRTDataType<TokenIdType*>::value);
 
     allocateBuffer();
 
@@ -82,17 +73,7 @@ void DynamicDecodeLayer<T>::allocateBuffer()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     mZeroParentIdsDevice
-        = mAllocator->reMalloc(mZeroParentIdsDevice, sizeof(TokenIdType*) * 2 * mDecoderDomain.getBatchSize(), false);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-void DynamicDecodeLayer<T>::freeBuffer()
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    mAllocator->free((void**) &mZeroParentIdsDevice);
+        = mBufferManager->gpu(ITensor::makeShape({2 * mDecoderDomain.getBatchSize()}), TRTDataType<TokenIdType>::value);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -102,13 +83,13 @@ void DynamicDecodeLayer<T>::initializeLayers()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mLayers = createLayers<T>(mDecodingMode, mDecoderDomain, mStream, mAllocator);
+    mLayers = createLayers<T>(mDecodingMode, mDecoderDomain, mBufferManager);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void DynamicDecodeLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
+void DynamicDecodeLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
     std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -164,7 +145,7 @@ void DynamicDecodeLayer<T>::forwardAsync(
         baseOutputs->sequenceLength.has_value(), "sequenceLength tensor is required in DynamicDecoderLayer.");
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
-    auto const maxSeqLen = baseOutputs->outputIds.shape[baseOutputs->outputIds.shape.size() - 1];
+    auto const maxSeqLen = baseOutputs->outputIds->getDimension<-1>();
 
     TLLM_CHECK_WITH_INFO((mConfiguredBeamWidth == 1 && localDecoderDomain.getBeamWidth() == 1)
             || (mConfiguredBeamWidth > 1 && localDecoderDomain.getBeamWidth() > 1
@@ -174,17 +155,14 @@ void DynamicDecodeLayer<T>::forwardAsync(
 
     if (!mIdsPtrHost->data())
     {
-        mIdsPtrHost = runtime::BufferManager::pinnedPool(ITensor::makeShape({static_cast<int32_t>(maxSeqLen),
-                                                             static_cast<int32_t>(2 * mDecoderDomain.getBatchSize())}),
-            runtime::TRTDataType<int32_t*>::value);
+        mIdsPtrHost = mBufferManager->pinnedPool(ITensor::makeShape({static_cast<int32_t>(maxSeqLen),
+                                                     static_cast<int32_t>(2 * mDecoderDomain.getBatchSize())}),
+            TRTDataType<TokenIdType*>::value);
         mRuntimeMaxSeqLen = maxSeqLen;
     }
 
-    std::vector<SizeType32> batchSlotsVec(localDecoderDomain.getBatchSize());
-    std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
-    auto batchSlotsHost
-        = params->batchSlots ? params->batchSlots->template getPtr<SizeType32 const>() : batchSlotsVec.data();
-    auto batchSlots = params->batchSlots ? params->batchSlots->template getPtr<SizeType32 const>() : nullptr;
+    auto batchSlotsHost = params->batchSlots ? params->batchSlots.value()
+                                             : getDefaultBatchSlots(localDecoderDomain.getBatchSize(), *mBufferManager);
 
     mCyclicStep = mCyclicStep % mRuntimeMaxSeqLen;
     prepareIdsPtrs(
@@ -196,9 +174,9 @@ void DynamicDecodeLayer<T>::forwardAsync(
     }
 
     // Copy nextIds and transpose logits when needed
-    prepareOutputData(baseOutputs, params, mIdsPtrHost, batchSlots, localDecoderDomain.getBatchSize(),
-        mDecoderDomain.getBatchSize(), localDecoderDomain.getBeamWidth(), maxSeqLen,
-        mDecoderDomain.getMaxDecodingTokens(), mCyclicStep, mOutputLogProbs, mStream);
+    prepareOutputData(baseOutputs, params, mIdsPtrHost, params->batchSlots.value_or(nullptr),
+        localDecoderDomain.getBatchSize(), mDecoderDomain.getBatchSize(), localDecoderDomain.getBeamWidth(), maxSeqLen,
+        mDecoderDomain.getMaxDecodingTokens(), mCyclicStep, mOutputLogProbs, getStream());
 
     mCyclicStep += 1;
 
@@ -220,62 +198,65 @@ void DynamicDecodeLayer<T>::forwardSync(
 
 template <typename T>
 void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSeqLen)
+    BufferConstPtr batchSlots, SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSeqLen)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto idsPtrHostSlice = ITensor::slice(mIdsPtrHost, mCyclicStep, 1);
-    auto idsPtrHost = reinterpret_cast<TokenIdType**>(runtime::bufferCast<int64_t>(*idsPtrHostSlice));
+    TensorPtr idsPtrHostSlice = ITensor::slice(mIdsPtrHost, mCyclicStep, 1);
+    idsPtrHostSlice->reshape(ITensor::makeShape({2 * mDecoderDomain.getBatchSize()}));
+    auto idsPtrHost = runtime::bufferCast<TokenIdType*>(*idsPtrHostSlice);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
-        auto const batchSlot = batchSlots[bi];
-        idsPtrHost[batchSlot]
-            = outputs->outputIds.template getPtrWithOffset<TokenIdType>(batchSlot * beamWidth * maxSeqLen);
+        auto const batchSlot = batchSlotsPtr[bi];
+        idsPtrHost[batchSlot] = bufferCast<TokenIdType>(*outputs->outputIds) + batchSlot * beamWidth * maxSeqLen;
     }
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
-        auto const batchSlot = batchSlots[bi];
+        auto const batchSlot = batchSlotsPtr[bi];
         if (beamWidth > 1)
         {
             idsPtrHost[mDecoderDomain.getBatchSize() + batchSlot]
-                = outputs->parentIds.value().template getPtrWithOffset<SizeType32>(batchSlot * beamWidth * maxSeqLen);
+                = bufferCast<TokenIdType>(*outputs->parentIds.value()) + batchSlot * beamWidth * maxSeqLen;
         }
         else
         {
-            idsPtrHost[mDecoderDomain.getBatchSize() + batchSlot] = mZeroParentIdsDevice + bi * beamWidth * maxSeqLen;
+            auto mZeroParentIdsDevicePtr = bufferCast<TokenIdType>(*mZeroParentIdsDevice);
+            idsPtrHost[mDecoderDomain.getBatchSize() + batchSlot]
+                = mZeroParentIdsDevicePtr + bi * beamWidth * maxSeqLen;
         }
     }
 
-    outputs->outputIdsPtr = Tensor(
-        MEMORY_GPU, DataType::TYPE_INT32_PTR, {static_cast<size_t>(mDecoderDomain.getBatchSize())}, idsPtrHost);
-    outputs->parentIdsPtr = Tensor(MEMORY_GPU, DataType::TYPE_INT32_PTR,
-        {static_cast<size_t>(mDecoderDomain.getBatchSize())}, idsPtrHost + mDecoderDomain.getBatchSize());
+    outputs->outputIdsPtr = ITensor::slice(idsPtrHostSlice, 0, mDecoderDomain.getBatchSize());
+    outputs->parentIdsPtr
+        = ITensor::slice(idsPtrHostSlice, mDecoderDomain.getBatchSize(), mDecoderDomain.getBatchSize());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
 void DynamicDecodeLayer<T>::prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-    std::shared_ptr<DecodingInputs> const& params, runtime::ITensor::SharedPtr const& idsPtrsHost,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
-    SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, SizeType32 cyclicStep, bool outputLogProbs, cudaStream_t stream)
+    std::shared_ptr<DecodingInputs> const& params, TensorPtr idsPtrsHost, BufferConstPtr batchSlots,
+    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
+    SizeType32 maxTokensPerStep, SizeType32 cyclicStep, bool outputLogProbs, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto idsPtrHostSlice = ITensor::slice(idsPtrsHost, cyclicStep, 1);
-    auto idsPtrHost = reinterpret_cast<TokenIdType**>(runtime::bufferCast<int64_t>(*idsPtrHostSlice));
-    auto const numNewTokens
-        = outputs->numNewTokens ? outputs->numNewTokens->template getPtr<SizeType32 const>() : nullptr;
-    invokeCopyNextStepIds(outputs->newTokens.template getPtr<TokenIdType>(), idsPtrHost,
-        outputs->sequenceLength->template getPtr<SizeType32>(), numNewTokens, batchSlots, batchSize, maxBatchSize,
-        beamWidth, maxSeqLen, maxTokensPerStep, stream);
+    TensorPtr idsPtrHostSlice = ITensor::slice(idsPtrsHost, cyclicStep, 1);
+    auto idsPtrHost = bufferCast<TokenIdType*>(*idsPtrHostSlice);
+    auto const numNewTokens = bufferCastOrNull<SizeType32>(outputs->numNewTokens);
+    auto newTokensPtr = bufferCast<TokenIdType>(*outputs->newTokens);
+    auto sequenceLengthsPtr = bufferCast<SizeType32>(*outputs->sequenceLength.value());
+    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+    invokeCopyNextStepIds(newTokensPtr, idsPtrHost, sequenceLengthsPtr, numNewTokens, batchSlotsPtr, batchSize,
+        maxBatchSize, beamWidth, maxSeqLen, maxTokensPerStep, stream);
 
     // Transpose output log probs from [maxSeqLen, batchSize, beamWidth] to [batchSize, beamWidth, maxSeqLen]
     if (outputLogProbs && outputs->outputLogProbsTiled)
     {
-        auto logProbsMaxSeqLen = outputs->outputLogProbsTiled.value().shape[0];
+        auto logProbsMaxSeqLen = outputs->outputLogProbsTiled.value()->getDimension<0>();
 
-        invokeTransposeLogProbs(outputs->outputLogProbs.value().template getPtr<float>(),
-            outputs->outputLogProbsTiled.value().template getPtr<float>(),
-            outputs->sequenceLength->template getPtr<SizeType32>(), batchSlots, batchSize, maxBatchSize, beamWidth,
-            logProbsMaxSeqLen, stream);
+        auto outputLogProbsPtr = bufferCast<float>(*outputs->outputLogProbs.value());
+        auto outputLogProbsTiledPtr = bufferCast<float>(*outputs->outputLogProbsTiled.value());
+        invokeTransposeLogProbs(outputLogProbsPtr, outputLogProbsTiledPtr, sequenceLengthsPtr, batchSlotsPtr, batchSize,
+            maxBatchSize, beamWidth, logProbsMaxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

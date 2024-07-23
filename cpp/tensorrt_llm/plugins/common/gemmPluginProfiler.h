@@ -207,7 +207,7 @@ public:
             {
                 std::ostringstream msg;
                 msg << "Cannot find ID (" << id << ") in the profile map. Abort.";
-                TLLM_LOG_ERROR(msg.str());
+                TLLM_THROW(msg.str());
             }
             return iter->second;
         }

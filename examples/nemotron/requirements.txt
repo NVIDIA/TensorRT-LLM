@@ -1,6 +1,8 @@
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.12.0.dev2024071600
+tensorrt_llm==0.12.0.dev2024072300
 transformers==4.40.2
+# https://github.com/NVIDIA/NeMo/issues/9793
+huggingface_hub==0.23.5
 datasets~=2.14.5
 evaluate~=0.4.1
 rouge_score~=0.1.2

@@ -13,7 +13,7 @@ model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
 def test_llm_with_model_downloaded():
-    llm = LLM(model=model_name, build_cache_config=True)
+    llm = LLM(model=model_name, enable_build_cache=True)
     for output in llm.generate(prompts):
         print(output)
 

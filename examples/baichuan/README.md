@@ -112,7 +112,6 @@ python convert_checkpoint.py --model_version v1_13b \
                              --model_dir baichuan-inc/Baichuan-13B-Chat \
                              --dtype float16 \
                              --output_dir ./tmp/baichuan_v1_13b/trt_ckpts/fp16/1-gpu/ \
-                             --world_size 2 \
                              --tp_size 2
 ```
 
@@ -187,7 +186,6 @@ To run the GPTQ Baichuan example, the following steps are required:
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --group_size 64 \
-                                 --world_size 2 \
                                  --tp_size 2 \
                                  --output_dir ./tmp/baichuan_v2_13b/trt_ckpts/int4_gptq_gs64/2-gpu/
     ```

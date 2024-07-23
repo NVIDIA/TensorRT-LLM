@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/decodingLayer.h"
+#include "decodingLayer.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
@@ -29,6 +29,7 @@ using namespace tensorrt_llm::runtime;
 
 namespace
 {
+
 template <typename T>
 bool allSame(std::optional<std::vector<T>> const& vOpt)
 {
@@ -67,23 +68,23 @@ namespace tensorrt_llm::layers
 {
 template <typename T>
 DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
-    : BaseLayer(decoderDomain, stream, std::move(allocator))
+    std::shared_ptr<BufferManager> bufferManager)
+    : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     if (mDecodingMode.isTopKorTopP())
     {
-        mDecodingLayer = std::make_unique<SamplingLayer<T>>(mDecodingMode, decoderDomain, mStream, mAllocator);
+        mDecodingLayer = std::make_unique<SamplingLayer<T>>(mDecodingMode, decoderDomain, mBufferManager);
     }
     else if (mDecodingMode.isBeamSearch())
     {
-        mDecodingLayer = std::make_unique<BeamSearchLayer<T>>(decoderDomain, mStream, mAllocator);
+        mDecodingLayer = std::make_unique<BeamSearchLayer<T>>(decoderDomain, mBufferManager);
     }
     else if (mDecodingMode.isMedusa())
     {
-        mDecodingLayer = std::make_unique<MedusaDecodingLayer<T>>(decoderDomain, mStream, mAllocator);
+        mDecodingLayer = std::make_unique<MedusaDecodingLayer<T>>(decoderDomain, mBufferManager);
     }
     else if (mDecodingMode.isLookahead())
     {
@@ -92,7 +93,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
-        mDecodingLayer = std::make_unique<ExplicitDraftTokensLayer<T>>(decoderDomain, mStream, mAllocator);
+        mDecodingLayer = std::make_unique<ExplicitDraftTokensLayer<T>>(decoderDomain, mBufferManager);
     }
     else
     {
@@ -105,7 +106,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
 }
 
 template <typename T>
-void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
+void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
     std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -172,6 +173,12 @@ void DecodingLayer<T>::forwardSync(
 }
 
 template <typename T>
+size_t DecodingLayer<T>::getWorkspaceSize() const noexcept
+{
+    return mDecodingLayer->getWorkspaceSize();
+}
+
+template <typename T>
 std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInputs>> DecodingLayer<T>::prepareParams(
     std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
     std::shared_ptr<BaseDecodingInputs> const& baseInputs) const
@@ -180,7 +187,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
-    auto const maxSeqLen = baseOutputs->outputIds.shape[baseOutputs->outputIds.shape.size() - 1];
+    auto const maxSeqLen = baseOutputs->outputIds->getDimension<-1>();
     auto const& endIds = params->endIds;
 
     std::shared_ptr<BaseDecodingOutputs> preparedOutputs;
@@ -195,16 +202,15 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     {
         auto const ite = params->ite;
         auto const step = params->step;
-        auto const localBatchSize = static_cast<std::size_t>(params->localBatchSize);
+        auto const localBatchSize = static_cast<int64_t>(params->localBatchSize);
 
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
             "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
 
         // In sampling, we have supported batch sampling. So, we always compute all
         // sentences once.
-        Tensor const logitsSlice{params->logits->slice(
-            {localBatchSize, static_cast<size_t>(localDecoderDomain.getBeamWidth()), params->logits->shape[2]}, 0)};
-        Tensor const endIdSlice{endIds.slice({localBatchSize}, 0)};
+        TensorPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
+        TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
         auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, step, ite, localBatchSize);
 
         decodeInputs->finished = params->finished;
@@ -214,8 +220,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         if (params->inputLengths)
         {
             auto& inputLengths = params->inputLengths.value();
-            decodeInputs->inputLengths
-                = inputLengths.slice({localBatchSize, static_cast<size_t>(localDecoderDomain.getBeamWidth())}, 0);
+            decodeInputs->inputLengths = ITensor::slice(inputLengths, 0, localBatchSize);
         }
         decodeInputs->batchSlots = params->batchSlots;
 

@@ -16,7 +16,6 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 

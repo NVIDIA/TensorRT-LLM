@@ -145,7 +145,7 @@ public:
         ElementC* ptr_C;
         ElementC* ptr_D;
 
-        int64_t* total_rows_before_expert;
+        int64_t const* total_rows_before_expert;
         int64_t gemm_n;
         int64_t gemm_k;
 
@@ -177,7 +177,7 @@ public:
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count, int group_size, typename EpilogueOutputOp::Params output_op,
             ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales, ElementC const* ptr_C,
-            ElementC* ptr_D, int64_t* total_rows_before_expert, int64_t gemm_n, int64_t gemm_k,
+            ElementC* ptr_D, int64_t const* total_rows_before_expert, int64_t gemm_n, int64_t gemm_k,
             GemmCoord* host_problem_sizes = nullptr)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)

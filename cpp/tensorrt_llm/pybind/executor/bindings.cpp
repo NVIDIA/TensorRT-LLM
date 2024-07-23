@@ -459,12 +459,13 @@ void InitBindings(pybind11::module_& m)
             self.getEnableChunkedContext(), self.getNormalizeLogProbs(), self.getIterStatsMaxIterations(),
             self.getRequestStatsMaxIterations(), self.getBatchingType(), self.getMaxBatchSize(), self.getMaxNumTokens(),
             parallelConfigState, peftCacheConfigState, self.getLogitsPostProcessorMap(),
-            self.getLogitsPostProcessorBatched(), self.getDecodingConfig(), self.getGpuWeightsPercent());
+            self.getLogitsPostProcessorBatched(), self.getDecodingConfig(), self.getGpuWeightsPercent(),
+            self.getMaxQueueSize(), self.getMultiBlockMode());
     };
     auto executorConfigSetState = [&kvCacheConfigSetstate, &peftCacheConfigSetstate, &schedulerConfigSetstate,
                                       &parallelConfigSetstate](py::tuple state)
     {
-        if (state.size() != 16)
+        if (state.size() != 18)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -488,14 +489,15 @@ void InitBindings(pybind11::module_& m)
             state[9].cast<std::optional<SizeType32>>(), parallelConfig, peftCacheConfig,
             state[12].cast<std::optional<tle::LogitsPostProcessorMap>>(),
             state[13].cast<std::optional<tle::LogitsPostProcessorBatched>>(),
-            state[14].cast<std::optional<tle::DecodingConfig>>(), state[15].cast<float>());
+            state[14].cast<std::optional<tle::DecodingConfig>>(), state[15].cast<float>(),
+            state[16].cast<std::optional<SizeType32>>(), state[17].cast<bool>());
     };
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
         .def(py::init<SizeType32, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType32,
                  SizeType32, tle::BatchingType, std::optional<SizeType32>, std::optional<SizeType32>,
                  std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
                  std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
-                 std::optional<tle::DecodingConfig>, float>(),
+                 std::optional<tle::DecodingConfig>, float, std::optional<SizeType32>, bool>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -506,7 +508,8 @@ void InitBindings(pybind11::module_& m)
             py::arg("parallel_config") = py::none(),
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
             py::arg("logits_post_processor_map") = py::none(), py::arg("logits_post_processor_batched") = py::none(),
-            py::arg("decoding_config") = py::none(), py::arg("gpu_weights_percent") = 1.0)
+            py::arg("decoding_config") = py::none(), py::arg("gpu_weights_percent") = 1.0,
+            py::arg("max_queue_size") = py::none(), py::arg("multi_block_mode") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -534,6 +537,9 @@ void InitBindings(pybind11::module_& m)
             "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig)
         .def_property("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
+        .def_property("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
+        .def_property(
+            "multi_block_mode", &tle::ExecutorConfig::getMultiBlockMode, &tle::ExecutorConfig::setMultiBlockMode)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 
     tensorrt_llm::pybind::executor::Executor::initBindings(m);

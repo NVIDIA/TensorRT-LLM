@@ -290,6 +290,7 @@ class GenerationMixin:
         attention_mask = None
         cache_indirection = None
         host_request_types = None
+        runtime_perf_knobs = None
 
         if use_gpt_attention_plugin:
             if use_cache:
@@ -321,6 +322,13 @@ class GenerationMixin:
                 shape=[-1],
                 dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
             )
+            runtime_perf_knobs = Tensor(name='host_runtime_perf_knobs',
+                                        dtype=trt.int64,
+                                        shape=[16],
+                                        dim_range=OrderedDict([
+                                            ('perf_knob_size',
+                                             [16] * num_profiles)
+                                        ]))
         else:
             attention_mask = Tensor(
                 name='attention_mask',
@@ -382,6 +390,7 @@ class GenerationMixin:
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
             'host_request_types': host_request_types,
+            'host_runtime_perf_knobs': runtime_perf_knobs,
         }
 
     def prepare_basic_inputs(
@@ -400,7 +409,6 @@ class GenerationMixin:
             remove_input_padding=False,
             use_gpt_attention_plugin=False,
             use_gemm_plugin=False,
-            use_custom_all_reduce=False,
             paged_kv_cache=False,
             tokens_per_block=64,
             gather_context_logits=False,
@@ -533,7 +541,7 @@ class GenerationMixin:
                     ]),
                 )
 
-        if use_custom_all_reduce and mapping.tp_size > 1:
+        if mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
                 mapping, num_profiles)
 

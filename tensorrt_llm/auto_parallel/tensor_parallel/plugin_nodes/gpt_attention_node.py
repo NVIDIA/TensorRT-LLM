@@ -28,6 +28,7 @@ class IdxEntry(Enum):
     PAST_KEY_VALUE = auto()
     KV_CACHE_QUANTIZATION_SCALE = auto()
     KV_CACHE_DEQUANTIZATION_SCALE = auto()
+    ROTARY_INV_FREQ = auto()
     ROTARY_COS_SIN = auto()
     ALIBI_SLOPES = auto()
     RELATIVE_ATTENTION_BIAS = auto()
@@ -39,6 +40,7 @@ class IdxEntry(Enum):
     SPEC_DECODING_PACKED_MASK = auto()
     SPEC_DECODING_POSITION_OFFSETS = auto()
     SPEC_DECODING_GENERATION_LENGTHS = auto()
+    HOST_RUNTIME_PERF_KNOBS = auto()
 
 
 class IdxEntryParser:
@@ -99,6 +101,8 @@ class IdxEntryParser:
         elif entry == IdxEntry.KV_CACHE_DEQUANTIZATION_SCALE:
             return self.use_cache and self.kv_cache_quant_mode.has_kv_cache_quant(
             )
+        elif entry == IdxEntry.ROTARY_INV_FREQ:
+            return self.position_embedding_type.is_rope()
         elif entry == IdxEntry.ROTARY_COS_SIN:
             return self.position_embedding_type.is_rope()
         elif entry == IdxEntry.ALIBI_SLOPES:
@@ -121,6 +125,8 @@ class IdxEntryParser:
             return self.is_spec_decoding_enabled
         elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
             return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.HOST_RUNTIME_PERF_KNOBS:
+            return True
         else:
             return False
 

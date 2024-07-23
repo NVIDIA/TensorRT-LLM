@@ -428,8 +428,6 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
         streamingllm = default_net().plugin_config.streamingllm
         use_mamba_conv1d_plugin = default_net(
         ).plugin_config.mamba_conv1d_plugin
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
 
         self.gather_context_logits = gather_context_logits
         mapping = self.config.mapping
@@ -482,7 +480,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                                       ('position_ids_inlen_range',
                                        ranges['position_ids_inlen_range']),
                                   ]))
-        if use_custom_all_reduce and mapping.tp_size > 1:
+        if mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
                 mapping, num_profiles)
 
@@ -597,7 +595,9 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 context_lengths=attention_inputs['context_lengths'],
                 host_context_lengths=attention_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
-                host_request_types=attention_inputs['host_request_types']),
+                host_request_types=attention_inputs['host_request_types'],
+                host_runtime_perf_knobs=attention_inputs[
+                    'host_runtime_perf_knobs']),
             'conv_states':
             recurrent_inputs['conv_states'],
             'rnn_states':

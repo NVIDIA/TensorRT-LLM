@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -45,11 +46,13 @@ class SpeculativeDecodingModule;
 class IGptDecoder
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor>;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
 
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots = nullptr,
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize,
+        std::optional<TensorConstPtr> const& batchSlots = std::nullopt,
         std::optional<DecodingOutput> const& output = std::nullopt)
         = 0;
 
@@ -92,7 +95,8 @@ public:
         size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
         std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots = nullptr,
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize,
+        std::optional<TensorConstPtr> const& batchSlots = std::nullopt,
         std::optional<DecodingOutput> const& output = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
@@ -109,7 +113,7 @@ public:
     }
 
 private:
-    BufferManager mManager;
+    std::shared_ptr<BufferManager> mManager;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
 
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have

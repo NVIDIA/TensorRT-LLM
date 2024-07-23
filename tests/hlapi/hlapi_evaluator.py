@@ -90,7 +90,6 @@ def benchmark_main(model_path: str,
             warmup=warmup,
             engine_cache_path=engine_output_dir,
             # The options should be identical to the cpp benchmark
-            enable_chunked_context=False,
             tensor_parallel_size=tp_size,
             build_config=build_config)
         assert evaluator

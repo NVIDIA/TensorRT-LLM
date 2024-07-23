@@ -132,10 +132,6 @@ void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWid
         mBufferManager.setZero(*dOutput.cumLogProbs);
         dOutput.beamHypotheses.reshape(batchSize, beamWidth, mMaxSequenceLength);
     }
-    else
-    {
-        dOutput.beamHypotheses.release();
-    }
 
     mNbSteps = 0;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

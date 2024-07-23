@@ -605,11 +605,71 @@ __device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val)
 }
 #endif
 
-// Binary maximum: compute the max of two scalar types
+// Binary maximum: compute the max of two values.
 template <typename T>
 __device__ inline T cuda_max(T val1, T val2)
 {
     return (val1 > val2) ? val1 : val2;
+}
+
+template <>
+__device__ inline float2 cuda_max(float2 val1, float2 val2)
+{
+    float2 out;
+    out.x = fmaxf(val1.x, val2.x);
+    out.y = fmaxf(val1.y, val2.y);
+    return out;
+}
+
+template <>
+__device__ inline half2 cuda_max(half2 val1, half2 val2)
+{
+    return __hmax2(val1, val2);
+}
+
+#ifdef ENABLE_BF16
+template <>
+__device__ inline __nv_bfloat162 cuda_max(__nv_bfloat162 val1, __nv_bfloat162 val2)
+{
+    return __hmax2(val1, val2);
+}
+#endif // ENABLE_BF16
+
+// Binary maximum: compute the min of two values.
+template <typename T>
+__device__ inline T cuda_min(T val1, T val2)
+{
+    return (val1 < val2) ? val1 : val2;
+}
+
+template <>
+__device__ inline float2 cuda_min(float2 val1, float2 val2)
+{
+    float2 out;
+    out.x = fminf(val1.x, val2.x);
+    out.y = fminf(val1.y, val2.y);
+    return out;
+}
+
+template <>
+__device__ inline half2 cuda_min(half2 val1, half2 val2)
+{
+    return __hmin2(val1, val2);
+}
+
+#ifdef ENABLE_BF16
+template <>
+__device__ inline __nv_bfloat162 cuda_min(__nv_bfloat162 val1, __nv_bfloat162 val2)
+{
+    return __hmin2(val1, val2);
+}
+#endif // ENABLE_BF16
+
+// Helper function of clamping the val into the given range.
+template <typename T>
+inline __device__ T cuda_clamp(T val, T minVal, T maxVal)
+{
+    return cuda_min(cuda_max(val, minVal), maxVal);
 }
 
 #ifdef ENABLE_FP8

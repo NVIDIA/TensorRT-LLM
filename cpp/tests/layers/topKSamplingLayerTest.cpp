@@ -29,16 +29,14 @@ class TopKSamplingLayerTest : public BaseSamplingLayerTest<T>
     {
         this->mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
         this->mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(this->mStream);
-
-        this->mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*this->mBufferManager);
     }
 
     void initLayer(TestSamplingParams const& params) override
     {
         auto const decodingDomain
             = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
-        this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopKSamplingLayer<T>>(
-            decodingDomain, this->mStream->get(), this->mAllocator);
+        this->mSamplingLayer
+            = std::make_shared<tensorrt_llm::layers::TopKSamplingLayer<T>>(decodingDomain, this->mBufferManager);
     }
 };
 

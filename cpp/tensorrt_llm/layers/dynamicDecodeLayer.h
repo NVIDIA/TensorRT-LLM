@@ -32,13 +32,11 @@ class DynamicDecodeLayer : public BaseLayer
     using Base = BaseLayer;
 
 public:
-    DynamicDecodeLayer(executor::DecodingMode const& mode, DecoderDomain const& decodingDomain, cudaStream_t stream,
-        std::shared_ptr<tc::IAllocator> allocator);
+    DynamicDecodeLayer(executor::DecodingMode const& mode, DecoderDomain const& decodingDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~DynamicDecodeLayer() override;
-
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
+        runtime::IBuffer::SharedConstPtr batchSlots, std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs) override;
@@ -55,30 +53,27 @@ public:
 
 private:
     void allocateBuffer();
-    void freeBuffer();
 
     void initialize();
     void initializeLayers();
 
-    void prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> const& outputs, runtime::SizeType32 const* batchSlots,
+    void prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> const& outputs, BufferConstPtr batchSlots,
         runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen);
     static void prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<DecodingInputs> const& params, runtime::ITensor::SharedPtr const& idsPtrsHost,
-        runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
-        runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep,
-        runtime::SizeType32 cyclicStep, bool outputLogProbs, cudaStream_t stream);
+        std::shared_ptr<DecodingInputs> const& params, TensorPtr const idsPtrsHost, BufferConstPtr batchSlots,
+        runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize, runtime::SizeType32 beamWidth,
+        runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep, runtime::SizeType32 cyclicStep,
+        bool outputLogProbs, cudaStream_t stream);
 
 private:
-    using Base::mAllocator;
-    using Base::mStream;
     using Base::mDecoderDomain;
 
     std::vector<std::unique_ptr<BaseLayer>> mLayers;
 
     executor::DecodingMode mDecodingMode;
 
-    runtime::TokenIdType* mZeroParentIdsDevice{nullptr};
-    runtime::ITensor::SharedPtr mIdsPtrHost;
+    TensorPtr mZeroParentIdsDevice;
+    TensorPtr mIdsPtrHost;
 
     bool mHasDiffRuntimeArgs{false};
 

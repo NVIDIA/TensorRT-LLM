@@ -71,7 +71,6 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
-        --use_custom_all_reduce disable \
         --gemm_plugin bfloat16 \
         --bert_attention_plugin bfloat16 \
         --gpt_attention_plugin bfloat16 \
@@ -87,7 +86,6 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
-        --use_custom_all_reduce disable \
         --gemm_plugin bfloat16 \
         --bert_attention_plugin bfloat16 \
         --gpt_attention_plugin bfloat16 \
@@ -196,7 +194,6 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --max_input_len 2048 \
     --max_seq_len 3076 \
     --paged_kv_cache disable \
-    --use_custom_all_reduce disable \
     --enable_xqa disable \
     --bert_attention_plugin disable \
     --moe_plugin disable \
@@ -246,7 +243,6 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
-        --use_custom_all_reduce disable \
         --gemm_plugin float16 \
         --bert_attention_plugin float16 \
         --gpt_attention_plugin float16 \
@@ -633,7 +629,6 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
-        --use_custom_all_reduce disable \
         --gemm_plugin bfloat16 \
         --bert_attention_plugin bfloat16 \
         --gpt_attention_plugin bfloat16 \

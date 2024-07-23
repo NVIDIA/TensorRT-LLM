@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams, TokenizerBase
 from tensorrt_llm.hlapi.llm_utils import BuildConfig, _ParallelConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.hlapi.utils import GpuArch, get_total_gpu_memory
+from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 from tensorrt_llm.models import PretrainedConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -80,12 +80,7 @@ def test_llm_loading_from_hf():
     llm = LLM(
         model=llama_model_path,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        enable_chunked_context=True,
     )
-
-    if GpuArch.is_post_ampere():
-        # chunked_context should be enabled by default
-        assert llm.args.enable_chunked_context
 
     sampling_params = SamplingParams(max_new_tokens=8)
 
@@ -164,7 +159,6 @@ def test_llm_without_tokenizer():
         model=llama_model_path,
         skip_tokenizer_init=True,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        enable_chunked_context=True,
     )
 
     sampling_params = SamplingParams(end_id=2, pad_id=2, max_new_tokens=8)

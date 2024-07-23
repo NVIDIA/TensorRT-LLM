@@ -35,10 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import tensorrt as trt
 import torch
 from tqdm import tqdm
-from transformers import PretrainedConfig as HfPretrainedConfig
 from transformers import PreTrainedTokenizerBase
-
-from tensorrt_llm.models.llama.config import LLaMAConfig
 
 from .._utils import mpi_barrier, mpi_broadcast, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
@@ -50,7 +47,8 @@ from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
 from ..models import MODEL_MAP
-from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
+from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
+                                     TopModelMixin)
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
@@ -211,8 +209,6 @@ class LlmArgs:
     scheduler_config (SchedulerConfig, default=SchedulerConfig()): The scheduler configuration for the model.
         Default is an empty SchedulerConfig instance.
 
-    enable_chunked_context (bool, default=False): Whether to enable chunked context for the model.
-
     normalize_log_probs (bool, default=False): Whether to normalize log probabilities for the model.
 
     iter_stats_max_iterations (int, optional): The maximum number of iterations for iteration statistics.
@@ -267,10 +263,6 @@ class LlmArgs:
 
     scheduler_config: SchedulerConfig = field(default_factory=SchedulerConfig)
 
-    # chunked context is disabled by default, and it is recommended to keep it enabled.
-    # The underlying implementation might disable it if it is not supported.
-    enable_chunked_context: bool = False
-
     normalize_log_probs: bool = False
 
     iter_stats_max_iterations: Optional[int] = None
@@ -280,12 +272,16 @@ class LlmArgs:
     batching_type: Optional[BatchingType] = None
 
     # Once set, the model will reuse the build_cache
-    enable_cache_config: Union[BuildCacheConfig, bool] = False
+    enable_build_cache: Union[BuildCacheConfig, bool] = False
 
     # Display the model building progress bar
     enable_tqdm: bool = False
 
     def __post_init__(self):
+        # NOTE: this is only for the compatibility with the old API, and will be removed in the future
+        # chunked context is disabled by default, and it is recommended to keep it enabled.
+        # The underlying implementation might disable it if it is not supported.
+        self.enable_chunked_context: bool = False
 
         if self.skip_tokenizer_init:
             self.tokenizer = None
@@ -359,12 +355,12 @@ class LlmArgs:
 
         self._setup_embedding_parallel_mode()
 
-        if self.enable_cache_config:
-            self.enable_cache_config = BuildCacheConfig() if isinstance(
-                self.enable_cache_config, bool) else self.enable_cache_config
-            if not isinstance(self.enable_cache_config, BuildCacheConfig):
+        if self.enable_build_cache:
+            self.enable_build_cache = BuildCacheConfig() if isinstance(
+                self.enable_build_cache, bool) else self.enable_build_cache
+            if not isinstance(self.enable_build_cache, BuildCacheConfig):
                 raise ValueError(
-                    f"Invalid build_cache_config: {self.enable_cache_config}")
+                    f"Invalid build_cache_config: {self.enable_build_cache}")
 
         if self.is_local_model:
             # Load parallel_config from the engine.
@@ -1012,26 +1008,18 @@ class ModelLoader:
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
-        from ..models import LLaMAForCausalLM
         assert self._model_dir is not None
 
         import transformers
-        _pretrained_config = transformers.PretrainedConfig.from_json_file(
-            os.path.join(self._model_dir, 'config.json'))
+        hf_config = transformers.AutoConfig.from_pretrained(self._model_dir)
+        architecture = hf_config.architectures[0]
 
-        model_arch = _pretrained_config.architectures[0]
-
-        # TODO[chunweiy]: add more models if ready
-        model_mapping = dict(
-            LlamaForCausalLM=LLaMAForCausalLM,
-            MixtralForCausalLM=LLaMAForCausalLM,
-        )
-        if model_arch not in model_mapping:
-            raise KeyError(
-                f"Unsupported model architecture: {model_arch}, "
-                f"only {', '.join(model_mapping.keys())} are supported now.")
-
-        model_cls = model_mapping[model_arch]
+        if architecture not in MODEL_MAP:
+            raise KeyError(f"Unsupported model architecture: {architecture}")
+        model_cls = MODEL_MAP[architecture]
+        if TopModelMixin.__name__ in model_cls.from_hugging_face.__qualname__:
+            raise NotImplementedError(
+                f"Unsupported model architecture in HLAPI: {architecture}")
 
         if self.llm_args.quant_config.quant_mode.has_any_quant():
             assert self.workspace is not None
@@ -1227,16 +1215,14 @@ class CachedModelLoader:
     def build_cache_enabled(self) -> bool:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
-        return (self.llm_args.enable_cache_config or _enable_build_cache) and (
+        return (self.llm_args.enable_build_cache or _enable_build_cache) and (
             self.llm_args.model_format is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
         '''
-        Get the cache stage fir engine building.
+        Get the cache stage for engine building.
         '''
-        assert self.llm_args.enable_cache_config
-
-        build_cache = BuildCache(self.llm_args.enable_cache_config)
+        build_cache = BuildCache(self.llm_args.enable_build_cache)
 
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
         dummy_build_config = CachedModelLoader.get_final_build_config(
@@ -1266,15 +1252,15 @@ class CachedModelLoader:
         # The build() doesn't need the real model instance to get a updated BuildConig. What is really needed is the
         # dtype. That's why the model will be downloaded from HF if necessary to get the accurate dtype.
 
-        # TODO[chunweiy]: Support more architectures
-        hf_pretrained_config = HfPretrainedConfig.from_json_file(model_dir /
-                                                                 "config.json")
-        if "LlamaForCausalLM" not in hf_pretrained_config.architectures:
-            raise ValueError(
-                f"Unsupported model architecture: {hf_pretrained_config.architectures}"
-            )
+        import transformers
+        hf_config = transformers.AutoConfig.from_pretrained(model_dir)
+        architecture = hf_config.architectures[0]
 
-        pretrained_config = LLaMAConfig.from_hugging_face(
+        if architecture not in MODEL_MAP:
+            raise KeyError(f"Unsupported model architecture: {architecture}")
+        model_cls = MODEL_MAP[architecture]
+        config_cls = model_cls.config_class
+        pretrained_config = config_cls.from_hugging_face(
             model_dir,
             mapping=Mapping(world_size=llm_args.parallel_config.world_size,
                             tp_size=llm_args.parallel_config.tp_size,
@@ -1286,7 +1272,7 @@ class CachedModelLoader:
         class DummyModel:
             # This is only used for getting the updated BuildConfig from build() without actually loading the whole
             # pretrained model to save overhead and memory.
-            config: LLaMAConfig
+            config: PretrainedConfig
 
         # dry_run to get the updated build_config for cache key.  The build_config is modified within build(), so using
         # a build_config before build() is not correct for cache key, so we need to get the build_config after build()

@@ -67,12 +67,18 @@ file(GLOB_RECURSE GROUPED_CU_INSTANTIATIONS
 file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
 file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
 
+# Get the sources for FP8 Rowwise GEMM launchers
+file(GLOB_RECURSE FBGEMM_CU_INSTANTIATIONS
+     ${INSTANTIATION_GENERATION_DIR}/fbgemm_gpu/*.cu)
+file(GLOB_RECURSE FBGEMM_SRC_CU fbgemm_gpu/*.cu)
+
 # Get the sources for all the remaining sources
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fbgemm_gpu/.*")
 list(REMOVE_ITEM ALL_SRCS
      "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
@@ -83,6 +89,7 @@ message(
   VERBOSE
   "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
 )
+message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
 message(VERBOSE "All srcs ${ALL_SRCS}")
 
 add_library(cutlass_src STATIC ${ALL_SRCS})
@@ -94,11 +101,13 @@ add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
 # WARNING: Building with `-G` flag may generate invalid results for this target
 add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
                                 ${GROUPED_CU_INSTANTIATIONS})
+add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
-foreach(target_name fpA_intB_gemm_src;moe_gemm_src;gemm_swiglu_sm90_src)
+foreach(target_name
+        fpA_intB_gemm_src;moe_gemm_src;fb_gemm_src;gemm_swiglu_sm90_src)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 

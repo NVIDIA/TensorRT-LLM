@@ -184,6 +184,7 @@ bool TllmRuntime::executeContext(SizeType32 contextIndex) const
 
 void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -256,10 +257,12 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
         TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
         TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -299,6 +302,7 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
             }
         }
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 CudaStream const& TllmRuntime::getStream() const

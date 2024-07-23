@@ -22,7 +22,7 @@ from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, is_same_dtype, trt_dtype_to_np,
                       trt_dtype_to_str, trt_gte_10)
 from ..functional import (ACT2FN, AllReduceFusionParams, AttentionMaskType,
-                          Conditional, PositionEmbeddingType,
+                          Conditional, LayerNormType, PositionEmbeddingType,
                           RopeEmbeddingUtils, RotaryScalingType, Tensor, arange,
                           bert_attention, cast, clip, concat, constant,
                           embedding, expand, expand_dims, expand_mask,
@@ -37,9 +37,15 @@ from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
 from .linear import ColumnLinear, QKVColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
-from .normalization import LayerNorm
+from .normalization import GroupNorm, LayerNorm, RmsNorm
 
 from ..functional import maximum  # isort:skip
+
+layernorm_map = {
+    LayerNormType.LayerNorm: LayerNorm,
+    LayerNormType.RmsNorm: RmsNorm,
+    LayerNormType.GroupNorm: GroupNorm,
+}
 
 
 def make_causal_mask(bsz, tgt_len, past_key_values_length, dtype):
@@ -134,7 +140,8 @@ class AttentionParams(object):
                  max_context_length: int = None,
                  host_request_types: Tensor = None,
                  encoder_input_lengths: Tensor = None,
-                 encoder_max_input_length: Tensor = None):
+                 encoder_max_input_length: Tensor = None,
+                 host_runtime_perf_knobs: Tensor = None):
         self.sequence_length = sequence_length
         self.context_lengths = context_lengths
         self.host_context_lengths = host_context_lengths
@@ -145,6 +152,8 @@ class AttentionParams(object):
 
         self.encoder_input_lengths = encoder_input_lengths
         self.encoder_max_input_length = encoder_max_input_length
+
+        self.host_runtime_perf_knobs = host_runtime_perf_knobs
 
     def is_valid_cross_attn(self, do_cross_attention):
         if do_cross_attention:
@@ -163,6 +172,8 @@ class AttentionParams(object):
             if self.host_request_types is None:
                 return False
             if self.max_context_length is None:
+                return False
+            if self.host_runtime_perf_knobs is None:
                 return False
 
         if remove_input_padding:
@@ -267,6 +278,7 @@ class Attention(Module):
                  apply_query_key_layer_scaling=False,
                  attention_head_size=None,
                  qk_layernorm=False,
+                 layernorm_type=LayerNormType.LayerNorm,
                  inner_layernorm=False,
                  eps=1e-05,
                  attention_mask_type=AttentionMaskType.padding,
@@ -345,13 +357,15 @@ class Attention(Module):
         self.rotary_embedding_scaling = rotary_embedding_scaling
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
+        self.short_mscale = 1.0
+        self.long_mscale = 1.0
         self.rotary_embedding_percentage = rotary_embedding_percentage
         self.use_implicit_relative_attention = self.relative_attention and use_implicit_relative_attention
         if rotary_embedding_scaling is not None:
-            assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
-            self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
-                "type"] == "linear" else RotaryScalingType.dynamic
-            self.rotary_embedding_scale = rotary_embedding_scaling["factor"]
+            self.rotary_embedding_scale_type = RotaryScalingType.from_string(
+                rotary_embedding_scaling["type"])
+            self.rotary_embedding_scale = rotary_embedding_scaling.get(
+                "factor", 1.0)
 
         self.rotary_embedding_dim = 0
         if self.position_embedding_type.is_rope():
@@ -360,8 +374,8 @@ class Attention(Module):
 
             if self.position_embedding_type == PositionEmbeddingType.long_rope:
                 embed_positions_short_factors, embed_positions_long_factors, \
-                embed_positions_short_factors_for_attention_plugin, \
-                embed_positions_long_factors_for_attention_plugin, mscale \
+                (short_inv_freq, embed_positions_short_factors_for_attention_plugin), \
+                (long_inv_freq, embed_positions_long_factors_for_attention_plugin), mscale \
                     = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
                     self.max_position_embeddings,
                     original_max_position_embeddings, self.rotary_embedding_dim,
@@ -375,10 +389,8 @@ class Attention(Module):
                 else:
                     short_mscale = long_mscale = mscale
 
-                rope_scaling_short_factors = np.array(
-                    rope_scaling_short_factors).reshape(1, -1)
-                rope_scaling_long_factors = np.array(
-                    rope_scaling_long_factors).reshape(1, -1)
+                short_inv_freq = short_inv_freq.reshape(1, -1)
+                long_inv_freq = long_inv_freq.reshape(1, -1)
 
                 self.register_parameter(
                     'embed_positions_short_factors',
@@ -404,15 +416,11 @@ class Attention(Module):
                 self.short_mscale = short_mscale
                 self.long_mscale = long_mscale
                 self.register_parameter(
-                    'rope_scaling_short_factors',
-                    Parameter(rope_scaling_short_factors,
-                              dtype='float32',
-                              is_buffer=True))
+                    'short_inv_freq',
+                    Parameter(short_inv_freq, dtype='float32', is_buffer=True))
                 self.register_parameter(
-                    'rope_scaling_long_factors',
-                    Parameter(rope_scaling_long_factors,
-                              dtype='float32',
-                              is_buffer=True))
+                    'long_inv_freq',
+                    Parameter(long_inv_freq, dtype='float32', is_buffer=True))
             else:
                 # Rotary cos/sin cache.
                 embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
@@ -422,10 +430,13 @@ class Attention(Module):
                 self.register_parameter(
                     'embed_positions',
                     Parameter(embed_positions, dtype='float32', is_buffer=True))
-                embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                     self.max_position_embeddings, self.rotary_embedding_dim,
                     self.rotary_embedding_base, self.rotary_embedding_scale,
                     self.rotary_embedding_scale_type)
+                self.register_parameter(
+                    'rotary_inv_freq',
+                    Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
                 self.register_parameter(
                     'embed_positions_for_gpt_attention',
                     Parameter(embed_positions_for_gpt_attention,
@@ -486,11 +497,17 @@ class Attention(Module):
                                                    tp_size, num_buckets),
                                             dtype=dtype)
         self.qk_layernorm = qk_layernorm
+        self.layernorm_type = layernorm_type
+        ln_type = layernorm_map[layernorm_type]
         if self.qk_layernorm:
-            self.q_layernorm = LayerNorm(self.attention_head_size, dtype=dtype)
-            self.k_layernorm = LayerNorm(self.attention_head_size, dtype=dtype)
-        self.inner_layernorm = LayerNorm(self.hidden_size, dtype=dtype,
-                                         eps=eps) if inner_layernorm else None
+            self.q_layernorm = ln_type(self.attention_head_size,
+                                       eps=eps,
+                                       dtype=dtype)
+            self.k_layernorm = ln_type(self.attention_head_size,
+                                       eps=eps,
+                                       dtype=dtype)
+        self.inner_layernorm = ln_type(self.hidden_size, dtype=dtype,
+                                       eps=eps) if inner_layernorm else None
         if clip_qkv is not None:
             self.clip_qkv = fp32_array([clip_qkv])
         else:
@@ -614,7 +631,6 @@ class Attention(Module):
                     base_shape, self.num_attention_heads, 3,
                     self.attention_head_size
                 ]))
-
             query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)
             q_shape = concat([
                 base_shape, self.num_attention_heads, self.attention_head_size
@@ -748,24 +764,21 @@ class Attention(Module):
                 rotary_cos_sin = slice(embed_positions,
                                        concat([select, 0]),
                                        sizes=concat([1, shape(long, 1)]))
-                short_factors = self.rope_scaling_short_factors.value
-                long_factors = self.rope_scaling_long_factors.value
-                scale_factors = concat([short_factors, long_factors], dim=0)
-                rope_scaling_factors = slice(scale_factors,
-                                             concat([select, 0]),
-                                             sizes=concat(
-                                                 [1, shape(long_factors, 1)]))
-                rope_scaling_factors = rope_scaling_factors.view((-1, ))
+                short_inv_freq = self.short_inv_freq.value
+                long_inv_freq = self.long_inv_freq.value
+                concat_inv_freq = concat([short_inv_freq, long_inv_freq], dim=0)
+                rotary_inv_freq = slice(concat_inv_freq,
+                                        concat([select, 0]),
+                                        sizes=concat(
+                                            [1, shape(long_inv_freq, 1)]))
+                rotary_inv_freq = rotary_inv_freq.view((-1, ))
             else:
+                # The rotary inv freq can be pre-computed.
+                rotary_inv_freq = self.rotary_inv_freq.value if self.position_embedding_type.is_rope(
+                ) else None
                 # Rotary cos/sin cache.
                 rotary_cos_sin = self.embed_positions_for_gpt_attention.value if self.position_embedding_type.is_rope(
                 ) else None
-                rope_scaling_factors = None
-
-            if self.position_embedding_type == PositionEmbeddingType.long_rope:
-                short_mscale, long_mscale = self.short_mscale, self.long_mscale
-            else:
-                short_mscale, long_mscale = None, None
 
             context, past_key_value = gpt_attention(
                 qkv=qkv,
@@ -787,14 +800,14 @@ class Attention(Module):
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 rotary_embedding_base=self.rotary_embedding_base,
                 rotary_embedding_scale_type=self.rotary_embedding_scale_type,
-                rotary_embedding_scaling_factors=rope_scaling_factors,
-                rotary_embedding_short_m_scale=short_mscale,
-                rotary_embedding_long_m_scale=long_mscale,
+                rotary_embedding_short_m_scale=self.short_mscale,
+                rotary_embedding_long_m_scale=self.long_mscale,
                 rotary_embedding_scale=self.rotary_embedding_scale,
                 rotary_embedding_max_positions=self.max_position_embeddings,
                 rotary_embedding_original_max_positions=self.
                 original_max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
+                rotary_inv_freq=rotary_inv_freq,
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
@@ -841,7 +854,9 @@ class Attention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
-                qk_tanh_scale=self.max_attn_value)
+                qk_tanh_scale=self.max_attn_value,
+                host_runtime_perf_knobs=attention_params.host_runtime_perf_knobs
+            )
 
         else:
             # plain TensorRT mode
@@ -1475,11 +1490,13 @@ class CogVLMAttention(Attention):
                                    dtype=dtype,
                                    tp_group=tp_group,
                                    tp_size=tp_size)
-        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_cogvlm_attention_plugin(
+        rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_cogvlm_attention_plugin(
             self.max_position_embeddings, self.rotary_embedding_dim,
             self.rotary_embedding_base, self.rotary_embedding_scale,
             self.rotary_embedding_scale_type, self.vision_start,
             self.vision_length)
+        self.register_parameter('rotary_inv_freq',
+                                Parameter(rotary_inv_freq, dtype='float32'))
         self.register_parameter(
             'embed_positions_for_gpt_attention',
             Parameter(embed_positions_for_gpt_attention, dtype='float32'))
@@ -1543,6 +1560,7 @@ class CogVLMAttention(Attention):
             ) or self.quant_mode.has_fp8_qdq(
             ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
 
+            rotary_inv_freq = self.rotary_inv_freq.value
             rotary_cos_sin = self.embed_positions_for_gpt_attention.value
             attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
             context, past_key_value = gpt_attention(
@@ -1568,6 +1586,7 @@ class CogVLMAttention(Attention):
                 rotary_embedding_scale=self.rotary_embedding_scale,
                 rotary_embedding_max_positions=self.max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
+                rotary_inv_freq=rotary_inv_freq,
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
@@ -1597,6 +1616,7 @@ class CogVLMAttention(Attention):
                 use_cache=use_cache,
                 spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
+                host_runtime_perf_knobs=attention_params.host_runtime_perf_knobs
             )
 
         bs = shape(context, 0)

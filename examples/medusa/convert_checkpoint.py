@@ -1095,17 +1095,18 @@ if __name__ == '__main__':
     if args.model_dir is not None:
         hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
 
-        model = hf_model.from_pretrained(args.model_dir,
-                                         torch_dtype='auto',
-                                         device_map="auto",
-                                         trust_remote_code=True)
+        model = hf_model.from_pretrained(
+            args.model_dir,
+            torch_dtype='auto',
+            device_map='auto' if not args.load_model_on_cpu else 'cpu',
+            trust_remote_code=True)
 
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
                 "TOKENIZERS_PARALLELISM", "false")
             if args.load_model_on_cpu:
                 logger.warning(
-                    "Note that running capture_activation_range on cpu would be very small."
+                    "Note that running capture_activation_range on cpu would be very slow."
                 )
             tokenizer = LlamaTokenizer.from_pretrained(args.model_dir,
                                                        padding_side='left')

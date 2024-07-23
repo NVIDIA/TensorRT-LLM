@@ -119,6 +119,10 @@ class LLaMAConfig(PretrainedConfig):
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
+        if getattr(hf_config, "use_scaled_rope", False):
+            rotary_scaling = {"type": "wavelen"}
+        else:
+            rotary_scaling = getattr(hf_config, "rope_scaling", None)
         rotary_base = getattr(hf_config, "rope_theta", 10000.0)
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
@@ -214,6 +218,11 @@ class LLaMAConfig(PretrainedConfig):
                 "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
             dtype = 'float16'
 
+        if meta_config.get('use_scaled_rope'):
+            rotary_scaling = {"type": "wavelen"}
+        else:
+            rotary_scaling = meta_config.get("rope_scaling")
+
         # meta checkpoint don't have vocab_size|hidden_act|rotary_base specified, use same default value as HF
         return cls(architecture="LlamaForCausalLM",
                    dtype=dtype,
@@ -226,6 +235,7 @@ class LLaMAConfig(PretrainedConfig):
                    position_embedding_type='rope_gpt_neox',
                    max_position_embeddings=2048,
                    hidden_act='silu',
+                   rotary_scaling=rotary_scaling,
                    rotary_base=meta_config.get('rope_theta', 10000),
                    norm_epsilon=meta_config["norm_eps"],
                    mapping=mapping,

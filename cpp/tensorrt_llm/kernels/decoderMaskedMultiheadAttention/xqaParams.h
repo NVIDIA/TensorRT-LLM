@@ -48,6 +48,7 @@ struct XQAParams
     int32_t const* sequence_lengths;                  //
     int32_t const* context_lengths;                   // maybe not used now
     void const* alibi_slopes;                         // maybe not used now
+    float const* rotary_embedding_inv_freq_cache;     // precomputed rotary inv freq
     int32_t const* spec_decoding_packed_mask;
     int const* spec_decoding_position_offsets;        // for position embedding.
     int const* spec_decoding_generation_lengths;      // variable input lengths.

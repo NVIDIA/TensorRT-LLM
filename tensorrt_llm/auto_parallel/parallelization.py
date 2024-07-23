@@ -1396,7 +1396,6 @@ class DistributedGraphGroup(GraphGroupBase):
         self.io_tensor_shards = {}
         self.shapes_by_device = {}
         self.values_by_device = {}
-        self.use_custom_all_reduce = False
         phy_mesh = config.graph_config.phy_mesh
         device_ids = phy_mesh.phy_devices_id
         for device_id in np.nditer(device_ids):
@@ -1565,21 +1564,15 @@ class DistributedGraphGroup(GraphGroupBase):
 
     def add_all_reduce_layer(self, context: GraphContext, input_name,
                              output_name, device_ids, to_reduce_tensors):
-        counter = 0
-        if self.use_custom_all_reduce:
-            counter = current_all_reduce_helper().gen_id()
+        counter = current_all_reduce_helper().gen_id()
         for device_id, to_reduce_tensor in zip(np.nditer(device_ids),
                                                to_reduce_tensors):
             device_id = device_id.item()
             layer_info = (input_name, output_name, device_id)
             network = self.get_network(device_id)
             graph = self.get_graph(device_id)
-            if self.use_custom_all_reduce:
-                strategy = AllReduceStrategy.AUTO
-                workspace = graph.get_input("all_reduce_workspace").as_trt()
-            else:
-                strategy = AllReduceStrategy.NCCL
-                workspace = None
+            strategy = AllReduceStrategy.AUTO
+            workspace = graph.get_input("all_reduce_workspace").as_trt()
 
             all_reduce_layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
                 network=network,
@@ -2202,9 +2195,7 @@ def parallelize(
     graph._plugin_config = simplifier.llm_network.plugin_config
     graph_group = GraphGroup.from_graph(graph, config, auto_parallel_config)
 
-    use_custom_all_reduce = graph._plugin_config.use_custom_all_reduce
-    if use_custom_all_reduce and not debug_mode:
-        graph_group.use_custom_all_reduce = True
+    if not debug_mode:
         init_all_reduce_helper()
         tp_size = phy_mesh.size // config.graph_config.num_stages
         shape = (CustomAllReduceHelper.POINTERS_PER_RANK * tp_size, )

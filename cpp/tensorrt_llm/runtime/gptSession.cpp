@@ -173,7 +173,7 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
         if (decoderPerRequest)
         {
             mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(
-                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode()));
+                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
         }
         else
         {
@@ -326,7 +326,7 @@ void GptSession::setup(Config const& sessionConfig)
         }
     }
 
-    if (mWorldConfig.isTensorParallel() && mModelConfig.useCustomAllReduce())
+    if (mWorldConfig.isTensorParallel())
     {
         createCustomAllReduceWorkspace(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxSequenceLength);
     }

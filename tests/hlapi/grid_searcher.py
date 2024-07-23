@@ -72,8 +72,6 @@ class GridSearcher:
             build_config = copy.deepcopy(origin_build_config)
             kv_cache_config = copy.deepcopy(origin_kv_cache_config)
 
-            build_config.plugin_config.multi_block_mode = llm_kwargs.pop(
-                'multi_block_mode')
             kv_cache_config.enable_block_reuse = llm_kwargs.pop(
                 'kvcache_reuse_blocks')
             scheduler_config = SchedulerConfig(
@@ -112,13 +110,11 @@ class GridSearcher:
     @property
     def tunable_space(self):
         tunable_options = dict(
-            multi_block_mode=[False, True],
             kvcache_reuse_blocks=[False, True],
             capacity_scheduling_policy=[
                 CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
                 CapacitySchedulerPolicy.MAX_UTILIZATION
             ],
-            enable_chunked_context=[False, True],
         )
         self.space_size = reduce(operator.mul,
                                  [len(v) for v in tunable_options.values()], 1)
