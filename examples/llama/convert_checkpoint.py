@@ -5,9 +5,12 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from transformers import AutoConfig
+
 import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAConfig, LLaMAForCausalLM
 from tensorrt_llm.models.convert_utils import has_safetensors
@@ -221,6 +224,7 @@ def parse_arguments():
         help=
         'Only save the model config w/o read and converting weights, be careful, this is for debug only'
     )
+    parser.add_argument('--log_level', type=str, default='info')
 
     args = parser.parse_args()
     # changing the default to be consistent as the cli help said.
@@ -252,7 +256,7 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
                 quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
     elif args.use_fp8_rowwise:
         quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-        # FIXME: this seems to be a constant value for meta fp8 recipe.
+        # this will be overwritten if specified in the hf config.
         quant_config.clamp_val = [-1200.0, 1200.0]
 
     if args.int8_kv_cache:
@@ -267,6 +271,21 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         quant_config.pre_quant_scale = False
         quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
 
+    return quant_config
+
+
+def update_quant_config_from_hf(quant_config, hf_config) -> QuantConfig:
+    hf_config_dict = hf_config.to_dict()
+    if hf_config_dict.get('quantization_config'):
+        # update the quant_algo, and clamp_val.
+        if hf_config_dict['quantization_config'].get(
+                'quant_method') == 'fbgemm_fp8':
+            logger.info(
+                "Load quantization configs from huggingface model_config.")
+            quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+            activation_scale_ub = hf_config_dict['quantization_config'].get(
+                'activation_scale_ub', 1200.0)
+            quant_config.clamp_val = [-activation_scale_ub, activation_scale_ub]
     return quant_config
 
 
@@ -346,6 +365,14 @@ def convert_and_save_hf(args):
     override_fields.update(args_to_build_options(args))
 
     quant_config = args_to_quant_config(args)
+
+    try:
+        hf_config = AutoConfig.from_pretrained(model_dir,
+                                               trust_remote_code=True)
+        quant_config = update_quant_config_from_hf(quant_config, hf_config)
+    except:
+        # llava_llama needs its own defined config.
+        logger.warning("AutoConfig cannot load the huggingface config.")
 
     if args.smoothquant is not None or args.int8_kv_cache:
         assert not args.load_by_shard, "When using quantization, TRT-LLM needs to load the whole HF model, thus load by shard not supported"
@@ -439,6 +466,7 @@ def execute(workers, func, args):
 def main():
     print(tensorrt_llm.__version__)
     args = parse_arguments()
+    logger.set_level(args.log_level)
 
     world_size = args.tp_size * args.pp_size
     if (args.moe_tp_size == -1 and args.moe_ep_size == -1):

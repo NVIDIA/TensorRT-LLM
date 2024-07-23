@@ -426,26 +426,50 @@ def split_matrix_tp(v, tensor_parallel, rank, dim):
     return split(v, tensor_parallel, rank, dim=dim)
 
 
-def get_weight(config, prefix, dtype):
-    if config[prefix + '.weight'].dtype != dtype:
-        config[prefix + '.weight'].data = config[prefix + '.weight'].to(dtype)
-    return config[prefix + '.weight'].detach()
+def get_weight(named_params, prefix, dtype):
+    if named_params[prefix + '.weight'].dtype != dtype:
+        named_params[prefix +
+                     '.weight'].data = named_params[prefix +
+                                                    '.weight'].to(dtype)
+    return named_params[prefix + '.weight'].detach()
 
 
-def get_bias(config, prefix, dtype):
-    if config[prefix + '.bias'].dtype != dtype:
-        config[prefix + '.bias'].data = config[prefix + '.bias'].to(dtype)
-    return config[prefix + '.bias'].detach()
+def get_weight_and_scale(named_params,
+                         prefix,
+                         dtype,
+                         mapping=None,
+                         split_scale=False):
+    if prefix + '.weight_scale' not in named_params:
+        return get_weight(named_params, prefix, dtype), None
+    else:
+        assert named_params[prefix + '.weight'].dtype == torch.float8_e4m3fn
+        assert named_params[prefix + '.weight_scale'].dtype == torch.float32
+        weight_scale = named_params[prefix + '.weight_scale'].detach()
+        if split_scale:
+            weight_scale = split(weight_scale,
+                                 mapping.tp_size,
+                                 mapping.tp_rank,
+                                 dim=0)
+        return named_params[prefix +
+                            '.weight'].detach(), weight_scale.reshape(-1)
 
 
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
+def get_bias(named_params, prefix, dtype):
+    if named_params[prefix + '.bias'].dtype != dtype:
+        named_params[prefix + '.bias'].data = named_params[prefix +
+                                                           '.bias'].to(dtype)
+    return named_params[prefix + '.bias'].detach()
 
 
-def fp8_per_channel_quant_weight_gpu(weight, rank=0):
+def get_weight_and_bias(named_params, prefix, dtype):
+    return get_weight(named_params, prefix,
+                      dtype), get_bias(named_params, prefix, dtype)
+
+
+def fp8_per_channel_quant_weight_gpu(weight, clamp_val, rank=0):
     weight = weight.to("cuda:" + str(rank))
     # activation range bound.
-    x = weight.to(torch.float32).clamp(-1200.0, 1200.0)
+    x = weight.to(torch.float32).clamp(clamp_val[0], clamp_val[1])
     xmax = x.abs().max(-1, keepdim=True).values
     # minimum scaling factor.
     torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
@@ -469,11 +493,16 @@ def get_tllm_linear_weight(weight,
                            dtype='float32',
                            use_gemm_woq_plugin=True,
                            use_fp8_rowwise=False,
+                           weight_scale=None,
+                           clamp_value=[-1200.0, 1200],
                            tp_rank=0,
                            postfix='weight',
                            quant_scale_name=None):
     results = {}
     if use_weight_only:
+        if weight_scale:
+            logger.error(
+                "Weight only doesn't support loading scales from the weights.")
         if weight.dim() > 2:
             v = weight.transpose(1, 2).contiguous()
         else:
@@ -490,11 +519,16 @@ def get_tllm_linear_weight(weight,
         else:
             results[prefix + 'per_channel_scale'] = torch_weight_scales
     elif use_fp8_rowwise:
-        processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-            weight)
+        if weight_scale is not None:
+            assert weight.dtype == torch.float8_e4m3fn, "weight data type must be torch.float8_e4m3fn"
+            results[prefix + postfix] = weight
+            torch_weight_scales = weight_scale.to(torch.float32)
+        else:
+            processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
+                weight, clamp_value)
+            results[prefix + postfix] = processed_torch_weights
+            torch_weight_scales = torch_weight_scales.to(torch.float32)
 
-        results[prefix + postfix] = processed_torch_weights
-        torch_weight_scales = torch_weight_scales.to(torch.float32)
         if quant_scale_name is not None:
             results[quant_scale_name] = torch_weight_scales
         else:
@@ -729,6 +763,7 @@ def load_weights_from_hf_model(hf_model,
     moe_config = config.moe
     mha_mode = (config.num_key_value_heads == config.num_attention_heads)
     layers_range = config.mapping.pp_layers(config.num_hidden_layers)
+    exclude_layers_id = [0, config.num_hidden_layers - 1]
 
     def convert_layer(l):
         prefix = f'model.layers.{l}.'
@@ -736,6 +771,10 @@ def load_weights_from_hf_model(hf_model,
         q_weight = get_weight(model_params, prefix + 'self_attn.q_proj', dtype)
         k_weight = get_weight(model_params, prefix + 'self_attn.k_proj', dtype)
         v_weight = get_weight(model_params, prefix + 'self_attn.v_proj', dtype)
+
+        # Meta's recipe of not using fp8 rowwise for the first and last layer.
+        use_fp8_rowwise_in_layer = use_fp8_rowwise and (
+            l not in exclude_layers_id)
 
         if not mha_mode:
             if config.num_key_value_heads < mapping.tp_size:
@@ -1052,13 +1091,14 @@ def load_weights_from_hf_model(hf_model,
                     dtype,
                     use_gemm_woq_plugin))
         else:
-            mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
-                                         dtype)
+            mlp_gate_weight, mlp_gate_weight_scale = get_weight_and_scale(
+                model_params, prefix + 'mlp.up_proj', dtype, mapping, True)
             split_v = split_matrix_tp(mlp_gate_weight,
                                       mapping.tp_size,
                                       mapping.tp_rank,
                                       dim=0)
             if use_smooth_quant:
+
                 mlp_gate_weight = mlp_gate_weight.t()
                 int8_weights = generate_int8(
                     mlp_gate_weight, act_range.get(prefix + 'mlp.up_proj'))
@@ -1079,14 +1119,20 @@ def load_weights_from_hf_model(hf_model,
                         cat_dim=-1))
             else:
                 weights.update(
-                    get_tllm_linear_weight(split_v, tllm_prex + 'mlp.gate.',
-                                           None, use_weight_only,
-                                           plugin_weight_only_quant_type, dtype,
-                                           use_gemm_woq_plugin,
-                                           use_fp8_rowwise))
+                    get_tllm_linear_weight(
+                        split_v,
+                        tllm_prex + 'mlp.gate.',
+                        None,
+                        use_weight_only,
+                        plugin_weight_only_quant_type,
+                        dtype,
+                        use_gemm_woq_plugin,
+                        use_fp8_rowwise_in_layer,
+                        weight_scale=mlp_gate_weight_scale,
+                        clamp_value=config.quantization.clamp_val))
 
-            mlp_fc_weight = get_weight(model_params, prefix + 'mlp.gate_proj',
-                                       dtype)
+            mlp_fc_weight, mlp_fc_weight_scale = get_weight_and_scale(
+                model_params, prefix + 'mlp.gate_proj', dtype, mapping, True)
             split_v = split_matrix_tp(mlp_fc_weight,
                                       mapping.tp_size,
                                       mapping.tp_rank,
@@ -1112,14 +1158,20 @@ def load_weights_from_hf_model(hf_model,
                         cat_dim=-1))
             else:
                 weights.update(
-                    get_tllm_linear_weight(split_v, tllm_prex + 'mlp.fc.', None,
-                                           use_weight_only,
-                                           plugin_weight_only_quant_type, dtype,
-                                           use_gemm_woq_plugin,
-                                           use_fp8_rowwise))
+                    get_tllm_linear_weight(
+                        split_v,
+                        tllm_prex + 'mlp.fc.',
+                        None,
+                        use_weight_only,
+                        plugin_weight_only_quant_type,
+                        dtype,
+                        use_gemm_woq_plugin,
+                        use_fp8_rowwise_in_layer,
+                        weight_scale=mlp_fc_weight_scale,
+                        clamp_value=config.quantization.clamp_val))
 
-            mlp_proj_weight = get_weight(model_params, prefix + 'mlp.down_proj',
-                                         dtype)
+            mlp_proj_weight, mlp_proj_weight_scale = get_weight_and_scale(
+                model_params, prefix + 'mlp.down_proj', dtype)
             split_v = split_matrix_tp(mlp_proj_weight,
                                       mapping.tp_size,
                                       mapping.tp_rank,
@@ -1147,11 +1199,17 @@ def load_weights_from_hf_model(hf_model,
                         cat_dim=0))
             else:
                 weights.update(
-                    get_tllm_linear_weight(split_v, tllm_prex + 'mlp.proj.',
-                                           None, use_weight_only,
-                                           plugin_weight_only_quant_type, dtype,
-                                           use_gemm_woq_plugin,
-                                           use_fp8_rowwise))
+                    get_tllm_linear_weight(
+                        split_v,
+                        tllm_prex + 'mlp.proj.',
+                        None,
+                        use_weight_only,
+                        plugin_weight_only_quant_type,
+                        dtype,
+                        use_gemm_woq_plugin,
+                        use_fp8_rowwise_in_layer,
+                        weight_scale=mlp_proj_weight_scale,
+                        clamp_value=config.quantization.clamp_val))
 
         # Layer norms do not use tensor parallelism
         input_ln_weight = get_weight(model_params, prefix + 'input_layernorm',
@@ -1410,20 +1468,55 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
         plugin_weight_only_quant_type = None
     use_weight_only = quant_mode.is_weight_only()
     use_fp8_rowwise = quant_mode.has_fp8_rowwise()
+    # Meta's recipe of not using fp8 rowwise for the first and last layer.
+    exclude_layers_id = [0, config.num_hidden_layers - 1]
 
     layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     qkv_weight_helper = QkvWeightHelper(config)
 
+    def convert_to_dtype(name, param, model_params, dtype):
+        # fp8 rowwise weights will only load fp8 weights and scales for the mlp layer.
+        if ('weight_scale' in name or name.replace('weight', 'weight_scale') in model_params) \
+           and use_fp8_rowwise:
+            assert 'mlp' in name, "only MLP layers support fp8 rowwise currently."
+            return param
+        else:
+            return param.to(dtype)
+
+    def fp8_rowwise_quantization(name,
+                                 param,
+                                 model_params,
+                                 clamp_value,
+                                 split_scale=False):
+        # check if weights are already quantized.
+        loaded_weight_scale = model_params.get(
+            name.replace('weight', 'weight_scale'))
+        if loaded_weight_scale is not None:
+            assert param.dtype == torch.float8_e4m3fn, "weight data type must be torch.float8_e4m3fn"
+            if split_scale:
+                assert mapping is not None
+                loaded_weight_scale = split(loaded_weight_scale,
+                                            mapping.tp_size,
+                                            mapping.tp_rank,
+                                            dim=0)
+
+            return param, loaded_weight_scale.reshape(-1)
+        else:
+            return fp8_per_channel_quant_weight_gpu(param, clamp_value)
+
     for model_file in iterate_shard_files(model_dir,
                                           rank=mapping.tp_rank,
                                           progress_bar=False):
         logger.debug(f'Loading file {str(model_file)}...')
-        model_params = load_state_dict(model_file, dtype=dtype)
+        model_params = load_state_dict(model_file)
         for name, param in model_params.items():
             logger.debug(f'Converting weight {name}...')
             layer_idx = retrieved_layer_index_from_name(name)
             tllm_prex = f'transformer.layers.{layer_idx}.'
+
+            param = convert_to_dtype(name, param, model_params, dtype)
+
             if layer_idx is None:
                 layer = None
             else:
@@ -1431,6 +1524,10 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                     continue
                 else:
                     tllm_prex = f'transformer.layers.{layer_idx - layers_range[0]}.'
+
+            # Meta's recipe of not using fp8 rowwise for the first and last layer.
+            use_fp8_rowwise_in_layer = use_fp8_rowwise and (
+                layer_idx not in exclude_layers_id)
 
             if 'model.embed_tokens.weight' in name:
                 if hf_config.tie_word_embeddings:
@@ -1505,7 +1602,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                         'attention.dense.per_channel_scale'] = torch_weight_scales
                 else:
                     weights[tllm_prex + 'attention.dense.weight'] = split_v
-            elif 'mlp.up_proj.weight' in name:
+            elif name.endswith('mlp.up_proj.weight'):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1515,9 +1612,10 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             'mlp.gate.weight'] = processed_torch_weights
                     weights[tllm_prex +
                             'mlp.gate.per_channel_scale'] = torch_weight_scales
-                elif use_fp8_rowwise:
-                    processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-                        split_v)
+                elif use_fp8_rowwise_in_layer:
+                    processed_torch_weights, torch_weight_scales = fp8_rowwise_quantization(
+                        name, split_v, model_params,
+                        config.quantization.clamp_val, True)
                     weights[tllm_prex +
                             'mlp.gate.weight'] = processed_torch_weights.view(
                                 plugin_weight_only_quant_type)
@@ -1527,7 +1625,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             torch.float32)
                 else:
                     weights[tllm_prex + 'mlp.gate.weight'] = split_v
-            elif 'mlp.down_proj.weight' in name:
+            elif name.endswith('mlp.down_proj.weight'):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1537,9 +1635,10 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             'mlp.proj.weight'] = processed_torch_weights
                     weights[tllm_prex +
                             'mlp.proj.per_channel_scale'] = torch_weight_scales
-                elif use_fp8_rowwise:
-                    processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-                        split_v)
+                elif use_fp8_rowwise_in_layer:
+                    processed_torch_weights, torch_weight_scales = fp8_rowwise_quantization(
+                        name, split_v, model_params,
+                        config.quantization.clamp_val)
                     weights[tllm_prex +
                             'mlp.proj.weight'] = processed_torch_weights.view(
                                 plugin_weight_only_quant_type)
@@ -1550,7 +1649,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                 else:
                     weights[tllm_prex + 'mlp.proj.weight'] = split_v
 
-            elif 'mlp.gate_proj.weight' in name:
+            elif name.endswith('mlp.gate_proj.weight'):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1562,9 +1661,10 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             'mlp.fc.weight'] = processed_torch_weights
                     weights[tllm_prex +
                             'mlp.fc.per_channel_scale'] = torch_weight_scales
-                elif use_fp8_rowwise:
-                    processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-                        split_v)
+                elif use_fp8_rowwise_in_layer:
+                    processed_torch_weights, torch_weight_scales = fp8_rowwise_quantization(
+                        name, split_v, model_params,
+                        config.quantization.clamp_val, True)
                     weights[tllm_prex +
                             'mlp.fc.weight'] = processed_torch_weights.view(
                                 plugin_weight_only_quant_type)
@@ -1997,8 +2097,9 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
     if config.quant_mode.has_any_quant() and not use_fp8_rowwise:
         logger.error(
             "Meta ckpts only support fp8_rowwise quantization currently.")
-    print(f"fp8 rowwise {use_fp8_rowwise}")
     weights = {}
+    # Meta's recipe of not using fp8 rowwise for the first and last layer.
+    exclude_layers_id = [0, config.num_hidden_layers - 1]
 
     def gather_ckpts(ckpts):
         gathered = {}
@@ -2182,6 +2283,9 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
         else:
             # layer specific weights
             layer_idx = extract_layer_idx(k)
+            # Meta's recipe of not using fp8 rowwise for the first and last layer.
+            use_fp8_rowwise_in_layer = use_fp8_rowwise and (
+                layer_idx not in exclude_layers_id)
 
             if layer_idx is None or int(layer_idx) not in layers_range:
                 continue
@@ -2193,9 +2297,9 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
             elif 'ffn_norm.weight' in k:
                 weights[tllm_prex + 'post_layernorm.weight'] = v
             elif 'feed_forward.w3.weight' in k:
-                if use_fp8_rowwise:
+                if use_fp8_rowwise_in_layer:
                     processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-                        v)
+                        v, config.quantization.clamp_val)
                     weights[tllm_prex +
                             'mlp.gate.weight'] = processed_torch_weights
                     weights[tllm_prex +
@@ -2203,9 +2307,9 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
                 else:
                     weights[tllm_prex + 'mlp.gate.weight'] = v
             elif 'feed_forward.w2.weight' in k:
-                if use_fp8_rowwise:
+                if use_fp8_rowwise_in_layer:
                     processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-                        v)
+                        v, config.quantization.clamp_val)
                     weights[tllm_prex +
                             'mlp.proj.weight'] = processed_torch_weights
                     weights[tllm_prex +
@@ -2213,9 +2317,9 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
                 else:
                     weights[tllm_prex + 'mlp.proj.weight'] = v
             elif 'feed_forward.w1.weight' in k:
-                if use_fp8_rowwise:
+                if use_fp8_rowwise_in_layer:
                     processed_torch_weights, torch_weight_scales = fp8_per_channel_quant_weight_gpu(
-                        v)
+                        v, config.quantization.clamp_val)
                     weights[tllm_prex +
                             'mlp.fc.weight'] = processed_torch_weights
                     weights[tllm_prex +

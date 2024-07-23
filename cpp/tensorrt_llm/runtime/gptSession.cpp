@@ -1,6 +1,3 @@
-//
-// Created by martinma on 5/24/23.
-//
 /*
  * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *

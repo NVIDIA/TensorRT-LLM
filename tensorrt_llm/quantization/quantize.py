@@ -213,9 +213,27 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
         GatedMLP: Fp8RowwiseGatedMLP,
         MLP: Fp8RowwiseMLP,
     }
+
+    def extract_layer_idx(name):
+        ss = name.split('.')
+        for s in ss:
+            if s.isdigit():
+                return int(s)
+        return None
+
     for name, layer, parent in model.named_modules_with_parent():
         layer_name = name.rsplit('.', 1)[-1]
+        layer_idx = extract_layer_idx(name)
         if layer_name in ['ln_f', 'ln_embed'] or "input_layernorm" in name:
+            continue
+
+        # Meta's Fp8 recipe
+        mapping = model.config.mapping
+        layers_range = mapping.pp_layers(model.config.num_hidden_layers)
+        is_first_layer = mapping.is_first_pp_rank() and layer_idx == 0
+        is_last_layer = mapping.is_last_pp_rank(
+        ) and layer_idx == len(layers_range) - 1
+        if is_first_layer or is_last_layer:
             continue
 
         quant_cls = None
