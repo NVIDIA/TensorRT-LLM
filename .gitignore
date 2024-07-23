@@ -48,3 +48,6 @@ results_trt/
 
 # Generated files
 cpp/include/tensorrt_llm/executor/version.h
+
+# User config files
+CMakeUserPresets.json

@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include <nccl.h>
 #include <unordered_set>
@@ -578,12 +577,14 @@ int AllreducePlugin::initialize() noexcept
         return 0;
     }
 
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     mNcclComm = getComm(mGroup);
     if (mStrategy != AllReduceStrategyType::NCCL)
     {
         initGroupTopology();
     }
 
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     return 0;
 }
 

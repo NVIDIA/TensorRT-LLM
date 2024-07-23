@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include <tuple>
 #include <type_traits>
 
@@ -268,6 +269,10 @@ __global__ void rms_norm_kernel(AllReduceParams params)
     local_final_output_buffer += block_offset;
     intermediate_buffer += block_offset;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     PackedStruct inter_vec, weight_vec;
     float acc = 0.f;
     for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
@@ -307,6 +312,9 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
         *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
@@ -329,11 +337,53 @@ void rms_norm_kernel_launcher(AllReduceParams params, cudaStream_t stream)
     if (cta_size * details::kBytesPerAccess / sizeof(T) < params.fusion_params.hidden_size)
     {
         smem_size = params.fusion_params.hidden_size * sizeof(T);
-        rms_norm_kernel<T, Bias, Residual, Affine, true><<<cta_num, cta_size, smem_size, stream>>>(params);
+        if (tensorrt_llm::common::getEnvEnableFDL())
+        {
+            TLLM_LOG_DEBUG("Enable FDL in rms_norm_kernel");
+            cudaLaunchConfig_t kernelConfig = {0};
+            kernelConfig.gridDim = cta_num;
+            kernelConfig.blockDim = cta_size;
+            kernelConfig.dynamicSmemBytes = smem_size;
+            kernelConfig.stream = stream;
+
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            kernelConfig.attrs = attribute;
+            kernelConfig.numAttrs = 1;
+
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, true>, params));
+        }
+        else
+        {
+            rms_norm_kernel<T, Bias, Residual, Affine, true><<<cta_num, cta_size, smem_size, stream>>>(params);
+        }
     }
     else
     {
-        rms_norm_kernel<T, Bias, Residual, Affine, false><<<cta_num, cta_size, smem_size, stream>>>(params);
+        if (tensorrt_llm::common::getEnvEnableFDL())
+        {
+            TLLM_LOG_DEBUG("Enable FDL in rms_norm_kernel");
+            cudaLaunchConfig_t kernelConfig = {0};
+            kernelConfig.gridDim = cta_num;
+            kernelConfig.blockDim = cta_size;
+            kernelConfig.dynamicSmemBytes = smem_size;
+            kernelConfig.stream = stream;
+
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            kernelConfig.attrs = attribute;
+            kernelConfig.numAttrs = 1;
+
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, false>, params));
+        }
+        else
+        {
+            rms_norm_kernel<T, Bias, Residual, Affine, false><<<cta_num, cta_size, smem_size, stream>>>(params);
+        }
     }
 }
 
@@ -375,6 +425,11 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
         int rank = (params.local_rank + ii) % RanksPerNode;
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     for (int offset = thread_offset; offset < norm_this_block * params.fusion_params.hidden_size;
          offset += blockDim.x * kPackedSize)
     {
@@ -435,6 +490,9 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
             *reinterpret_cast<int4*>(&local_final_output_buffer[norm_offset + offset]) = sum_vec.packed;
         }
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, int RanksPerNode, bool Bias, bool Affine>
@@ -455,16 +513,60 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams params, cudaStream
     int norm_num = params.elts_total / params.fusion_params.hidden_size;
     int cta_num = std::min(norm_num, static_cast<int>(MAX_ALL_REDUCE_BLOCKS));
     int smem_size = 0;
+
     if (cta_size * kPackedSize < params.fusion_params.hidden_size)
     {
         smem_size = params.fusion_params.hidden_size * sizeof(T);
-        one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>
-            <<<cta_num, cta_size, smem_size, stream>>>(params);
+        if (tensorrt_llm::common::getEnvEnableFDL())
+        {
+            TLLM_LOG_DEBUG("Enable FDL in one_shot_all_reduce_norm_kernel");
+
+            cudaLaunchConfig_t kernelConfig = {0};
+            kernelConfig.gridDim = cta_num;
+            kernelConfig.blockDim = cta_size;
+            kernelConfig.dynamicSmemBytes = smem_size;
+            kernelConfig.stream = stream;
+
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            kernelConfig.attrs = attribute;
+            kernelConfig.numAttrs = 1;
+
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>, params));
+        }
+        else
+        {
+            one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>
+                <<<cta_num, cta_size, smem_size, stream>>>(params);
+        }
     }
     else
     {
-        one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>
-            <<<cta_num, cta_size, smem_size, stream>>>(params);
+        if (tensorrt_llm::common::getEnvEnableFDL())
+        {
+            cudaLaunchConfig_t kernelConfig = {0};
+            kernelConfig.gridDim = cta_num;
+            kernelConfig.blockDim = cta_size;
+            kernelConfig.dynamicSmemBytes = smem_size;
+            kernelConfig.stream = stream;
+
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            kernelConfig.attrs = attribute;
+            kernelConfig.numAttrs = 1;
+
+            TLLM_LOG_DEBUG("Enable FDL in one_shot_all_reduce_norm_kernel");
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>, params));
+        }
+        else
+        {
+            one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>
+                <<<cta_num, cta_size, smem_size, stream>>>(params);
+        }
     }
 }
 }; // namespace reduce_fusion
@@ -655,6 +757,10 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     if constexpr (PUSH_MODE || COPY_INPUT)
     {
         // Copy all blocks from local buffer to shareable buffer
@@ -784,6 +890,10 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
             *reinterpret_cast<int4*>(&local_output_buffer[offset_rank]) = sums.packed;
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type)
@@ -869,8 +979,30 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
         }
         auto output_ptr = params.local_output_buffer_ptr;
         params.local_output_buffer_ptr = params.fusion_params.intermediate_buffer;
-        twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+
+        if (tensorrt_llm::common::getEnvEnableFDL())
+        {
+            TLLM_LOG_DEBUG("Enable FDL in twoShotAllReduceKernel");
+            cudaLaunchConfig_t kernelConfig = {0};
+            kernelConfig.gridDim = blocks_per_grid;
+            kernelConfig.blockDim = threads_per_block;
+            kernelConfig.dynamicSmemBytes = 0;
+            kernelConfig.stream = stream;
+
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            kernelConfig.attrs = attribute;
+            kernelConfig.numAttrs = 1;
+
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                &kernelConfig, twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>, params));
+        }
+        else
+        {
+            twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE, Bias, true>
+                <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        }
         params.local_output_buffer_ptr = output_ptr;
         reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(params, stream);
     }

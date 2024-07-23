@@ -264,10 +264,10 @@ __global__
     int L = L_;
     int DS_ = (D_ + S_pre_ + S_post_);
 
-    int aIStart = blockIdx.z * L_ * DS_;
-    int aOStart = blockIdx.z * L_ * D_;
+    long aIStart = long(blockIdx.z) * L_ * DS_;
+    long aOStart = long(blockIdx.z) * L_ * D_;
     int sStart = blockIdx.z * (K_ - 1) * D_;
-    int lStart = blockIdx.y * tileL_;
+    long lStart = blockIdx.y * tileL_;
     int dStart = blockIdx.x * tileD_;
 
     if (removePadding_)
@@ -547,10 +547,10 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
     int L = L_;
     int DS_ = (D_ + S_pre_ + S_post_);
 
-    int aIStart = blockIdx.z * L_ * DS_;
-    int aOStart = blockIdx.z * L_ * D_;
+    long aIStart = long(blockIdx.z) * L_ * DS_;
+    long aOStart = long(blockIdx.z) * L_ * D_;
     int sStart = blockIdx.z * (K_ - 1) * D_;
-    int lStart = blockIdx.y * tileL_;
+    long lStart = blockIdx.y * tileL_;
     int dStart = blockIdx.x * tileD_;
 
     if (removePadding_)

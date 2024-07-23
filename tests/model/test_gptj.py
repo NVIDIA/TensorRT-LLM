@@ -221,18 +221,21 @@ class TestGPTJ(unittest.TestCase):
                             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                             device='cuda'))
 
-        def run_engine(context,
-                       input_ids,
-                       context_lengths,
-                       host_request_types,
-                       position_ids,
-                       last_token_ids,
-                       cache_indirection,
-                       host_past_key_value_lengths,
-                       host_max_attention_window_sizes,
-                       host_sink_token_length,
-                       sequence_length,
-                       host_context_lengths=None):
+        def run_engine(
+            context,
+            input_ids,
+            context_lengths,
+            host_request_types,
+            position_ids,
+            last_token_ids,
+            cache_indirection,
+            host_past_key_value_lengths,
+            host_max_attention_window_sizes,
+            host_sink_token_length,
+            sequence_length,
+            host_runtime_perf_knobs,
+            host_context_lengths=None,
+        ):
 
             ctx_buffer = {
                 'input_ids': input_ids,
@@ -244,6 +247,7 @@ class TestGPTJ(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
+                'host_runtime_perf_knobs': host_runtime_perf_knobs,
             }
             ctx_buffer[
                 f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
@@ -330,6 +334,11 @@ class TestGPTJ(unittest.TestCase):
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
 
+            perf_knob_tensor_size = 16
+            context_runtime_perf_knobs = torch.tensor([-1] *
+                                                      perf_knob_tensor_size,
+                                                      dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.ctx_context,
                 input_ids=ctx_ids,
@@ -342,7 +351,8 @@ class TestGPTJ(unittest.TestCase):
                 host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types)
+                host_request_types=host_request_types,
+                host_runtime_perf_knobs=context_runtime_perf_knobs)
 
             np.testing.assert_allclose(ref.cpu().numpy(),
                                        res.cpu().numpy(),
@@ -418,6 +428,10 @@ class TestGPTJ(unittest.TestCase):
             # For step 1, the sequence_lengths = context_lengths + 1.
             sequence_length_buffer = torch.add(ctx_context_lengths, 1)
 
+            perf_knob_tensor_size = 16
+            gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.context_1,
                 input_ids=step1_id,
@@ -431,7 +445,8 @@ class TestGPTJ(unittest.TestCase):
                 host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types)
+                host_request_types=host_request_types,
+                host_runtime_perf_knobs=gen_runtime_perf_knobs)
 
             np.testing.assert_allclose(ref.cpu().numpy(),
                                        res.cpu().numpy(),

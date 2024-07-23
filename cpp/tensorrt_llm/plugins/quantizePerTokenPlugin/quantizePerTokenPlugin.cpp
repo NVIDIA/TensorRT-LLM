@@ -18,6 +18,7 @@
 #include "tensorrt_llm/kernels/quantization.h"
 
 using namespace nvinfer1;
+using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using tensorrt_llm::plugins::QuantizePerTokenPluginCreator;
 using tensorrt_llm::plugins::QuantizePerTokenPlugin;
@@ -27,12 +28,24 @@ static char const* QUANTIZE_PER_TOKEN_PLUGIN_NAME{"QuantizePerToken"};
 PluginFieldCollection QuantizePerTokenPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> QuantizePerTokenPluginCreator::mPluginAttributes;
 
-QuantizePerTokenPlugin::QuantizePerTokenPlugin() {}
+QuantizePerTokenPlugin::QuantizePerTokenPlugin(nvinfer1::DataType outputType, QuantMode quantMode, bool clampValEnabled)
+    : mOutputType{outputType}
+    , mQuantMode{quantMode}
+    , mClampValEnabled{clampValEnabled}
+{
+    TLLM_CHECK_WITH_INFO(mOutputType == nvinfer1::DataType::kINT8 || mOutputType == nvinfer1::DataType::kFP8,
+        "Only int8 or fp8 output type is allowed.");
+    // Check if the quant mode is valid.
+    TLLM_CHECK_WITH_INFO(mQuantMode.hasPerTokenScaling(), "The quant mode is not valid.");
+}
 
 // Parameterized constructor
 QuantizePerTokenPlugin::QuantizePerTokenPlugin(void const* data, size_t length)
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
+    read(d, mOutputType);
+    read(d, mQuantMode);
+    read(d, mClampValEnabled);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
         "caused by using different TensorRT-LLM version to build "
@@ -43,7 +56,7 @@ QuantizePerTokenPlugin::QuantizePerTokenPlugin(void const* data, size_t length)
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* QuantizePerTokenPlugin::clone() const noexcept
 {
-    auto* plugin = new QuantizePerTokenPlugin();
+    auto* plugin = new QuantizePerTokenPlugin(mOutputType, mQuantMode, mClampValEnabled);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -53,7 +66,7 @@ nvinfer1::DimsExprs QuantizePerTokenPlugin::getOutputDimensions(
 {
     try
     {
-        TLLM_CHECK(nbInputs == 1);
+        TLLM_CHECK(nbInputs <= 2);
         TLLM_CHECK(outputIndex < 2);
         if (outputIndex == 0)
         {
@@ -81,9 +94,8 @@ nvinfer1::DimsExprs QuantizePerTokenPlugin::getOutputDimensions(
 bool QuantizePerTokenPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    switch (pos)
+    if (pos == 0)
     {
-    case 0:
         // activation
         return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF
 #ifdef ENABLE_BF16
@@ -91,17 +103,26 @@ bool QuantizePerTokenPlugin::supportsFormatCombination(
 #endif
                    )
             && inOut[pos].format == TensorFormat::kLINEAR;
-    case 1:
+    }
+    else if (pos == 1 && mClampValEnabled)
+    {
+        // clamp_max_v
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
+    }
+    else if (pos == 1 + int(mClampValEnabled))
+    {
         // quantized activation
-        return inOut[pos].type == nvinfer1::DataType::kINT8 && inOut[pos].format == TensorFormat::kLINEAR;
-    case 2:
+        return inOut[pos].type == mOutputType && inOut[pos].format == TensorFormat::kLINEAR;
+    }
+    else if (pos == 2 + int(mClampValEnabled))
+    {
         // scales
         return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
-    default:
-        // Never should be here
-        assert(false);
-        return false;
     }
+
+    // Never should be here
+    assert(false);
+    return false;
 }
 
 void QuantizePerTokenPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
@@ -115,12 +136,28 @@ size_t QuantizePerTokenPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const
     return 0;
 }
 
+template <typename T, typename QuantT>
+void QuantizePerTokenPlugin::dispatchDataType(void* output, void const* input, void const* clampValPtr, void* scalePtr,
+    int dim0, int dim1, cudaStream_t stream) noexcept
+{
+    // inputs
+    //     activation     [dim0(*), dim1]
+    //     clamp_value    [2], contains min val, and max val (optional)
+    // outputs
+    //     quant          [dim0(*), dim1]
+    //     scale_tokens   [dim0(*), 1]
+
+    invokePerTokenQuantization(reinterpret_cast<QuantT*>(output), reinterpret_cast<T const*>(input), dim0, dim1,
+        reinterpret_cast<float const*>(clampValPtr), reinterpret_cast<float*>(scalePtr), mQuantMode, stream);
+}
+
 int QuantizePerTokenPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     // inputs
     //     activation     [M(*), K]
+    //     clamp_value    [2], contains min val, and max val (optional)
     // outputs
     //     quant          [M(*), K]
     //     scale_tokens   [M(*), 1]
@@ -132,23 +169,40 @@ int QuantizePerTokenPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
     const int64_t k = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
 
-    if (inputDesc[0].type == DataType::kFLOAT)
+    void const* clampValPtr = mClampValEnabled ? inputs[1] : nullptr;
+
+    if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kINT8)
     {
-        invokePerTokenQuantization<float>(reinterpret_cast<int8_t*>(outputs[0]),
-            reinterpret_cast<float const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
+        dispatchDataType<float, int8_t>(outputs[0], inputs[0], clampValPtr, outputs[1], m, k, stream);
     }
-    else if (inputDesc[0].type == DataType::kHALF)
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kFP8)
     {
-        invokePerTokenQuantization<half>(reinterpret_cast<int8_t*>(outputs[0]),
-            reinterpret_cast<half const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
+        dispatchDataType<float, __nv_fp8_e4m3>(outputs[0], inputs[0], clampValPtr, outputs[1], m, k, stream);
     }
+#endif // ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kINT8)
+    {
+        dispatchDataType<half, int8_t>(outputs[0], inputs[0], clampValPtr, outputs[1], m, k, stream);
+    }
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kFP8)
+    {
+        dispatchDataType<half, __nv_fp8_e4m3>(outputs[0], inputs[0], clampValPtr, outputs[1], m, k, stream);
+    }
+#endif // ENABLE_FP8
 #ifdef ENABLE_BF16
-    else if (inputDesc[0].type == DataType::kBF16)
+    else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kINT8)
     {
-        invokePerTokenQuantization<__nv_bfloat16>(reinterpret_cast<int8_t*>(outputs[0]),
-            reinterpret_cast<__nv_bfloat16 const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
+        dispatchDataType<__nv_bfloat16, int8_t>(outputs[0], inputs[0], clampValPtr, outputs[1], m, k, stream);
     }
-#endif
+#ifdef ENABLE_FP8
+    else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kFP8)
+    {
+        dispatchDataType<__nv_bfloat16, __nv_fp8_e4m3>(outputs[0], inputs[0], clampValPtr, outputs[1], m, k, stream);
+    }
+#endif // ENABLE_FP8
+#endif // ENABLE_BF16
 
     return 0;
 }
@@ -157,9 +211,9 @@ int QuantizePerTokenPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 nvinfer1::DataType QuantizePerTokenPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    TLLM_CHECK(nbInputs == 1);
+    TLLM_CHECK(nbInputs >= 1);
     TLLM_CHECK(index < 2);
-    return index == 0 ? nvinfer1::DataType::kINT8 : nvinfer1::DataType::kFLOAT;
+    return index == 0 ? mOutputType : nvinfer1::DataType::kFLOAT;
 }
 
 // IPluginV2 Methods
@@ -188,12 +242,15 @@ void QuantizePerTokenPlugin::terminate() noexcept {}
 
 size_t QuantizePerTokenPlugin::getSerializationSize() const noexcept
 {
-    return 0;
+    return sizeof(mOutputType) + sizeof(mQuantMode) + sizeof(mClampValEnabled);
 }
 
 void QuantizePerTokenPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
+    write(d, mOutputType);
+    write(d, mQuantMode);
+    write(d, mClampValEnabled);
     assert(d == a + getSerializationSize());
 }
 
@@ -209,6 +266,9 @@ QuantizePerTokenPluginCreator::QuantizePerTokenPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 3));
+    mPluginAttributes.emplace_back(PluginField("quant_mode", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("clamp_enabled", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -230,9 +290,12 @@ PluginFieldCollection const* QuantizePerTokenPluginCreator::getFieldNames() noex
 
 IPluginV2* QuantizePerTokenPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
+    PluginFieldParser p{fc->nbFields, fc->fields};
     try
     {
-        auto* obj = new QuantizePerTokenPlugin();
+        auto* obj = new QuantizePerTokenPlugin(static_cast<nvinfer1::DataType>(p.getScalar<int32_t>("type_id").value()),
+            QuantMode(p.getScalar<int32_t>("quant_mode").value()),
+            static_cast<bool>(p.getScalar<int8_t>("clamp_enabled").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

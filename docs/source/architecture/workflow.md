@@ -10,7 +10,7 @@ The build workflow contains two major steps.
 
 To generalize the TensorRT-LLM optimization features to all models, and to share the same workflow between different models for TensorRT-LLM users, TensorRT-LLM has conventions about how the models shall be defined and how the models shall be imported.
 
-TensorRT-LLM checkpoint convention is documented in [checkpoint doc](../../docs/source/checkpoint.md), and all decoder-only models had been migrated to adopt the convention. Model-specific convert_checkpoint.py scripts are shipped as source code in example directories, and a trtllm-build CLI tool had been added. However, there are some disadvantages of providing convert checkpoint scripts outside the core TensorRT-LLM lib as example:
+TensorRT-LLM checkpoint convention is documented in [checkpoint doc](/docs/source/architecture/checkpoint.md), and all decoder-only models had been migrated to adopt the convention. Model-specific convert_checkpoint.py scripts are shipped as source code in example directories, and a trtllm-build CLI tool had been added. However, there are some disadvantages of providing convert checkpoint scripts outside the core TensorRT-LLM lib as example:
 
 1. TensorRT-LLM evolves so quickly that the model's definition code might have changed for better performance; which means the `convert_checkpoint.py` is out of date.
 
@@ -47,7 +47,7 @@ class LLaMAForCausalLM (DecoderModelForCausalLM):
 ```
 
 
-Then, in the [convert_checkpoint.py](../../examples/llama//convert_checkpoint.py) script, the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the `from_hugging_face` API will keep the same, thus the existing workflow using this interface will not be affected.
+Then, in the [convert_checkpoint.py](../../../../examples/llama/convert_checkpoint.py) script, the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the `from_hugging_face` API will keep the same, thus the existing workflow using this interface will not be affected.
 
 
 ```python
@@ -65,7 +65,7 @@ Since LLaMA models were also released with different formats, such as the Meta c
 In the 0.9 release, only LLaMA is refactored. Since popular LLaMA (and its variants) models are released by Hugging Face and Meta checkpoint formats, only these two functions are implemented.
 
 
-In future releases, there might be `from_jax`, `from_nemo`, `from_keras` or other factory methods for different training checkpoints added, for example the TensorRT-LLM [GEMMA](../../examples/gemma/README.md) model supports JAX/Keras formats in addition to huggingface. The model developers can choose to implement **any subset** of these factory methods for the models they contributed to TensorRT-LLM.
+In future releases, there might be `from_jax`, `from_nemo`, `from_keras` or other factory methods for different training checkpoints added, for example the TensorRT-LLM [GEMMA](../../../../examples/gemma/README.md) model supports JAX/Keras formats in addition to huggingface. The model developers can choose to implement **any subset** of these factory methods for the models they contributed to TensorRT-LLM.
 
 
 For some formats which are not supported by TensorRT-LLM model developers, you still have the freedom to implement your own weights conversion outside the core lib; the flow will look like this:
@@ -96,7 +96,7 @@ TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantizati
 
 In TensorRT-LLM 0.8 version:
 
-* For Modelopt-supported quantization algorithms, a standalone script in the example folder [quantize.py](../../examples/quantization/quantize.py) shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.
+* For Modelopt-supported quantization algorithms, a standalone script in the example folder [quantize.py](../../../../examples/quantization/quantize.py) shall be executed to export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.
 
 * For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.
 

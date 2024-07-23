@@ -17,8 +17,10 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/quantTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
+#include <float.h>
 
 using namespace tensorrt_llm::common;
 
@@ -124,51 +126,217 @@ template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const
     float const* scalePtr, cudaStream_t stream, int maxGridSize);
 #endif
 
-template <typename T>
-__global__ void perTokenQuantization(
-    int8_t* dst, T const* src, const int64_t numRows, const int64_t numCols, float* scalePtr)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T, int NUM_ELTS>
+struct DstVec
 {
-    T const* srcRow = src + blockIdx.x * numCols;
-    int8_t* dstRow = dst + blockIdx.x * numCols;
+    static_assert("not implemented.");
+};
 
-    T localMax = 1e-6f;
-    for (int i = threadIdx.x; i < numCols; i += blockDim.x)
-    {
-        localMax = cuda_max(localMax, cuda_abs(srcRow[i]));
-    }
-    float const rowMax = blockAllReduceMax(cuda_cast<float>(localMax));
+template <>
+struct DstVec<float2, 2>
+{
+    using Type = uint32_t;
+};
 
-    if (threadIdx.x == 0)
-    {
-        scalePtr[blockIdx.x] = rowMax / 127.f;
-    }
+template <>
+struct DstVec<half2, 4>
+{
+    using Type = uint2;
+};
 
-    float const scaleOrigQuant = 127.f / rowMax;
-    for (int i = threadIdx.x; i < numCols; i += blockDim.x)
+#ifdef ENABLE_BF16
+
+template <>
+struct DstVec<__nv_bfloat162, 4>
+{
+    using Type = uint2;
+};
+
+#endif // ENABLE_BF16
+
+template <typename T>
+struct DstVec<T, 4>
+{
+    static_assert(sizeof(T) == 4, "not implemented.");
+    using Type = uint32_t;
+};
+
+template <typename T>
+struct DstVec<T, 8>
+{
+    static_assert(sizeof(T) == 2, "not implemented.");
+    using Type = uint2;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function of getting the absMax of all elements in the vector after clamping.
+// Pack two elements in order to use possible hmax2 instructions.
+template <typename T>
+inline __device__ void clampAndAbsMax(T& localMax, uint4& vec, T const clampMin, T const clampMax)
+{
+    static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
+
+#pragma unroll
+    for (int i = 0; i < NUM_ELTS; ++i)
     {
-        dstRow[i] = cuda_cast<int8_t>(cuda_cast<float>(srcRow[i]) * scaleOrigQuant);
+        T& val = reinterpret_cast<T*>(&vec)[i];
+        val = cuda_clamp(val, clampMin, clampMax);
+        localMax = cuda_max(localMax, cuda_abs(val));
     }
 }
 
-template <typename T>
-void invokePerTokenQuantization(
-    int8_t* dst, T const* src, const int64_t numRows, const int64_t numCols, float* scalePtr, cudaStream_t stream)
+// Helper function of quantizing the vector and storing it to global memory.
+// Pack two elements in order to use fast convert instructions.
+template <typename T, typename QuantT, bool USE_SMEM>
+inline __device__ void quantizeAndStore(
+    QuantT* dstPtr, uint4 vec, T const clampMin, T const clampMax, float const scaleOrigQuant)
+{
+    static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
+
+    using DstVecType = typename DstVec<T, NUM_ELTS>::Type;
+    DstVecType dstVec;
+#pragma unroll
+    for (int i = 0; i < NUM_ELTS; ++i)
+    {
+        T val = reinterpret_cast<T*>(&vec)[i];
+        // Values loaded from smem has already been clamped.
+        if constexpr (!USE_SMEM)
+        {
+            val = cuda_clamp(val, clampMin, clampMax);
+        }
+        float2 val2 = cuda_cast<float2>(val);
+        val2.x *= scaleOrigQuant;
+        val2.y *= scaleOrigQuant;
+        QuantT quantVal = cuda_cast<QuantT>(val2);
+        reinterpret_cast<QuantT*>(&dstVec)[i] = quantVal;
+    }
+    // Store to destination buffer.
+    *reinterpret_cast<DstVecType*>(dstPtr) = dstVec;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T, typename QuantT, bool USE_SMEM>
+__global__ void perTokenQuantization(QuantT* dst, T const* src, const int64_t numRows, const int64_t numCols,
+    float const* clampPtr, float* scalePtr, bool hasFp8MinScaling)
+{
+    // Smem buffer.
+    extern __shared__ uint4 smemBuffer[];
+
+    // The clamping minimum / maximum values.
+    T const clampMin = cuda_cast<T>(clampPtr ? clampPtr[0] : -FLT_MAX);
+    T const clampMax = cuda_cast<T>(clampPtr ? clampPtr[1] : FLT_MAX);
+
+    // Pack two elements in order to use higher through instructions.
+    using T2 = typename packed_as<T, 2>::type;
+    using QuantT2 = typename packed_as<QuantT, 2>::type;
+    T2 const clampMin2 = cuda_cast<T2, T>(clampMin);
+    T2 const clampMax2 = cuda_cast<T2, T>(clampMax);
+
+    // The quantized data type's maximum value (upper-bound).
+    static constexpr float MAX_QUANT_VAL = QuantTypeStaticVals<QuantT>::MAX_VAL;
+    // The minimum scaling factor (lower-bound).
+    static constexpr float MIN_SCALING_FACTOR = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR;
+    static constexpr float MIN_SCALING_FACTOR_RCP = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR_RCP;
+
+    // The number of elements in the packed uint4 vec.
+    static constexpr int NUM_ELTS_PER_VEC = sizeof(uint4) / sizeof(T);
+    // The number of vectors in the column.
+    int const numColVecs = numCols / NUM_ELTS_PER_VEC;
+    // The vector pointers for src.
+    uint4 const* srcVec = reinterpret_cast<uint4 const*>(src) + blockIdx.x * numColVecs;
+    // The pointer for dst.
+    QuantT* dstRow = dst + blockIdx.x * numCols;
+    // T const* srcRow = src + blockIdx.x * numCols;
+
+    T2 localMax2 = cuda_cast<T2, T>(T(1e-6f));
+    for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
+    {
+        uint4 vec = srcVec[i];
+        clampAndAbsMax(localMax2, vec, clampMin2, clampMax2);
+        // Avoid reloading from global memory.
+        if constexpr (USE_SMEM)
+        {
+            smemBuffer[i] = vec;
+        }
+    }
+    float const rowMax = blockAllReduceMax(cuda_cast<float>(cuda_max<T, T2>(localMax2)));
+
+    if (threadIdx.x == 0)
+    {
+        scalePtr[blockIdx.x]
+            = hasFp8MinScaling ? cuda_max(rowMax / MAX_QUANT_VAL, MIN_SCALING_FACTOR) : (rowMax / MAX_QUANT_VAL);
+    }
+
+    float const scaleOrigQuant
+        = hasFp8MinScaling ? fminf(MAX_QUANT_VAL / rowMax, MIN_SCALING_FACTOR_RCP) : MAX_QUANT_VAL / rowMax;
+    for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
+    {
+        uint4 vec = USE_SMEM ? smemBuffer[i] : srcVec[i];
+        QuantT2* dstPtr = reinterpret_cast<QuantT2*>(dstRow + i * NUM_ELTS_PER_VEC);
+        quantizeAndStore<T2, QuantT2, USE_SMEM>(dstPtr, vec, clampMin2, clampMax2, scaleOrigQuant);
+    }
+}
+
+// Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
+template <typename T, typename QuantT>
+void invokePerTokenQuantization(QuantT* dst, T const* src, const int64_t numRows, const int64_t numCols,
+    float const* clampPtr, float* scalePtr, QuantMode quantMode, cudaStream_t stream)
 {
     // each block is responsible for a single row
     const dim3 block(512);
     const dim3 grid(numRows);
 
-    perTokenQuantization<<<grid, block, 0, stream>>>(dst, src, numRows, numCols, scalePtr);
+    // The number of elements in the packed uint4 vec.
+    static constexpr int NUM_ELTS_PER_VEC = sizeof(uint4) / sizeof(T);
+    TLLM_CHECK_WITH_INFO(numCols % NUM_ELTS_PER_VEC == 0, "Not supported.");
+
+    // Cache vectors to smem to avoid reloading.
+    size_t const dynamicSmemSz = numCols * sizeof(T);
+    // Need to check if smem capacity is enough.
+    bool useSmem = true;
+    if (dynamicSmemSz >= 48 * 1024)
+    {
+        cudaError_t res = cudaFuncSetAttribute(
+            perTokenQuantization<T, QuantT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamicSmemSz);
+        // Fall back to reloading-reversion if smem is not enough.
+        useSmem = (res == cudaSuccess);
+    }
+
+    // Enable min_scaling_factor if it is fp8 rowwise per-token quantization.
+    bool hasFp8MinScaling = quantMode.hasFp8RowWise();
+    // Do we use smem ?
+    if (useSmem)
+    {
+        perTokenQuantization<T, QuantT, true>
+            <<<grid, block, dynamicSmemSz, stream>>>(dst, src, numRows, numCols, clampPtr, scalePtr, hasFp8MinScaling);
+    }
+    else
+    {
+        perTokenQuantization<T, QuantT, false>
+            <<<grid, block, 0, stream>>>(dst, src, numRows, numCols, clampPtr, scalePtr, hasFp8MinScaling);
+    }
 }
 
-#define INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(T)                                                                   \
-    template void invokePerTokenQuantization(                                                                          \
-        int8_t* dst, const T* src, const int64_t numRows, const int64_t numCols, float* scalePtr, cudaStream_t stream)
+#define INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(T, QuantT)                                                           \
+    template void invokePerTokenQuantization(QuantT* dst, const T* src, const int64_t numRows, const int64_t numCols,  \
+        float const* clampPtr, float* scalePtr, QuantMode quantMode, cudaStream_t stream)
 
-INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(float);
-INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(half);
+INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(float, int8_t);
+INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(half, int8_t);
 #ifdef ENABLE_BF16
-INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16);
+INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, int8_t);
+#endif
+
+#ifdef ENABLE_FP8
+INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(float, __nv_fp8_e4m3);
+INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(half, __nv_fp8_e4m3);
+#ifdef ENABLE_BF16
+INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, __nv_fp8_e4m3);
+#endif
 #endif
 
 } // namespace kernels

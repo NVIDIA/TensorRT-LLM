@@ -128,6 +128,12 @@ def trt_gte_10_1():
     return trt_ver.major > 9 and trt_ver.minor > 0
 
 
+# Check if TRT version >= 10.2
+def trt_gte_10_2():
+    ver = version.parse(trt_version())
+    return (ver.major * 10 + ver.minor) >= 102
+
+
 def torch_version():
     return torch.__version__
 
@@ -301,6 +307,7 @@ _torch_to_trt_dtype_dict = {
     torch.int64: trt.int64,
     torch.int32: trt.int32,
     torch.int8: trt.int8,
+    torch.float8_e4m3fn: trt.fp8,
     torch.qint8: trt.int8,
     torch.bool: trt.bool,
     torch.bfloat16: trt.bfloat16

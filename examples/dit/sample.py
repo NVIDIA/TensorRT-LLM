@@ -72,9 +72,7 @@ class TllmDiT(object):
 
         expected_tensor_names = ['latent', 'timestep', 'label', 'output']
 
-        self.use_custom_all_reduce = config['build_config']['plugin_config'][
-            'use_custom_all_reduce']
-        if self.mapping.tp_size > 1 and self.use_custom_all_reduce:
+        if self.mapping.tp_size > 1:
             set_peer_access(self.mapping)
             self.buffer, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,

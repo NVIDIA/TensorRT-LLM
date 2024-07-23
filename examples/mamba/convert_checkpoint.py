@@ -1,11 +1,12 @@
 import argparse
 import copy
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import List, Union
 
 import safetensors.torch
 import torch
@@ -134,6 +135,10 @@ def convert_hf_mamba(hf_mamba,
 
 def rename_hf_to_tllm(name: str):
     """ Rename a HF parameter name by the corresponding TRT-LLM style name. """
+    # remove model
+    if 'model.' in name:
+        name = name.replace('model.', '')
+
     # change layer name
     if 'embeddings.' in name:
         name = name.replace('embeddings', 'vocab_embedding')
@@ -227,18 +232,15 @@ def convert(worker_rank, args, convert_args):
 @dataclass
 class MambaConfig:
 
-    d_model: int = 2560
+    architectures: List[str] = field(
+        default_factory=lambda: ['MambaForCausalLM'])
     d_intermediate: int = 0
-    n_layer: int = 64
     vocab_size: int = 50277
-    ssm_cfg: dict = field(default_factory=dict)
     attn_layer_idx: list = field(default_factory=list)
     attn_cfg: dict = field(default_factory=dict)
     rms_norm: bool = True
     residual_in_fp32: bool = True
-    fused_add_norm: bool = True
     pad_vocab_size_multiple: int = 8
-    tie_embeddings: bool = True
     hidden_size: int = 2560
     num_hidden_layers: int = 64
     intermediate_size: int = 0
@@ -257,22 +259,23 @@ class MambaConfig:
 def load_config_hf(model_name):
     resolved_archive_file = cached_file(
         model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
+    if resolved_archive_file is None:
+        resolved_archive_file = os.path.join(model_name, 'params.json')
     config = json.load(open(resolved_archive_file))
     if 'transformers_version' in config:  # transformer compatible models
         hf_config = AutoConfig.from_pretrained(model_name,
                                                trust_remote_code=True)
         # TODO: change mamba_version when transformers can support Mamba2 models
         mamba_version = 'Mamba1'
-    else:  # state-spaces/mamba models
-        hf_config = MambaConfig(**config)
-        hf_config.hidden_size = hf_config.d_model
-        hf_config.num_hidden_layers = hf_config.n_layer
-        if 'expand' in hf_config.ssm_cfg:
-            expand = hf_config.ssm_cfg['expand']
-            hf_config.intermediate_size = expand * hf_config.d_model
-        else:
-            hf_config.intermediate_size = 2 * hf_config.d_model
-        ssm_cfg_to_hf_cfg = {
+    elif 'ssm_cfg' in config:  # state-spaces/mamba models
+        ssm_cfg = config.pop('ssm_cfg')
+        cfg_to_mamba_cfg = {
+            'd_model': 'hidden_size',
+            'n_layer': 'num_hidden_layers',
+            'fused_add_norm': None,
+            'tie_embeddings': None,
+        }
+        ssm_cfg_to_mamba_cfg = {
             'd_state': 'state_size',
             'd_conv': 'conv_kernel',
             'bias': 'use_bias',
@@ -281,12 +284,42 @@ def load_config_hf(model_name):
             'chunk_size': 'chunk_size',
             'rmsnorm': 'ssm_rmsnorm',
         }
-        cfg_dict = {}
-        for k, v in hf_config.ssm_cfg.items():
-            if k in ssm_cfg_to_hf_cfg:
-                cfg_dict[ssm_cfg_to_hf_cfg[k]] = v
-        hf_config.update(cfg_dict)
-        mamba_version = hf_config.ssm_cfg.pop("layer", "Mamba1")
+        for k in cfg_to_mamba_cfg:
+            if k in config:
+                v = config.pop(k)
+                if cfg_to_mamba_cfg[k] is not None:
+                    config[cfg_to_mamba_cfg[k]] = v
+        for k in ssm_cfg_to_mamba_cfg:
+            if k in ssm_cfg and ssm_cfg_to_mamba_cfg[k] is not None:
+                config[ssm_cfg_to_mamba_cfg[k]] = ssm_cfg[k]
+        hf_config = MambaConfig(**config)
+        if 'expand' in ssm_cfg:
+            expand = ssm_cfg['expand']
+            hf_config.intermediate_size = expand * hf_config.hidden_size
+        else:
+            hf_config.intermediate_size = 2 * hf_config.hidden_size
+        mamba_version = ssm_cfg.pop("layer", "Mamba1")
+    else:  # mistral format
+        cfg_to_mamba_cfg = {
+            'dim': 'hidden_size',
+            'n_layers': 'num_hidden_layers',
+            'n_groups': 'ngroups',
+            'fused_add_norm': None,
+            'tie_embeddings': None,
+            'model_type': None,
+        }
+        for k in cfg_to_mamba_cfg:
+            if k in config:
+                v = config.pop(k)
+                if cfg_to_mamba_cfg[k] is not None:
+                    config[cfg_to_mamba_cfg[k]] = v
+        hf_config = MambaConfig(**config)
+        if 'expand' in config:
+            expand = config['expand']
+            hf_config.intermediate_size = expand * hf_config.hidden_size
+        else:
+            hf_config.intermediate_size = 2 * hf_config.hidden_size
+        mamba_version = 'Mamba2'
     return hf_config, mamba_version
 
 
@@ -308,7 +341,7 @@ def main():
                                                  pad_vocab_size_multiple)
 
     config = {
-        'architecture': 'MambaForCausalLM',
+        'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
         'logits_dtype': 'float32',
         'hidden_size': hf_config.hidden_size,

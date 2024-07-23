@@ -258,8 +258,6 @@ class MambaForCausalLM(PretrainedModel):
         multiple_profiles = default_net().plugin_config.multiple_profiles
         use_mamba_conv1d_plugin = default_net(
         ).plugin_config.mamba_conv1d_plugin
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
 
         self.gather_context_logits = gather_context_logits
         mapping = self.config.mapping
@@ -296,7 +294,7 @@ class MambaForCausalLM(PretrainedModel):
                                     ranges['bb_range']),
                                    ('input_len', ranges['inlen_range']),
                                ]))
-        if use_custom_all_reduce and mapping.tp_size > 1:
+        if mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
                 mapping, num_profiles)
 

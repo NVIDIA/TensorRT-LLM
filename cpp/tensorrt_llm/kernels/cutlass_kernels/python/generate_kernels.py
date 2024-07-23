@@ -397,7 +397,7 @@ def get_sm80_file_content(op_item):
 
     instantiations = f"""
         template void sm80_generic_fused_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {op_item['cta_shape'][0]}, {op_item['cta_shape'][1]}, {op_item['cta_shape'][2]}, {op_item['stage']}, {epi_tag}>
-                ({act_tag} const* A, {weight_tag} const* B, {act_tag} const* biases, {act_tag}* C, int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream, int* kernel_occupancy);
+                ({act_tag} const* A, {weight_tag} const* B, {act_tag} const* biases, {act_tag}* C, int64_t const* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream, int* kernel_occupancy);
 """
     file_content = f"""{includes}
 namespace tensorrt_llm

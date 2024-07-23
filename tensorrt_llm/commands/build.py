@@ -75,19 +75,30 @@ def parse_arguments():
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=256)
-    parser.add_argument('--max_input_len', type=int, default=1024)
+    parser.add_argument(
+        '--max_batch_size',
+        type=int,
+        default=256,
+        help="Max number of requests that the engine can handle.")
+    parser.add_argument('--max_input_len',
+                        type=int,
+                        default=1024,
+                        help="Max input length of one request.")
     parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',
         type=int,
         default=None,
-        help=
-        "Max total length of context and generated sequence. If unspecified, will try to deduce from the model config."
-    )
+        help="Max total length of one request, including prompt and outputs. "
+        "If unspecified, will try to deduce from the model config.")
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=8192)
+    parser.add_argument(
+        '--max_num_tokens',
+        type=int,
+        default=8192,
+        help="Max number of batched input tokens after padding is removed "
+        "(triggered by `--remove_input_padding`) in each batch.")
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
@@ -437,8 +448,8 @@ def main():
         rotary_scaling = getattr(model_config, "rotary_scaling", None)
         if rotary_scaling is not None:
             rotary_type = rotary_scaling['type']
-            rotary_factor = rotary_scaling[
-                'factor'] if rotary_type != 'su' else 1
+            rotary_factor = rotary_scaling.get(
+                'factor', 1.0) if rotary_type != 'su' else 1
         else:
             rotary_factor = 1
 

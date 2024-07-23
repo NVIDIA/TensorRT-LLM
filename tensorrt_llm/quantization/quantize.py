@@ -6,7 +6,8 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import QuantConfig
 from ..parameter import Parameter
-from .layers import (FP8Linear, FP8RowLinear, Int8SmoothQuantLinear,
+from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseGatedMLP, Fp8RowwiseMLP,
+                     Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
                      Int8SmoothQuantRowLinear, SmoothQuantAttention,
                      SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
                      SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
@@ -28,6 +29,7 @@ def quantize_layers(
         '*vocab_embedding',
         '*position_embedding',
         '*block_embedding',
+        '*shared_expert_gate',
     ]
 
     for name, module, parent in model.named_modules_with_parent():
@@ -203,6 +205,40 @@ def fp8_quantize(model, quant_config: QuantConfig):
     return model
 
 
+def fp8_rowwise_quantize(model, quant_config: QuantConfig):
+    assert quant_config.quant_mode.has_fp8_rowwise()
+
+    quant_map = {
+        RmsNorm: Fp8RowwiseRmsNorm,
+        GatedMLP: Fp8RowwiseGatedMLP,
+        MLP: Fp8RowwiseMLP,
+    }
+    for name, layer, parent in model.named_modules_with_parent():
+        layer_name = name.rsplit('.', 1)[-1]
+        if layer_name in ['ln_f', 'ln_embed'] or "input_layernorm" in name:
+            continue
+
+        quant_cls = None
+        for cls in quant_map:
+            if isinstance(layer, cls):
+                quant_cls = quant_map[cls]
+                break
+
+        if quant_cls is None:
+            continue
+
+        init_params = get_init_params(layer, quant_cls)
+        init_params["quant_mode"] = quant_config.quant_mode
+        quant_layer = quant_cls(**init_params, clamp_val=quant_config.clamp_val)
+        if parent is not None:
+            setattr(parent, layer_name, quant_layer)
+        else:
+            model = quant_layer
+
+    setattr(model, 'quant_mode', quant_config.quant_mode)
+    return model
+
+
 def kv_cache_quantize(model, quant_config: QuantConfig):
     assert quant_config.quant_mode.has_kv_cache_quant()
     for name, module in model.named_modules():
@@ -216,6 +252,8 @@ def quantize(model, quant_config: QuantConfig):
 
     if quant_mode.has_fp8_qdq():
         model = fp8_quantize(model, quant_config)
+    elif quant_mode.has_fp8_rowwise():
+        model = fp8_rowwise_quantize(model, quant_config)
     elif quant_mode.has_act_and_weight_quant():
         model = smooth_quantize(model, quant_config)
     elif quant_mode.is_weight_only():

@@ -1399,8 +1399,8 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     {
     case PositionEmbeddingType::kROPE_GPTJ:
     {
-        mmha::apply_rotary_embedding(q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0,
-            nullptr, dst_kv_seq_idx);
+        mmha::apply_rotary_embedding(
+            q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, dst_kv_seq_idx);
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
@@ -1432,7 +1432,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
 
             mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, 0, nullptr, dst_kv_seq_idx);
+                rotary_embedding_scale, dst_kv_seq_idx);
 
             mmha::write_smem_transpose(q, q_smem, transpose_idx, smem_pitch);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
@@ -1912,7 +1912,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
     case PositionEmbeddingType::kROPE_GPTJ:
     {
         mmha::apply_rotary_embedding(
-            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, 0, nullptr, token_pos_idx);
+            k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
@@ -1940,7 +1940,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
         {
             mmha::vec_from_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
             mmha::apply_rotary_embedding(k, transpose_idx / tidx_factor, rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, 0, nullptr, token_pos_idx);
+                rotary_embedding_scale, token_pos_idx);
             mmha::write_smem_transpose(k, k_smem, transpose_idx, smem_pitch);
         }
 
@@ -2074,7 +2074,7 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
     constexpr uint32_t packSize = 16 / std::max(srcElemSize, dstElemSize);
     auto const tid = blockDim.x * blockIdx.x + threadIdx.x;
     auto const nbThrds = blockDim.x * gridDim.x;
-    if (nbThrds * packSize + packSize - 1 >= size)
+    if (tid * packSize >= size)
     {
         return;
     }

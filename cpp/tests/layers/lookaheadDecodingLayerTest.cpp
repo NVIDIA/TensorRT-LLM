@@ -24,7 +24,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
@@ -44,7 +43,6 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
 
 namespace tk = tensorrt_llm::kernels;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace trk = tensorrt_llm::runtime::kernels;
 
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -348,40 +346,43 @@ void LookaheadDecodingLayerTest::allocateBuffers()
 
     auto maxBatchShape1D = ITensor::makeShape({maxBatchSize});
 
-    mAlgoConfigBatch = BufferManager::pinned(ITensor::makeShape({maxBatchSize, 3}), nvinfer1::DataType::kINT32);
+    mAlgoConfigBatch = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, 3}), nvinfer1::DataType::kINT32);
 
-    mFinished = BufferManager::pinned(maxBatchShape1D, TRTDataType<tk::FinishedState::UnderlyingType>::value);
-    mEndIds = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mTokensPerStep = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mFinished = BufferManager::pinnedPool(maxBatchShape1D, TRTDataType<tk::FinishedState::UnderlyingType>::value);
+    mEndIds = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mTokensPerStep = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
-    mOutputIds = BufferManager::pinned(
+    mOutputIds = BufferManager::pinnedPool(
         ITensor::makeShape({maxBatchSize, mMaxSeqLen + mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mSequenceLengths = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mSequenceLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
-    mProbs = BufferManager::pinned(
+    mProbs = BufferManager::pinnedPool(
         ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, vocabSize}), nvinfer1::DataType::kFLOAT);
 
     mGoldenSampledTokens
         = BufferManager::cpu(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
     mInputTokensBatch
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
     mPositionIdsBatch
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
 
-    mNumNewTokens = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mDraftLengths = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mDraftTokens = BufferManager::pinned(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
-    mDraftPosIds = BufferManager::pinned(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
+    mNumNewTokens = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mDraftTokens
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
+    mDraftPosIds
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
     auto divUp32 = [](SizeType32 x) { return x / 32 + ((x % 32) ? 1 : 0); };
-    mPackedMasks = BufferManager::pinned(
+    mPackedMasks = BufferManager::pinnedPool(
         ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, divUp32(mMaxTokensPerStep)}), nvinfer1::DataType::kINT32);
-    mPackedMasksBool = BufferManager::pinned(
+    mPackedMasksBool = BufferManager::pinnedPool(
         ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, mMaxTokensPerStep}), nvinfer1::DataType::kBOOL);
-    mKNumNewTokensCumSum = BufferManager::pinned(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
+    mKNumNewTokensCumSum
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
     mPathsOffsets
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize, maxNumNewTokens}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxNumNewTokens}), nvinfer1::DataType::kINT32);
 
-    mBatchSlotsMax = BufferManager::pinned(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mBatchSlotsMax = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
     auto const batchSize = 0;
     auto batchShape1D = ITensor::makeShape({batchSize});
@@ -460,7 +461,7 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
     TensorPtr newRequestSlots = ITensor::slice(mBatchSlotsMax, batchSize, requestSize);
     PRINT_VALUES(newRequestSlots);
     PRINT_VALUES(mBatchSlotsMax);
-    mDecoder->setup(requestSize, beamSize, bufferCast<SizeType32>(*newRequestSlots), setupParams);
+    mDecoder->setup(requestSize, beamSize, newRequestSlots, setupParams);
 
     batchSize += requestIds.size();
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
@@ -623,25 +624,25 @@ void LookaheadDecodingLayerTest::decodeForward(void)
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
     PRINT_VALUES(mBatchSlots);
 
-    auto inputParams = std::make_shared<LookaheadDecodingInputs>(tcc::toTllmTensor(*mEndIds));
+    auto inputParams = std::make_shared<LookaheadDecodingInputs>(mEndIds);
     inputParams->localBatchSize = batchSize;
-    inputParams->logits = tcc::toTllmTensor(*ITensor::slice(mProbs, 0, batchSize));
-    inputParams->batchSlots = tcc::toTllmTensor(*mBatchSlots);
-    inputParams->finished = tcc::toTllmTensor(*mFinished); // TODO(liweim) ask finished protocol
-    inputParams->curTokensPerStep = tcc::toTllmTensor(*mTokensPerStep);
+    inputParams->logits = ITensor::slice(mProbs, 0, batchSize);
+    inputParams->batchSlots = mBatchSlots;
+    inputParams->finished = mFinished; // TODO(liweim) ask finished protocol
+    inputParams->curTokensPerStep = mTokensPerStep;
 
-    auto outputParams = std::make_shared<SpeculativeDecodingOutputs>(tcc::toTllmTensor(*mOutputIds));
+    auto outputParams = std::make_shared<SpeculativeDecodingOutputs>(mOutputIds);
 
     PRINT_VALUES(mSequenceLengths);
-    outputParams->sequenceLength = tcc::toTllmTensor(*mSequenceLengths);
-    outputParams->finished = tcc::toTllmTensor(*mFinished);
-    outputParams->nextDraftLengths = tcc::toTllmTensor(*mDraftLengths);
-    outputParams->nextDraftTokens = tcc::toTllmTensor(*mDraftTokens);
-    outputParams->nextDraftPosIds = tcc::toTllmTensor(*mDraftPosIds);
-    outputParams->packedMasks = tcc::toTllmTensor(*mPackedMasks);
-    outputParams->numNewTokens = tcc::toTllmTensor(*mNumNewTokens);
-    outputParams->numNewTokensCumSum = tcc::toTllmTensor(*mKNumNewTokensCumSum);
-    outputParams->pathsOffsets = tcc::toTllmTensor(*mPathsOffsets);
+    outputParams->sequenceLength = mSequenceLengths;
+    outputParams->finished = mFinished;
+    outputParams->nextDraftLengths = mDraftLengths;
+    outputParams->nextDraftTokens = mDraftTokens;
+    outputParams->nextDraftPosIds = mDraftPosIds;
+    outputParams->packedMasks = mPackedMasks;
+    outputParams->numNewTokens = mNumNewTokens;
+    outputParams->numNewTokensCumSum = mKNumNewTokensCumSum;
+    outputParams->pathsOffsets = mPathsOffsets;
 
     PRINT_VALUES(mTokensPerStep);
 

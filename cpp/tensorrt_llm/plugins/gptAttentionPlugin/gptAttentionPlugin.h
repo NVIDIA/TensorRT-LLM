@@ -60,16 +60,18 @@ namespace tensorrt_llm::plugins
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
 //     11. attention_output_quantization_scale [1] (on device, optional)
-//     12. rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
-//     13. alibi_slopes [num_heads] (optional for ALiBi position embedding)
-//     14. relative_attention_bias [num_heads] (optional for ALiBi position embedding)
-//     15. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
-//     16. qkv_bias (optional) [local_hidden_size * 3]
-//     17. spec_decoding_generation_lengths (optional, required when medusa is enabled) (int32_t) [batch_size]
-//     18. spec_decoding_packed_mask (optional, required when medusa is enabled) (int32_t) [num_tokens, packed_mask_dim]
+//     12. rotary_inv_freq [head_size / 2] or [head_size] (longrope type) (float) (on device, optional)
+//     13. rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
+//     14. alibi_slopes [num_heads] (optional for ALiBi position embedding)
+//     15. relative_attention_bias [num_heads] (optional for ALiBi position embedding)
+//     16. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
+//     17. qkv_bias (optional) [local_hidden_size * 3]
+//     18. spec_decoding_generation_lengths (optional, required when medusa is enabled) (int32_t) [batch_size]
+//     19. spec_decoding_packed_mask (optional, required when medusa is enabled) (int32_t) [num_tokens, packed_mask_dim]
 //                                    packed_mask_dim = divUp(max_num_spec_decoding_tokens + 1, 32)
-//     19. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
+//     20. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
 //     max_num_spec_decoding_tokens + 1]
+//     20. host_runtime_perf_knobs (int64)
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
@@ -88,8 +90,8 @@ public:
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
-        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
+        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
@@ -180,8 +182,8 @@ private:
         KV_CACHE_QUANTIZATION_SCALE,
         KV_CACHE_DEQUANTIZATION_SCALE,
         ATTENTION_OUTPUT_QUANTIZATION_SCALE,
+        ROTARY_INV_FREQ,
         ROTARY_COS_SIN,
-        ROTARY_EMBEDDING_SCALING_FACTORS,
         ALIBI_SLOPES,
         RELATIVE_ATTENTION_BIAS,
         CROSS_QKV,
@@ -192,6 +194,7 @@ private:
         SPEC_DECODING_GENERATION_LENGTHS,
         SPEC_DECODING_PACKED_MASK,
         SPEC_DECODING_POSITION_OFFSETS,
+        HOST_RUNTIME_PERF_KNOBS,
         ENUM_SIZE,
     };
 

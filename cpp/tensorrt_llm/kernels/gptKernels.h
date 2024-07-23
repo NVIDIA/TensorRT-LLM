@@ -59,6 +59,8 @@ enum class RotaryScalingType : int8_t
     kNONE = 0,
     kLINEAR = 1,
     kDYNAMIC = 2,
+    kLONG = 3,
+    kWAVELEN = 4
 };
 
 struct BlockSparseParams
@@ -134,6 +136,7 @@ struct BuildDecoderInfoParams
     int rotaryEmbeddingDim;
     RotaryScalingType rotaryScalingType;
     float* rotaryEmbeddingInvFreq;
+    float const* rotaryEmbeddingInvFreqCache;
     float2* rotaryEmbeddingCoeffCache;
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
@@ -170,6 +173,7 @@ struct BuildDecoderInfoParams
         ss << "rotaryEmbeddingDim: " << rotaryEmbeddingDim << std::endl;
         ss << "rotaryScalingType: " << static_cast<int>(rotaryScalingType) << std::endl;
         ss << "rotaryEmbeddingInvFreq: " << rotaryEmbeddingInvFreq << std::endl;
+        ss << "rotaryEmbeddingInvFreqCache: " << rotaryEmbeddingInvFreqCache << std::endl;
         ss << "rotaryEmbeddingCoeffCache: " << rotaryEmbeddingCoeffCache << std::endl;
         ss << "rotaryEmbeddingMaxPositions: " << rotaryEmbeddingMaxPositions << std::endl;
 

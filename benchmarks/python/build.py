@@ -513,7 +513,7 @@ def build_gpt(args):
 
     elif family == "chatglm":
         config = {
-            'architecture': 'ChatGLMForCausalLM',
+            'architecture': 'ChatGLMModel',
             'dtype': args.dtype,
             'num_hidden_layers': build_config['num_layers'],
             'num_attention_heads': build_config['num_heads'],
@@ -546,7 +546,7 @@ def build_gpt(args):
 
     elif family in ["chatglm2", "chatglm3"]:
         config = {
-            'architecture': 'ChatGLMForCausalLM',
+            'architecture': 'ChatGLMModel',
             'dtype': args.dtype,
             'num_hidden_layers': build_config['num_layers'],
             'num_attention_heads': build_config['num_heads'],
@@ -579,7 +579,7 @@ def build_gpt(args):
 
     elif family == "glm":
         config = {
-            'architecture': 'ChatGLMForCausalLM',
+            'architecture': 'GLMModel',
             'dtype': args.dtype,
             'num_hidden_layers': build_config['num_layers'],
             'num_attention_heads': build_config['num_heads'],
@@ -923,6 +923,45 @@ def build_gpt(args):
         tensorrt_llm_model = optimize_model(tensorrt_llm_model,
                                             use_fused_mlp=True,
                                             use_fused_rg_lru=True)
+    elif family == "phi3":
+        config = {
+            'architecture':
+            'PhiForCausalLM',
+            'dtype':
+            args.dtype,
+            'rotary_base':
+            10000.0,
+            'num_hidden_layers':
+            build_config['num_layers'],
+            'num_attention_heads':
+            build_config['num_heads'],
+            'num_key_value_heads':
+            build_config['num_heads'] if build_config['num_kv_heads'] is None
+            else build_config['num_kv_heads'],
+            'hidden_size':
+            build_config['hidden_size'],
+            'intermediate_size':
+            build_config['inter_size'],
+            'vocab_size':
+            build_config['vocab_size'],
+            'position_embedding_type':
+            'rope_gpt_neox',
+            'max_position_embeddings':
+            build_config['n_positions'],
+            'hidden_act':
+            build_config['hidden_act'],
+            'quantization': {
+                'quant_algo': quant_algo,
+                'kv_cache_quant_algo': kv_cache_quant_algo,
+                'group_size': 128
+            },
+            'mapping': {
+                'world_size': world_size,
+                'tp_size': world_size
+            },
+        }
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_model = tensorrt_llm.models.Phi3ForCausalLM(config)
 
     else:
         raise Exception(f'Unexpected model: {args.model}')
@@ -966,9 +1005,7 @@ def build_gpt(args):
         network.plugin_config.remove_input_padding = True
 
     if world_size > 1:
-        network.plugin_config.set_nccl_plugin(
-            dtype=args.dtype,
-            use_custom_all_reduce=build_config["use_custom_all_reduce"])
+        network.plugin_config.set_nccl_plugin(dtype=args.dtype)
 
     if args.multiple_profiles:
         network.plugin_config.multiple_profiles = True
@@ -1106,9 +1143,7 @@ def build_bert(args):
         network.plugin_config.set_context_fmha(ContextFMHAType.enabled)
 
     if world_size > 1:
-        network.plugin_config.set_nccl_plugin(
-            dtype=args.dtype,
-            use_custom_all_reduce=build_config["use_custom_all_reduce"])
+        network.plugin_config.set_nccl_plugin(dtype=args.dtype)
 
     with net_guard(network):
         # Prepare
@@ -1458,8 +1493,7 @@ def enc_dec_build_helper(component, config, args):
         network.plugin_config.gpt_attention_plugin = args.dtype
 
     if world_size > 1:
-        network.plugin_config.set_nccl_plugin(
-            dtype=args.dtype, use_custom_all_reduce=False)  # by default
+        network.plugin_config.set_nccl_plugin(dtype=args.dtype)
 
     with net_guard(network):
         # Prepare
@@ -1522,7 +1556,6 @@ def enc_dec_build_helper(component, config, args):
         cross_attention=builder_config.cross_attention,
         has_position_embedding=builder_config.has_position_embedding,
         has_token_type_embedding=builder_config.has_token_type_embedding,
-        use_custom_all_reduce=False,  # by default
         dtype=dtype,
     )
 

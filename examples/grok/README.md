@@ -73,8 +73,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpus_bf16 \
             --moe_plugin bfloat16 \
             --paged_kv_cache enable \
             --remove_input_padding enable \
-            --workers 8 \
-            --strongly_typed
+            --workers 8
 
 
 # Run Grok-1 with 8 GPUs

@@ -53,7 +53,7 @@ def load_config(config_path: Path) -> Dict[str, any]:
         return json.load(f)
 
 
-def prune_and_save(ckpt_dir: str, out_dir: str):
+def prune_and_save(ckpt_dir: str, out_dir: str, prune_all: bool):
     logger.info(f'Checkpoint Dir: {ckpt_dir}, Out Dir: {out_dir}')
     model_config = PretrainedConfig.from_json_file(
         os.path.join(ckpt_dir, 'config.json'))
@@ -73,7 +73,7 @@ def prune_and_save(ckpt_dir: str, out_dir: str):
                                    device='cpu') as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
-                if can_prune(key):
+                if prune_all or can_prune(key):
                     pruned_weights[key] = torch.tensor([], dtype=tensor.dtype)
                 else:
                     pruned_weights[key] = tensor
@@ -91,6 +91,10 @@ def prune_and_save(ckpt_dir: str, out_dir: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint_dir', type=str, default=None)
+    parser.add_argument('--prune_all',
+                        default=False,
+                        action='store_true',
+                        help='Remove all weights in the checkpoint')
     parser.add_argument(
         '--out_dir',
         type=str,
@@ -111,7 +115,7 @@ def main():
             Path(args.checkpoint_dir).with_name(ckpt_name + '.pruned'))
 
     prune_and_save(os.path.abspath(args.checkpoint_dir),
-                   os.path.abspath(args.out_dir))
+                   os.path.abspath(args.out_dir), args.prune_all)
 
 
 if __name__ == '__main__':

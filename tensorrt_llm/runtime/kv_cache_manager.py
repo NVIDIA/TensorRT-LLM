@@ -339,6 +339,10 @@ class KVCacheManager(object):
         self.lens.append(seq_len)
         self.sequences.append(sequence)
 
+        # Enable cyclic kv cache when inputLength exceeds maxAttentionWindow.
+        # Note that currently cyclic kv cache doesn't work with shared kv cache of different beams.
+        enable_cyclic_kv_cache = seq_len >= self.max_token_num
+
         # Get the final token index in kv cache
         final_token_kv_index = self.sink_block_token_num + (
             (seq_len - 1 - self.sink_block_token_num) %
@@ -346,8 +350,11 @@ class KVCacheManager(object):
 
         # Get block index that with shareAmongBeams=False.
         unshared_block_idx = -1
-        if final_token_kv_index % self.tokens_per_block > 0:
-            unshared_block_idx = final_token_kv_index // self.tokens_per_block
+        if (not enable_cyclic_kv_cache or self.beam_width > 1
+                or final_token_kv_index % self.tokens_per_block > 0):
+            unshared_block_idx = final_token_kv_index // self.tokens_per_block + 1 if (
+                final_token_kv_index + 1
+            ) % self.tokens_per_block == 0 else final_token_kv_index // self.tokens_per_block
 
         # Get context block num.
         # Allocate one more block if there are tokens that can't be shared across beams.

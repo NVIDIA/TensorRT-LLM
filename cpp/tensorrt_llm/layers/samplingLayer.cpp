@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/samplingLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
 
+#include "samplingLayer.h"
 #include <algorithm>
 
 using namespace tensorrt_llm::common;
@@ -30,25 +30,26 @@ using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::layers
 {
+
 template <typename T>
 SamplingLayer<T>::SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
-    : BaseLayer(decoderDomain, stream, std::move(allocator))
+    std::shared_ptr<BufferManager> bufferManager)
+    : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK_WITH_INFO(!mDecodingMode.isBeamSearch(), "SamplingLayer does not support Beam search mode");
-    TLLM_CHECK_WITH_INFO(mDecodingMode.isTopKorTopP(), "SamplingLayer requires TopK nor TopP mode");
+    TLLM_CHECK_WITH_INFO(mDecodingMode.isTopKorTopP(), "SamplingLayer requires TopK or TopP mode");
     if (mDecodingMode.isTopK())
     {
-        mSamplingLayers.emplace_back(std::make_unique<TopKSamplingLayer<T>>(decoderDomain, mStream, mAllocator));
+        mSamplingLayers.emplace_back(std::make_unique<TopKSamplingLayer<T>>(decoderDomain, mBufferManager));
     }
 
     if (mDecodingMode.isTopP())
     {
         mSamplingLayers.emplace_back(
-            std::make_unique<TopPSamplingLayer<T>>(decoderDomain, mStream, mAllocator, /* deterministic */ true));
+            std::make_unique<TopPSamplingLayer<T>>(decoderDomain, mBufferManager, /* deterministic */ true));
     }
 
     allocateBuffer(decoderDomain.getBatchSize());
@@ -61,55 +62,28 @@ void SamplingLayer<T>::allocateBuffer(SizeType32 batchSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mWorkspaceSize = 0;
+    size_t workspaceSize = 0;
     for (auto&& layer : mSamplingLayers)
     {
-        mWorkspaceSize = std::max(mWorkspaceSize, layer->getWorkspaceSize());
+        workspaceSize = std::max(workspaceSize, layer->getWorkspaceSize());
     }
 
-    std::array<size_t, 4> deviceBufferSizes;
-    deviceBufferSizes[0] = sizeof(curandState_t) * batchSize;
-    deviceBufferSizes[1] = sizeof(uint64_t) * batchSize;
-    deviceBufferSizes[2] = sizeof(bool) * batchSize;
-    deviceBufferSizes[3] = mWorkspaceSize;
-
-    mCurandStatesDevice = mAllocator->reMalloc(mCurandStatesDevice, deviceBufferSizes[0], false);
-    mRandomSeedsDevice = mAllocator->reMalloc(mRandomSeedsDevice, deviceBufferSizes[1], false);
-    mSkipDecodeDevice = mAllocator->reMalloc(mSkipDecodeDevice, deviceBufferSizes[2], false);
-    mSamplingWorkspaceDevice = mAllocator->reMalloc(mSamplingWorkspaceDevice, deviceBufferSizes[3], false);
-
-    auto const bytesAllocated = std::accumulate(deviceBufferSizes.begin(), deviceBufferSizes.end(), size_t{0});
-    TLLM_LOG_DEBUG("SamplingLayer allocated %d bytes on GPU", bytesAllocated);
-
-    mAllocatedSize = bytesAllocated;
-    for (auto&& layer : mSamplingLayers)
-    {
-        mAllocatedSize += layer->getAllocatedSize();
-    }
+    mCurandStatesDevice
+        = mBufferManager->gpu(ITensor::makeShape({batchSize, sizeof(curandState_t)}), TRTDataType<int8_t>::value);
+    auto const batchSizeShape = ITensor::makeShape({batchSize});
+    mRandomSeedsDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<uint64_t>::value);
+    mSkipDecodeDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<bool>::value);
+    mSamplingWorkspaceDevice = mBufferManager->gpu(workspaceSize, TRTDataType<int8_t>::value);
 
     // host buffers.
-    mSkipDecodeHost = (bool*) std::realloc(mSkipDecodeHost, sizeof(bool) * batchSize);
+    mSkipDecodeHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<bool>::value);
     TLLM_CHECK(mSkipDecodeHost != nullptr);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void SamplingLayer<T>::freeBuffer()
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    mAllocator->free((void**) (&mCurandStatesDevice));
-    mAllocator->free((void**) (&mRandomSeedsDevice));
-    mAllocator->free((void**) (&mSkipDecodeDevice));
-    mAllocator->free((void**) (&mSamplingWorkspaceDevice));
-    std::free(mSkipDecodeHost);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
+void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
     std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -121,26 +95,31 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeTyp
     // [batchSize] random seeds, initializing the random table by different
     // random seeds respectively. If no random seed, initialize the random table
     // of all sentences by 0 directly.
+    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
     if (setupParams->randomSeed)
     {
+        auto curandStateDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
         if (setupParams->randomSeed->size() == 1)
         {
             invokeCurandInitialize(
-                mCurandStatesDevice, batchSlots, batchSize, setupParams->randomSeed->front(), mStream);
+                curandStateDevicePtr, batchSlotsPtr, batchSize, setupParams->randomSeed->front(), getStream());
             sync_check_cuda_error();
         }
         else
         {
             TLLM_CHECK_WITH_INFO(setupParams->randomSeed->size() == batchSize, "Random seed vector size mismatch.");
-            cudaAutoCpy(mRandomSeedsDevice, setupParams->randomSeed->data(), batchSize, mStream);
-            invokeCurandBatchInitialize(mCurandStatesDevice, batchSlots, batchSize, mRandomSeedsDevice, mStream);
+            auto randomSeedsDevicePtr = bufferCast<uint64_t>(*mRandomSeedsDevice);
+            cudaAutoCpy(randomSeedsDevicePtr, setupParams->randomSeed->data(), batchSize, getStream());
+            invokeCurandBatchInitialize(
+                curandStateDevicePtr, batchSlotsPtr, batchSize, randomSeedsDevicePtr, getStream());
             sync_check_cuda_error();
         }
     }
     else
     {
         // Initialize curand states using the default seed 0.
-        invokeCurandInitialize(mCurandStatesDevice, batchSlots, batchSize, 0, mStream);
+        auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+        invokeCurandInitialize(curandStatesDevicePtr, batchSlotsPtr, batchSize, 0, getStream());
     }
 
     if (setupParams->outputLogProbs)
@@ -173,14 +152,14 @@ void SamplingLayer<T>::forwardAsync(
 
     auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 
-    auto const batchSize = inputs->logits->shape[0];
+    auto const batchSize = inputs->logits.value()->getDimension<0>();
 
-    auto logits = inputs->logits->template getPtr<T>();
-    auto endIds = inputs->endIds.template getPtr<int const>();
-    auto batchSlots = inputs->batchSlots ? inputs->batchSlots->template getPtr<int const>() : nullptr;
+    auto logits = bufferCast<T>(*inputs->logits.value());
+    auto endIds = bufferCast<TokenIdType>(*inputs->endIds);
+    auto batchSlots = bufferCastOrNull<SizeType32>(inputs->batchSlots);
 
-    FinishedState* finishedInput = (inputs->finished)
-        ? reinterpret_cast<FinishedState*>(inputs->finished->template getPtr<FinishedState::UnderlyingType>())
+    FinishedState const* finishedInput = (inputs->finished)
+        ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*inputs->finished.value()))
         : nullptr;
 
     auto const skipTopP = !mDecodingMode.isTopP();
@@ -188,14 +167,14 @@ void SamplingLayer<T>::forwardAsync(
     // Compute probabilities either for TopP or if cumLogProbs or outputLogProbs are specified
     bool const skipSoftMax = skipTopP && !mOutputLogProbs && !mCumLogProbs;
 
-    inputs->curandStates = mCurandStatesDevice;
-    inputs->samplingWorkspace = mSamplingWorkspaceDevice;
+    inputs->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    inputs->samplingWorkspace = mSamplingWorkspaceDevice->data();
     inputs->probsComputed = !skipSoftMax;
     if (!skipSoftMax)
     {
         invokeAddBiasSoftMax(logits, (T**) nullptr, logits, (T*) (nullptr), endIds, finishedInput, batchSlots,
             batchSize, mDecoderDomain.getBatchSize(), /* bw */ 1, mDecoderDomain.getVocabSize(),
-            mDecoderDomain.getVocabSizePadded(), skipSoftMax, /* batchSlotLogits */ false, mStream);
+            mDecoderDomain.getVocabSizePadded(), skipSoftMax, /* batchSlotLogits */ false, getStream());
         sync_check_cuda_error();
     }
 
@@ -205,6 +184,12 @@ void SamplingLayer<T>::forwardAsync(
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+size_t SamplingLayer<T>::getWorkspaceSize() const noexcept
+{
+    return mSamplingWorkspaceDevice->getSizeInBytes();
 }
 
 template class SamplingLayer<float>;

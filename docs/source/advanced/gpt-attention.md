@@ -89,7 +89,7 @@ for IA3.
 _The masked MHA kernel has a special version that distributes the work across
 multiple CUDA thread-blocks on the GPU for cases where the GPU occupancy is
 low. That mode called multi-block can be enabled using the `multi_block_mode`
-flag. Users are recommended to test that mode in scenarios where both the batch
+flag during runtime. Users are recommended to test that mode in scenarios where both the batch
 size and the number of heads in the model are relatively small. The exact
 definition of small in that context will depend on the model of the GPU and is
 hard to predict but to provide with a rule of thumb, it is worth testing that
@@ -165,7 +165,7 @@ which is expected to increase the total throughput. Chunking contexts also remov
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
 needs to be enabled. Except for the last one, the size of the context chunk needs
 to be an integer multiple of the kv-cache block size. Refer to
-[the performance best practices](perf_best_practices.md#chunked-context) for usage.
+[the performance best practices](../performance/perf-best-practices.md#chunked-context) for usage.
 
 ## KV Cache
 

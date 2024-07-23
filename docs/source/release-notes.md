@@ -5,29 +5,139 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
-## TensorRT-LLM Release Next
-
-### Announcements
-- TBD
+## TensorRT-LLM Release 0.11.0
 
 ### Key Features and Enhancements
-- TBD
+- Supported very long context for LLaMA (see “Long context evaluation” section in `examples/llama/README.md`).
+- Low latency optimization
+  - Added a reduce-norm feature which aims to fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, which is recommended to be enabled when the batch size is small and the generation phase time is dominant.
+  - Added FP8 support to the GEMM plugin, which benefits the cases when batch size is smaller than 4.
+  - Added a fused GEMM-SwiGLU plugin for FP8 on SM90.
+- LoRA enhancements
+  - Supported running FP8 LLaMA with FP16 LoRA checkpoints.
+  - Added support for quantized base model and FP16/BF16 LoRA.
+    - SQ OOTB (- INT8 A/W) + FP16/BF16/FP32 LoRA​
+    - INT8/ INT4 Weight-Only (INT8 /W) + FP16/BF16/FP32 LoRA​
+    - Weight-Only Group-wise + FP16/BF16/FP32 LoRA
+  - Added LoRA support to Qwen2, see “Run models with LoRA” section in `examples/qwen/README.md`.
+  - Added support for Phi-3-mini/small FP8 base + FP16/BF16 LoRA, see “Run Phi-3 with LoRA” section in `examples/phi/README.md`.
+  - Added support for starcoder-v2 FP8 base + FP16/BF16 LoRA, see “Run StarCoder2 with LoRA” section in `examples/gpt/README.md`.
+- Encoder-decoder models C++ runtime enhancements
+  - Supported paged KV cache and inflight batching. (#800)
+  - Supported tensor parallelism.
+- Supported INT8 quantization with embedding layer excluded.
+- Updated default model for Whisper to `distil-whisper/distil-large-v3`, thanks to the contribution from @IbrahimAmin1 in #1337.
+- Supported HuggingFace model automatically download for the Python high level API.
+- Supported explicit draft tokens for in-flight batching.
+- Supported local custom calibration datasets, thanks to the contribution from @DreamGenX in #1762.
+- Added batched logits post processor.
+- Added Hopper qgmma kernel to XQA JIT codepath.
+- Supported tensor parallelism and expert parallelism enabled together for MoE.
+- Supported the pipeline parallelism cases when the number of layers cannot be divided by PP size.
+- Added `numQueuedRequests` to the iteration stats log of the executor API.
+- Added `iterLatencyMilliSec` to the iteration stats log of the executor API.
+- Add HuggingFace model zoo from the community, thanks to the contribution from @matichon-vultureprime in #1674.
 
 ### API Changes
-- TBD
+- [BREAKING CHANGE] `trtllm-build` command
+  - Migrated Whisper to unified workflow (`trtllm-build` command), see documents: examples/whisper/README.md.
+  - `max_batch_size` in `trtllm-build` command is switched to 256 by default.
+  - `max_num_tokens` in `trtllm-build` command is switched to 8192 by default.
+  - Deprecated `max_output_len` and added `max_seq_len`.
+  - Removed unnecessary `--weight_only_precision` argument from `trtllm-build` command.
+  - Removed `attention_qk_half_accumulation` argument from `trtllm-build` command.
+  - Removed `use_context_fmha_for_generation` argument from `trtllm-build` command.
+  - Removed `strongly_typed` argument from `trtllm-build` command.
+  - The default value of `max_seq_len` reads from the HuggingFace mode config now.
+- C++ runtime
+  - [BREAKING CHANGE] Renamed `free_gpu_memory_fraction` in `ModelRunnerCpp` to `kv_cache_free_gpu_memory_fraction`.
+  - [BREAKING CHANGE] Refactored `GptManager` API
+    - Moved `maxBeamWidth` into `TrtGptModelOptionalParams`.
+    - Moved `schedulerConfig` into `TrtGptModelOptionalParams`.
+  - Added some more options to `ModelRunnerCpp`, including `max_tokens_in_paged_kv_cache`, `kv_cache_enable_block_reuse` and `enable_chunked_context`.
+- [BREAKING CHANGE] Python high-level API
+  - Removed the `ModelConfig` class, and all the options are moved to `LLM` class.
+  - Refactored the `LLM` class, please refer to `examples/high-level-api/README.md`
+    - Moved the most commonly used options in the explicit arg-list, and hidden the expert options in the kwargs.
+    - Exposed `model` to accept either HuggingFace model name or local HuggingFace model/TensorRT-LLM checkpoint/TensorRT-LLM engine.
+    - Support downloading model from HuggingFace model hub, currently only Llama variants are supported.
+    - Support build cache to reuse the built TensorRT-LLM engines by setting environment variable `TLLM_HLAPI_BUILD_CACHE=1` or passing `enable_build_cache=True` to `LLM` class.
+    - Exposed low-level options including `BuildConfig`, `SchedulerConfig` and so on in the kwargs, ideally you should be able to configure details about the build and runtime phase.
+  - Refactored `LLM.generate()` and `LLM.generate_async()` API.
+    - Removed `SamplingConfig`.
+    - Added `SamplingParams` with more extensive parameters, see `tensorrt_llm/hlapi/utils.py`.
+      - The new `SamplingParams` contains and manages fields from Python bindings of `SamplingConfig`, `OutputConfig`, and so on.
+    - Refactored `LLM.generate()` output as `RequestOutput`, see `tensorrt_llm/hlapi/llm.py`.
+  - Updated the `apps` examples, specially by rewriting both `chat.py` and `fastapi_server.py` using the `LLM` APIs, please refer to the `examples/apps/README.md` for details.
+    - Updated the `chat.py` to support multi-turn conversation, allowing users to chat with a model in the terminal.
+    - Fixed the `fastapi_server.py` and eliminate the need for `mpirun` in multi-GPU scenarios.
+- [BREAKING CHANGE] Speculative decoding configurations unification
+  - Introduction of `SpeculativeDecodingMode.h` to choose between different speculative decoding techniques.
+  - Introduction of `SpeculativeDecodingModule.h` base class for speculative decoding techniques.
+  - Removed `decodingMode.h`.
+- `gptManagerBenchmark`
+  - [BREAKING CHANGE] `api` in `gptManagerBenchmark` command is `executor` by default now.
+  - Added a runtime `max_batch_size`.
+  - Added a runtime `max_num_tokens`.
+- [BREAKING CHANGE] Added a `bias` argument to the `LayerNorm` module, and supports non-bias layer normalization.
+- [BREAKING CHANGE] Removed `GptSession` Python bindings.
 
 ### Model Updates
-- TBD
+- Supported Jais, see `examples/jais/README.md`.
+- Supported DiT, see `examples/dit/README.md`.
+- Supported VILA 1.5.
+- Supported Video NeVA, see `Video NeVA`section in `examples/multimodal/README.md`.
+- Supported Grok-1, see `examples/grok/README.md`.
+- Supported Qwen1.5-110B with FP8 PTQ.
+- Supported Phi-3 small model with block sparse attention.
+- Supported InternLM2 7B/20B, thanks to the contribution from @RunningLeon in #1392.
+- Supported Phi-3-medium models, see `examples/phi/README.md`.
+- Supported Qwen1.5 MoE A2.7B.
+- Supported phi 3 vision multimodal.
 
 ### Fixed Issues
-- TBD
+- Fixed brokens outputs for the cases when batch size is larger than 1. (#1539)
+- Fixed `top_k` type in `executor.py`, thanks to the contribution from @vonjackustc in #1329.
+- Fixed stop and bad word list pointer offset in Python runtime, thanks to the contribution from @fjosw in #1486.
+- Fixed some typos for Whisper model, thanks to the contribution from @Pzzzzz5142 in #1328.
+- Fixed export failure with CUDA driver < 526 and pynvml >= 11.5.0, thanks to the contribution from @CoderHam in #1537.
+- Fixed an issue in NMT weight conversion, thanks to the contribution from @Pzzzzz5142 in #1660.
+- Fixed LLaMA Smooth Quant conversion, thanks to the contribution from @lopuhin in #1650.
+- Fixed `qkv_bias` shape issue for Qwen1.5-32B (#1589), thanks to the contribution from @Tlntin in #1637.
+- Fixed the error of Ada traits for `fpA_intB`, thanks to the contribution from @JamesTheZ  in #1583.
+- Update `examples/qwenvl/requirements.txt`, thanks to the contribution from @ngoanpv in #1248.
+- Fixed rsLoRA scaling in `lora_manager`, thanks to the contribution from @TheCodeWrangler in #1669.
+- Fixed Qwen1.5 checkpoint convert failure #1675.
+- Fixed Medusa safetensors and AWQ conversion, thanks to the contribution from @Tushar-ml in #1535.
+- Fixed `convert_hf_mpt_legacy` call failure when the function is called in other than global scope, thanks to the contribution from @bloodeagle40234 in #1534.
+- Fixed `use_fp8_context_fmha` broken outputs (#1539).
+- Fixed pre-norm weight conversion for NMT models, thanks to the contribution from @Pzzzzz5142 in #1723.
+- Fixed random seed initialization issue, thanks to the contribution from @pathorn in #1742.
+- Fixed stop words and bad words in python bindings. (#1642)
+- Fixed the issue that when converting checkpoint for Mistral 7B v0.3, thanks to the contribution from @Ace-RR: #1732.
+- Fixed broken inflight batching for fp8 Llama and Mixtral, thanks to the contribution from @bprus: #1738
+- Fixed the failure when `quantize.py` is export data to config.json, thanks to the contribution from @janpetrov: #1676
+- Raise error when autopp detects unsupported quant plugin #1626.
+- Fixed the issue that `shared_embedding_table` is not being set when loading Gemma #1799, thanks to the contribution from @mfuntowicz.
+- Fixed stop and bad words list contiguous for `ModelRunner` #1815, thanks to the contribution from @Marks101.
+- Fixed missing comment for `FAST_BUILD`, thanks to the support from @lkm2835 in #1851.
+- Fixed the issues that Top-P sampling occasionally produces invalid tokens. #1590
+- Fixed #1424.
+- Fixed #1529.
+- Fixed `benchmarks/cpp/README.md` for #1562 and #1552.
+- Fixed dead link, thanks to the help from @DefTruth, @buvnswrn and @sunjiabin17 in: https://github.com/triton-inference-server/tensorrtllm_backend/pull/478, https://github.com/triton-inference-server/tensorrtllm_backend/pull/482 and https://github.com/triton-inference-server/tensorrtllm_backend/pull/449.
 
-### Infrastructure changes
+### Infrastructure Changes
   - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.05-py3`.
   - Base Docker image for TensorRT-LLM backend is updated to `nvcr.io/nvidia/tritonserver:24.05-py3`.
-  - The dependent TensorRT version is updated to 10.1.0.
+  - The dependent TensorRT version is updated to 10.2.0.
   - The dependent CUDA version is updated to 12.4.1.
   - The dependent PyTorch version is updated to 2.3.1.
+  - The dependent ModelOpt version is updated to v0.13.0.
+
+### Known Issues
+
+- In a conda environment on Windows, installation of TensorRT-LLM may succeed. However, when importing the library in Python, you may receive an error message of `OSError: exception: access violation reading 0x0000000000000000`. This issue is under investigation.
 
 
 ## TensorRT-LLM Release 0.10.0

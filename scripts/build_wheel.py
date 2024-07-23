@@ -223,6 +223,10 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
+        copy(
+            build_dir /
+            "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention.so",
+            lib_dir / "libdecoder_attention.so")
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():

@@ -73,6 +73,7 @@ class QuantConfig:
     kv_cache_quant_algo: Optional[QuantAlgo] = None
     group_size: Optional[int] = 128
     smoothquant_val: Optional[float] = None
+    clamp_val: Optional[List[float]] = None
     has_zero_point: Optional[bool] = False
     pre_quant_scale: Optional[bool] = False
     exclude_modules: Optional[List[str]] = None
@@ -527,8 +528,6 @@ class PretrainedModel(Module,
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
         tokens_per_block = default_net().plugin_config.tokens_per_block
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
         use_lora_plugin = default_net().plugin_config.lora_plugin
         multiple_profiles = default_net().plugin_config.multiple_profiles
         streamingllm = default_net().plugin_config.streamingllm
@@ -557,7 +556,6 @@ class PretrainedModel(Module,
             mapping=self.config.mapping,
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
-            use_custom_all_reduce=use_custom_all_reduce,
             use_lora_plugin=use_lora_plugin,
             max_draft_len=max_draft_len,
             speculative_decoding_draft_tokens_external=
@@ -601,7 +599,8 @@ class PretrainedModel(Module,
                 context_lengths=model_inputs['context_lengths'],
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
-                host_request_types=model_inputs['host_request_types'])
+                host_request_types=model_inputs['host_request_types'],
+                host_runtime_perf_knobs=model_inputs['host_runtime_perf_knobs'])
         }
 
         if prompt_embedding_table_size > 0:
@@ -633,12 +632,13 @@ class PretrainedModel(Module,
         mapping: Optional[Mapping] = None,
         quant_config: Optional[QuantConfig] = None,
         *,
-        calib_dataset='cnn_dailymail',
-        calib_batches=512,
-        calib_batch_size=1,
-        calib_max_seq_length=512,
-        random_seed=1234,
-        tokenizer_max_seq_length=2048,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
     ):
         if mapping is None:  # single gpu
             mapping = Mapping()
@@ -653,7 +653,7 @@ class PretrainedModel(Module,
             hf_model_dir)  # quantize_and_export has some code can not take Path
         quantize_and_export(
             model_dir=hf_model_dir,
-            device='cuda',
+            device=device,
             calib_dataset=calib_dataset,
             dtype=dtype,
             qformat=modelopt_qformat,
@@ -1153,6 +1153,16 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
 
     # FP8
     elif quant_algo == QuantAlgo.FP8:
+        for name, param in weights.items():
+            if name.endswith('weight') and param.dtype == torch.int8:
+                weights[name] = param.view(torch.float8_e4m3fn)
+        # lm_head is not quantized to FP8
+        if "lm_head.weight" in weights:
+            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
+                model_config.dtype)
+            weights.pop('lm_head.weights_scaling_factor', None)
+            weights.pop('lm_head.activation_scaling_factor', None)
+    elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
         for name, param in weights.items():
             if name.endswith('weight') and param.dtype == torch.int8:
                 weights[name] = param.view(torch.float8_e4m3fn)

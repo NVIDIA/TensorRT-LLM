@@ -18,6 +18,7 @@ import unittest
 from itertools import product
 
 import numpy as np
+import pytest
 import torch
 from parameterized import parameterized
 
@@ -35,20 +36,34 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand(list(
-        product([2048], [4], ['context', 'generation'],
-                ['float16', 'float32', 'bfloat16'], [5], [16], [False, True],
-                [False, True], [False, True])),
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        list(
+            product([2048], [4], ['context', 'generation'],
+                    ['float16', 'float32', 'bfloat16'], [5], [16], [0, 64],
+                    [False, True], [False, True])) +
+        # long sequence tests to cover the int overflow issue
+        list(
+            product([5376], [4], ['context'], ['float16', 'bfloat16'], [2],
+                    [131072], [10240], [False, True], [False, True])),
+        name_func=unittest_name_func)
     def test_mamba_conv1d(self, dim, dconv, req_type, dtype, batch_size,
-                          max_seq_len, remove_padding, apply_silu, with_stride):
+                          max_seq_len, stride_size, remove_padding, apply_silu):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
+        if max_seq_len == 131072:
+            total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
+            if total_gpu_mem <= 33 * 1024**3:
+                pytest.skip(
+                    "The long sequence test needs at least 33GB memory, skipping"
+                )
 
         device = "cuda"
         seq_len = max_seq_len if req_type == 'context' else 1
-        pre_stride = 64 if with_stride else 0
+        with_stride = stride_size > 0
+        pre_stride = stride_size
         post_stride = 64 if with_stride else 0
+        mean = 0.0
+        std_dev = 1.0 if dtype == "float32" else 0.5
 
         # test data
         last_token_ids_trt = None
@@ -57,14 +72,16 @@ class TestFunctional(unittest.TestCase):
             last_token_ids = torch.randint(1,
                                            seq_len + 1, (batch_size, ),
                                            dtype=torch.int32)
+            last_token_ids[0] = seq_len
+            host_context_length = last_token_ids.detach().clone().cpu()
             last_token_ids_trt = torch.cumsum(last_token_ids,
                                               dim=0,
                                               dtype=torch.int32).to(device)
         else:
             last_token_ids = torch.ones(
                 (batch_size, ), dtype=torch.int32, device=device) * seq_len
+            host_context_length = last_token_ids.detach().clone().cpu()
             last_token_ids_trt = last_token_ids
-        host_context_length = last_token_ids.cpu()
         if req_type == 'context':
             past_conv_state = torch.zeros([batch_size, dim, dconv - 1],
                                           dtype=str_dtype_to_torch(dtype),
@@ -75,6 +92,8 @@ class TestFunctional(unittest.TestCase):
                                           dconv - 1,
                                           dtype=str_dtype_to_torch(dtype),
                                           device=device)
+            past_conv_state.normal_(mean, std_dev)
+
         conv_weight = torch.randn([dim, 1, dconv],
                                   dtype=str_dtype_to_torch(dtype),
                                   device=device)
@@ -85,11 +104,12 @@ class TestFunctional(unittest.TestCase):
         host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
                                           batch_size,
                                           dtype=torch.int32)
-        x = torch.randn(batch_size,
+        x = torch.empty(batch_size,
                         dim,
                         seq_len,
                         device=device,
                         dtype=str_dtype_to_torch(dtype))
+        x.normal_(mean, std_dev)
 
         x_trt = x.detach().permute(0, 2, 1).contiguous()
         if remove_padding and req_type == 'context':

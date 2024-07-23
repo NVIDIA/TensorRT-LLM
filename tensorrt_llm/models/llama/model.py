@@ -362,12 +362,13 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         mapping: Optional[Mapping] = None,
         quant_config: Optional[QuantConfig] = None,
         *,
-        calib_dataset='cnn_dailymail',
-        calib_batches=512,
-        calib_batch_size=1,
-        calib_max_seq_length=512,
-        random_seed=1234,
-        tokenizer_max_seq_length=2048,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
         DEFAULT_MODELOPT_FLOW = [
@@ -386,6 +387,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              dtype=config.dtype,
                              mapping=config.mapping,
                              quant_config=config.quantization,
+                             device=device,
                              calib_dataset=calib_dataset,
                              calib_batches=calib_batches,
                              calib_batch_size=calib_batch_size,
@@ -395,8 +397,10 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         else:
             # non-modelopt, the legacy TRT-LLM native quantization algorithm:
             # sq, int4/int8 weights only, int8 kv cache
-            NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None
-                                 ] + W8A8_SQ_PLUGIN_LIST
+            NATIVE_QUANT_FLOW = [
+                QuantAlgo.W4A16, QuantAlgo.W8A16,
+                QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None
+            ] + W8A8_SQ_PLUGIN_LIST
             is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
                 (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
             assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
@@ -407,6 +411,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
+                             device=device,
                              calib_dataset=calib_dataset)
 
     def use_lora(self, lora_config: LoraConfig):

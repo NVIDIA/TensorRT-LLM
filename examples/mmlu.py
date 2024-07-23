@@ -379,14 +379,21 @@ def main():
         runner_kwargs = {}
         if PYTHON_BINDINGS:
             runner_kwargs.update(max_beam_width=1)
+        runner_kwargs.update(
+            max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+            kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+            kv_cache_free_gpu_memory_fraction=args.
+            kv_cache_free_gpu_memory_fraction,
+            enable_chunked_context=args.enable_chunked_context,
+            multi_block_mode=args.multi_block_mode)
         model = runner_cls.from_dir(args.engine_dir,
                                     rank=runtime_rank,
                                     **runner_kwargs)
     else:
         assert args.test_hf, "Must test either TRT-LLM or HF"
-        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+        if 'GLM' in model_name and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
-        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+        elif 'GLM' in model_name and model_version == 'chatglm':
             auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM

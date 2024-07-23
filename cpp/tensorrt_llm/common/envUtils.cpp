@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cstdlib>
 
@@ -141,6 +142,30 @@ int getEnvMmhaKernelBlockSize()
         }
     }
     return mmhaKernelBlockSize;
+}
+
+bool getEnvEnableFDL()
+{
+    static bool init = false;
+    static bool enableFDL = false;
+    if (!init)
+    {
+        init = true;
+        // FDL only available when arch >= 90
+        if (getSMVersion() >= 90)
+        {
+            char const* enable_fdl = std::getenv("TRTLLM_ENABLE_FDL");
+            if (enable_fdl)
+            {
+                // FDL will be enabled by setting the env variables `TRTLLM_ENABLE_FDL` to `1`
+                if (enable_fdl[0] == '1' && enable_fdl[1] == '\0')
+                {
+                    enableFDL = true;
+                }
+            }
+        }
+    }
+    return enableFDL;
 }
 
 } // namespace tensorrt_llm::common

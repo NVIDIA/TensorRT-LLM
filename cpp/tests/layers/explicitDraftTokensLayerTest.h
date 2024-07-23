@@ -26,8 +26,6 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/common/tllmException.h"
 
 namespace tensorrt_llm::tests::layers
@@ -317,7 +315,6 @@ private:
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::common::CudaAllocator> mAllocator;
     std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<T>> mExplicitDraftTokensLayer;
 
     ExplicitDraftTokensDummyNetwork mNetwork;

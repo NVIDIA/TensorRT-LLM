@@ -122,10 +122,11 @@ struct Multihead_attention_params_base
     int rotary_embedding_dim = 0;
     float rotary_embedding_base = 0.0f;
     RotaryScalingType rotary_embedding_scale_type = RotaryScalingType::kNONE;
-    float rotary_embedding_scale = 0.0f;
-    float rotary_embedding_short_m_scale = 0.0f;
-    float rotary_embedding_long_m_scale = 0.0f;
-    float const* rotary_embedding_scaling_factors = nullptr;
+    float rotary_embedding_scale = 1.0f;
+    // The pre-computed rotary inv freq when building the engines (as constant weights).
+    float const* rotary_embedding_inv_freq_cache = nullptr;
+    float rotary_embedding_short_m_scale = 1.0f;
+    float rotary_embedding_long_m_scale = 1.0f;
     int rotary_embedding_max_positions = 0;
     int rotary_embedding_original_max_positions = 0;
     int rotary_cogvlm_vision_start = -1;

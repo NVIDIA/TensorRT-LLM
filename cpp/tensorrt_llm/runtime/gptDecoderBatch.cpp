@@ -76,7 +76,8 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
 } // namespace
 
 GptDecoderBatch::GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded,
-    GptDecoderBatch::CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode)
+    GptDecoderBatch::CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode,
+    nvinfer1::DataType dtype)
     : mVocabSize{vocabSize}
     , mVocabSizePadded{vocabSizePadded}
     , mStream{std::move(stream)}
@@ -128,7 +129,7 @@ GptDecoderBatch::GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePad
     dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
     dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
     dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
-    dInput->embeddingBias = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    dInput->embeddingBias = mBufferManager.emptyTensor(MemoryType::kGPU, dtype);
 
     if (!mSpeculativeDecodingMode.isNone())
     {
@@ -274,10 +275,6 @@ void GptDecoderBatch::setup(executor::DecodingMode const& mode, SizeType32 maxBa
     if (maxBeamWidth > 1)
     {
         dOutput.beamHypotheses.reshape(maxBatchSize, maxBeamWidth, mMaxSequenceLength);
-    }
-    else
-    {
-        dOutput.beamHypotheses.release();
     }
 
     // speculative decoding only works for beam width == 1
@@ -785,8 +782,7 @@ void GptDecoderBatch::newRequests(std::vector<SizeType32> const& seqSlots,
     {
         TensorPtr batchSlotsView = ITensor::slice(mBatchSlotsSetup, 0, localBatchSize);
         auto fusedSamplingConfig = SamplingConfig(samplingConfigs);
-        mDecoders[0]->setup(
-            fusedSamplingConfig, localBatchSize, bufferCast<SizeType32>(*batchSlotsView), {*mJointDecodingOutput});
+        mDecoders[0]->setup(fusedSamplingConfig, localBatchSize, batchSlotsView, {*mJointDecodingOutput});
 
         auto const& stream = mStreams.at(0);
         CudaEvent event{};
@@ -961,7 +957,7 @@ void GptDecoderBatch::forwardFusedDecoder(
     TLLM_CHECK(sequenceLengths);
 
     auto batchSlotsDecoderPtr
-        = input.seqSlots ? bufferCast<SizeType32>(*input.seqSlots) : bufferCast<SizeType32>(*mBatchSlotsDecoder);
+        = maxBeamWidth > 1 ? bufferCast<SizeType32>(*input.seqSlots) : bufferCast<SizeType32>(*mBatchSlotsDecoder);
     auto batchSlotsAcceptTokensPtr = bufferCast<SizeType32>(*mBatchSlotsAcceptTokens);
     auto batchSlotsAcceptLogitsPtr = bufferCast<SizeType32>(*mBatchSlotsAcceptLogits);
     auto& dInput = *mJointDecodingInput;
@@ -1019,7 +1015,7 @@ void GptDecoderBatch::forwardFusedDecoder(
     auto const maxDecodingEngineTokens
         = *std::max_element(std::begin(mNumDecodingEngineTokens), std::end(mNumDecodingEngineTokens));
 
-    std::vector<SharedConstPtr> logitsVec;
+    std::vector<TensorPtr> logitsVec;
     auto targetLogitsPtrsSlice = ITensor::slice(mTargetLogitsPtrs, step, 1);
     auto targetLogitsPtrsSlicePtr = reinterpret_cast<void const**>(bufferCast<int64_t>(*targetLogitsPtrsSlice));
     SizeType32 targetLogitsIdx = 0;
@@ -1030,7 +1026,7 @@ void GptDecoderBatch::forwardFusedDecoder(
             continue;
         }
         auto& targetLogits = allTargetLogits[bi];
-        SharedConstPtr logitsSlice = ITensor::slice(targetLogits, step, singleRequest);
+        TensorPtr logitsSlice = ITensor::slice(targetLogits, step, singleRequest);
         logitsVec.push_back(logitsSlice);
         targetLogitsPtrsSlicePtr[targetLogitsIdx++] = logitsSlice->data();
     }
@@ -1069,10 +1065,9 @@ void GptDecoderBatch::forwardFusedDecoder(
     dInput.logitsVec = logitsVec;
     dInput.finished = finishedStepsInput;
 
-    if (input.seqSlots)
+    if (maxBeamWidth > 1)
     {
-        TensorPtr batchSlotsDecoderSlice = ITensor::slice(input.seqSlots, step, 1);
-        dInput.batchSlots = batchSlotsDecoderSlice;
+        dInput.batchSlots = input.seqSlots;
     }
     else
     {
@@ -1319,7 +1314,7 @@ void GptDecoderBatch::forwardAsync(decoder::Output& output, decoder::Input const
     auto const& logitsShape = input.logits->getShape();
     auto const batchSize = logitsShape.d[0];
     auto constexpr singleRequest = 1;
-    std::vector<ITensor::SharedConstPtr> logits;
+    std::vector<ITensor::SharedPtr> logits;
     logits.reserve(batchSize);
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {

@@ -71,7 +71,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     int* seqKVOffsets, int const* seqQLengths, int const* seqKVLengths, uint32_t* fmha_tile_counter, int batchSize,
     int maxQSeqLength, bool removePadding, float rotaryEmbeddingScale, float rotaryEmbeddingBase,
     int rotaryEmbeddingDim, RotaryScalingType rotaryScalingType, int rotaryEmbeddingMaxPositions,
-    float* rotaryEmbeddingInvFreq, float2* rotaryEmbeddingCoeffCache)
+    float* rotaryEmbeddingInvFreq, float const* rotaryEmbeddingInvFreqCache, float2* rotaryEmbeddingCoeffCache)
 {
     // Dynamic shared memory for storing seqOffsets.
     extern __shared__ int smemSeqQOffsets[];
@@ -174,8 +174,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     {
         mmha::update_rotary_base_n_scale(rotaryEmbeddingBase, rotaryEmbeddingScale, rotaryScalingType,
             rotaryEmbeddingDim, rotaryEmbeddingMaxPositions, seqKVLengths[batchIdx]);
-        float const invFreq = rotaryEmbeddingScale / powf(rotaryEmbeddingBase, zid / (float) rotaryEmbeddingDim);
-        rotaryEmbeddingInvFreq[batchIdx * halfRotaryEmbeddingDim + threadIdx.x] = invFreq;
+        // Recompute the rotary scales when it is dynamic scaling.
+        if (rotaryScalingType == RotaryScalingType::kDYNAMIC || rotaryEmbeddingInvFreqCache == nullptr)
+        {
+            float const invFreq = rotaryEmbeddingScale / powf(rotaryEmbeddingBase, zid / (float) rotaryEmbeddingDim);
+            rotaryEmbeddingInvFreq[batchIdx * halfRotaryEmbeddingDim + threadIdx.x] = invFreq;
+        }
+        else
+        {
+            // Otherwise, expand the inv freq cache to batch size.
+            float const invFreqCache = rotaryEmbeddingInvFreqCache[threadIdx.x];
+            rotaryEmbeddingInvFreq[batchIdx * halfRotaryEmbeddingDim + threadIdx.x] = invFreqCache;
+        }
     }
 
     // Reset fmha tile counter to 0 before launching fmha kernels.
@@ -292,7 +302,7 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
                 params.seqKVOffsets, params.seqQLengths, params.seqKVLengths, params.fmhaTileCounter, params.batchSize,
                 params.maxQSeqLength, params.removePadding, params.rotaryEmbeddingScale, params.rotaryEmbeddingBase,
                 params.rotaryEmbeddingDim, params.rotaryScalingType, params.rotaryEmbeddingMaxPositions,
-                params.rotaryEmbeddingInvFreq, params.rotaryEmbeddingCoeffCache);
+                params.rotaryEmbeddingInvFreq, params.rotaryEmbeddingInvFreqCache, params.rotaryEmbeddingCoeffCache);
     }
     else
     {
@@ -301,7 +311,7 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
                 params.seqKVOffsets, params.seqQLengths, params.seqKVLengths, params.fmhaTileCounter, params.batchSize,
                 params.maxQSeqLength, params.removePadding, params.rotaryEmbeddingScale, params.rotaryEmbeddingBase,
                 params.rotaryEmbeddingDim, params.rotaryScalingType, params.rotaryEmbeddingMaxPositions,
-                params.rotaryEmbeddingInvFreq, params.rotaryEmbeddingCoeffCache);
+                params.rotaryEmbeddingInvFreq, params.rotaryEmbeddingInvFreqCache, params.rotaryEmbeddingCoeffCache);
     }
 
     // Compute the attention mask, if needed.

@@ -16,18 +16,20 @@
 
 #include "tensorrt_llm/thop/dynamicDecodeOp.h"
 
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
-#include "tensorrt_llm/thop/torchAllocator.h"
+#include <c10/cuda/CUDAFunctions.h>
 
 namespace th = torch;
 
 namespace tle = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace tl = tensorrt_llm::layers;
+namespace tk = tensorrt_llm::kernels;
 
 namespace torch_ext
 {
@@ -35,20 +37,22 @@ namespace torch_ext
 template <typename T>
 FtDynamicDecode<T>::FtDynamicDecode(size_t const maxBatchSize, size_t const maxBeamWidth, size_t const vocabSize,
     size_t const vocabSizePadded, int const tensorParaSize, int const pipelineParaSize)
-    : mFinishedSum(tr::BufferManager::pinned(
-        tr::ITensor::makeShape({static_cast<int32_t>(maxBatchSize)}), nvinfer1::DataType::kINT32))
 {
     TLLM_CHECK_WITH_INFO(vocabSizePadded % tensorParaSize == 0,
         tensorrt_llm::common::fmtstr(
             "vocabSize (%ld) is not multiple of tensorParaSize (%d).", vocabSizePadded, tensorParaSize));
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto allocator = std::make_shared<tensorrt_llm::thop::TorchAllocator>(stream);
-
     auto const decodingDomain = tl::DecoderDomain(maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded);
 
-    mDynamicDecodeLayer = std::make_shared<tl::DynamicDecodeLayer<T>>(
-        tle::DecodingMode::Auto(), decodingDomain, stream, std::move(allocator));
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto const currentDeviceId = c10::cuda::current_device();
+    auto cudaStreamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>(stream, currentDeviceId);
+    auto bufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(cudaStreamPtr);
+
+    mFinishedSum = bufferManager->pinnedPool(
+        tr::ITensor::makeShape({static_cast<int32_t>(maxBatchSize)}), nvinfer1::DataType::kINT32);
+    mDynamicDecodeLayer
+        = std::make_shared<tl::DynamicDecodeLayer<T>>(tle::DecodingMode::Auto(), decodingDomain, bufferManager);
 }
 
 namespace
@@ -62,13 +66,22 @@ void safeInsert(th::optional<th::Tensor>& tensor, std::optional<std::vector<T>>&
     {
         auto ptr = get_ptr<valueType>(tensor.value());
         auto shape = convert_shape(tensor.value());
-        size_t const size = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<>());
+        size_t const size = tensorrt_llm::runtime::ITensor::volume(shape);
         arg = std::vector<valueType>(ptr, ptr + size);
     }
 }
 
 template <typename T>
-void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tc::Tensor>& arg)
+void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tr::ITensor::SharedPtr>& arg)
+{
+    if (tensor.has_value())
+    {
+        arg = convert_tensor<T>(tensor.value());
+    }
+}
+
+template <typename T>
+void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tr::ITensor::SharedConstPtr>& arg)
 {
     if (tensor.has_value())
     {
@@ -99,55 +112,53 @@ void safeUpdatePtr(th::optional<th::Tensor>& tensor, T*& ptr)
 } // namespace
 
 template <typename T>
-void FtDynamicDecode<T>::setup(size_t const batchSize, size_t const beamWidth, th::optional<th::Tensor> runtimeTopKOpt,
-    th::optional<th::Tensor> runtimeTopPOpt, th::optional<th::Tensor> temperatureOpt,
-    th::optional<th::Tensor> repetitionPenaltyOpt, th::optional<th::Tensor> presencePenaltyOpt,
-    th::optional<th::Tensor> frequencyPenaltyOpt, th::optional<th::Tensor> minLengthOpt,
-    th::optional<th::Tensor> lengthPenaltyOpt, th::optional<th::Tensor> earlyStoppingOpt,
-    th::optional<th::Tensor> beamSearchDiversityRateOpt, th::optional<th::Tensor> randomSeedOpt,
-    th::optional<th::Tensor> topPDecayOpt, th::optional<th::Tensor> topPMinOpt,
-    th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt, bool outputLogProbs,
-    bool cumLogProbs)
+void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
+    th::optional<th::Tensor> runtime_top_k_opt, th::optional<th::Tensor> runtime_top_p_opt,
+    th::optional<th::Tensor> temperature_opt, th::optional<th::Tensor> repetition_penalty_opt,
+    th::optional<th::Tensor> presence_penalty_opt, th::optional<th::Tensor> frequency_penalty_opt,
+    th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
+    th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
 {
-    mBeamWidth = beamWidth;
-
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    mDynamicDecodeLayer->setStream(stream);
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    mBeamWidth = beam_width;
 
     auto setupParams = std::make_shared<tl::DynamicDecodeSetupParams>();
     auto penaltyParams = std::make_shared<tl::PenaltySetupParams>();
     auto banWordsParams = std::make_shared<tl::BanWordsSetupParams>();
-    safeInsert(temperatureOpt, penaltyParams->temperature);
-    safeInsert(repetitionPenaltyOpt, penaltyParams->repetitionPenalty);
-    safeInsert(presencePenaltyOpt, penaltyParams->presencePenalty);
-    safeInsert(frequencyPenaltyOpt, penaltyParams->frequencyPenalty);
-    safeInsert(minLengthOpt, penaltyParams->minLength);
+    safeInsert(temperature_opt, penaltyParams->temperature);
+    safeInsert(repetition_penalty_opt, penaltyParams->repetitionPenalty);
+    safeInsert(presence_penalty_opt, penaltyParams->presencePenalty);
+    safeInsert(frequency_penalty_opt, penaltyParams->frequencyPenalty);
+    safeInsert(min_length_opt, penaltyParams->minLength);
 
-    safeInsert(noRepeatNgramSizeOpt, banWordsParams->noRepeatNgramSize);
+    safeInsert(no_repeat_ngram_size_opt, banWordsParams->noRepeatNgramSize);
 
-    if (beamWidth == 1)
+    if (beam_width == 1)
     {
         auto decodingParams = std::make_shared<tl::SamplingSetupParams>();
-        safeInsert(runtimeTopKOpt, decodingParams->runtimeTopK);
-        safeInsert(runtimeTopPOpt, decodingParams->runtimeTopP);
-        safeInsert(topPDecayOpt, decodingParams->topPDecay);
-        safeInsert(topPMinOpt, decodingParams->topPMin);
-        safeInsert(topPResetIdsOpt, decodingParams->topPResetIds);
-        decodingParams->outputLogProbs = std::vector<bool>({outputLogProbs});
-        decodingParams->cumLogProbs = std::vector<bool>({cumLogProbs});
-        safeInsert(randomSeedOpt, decodingParams->randomSeed);
+        safeInsert(runtime_top_k_opt, decodingParams->runtimeTopK);
+        safeInsert(runtime_top_p_opt, decodingParams->runtimeTopP);
+        safeInsert(top_p_decay_opt, decodingParams->topPDecay);
+        safeInsert(top_p_min_opt, decodingParams->topPMin);
+        safeInsert(top_p_reset_ids_opt, decodingParams->topPResetIds);
+        decodingParams->outputLogProbs = std::vector<bool>({output_log_probs});
+        decodingParams->cumLogProbs = std::vector<bool>({cum_log_probs});
+        safeInsert(random_seed_opt, decodingParams->randomSeed);
 
         setupParams->decodingParams = decodingParams;
     }
     else
     {
         auto decodingParams = std::make_shared<tl::BeamSearchSetupParams>();
-        safeInsert(beamSearchDiversityRateOpt, decodingParams->beamSearchDiversityRate);
-        safeInsert(lengthPenaltyOpt, decodingParams->lengthPenalty);
-        safeInsert(earlyStoppingOpt, decodingParams->earlyStopping);
-        decodingParams->outputLogProbs = std::vector<bool>({outputLogProbs});
-        decodingParams->cumLogProbs = std::vector<bool>({cumLogProbs});
-        safeInsert(randomSeedOpt, decodingParams->randomSeed);
+        safeInsert(beam_search_diversity_rate_opt, decodingParams->beamSearchDiversityRate);
+        safeInsert(length_penalty_opt, decodingParams->lengthPenalty);
+        safeInsert(early_stopping_opt, decodingParams->earlyStopping);
+        decodingParams->outputLogProbs = std::vector<bool>({output_log_probs});
+        decodingParams->cumLogProbs = std::vector<bool>({cum_log_probs});
+        safeInsert(random_seed_opt, decodingParams->randomSeed);
 
         setupParams->decodingParams = decodingParams;
     }
@@ -156,7 +167,8 @@ void FtDynamicDecode<T>::setup(size_t const batchSize, size_t const beamWidth, t
 
     setupParams->penaltyParams = penaltyParams;
     setupParams->banWordsParams = banWordsParams;
-    mDynamicDecodeLayer->setup(batchSize, beamWidth, nullptr, setupParams);
+    mDynamicDecodeLayer->setup(batch_size, beam_width, nullptr, setupParams);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -192,22 +204,22 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
             convert_tensor<int>(endId), step, static_cast<int>(ite), localBatchSize);
     }
 
-    forwardParams->logits = convert_tensor<float>(logits);
+    forwardParams->logits = convert_tensor<T>(logits);
     forwardParams->stopCriteriaInputs = std::make_shared<tl::StopCriteriaDecodingInputs>(localBatchSize);
     forwardParams->banWordsInputs = std::make_shared<tl::BanWordsDecodingInputs>(localBatchSize);
 
     safeUpdate<T>(embeddingBiasOpt, forwardParams->embeddingBias);
-    safeUpdate<int>(inputLengthsOpt, forwardParams->inputLengths);
-    safeUpdate<int>(sequenceLimitLengthOpt, forwardParams->stopCriteriaInputs->sequenceLimitLength);
-    safeUpdate<uint64_t>(stopWordsListPtrsOpt, forwardParams->stopCriteriaInputs->stopWordsPtr);
-    safeUpdate<int>(stopWordsLensOpt, forwardParams->stopCriteriaInputs->stopWordsLengths);
+    safeUpdate<tr::SizeType32>(inputLengthsOpt, forwardParams->inputLengths);
+    safeUpdate<tr::SizeType32>(sequenceLimitLengthOpt, forwardParams->stopCriteriaInputs->sequenceLimitLength);
+    safeUpdate<tr::TokenIdType*>(stopWordsListPtrsOpt, forwardParams->stopCriteriaInputs->stopWordsPtr);
+    safeUpdate<tr::SizeType32>(stopWordsLensOpt, forwardParams->stopCriteriaInputs->stopWordsLengths);
     forwardParams->stopCriteriaInputs->maxStopWordsLen = maxStopWordsLen;
-    safeUpdate<uint64_t>(badWordsListPtrsOpt, forwardParams->banWordsInputs->badWordsPtr);
-    safeUpdate<int>(badWordsLensOpt, forwardParams->banWordsInputs->badWordsLengths);
+    safeUpdate<tr::TokenIdType*>(badWordsListPtrsOpt, forwardParams->banWordsInputs->badWordsPtr);
+    safeUpdate<tr::SizeType32>(badWordsLensOpt, forwardParams->banWordsInputs->badWordsLengths);
     forwardParams->banWordsInputs->maxBadWordsLen = maxBadWordsLen;
-    safeUpdate<int>(srcCacheIndirectionOpt, forwardParams->srcCacheIndirection);
+    safeUpdate<tr::SizeType32>(srcCacheIndirectionOpt, forwardParams->srcCacheIndirection);
 
-    auto const& outputIdsConverted = convert_tensor<int>(outputTokenIds);
+    tr::ITensor::SharedPtr outputIdsConverted = convert_tensor<tr::TokenIdType>(outputTokenIds);
 
     std::shared_ptr<tl::BaseDecodingOutputs> outputParams;
     if (isBeamSearch)
@@ -218,21 +230,21 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     {
         outputParams = std::make_shared<tl::BaseDecodingOutputs>(outputIdsConverted);
     }
-    outputParams->newTokens = std::move(convert_tensor<int>(newTokens));
-    safeUpdate<uint8_t>(finishedInput, forwardParams->finished);
-    safeUpdate<uint8_t>(finishedOutput, outputParams->finished);
-    safeUpdate<int>(sequenceLengthsOpt, outputParams->sequenceLength);
+    outputParams->newTokens = std::move(convert_tensor<tr::TokenIdType>(newTokens));
+    safeUpdate<tk::FinishedState::UnderlyingType>(finishedInput, forwardParams->finished);
+    safeUpdate<tk::FinishedState::UnderlyingType>(finishedOutput, outputParams->finished);
+    safeUpdate<tr::SizeType32>(sequenceLengthsOpt, outputParams->sequenceLength);
     safeUpdate<float>(cumLogProbsOpt, outputParams->cumLogProbs);
     safeUpdate<float>(outputLogProbsOpt, outputParams->outputLogProbs);
     safeUpdate<float>(outputLogProbsTiledOpt, outputParams->outputLogProbsTiled);
-    safeUpdate<int>(parentIdsOpt, outputParams->parentIds);
+    safeUpdate<tr::TokenIdType>(parentIdsOpt, outputParams->parentIds);
 
-    std::int32_t* finishedSumHost = nullptr;
+    tr::SizeType32* finishedSumHost = nullptr;
     if (forwardParams->stopCriteriaInputs->sequenceLimitLength && outputParams->finished.has_value())
     {
         // Skip the initialization and later calculation if there is no limit of sequence length or no finished beam
-        outputParams->finishedSum = tcc::toTllmTensor(*mFinishedSum);
-        finishedSumHost = tr::bufferCast<std::int32_t>(*mFinishedSum);
+        outputParams->finishedSum = mFinishedSum;
+        finishedSumHost = tr::bufferCast<tr::SizeType32>(*mFinishedSum);
         for (int32_t bi = 0; bi < localBatchSize; ++bi)
         {
             finishedSumHost[bi] = 0;
@@ -253,9 +265,9 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
             safeUpdatePtr<float>(beamHypsLogProbsCbaOpt, outputsBeamSearch->beamHypotheses->logProbsCBA);
             safeUpdatePtr<float>(beamHypsMinNormedScoresOpt, outputsBeamSearch->beamHypotheses->minNormedScoresCBA);
             safeUpdatePtr<float>(beamHypsNormedScoresCbaOpt, outputsBeamSearch->beamHypotheses->normedScoresCBA);
-            safeUpdatePtr<int>(beamHypsNumBeamsOpt, outputsBeamSearch->beamHypotheses->numBeamsCBA);
-            safeUpdatePtr<int>(beamHypsOutputIdsCbaOpt, outputsBeamSearch->beamHypotheses->outputIdsCBA);
-            safeUpdatePtr<int>(beamHypsSeqLenCbaOpt, outputsBeamSearch->beamHypotheses->sequenceLengthsCBA);
+            safeUpdatePtr<tr::SizeType32>(beamHypsNumBeamsOpt, outputsBeamSearch->beamHypotheses->numBeamsCBA);
+            safeUpdatePtr<tr::TokenIdType>(beamHypsOutputIdsCbaOpt, outputsBeamSearch->beamHypotheses->outputIdsCBA);
+            safeUpdatePtr<tr::SizeType32>(beamHypsSeqLenCbaOpt, outputsBeamSearch->beamHypotheses->sequenceLengthsCBA);
         }
     }
 
@@ -264,12 +276,12 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     if (finishedSumHost)
     {
         TLLM_CUDA_CHECK(::cudaStreamSynchronize(mDynamicDecodeLayer->getStream()));
-        int32_t numRealFinished = 0;
+        tr::SizeType32 numRealFinished = 0;
         for (int32_t bi = 0; bi < localBatchSize; ++bi)
         {
             numRealFinished += finishedSumHost[bi];
         }
-        auto const numToFinish = outputParams->finished->size();
+        auto const numToFinish = outputParams->finished.value()->getSize();
         auto shouldStopAccessor = shouldStop.accessor<bool, 1>();
         shouldStopAccessor[0] = numToFinish == numRealFinished;
     }
@@ -278,10 +290,10 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
 DynamicDecodeOp::DynamicDecodeOp(int64_t const maxBatchSize, int64_t const maxBeamWidth, int64_t const vocabSize,
     int64_t const vocabSizePadded, int64_t const tensorParaSize, int64_t const pipelineParaSize,
     at::ScalarType const scalarType)
-    : maxBatchSize_(static_cast<size_t>(maxBatchSize))
-    , maxBeamWidth_(static_cast<size_t>(maxBeamWidth))
-    , vocabSize_(static_cast<size_t>(vocabSize))
-    , vocabSizePadded_(static_cast<size_t>(vocabSizePadded))
+    : maxBatchSize_(static_cast<tr::SizeType32>(maxBatchSize))
+    , maxBeamWidth_(static_cast<tr::SizeType32>(maxBeamWidth))
+    , vocabSize_(static_cast<tr::SizeType32>(vocabSize))
+    , vocabSizePadded_(static_cast<tr::SizeType32>(vocabSizePadded))
     , tensorParaSize_(static_cast<int>(tensorParaSize))
     , pipelineParaSize_(static_cast<int>(pipelineParaSize))
     , scalarType_(scalarType)
@@ -335,10 +347,10 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     CHECK_OPTIONAL_INPUT(topPMinOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPResetIdsOpt, torch::kInt32);
 
-    dynamicDecode_->setup(static_cast<size_t>(batchSize), static_cast<size_t>(beamWidth), runtimeTopKOpt,
-        runtimeTopPOpt, temperatureOpt, repetitionPenaltyOpt, presencePenaltyOpt, frequencyPenaltyOpt, minLengthOpt,
-        lengthPenaltyOpt, earlyStoppingOpt, beamSearchDiversityRateOpt, randomSeedOpt, topPDecayOpt, topPMinOpt,
-        topPResetIdsOpt, noRepeatNgramSizeOpt, outputLogProbs, cumLogProbs);
+    dynamicDecode_->setup(static_cast<tr::SizeType32>(batchSize), static_cast<tr::SizeType32>(beamWidth),
+        runtimeTopKOpt, runtimeTopPOpt, temperatureOpt, repetitionPenaltyOpt, presencePenaltyOpt, frequencyPenaltyOpt,
+        minLengthOpt, lengthPenaltyOpt, earlyStoppingOpt, beamSearchDiversityRateOpt, randomSeedOpt, topPDecayOpt,
+        topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, outputLogProbs, cumLogProbs);
 }
 
 th::Tensor DynamicDecodeOp::forward(
@@ -386,7 +398,7 @@ th::Tensor DynamicDecodeOp::forward(
     CHECK_INPUT(logits, scalarType_);
     TLLM_CHECK_WITH_INFO(logits.dim() == 3,
         "logits is of shape (batchSize, beamWidth, vocabSizePadded), but got dim=%d shape=%s", (int) logits.dim(),
-        tensorrt_llm::common::vec2str(convert_shape(logits)).c_str());
+        tensorrt_llm::runtime::ITensor::toString(convert_shape(logits)).c_str());
     TLLM_CHECK_WITH_INFO(static_cast<size_t>(logits.size(2)) == vocabSizePadded_,
         "logits is of shape (batchSize, beamWidth, vocabSize(%ld)), but got the last dim=%ld.", vocabSizePadded_,
         static_cast<size_t>(logits.size(2)));

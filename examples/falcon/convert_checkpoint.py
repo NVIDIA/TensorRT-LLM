@@ -104,7 +104,6 @@ def load_falcon_config(model_dir: str) -> FalconConfig:
     """
 
     config = FalconConfig.from_pretrained(model_dir)
-    config.architectures = ["FalconForCausalLM"]
     # Falcon-7B config may not have num_kv_heads or n_head_kv.
     # Although Falcon-180B uses GQA (num_kv_heads=8), its config
     # has multi_query=True.

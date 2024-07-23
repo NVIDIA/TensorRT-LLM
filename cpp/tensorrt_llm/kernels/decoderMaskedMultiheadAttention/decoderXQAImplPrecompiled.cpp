@@ -185,6 +185,7 @@ public:
         decoder_params.rotaryEmbeddingDim = xqaParams.rotary_embedding_dim;
         decoder_params.rotaryScalingType = xqaParams.rotary_embedding_scale_type;
         decoder_params.rotaryEmbeddingInvFreq = launchParams.rotary_inv_freq_buf;
+        decoder_params.rotaryEmbeddingInvFreqCache = xqaParams.rotary_embedding_inv_freq_cache;
         decoder_params.rotaryEmbeddingMaxPositions = xqaParams.rotary_embedding_max_positions;
 
         invokeBuildDecoderInfo(decoder_params, stream);
@@ -432,10 +433,6 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     {
         SUPPORT_RETURN_FALSE("paged_kv_cache");
     }
-    if (!forConfigurePlugin && xqaParams.host_past_key_value_lengths == nullptr)
-    {
-        SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
-    }
     if (xqaParams.beam_width != 1 && !isGPTJBeam4Kernel)
     {
         SUPPORT_RETURN_FALSE("beam_width");
@@ -457,9 +454,28 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     // MultiQueryTokens mode (Medusa mode) can support any nbQHeadsPerKV.
     if (!xqaParams.multi_query_tokens)
     {
-        if (nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
+        if (nbQHeadsPerKV != 16 && nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
         {
             SUPPORT_RETURN_FALSE("nbHeads");
+        }
+    }
+
+    if (!forConfigurePlugin)
+    {
+        // Inference time checks.
+        if (xqaParams.host_past_key_value_lengths == nullptr)
+        {
+            SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
+        }
+        for (int i = 0; i < xqaParams.batch_size; ++i)
+        {
+            // Only checks for non-medusa case, because medusa may not accept all tokens in host_past_key_value_lengths.
+            // FIXME(perkzz): medusa should check for sliding-window attention.
+            if (!xqaParams.multi_query_tokens
+                && xqaParams.host_past_key_value_lengths[i] + 1 > xqaParams.max_attention_window_size)
+            {
+                SUPPORT_RETURN_FALSE("sliding window attention");
+            }
         }
     }
 

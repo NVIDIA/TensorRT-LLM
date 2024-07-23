@@ -26,7 +26,7 @@ import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import (str_dtype_to_trt, support_strongly_type, to_json_file,
-                     trt_gte_10)
+                     trt_gte_10, trt_gte_10_2)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .graph_rewriting import optimize
@@ -195,6 +195,10 @@ class Builder():
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
+
+        # Use fine-grained refit when strip plan is enabled in TRT10.2+.
+        if use_strip_plan and trt_gte_10_2():
+            config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
 
         if use_strip_plan:
             config.set_flag(trt.BuilderFlag.STRIP_PLAN)
@@ -384,12 +388,6 @@ class Builder():
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
         builder_config.auto_parallel_config = network.auto_parallel_config
-        if builder_config.auto_parallel_config is not None:
-            mapping = builder_config.auto_parallel_config["mapping"]
-            builder_config.tensor_parallel = mapping.tp_size
-            builder_config.pipeline_parallel = mapping.pp_size
-            builder_config.moe_tensor_parallel = mapping.moe_tp_size
-            builder_config.moe_expert_parallel = mapping.moe_ep_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         logger.info(
@@ -398,6 +396,7 @@ class Builder():
         engine = None
 
         # Rename weights
+        is_refit_individual_supported = trt_gte_10_2()
         if network.named_parameters is not None:
             for name, param in network.named_parameters:
                 if param._get_weights() is None:
@@ -410,6 +409,9 @@ class Builder():
                 if not network.trt_network.set_weights_name(
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
+                if is_refit_individual_supported:
+                    # This mark_weights_refittable has no side effect when refit_individual is not enabled.
+                    network.trt_network.mark_weights_refittable(name)
 
         network._fill_weights()
         # Build engine
@@ -849,6 +851,7 @@ def build(model: PretrainedModel,
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
 
@@ -859,9 +862,10 @@ def build(model: PretrainedModel,
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
+    if use_fp8_rowwise:
+        network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
-    network.plugin_config.set_nccl_plugin(
-        nccl_plugin, network.plugin_config.use_custom_all_reduce)
+    network.plugin_config.set_nccl_plugin(nccl_plugin)
 
     # NOTE: Please never change the build_config object after this point!
     if return_build_config:

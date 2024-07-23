@@ -1035,7 +1035,7 @@ if __name__ == '__main__':
         position_embedding_type = 'rope_gptj'
 
     config = {
-        'architecture': 'ChatGLMForCausalLM',
+        'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
         'logits_dtype': args.logits_dtype,
         'num_hidden_layers': hf_config.num_layers,

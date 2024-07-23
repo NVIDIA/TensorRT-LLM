@@ -34,7 +34,6 @@ using namespace tensorrt_llm::layers;
 using namespace tensorrt_llm::common;
 
 namespace tk = tensorrt_llm::kernels;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace trk = tensorrt_llm::runtime::kernels;
 namespace tle = tensorrt_llm::executor;
 
@@ -111,8 +110,6 @@ void DynamicDecodeLayerTest<T>::SetUp()
 {
     mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
     mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
-
-    mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*mBufferManager);
 }
 
 template <typename T>
@@ -142,8 +139,8 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
         mMaxBatchSize, mBeamWidth, mVocabSize, mVocabSizePadded, speculativeDecodingModule);
 
-    mDecodeLayer = std::make_unique<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        mDecodingMode, decodingDomain, mStream->get(), mAllocator);
+    mDecodeLayer
+        = std::make_unique<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mDecodingMode, decodingDomain, mBufferManager);
 
     auto const dataType = TRTDataType<T>::value;
 
@@ -271,8 +268,7 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& p
     mLogitsVec.resize(mBatchSize);
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
-        auto logitsSlice = ITensor::slice(mLogitsDevice, bi, 1);
-        mLogitsVec[bi] = tcc::toTllmTensor(*logitsSlice);
+        mLogitsVec[bi] = ITensor::slice(mLogitsDevice, bi, 1);
     }
 
     if (mDecodingMode.isMedusa())
@@ -387,7 +383,7 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& p
         reinterpret_cast<SizeType32**>(bufferCast<int64_t>(*mStopWordsPtrs)), bufferCast<SizeType32>(*mStopWordsLens),
         mMaxStopWordsLen, params.stopWords);
 
-    mDecodeLayer->setup(mBatchSize, mBeamWidth, batchSlotsPtr, setupParams);
+    mDecodeLayer->setup(mBatchSize, mBeamWidth, mBatchSlots, setupParams);
 
     mStream->synchronize();
 
@@ -456,7 +452,7 @@ void DynamicDecodeLayerTest<T>::createMedusaInputs(std::shared_ptr<DecodingInput
     auto inputs = std::dynamic_pointer_cast<MedusaDecodingInputs>(baseInputs);
 
     auto batchSlots = BufferRange<SizeType32>(*mBatchSlots);
-    std::vector<std::vector<tc::Tensor>> medusaLogits(mMaxBatchSize);
+    std::vector<std::vector<TensorPtr>> medusaLogits(mMaxBatchSize);
     auto const medusaLogitsPtr = bufferCast<T>(*mMedusaLogitsDevice);
     for (SizeType32 bi = 0; bi < mMaxBatchSize; ++bi)
     {
@@ -469,15 +465,15 @@ void DynamicDecodeLayerTest<T>::createMedusaInputs(std::shared_ptr<DecodingInput
             TensorPtr logitsHead = ITensor::slice(mMedusaLogitsDevice, hi, 1);
             logitsHead->squeeze(0);
             TensorPtr logitsHeadBatch = ITensor::slice(logitsHead, bi, 1);
-            medusaLogits[batchSlots[bi]][hi] = tcc::toTllmTensor(*logitsHeadBatch);
+            medusaLogits[batchSlots[bi]][hi] = logitsHeadBatch;
         }
     }
 
-    inputs->paths = tcc::toTllmTensor(*mPathsDevice);
-    inputs->treeIds = tcc::toTllmTensor(*mTreeIdsDevice);
+    inputs->paths = mPathsDevice;
+    inputs->treeIds = mTreeIdsDevice;
     inputs->medusaLogits = medusaLogits;
-    inputs->curTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
-    inputs->targetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    inputs->curTokensPerStep = mTokensPerStepDevice;
+    inputs->targetTokensPerStep = mTokensPerStepDevice;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -490,18 +486,18 @@ std::shared_ptr<DecodingInputs> DynamicDecodeLayerTest<T>::createInputTensors(Si
     std::shared_ptr<DecodingInputs> forwardParams;
     if (mDecodingMode.isTopKorTopP())
     {
-        forwardParams = std::make_shared<SamplingInputs>(tcc::toTllmTensor(*mEndIdsDevice), step, ite, mBatchSize);
+        forwardParams = std::make_shared<SamplingInputs>(mEndIdsDevice, step, ite, mBatchSize);
     }
     else if (mDecodingMode.isMedusa())
     {
-        forwardParams = std::make_shared<MedusaDecodingInputs>(tcc::toTllmTensor(*mEndIdsDevice), mBatchSize);
+        forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSize);
     }
 
-    forwardParams->embeddingBias = tcc::toTllmTensor(*mEmbeddingBiasDevice);
+    forwardParams->embeddingBias = mEmbeddingBiasDevice;
 
-    forwardParams->finished = tcc::toTllmTensor(*mFinishedDevice);
+    forwardParams->finished = mFinishedDevice;
 
-    forwardParams->batchSlots = tcc::toTllmTensor(*mBatchSlots);
+    forwardParams->batchSlots = mBatchSlots;
 
     if (mUseLogitsVec)
     {
@@ -509,17 +505,17 @@ std::shared_ptr<DecodingInputs> DynamicDecodeLayerTest<T>::createInputTensors(Si
     }
     else
     {
-        forwardParams->logits = tcc::toTllmTensor(*mLogitsDevice);
+        forwardParams->logits = mLogitsDevice;
     }
 
     forwardParams->banWordsInputs = std::make_shared<BanWordsDecodingInputs>(mBatchSize);
-    forwardParams->banWordsInputs->badWordsPtr = tcc::toTllmTensor(*mBadWordsPtrs);
-    forwardParams->banWordsInputs->badWordsLengths = tcc::toTllmTensor(*mBadWordsLens);
+    forwardParams->banWordsInputs->badWordsPtr = mBadWordsPtrs;
+    forwardParams->banWordsInputs->badWordsLengths = mBadWordsLens;
     forwardParams->banWordsInputs->maxBadWordsLen = mMaxBadWordsLen;
 
     forwardParams->stopCriteriaInputs = std::make_shared<StopCriteriaDecodingInputs>(mBatchSize);
-    forwardParams->stopCriteriaInputs->stopWordsPtr = tcc::toTllmTensor(*mStopWordsPtrs);
-    forwardParams->stopCriteriaInputs->stopWordsLengths = tcc::toTllmTensor(*mStopWordsLens);
+    forwardParams->stopCriteriaInputs->stopWordsPtr = mStopWordsPtrs;
+    forwardParams->stopCriteriaInputs->stopWordsLengths = mStopWordsLens;
     forwardParams->stopCriteriaInputs->maxStopWordsLen = mMaxStopWordsLen;
 
     if (mDecodingMode.isMedusa())
@@ -544,13 +540,13 @@ void DynamicDecodeLayerTest<T>::createMedusaOutputs(std::shared_ptr<BaseDecoding
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto outputs = std::dynamic_pointer_cast<SpeculativeDecodingOutputs>(baseOutputs);
-    outputs->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
+    outputs->nextDraftTokens = mNextDraftTokensDevice;
 
-    outputs->numNewTokens = tcc::toTllmTensor(*mAcceptedLengths);
+    outputs->numNewTokens = mAcceptedLengths;
 
-    outputs->numNewTokensCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+    outputs->numNewTokensCumSum = mAcceptedLengthCumSumDevice;
 
-    outputs->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+    outputs->pathsOffsets = mPackedPathsDevice;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -564,29 +560,29 @@ std::shared_ptr<BaseDecodingOutputs> DynamicDecodeLayerTest<T>::createOutputTens
 
     if (mDecodingMode.isMedusa())
     {
-        outputParams = std::make_shared<SpeculativeDecodingOutputs>(tcc::toTllmTensor(*mOutputIdsDevice));
+        outputParams = std::make_shared<SpeculativeDecodingOutputs>(mOutputIdsDevice);
     }
     else
     {
-        outputParams = std::make_shared<BaseDecodingOutputs>(tcc::toTllmTensor(*mOutputIdsDevice));
+        outputParams = std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
     }
 
-    outputParams->sequenceLength = tcc::toTllmTensor(*mSeqLengthsDevice);
+    outputParams->sequenceLength = mSeqLengthsDevice;
 
-    outputParams->finished = tcc::toTllmTensor(*mFinishedDevice);
+    outputParams->finished = mFinishedDevice;
 
-    outputParams->finishedSum = tcc::toTllmTensor(*mFinishedSumDevice);
+    outputParams->finishedSum = mFinishedSumDevice;
 
-    outputParams->newTokens = tcc::toTllmTensor(*mNewTokens);
+    outputParams->newTokens = mNewTokens;
 
     if (!mDecodingMode.isMedusa())
     {
         // Output log probs are not supported in Medusa
-        outputParams->cumLogProbs = tcc::toTllmTensor(*mCumLogProbsDevice);
+        outputParams->cumLogProbs = mCumLogProbsDevice;
 
-        outputParams->outputLogProbs = tcc::toTllmTensor(*mOutputLogProbsDevice);
+        outputParams->outputLogProbs = mOutputLogProbsDevice;
 
-        outputParams->outputLogProbsTiled = tcc::toTllmTensor(*mOutputLogProbsTiledDevice);
+        outputParams->outputLogProbsTiled = mOutputLogProbsTiledDevice;
     }
 
     if (mDecodingMode.isMedusa())
@@ -708,7 +704,7 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
             }
             else
             {
-                inputTensors->logits = tcc::toTllmTensor(*mLogitsDevice);
+                inputTensors->logits = mLogitsDevice;
                 inputTensors->logitsVec = std::nullopt;
             }
             inputTensors->step = step;

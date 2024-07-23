@@ -44,7 +44,6 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
         f'--checkpoint_dir={ckpt_dir}',
         f'--output_dir={engine_dir}',
         '--gpt_attention_plugin=float16',
-        '--use_custom_all_reduce=enable',
         '--gemm_plugin=float16',
         '--max_batch_size=32',
         '--max_input_len=40',

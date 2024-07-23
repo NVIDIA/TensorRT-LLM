@@ -24,6 +24,8 @@ from tensorrt_llm.builder import get_engine_version
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',
+    'GLMModel': 'THUDM/glm-10b',
+    'ChatGLMModel': 'THUDM/chatglm3-6b',
     'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
     'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
     'GPTForCausalLM': 'gpt2-medium',
@@ -79,7 +81,7 @@ def read_model_name(engine_dir: str):
 
     model_arch = config['pretrained_config']['architecture']
     model_version = None
-    if model_arch == 'ChatGLMForCausalLM':
+    if 'GLM' in model_arch:
         model_version = config['pretrained_config']['chatglm_version']
     if model_arch == 'QWenForCausalLM':
         model_version = config['pretrained_config']['qwen_type']
@@ -137,7 +139,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
             gen_config = json.load(f)
         pad_id = gen_config['pad_token_id']
         end_id = gen_config['eos_token_id']
-    elif model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+    elif 'GLM' in model_name and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
     else:
@@ -208,6 +210,12 @@ def add_common_args(parser):
         default=None,
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
+    )
+    parser.add_argument(
+        '--multi_block_mode',
+        action='store_true',
+        help=
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(

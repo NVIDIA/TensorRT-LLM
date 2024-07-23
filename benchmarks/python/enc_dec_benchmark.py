@@ -108,8 +108,6 @@ class EncDecBenchmark(BaseBenchmark):
                     ["has_position_embedding"],
                     has_token_type_embedding=config["builder_config"]
                     ["has_token_type_embedding"],
-                    use_custom_all_reduce=config["plugin_config"].get(
-                        "use_custom_all_reduce", False),
                     dtype=config_dtype,
                 )
                 self.max_batch_size = config["builder_config"]["max_batch_size"]
