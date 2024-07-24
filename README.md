@@ -17,6 +17,15 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/07/23] 👀 @AIatMeta Llama 3.1 405B trained on 16K NVIDIA H100s - inference is #TensorRT #LLM optimized ⚡
+🦙 400 tok/s - per node
+🦙 37 tok/s - per user
+🦙 1 node inference
+➡️ [link](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms/?ncid=so-twit-317976%E2%9C%A8)
+<div align="center">
+<img src="docs/source/media/picture-07-23-2024.png" width="45%">
+<div align="left">
+
 * [2024/07/09] Checklist to maximize multi-language performance of @meta #Llama3 with #TensorRT #LLM inference:
 ✅ MultiLingual
 ✅ NIM
