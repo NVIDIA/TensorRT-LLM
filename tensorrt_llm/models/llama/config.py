@@ -119,10 +119,6 @@ class LLaMAConfig(PretrainedConfig):
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
-        if getattr(hf_config, "use_scaled_rope", False):
-            rotary_scaling = {"type": "wavelen"}
-        else:
-            rotary_scaling = getattr(hf_config, "rope_scaling", None)
         rotary_base = getattr(hf_config, "rope_theta", 10000.0)
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
@@ -219,7 +215,7 @@ class LLaMAConfig(PretrainedConfig):
             dtype = 'float16'
 
         if meta_config.get('use_scaled_rope'):
-            rotary_scaling = {"type": "wavelen"}
+            rotary_scaling = {"type": "llama3"}
         else:
             rotary_scaling = meta_config.get("rope_scaling")
 

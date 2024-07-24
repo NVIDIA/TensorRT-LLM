@@ -1452,10 +1452,10 @@ class SmoothQuantAttention(Module):
         self.rotary_embedding_dim = 0
 
         if rotary_embedding_scaling is not None:
-            assert rotary_embedding_scaling["type"] in ["linear", "dynamic"]
-            self.rotary_embedding_scale_type = RotaryScalingType.linear if rotary_embedding_scaling[
-                "type"] == "linear" else RotaryScalingType.dynamic
-            self.rotary_embedding_scale = rotary_embedding_scaling["factor"]
+            self.rotary_embedding_scale_type = RotaryScalingType.from_string(
+                rotary_embedding_scaling["type"])
+            self.rotary_embedding_scale = rotary_embedding_scaling.get(
+                "factor", 1.0)
             assert self.rotary_embedding_scale > 1.0
 
         if self.position_embedding_type.is_rope():
@@ -1464,7 +1464,7 @@ class SmoothQuantAttention(Module):
             rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                 self.max_position_embeddings, self.rotary_embedding_dim,
                 self.rotary_embedding_base, self.rotary_embedding_scale,
-                self.rotary_embedding_scale_type)
+                self.rotary_embedding_scale_type, rotary_embedding_scaling)
             self.register_parameter(
                 'rotary_inv_freq',
                 Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))

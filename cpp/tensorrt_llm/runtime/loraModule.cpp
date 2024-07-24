@@ -58,7 +58,8 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMOE_GATE:
         case ModuleType::kMOE_4H_TO_H:
         case ModuleType::kMOE_ROUTER:
-        case ModuleType::kINVALID: throw std::runtime_error("Invalid loRA module " + moduleName);
+        case ModuleType::kMLP_ROUTER:
+        case ModuleType::kINVALID: throw std::runtime_error("Invalid LoRA module " + moduleName);
         }
     }
     return modules;

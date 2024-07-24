@@ -18,7 +18,7 @@ import tensorrt as trt
 
 from .._common import default_net
 from ..functional import (ACT2FN, AllReduceFusionParams, cast, concat,
-                          gemm_swiglu)
+                          gemm_swiglu, is_gated_activation)
 from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.functional import quantize
@@ -26,6 +26,34 @@ from ..quantization.layers import FP8Linear, FP8RowLinear
 from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
 from .normalization import LayerNorm
+
+
+def fc_gate_lora(hidden_states, lora, lora_layer_params):
+    if lora_layer_params is not None:
+        mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_h_to_4h")
+        mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_gate")
+
+        if mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
+            mlp_in_lora_params = LoraRuntimeParams(
+                lora_ranks=[
+                    mlp_fc_lora_params.lora_ranks[0],
+                    mlp_gate_lora_params.lora_ranks[0]
+                ],
+                lora_weights_pointers=[
+                    mlp_fc_lora_params.lora_weights_pointers[0],
+                    mlp_gate_lora_params.lora_weights_pointers[0]
+                ],
+                host_request_types=mlp_fc_lora_params.host_request_types,
+                host_context_lengths=mlp_fc_lora_params.host_context_lengths,
+                max_context_length=mlp_fc_lora_params.max_context_length)
+
+            mlp_fc_lora, mlp_gate_lora = lora(hidden_states, mlp_in_lora_params)
+            mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
+                                   dim=mlp_fc_lora.rank() - 1)
+            return mlp_in_result
+    return None
 
 
 class MLP(Module):
@@ -76,19 +104,28 @@ class MLP(Module):
         self.tp_size = tp_size
         self.quant_mode = quant_mode
         self.eps = eps
+        # see optimize_model's add_lora for LoRA initialization
+        self.lora = None
 
     def forward(self, hidden_states, lora_layer_params=None, gegelu_limit=None):
-        mlp_fc_lora_params = None
-        if lora_layer_params is not None:
-            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
-                0, "mlp_h_to_4h")
+        if is_gated_activation(self.hidden_act):
+            inter = self.fc(hidden_states)
+            lora_result = fc_gate_lora(hidden_states, self.lora,
+                                       lora_layer_params)
+            if lora_result is not None:
+                inter = inter + lora_result
+        else:
+            mlp_fc_lora_params = None
+            if lora_layer_params is not None:
+                mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+                    0, "mlp_h_to_4h")
+            inter = self.fc(hidden_states, mlp_fc_lora_params)
 
         mlp_proj_lora_params = None
         if lora_layer_params is not None:
             mlp_proj_lora_params = lora_layer_params.get_runtime_params(
                 0, "mlp_4h_to_h")
 
-        inter = self.fc(hidden_states, mlp_fc_lora_params)
         if self.hidden_act == 'gegelu':
             inter = ACT2FN[self.hidden_act](inter, gegelu_limit)
         else:
@@ -286,32 +323,9 @@ class FusedGatedMLP(Module):
 
         inter = self.fused_fc(hidden_states)
 
-        if lora_layer_params is not None:
-            mlp_fc_lora_params = lora_layer_params.get_runtime_params(
-                0, "mlp_h_to_4h")
-            mlp_gate_lora_params = lora_layer_params.get_runtime_params(
-                0, "mlp_gate")
-
-            if mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
-                mlp_in_lora_params = LoraRuntimeParams(
-                    lora_ranks=[
-                        mlp_fc_lora_params.lora_ranks[0],
-                        mlp_gate_lora_params.lora_ranks[0]
-                    ],
-                    lora_weights_pointers=[
-                        mlp_fc_lora_params.lora_weights_pointers[0],
-                        mlp_gate_lora_params.lora_weights_pointers[0]
-                    ],
-                    host_request_types=mlp_fc_lora_params.host_request_types,
-                    host_context_lengths=mlp_fc_lora_params.
-                    host_context_lengths,
-                    max_context_length=mlp_fc_lora_params.max_context_length)
-
-                mlp_fc_lora, mlp_gate_lora = self.lora(hidden_states,
-                                                       mlp_in_lora_params)
-                mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
-                                       dim=mlp_fc_lora.rank() - 1)
-                inter = inter + mlp_in_result
+        lora_result = fc_gate_lora(hidden_states, self.lora, lora_layer_params)
+        if lora_result is not None:
+            inter = inter + lora_result
 
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)

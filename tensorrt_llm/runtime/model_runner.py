@@ -24,7 +24,7 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
-from .._utils import mpi_comm, mpi_world_size, numpy_to_torch, trt_gte_10
+from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
 from ..bindings import MpiComm
 from ..bindings.executor import Executor
 from ..builder import Engine, get_engine_version
@@ -520,7 +520,7 @@ class ModelRunner(ModelRunnerMixin):
                               runtime_mapping,
                               debug_mode=debug_mode,
                               stream=stream)
-        if trt_gte_10() and session.runtime.engine.streamable_weights_size:
+        if session.runtime.engine.streamable_weights_size:
             session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
@@ -623,7 +623,7 @@ class ModelRunner(ModelRunnerMixin):
             else:
                 lora_manager = None
 
-            if trt_gte_10() and session.runtime.engine.streamable_weights_size:
+            if session.runtime.engine.streamable_weights_size:
                 session.runtime._set_weight_streaming(gpu_weights_percent)
 
             profiler.stop('load tensorrt_llm engine')

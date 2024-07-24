@@ -219,7 +219,12 @@ class TestMamba(unittest.TestCase):
                     # gen
                     part_step1_id = step1_id[i].view(1, 1)
                     part_hf_gen_outputs = hf_mamba.forward(
-                        part_step1_id, cache_params=part_cache_params)
+                        part_step1_id,
+                        cache_params=part_cache_params,
+                        cache_position=torch.arange(
+                            hf_config.conv_kernel - 1,
+                            hf_config.conv_kernel,
+                            device=part_step1_id.device))
                     torch.cuda.synchronize()
                     gen_ref[i][:] = part_hf_gen_outputs.logits[0, -1, :]
             else:
@@ -231,7 +236,11 @@ class TestMamba(unittest.TestCase):
                 # gen
                 hf_outputs = hf_mamba.forward(step1_id,
                                               cache_params=cache_params,
-                                              use_cache=True)
+                                              use_cache=True,
+                                              cache_position=torch.arange(
+                                                  hf_config.conv_kernel - 1,
+                                                  hf_config.conv_kernel,
+                                                  device=step1_id.device))
                 gen_ref = hf_outputs.logits[:, -1, :]
 
         # get tensorrt llm mamba rumtime

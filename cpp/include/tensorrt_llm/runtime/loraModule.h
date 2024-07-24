@@ -48,6 +48,7 @@ public:
         kMOE_4H_TO_H = 14,
         kMOE_GATE = 15,
         kMOE_ROUTER = 16,
+        kMLP_ROUTER = 17,
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
@@ -216,6 +217,8 @@ public:
             return ModuleType::kMOE_GATE;
         else if (name == "moe_router")
             return ModuleType::kMOE_ROUTER;
+        else if (name == "mlp_router")
+            return ModuleType::kMLP_ROUTER;
         else
             return ModuleType::kINVALID;
     }
@@ -241,6 +244,7 @@ public:
         case ModuleType::kMOE_4H_TO_H: return "moe_4h_to_h";
         case ModuleType::kMOE_GATE: return "moe_gate";
         case ModuleType::kMOE_ROUTER: return "moe_router";
+        case ModuleType::kMLP_ROUTER: return "mlp_router";
         case ModuleType::kINVALID: return "INVALID";
         }
         return "INVALID";

@@ -25,8 +25,7 @@ from typing import Dict, Optional, Union
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import (str_dtype_to_trt, support_strongly_type, to_json_file,
-                     trt_gte_10, trt_gte_10_2)
+from ._utils import str_dtype_to_trt, to_json_file
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .graph_rewriting import optimize
@@ -112,7 +111,7 @@ class Builder():
             explicit_batch_flag = 1 << int(
                 trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 
-        if support_strongly_type() and self.strongly_typed:
+        if self.strongly_typed:
             return Network()._init(
                 self.trt_builder.create_network(
                     explicit_batch_flag
@@ -145,35 +144,15 @@ class Builder():
             @param int8: whether to build with int8 enabled or not. Can't be used together with refit option
             @return: A BuilderConfig object, return None if failed
         '''
-        if strongly_typed and not support_strongly_type():
-            logger.warning(
-                "TRT version does not support strongly_type. strongly_typed flag is ignored."
-            )
-
-        # In TRT 10.0, enable strongly_typed by default.
-        self.strongly_typed = self.strongly_typed or (strongly_typed and
-                                                      support_strongly_type())
+        self.strongly_typed = self.strongly_typed or strongly_typed
 
         quant_mode = kwargs.get("quant_mode", QuantMode(0))
         if not strongly_typed and precision not in self._ALLOWED_PRECISIONS:
             logger.error(
                 f"precision should be one of {self._ALLOWED_PRECISIONS}")
 
-        if use_strip_plan and not trt_gte_10():
-            logger.error(
-                "cannot use --strip_plan with tensorrt version 9.x or below")
-
-        if (use_refit or use_strip_plan) and int8 and not trt_gte_10():
-            # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
-            # These folded weights can not be refitted
-            logger.error(
-                "can't use refit/strip_plan and int8 mode at the same time before tensorrt 10.0"
-            )
-
         config = self.trt_builder.create_builder_config()
         if weight_streaming:
-            assert trt_gte_10(), \
-                  "Weight streaming is only supported by TensorRT 10.0 or later."
             config.set_flag(trt.BuilderFlag.WEIGHT_STREAMING)
         if not self.strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
@@ -197,7 +176,7 @@ class Builder():
             config.set_flag(trt.BuilderFlag.REFIT)
 
         # Use fine-grained refit when strip plan is enabled in TRT10.2+.
-        if use_strip_plan and trt_gte_10_2():
+        if use_strip_plan:
             config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
 
         if use_strip_plan:
@@ -396,7 +375,6 @@ class Builder():
         engine = None
 
         # Rename weights
-        is_refit_individual_supported = trt_gte_10_2()
         if network.named_parameters is not None:
             for name, param in network.named_parameters:
                 if param._get_weights() is None:
@@ -409,9 +387,8 @@ class Builder():
                 if not network.trt_network.set_weights_name(
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
-                if is_refit_individual_supported:
-                    # This mark_weights_refittable has no side effect when refit_individual is not enabled.
-                    network.trt_network.mark_weights_refittable(name)
+                # This mark_weights_refittable has no side effect when refit_individual is not enabled.
+                network.trt_network.mark_weights_refittable(name)
 
         network._fill_weights()
         # Build engine
