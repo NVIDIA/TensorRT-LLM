@@ -17,13 +17,19 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/07/23] 👀 @AIatMeta Llama 3.1 405B trained on 16K NVIDIA H100s - inference is #TensorRT #LLM optimized ⚡
+🦙 400 tok/s - per node
+🦙 37 tok/s - per user
+🦙 1 node inference
+➡️ [link](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms/?ncid=so-twit-317976%E2%9C%A8)
+<div align="center">
+<img src="docs/source/media/picture-07-23-2024.png" width="45%">
+<div align="left">
+
 * [2024/07/09] Checklist to maximize multi-language performance of @meta #Llama3 with #TensorRT #LLM inference:
 ✅ MultiLingual
 ✅ NIM
 ✅ LoRA tuned adaptors[➡️ Tech blog](https://developer.nvidia.com/blog/deploy-multilingual-llms-with-nvidia-nim/)
-<div align="center">
-<img src="docs/source/media/picture-07-09-2024.png" width="45%">
-<div align="left">
 
 * [2024/07/02] Let the @MistralAI MoE tokens fly 📈 🚀 #Mixtral 8x7B with NVIDIA #TensorRT #LLM on #H100.
 [➡️ Tech blog](https://developer.nvidia.com/blog/achieving-high-mixtral-8x7b-performance-with-nvidia-h100-tensor-core-gpus-and-tensorrt-llm?ncid=so-twit-928467)
