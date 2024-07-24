@@ -30,9 +30,6 @@ TensorRT-LLM
 ✅ MultiLingual
 ✅ NIM
 ✅ LoRA tuned adaptors[➡️ Tech blog](https://developer.nvidia.com/blog/deploy-multilingual-llms-with-nvidia-nim/)
-<div align="center">
-<img src="docs/source/media/picture-07-09-2024.png" width="45%">
-<div align="left">
 
 * [2024/07/02] Let the @MistralAI MoE tokens fly 📈 🚀 #Mixtral 8x7B with NVIDIA #TensorRT #LLM on #H100.
 [➡️ Tech blog](https://developer.nvidia.com/blog/achieving-high-mixtral-8x7b-performance-with-nvidia-h100-tensor-core-gpus-and-tensorrt-llm?ncid=so-twit-928467)
