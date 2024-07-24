@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from typing import Optional, Union
-
-from tensorrt_llm.lora_manager import LoraConfig, use_lora
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send, sigmoid
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, RowLinear)
+from ...lora_manager import (LoraConfig,
+                             get_default_trtllm_modules_to_hf_modules, use_lora)
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
@@ -143,10 +144,16 @@ class QWenDecoderLayer(Module):
 
         shared_output = None
         if self.config.qwen_type == 'qwen2_moe':
-            shared_output = self.shared_expert(hidden_states)
+            shared_output = self.shared_expert(
+                hidden_states, lora_layer_params=lora_layer_params)
             if self.shared_expert_gate is not None:
+                gate_lora_params = None
+                if lora_layer_params is not None:
+                    gate_lora_params = lora_layer_params.get_runtime_params(
+                        0, "mlp_router")
                 shared_output = sigmoid(
-                    self.shared_expert_gate(hidden_states)) * shared_output
+                    self.shared_expert_gate(hidden_states,
+                                            gate_lora_params)) * shared_output
 
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
@@ -247,6 +254,25 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 "mlp_4h_to_h": "mlp.c_proj",
                 "mlp_gate": "w1",
             }
+        elif config.qwen_type == 'qwen2_moe':
+            self.trtllm_modules_to_hf_modules = copy.copy(
+                get_default_trtllm_modules_to_hf_modules())
+            self.trtllm_modules_to_hf_modules.update({
+                "mlp_h_to_4h":
+                "mlp.shared_expert.gate_proj",
+                "mlp_4h_to_h":
+                "mlp.shared_expert.down_proj",
+                "mlp_gate":
+                "mlp.shared_expert.up_proj",
+                "mlp_router":
+                "mlp.shared_expert_gate",
+                "moe_h_to_4h":
+                "mlp.experts.gate_proj",
+                "moe_4h_to_h":
+                "mlp.experts.down_proj",
+                "moe_gate":
+                "mlp.experts.up_proj",
+            })
         else:
             self.trtllm_modules_to_hf_modules = None
         super().__init__(config, transformer, lm_head)

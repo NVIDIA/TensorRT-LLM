@@ -23,7 +23,7 @@ import torch
 import tensorrt as trt
 # isort: on
 
-from .._utils import torch_dtype_to_trt, trt_dtype_to_torch, trt_gte_10
+from .._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from ..logger import logger
 
 
@@ -66,7 +66,7 @@ class Session(object):
             self._engine = self.runtime.deserialize_cuda_engine(engine_buffer)
 
         self._context = None
-        if not (trt_gte_10() and self.engine.streamable_weights_size):
+        if not self.engine.streamable_weights_size:
             self.__prepare_execution_contexts()
         return self
 
@@ -210,20 +210,16 @@ class Session(object):
 
         self._context = None
 
-        if not trt_gte_10():
-            assert gpu_weights_percent == 1, "Weight streaming is only supported by TensorRT 10.0 or later."
-            return
-        else:
-            min = self.engine.minimum_weight_streaming_budget
-            max = self.engine.streamable_weights_size
-            budget = int(min + gpu_weights_percent * (max - min))
+        min = self.engine.minimum_weight_streaming_budget
+        max = self.engine.streamable_weights_size
+        budget = int(min + gpu_weights_percent * (max - min))
 
-            budget_config = budget if gpu_weights_percent != 1 else 0
-            self.engine.weight_streaming_budget = budget_config
-            assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
-            logger.info(
-                f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
-            )
+        budget_config = budget if gpu_weights_percent != 1 else 0
+        self.engine.weight_streaming_budget = budget_config
+        assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
+        logger.info(
+            f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
+        )
 
         if self.engine.streamable_weights_size:
             try:

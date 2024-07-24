@@ -18,10 +18,8 @@ from typing import List, Optional, Type, Union
 
 import numpy as np
 import tensorrt as trt
-from packaging import version
 
-from tensorrt_llm._utils import (get_init_params, str_dtype_to_trt, trt_gte_10,
-                                 trt_version)
+from tensorrt_llm._utils import get_init_params, str_dtype_to_trt
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
@@ -553,106 +551,81 @@ class MoeOOTB(MOE):
             router_probs = softmax(routing, -1)
             topk_values, topk_indices = topk(router_probs, self.top_k, dim=-1)
 
-        if trt_gte_10() and version.parse(trt_version()).minor >= 2:
-            # For TRT 10.2 and above, avoid over-computing by using NonZero ops to select tokens for each experts.
+        hidden_size = shape(hidden_states, -1)
+        # [B*sq, hidden]
+        inputs_merged = hidden_states.view(concat([-1, hidden_size]))
+        flat_topk_indices = topk_indices.view(
+            concat([-1, shape(topk_indices, -1)]))
+        flat_topk_values = topk_values.view(concat([-1,
+                                                    shape(topk_values, -1)]))
 
-            hidden_size = shape(hidden_states, -1)
-            #[B*sq, hidden]
-            inputs_merged = hidden_states.view(concat([-1, hidden_size]))
-            flat_topk_indices = topk_indices.view(
-                concat([-1, shape(topk_indices, -1)]))
-            flat_topk_values = topk_values.view(
-                concat([-1, shape(topk_values, -1)]))
+        # Create output space
+        zero_buffer = inputs_merged * 0.0
+        output = zero_buffer
 
-            # Create output space
-            zero_buffer = inputs_merged * 0.0
-            output = zero_buffer
+        expert_indices_stack = []
+        indices_stack = []
+        # When topk indices are equal to expert index, the expert will inference the tokens.
+        # Bundle all indices and experts index, then do mask once.
+        for i, expert in enumerate(self.experts):
+            if self.mapping.has_moe_ep():
+                index = i + self.experts_per_node * self.mapping.moe_ep_rank
+            else:
+                index = i
+            expert_indices_stack.append(
+                flat_topk_indices.view(concat([1, shape(flat_topk_indices)])))
 
-            expert_indices_stack = []
-            indices_stack = []
-            # When topk indices are equal to expert index, the expert will inference the tokens.
-            # Bundle all indices and experts index, then do mask once.
-            for i, expert in enumerate(self.experts):
-                if self.mapping.has_moe_ep():
-                    index = i + self.experts_per_node * self.mapping.moe_ep_rank
-                else:
-                    index = i
-                expert_indices_stack.append(
-                    flat_topk_indices.view(concat([1,
-                                                   shape(flat_topk_indices)])))
+            indices_stack.append(constant(int32_array(index)))
 
-                indices_stack.append(constant(int32_array(index)))
+        all_expert_indices = concat(expert_indices_stack, dim=0)
+        indices = expand(
+            concat(indices_stack).view(concat([len(self.experts), 1, 1])),
+            shape(all_expert_indices))
 
-            all_expert_indices = concat(expert_indices_stack, dim=0)
-            indices = expand(
-                concat(indices_stack).view(concat([len(self.experts), 1, 1])),
-                shape(all_expert_indices))
+        # Create all experts mask
+        all_expert_mask = all_expert_indices == indices
 
-            # Create all experts mask
-            all_expert_mask = all_expert_indices == indices
+        experts_weights = cast(
+            sum(flat_topk_values *
+                cast(all_expert_mask, flat_topk_values.dtype),
+                dim=-1,
+                keepdim=True), self.dtype)
 
-            experts_weights = cast(
-                sum(flat_topk_values *
-                    cast(all_expert_mask, flat_topk_values.dtype),
-                    dim=-1,
-                    keepdim=True), self.dtype)
+        all_expert_mask = cast(
+            sum(cast(all_expert_mask, flat_topk_values.dtype),
+                dim=-1,
+                keepdim=True), 'bool')
+        all_expert_mask = repeat_interleave(all_expert_mask, shape(output, -1),
+                                            2)
 
-            all_expert_mask = cast(
-                sum(cast(all_expert_mask, flat_topk_values.dtype),
-                    dim=-1,
-                    keepdim=True), 'bool')
-            all_expert_mask = repeat_interleave(all_expert_mask,
-                                                shape(output, -1), 2)
+        # split the mask and weights for each expert
+        experts_mask = split(all_expert_mask, 1, dim=0)
+        expert_weights = split(experts_weights, 1, dim=0)
 
-            # split the mask and weights for each expert
-            experts_mask = split(all_expert_mask, 1, dim=0)
-            expert_weights = split(experts_weights, 1, dim=0)
+        for i, expert in enumerate(self.experts):
+            # get mask token index
+            non_zero_index = nonzero(experts_mask[i].view(
+                concat([-1, hidden_size])))
+            non_zero_index = non_zero_index.transpose(1, 0)
+            input_for_expert = gather_nd(inputs_merged, non_zero_index, 0)
+            input_for_expert = input_for_expert.view(concat([-1, hidden_size]),
+                                                     zero_is_placeholder=False)
 
-            for i, expert in enumerate(self.experts):
-                # get mask token index
-                non_zero_index = nonzero(experts_mask[i].view(
-                    concat([-1, hidden_size])))
-                non_zero_index = non_zero_index.transpose(1, 0)
-                input_for_expert = gather_nd(inputs_merged, non_zero_index, 0)
-                input_for_expert = input_for_expert.view(
-                    concat([-1, hidden_size]), zero_is_placeholder=False)
+            # Expert inference
+            expert_output = expert(
+                input_for_expert,
+                lora_layer_params=self.moe_to_expert_lora_params(
+                    lora_layer_params, index))
 
-                # Expert inference
-                expert_output = expert(
-                    input_for_expert,
-                    lora_layer_params=self.moe_to_expert_lora_params(
-                        lora_layer_params, index))
+            # scatter expert output to real position
+            expert_finialized_output = zero_buffer
+            expert_finialized_output = scatter_nd(
+                expert_finialized_output, non_zero_index,
+                expert_output.view([-1])) * expert_weights[i]
 
-                # scatter expert output to real position
-                expert_finialized_output = zero_buffer
-                expert_finialized_output = scatter_nd(
-                    expert_finialized_output, non_zero_index,
-                    expert_output.view([-1])) * expert_weights[i]
+            output += expert_finialized_output
 
-                output += expert_finialized_output
-
-            output = output.view(shape(hidden_states))
-        else:
-            output = hidden_states * 0.0  # Create output space
-            # Use over-computation when TRT version is too low.
-            # Experts inference
-            for i, expert in enumerate(self.experts):
-                if self.mapping.has_moe_ep():
-                    index = i + self.experts_per_node * self.mapping.moe_ep_rank
-                else:
-                    index = i
-                # inference expert
-                out = expert(hidden_states,
-                             lora_layer_params=self.moe_to_expert_lora_params(
-                                 lora_layer_params, index))
-
-                expert_mask = topk_indices == index
-                expert_weights = cast(
-                    sum(topk_values * cast(expert_mask, topk_values.dtype),
-                        dim=-1,
-                        keepdim=True), self.dtype)
-
-                output += out * expert_weights
+        output = output.view(shape(hidden_states))
 
         need_ep_reduce = self.mapping.has_moe_ep(
         ) and self.mapping.moe_ep_group is not None

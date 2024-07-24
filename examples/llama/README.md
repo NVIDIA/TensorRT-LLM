@@ -1209,7 +1209,7 @@ Note that the sink tokens is included in the sliding attention tokens, and there
 
 ## Run LLaMA-3.1 405B Model
 
-Currently, TensorRT-LLM supports Meta checkpoint and Huggingface checkpoint for LLaMA-3.1. In this section, we demonstrate how to run the LLaMA-3.1 405B model via TensorRT-LLM. Here, we assume users have downloaded the checkpoints and placed them at `llama_3.1_405B_meta_model/` (Meta checkpoint) and `llama_3.1_405B_HF_model/` (HF checkpoint). Before converting the checkpoints to TensorRT-LLM unified checkpoints, **please check that `"use_scaled_rope": true` is set in the configuration file**. With this flag, TensorRT-LLM will enable the rope scaling of LLaMA-3.1. If not, please add it to the config file.
+Currently, TensorRT-LLM supports Meta checkpoint and Huggingface checkpoint for LLaMA-3.1. In this section, we demonstrate how to run the LLaMA-3.1 405B model via TensorRT-LLM. Here, we assume users have downloaded the checkpoints and placed them at `llama_3.1_405B_meta_model/` (Meta BF16 checkpoint), `llama_3.1_405B_HF_model/` (HF BF16 checkpoint) and `llama_3.1_405B_HF_FP8_model/` (HF FP8 checkpoint). Before converting the checkpoints to TensorRT-LLM unified checkpoints, **please check that `{"rope_scaling": {"rope_type": "llama3"}}` is set in the configuration file**. With this flag, TensorRT-LLM will enable the rope scaling of LLaMA-3.1. If not, please add it to the config file.
 
 Users can run the LLaMA-3.1 model with higher precision (bf16/fp16) or fp8. Here, to prevent accuracy drop, we perform per-channel per-token fp8 quantization (leveraged from https://github.com/pytorch/FBGEMM) on MLP layers, keeping other layers at higher precision. Note that fp8 quantization is only supported on Huggingface checkpoint now. We will support it on Meta checkpoint soon.
 
@@ -1217,7 +1217,10 @@ Users can run the LLaMA-3.1 model with higher precision (bf16/fp16) or fp8. Here
 
 To use the fp8 quantization, please add the `--use_fp8_rowwise` flag during the checkpoint conversion. In this demonstration, we convert the Meta checkpoint to bfloat16 with TP8-PP2 and the HF checkpoint to FP8 with TP8.
 
+Note that you may need to update your transformers installation via `pip install --upgrade transformers`.
+
 ```bash
+# Run BF16 model by BF16
 python examples/llama/convert_checkpoint.py --meta_ckpt_dir llama_3.1_405B_meta_model/ \
                             --output_dir llama_3.1_405B_meta_model/trt_ckpts/tp8-pp2/ \
                             --dtype bfloat16 \
@@ -1226,10 +1229,20 @@ python examples/llama/convert_checkpoint.py --meta_ckpt_dir llama_3.1_405B_meta_
                             --load_by_shard \
                             --workers 8
 
+# Run BF16 model by FP8
 python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_model/ \
                             --output_dir llama_3.1_405B_HF_model/trt_ckpts/tp8-pp1/ \
                             --dtype bfloat16 \
                             --use_fp8_rowwise \
+                            --tp_size 8 \
+                            --pp_size 1 \
+                            --load_by_shard \
+                            --workers 8
+
+# Run FP8 model by FP8
+python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_FP8_model/ \
+                            --output_dir llama_3.1_405B_HF_FP8_model/trt_ckpts/tp8-pp1/ \
+                            --dtype bfloat16 \
                             --tp_size 8 \
                             --pp_size 1 \
                             --load_by_shard \
@@ -1249,6 +1262,14 @@ trtllm-build --checkpoint_dir llama_3.1_405B_meta_model/trt_ckpts/tp8-pp2/ \
 
 trtllm-build --checkpoint_dir llama_3.1_405B_HF_model/trt_ckpts/tp8-pp1/ \
              --output_dir llama_3.1_405B_HF_model/trt_engines/tp8-pp1/ \
+             --max_num_tokens 4096 \
+             --max_input_len 64000 \
+             --max_seq_len 65000 \
+             --use_paged_context_fmha enable \
+             --workers 8
+
+trtllm-build --checkpoint_dir llama_3.1_405B_HF_FP8_model/trt_ckpts/tp8-pp1/ \
+             --output_dir llama_3.1_405B_HF_FP8_model/trt_engines/tp8-pp1/ \
              --max_num_tokens 4096 \
              --max_input_len 64000 \
              --max_seq_len 65000 \
@@ -1298,8 +1319,24 @@ srun --mpi pmi2 -N 1 -n 8 --ntasks-per-node 8 --container-image <your container>
 --container-name llama-3.1-405b \
 --container-workdir <your container work directory> \
 bash -c 'python ./examples/eval_long_context.py --task passkey \
-                                                --engine_dir llama_3.1_405B_HF_model/trt_ckpts/tp8-pp1/ \
+                                                --engine_dir llama_3.1_405B_HF_model/trt_engines/tp8-pp1/ \
                                                 --tokenizer_dir llama_3.1_405B_HF_model/ \
+                                                --stop_idx 6 \
+                                                --max_input_length 64000 \
+                                                --enable_chunked_context \
+                                                --kv_cache_free_gpu_memory_fraction 0.999 \
+                                                --max_tokens_in_paged_kv_cache 65064 \
+                                                --data_dir 64k_context \
+                                                --output_dir 64k_context_tp8'
+
+# Long context test for 64k
+srun --mpi pmi2 -N 1 -n 8 --ntasks-per-node 8 --container-image <your container>  \
+--container-mounts <your container mount> \
+--container-name llama-3.1-405b \
+--container-workdir <your container work directory> \
+bash -c 'python ./examples/eval_long_context.py --task passkey \
+                                                --engine_dir llama_3.1_405B_HF_FP8_model/trt_engines/tp8-pp1/ \
+                                                --tokenizer_dir llama_3.1_405B_HF_FP8_model/ \
                                                 --stop_idx 6 \
                                                 --max_input_length 64000 \
                                                 --enable_chunked_context \
@@ -1332,5 +1369,16 @@ bash -c 'python ./examples/mmlu.py --test_trt_llm \
                                    --tokenizer_dir llama_3.1_405B_HF_model/ \
                                    --enable_chunked_context \
                                    --kv_cache_free_gpu_memory_fraction 0.999 \
-                                   --max_tokens_in_paged_kv_cache 256064'
+                                   --max_tokens_in_paged_kv_cache 65064'
+
+srun --mpi pmi2 -N 1 -n 8 --ntasks-per-node 8 --container-image <your container>  \
+--container-mounts <your container mount> \
+--container-name llama-3.1-405b \
+--container-workdir <your container work directory> \
+bash -c 'python ./examples/mmlu.py --test_trt_llm \
+                                   --engine_dir llama_3.1_405B_HF_FP8_model/trt_engines/tp8-pp1/ \
+                                   --tokenizer_dir llama_3.1_405B_HF_FP8_model/ \
+                                   --enable_chunked_context \
+                                   --kv_cache_free_gpu_memory_fraction 0.999 \
+                                   --max_tokens_in_paged_kv_cache 65064'
 ```

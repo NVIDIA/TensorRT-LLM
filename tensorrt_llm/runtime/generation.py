@@ -34,7 +34,7 @@ from tensorrt_llm.runtime.redrafter_utils import *
 
 from .._ipc_utils import set_peer_access
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
-                      trt_dtype_to_torch, trt_gte_10)
+                      trt_dtype_to_torch)
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
@@ -266,7 +266,7 @@ class _Runtime(object):
         self.engine_inspector = self.engine.create_engine_inspector()
         # cuda graph ping-pong instances
         self.cuda_graph_instances = [None for _ in range(2)]
-        if not (trt_gte_10() and self.engine.streamable_weights_size):
+        if not self.engine.streamable_weights_size:
             # engine does not have weight streaming enabled
             self.__prepare_execution_contexts()
 
@@ -371,20 +371,16 @@ class _Runtime(object):
         self.context_1 = None
         self.ctx_context = None
 
-        if not trt_gte_10():
-            assert gpu_weights_percent == 1, "Weight streaming is only supported by TensorRT 10.0 or later."
-            return
-        else:
-            min = self.engine.minimum_weight_streaming_budget
-            max = self.engine.streamable_weights_size
-            budget = int(min + gpu_weights_percent * (max - min))
+        min = self.engine.minimum_weight_streaming_budget
+        max = self.engine.streamable_weights_size
+        budget = int(min + gpu_weights_percent * (max - min))
 
-            budget_config = budget if gpu_weights_percent != 1 else 0
-            self.engine.weight_streaming_budget = budget_config
-            assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
-            logger.info(
-                f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
-            )
+        budget_config = budget if gpu_weights_percent != 1 else 0
+        self.engine.weight_streaming_budget = budget_config
+        assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
+        logger.info(
+            f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
+        )
 
         if self.engine.streamable_weights_size:
             try:
@@ -1086,9 +1082,6 @@ class GenerationSession(object):
         if not self.has_attn_layers:
             # Create two cuda graph once.If cuda graph has already existed, skip it.
             if self.runtime.cuda_graph_instances[instance_idx] is not None:
-                return
-            # WAR for TRT 9.x
-            if not trt_gte_10() and step < 3:
                 return
         # capture cuda graph
         CUASSERT(

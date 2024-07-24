@@ -30,8 +30,7 @@ from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, bool_array, dim_resolve_negative,
                      dim_to_trt_axes, dims_array, fp16_array, fp32_array,
                      int32_array, int64_array, np_dtype_to_trt,
-                     str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str,
-                     trt_gte_10)
+                     str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -639,7 +638,7 @@ class RotaryScalingType(IntEnum):
     linear = 1
     dynamic = 2
     longrope = 3
-    wavelen = 4
+    llama3 = 4
 
     @staticmethod
     def from_string(s):
@@ -1029,10 +1028,6 @@ def matmul(input: Tensor,
     '''
     # This option is only supported for fp16, but not bf16 or any other precisions.
     use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF
-
-    # TODO: fp32 accum has issues with strongly_typed and it will be fixed in TensorRT 10.0
-    if default_net().strongly_typed and not trt_gte_10():
-        use_fp32_acc = False
 
     if use_fp32_acc:
         input = cast(input, 'float32')
@@ -4139,11 +4134,14 @@ def bert_attention(tensor: Tensor,
 class RopeEmbeddingUtils:
 
     @staticmethod
-    def apply_wavelen_scaling(inv_freqs: np.ndarray,
-                              scale_factor: float = 8.0,
-                              low_freq_factor: float = 1.0,
-                              high_freq_factor: float = 4.0,
-                              old_context_len: int = 8192):
+    # ref: https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L298
+    def apply_llama3_scaling(inv_freqs: np.ndarray, rope_scaling_config: dict):
+
+        scale_factor = rope_scaling_config.get("factor", 8.0)
+        low_freq_factor = rope_scaling_config.get("low_freq_factor", 1.0)
+        high_freq_factor = rope_scaling_config.get("high_freq_factor", 4.0)
+        old_context_len = rope_scaling_config.get(
+            "original_max_position_embeddings", 8192)
 
         low_freq_wavelen = old_context_len / low_freq_factor
         high_freq_wavelen = old_context_len / high_freq_factor
@@ -4183,12 +4181,19 @@ class RopeEmbeddingUtils:
             theta: float = 10000.0,
             scale: float = 1.0,
             scale_type: RotaryScalingType = RotaryScalingType.none,
+            # Other scaling configs that only used by certain scaling types.
+            rope_scaling_config: dict = None,
             dtype=np.float32):
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
-        inv_freq = scale / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
-        if scale_type == RotaryScalingType.wavelen:
-            inv_freq = RopeEmbeddingUtils.apply_wavelen_scaling(inv_freq)
+        if scale_type == RotaryScalingType.llama3:
+            assert rope_scaling_config is not None, "rotary_scaling config must be provided."
+            inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+            inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
+                inv_freq, rope_scaling_config)
+        else:
+            inv_freq = scale / (theta
+                                **(np.arange(0, dim, 2) / dim)).astype(dtype)
         sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
                                                 np.arange(num_pos, dtype=dtype),
                                                 inv_freq,
@@ -4618,7 +4623,7 @@ def gpt_attention(
                 * RotaryScalingType.linear
                 * RotaryScalingType.dynamic
                 * RotaryScalingType.longrope
-                * RotaryScalingType.wavelen
+                * RotaryScalingType.llama3
 
         rotary_embedding_scale: float
             The scale value to use for linear/dynamic scaling in RoPE.

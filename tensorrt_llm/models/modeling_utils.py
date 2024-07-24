@@ -15,8 +15,8 @@ from .._common import default_net
 from .._utils import (get_init_params, numpy_to_torch, release_gc,
                       str_dtype_to_torch, str_dtype_to_trt, trt_dtype_to_torch)
 from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
-from ..layers import (AttentionParams, Embedding, FusedGatedMLP, FusedRgLru,
-                      GatedMLP, KeyValueCacheParams, LoraParams,
+from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
+                      FusedRgLru, GatedMLP, KeyValueCacheParams, LoraParams,
                       PromptTuningEmbedding, RgLru)
 from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
@@ -982,7 +982,7 @@ def add_lora(model: PretrainedModel,
                 out_hidden_sizes=[layer.out_features],
                 max_low_rank=max_rank,
             )
-        if isinstance(layer, FusedGatedMLP):
+        if isinstance(layer, (MLP, FusedGatedMLP)):
             if max_rank is None:
                 max_rank = min(layer.hidden_size,
                                layer.ffn_hidden_size // layer.tp_size)

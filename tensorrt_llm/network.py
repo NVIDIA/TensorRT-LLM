@@ -27,7 +27,7 @@ import tensorrt as trt
 from tensorrt_llm.module import Module
 
 from ._common import set_network
-from ._utils import get_extra_attr, has_extra_attr, set_extra_attr, trt_gte_10_1
+from ._utils import get_extra_attr, has_extra_attr, set_extra_attr
 from .logger import logger
 from .plugin import PluginConfig
 
@@ -214,11 +214,8 @@ class Network(object):
             logger.debug(
                 f'Add input: {name}, shape: {shape}, dtype: {dtype}, dimension names:{list(dim_range.keys())}'
             )
-            # NOTE: Multi-profile build sometimes fails with named dimensions in TRT < 10.1 : https://nvbugs/4645559
-            # TODO: Remove this condition once things are stable with TRT 10.1
-            if trt_gte_10_1():
-                for i, dim_name in enumerate(dim_range.keys()):
-                    tensor.trt_tensor.set_dimension_name(i, str(dim_name))
+            for i, dim_name in enumerate(dim_range.keys()):
+                tensor.trt_tensor.set_dimension_name(i, str(dim_name))
         else:
             logger.debug(f'Add input: {name}, shape: {shape}, dtype: {dtype}')
         self._inputs[name] = tensor

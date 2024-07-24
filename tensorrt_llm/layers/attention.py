@@ -20,7 +20,7 @@ import tensorrt as trt
 
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, is_same_dtype, trt_dtype_to_np,
-                      trt_dtype_to_str, trt_gte_10)
+                      trt_dtype_to_str)
 from ..functional import (ACT2FN, AllReduceFusionParams, AttentionMaskType,
                           Conditional, LayerNormType, PositionEmbeddingType,
                           RopeEmbeddingUtils, RotaryScalingType, Tensor, arange,
@@ -362,8 +362,10 @@ class Attention(Module):
         self.rotary_embedding_percentage = rotary_embedding_percentage
         self.use_implicit_relative_attention = self.relative_attention and use_implicit_relative_attention
         if rotary_embedding_scaling is not None:
+            rotary_scaling_type = rotary_embedding_scaling.get(
+                "type", rotary_embedding_scaling.get("rope_type"))
             self.rotary_embedding_scale_type = RotaryScalingType.from_string(
-                rotary_embedding_scaling["type"])
+                rotary_scaling_type)
             self.rotary_embedding_scale = rotary_embedding_scaling.get(
                 "factor", 1.0)
 
@@ -433,7 +435,8 @@ class Attention(Module):
                 rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                     self.max_position_embeddings, self.rotary_embedding_dim,
                     self.rotary_embedding_base, self.rotary_embedding_scale,
-                    self.rotary_embedding_scale_type)
+                    self.rotary_embedding_scale_type,
+                    self.rotary_embedding_scaling)
                 self.register_parameter(
                     'rotary_inv_freq',
                     Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
@@ -1153,12 +1156,7 @@ class Attention(Module):
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
                     query /= (self.q_scaling * self.norm_factor)
-                if trt_gte_10() or self.position_embedding_type.is_alibi():
-                    attention_scores = matmul(query, key)
-                else:
-                    # For TRT 9.x, OOTB need this WAR to fuse mha.
-                    attention_scores = matmul(cast(query, 'float32'),
-                                              cast(key, 'float32'))
+                attention_scores = matmul(query, key)
                 if not norm_before_bmm1:
                     attention_scores = attention_scores / (self.q_scaling *
                                                            self.norm_factor)
@@ -1182,24 +1180,16 @@ class Attention(Module):
 
             attention_probs = softmax(attention_scores, dim=-1)
 
-            if trt_gte_10() or self.position_embedding_type.is_alibi():
-                # For trt_version() == 9.x and pos_embed == alibi, TRT has gpu buffer management issues. Need this WAR to avoid peak gpu mem regression.
-                # A dummy reshape WAR for mha fusion for 10.0
-                attention_probs = attention_probs.view(
-                    concat([
-                        shape(attention_probs, 0),
-                        shape(attention_probs, 1),
-                        shape(attention_probs, 2),
-                        shape(value, 2)
-                    ]))
-                context = matmul(attention_probs, value,
-                                 use_fp32_acc=False).permute([0, 2, 1, 3])
-            else:
-                # For TRT 9.x, need this WAR to fuse mha.
-                context = matmul(attention_probs,
-                                 cast(value, 'float32')).permute([0, 2, 1, 3])
-                if context.dtype != value.dtype:
-                    context = cast(context, value.dtype)
+            # A dummy reshape WAR for mha fusion
+            attention_probs = attention_probs.view(
+                concat([
+                    shape(attention_probs, 0),
+                    shape(attention_probs, 1),
+                    shape(attention_probs, 2),
+                    shape(value, 2)
+                ]))
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
             context = context.view(
                 concat([
                     shape(context, 0),

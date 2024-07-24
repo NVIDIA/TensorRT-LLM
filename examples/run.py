@@ -304,7 +304,7 @@ def main(args):
     encoder_input_lengths = [x.size(0)
                              for x in encoder_input_ids] if is_enc_dec else None
 
-    if not supports_inflight_batching(
+    if not args.use_py_session and not supports_inflight_batching(
             os.path.join(args.engine_dir, "decoder") if is_enc_dec else args.
             engine_dir):
         logger.warning(

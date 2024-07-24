@@ -447,7 +447,8 @@ def main():
         # Extract rotary scaling which will be used for checks and default value of max_seq_len
         rotary_scaling = getattr(model_config, "rotary_scaling", None)
         if rotary_scaling is not None:
-            rotary_type = rotary_scaling['type']
+            rotary_type = rotary_scaling.get('type',
+                                             rotary_scaling.get('rope_type'))
             rotary_factor = rotary_scaling.get(
                 'factor', 1.0) if rotary_type != 'su' else 1
         else:
