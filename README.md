@@ -88,9 +88,9 @@ for integration with the
 a production-quality system to serve LLMs.  Models built with TensorRT-LLM can
 be executed on a wide range of configurations going from a single GPU to
 multiple nodes with multiple GPUs (using
-[Tensor Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#tensor-parallelism)
+[Tensor Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#tensor-parallelism)
 and/or
-[Pipeline Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#pipeline-parallelism)).
+[Pipeline Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#pipeline-parallelism)).
 
 The TensorRT-LLM Python API architecture looks similar to the
 [PyTorch](https://pytorch.org) API. It provides a
