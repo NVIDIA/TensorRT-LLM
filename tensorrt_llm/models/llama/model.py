@@ -65,7 +65,8 @@ class LLaMADecoderLayer(Module):
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode)
 
-        if int(self.local_layer_idx) % 2 == 0:
+        is_interleaved_moe = True if (hasattr(config, "moe_layers") and config.moe_layers) else False
+        if is_interleaved_moe and self.local_layer_idx not in config.moe_layers:
             mlp_hidden_size = config.hidden_size * 4 if config.dense_ffn_hidden_size is None else config.dense_ffn_hidden_size
         else:
             mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -74,12 +75,17 @@ class LLaMADecoderLayer(Module):
         mlp_kwargs = {}
 
         # to support interleaved moe model arch, even layers are dense, odd layers are moe
-        if config.moe.has_moe() and int(self.local_layer_idx) % 2 != 0:
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config": config.moe,
-                "mapping": config.mapping,
-            }
+        if config.moe.has_moe():
+            if self.local_layer_idx in config.moe_layers:
+                ClsMLP = MOE
+                mlp_kwargs = {
+                    "moe_config": config.moe,
+                    "mapping": config.mapping,
+                }
+            else:
+                mlp_kwargs = {
+                    "is_interleaved_moe": is_interleaved_moe,
+                }
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
                           hidden_act=config.hidden_act,

@@ -1450,7 +1450,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                         'attention.dense.per_channel_scale'] = torch_weight_scales
                 else:
                     weights[tllm_prex + 'attention.dense.weight'] = split_v
-            elif 'mlp.up_proj.weight' or 'mlp.w3.weight' in name:
+            elif any(x in name for x in ('mlp.up_proj.weight', 'mlp.w3.weight')):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1462,7 +1462,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                             'mlp.gate.per_channel_scale'] = torch_weight_scales
                 else:
                     weights[tllm_prex + 'mlp.gate.weight'] = split_v
-            elif 'mlp.down_proj.weight' or 'mlp.w2.weight' in name:
+            elif any(x in name for x in ('mlp.down_proj.weight', 'mlp.w2.weight')):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=1)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1475,7 +1475,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: LLaMAConfig):
                 else:
                     weights[tllm_prex + 'mlp.proj.weight'] = split_v
 
-            elif 'mlp.gate_proj.weight' or 'mlp.w1.weight' in name:
+            elif any(x in name for x in ('mlp.gate_proj.weight', 'mlp.w1.weight')):
                 split_v = split(param, mapping.tp_size, mapping.tp_rank, dim=0)
                 if use_weight_only:
                     processed_torch_weights, torch_weight_scales = \
@@ -1677,7 +1677,7 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                          1)  # mlp.proj
             load_and_set(f'{tllm_prex}.mlp.fc.weight', prefix + key_list[8],
                          0)  # mlp.fc
-        elif is_interleaved_moe and int(layer_idx) % 2 == 0:
+        elif is_interleaved_moe and layer_idx not in config.moe_layers:
             load_and_set(f'{tllm_prex}.mlp.gate.weight', prefix + key_list[11],
                          0)  # mlp.gate
             load_and_set(f'{tllm_prex}.mlp.proj.weight', prefix + key_list[12],

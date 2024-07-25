@@ -42,14 +42,19 @@ class MLP(Module):
             quant_mode=QuantMode(0),
             inner_layernorm=False,
             eps=1e-05,
+            is_interleaved_moe=False,
     ):
         super().__init__()
         if hidden_act not in ACT2FN:
             raise ValueError(
                 'unsupported activation function: {}'.format(hidden_act))
-        fc_output_size = 2 * ffn_hidden_size if hidden_act in [
-            'swiglu', 'gegelu'
-        ] else ffn_hidden_size
+        if is_interleaved_moe:
+            fc_output_size = ffn_hidden_size
+            hidden_act = 'silu'
+        else:
+            fc_output_size = 2 * ffn_hidden_size if hidden_act in [
+                'swiglu', 'gegelu'
+            ] else ffn_hidden_size
         self.inner_layernorm = LayerNorm(ffn_hidden_size, dtype=dtype,
                                          eps=eps) if inner_layernorm else None
 
@@ -113,6 +118,7 @@ class GatedMLP(MLP):
             quant_mode=QuantMode(0),
             inner_layernorm=False,
             eps=1e-05,
+            is_interleaved_moe=False,
     ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -123,7 +129,8 @@ class GatedMLP(MLP):
                          tp_size=tp_size,
                          quant_mode=quant_mode,
                          inner_layernorm=inner_layernorm,
-                         eps=eps)
+                         eps=eps,
+                         is_interleaved_moe=is_interleaved_moe)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
