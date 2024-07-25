@@ -167,10 +167,12 @@ def prepare_inputs():
         'input_ids': input_ids,
         'input_lengths': input_lengths,
         'token_type_ids': token_type_ids,
-        'position_ids': position_ids if args.remove_input_padding else None,
-        'max_input_length':
-        max_input_length if args.remove_input_padding else None,
     }
+
+    if args.remove_input_padding:
+        inputs['position_ids'] = position_ids
+        inputs['max_input_length'] = max_input_length
+
     return inputs
 
 

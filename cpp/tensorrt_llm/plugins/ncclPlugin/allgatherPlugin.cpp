@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "allgatherPlugin.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 
 #include <nccl.h>
 
@@ -137,7 +138,9 @@ int AllgatherPlugin::initialize() noexcept
     {
         return 0;
     }
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     mNcclComm = getComm(mGroup);
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     return 0;
 }
 

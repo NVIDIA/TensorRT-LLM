@@ -180,6 +180,7 @@ def create_session(builder,
                    network,
                    precision="float32",
                    int8=False,
+                   fp8=False,
                    opt_level=None,
                    memory_pool_limit=None,
                    optimization_profiles=[],
@@ -195,6 +196,7 @@ def create_session(builder,
     """
     builder_config = builder.create_builder_config(precision=precision,
                                                    int8=int8,
+                                                   fp8=fp8,
                                                    opt_level=opt_level,
                                                    quant_mode=quant_mode)
     # Some tests require to set mem pool limit to avoid OOM

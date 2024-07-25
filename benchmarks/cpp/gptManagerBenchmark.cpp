@@ -155,6 +155,7 @@ struct BenchmarkParams
     std::optional<SizeType32> maxNumTokens{std::nullopt};
     int randomSeed = 430;
     std::optional<int> maxAttentionWindow{std::nullopt};
+    bool multiBlockMode{false};
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
@@ -820,6 +821,7 @@ public:
         executorConfig.setDecodingConfig(texec::DecodingConfig(
             benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
             std::nullopt, benchmarkParams.medusaChoices));
+        executorConfig.setMultiBlockMode(benchmarkParams.multiBlockMode);
 
         mExecutor = std::make_unique<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
 
@@ -1399,6 +1401,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.decodingConfig = texec::DecodingConfig(
         benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
         std::nullopt, benchmarkParams.medusaChoices);
+    optionalParams.multiBlockMode = benchmarkParams.multiBlockMode;
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
     auto const worldConfig = WorldConfig::mpi(jsonConfig.getGpusPerNode(), jsonConfig.getTensorParallelism(),
@@ -1439,6 +1442,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
             auto startLoraLoad = std::chrono::steady_clock::now();
             LoraLib loras(benchmarkParams.loraDir.value());
             SizeType32 reqId = 0;
+            gptServer->resetBatchDeadline();
             for (auto const& [taskId, p] : loras.getLoras())
             {
                 reqId++;
@@ -1550,6 +1554,9 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
             std::vector<texec::Request> requests;
             for (auto& [taskId, p] : loras.getLoras())
             {
+                // squeeze lora configs and weights since LoraConfig requires them to be 2D tensors
+                p.first->squeeze(0);
+                p.second->squeeze(0);
                 texec::LoraConfig loraConfig(
                     taskId, texec::detail::ofITensor(p.first), texec::detail::ofITensor(p.second));
                 Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, static_cast<int32_t>(taskId)};
@@ -1771,6 +1778,10 @@ int main(int argc, char* argv[])
     options.add_options()(
         "medusa_choices", "Medusa choices in the format of [[0], [0, 1], [0, 0, 1]]", cxxopts::value<std::string>());
 
+    options.add_options()("multi_block_mode",
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel",
+        cxxopts::value<bool>()->default_value("false"));
+
     auto result = options.parse(argc, argv);
 
     if (result.count("help"))
@@ -1921,6 +1932,9 @@ int main(int argc, char* argv[])
     {
         benchmarkParams.medusaChoices = parseVectorOfVectors(result["medusa_choices"].as<std::string>());
     }
+
+    // Argument: multi_block_mode
+    benchmarkParams.multiBlockMode = result["multi_block_mode"].as<bool>();
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

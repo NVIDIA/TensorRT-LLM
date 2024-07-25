@@ -82,7 +82,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  max_tokens_in_paged_kv_cache: int | None = None,
                  kv_cache_enable_block_reuse: bool = False,
                  enable_chunked_context: bool = False,
-                 is_enc_dec: bool = False) -> 'ModelRunnerCpp':
+                 is_enc_dec: bool = False,
+                 multi_block_mode: Optional[bool] = None) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -129,6 +130,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Enables chunked context.
             is_enc_dec (bool):
                 Whether the model is encoder-decoder architecture.
+            multi_block_mode (bool):
+                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
@@ -205,6 +208,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         decoding_config = trtllm.DecodingConfig()
         if medusa_choices is not None:
             decoding_config.medusa_choices = medusa_choices
+            if multi_block_mode is not None:
+                multi_block_mode = False  # Medusa doesn't support multi-block mode.
 
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
@@ -232,6 +237,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config=decoding_config,
             gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
+        if multi_block_mode is not None:
+            trtllm_config.multi_block_mode = multi_block_mode
         executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
                                    trtllm_config)
 

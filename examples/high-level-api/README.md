@@ -369,6 +369,8 @@ Although the HLAPI runs the engine building in the background, you can also cach
 To enable the build cache, there are two ways to do it:
 
 1. Use the environment variable: `export TLLM_HLAPI_BUILD_CACHE=1` to enable the build cache globally, and optionally export `TLLM_HLAPI_BUILD_CACHE_ROOT` to specify the cache root directory.
-2. Pass the `build_cache_config` to the `LLM` constructor
+2. Pass the `enable_build_cache` to the `LLM` constructor
 
 The build cache will reuse the built engine if all the building settings are the same, or it will rebuild the engine.
+
+NOTE: The build cache monitors the model path and build settings, if you change the weights while keeping the same model path, the build cache will not detect the change and reuse the old engine.

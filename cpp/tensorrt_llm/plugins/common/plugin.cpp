@@ -48,6 +48,7 @@ namespace
 ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
 {
     auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     ncclUniqueId id;
     if (rank == *group.begin())
     {
@@ -61,15 +62,30 @@ ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
     {
         COMM_SESSION.recvValue(id, *group.begin(), 0);
     }
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;
 }
 } // namespace
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 {
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     static std::map<std::set<int>, std::weak_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
+    std::ostringstream oss;
+    int index = 0;
+    for (auto const& rank : group)
+    {
+        if (index != 0)
+        {
+            oss << ",";
+        }
+        oss << rank;
+        index++;
+    }
+    auto groupStr = oss.str();
     auto it = commMap.find(group);
     if (it != commMap.end())
     {
@@ -77,13 +93,21 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         auto ncclComm = it->second.lock();
         if (ncclComm)
         {
+            TLLM_LOG_TRACE("NCCL comm for group(%s) is cached for rank %d", groupStr.c_str(), rank);
             return ncclComm;
         }
     }
 
+    TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
     ncclUniqueId id = getUniqueId(group);
-    auto const rank = COMM_SESSION.getRank();
-    auto const groupRank = rank % group.size();
+    int groupRank = 0;
+    for (auto const& currentRank : group)
+    {
+        if (rank == currentRank)
+            break;
+        ++groupRank;
+    }
+    TLLM_CHECK(groupRank < group.size());
     std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
         [](ncclComm_t* comm)
         {
@@ -92,6 +116,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         });
     NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;
 }
 #endif // ENABLE_MULTI_DEVICE

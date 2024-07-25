@@ -149,7 +149,6 @@ class GPTBenchmark(BaseBenchmark):
             dtype=self.dtype,
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
-            use_custom_all_reduce=self.use_custom_all_reduce,
             tokens_per_block=self.tokens_per_block if hasattr(
                 self, 'tokens_per_block') else 64,
             mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,

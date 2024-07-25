@@ -40,23 +40,12 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
 
-    explicit Input(std::vector<TensorConstPtr> const& logits, std::vector<bool> const& active)
+    explicit Input(std::vector<TensorPtr> const& logits, std::vector<bool> const& active)
         : logits{logits}
         , active{active}
     {
         TLLM_CHECK_WITH_INFO(
             this->active.size() == logits.size(), "'active' vector size does not match logits vector size");
-    }
-
-    explicit Input(std::vector<TensorConstPtr> const& logits)
-        : Input{logits, std::vector<bool>(logits.size(), true)}
-    {
-    }
-
-    explicit Input(std::vector<TensorPtr> const& logits, std::vector<bool> const& active)
-        : Input{
-            utils::transformVector(logits, [](auto& x) { return std::const_pointer_cast<ITensor const>(x); }), active}
-    {
     }
 
     explicit Input(std::vector<TensorPtr> const& logits)
@@ -65,18 +54,18 @@ public:
     }
 
     // mandatory parameters
-    std::vector<TensorConstPtr>
+    std::vector<TensorPtr>
         logits; // batchSize * [1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
 
     // control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
 
     // parameters for beam search
-    TensorConstPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
-                                     // within one beam for beam search, on gpu
-    std::vector<std::vector<TensorConstPtr>>
-        predictedDraftLogits; // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
-    TensorPtr seqSlots;       // [batchSize]
+    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
+                                // within one beam for beam search, on gpu
+    std::vector<std::vector<TensorPtr>>
+        predictedDraftLogits;   // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    TensorPtr seqSlots;         // [batchSize]
 
     // explicit draft tokens data.
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;

@@ -24,7 +24,6 @@ using namespace tensorrt_llm::layers;
 using namespace tensorrt_llm::common;
 
 namespace tk = tensorrt_llm::kernels;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace trk = tensorrt_llm::runtime::kernels;
 
 template <typename T>
@@ -103,7 +102,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     setupParams->topPResetIds
         = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
 
-    mSamplingLayer->setup(mBatchSize, mBeamWidth, batchSlotsPtr, setupParams);
+    mSamplingLayer->setup(mBatchSize, mBeamWidth, mBatchSlots, setupParams);
 
     mStream->synchronize();
 }
@@ -112,16 +111,15 @@ template <typename T>
 std::shared_ptr<SamplingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
-    auto decodeInputTensors
-        = std::make_shared<SamplingInputs>(tcc::toTllmTensor(*mEndIdsDevice), step, ite, mBatchSize);
+    auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, step, ite, mBatchSize);
 
-    decodeInputTensors->logits = tcc::toTllmTensor(*mLogitsDevice);
+    decodeInputTensors->logits = mLogitsDevice;
 
-    decodeInputTensors->inputLengths = tcc::toTllmTensor(*mContextLengthDevice);
+    decodeInputTensors->inputLengths = mContextLengthDevice;
 
-    decodeInputTensors->finished = tcc::toTllmTensor(*mFinishedDevice);
+    decodeInputTensors->finished = mFinishedDevice;
 
-    decodeInputTensors->batchSlots = tcc::toTllmTensor(*mBatchSlots);
+    decodeInputTensors->batchSlots = mBatchSlots;
 
     decodeInputTensors->probsComputed = mComputeProbs;
 
@@ -135,16 +133,16 @@ std::shared_ptr<SamplingInputs> BaseSamplingLayerTest<T>::createInputTensors(int
 template <typename T>
 std::shared_ptr<BaseDecodingOutputs> BaseSamplingLayerTest<T>::createOutputTensors()
 {
-    auto decodeOutputs = std::make_shared<BaseDecodingOutputs>(tcc::toTllmTensor(*mOutputIdsDevice));
-    decodeOutputs->outputIdsPtr = tcc::toTllmTensor(*mIdsPtrHost);
+    auto decodeOutputs = std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
+    decodeOutputs->outputIdsPtr = mIdsPtrHost;
 
-    decodeOutputs->sequenceLength = tcc::toTllmTensor(*mSeqLengthsDevice);
+    decodeOutputs->sequenceLength = mSeqLengthsDevice;
 
-    decodeOutputs->finished = tcc::toTllmTensor(*mFinishedDevice);
+    decodeOutputs->finished = mFinishedDevice;
 
-    decodeOutputs->outputLogProbs = tcc::toTllmTensor(*mOutputLogProbsDevice);
+    decodeOutputs->outputLogProbs = mOutputLogProbsDevice;
 
-    decodeOutputs->cumLogProbs = tcc::toTllmTensor(*mCumLogProbsDevice);
+    decodeOutputs->cumLogProbs = mCumLogProbsDevice;
 
     // TODO(nkorobov): check log probs and cum_log_probs
     return decodeOutputs;

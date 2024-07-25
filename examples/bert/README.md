@@ -32,12 +32,20 @@ python3 build.py --model RobertaModel --dtype=float16 --log_level=verbose
 
 # Build BertModel with TensorRT-LLM BERT Attention plugin for enhanced runtime performance
 python3 build.py --dtype=float16 --log_level=verbose --use_bert_attention_plugin float16
+
+# Build BertForSequenceClassification with TensorRT-LLM remove input padding knob for enhanced runtime performance
+python3 build.py --model BertForSequenceClassification --remove_input_padding --use_bert_attention_plugin float16
 ```
 
 The following command can be used to run the model on a single GPU:
 
 ```bash
 python3 run.py
+
+```
+If the model built with **--remove_input_padding** knob, please run the model with below command
+```bash
+python3 run_remove_input_padding.py
 ```
 
 #### Fused MultiHead Attention (FMHA)
@@ -47,6 +55,13 @@ You can enable the FMHA kernels for BERT by adding `--enable_context_fmha` to th
 If you find that the default fp16 accumulation (`--enable_context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc`. However, it is expected to see performance drop.
 
 Note `--enable_context_fmha` / `--enable_context_fmha_fp32_acc` has to be used together with `--use_bert_attention_plugin float16`.
+
+
+#### Remove input padding
+The remove input padding feature is enabled by adding `--remove_input_padding` into build command.
+When input padding is removed, the different tokens are packed together. It reduces both the amount of computations and memory consumption. For more details, see this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#padded-and-packed-tensors).
+
+Currently, this feature only enables for BertForSequenceClassification model.
 
 ## Build and run on two GPUs
 

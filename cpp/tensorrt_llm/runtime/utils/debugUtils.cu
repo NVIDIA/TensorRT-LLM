@@ -59,6 +59,8 @@ template void invokeCheckTensorNanKernel(float const* data, std::size_t size, in
 template void invokeCheckTensorNanKernel(half const* data, std::size_t size, int* foundNan, cudaStream_t stream);
 template void invokeCheckTensorNanKernel(
     __nv_bfloat16 const* data, std::size_t size, int* foundNan, cudaStream_t stream);
+template void invokeCheckTensorNanKernel(
+    __nv_fp8_e4m3 const* data, std::size_t size, int* foundNan, cudaStream_t stream);
 
 template <typename T>
 void printLogitsKeyInfo(ITensor const& tensor, std::string const& infoStr)
@@ -124,6 +126,7 @@ void printLogitsKeyInfo(ITensor const& tensor, std::string const& infoStr)
 template void printLogitsKeyInfo<float>(ITensor const& tensor, std::string const& infoStr);
 template void printLogitsKeyInfo<half>(ITensor const& tensor, std::string const& infoStr);
 template void printLogitsKeyInfo<__nv_bfloat16>(ITensor const& tensor, std::string const& infoStr);
+template void printLogitsKeyInfo<__nv_fp8_e4m3>(ITensor const& tensor, std::string const& infoStr);
 
 template <typename T>
 bool tensorHasNan(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr)
@@ -141,6 +144,8 @@ bool tensorHasNan(ITensor const& tensor, BufferManager const& manager, std::stri
 template bool tensorHasNan<float>(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
 template bool tensorHasNan<half>(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
 template bool tensorHasNan<__nv_bfloat16>(
+    ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
+template bool tensorHasNan<__nv_fp8_e4m3>(
     ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
 
 bool tensorHasNan(
@@ -160,6 +165,10 @@ bool tensorHasNan(
     else if (type == nvinfer1::DataType::kBF16)
     {
         return tensorHasNan<__nv_bfloat16>(*tensorView, manager, infoStr);
+    }
+    else if (type == nvinfer1::DataType::kFP8)
+    {
+        return tensorHasNan<__nv_fp8_e4m3>(*tensorView, manager, infoStr);
     }
     else
     {

@@ -213,7 +213,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
     auto const& pagedKvCache = pluginConfig.at("paged_kv_cache");
     auto const& tokensPerBlock = pluginConfig.at("tokens_per_block");
-    auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
     auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
@@ -228,7 +227,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.usePagedKvCache(pagedKvCache);
     modelConfig.usePagedState(pagedState);
     modelConfig.setTokensPerBlock(tokensPerBlock);
-    modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
@@ -353,7 +351,7 @@ GptJsonConfig parseJson(InputType&& input)
     }
     else
     {
-        if (name == "ChatGLMForCausalLM")
+        if (name.find("GLM") != std::string::npos)
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
             auto const chatglmVersion = pretrainedConfig.at("chatglm_version").template get<std::string>();

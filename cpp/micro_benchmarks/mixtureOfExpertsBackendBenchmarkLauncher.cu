@@ -184,7 +184,6 @@ int parseTacticToId(nlohmann::json tactic_config)
 template <class BenchClass>
 void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
 {
-
     if (tactic.is_number_integer())
     {
         tactic_ids.push_back(tactic.get<int>());
@@ -300,14 +299,14 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
     std::stringstream buffer;
     buffer << file.rdbuf();
     auto file_contents = buffer.str();
-    if (VERBOSE)
+    if (LOG_LEVEL >= INFO)
         std::cout << "Loaded benchmark file: " << file_contents << std::endl;
     auto source_data = nlohmann::json::parse(file_contents);
 
     int i = 0;
     for (auto run_config : source_data)
     {
-        if (VERBOSE)
+        if (LOG_LEVEL >= VERBOSE)
             std::cout << "Parsing run config: " << run_config.dump(2) << std::endl;
         std::string config_name = "config_" + std::to_string(i);
 
@@ -394,11 +393,28 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         }
 
         // Do this after filtering datatypes as tactics only make sense if we know the data type
-        std::vector<int> tactic_ids{};
-        parseTacticToVectorID<BenchClass>(run_config["tactic_id"], tactic_ids);
-        if (tactic_ids.empty())
+        bool has_tactic_ids2 = false;
+        std::vector<int> tactic_ids1{};
+        std::vector<int> tactic_ids2{};
+        if (run_config.contains("tactic_id1") || run_config.contains("tactic_id2"))
         {
-            std::cerr << "Warning: Skipping benchmark, no such tactic: " << run_config["tactic"].dump(2) << std::endl;
+            if (run_config.contains("tactic_id"))
+            {
+                throw std::invalid_argument("Cannot use tactic_id and tactic_idX");
+            }
+            has_tactic_ids2 = true;
+            parseTacticToVectorID<BenchClass>(run_config["tactic_id1"], tactic_ids1);
+            parseTacticToVectorID<BenchClass>(run_config["tactic_id2"], tactic_ids2);
+        }
+        else
+        {
+            parseTacticToVectorID<BenchClass>(run_config["tactic_id"], tactic_ids1);
+            has_tactic_ids2 = false;
+            tactic_ids2.resize(1); // Dummy value so we loop exactly once below
+        }
+        if (tactic_ids1.empty() || tactic_ids2.empty())
+        {
+            std::cerr << "Warning: Skipping benchmark, no valid tactic found" << std::endl;
             static bool printed = false;
             if (!printed)
             {
@@ -420,19 +436,27 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         int bias = get_or("bias", 0);
         TLLM_CHECK_WITH_INFO(world_rank < tp_size * ep_size, "Rank is out of bounds of tp*ep");
 
-        for (auto tactic_id : tactic_ids)
+        for (auto t1 : tactic_ids1)
         {
-            benchmark->Args({num_experts,                //
-                run_config.at("k").get<int>(),           //
-                run_config.at("hidden_size").get<int>(), //
-                run_config.at("inter_size").get<int>(),  //
-                tp_size, ep_size, world_rank,            //
-                run_config.at("num_tokens").get<int>(),  //
-                bias,                                    //
-                run_config.at("act_fn").get<int>(),      //
-                run_config.at("norm_mode").get<int>(),   //
-                tactic_id,                               //
-                *routing_config});
+            // tactic_ids2 will have one dummy value if has_tactic_ids2 = false
+            for (auto t2 : tactic_ids2)
+            {
+                if (!has_tactic_ids2)
+                    t2 = t1;
+
+                benchmark->Args({num_experts,                //
+                    run_config.at("k").get<int>(),           //
+                    run_config.at("hidden_size").get<int>(), //
+                    run_config.at("inter_size").get<int>(),  //
+                    tp_size, ep_size, world_rank,            //
+                    run_config.at("num_tokens").get<int>(),  //
+                    bias,                                    //
+                    run_config.at("act_fn").get<int>(),      //
+                    run_config.at("norm_mode").get<int>(),   //
+                    t1,                                      //
+                    t2,                                      //
+                    *routing_config});
+            }
         }
     }
 }
@@ -465,17 +489,18 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
                             for (auto bias : use_bias)
                                 for (auto act : activation_type)
                                     for (auto norm : norm_mode)
-                                        for (auto tactic : cutlass_tactic)
-                                            for (auto routing : routing_config)
-                                                benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens, bias,
-                                                    (int) act, (int) norm, tactic, routing});
+                                        for (auto tactic1 : cutlass_tactic)
+                                            for (auto tactic2 : cutlass_tactic)
+                                                for (auto routing : routing_config)
+                                                    benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens,
+                                                        bias, (int) act, (int) norm, tactic1, tactic2, routing});
                     }
 }
 
 template <class BenchClass>
 void argGen(benchmark::internal::Benchmark* benchmark)
 {
-    if (VERBOSE)
+    if (LOG_LEVEL >= VERBOSE)
     {
         std::cout << "List of all tactics for dtype " << (int) BenchClass::toDTypeID() << ":\n";
         int i = 0;
@@ -491,7 +516,7 @@ void argGen(benchmark::internal::Benchmark* benchmark)
     // Generic setup
     benchmark->UseManualTime();
     benchmark->ArgNames({"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank",
-        "Num Tokens", "Use Bias", "Activation Function", "Norm Mode", "Tactic ID", "Routing ID"});
+        "Num Tokens", "Use Bias", "Activation Function", "Norm Mode", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
 
     if (workloadFile)
         argGenLoadFile<BenchClass>(benchmark);
@@ -556,6 +581,8 @@ void help()
            "    \"act_fn\": int,\n"
            "    \"norm_mode\": int,\n"
            "    \"tactic_id\": tactic, (see below)\n"
+           "    \"tactic_id1\": tactic, (see below)\n"
+           "    \"tactic_id2\": tactic, (see below)\n"
            "    \"dtypes\": [string, ...], (optional)\n"
            "    \"routing_values_name\": string, (optional)\n"
            "    \"routing_values\": [float, ...], or string, (optional, length is a multiple of num_experts)\n"
@@ -577,13 +604,17 @@ void help()
            "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
            "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM. See\n"
            "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
-           "- \"tactic_id\"\n"
+           "- \"tactic_id, tactic_id1, tactic_id2\"\n"
+           "The config for the CUTLASS GEMM. tactic_id sets the same tactic for both to the same tactic (except in "
+           "auto mode)\n"
+           "Use tactic_idX to set the tactic for the corresponding GEMM"
            "Valid tactics are:\n"
            " - An object:\n"
            "   {\n"
            "      \"is_sm90\": bool,\n"
            "      \"tile_shape\": [int, int, int] or int,\n"
-           "      \"cluster_shape\": [int, int, int] or int, (required for sm90, type must be an int if tile_shape is "
+           "      \"cluster_shape\": [int, int, int] or int, (required for sm90, type must be an int if tile_shape "
+           "is "
            "an int)\n"
            "      \"warp_shape\": [int, int, int], (required for non-sm90 if tile_shape is an array)\n"
            "      \"stages\": int, (required for non-sm90)\n"
@@ -592,11 +623,14 @@ void help()
            "configurations\n"
            " - An array: of integers or objects, forms a list of tactics to sweep\n"
            " - The string \"all\": This will sweep through all possible tactics\n"
-           " - The string \"auto\": This runs a short benchmark to pick the fastest tactic before each benchmark case. "
-           "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate results"
+           " - The string \"auto\": This runs a short benchmark to pick the fastest tactic before each benchmark "
+           "case. "
+           "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate "
+           "results"
            "- dtypes - A list of dtypes to run this config through.\n"
            "Allowed values are: fp8, int4, int8, float, half, bfloat16\n"
-           "If this argument is omitted all dtypes will be run. Note, not all tactics are supported for all dtypes,\n"
+           "If this argument is omitted all dtypes will be run. Note, not all tactics are supported for all "
+           "dtypes,\n"
            "unsupported tactics will be skipped with a warning.\n"
            "- \"routing_values_name\" - a name to help identify the routing pattern. This can be used by later "
            "benchmarks to reuse the config\n"

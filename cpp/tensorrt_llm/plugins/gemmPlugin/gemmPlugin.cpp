@@ -20,7 +20,7 @@
 #include "gemmPluginProfiler.h"
 #include "plugin.h"
 #include "pluginUtils.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/fp8Gemm.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemm.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 
 #include <NvInferRuntime.h>
@@ -382,18 +382,18 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     if (M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
     {
         tensorrt_llm::common::QuantMode quantMode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
-        tensorrt_llm::kernels::fp8_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
+        tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
             reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
             nvinfer1::DataType::kFP8, mOutputType);
-        cudaKernelFinished = tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher(params, stream);
+        cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
     else if (M <= 6 && N <= 128000 && !mUseFp8 && noPadDim && cudaKernelSupportType)
     {
         tensorrt_llm::common::QuantMode quantMode;
-        tensorrt_llm::kernels::fp8_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
+        tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
             reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
             mType, mOutputType);
-        cudaKernelFinished = tensorrt_llm::kernels::fp8_gemm::fp8GemmDispatcher(params, stream);
+        cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
 
     if (!cudaKernelFinished)

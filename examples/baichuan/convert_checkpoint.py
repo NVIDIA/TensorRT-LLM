@@ -1145,7 +1145,7 @@ if __name__ == '__main__':
 
     world_size = args.tp_size * args.pp_size
     config = {
-        'architecture': 'BaichuanForCausalLM',
+        'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
         'logits_dtype': args.logits_dtype,
         'vocab_size': hf_config.vocab_size,

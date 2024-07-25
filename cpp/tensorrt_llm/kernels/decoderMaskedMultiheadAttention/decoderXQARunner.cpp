@@ -101,7 +101,7 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_t
     return workspace_size;
 }
 
-DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams)
+DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams, bool for_configure_plugin)
 {
     if (xqaParams.multi_query_tokens)
     {
@@ -125,19 +125,19 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
 
 bool DecoderXQARunner::shouldUse(XQAParams const& xqa_params, bool for_configure_plugin)
 {
-    return getImplFromXQAParams(xqa_params)->shouldUse(xqa_params, for_configure_plugin);
+    return getImplFromXQAParams(xqa_params, for_configure_plugin)->shouldUse(xqa_params, for_configure_plugin);
 }
 
 void DecoderXQARunner::prepareForRun(XQAParams const& xqa_params)
 {
-    return getImplFromXQAParams(xqa_params)->prepare(xqa_params);
+    return getImplFromXQAParams(xqa_params, true)->prepare(xqa_params);
 }
 
 template <typename KVCacheBuffer>
 void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
-    return getImplFromXQAParams(xqa_params)->run(xqa_params, kv_cache_buffer, stream);
+    return getImplFromXQAParams(xqa_params, false)->run(xqa_params, kv_cache_buffer, stream);
 }
 
 DecoderXQARunner::Resource* DecoderXQARunner::getResourceGlobal()

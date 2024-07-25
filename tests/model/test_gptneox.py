@@ -283,6 +283,11 @@ class TestGPTNeoX(unittest.TestCase):
                        dtype=torch.int32,
                        device='cuda')
         ]  # ping-pong buffers
+
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -290,6 +295,7 @@ class TestGPTNeoX(unittest.TestCase):
             'position_ids': ctx_position_ids,
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -384,6 +390,9 @@ class TestGPTNeoX(unittest.TestCase):
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+
         step1_buffer = {
             'input_ids': step1_id,
             'context_lengths': gen_context_lengths,
@@ -391,6 +400,7 @@ class TestGPTNeoX(unittest.TestCase):
             'position_ids': gen_position_ids,
             'last_token_ids': gen_last_token_ids,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

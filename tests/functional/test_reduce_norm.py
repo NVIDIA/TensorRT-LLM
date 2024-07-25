@@ -99,7 +99,6 @@ class TestCommunicationPlugin(unittest.TestCase):
 
         builder = tllm.Builder()
         net = builder.create_network()
-        net.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
         _, workspace = current_all_reduce_helper().allocate_workspace(
             self.mapping, size * dtype_size)
 

@@ -19,7 +19,6 @@ from collections import OrderedDict
 import numpy as np
 import tensorrt as trt
 
-from ..._common import default_net
 from ..._utils import str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str
 from ...functional import (Tensor, arange, chunk, concat, constant, cos, exp,
                            expand, shape, silu, sin, slice, split, unsqueeze)
@@ -326,10 +325,8 @@ class DiT(PretrainedModel):
 
             @return: a list contains values which can be fed into the self.forward()
         '''
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
         mapping = self.config.mapping
-        if use_custom_all_reduce and mapping.tp_size > 1:
+        if mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(mapping, 1)
 
         def dit_default_range(max_batch_size):

@@ -87,7 +87,6 @@ public:
         , mComputeContextLogits(false)
         , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
-        , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
@@ -354,16 +353,6 @@ public:
         mModelVariant = modelVariant;
     }
 
-    [[nodiscard]] bool constexpr useCustomAllReduce() const noexcept
-    {
-        return mUseCustomAllReduce;
-    }
-
-    void constexpr useCustomAllReduce(bool customAllReduce) noexcept
-    {
-        mUseCustomAllReduce = customAllReduce;
-    }
-
     [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
     {
         return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
@@ -610,7 +599,6 @@ private:
     bool mComputeContextLogits;
     bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
-    bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
 

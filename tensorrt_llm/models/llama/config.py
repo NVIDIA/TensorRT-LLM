@@ -223,6 +223,11 @@ class LLaMAConfig(PretrainedConfig):
                 "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
             dtype = 'float16'
 
+        if meta_config.get('use_scaled_rope'):
+            rotary_scaling = {"type": "llama3"}
+        else:
+            rotary_scaling = meta_config.get("rope_scaling")
+
         # meta checkpoint don't have vocab_size|hidden_act|rotary_base specified, use same default value as HF
         return cls(architecture="LlamaForCausalLM",
                    dtype=dtype,
@@ -235,6 +240,7 @@ class LLaMAConfig(PretrainedConfig):
                    position_embedding_type='rope_gpt_neox',
                    max_position_embeddings=2048,
                    hidden_act='silu',
+                   rotary_scaling=rotary_scaling,
                    rotary_base=meta_config.get('rope_theta', 10000),
                    norm_epsilon=meta_config["norm_eps"],
                    mapping=mapping,

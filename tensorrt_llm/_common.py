@@ -182,9 +182,12 @@ class _BuildingFlag:
 
     def __enter__(self):
         os.environ['IS_BUILDING'] = '1'
+        os.environ[
+            '__LUNOWUD'] = '-cask_fusion:fp8=off'  # will be removed in future releases
 
     def __exit__(self, type, value, tb):
         del os.environ['IS_BUILDING']
+        del os.environ['__LUNOWUD']
 
 
 def _is_building(f):

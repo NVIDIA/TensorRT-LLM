@@ -25,8 +25,7 @@ from typing import Dict, Optional, Union
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import (str_dtype_to_trt, support_strongly_type, to_json_file,
-                     trt_gte_10)
+from ._utils import str_dtype_to_trt, to_json_file
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .graph_rewriting import optimize
@@ -112,7 +111,7 @@ class Builder():
             explicit_batch_flag = 1 << int(
                 trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 
-        if support_strongly_type() and self.strongly_typed:
+        if self.strongly_typed:
             return Network()._init(
                 self.trt_builder.create_network(
                     explicit_batch_flag
@@ -145,35 +144,15 @@ class Builder():
             @param int8: whether to build with int8 enabled or not. Can't be used together with refit option
             @return: A BuilderConfig object, return None if failed
         '''
-        if strongly_typed and not support_strongly_type():
-            logger.warning(
-                "TRT version does not support strongly_type. strongly_typed flag is ignored."
-            )
-
-        # In TRT 10.0, enable strongly_typed by default.
-        self.strongly_typed = self.strongly_typed or (strongly_typed and
-                                                      support_strongly_type())
+        self.strongly_typed = self.strongly_typed or strongly_typed
 
         quant_mode = kwargs.get("quant_mode", QuantMode(0))
         if not strongly_typed and precision not in self._ALLOWED_PRECISIONS:
             logger.error(
                 f"precision should be one of {self._ALLOWED_PRECISIONS}")
 
-        if use_strip_plan and not trt_gte_10():
-            logger.error(
-                "cannot use --strip_plan with tensorrt version 9.x or below")
-
-        if (use_refit or use_strip_plan) and int8 and not trt_gte_10():
-            # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
-            # These folded weights can not be refitted
-            logger.error(
-                "can't use refit/strip_plan and int8 mode at the same time before tensorrt 10.0"
-            )
-
         config = self.trt_builder.create_builder_config()
         if weight_streaming:
-            assert trt_gte_10(), \
-                  "Weight streaming is only supported by TensorRT 10.0 or later."
             config.set_flag(trt.BuilderFlag.WEIGHT_STREAMING)
         if not self.strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
@@ -195,6 +174,10 @@ class Builder():
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
+
+        # Use fine-grained refit when strip plan is enabled in TRT10.2+.
+        if use_strip_plan:
+            config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
 
         if use_strip_plan:
             config.set_flag(trt.BuilderFlag.STRIP_PLAN)
@@ -384,12 +367,6 @@ class Builder():
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
         builder_config.auto_parallel_config = network.auto_parallel_config
-        if builder_config.auto_parallel_config is not None:
-            mapping = builder_config.auto_parallel_config["mapping"]
-            builder_config.tensor_parallel = mapping.tp_size
-            builder_config.pipeline_parallel = mapping.pp_size
-            builder_config.moe_tensor_parallel = mapping.moe_tp_size
-            builder_config.moe_expert_parallel = mapping.moe_ep_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
         logger.info(
@@ -410,6 +387,8 @@ class Builder():
                 if not network.trt_network.set_weights_name(
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
+                # This mark_weights_refittable has no side effect when refit_individual is not enabled.
+                network.trt_network.mark_weights_refittable(name)
 
         network._fill_weights()
         # Build engine
@@ -849,6 +828,7 @@ def build(model: PretrainedModel,
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
 
@@ -859,9 +839,10 @@ def build(model: PretrainedModel,
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
+    if use_fp8_rowwise:
+        network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
-    network.plugin_config.set_nccl_plugin(
-        nccl_plugin, network.plugin_config.use_custom_all_reduce)
+    network.plugin_config.set_nccl_plugin(nccl_plugin)
 
     # NOTE: Please never change the build_config object after this point!
     if return_build_config:

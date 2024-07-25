@@ -30,8 +30,7 @@ from ._common import default_net, default_trtnet, precision
 from ._utils import (bf16_array, bool_array, dim_resolve_negative,
                      dim_to_trt_axes, dims_array, fp16_array, fp32_array,
                      int32_array, int64_array, np_dtype_to_trt,
-                     str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str,
-                     trt_gte_10)
+                     str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -638,6 +637,15 @@ class RotaryScalingType(IntEnum):
     none = 0
     linear = 1
     dynamic = 2
+    longrope = 3
+    llama3 = 4
+
+    @staticmethod
+    def from_string(s):
+        try:
+            return RotaryScalingType[s]
+        except KeyError:
+            raise ValueError(f'Unsupported rotary scaling type: {s}')
 
 
 class PositionEmbeddingType(IntEnum):
@@ -1020,10 +1028,6 @@ def matmul(input: Tensor,
     '''
     # This option is only supported for fp16, but not bf16 or any other precisions.
     use_fp32_acc = use_fp32_acc and input.dtype == trt.DataType.HALF and mat2.dtype == trt.DataType.HALF
-
-    # TODO: fp32 accum has issues with strongly_typed and it will be fixed in TensorRT 10.0
-    if default_net().strongly_typed and not trt_gte_10():
-        use_fp32_acc = False
 
     if use_fp32_acc:
         input = cast(input, 'float32')
@@ -3393,11 +3397,7 @@ def conv1d(input: Tensor,
                             and bias.producer.type == trt.LayerType.CONSTANT)
         bias = bias.producer.weights if is_bias_constant else trt.Weights()
 
-    input_shuffle_layer = default_trtnet().add_shuffle(input.trt_tensor)
-    input_shuffle_layer.reshape_dims = trt.Dims([*(input.size()), 1])
-    input_shuffled = _create_tensor(input_shuffle_layer.get_output(0),
-                                    input_shuffle_layer)
-
+    input_shuffled = stack([input], dim=input.ndim())
     kernel_size = trt.Dims([kernel_size, 1])
 
     layer = default_trtnet().add_convolution_nd(input_shuffled.trt_tensor,
@@ -3414,14 +3414,7 @@ def conv1d(input: Tensor,
         layer.set_input(2, bias.trt_tensor)
 
     output_2d = _create_tensor(layer.get_output(0), layer)
-    output_2d_shuffle_layer = default_trtnet().add_shuffle(output_2d.trt_tensor)
-    output_2d_shuffle_layer.reshape_dims = trt.Dims(
-        [output_2d.size()[0],
-         output_2d.size()[1],
-         output_2d.size()[2]])
-    output_1d = _create_tensor(output_2d_shuffle_layer.get_output(0),
-                               output_2d_shuffle_layer)
-
+    output_1d = squeeze(output_2d, dim=-1)
     return output_1d
 
 
@@ -3769,7 +3762,7 @@ def create_allreduce_plugin(
 def allreduce(
         tensor: Tensor,
         group: List[int],
-        strategy: Optional[AllReduceStrategy] = None,
+        strategy: Optional[AllReduceStrategy] = AllReduceStrategy.AUTO,
         config: AllReduceConfig = AllReduceConfig(0),
         reduce_fusion_params: Optional[AllReduceFusionParams] = None) -> Tensor:
     '''
@@ -3806,11 +3799,10 @@ def allreduce(
         The tensor produced by that layer.
     '''
 
-    if strategy is None:
-        if default_net().plugin_config.use_custom_all_reduce:
-            strategy = AllReduceStrategy.AUTO
-        else:
-            strategy = AllReduceStrategy.NCCL
+    # TODO(TRTLLM-996): remove this WAR when custom allreduce is supported
+    # for encoder models in C++ runtime.
+    if current_all_reduce_helper().workspace is None:
+        strategy = AllReduceStrategy.NCCL
 
     workspace = None
     counter = 0
@@ -4142,6 +4134,33 @@ def bert_attention(tensor: Tensor,
 class RopeEmbeddingUtils:
 
     @staticmethod
+    # ref: https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L298
+    def apply_llama3_scaling(inv_freqs: np.ndarray, rope_scaling_config: dict):
+
+        scale_factor = rope_scaling_config.get("factor", 8.0)
+        low_freq_factor = rope_scaling_config.get("low_freq_factor", 1.0)
+        high_freq_factor = rope_scaling_config.get("high_freq_factor", 4.0)
+        old_context_len = rope_scaling_config.get(
+            "original_max_position_embeddings", 8192)
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+        new_inv_freqs = []
+        for inv_freq in inv_freqs:
+            wavelen = 2 * math.pi / inv_freq
+            if wavelen < high_freq_wavelen:
+                new_inv_freqs.append(inv_freq)
+            elif wavelen > low_freq_wavelen:
+                new_inv_freqs.append(inv_freq / scale_factor)
+            else:
+                assert low_freq_wavelen != high_freq_wavelen
+                smooth = (old_context_len / wavelen - low_freq_factor) / (
+                    high_freq_factor - low_freq_factor)
+                new_inv_freqs.append((1 - smooth) * inv_freq / scale_factor +
+                                     smooth * inv_freq)
+        return np.array(new_inv_freqs, dtype=inv_freqs.dtype)
+
+    @staticmethod
     def create_sinusoidal_positions(num_pos: int,
                                     dim: int,
                                     theta: float = 10000.0,
@@ -4162,10 +4181,19 @@ class RopeEmbeddingUtils:
             theta: float = 10000.0,
             scale: float = 1.0,
             scale_type: RotaryScalingType = RotaryScalingType.none,
+            # Other scaling configs that only used by certain scaling types.
+            rope_scaling_config: dict = None,
             dtype=np.float32):
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
-        inv_freq = scale / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+        if scale_type == RotaryScalingType.llama3:
+            assert rope_scaling_config is not None, "rotary_scaling config must be provided."
+            inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
+            inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
+                inv_freq, rope_scaling_config)
+        else:
+            inv_freq = scale / (theta
+                                **(np.arange(0, dim, 2) / dim)).astype(dtype)
         sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
                                                 np.arange(num_pos, dtype=dtype),
                                                 inv_freq,
@@ -4175,7 +4203,7 @@ class RopeEmbeddingUtils:
         concat = np.concatenate((np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
                                 axis=-1)
 
-        return concat.reshape(1, -1).astype(dtype)
+        return inv_freq, concat.reshape(1, -1).astype(dtype)
 
     @staticmethod
     def create_sinusoidal_positions_for_cogvlm_attention_plugin(
@@ -4206,7 +4234,7 @@ class RopeEmbeddingUtils:
         concat = np.concatenate((np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
                                 axis=-1)
 
-        return concat.reshape(1, -1).astype(dtype)
+        return inv_freq, concat.reshape(1, -1).astype(dtype)
 
     def create_sinusoidal_positions_long_rope(
             num_pos: int,
@@ -4247,7 +4275,11 @@ class RopeEmbeddingUtils:
                 concat = np.expand_dims(concat, axis=0)
 
             mscale = short_mscale if is_short else long_mscale
-            return concat.astype(dtype) * mscale
+            # gpt attention plugins also need inv_freq.
+            if for_attention_plugin:
+                return inv_freq, concat.astype(dtype) * mscale
+            else:
+                return concat.astype(dtype) * mscale
 
         return _compute_sinusoidal_positions(
             scaling_short_factors, True, False), _compute_sinusoidal_positions(
@@ -4465,14 +4497,14 @@ def gpt_attention(
     rotary_embedding_dim: int = 0,
     rotary_embedding_base: float = 10000.0,
     rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
-    rotary_embedding_scaling_factors: Optional[Tensor] = None,
-    rotary_embedding_short_m_scale: Optional[float] = None,
-    rotary_embedding_long_m_scale: Optional[float] = None,
+    rotary_embedding_short_m_scale: float = 1.0,
+    rotary_embedding_long_m_scale: float = 1.0,
     rotary_embedding_scale: float = 1.0,
     rotary_embedding_max_positions: int = 1024,
     rotary_embedding_original_max_positions: int = 1024,
     position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
     learned_absolute,
+    rotary_inv_freq: Optional[Tensor] = None,
     rotary_cos_sin: Optional[Tensor] = None,
     kv_orig_quant_scale: Optional[Tensor] = None,
     kv_quant_orig_scale: Optional[Tensor] = None,
@@ -4506,6 +4538,7 @@ def gpt_attention(
     spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
+    host_runtime_perf_knobs: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4589,11 +4622,16 @@ def gpt_attention(
                 * RotaryScalingType.none
                 * RotaryScalingType.linear
                 * RotaryScalingType.dynamic
+                * RotaryScalingType.longrope
+                * RotaryScalingType.llama3
 
         rotary_embedding_scale: float
             The scale value to use for linear/dynamic scaling in RoPE.
             Ignored when position_embedding_type is not RoPE.
             Must be set to 1 (default) if rotary_embedding_scale_type is `none`.
+
+        rotary_inv_freq: float Tensor
+            The rotary inv freq with shape [head_size / 2].
 
         rotary_cos_sin: float2(cos/sin) Tensor
             The rotary cos/sin cache, which will be reused among different requests.
@@ -4730,6 +4768,9 @@ def gpt_attention(
                 Shape: [sum(spec_decoding_generation_lengths), divUp(num_draft_tokens + 1, 32)].
 
 
+        host_runtime_perf_knobs: Tensor = None,
+            The runtime perf knobs bit mask, controls whether to use certain perf knob in the runtime.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4857,10 +4898,6 @@ def gpt_attention(
         "block_sparse_vertical_stride",
         np.array([block_sparse_vertical_stride], np.int32),
         trt.PluginFieldType.INT32)
-    multi_block_mode = trt.PluginField(
-        "multi_block_mode",
-        np.array(np.int8(default_net().plugin_config.multi_block_mode),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
     enable_xqa = trt.PluginField(
         "enable_xqa",
         np.array(np.int8(default_net().plugin_config.enable_xqa),
@@ -4925,8 +4962,8 @@ def gpt_attention(
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, multi_block_mode,
-        enable_xqa, kv_cache_quant_mode_field, remove_input_padding, mask_type,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        kv_cache_quant_mode_field, remove_input_padding, mask_type,
         block_sparse_block_size, block_sparse_homo_head_pattern,
         block_sparse_num_local_blocks, block_sparse_vertical_stride,
         paged_kv_cache, tokens_per_block, pf_type, max_context_length,
@@ -4976,10 +5013,10 @@ def gpt_attention(
         ).plugin_config.use_fp8_context_fmha, "FP8 Context FMHA needs to be enabled"
         plug_inputs += [attention_output_orig_quant_scale]
 
+    if rotary_inv_freq is not None:
+        plug_inputs += [rotary_inv_freq]
     if rotary_cos_sin is not None:
         plug_inputs += [rotary_cos_sin]
-    if rotary_embedding_scaling_factors is not None:
-        plug_inputs += [rotary_embedding_scaling_factors]
 
     if alibi_slopes is not None:
         plug_inputs += [alibi_slopes]
@@ -5004,6 +5041,8 @@ def gpt_attention(
             spec_decoding_generation_lengths, spec_decoding_packed_mask,
             spec_decoding_position_offsets
         ]
+    if host_runtime_perf_knobs is not None:
+        plug_inputs += [host_runtime_perf_knobs]
 
     for idx, i in enumerate(plug_inputs):
         assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
@@ -5408,6 +5447,7 @@ ACT2FN = {
     'gelu': gelu,
     'gelu_new': gelu,
     'gelu_fast': gelu,
+    'gelu_pytorch_tanh': gelu,
     'geglu': geglu,
     'gegelu': gegelu,
     'identity': identity,

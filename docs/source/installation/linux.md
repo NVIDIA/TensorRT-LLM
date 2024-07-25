@@ -8,7 +8,7 @@
 
     ```bash
     # Obtain and start the basic docker image environment (optional).
-    docker run --rm --ipc=host --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.4.0-devel-ubuntu22.04
+    docker run --rm --ipc=host --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.4.1-devel-ubuntu22.04
     ```
     Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 

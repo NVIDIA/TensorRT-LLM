@@ -9,7 +9,7 @@ from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import QWenForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.models.qwen.convert import from_hugging_face, quantize
+from tensorrt_llm.models.qwen.convert import load_hf_qwen
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -105,12 +105,7 @@ def parse_arguments():
                         default=128,
                         help='Group size used in GPTQ quantization.')
 
-    parser.add_argument("--dataset-cache-dir",
-                        type=str,
-                        default=None,
-                        help="cache dir to load the hugging face dataset")
     parser.add_argument("--load_model_on_cpu", action="store_true")
-
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",
@@ -162,7 +157,7 @@ def parse_arguments():
     return args
 
 
-def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
+def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
@@ -172,6 +167,7 @@ def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
         elif args.weight_only_precision == 'int4':
             quant_config.quant_algo = QuantAlgo.W4A16
     elif args.smoothquant:
+        quant_config.smoothquant_val = args.smoothquant
         if args.per_channel:
             if args.per_token:
                 quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
@@ -195,11 +191,6 @@ def args_to_quantization(args: argparse.Namespace) -> QuantConfig:
     return quant_config
 
 
-def has_any_quant(args):
-    quant_config = args_to_quantization(args)
-    return quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None
-
-
 def args_to_build_options(args):
     return {
         'use_parallel_embedding': args.use_parallel_embedding,
@@ -210,24 +201,6 @@ def args_to_build_options(args):
     }
 
 
-def preload_model(args, model_dir, load_model_on_cpu):
-    from transformers import AutoModelForCausalLM
-    if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map="auto" if not load_model_on_cpu else 'cpu',
-            torch_dtype='auto',
-            trust_remote_code=True)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map='auto' if not load_model_on_cpu else 'cpu',
-            torch_dtype='auto',
-            trust_remote_code=True).half()
-
-    return model
-
-
 def convert_and_save_hf(args):
     model_dir = args.model_dir
     load_model_on_cpu = args.load_model_on_cpu
@@ -236,11 +209,14 @@ def convert_and_save_hf(args):
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
     override_fields = {}
-    quantization = args_to_quantization(args)
     override_fields.update(args_to_build_options(args))
 
+    # Qwen models have GPTQ-quantized checkpoint available on HF.
+    use_hf_gptq_checkpoint = (args.use_weight_only
+                              and args.weight_only_precision == 'int4_gptq')
+    quant_config = args_to_quant_config(args)
+
     if args.smoothquant is not None or args.int8_kv_cache:
-        assert not args.load_model_on_cpu, "When using quantization, TRT-LLM needs to load the model to GPU"
         mapping = Mapping(
             world_size=world_size,
             rank=-1,  #intentinoally make -1 to avoid mistake
@@ -249,19 +225,17 @@ def convert_and_save_hf(args):
             moe_tp_size=args.moe_tp_size,
             moe_ep_size=args.moe_ep_size,
         )
-        #TODO: change to QWenForCausalLM.quantize later
-        quantize(args.dtype,
-                 args.model_dir,
-                 args.output_dir,
-                 mapping=mapping,
-                 quantization=quantization,
-                 calib_dataset=args.calib_dataset,
-                 override_fields=override_fields,
-                 dataset_cache_dir=args.dataset_cache_dir,
-                 smoothquant_val=args.smoothquant,
-                 int8_kv_cache=args.int8_kv_cache)
+        QWenForCausalLM.quantize(args.model_dir,
+                                 args.output_dir,
+                                 dtype=args.dtype,
+                                 mapping=mapping,
+                                 quant_config=quant_config,
+                                 calib_dataset=args.calib_dataset,
+                                 **override_fields)
     else:
-        hf_model = preload_model(args, model_dir, load_model_on_cpu)
+        # When not loading by shard, preload one complete model and then slice per rank weights from this
+        # this saves the disk reloading time
+        hf_model = load_hf_qwen(model_dir, load_model_on_cpu)
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
@@ -270,17 +244,13 @@ def convert_and_save_hf(args):
                               pp_size=args.pp_size,
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
-            #TODO: change to QWenForCausalLM.from_hugging_face later
-            qwen = from_hugging_face(
-                QWenForCausalLM,
-                hf_model,
-                model_dir,
+            qwen = QWenForCausalLM.from_hugging_face(
+                model_dir if hf_model is None else hf_model,
                 args.dtype,
                 mapping=mapping,
-                quantization=quantization,
-                from_hf_gptq=(args.use_weight_only
-                              and args.weight_only_precision == 'int4_gptq'),
-                override_fields=override_fields)
+                quant_config=quant_config,
+                use_hf_gptq_checkpoint=use_hf_gptq_checkpoint,
+                **override_fields)
             qwen.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del qwen
 

@@ -46,8 +46,8 @@ public:
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
-        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
+        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
@@ -95,6 +95,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Rotary inv_freq cache buffer to avoid re-computing.
+        float const* rotary_inv_freq;
         // Rotary cos sin cache buffer to avoid re-computing.
         float2 const* rotary_cos_sin;
         int32_t input_seq_length; // padded input length
@@ -139,6 +141,7 @@ protected:
 
             ss << "attention_input: " << attention_input << std::endl;
             ss << "qkv_bias: " << qkv_bias << std::endl;
+            ss << "rotary_inv_freq: " << rotary_inv_freq << std::endl;
             ss << "rotary_cos_sin: " << rotary_cos_sin << std::endl;
             ss << "input_seq_length: " << input_seq_length << std::endl;
             ss << "max_past_kv_len: " << max_past_kv_len << std::endl;
@@ -185,6 +188,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Rotary inv_freq cache buffer to avoid re-computing.
+        float const* rotary_inv_freq;
         // NOTE: input_seq_length might be larger than one in the medusa mode.
         int32_t input_seq_length;
         int32_t const* sequence_lengths;
@@ -194,7 +199,6 @@ protected:
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
         float const* attention_output_orig_quant;
-        float const* rotary_embedding_scaling_factors;
         T const* alibi_slopes;
         void* context_buf;
         void* key_value_cache;
@@ -228,6 +232,7 @@ protected:
         bool spec_decoding_is_generation_length_variable = false;
         int32_t spec_decoding_max_generation_length = 1;
         int32_t total_num_input_tokens;
+        int64_t const* runtime_perf_knobs = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>

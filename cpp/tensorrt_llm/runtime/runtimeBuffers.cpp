@@ -451,7 +451,7 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         rnnStateBuffers->getRuntimeBuffers(this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
     }
 
-    if (modelConfig.useCustomAllReduce() && worldConfig.isTensorParallel())
+    if (worldConfig.isTensorParallel())
     {
         inputBuffers.insert_or_assign("all_reduce_workspace", commPtrs);
     }

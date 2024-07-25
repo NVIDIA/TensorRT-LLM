@@ -86,6 +86,7 @@ auto constexpr kLoraWeights = "lora_weights";
 // "moe_4h_to_h": 14 # for mixtral adapter for expert mlp layer: down projection
 // "moe_gate": 15    # for mixtral adapter for expert mlp layer: gate
 // "moe_router": 16  # for mixtral adapter for expert router layer
+// "mlp_router": 17  # for qwen2-moe adapter for shared expert gate layer
 //
 // last dim holds [ module_id, layer_idx, adapter_size (D / R value) ]
 auto constexpr kLoraConfig = "lora_config"; // [num_lora_modules_layers, 3]

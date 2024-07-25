@@ -145,11 +145,12 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     std::vector<int> sequenceLengthsVec(batchSize * beamWidth, maxInputLength);
     outputs.lengths
         = manager.copyFrom(sequenceLengthsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU);
-    outputs.finished = manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kBOOL);
+    outputs.finished = manager.gpu(ITensor::makeShape({batchSize, beamWidth}),
+        TRTDataType<tensorrt_llm::kernels::FinishedState::UnderlyingType>::value);
     inputs.finished = ITensor::view(outputs.finished);
     manager.setZero(*outputs.finished);
-    outputs.finishedSum = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
-    auto* finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);
+    outputs.finishedSum = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+    auto finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
         finishedSumHost[bi] = -1;

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
+#include "lookaheadDecodingLayer.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -49,7 +49,7 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
         = std::dynamic_pointer_cast<LookaheadModule const>(decoderDomain.getSpeculativeDecodingModule());
     auto const [maxW, maxN, maxG] = lookaheadModule->getExecutionConfig().get();
 
-    for (runtime::SizeType32 id = 0; id < maxBatchSize; id++)
+    for (SizeType32 id = 0; id < maxBatchSize; id++)
     {
         mAlgos.emplace_back(maxW, maxN, maxG, id);
     }
@@ -81,7 +81,7 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
 
 template <typename T>
 LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
-    DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> const& bufferManager)
+    DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager)
     : BaseLayer(decoderDomain, bufferManager)
     , mCpuAlgo(std::make_optional<CpuAlgorithmResources>(decoderDomain))
 {
@@ -94,11 +94,10 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
     auto const maxBatchShape1D = ITensor::makeShape({maxBatchSize});
     auto const maxBatchShape2D = ITensor::makeShape({maxBatchSize, maxTokensPerStep});
 
-    mWorkspaceSize = getTopKWorkspaceSize<T>(maxBatchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
-    TLLM_LOG_DEBUG("mWorkspaceSize=%d", mWorkspaceSize);
-
+    auto workspaceSize = getTopKWorkspaceSize<T>(maxBatchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
     mSamplingWorkspaceDevice
-        = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(mWorkspaceSize)}), nvinfer1::DataType::kINT8);
+        = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
+    TLLM_LOG_DEBUG("workspaceSize=%d", getWorkspaceSize());
     mTargetTokensDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
     mRandomSeedsDevice = mBufferManager->gpu(maxBatchShape1D, nvinfer1::DataType::kINT64);
     mSamplingMaskDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kBOOL);
@@ -108,8 +107,8 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
 }
 
 template <typename T>
-void LookaheadDecodingLayer<T>::setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
-    runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -120,9 +119,10 @@ void LookaheadDecodingLayer<T>::setup(runtime::SizeType32 batchSize, runtime::Si
         auto& algoConfigs = setupParams->algoConfigs;
         TLLM_CHECK_WITH_INFO(algoConfigs.size() == 1 || algoConfigs.size() == batchSize,
             "Lookahead runtime configuration size should be either 1 or batchSize");
-        for (runtime::SizeType32 bi = 0; bi < batchSize; bi++)
+        auto const batchSlotsRange = BufferRange<SizeType32 const>(*batchSlots);
+        for (SizeType32 bi = 0; bi < batchSize; bi++)
         {
-            SizeType32 gbi = batchSlots[bi];
+            auto const gbi = batchSlotsRange[bi];
             SizeType32 bi1orN = (algoConfigs.size() == 1) ? 0 : bi;
             TLLM_LOG_DEBUG("CPU ALGO [ %d ] setup", gbi);
             PRINT_TOKENS(setupParams->prompt[bi]);
@@ -138,26 +138,28 @@ void LookaheadDecodingLayer<T>::setup(runtime::SizeType32 batchSize, runtime::Si
     }
 
     auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
     if (setupParams->randomSeed)
     {
         auto& randomSeed = setupParams->randomSeed.value();
         if (randomSeed.size() == 1)
         {
-            invokeCurandInitialize(curandStatesDevicePtr, batchSlots, batchSize, randomSeed.front(), mStream);
+            invokeCurandInitialize(curandStatesDevicePtr, batchSlotsPtr, batchSize, randomSeed.front(), getStream());
             sync_check_cuda_error();
         }
         else
         {
             TLLM_CHECK_WITH_INFO(randomSeed.size() == batchSize, "Random seed vector size mismatch.");
-            cudaAutoCpy(bufferCast<uint64_t>(*mRandomSeedsDevice), randomSeed.data(), batchSize, mStream);
-            invokeCurandBatchInitialize(
-                curandStatesDevicePtr, batchSlots, batchSize, bufferCast<uint64_t>(*mRandomSeedsDevice), mStream);
+            cudaAutoCpy(bufferCast<uint64_t>(*mRandomSeedsDevice), randomSeed.data(), batchSize, getStream());
+            invokeCurandBatchInitialize(curandStatesDevicePtr, batchSlotsPtr, batchSize,
+                bufferCast<uint64_t>(*mRandomSeedsDevice), getStream());
             sync_check_cuda_error();
         }
     }
     else
     {
-        invokeCurandInitialize(curandStatesDevicePtr, batchSlots, batchSize, DefaultDecodingParams::getSeed(), mStream);
+        invokeCurandInitialize(
+            curandStatesDevicePtr, batchSlotsPtr, batchSize, DefaultDecodingParams::getSeed(), getStream());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -179,12 +181,11 @@ void LookaheadDecodingLayer<T>::forwardAsync(
     TLLM_CHECK(inputs->logits);
 
     mBufferManager->copy(
-        inputs->batchSlots->template getPtr<SizeType32 const>(), *mCpuAlgo->mBatchSlots, runtime::MemoryType::kGPU);
-    mBufferManager->copy(inputs->curTokensPerStep->template getPtr<SizeType32 const>(), *mCpuAlgo->mTokensPerStep,
+        bufferCast<SizeType32>(*inputs->batchSlots.value()), *mCpuAlgo->mBatchSlots, runtime::MemoryType::kGPU);
+    mBufferManager->copy(bufferCast<SizeType32>(*inputs->curTokensPerStep.value()), *mCpuAlgo->mTokensPerStep,
         runtime::MemoryType::kGPU);
-    mBufferManager->copy(
-        inputs->endIds.template getPtr<TokenIdType const>(), *mCpuAlgo->mEndIds, runtime::MemoryType::kGPU);
-    mBufferManager->copy(outputs->sequenceLength->template getPtr<SizeType32 const>(), *mCpuAlgo->mSequenceLengths,
+    mBufferManager->copy(bufferCast<TokenIdType>(*inputs->endIds), *mCpuAlgo->mEndIds, runtime::MemoryType::kGPU);
+    mBufferManager->copy(bufferCast<SizeType32>(*outputs->sequenceLength.value()), *mCpuAlgo->mSequenceLengths,
         runtime::MemoryType::kGPU);
 
     TopKSamplingKernelParams<T> params;
@@ -195,13 +196,13 @@ void LookaheadDecodingLayer<T>::forwardAsync(
     params.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     params.maxSeqLen = mDecoderDomain.getMaxDecodingTokens();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.batchSlots = inputs->batchSlots->template getPtr<SizeType32 const>();
+    params.batchSlots = bufferCast<SizeType32>(*inputs->batchSlots.value());
     TLLM_LOG_DEBUG("batchSize = %d", batchSize);
-    params.logProbs = inputs->logits ? inputs->logits->template getPtr<T>() : nullptr;
+    params.logProbs = bufferCastOrNull<T>(inputs->logits);
     params.outputIds = bufferCast<TokenIdType>(*mTargetTokensDevice);
     params.workspace = bufferCast<int8_t>(*mSamplingWorkspaceDevice);
     params.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
-    params.tokensPerStep = inputs->curTokensPerStep->template getPtr<SizeType32 const>();
+    params.tokensPerStep = bufferCast<SizeType32>(*inputs->curTokensPerStep.value());
 
     TLLM_LOG_DEBUG(
         "invokeBatchTopKSampling: maxBatchSize=%d, batchSize=%d, maxTopK=%d, maxTokensPerStep=%d, maxSeqLen=%d, "
@@ -212,7 +213,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(
     // Sample multiple tokens per request and store them to separate to be accepted/rejected later
     // Sequence length is not modified, endIds is not checked, outputLogProbs are not supported.
     // Finished state is not set.
-    invokeBatchTopKSampling(params, mStream);
+    invokeBatchTopKSampling(params, getStream());
 
     mBufferManager->copy(*mTargetTokensDevice, *mCpuAlgo->mTargetTokens);
 
@@ -230,11 +231,17 @@ void LookaheadDecodingLayer<T>::forwardSync(
 }
 
 template <typename T>
+size_t LookaheadDecodingLayer<T>::getWorkspaceSize() const noexcept
+{
+    return mSamplingWorkspaceDevice->getSizeInBytes();
+}
+
+template <typename T>
 void LookaheadDecodingLayer<T>::posIdsToMask(TensorPtr mask, TensorConstPtr posIds)
 {
     auto len = ITensor::volume(posIds->getShape());
-    TLLM_CHECK(mask->getShape().d[0] > len);
-    TLLM_CHECK(mask->getShape().d[1] * 32 > len);
+    TLLM_CHECK(mask->getDimension<0>() > len);
+    TLLM_CHECK(mask->getDimension<1>() * 32 > len);
     auto posIdsRange = BufferRange<SizeType32 const>(*posIds);
     auto maskLocation = BufferLocation<SizeType32>(*mask);
 
@@ -275,7 +282,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     auto outputs = std::dynamic_pointer_cast<SpeculativeDecodingOutputs>(outputParams);
     auto const batchSize = inputs->localBatchSize;
 
-    TensorPtr outputIds(wrap(outputs->outputIds));
     BufferRange<SizeType32 const> tokensPerStepRange(*mCpuAlgo->mTokensPerStep);
     BufferRange<SizeType32> numNewTokensRange(*mCpuAlgo->mNumNewTokens);
     BufferRange<SizeType32> numNewTokensCumSumRange(*mCpuAlgo->mNumNewTokensCumSum);
@@ -310,8 +316,9 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
         }
 
         auto maxNumNewTokens = mCpuAlgo->mOutputIds->getShape().d[1];
+
         mBufferManager->copy(*ITensor::at(mCpuAlgo->mOutputIds, {gbi}),
-            *ITensor::slice(outputIds, {gbi, sequenceLengthsRange[gbi]}, maxNumNewTokens));
+            *ITensor::slice(outputs->outputIds, {gbi, sequenceLengthsRange[gbi]}, maxNumNewTokens));
 
         sequenceLengthsRange[gbi] += numNewTokensRange[gbi];
 
@@ -337,21 +344,21 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     TLLM_CHECK(outputs->numNewTokens);
 
     mBufferManager->copy(*mCpuAlgo->mSequenceLengths,    //
-        const_cast<void*>(outputs->sequenceLength.value().data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->sequenceLength.value()->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mPathsOffsets,       //
-        const_cast<void*>(outputs->pathsOffsets.data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->pathsOffsets->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mNumNewTokens,       //
-        const_cast<void*>(outputs->numNewTokens->data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->numNewTokens.value()->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mNumNewTokensCumSum, //
-        const_cast<void*>(outputs->numNewTokensCumSum.data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->numNewTokensCumSum->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mNextDraftTokens,    //
-        const_cast<void*>(outputs->nextDraftTokens.data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->nextDraftTokens->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mNextDraftPosIds,    //
-        const_cast<void*>(outputs->nextDraftPosIds.data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->nextDraftPosIds->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mPackedMasks,        //
-        const_cast<void*>(outputs->packedMasks.data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->packedMasks->data()), runtime::MemoryType::kGPU);
     mBufferManager->copy(*mCpuAlgo->mNextDraftLengths,   //
-        const_cast<void*>(outputs->nextDraftLengths.data), runtime::MemoryType::kGPU);
+        const_cast<void*>(outputs->nextDraftLengths->data()), runtime::MemoryType::kGPU);
 
     // TODO(liweim) do we need this?
     // mBufferManager->getStream().synchronize();

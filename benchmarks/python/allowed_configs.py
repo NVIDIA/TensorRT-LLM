@@ -42,7 +42,6 @@ class BuildConfig:
     pre_norm: Optional[bool] = None
     do_layer_norm_before: Optional[bool] = None
     enable_context_fmha: bool = True
-    enable_multi_block_mode: bool = False
     # The enum name of PositionEmbeddingType
     # None means using the model family's default value defined in the ctor
     position_embedding_type: str = None
@@ -51,8 +50,6 @@ class BuildConfig:
     rotary_pct: Optional[float] = None
     bias: bool = True
     quantization: Optional[str] = None
-    # use_custom_all_reduce gives better performance with NVLink
-    use_custom_all_reduce: bool = True
     moe_num_experts: int = 0
     moe_top_k: int = 0
     use_alibi: bool = None
@@ -443,8 +440,7 @@ _allowed_configs = {
                                          max_batch_size=16,
                                          max_input_len=8000,
                                          max_seq_len=8200,
-                                         builder_opt=None,
-                                         enable_multi_block_mode=True)),
+                                         builder_opt=None)),
     "llama_70b_long_generation":
     ModelConfig(name="llama_70b_long_generation",
                 family="llama",
@@ -460,8 +456,7 @@ _allowed_configs = {
                                          max_batch_size=64,
                                          max_input_len=200,
                                          max_seq_len=16584,
-                                         builder_opt=None,
-                                         enable_multi_block_mode=True)),
+                                         builder_opt=None)),
     "llama_70b_sq_per_tensor":
     ModelConfig(name="llama_70b_sq_per_tensor",
                 family="llama",
@@ -1207,6 +1202,23 @@ _allowed_configs = {
                     max_seq_len=712,
                     builder_opt=None,
                 )),
+    "qwen2_7b_instruct":
+    ModelConfig(name="qwen2_7b_instruct",
+                family="qwen2",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=28,
+                    num_heads=28,
+                    hidden_size=3584,
+                    vocab_size=152064,
+                    hidden_act='silu',
+                    n_positions=32768,
+                    inter_size=18944,
+                    max_batch_size=64,
+                    max_input_len=512,
+                    max_seq_len=712,
+                    builder_opt=None,
+                )),
     "mamba_2.8b":
     ModelConfig(name="mamba_2.8b",
                 family="mamba",
@@ -1410,6 +1422,118 @@ _allowed_configs = {
                     rnn_conv_dim_size=2560,
                     logits_soft_cap=30.0,
                     state_dtype="float32",
+                )),
+    "llama_v3_8b_instruct":
+    ModelConfig(name="llama_v3_8b_instruct",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    num_kv_heads=8,
+                    hidden_size=4096,
+                    vocab_size=128256,
+                    hidden_act='silu',
+                    n_positions=8192,
+                    inter_size=14336,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_seq_len=2048,
+                    builder_opt=None,
+                )),
+    "mistral_7b_v0.1":
+    ModelConfig(name="mistral_7b_v0.1",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    num_kv_heads=8,
+                    hidden_size=4096,
+                    vocab_size=32000,
+                    hidden_act='silu',
+                    n_positions=32768,
+                    inter_size=14336,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_seq_len=2048,
+                    builder_opt=None,
+                )),
+    "mixtral_8x7b_v0.1":
+    ModelConfig(name="mixtral_8x7b_v0.1",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    num_kv_heads=8,
+                    hidden_size=4096,
+                    vocab_size=32000,
+                    hidden_act='silu',
+                    n_positions=32768,
+                    inter_size=14336,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_seq_len=712,
+                    builder_opt=None,
+                    moe_num_experts=8,
+                    moe_top_k=2,
+                )),
+    "mixtral_8x22b_v0.1":
+    ModelConfig(name="mixtral_8x22b_v0.1",
+                family="llama",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=56,
+                    num_heads=48,
+                    num_kv_heads=8,
+                    hidden_size=6144,
+                    vocab_size=32000,
+                    hidden_act='silu',
+                    n_positions=65536,
+                    inter_size=16384,
+                    max_batch_size=128,
+                    max_input_len=512,
+                    max_seq_len=712,
+                    builder_opt=None,
+                    moe_num_experts=8,
+                    moe_top_k=2,
+                )),
+    "phi_3_mini_4k_instruct":
+    ModelConfig(name="phi_3_mini_4k_instruct",
+                family="phi3",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    num_kv_heads=32,
+                    hidden_size=3072,
+                    vocab_size=32064,
+                    hidden_act='silu',
+                    n_positions=4096,
+                    inter_size=8192,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_seq_len=2048,
+                    builder_opt=None,
+                )),
+    "phi_3_mini_128k_instruct":
+    ModelConfig(name="phi_3_mini_128k_instruct",
+                family="phi3",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=32,
+                    num_heads=32,
+                    num_kv_heads=8,
+                    hidden_size=4096,
+                    vocab_size=128256,
+                    hidden_act='silu',
+                    n_positions=131072,
+                    inter_size=14336,
+                    max_batch_size=64,
+                    max_input_len=1024,
+                    max_seq_len=2048,
+                    builder_opt=None,
                 )),
 }
 

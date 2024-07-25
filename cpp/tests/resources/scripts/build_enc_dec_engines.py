@@ -127,27 +127,35 @@ class Build(RunCMDMixin):
         encoder_build = [
             f"trtllm-build --checkpoint_dir {join(weight_dir, 'encoder')}",
             f"--output_dir {join(engine_dir, 'encoder')}",
-            f'--paged_kv_cache disable', f'--moe_plugin disable',
-            f'--enable_xqa disable', f'--max_beam_width {args.beams}',
-            f'--max_batch_size 8', f'--max_input_len 512',
+            f'--paged_kv_cache disable',
+            f'--moe_plugin disable',
+            f'--enable_xqa disable',
+            f'--max_beam_width {args.beams}',
+            f'--max_batch_size 8',
+            f'--max_input_len 512',
             f'--gemm_plugin {args.dtype}',
             f'--bert_attention_plugin {args.dtype}',
             f'--gpt_attention_plugin {args.dtype}',
-            f'--remove_input_padding enable', f'--context_fmha disable',
-            '--use_custom_all_reduce disable'
+            f'--remove_input_padding enable',
+            f'--context_fmha disable',
         ]
 
         decoder_build = [
             f"trtllm-build --checkpoint_dir {join(weight_dir, 'decoder')}",
             f"--output_dir {join(engine_dir, 'decoder')}",
-            f'--paged_kv_cache enable', f'--moe_plugin disable',
-            f'--enable_xqa disable', f'--max_beam_width {args.beams}',
-            f'--max_batch_size 8', f'--max_seq_len 201',
-            f'--max_encoder_input_len 512', f'--gemm_plugin {args.dtype}',
+            f'--paged_kv_cache enable',
+            f'--moe_plugin disable',
+            f'--enable_xqa disable',
+            f'--max_beam_width {args.beams}',
+            f'--max_batch_size 8',
+            f'--max_seq_len 201',
+            f'--max_encoder_input_len 512',
+            f'--gemm_plugin {args.dtype}',
             f'--bert_attention_plugin {args.dtype}',
             f'--gpt_attention_plugin {args.dtype}',
-            f'--remove_input_padding enable', f'--context_fmha disable',
-            '--max_input_len 1', '--use_custom_all_reduce disable'
+            f'--remove_input_padding enable',
+            f'--context_fmha disable',
+            '--max_input_len 1',
         ]
 
         encoder_build = ' '.join(encoder_build)

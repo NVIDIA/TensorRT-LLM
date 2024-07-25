@@ -31,50 +31,40 @@ class TopPSamplingLayer : public BaseLayer
     using Base = BaseLayer;
 
 public:
-    TopPSamplingLayer(DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator, bool isDeterministic = true,
-        bool isAirTopP = true);
-    ~TopPSamplingLayer();
+    TopPSamplingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager,
+        bool isDeterministic = true, bool isAirTopP = true);
 
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams) override;
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
-    [[nodiscard]] bool const* getSkipDecodeHost() const
-    {
-        return mSkipDecodeHost;
-    }
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 protected:
-    runtime::SizeType32* mRuntimeTopKDevice{nullptr};
-    float* mRuntimeTopPDevice{nullptr};
+    TensorPtr mRuntimeTopKDevice;
+    TensorPtr mRuntimeTopPDevice;
     float mRuntimeMaxTopP{0.f};
-    float* mInitialTopPDevice{nullptr};
-    float* mTopPDecayDevice{nullptr};
-    float* mTopPMinDevice{nullptr};
-    runtime::TokenIdType* mTopPResetIdsDevice{nullptr};
-    void* mSetupWorkspaceDevice{nullptr};
+    TensorPtr mInitialTopPDevice;
+    TensorPtr mTopPDecayDevice;
+    TensorPtr mTopPMinDevice;
+    TensorPtr mTopPResetIdsDevice;
+    BufferPtr mSetupWorkspaceDevice;
 
-    bool* mSkipDecodeDevice{nullptr};
-    bool* mSkipDecodeHost{nullptr};
+    TensorPtr mSkipDecodeDevice;
+    TensorPtr mSkipDecodeHost;
     runtime::SizeType32 mAirTopPBlockNum{0};
+    runtime::SizeType32 mWorkspaceSize{0};
 
     cudaDeviceProp mDeviceProp;
     bool mIsDeterministic{true};
     bool mIsAirTopP{false};
 
-    using Base::mWorkspaceSize;
-    using Base::mAllocatedSize;
-
-    using Base::mStream;
-    using Base::mAllocator;
-
     using Base::mDecoderDomain;
 
 private:
     void allocateBuffer(runtime::SizeType32 batchSize);
-    void freeBuffer();
 };
 
 } // namespace tensorrt_llm::layers

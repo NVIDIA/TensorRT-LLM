@@ -255,7 +255,7 @@ Consider the following diagram, which illustrates how the hidden states from the
 are passed to the base model's language model (LM) head and to four Medusa heads (MHs).
 
 <p align="center">
-    <img src="./media/medusa_tree.svg" alt="Example Medusa Tree" width="auto" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/media/medusa_tree.svg?raw=true" alt="Example Medusa Tree" width="auto" height="auto">
 </p>
 
 In this example:
@@ -296,7 +296,7 @@ So, only `9` candidates are specified.
 
 ## Using Medusa with TensorRT-LLM
 
-For guidance on constructing and executing Medusa with the Python runtime, consult the [Medusa README](../../examples/medusa/README.md). When utilizing the Inflight Fused Batching (IFB) with the C++ API, it is necessary to define the `medusa_choices` explicitly within the model configuration. For detailed instructions, refer to the [model configuration in TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend?tab=readme-ov-file#modify-the-model-configuration) for more details.
+For guidance on constructing and executing Medusa with the Python runtime, consult the [Medusa README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/medusa/README.md). When utilizing the Inflight Fused Batching (IFB) with the C++ API, it is necessary to define the `medusa_choices` explicitly within the model configuration. For detailed instructions, refer to the [model configuration in TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend?tab=readme-ov-file#modify-the-model-configuration) for more details.
 
 ### Limitations
 

@@ -1403,10 +1403,7 @@ if __name__ == "__main__":
         choices=['t5', 'nmt', 'bart', 'pix2struct', 'blip2'],
         help=
         'Multimodal type when this script is used for multimodal conversion.')
-    parser.add_argument('--world_size',
-                        type=int,
-                        default=1,
-                        help='MPI world size (must equal TP * PP)')
+
     parser.add_argument('--tp_size',
                         type=int,
                         default=1,

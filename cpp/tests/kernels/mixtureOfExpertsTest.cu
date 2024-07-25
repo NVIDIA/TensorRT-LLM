@@ -96,9 +96,9 @@ protected:
     constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
     using WeightStorage = std::conditional_t<INT_QUANT, uint8_t, WeightType>;
     constexpr static int WEIGHT_ELEM_PER_BYTE = INT4 ? 2 : 1;
-    constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 8;
-    constexpr static int64_t DEFAULT_HIDDEN_SIZE
-        = HIDDEN_SIZE_MULTIPLIER * 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
+    constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
+    constexpr static int64_t MINIMUM_ALIGNMENT = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
+    constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT;
 
     static BufferManager::CudaStreamPtr mStream;
     static std::unique_ptr<BufferManager> mBufferManager;
@@ -245,7 +245,14 @@ protected:
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
-    std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mSelectedConfig = std::nullopt;
+    // If the test sets mOverrideSelectedConfig1 the BasicPermuteTest and *ParallelTests will use that instead of
+    // looping over samples for the different architectures we support.
+    std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mOverrideSelectedConfig1 = std::nullopt;
+    std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mOverrideSelectedConfig2 = std::nullopt;
+
+    // This is the actual tactic we use internally in runMoePermute
+    std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mInternalSelectedConfig1 = std::nullopt;
+    std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mInternalSelectedConfig2 = std::nullopt;
 
     // Keep to simple power of two so we can have tight bounds on precision for quantized modes
     float const mExpertWDiag1{0.5};
@@ -665,6 +672,45 @@ protected:
         return std::tuple{weight_1, weight_2, bias_1, bias2_ptr, scale_1, scale_2, scale_3};
     }
 
+    auto selectTacticsForArch(int sm)
+    {
+        bool is_sm90 = sm >= 90 && !INT_QUANT;
+        auto tactics = mMoERunner.getTactics();
+        auto it = std::find_if(tactics.begin(), tactics.end(), [is_sm90](auto& c) { return c.is_sm90 == is_sm90; });
+        if (it == tactics.end())
+        {
+            // Fall back to any tactic
+            std::cout << "WARNING: Could not find config for sm version " << sm << std::endl;
+            return std::pair{tactics[0], tactics[0]};
+        }
+        else
+        {
+            return std::pair(*it, *it);
+        }
+    }
+
+    using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+        tensorrt_llm::cutlass_extensions::CutlassGemmConfig>>;
+
+    auto getAllTileConfigsToTest()
+    {
+        if (mOverrideSelectedConfig1 && mOverrideSelectedConfig2)
+        {
+            return ConfigsToTestVec{std::pair{*mOverrideSelectedConfig1, *mOverrideSelectedConfig2}};
+        }
+
+        ConfigsToTestVec tactics{};
+        if (!FP8)
+        {
+            tactics.push_back(selectTacticsForArch(80));
+        }
+        if (getSMVersion() >= 90)
+        {
+            tactics.push_back(selectTacticsForArch(90));
+        }
+        return tactics;
+    }
+
     void runMoEPermute(MOEParallelismConfig parallelism_config)
     {
         // Clear the buffers to blank so we can assume zero if not written
@@ -674,24 +720,15 @@ protected:
             = getWeights(parallelism_config);
 
         auto stream = mStream->get();
-        auto tactic = mSelectedConfig;
-        if (!tactic)
+        auto tactic1 = mInternalSelectedConfig1;
+        auto tactic2 = mInternalSelectedConfig2;
+        if (!tactic1)
         {
             int sm = getSMVersion();
-            bool is_sm90 = sm >= 90 && !INT_QUANT;
-            auto tactics = mMoERunner.getTactics();
-            auto it = std::find_if(tactics.begin(), tactics.end(), [is_sm90](auto& c) { return c.is_sm90 == is_sm90; });
-            if (it == tactics.end())
-            {
-                // Fall back to any tactic
-                std::cout << "WARNING: Could not find config for sm version " << sm << std::endl;
-                tactic = tactics[0];
-            }
-            else
-            {
-                tactic = *it;
-            }
+            std::tie(tactic1, tactic2) = selectTacticsForArch(sm);
         }
+        ASSERT_TRUE(tactic1.has_value());
+        ASSERT_TRUE(tactic2.has_value());
 
         QuantParams quant_params;
         if constexpr (INT_QUANT)
@@ -704,7 +741,7 @@ protected:
                 static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
         }
 
-        mMoERunner.setTactic(tactic);
+        mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
@@ -960,7 +997,7 @@ protected:
         }
     }
 
-    void BasicPermuteTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE);
+    void BasicPermuteTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4);
 
     std::vector<int> calcPermuteMapExpertParallel(std::vector<int> const& expected_experts);
     void ExpertParallelTest(int k = 1);
@@ -1012,52 +1049,58 @@ template <class TypeParam_>
 int MixtureOfExpertsTest<TypeParam_>::mDeviceCount{};
 
 template <class TypeParam_>
-void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(int k, int64_t hidden_size)
+void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(int k, int64_t hidden_size, int64_t num_experts)
 {
     if constexpr (FP8)
     {
         // TODO Remove this when bias + FP8 is supported
         mUseBias = false;
     }
+    auto test_archs = getAllTileConfigsToTest();
+    for (auto [gemm1, gemm2] : test_archs)
+    {
+        mInternalSelectedConfig1 = gemm1;
+        mInternalSelectedConfig2 = gemm2;
 
-    int64_t num_experts = 4;
-    int64_t num_tokens = 3;
+        //    int64_t num_experts = 4;
+        int64_t num_tokens = 3;
 
-    std::vector<DataType> hidden_states(hidden_size * num_tokens);
-    auto raw_unquant_input = populateTokens(hidden_states);
+        std::vector<DataType> hidden_states(hidden_size * num_tokens);
+        auto raw_unquant_input = populateTokens(hidden_states);
 
-    std::vector<float> probs = {
-        0.5, 0.1, 0.25, 0.15,   //
-        0.03, 0.2, 0.07, 0.7,   //
-        0.25, 0.21, 0.35, 0.19, //
-    };
+        std::vector<float> probs = {
+            0.5, 0.1, 0.25, 0.15,   //
+            0.03, 0.2, 0.07, 0.7,   //
+            0.25, 0.21, 0.35, 0.19, //
+        };
 
-    std::vector<std::vector<DataType>> hidden_input = {hidden_states};
-    std::vector<std::vector<float>> router_input = {probs};
-    resizeRouterInputs(router_input, num_experts, num_tokens);
+        std::vector<std::vector<DataType>> hidden_input = {hidden_states};
+        std::vector<std::vector<float>> router_input = {probs};
+        resizeRouterInputs(router_input, num_experts, num_tokens);
 
-    runMoEPermute(hidden_input, router_input, hidden_size, num_experts, k);
+        runMoEPermute(hidden_input, router_input, hidden_size, num_experts, k);
 
-    std::vector<int> expected_experts{0, 3, 2};
-    if (k == 2)
-        expected_experts = {0, 2, 3, 1, 2, 0};
-    else if (k == 3)
-        expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
+        std::vector<int> expected_experts{0, 3, 2};
+        if (k == 2)
+            expected_experts = {0, 2, 3, 1, 2, 0};
+        else if (k == 3)
+            expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
 
-    auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
-    EXPECT_EQ(selected_expert, expected_experts);
+        auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
+        EXPECT_EQ(selected_expert, expected_experts);
 
-    auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
-    // This is the final position of:
-    // Token 1 Expert 1, T2E1, T3E1, T1E2, T2E2, T3E2
-    std::vector<int> permute_map{0, 2, 1};
-    if (k == 2)
-        permute_map = {0, 5, 4, 3, 2, 1};
-    if (k == 3)
-        permute_map = {0, 8, 6, 4, 2, 1, 7, 5, 3};
-    ASSERT_EQ(permute_map, proj_map);
-    compareSoftmax(selected_expert, router_input[0]);
-    compareFinal(selected_expert, router_input[0], raw_unquant_input);
+        auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
+        // This is the final position of:
+        // Token 1 Expert 1, T2E1, T3E1, T1E2, T2E2, T3E2
+        std::vector<int> permute_map{0, 2, 1};
+        if (k == 2)
+            permute_map = {0, 5, 4, 3, 2, 1};
+        if (k == 3)
+            permute_map = {0, 8, 6, 4, 2, 1, 7, 5, 3};
+        ASSERT_EQ(permute_map, proj_map);
+        compareSoftmax(selected_expert, router_input[0]);
+        compareFinal(selected_expert, router_input[0], raw_unquant_input);
+    }
 }
 
 TYPED_TEST(MixtureOfExpertsTest, Permute)
@@ -1107,49 +1150,32 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwiglu)
     this->BasicPermuteTest(3);
 }
 
-TYPED_TEST(MixtureOfExpertsTest, Finished)
+TYPED_TEST(MixtureOfExpertsTest, PermuteVerySmall)
 {
-    if (this->FP8)
+    for (int i = 1; i <= 3; i++)
     {
-        // TODO Remove this when bias + FP8 is supported
-        this->mUseBias = false;
+        this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(3, this->MINIMUM_ALIGNMENT * i);
     }
+}
 
-    using DataType = typename TypeParam::DataType;
-    int64_t hidden_size = this->DEFAULT_HIDDEN_SIZE;
-    int64_t num_experts = 4;
-    int64_t num_tokens = 3;
-    int64_t k = 2;
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
+{
+    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    for (int i = 1; i <= 3; i++)
+    {
+        this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(3, this->MINIMUM_ALIGNMENT * i);
+    }
+}
 
-    std::vector<DataType> hidden_states(hidden_size * num_tokens);
-    auto raw_unquant_input = this->populateTokens(hidden_states);
-
-    std::vector<float> probs = {
-        0.5, 0.1, 0.25, 0.15, //
-        0.05, 0.2, 0.05, 0.7, //
-        0.25, 0.2, 0.35, 0.2, //
-    };
-
-    this->runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {0, 0, 1});
-
-    auto selected_expert = this->getDataFromDevice(this->mSelectedExpert, num_tokens * k);
-    // Token 1
-    EXPECT_EQ(selected_expert[0], 0);
-    EXPECT_EQ(selected_expert[1], 2);
-    // Token 2
-    EXPECT_EQ(selected_expert[2], 3);
-    EXPECT_EQ(selected_expert[3], 1);
-    // Token 3
-    EXPECT_EQ(selected_expert[4], num_experts); // One past the end
-    EXPECT_EQ(selected_expert[5], num_experts);
-
-    auto proj_map = this->getDataFromDevice(this->mSourceToExpandedMap, num_tokens * k);
-    // This is the final position of:
-    // Token 1 Expert 1, T2E1, T3E1, T1E2, T2E2, T3E3
-    std::vector<int> permute_map{0, 3, 4, 2, 1, 5};
-    ASSERT_EQ(permute_map, proj_map);
-    this->compareSoftmax(selected_expert, probs);
-    this->compareFinal(selected_expert, probs, raw_unquant_input);
+TYPED_TEST(MixtureOfExpertsTest, PermuteMixtral8x7b)
+{
+    this->mUseBias = false;
+    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->BasicPermuteTest(2, 4096, 8);
 }
 
 template <class TypeParam_>
@@ -1180,59 +1206,67 @@ void MixtureOfExpertsTest<TypeParam_>::ExpertParallelTest(int k)
         mUseBias = false;
     }
 
-    int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
-    int parallelism = 2;
-    int64_t num_experts = 4;
-    int64_t num_tokens = 3;
-
-    std::vector<DataType> hidden_states(hidden_size * num_tokens);
-    auto raw_unquant_input = populateTokens(hidden_states);
-
-    std::vector<float> probs = {
-        0.5, 0.1, 0.25, 0.15,   //
-        0.03, 0.2, 0.07, 0.7,   //
-        0.25, 0.21, 0.35, 0.19, //
-    };
-
-    std::vector<int> expected_experts{0, 3, 2};
-    if (k == 2)
-        expected_experts = {0, 2, 3, 1, 2, 0};
-    else if (k == 3)
-        expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-    std::vector<OutputType> results(hidden_states.size(), 0);
-    for (int i = 0; i < parallelism; i++)
+    auto test_archs = getAllTileConfigsToTest();
+    for (auto [gemm1, gemm2] : test_archs)
     {
-        if (i == 0)
+        mInternalSelectedConfig1 = gemm1;
+        mInternalSelectedConfig2 = gemm2;
+
+        int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
+        int parallelism = 2;
+        int64_t num_experts = 4;
+        int64_t num_tokens = 3;
+
+        std::vector<DataType> hidden_states(hidden_size * num_tokens);
+        auto raw_unquant_input = populateTokens(hidden_states);
+
+        std::vector<float> probs = {
+            0.5, 0.1, 0.25, 0.15,   //
+            0.03, 0.2, 0.07, 0.7,   //
+            0.25, 0.21, 0.35, 0.19, //
+        };
+
+        std::vector<int> expected_experts{0, 3, 2};
+        if (k == 2)
+            expected_experts = {0, 2, 3, 1, 2, 0};
+        else if (k == 3)
+            expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
+        std::vector<OutputType> results(hidden_states.size(), 0);
+        for (int i = 0; i < parallelism; i++)
         {
-            // Only need to init the inputs on the first iteration
-            runMoEPermute(
-                {hidden_states}, {probs}, hidden_size, num_experts, k, {}, MOEParallelismConfig{1, 0, parallelism, i});
+            if (i == 0)
+            {
+                // Only need to init the inputs on the first iteration
+                runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
+                    MOEParallelismConfig{1, 0, parallelism, i});
+            }
+            else
+            {
+                runMoEPermute(MOEParallelismConfig{1, 0, parallelism, i});
+            }
+
+            auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
+            // Experts should only be selected when we are on the right node
+            // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
+            int const start_expert = i * (mNumExperts / parallelism);
+            std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
+                [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
+            auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, parallelism, i);
+            ASSERT_EQ(selected_expert, masked_expected_experts);
+
+            auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
+            auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
+            ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
+            compareSoftmax(expected_experts, probs);
+
+            // Do the final reduce
+            auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
+            std::transform(
+                iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
         }
-        else
-        {
-            runMoEPermute(MOEParallelismConfig{1, 0, parallelism, i});
-        }
 
-        auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
-        // Experts should only be selected when we are on the right node
-        // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
-        int const start_expert = i * (mNumExperts / parallelism);
-        std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
-            [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
-        auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, parallelism, i);
-        ASSERT_EQ(selected_expert, masked_expected_experts);
-
-        auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
-        auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
-        ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
-        compareSoftmax(expected_experts, probs);
-
-        // Do the final reduce
-        auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
-        std::transform(iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
+        compareFinal(expected_experts, probs, raw_unquant_input, results);
     }
-
-    compareFinal(expected_experts, probs, raw_unquant_input, results);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, ExpertParallel)
@@ -1282,57 +1316,65 @@ void MixtureOfExpertsTest<TypeParam_>::TensorParallelTest(int k)
         mUseBias = false;
     }
 
-    int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
-    int parallelism = 8;
-    int64_t num_experts = 4;
-    int64_t num_tokens = 3;
-
-    std::vector<DataType> hidden_states(hidden_size * num_tokens);
-    auto raw_unquant_input = populateTokens(hidden_states);
-
-    std::vector<float> probs = {
-        0.5, 0.1, 0.25, 0.15,   //
-        0.03, 0.2, 0.07, 0.7,   //
-        0.25, 0.21, 0.35, 0.19, //
-    };
-
-    std::vector<int> expected_experts{0, 3, 2};
-    if (k == 2)
-        expected_experts = {0, 2, 3, 1, 2, 0};
-    else if (k == 3)
-        expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-    std::vector<OutputType> results(hidden_states.size(), 0);
-    for (int i = 0; i < parallelism; i++)
+    auto test_archs = getAllTileConfigsToTest();
+    for (auto [gemm1, gemm2] : test_archs)
     {
-        if (i == 0)
-        {
-            // Only need to init the inputs on the first iteration
-            runMoEPermute(
-                {hidden_states}, {probs}, hidden_size, num_experts, k, {}, MOEParallelismConfig{parallelism, i, 1, 0});
-        }
-        else
-        {
-            runMoEPermute(MOEParallelismConfig{parallelism, i, 1, 0});
-        }
+        mInternalSelectedConfig1 = gemm1;
+        mInternalSelectedConfig2 = gemm2;
 
-        auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
-        EXPECT_EQ(selected_expert, expected_experts);
+        int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
+        int parallelism = 8;
+        int64_t num_experts = 4;
+        int64_t num_tokens = 3;
 
-        auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
-        std::vector<int> permute_map{0, 2, 1};
+        std::vector<DataType> hidden_states(hidden_size * num_tokens);
+        auto raw_unquant_input = populateTokens(hidden_states);
+
+        std::vector<float> probs = {
+            0.5, 0.1, 0.25, 0.15,   //
+            0.03, 0.2, 0.07, 0.7,   //
+            0.25, 0.21, 0.35, 0.19, //
+        };
+
+        std::vector<int> expected_experts{0, 3, 2};
         if (k == 2)
-            permute_map = {0, 5, 4, 3, 2, 1};
-        if (k == 3)
-            permute_map = {0, 8, 6, 4, 2, 1, 7, 5, 3};
+            expected_experts = {0, 2, 3, 1, 2, 0};
+        else if (k == 3)
+            expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
+        std::vector<OutputType> results(hidden_states.size(), 0);
+        for (int i = 0; i < parallelism; i++)
+        {
+            if (i == 0)
+            {
+                // Only need to init the inputs on the first iteration
+                runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
+                    MOEParallelismConfig{parallelism, i, 1, 0});
+            }
+            else
+            {
+                runMoEPermute(MOEParallelismConfig{parallelism, i, 1, 0});
+            }
 
-        ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
+            auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
+            EXPECT_EQ(selected_expert, expected_experts);
 
-        // Do the final reduce
-        auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
-        std::transform(iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
+            auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
+            std::vector<int> permute_map{0, 2, 1};
+            if (k == 2)
+                permute_map = {0, 5, 4, 3, 2, 1};
+            if (k == 3)
+                permute_map = {0, 8, 6, 4, 2, 1, 7, 5, 3};
+
+            ASSERT_EQ(permute_map, proj_map) << "Iteration " << i;
+
+            // Do the final reduce
+            auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
+            std::transform(
+                iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
+        }
+
+        compareFinal(expected_experts, probs, raw_unquant_input, results);
     }
-
-    compareFinal(expected_experts, probs, raw_unquant_input, results);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, TensorParallel)
@@ -1391,64 +1433,71 @@ void MixtureOfExpertsTest<TypeParam_>::MixedParallelTest(int k)
         mUseBias = false;
     }
 
-    int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
-    int tp_parallelism = 2;
-    int ep_parallelism = 2;
-    int64_t num_experts = 4;
-    int64_t num_tokens = 3;
-
-    std::vector<DataType> hidden_states(hidden_size * num_tokens);
-    auto raw_unquant_input = populateTokens(hidden_states);
-
-    std::vector<float> probs = {
-        0.5, 0.1, 0.25, 0.15,   //
-        0.03, 0.2, 0.07, 0.7,   //
-        0.25, 0.21, 0.35, 0.19, //
-    };
-
-    std::vector<int> expected_experts{0, 3, 2};
-    if (k == 2)
-        expected_experts = {0, 2, 3, 1, 2, 0};
-    else if (k == 3)
-        expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
-    std::vector<OutputType> results(hidden_states.size(), 0);
-    for (int i = 0; i < tp_parallelism; i++)
+    auto test_archs = getAllTileConfigsToTest();
+    for (auto [gemm1, gemm2] : test_archs)
     {
-        for (int j = 0; j < ep_parallelism; j++)
+        mInternalSelectedConfig1 = gemm1;
+        mInternalSelectedConfig2 = gemm2;
+
+        int64_t hidden_size = DEFAULT_HIDDEN_SIZE;
+        int tp_parallelism = 2;
+        int ep_parallelism = 2;
+        int64_t num_experts = 4;
+        int64_t num_tokens = 3;
+
+        std::vector<DataType> hidden_states(hidden_size * num_tokens);
+        auto raw_unquant_input = populateTokens(hidden_states);
+
+        std::vector<float> probs = {
+            0.5, 0.1, 0.25, 0.15,   //
+            0.03, 0.2, 0.07, 0.7,   //
+            0.25, 0.21, 0.35, 0.19, //
+        };
+
+        std::vector<int> expected_experts{0, 3, 2};
+        if (k == 2)
+            expected_experts = {0, 2, 3, 1, 2, 0};
+        else if (k == 3)
+            expected_experts = {0, 2, 3, 3, 1, 2, 2, 0, 1};
+        std::vector<OutputType> results(hidden_states.size(), 0);
+        for (int i = 0; i < tp_parallelism; i++)
         {
-            if (i == 0 && j == 0)
+            for (int j = 0; j < ep_parallelism; j++)
             {
-                // Only need to init the inputs on the first iteration
-                runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
-                    MOEParallelismConfig{tp_parallelism, i, ep_parallelism, j});
+                if (i == 0 && j == 0)
+                {
+                    // Only need to init the inputs on the first iteration
+                    runMoEPermute({hidden_states}, {probs}, hidden_size, num_experts, k, {},
+                        MOEParallelismConfig{tp_parallelism, i, ep_parallelism, j});
+                }
+                else
+                {
+                    runMoEPermute(MOEParallelismConfig{tp_parallelism, i, ep_parallelism, j});
+                }
+
+                auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
+                // Experts should only be selected when we are on the right node
+                // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
+                int const start_expert = j * (mNumExperts / ep_parallelism);
+                std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
+                    [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
+                auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_parallelism, j);
+                ASSERT_EQ(selected_expert, masked_expected_experts);
+
+                auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
+                auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
+                ASSERT_EQ(permute_map, proj_map) << "Iteration " << i << " " << j;
+                compareSoftmax(expected_experts, probs);
+
+                // Do the final reduce
+                auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
+                std::transform(
+                    iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
             }
-            else
-            {
-                runMoEPermute(MOEParallelismConfig{tp_parallelism, i, ep_parallelism, j});
-            }
-
-            auto selected_expert = getDataFromDevice(mSelectedExpert, num_tokens * k);
-            // Experts should only be selected when we are on the right node
-            // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
-            int const start_expert = j * (mNumExperts / ep_parallelism);
-            std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
-                [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
-            auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_parallelism, j);
-            ASSERT_EQ(selected_expert, masked_expected_experts);
-
-            auto proj_map = getDataFromDevice(mSourceToExpandedMap, num_tokens * k);
-            auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
-            ASSERT_EQ(permute_map, proj_map) << "Iteration " << i << " " << j;
-            compareSoftmax(expected_experts, probs);
-
-            // Do the final reduce
-            auto iter_results = getDataFromDevice(mFinalOutput, num_tokens * hidden_size);
-            std::transform(
-                iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
         }
-    }
 
-    compareFinal(expected_experts, probs, raw_unquant_input, results);
+        compareFinal(expected_experts, probs, raw_unquant_input, results);
+    }
 }
 
 TYPED_TEST(MixtureOfExpertsTest, MixedParallel)
@@ -1491,40 +1540,57 @@ TYPED_TEST(MixtureOfExpertsTest, MixedParallelSwiglu)
 
 TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 {
-    std::vector<tensorrt_llm::ActivationType> actiavtion_pool = {
+    auto genConfigName = [](auto conf) -> std::string
+    {
+        using namespace tensorrt_llm::cutlass_extensions;
+        std::stringstream tactic;
+        tactic << (conf.is_sm90 ? "SM90+" : "<SM90") << " tactic with tile shape ";
+        if (conf.tile_config_sm90 != CutlassTileConfigSM90::ChooseWithHeuristic)
+        {
+            tactic << (int) conf.tile_config_sm90 << " and cluster shape " << (int) conf.cluster_shape
+                   << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
+                   << (int) conf.epilogue_schedule;
+        }
+        else if (conf.tile_config != CutlassTileConfig::ChooseWithHeuristic)
+        {
+            tactic << (int) conf.tile_config << " and stages " << (int) conf.stages << " split k "
+                   << (int) conf.split_k_factor;
+        }
+        else
+        {
+            return {};
+        }
+        return tactic.str();
+    };
+
+    auto const actiavtion_pool = {
         tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Swiglu, tensorrt_llm::ActivationType::Geglu};
     auto configs = this->mMoERunner.getTactics();
     for (auto const activation_type : actiavtion_pool)
     {
-        for (auto conf : configs)
+        for (auto conf1 : configs)
         {
-            using namespace tensorrt_llm::cutlass_extensions;
-            std::stringstream tactic;
-            tactic << "Failed " << (conf.is_sm90 ? "SM90+" : "<SM90") << " tactic with tile shape ";
-            if (conf.tile_config_sm90 != CutlassTileConfigSM90::ChooseWithHeuristic)
+            for (auto conf2 : configs)
             {
-                tactic << (int) conf.tile_config_sm90 << " and cluster shape " << (int) conf.cluster_shape
-                       << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
-                       << (int) conf.epilogue_schedule;
+                auto name1 = genConfigName(conf1);
+                auto name2 = genConfigName(conf2);
+                if (name1.empty() || name2.empty())
+                {
+                    FAIL() << "Uninitialised tactic encountered";
+                }
+                EXPECT_NO_THROW({
+                    this->mActType = activation_type;
+                    for (int k = 1; k <= 3; k++)
+                    {
+                        this->mOverrideSelectedConfig1 = conf1;
+                        this->mOverrideSelectedConfig2 = conf2;
+                        this->BasicPermuteTest(k);
+                    }
+                    if (::testing::Test::HasFailure()) // Throw on test failure so we get the print message
+                        throw std::runtime_error("Test Failed");
+                }) << "Failed\nTactic 1: "
+                   << name1 << "\nTactic 2: " << name2 << " and activation type: " << static_cast<int>(activation_type);
             }
-            else if (conf.tile_config != CutlassTileConfig::ChooseWithHeuristic)
-            {
-                tactic << (int) conf.tile_config << " and stages " << (int) conf.stages << " split k "
-                       << (int) conf.split_k_factor;
-            }
-            else
-            {
-                FAIL() << "Uninitialised tactic encountered";
-            }
-            tactic << " and activation type: " << static_cast<int>(activation_type);
-
-            EXPECT_NO_THROW({
-                this->mActType = activation_type;
-                this->mSelectedConfig = conf;
-                this->BasicPermuteTest();
-                if (::testing::Test::HasFailure())
-                    throw std::runtime_error("Test Failed");
-            }) << tactic.str();
         }
     }
 }

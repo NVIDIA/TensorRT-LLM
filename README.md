@@ -7,7 +7,7 @@ TensorRT-LLM
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.4.1-green)](https://developer.nvidia.com/cuda-downloads)
-[![trt](https://img.shields.io/badge/TRT-10.1.0-green)](https://developer.nvidia.com/tensorrt)
+[![trt](https://img.shields.io/badge/TRT-10.2.0-green)](https://developer.nvidia.com/tensorrt)
 [![version](https://img.shields.io/badge/release-0.12.0.dev-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
@@ -17,13 +17,19 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/07/23] 👀 @AIatMeta Llama 3.1 405B trained on 16K NVIDIA H100s - inference is #TensorRT #LLM optimized ⚡
+🦙 400 tok/s - per node
+🦙 37 tok/s - per user
+🦙 1 node inference
+➡️ [link](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms)
+<div align="center">
+<img src="docs/source/media/picture-07-23-2024.png" width="45%">
+<div align="left">
+
 * [2024/07/09] Checklist to maximize multi-language performance of @meta #Llama3 with #TensorRT #LLM inference:
 ✅ MultiLingual
 ✅ NIM
 ✅ LoRA tuned adaptors[➡️ Tech blog](https://developer.nvidia.com/blog/deploy-multilingual-llms-with-nvidia-nim/)
-<div align="center">
-<img src="docs/source/media/picture-07-09-2024.png" width="45%">
-<div align="left">
 
 * [2024/07/02] Let the @MistralAI MoE tokens fly 📈 🚀 #Mixtral 8x7B with NVIDIA #TensorRT #LLM on #H100.
 [➡️ Tech blog](https://developer.nvidia.com/blog/achieving-high-mixtral-8x7b-performance-with-nvidia-h100-tensor-core-gpus-and-tensorrt-llm?ncid=so-twit-928467)

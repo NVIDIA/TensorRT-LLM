@@ -84,6 +84,10 @@ TransformerBuffers::TransformerBuffers(
         pastKeyValueLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
         maxAttentionWindows = BufferManager::cpu(ITensor::makeShape({localNbLayers}), nvinfer1::DataType::kINT32);
         sinkTokenLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
+        SizeType32 perfKnobSize = 16;
+        runtimePerfKnobsHost = BufferManager::cpu(ITensor::makeShape({perfKnobSize}), nvinfer1::DataType::kINT64);
+        auto runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
+        std::fill_n(runtimePerfKnobsHostPtr, perfKnobSize, -1);
     }
     else
     {
@@ -198,6 +202,7 @@ TransformerBuffers TransformerBuffers::sliceTo(
         buffers.pastKeyValueLengths = ITensor::slice(pastKeyValueLengths, offset, batchSize);
         buffers.maxAttentionWindows = maxAttentionWindows;
         buffers.sinkTokenLengths = sinkTokenLengths;
+        buffers.runtimePerfKnobsHost = runtimePerfKnobsHost;
     }
     else
     {
@@ -704,6 +709,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         inputBuffers.insert_or_assign("sequence_length", runtimeBuffers->sequenceLengths);
         inputBuffers.insert_or_assign("host_sink_token_length", sinkTokenLengths);
         inputBuffers.insert_or_assign("host_max_attention_window_sizes", maxAttentionWindows);
+        inputBuffers.insert_or_assign("host_runtime_perf_knobs", runtimePerfKnobsHost);
 
         if (modelConfig.usePackedInput())
         {

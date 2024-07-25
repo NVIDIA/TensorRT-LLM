@@ -90,7 +90,6 @@ def read_config(config_path: Path):
     skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
     has_position_embedding = pretrained_config["has_position_embedding"]
     has_token_type_embedding = hasattr(pretrained_config, "type_vocab_size")
-    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     dtype = pretrained_config["dtype"]
 
     paged_kv_cache = plugin_config['paged_kv_cache']
@@ -118,7 +117,6 @@ def read_config(config_path: Path):
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
-        use_custom_all_reduce=use_custom_all_reduce,
         dtype=dtype,
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
@@ -390,7 +388,7 @@ class TRTLLMEncDecModel:
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
 
-        if self.encoder_model_config.use_custom_all_reduce and self.encoder_runtime_mapping.tp_size > 1:
+        if self.encoder_runtime_mapping.tp_size > 1:
             set_peer_access(self.encoder_runtime_mapping)
             ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.encoder_runtime_mapping,

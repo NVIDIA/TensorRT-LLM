@@ -37,12 +37,10 @@ template <typename T>
 class PenaltyLayer : public BaseLayer
 {
 public:
-    PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~PenaltyLayer() override;
-
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
@@ -51,38 +49,34 @@ public:
 
     T* getRuntimeLogitsDevice()
     {
-        return mRuntimeLogitsDevice;
+        return tensorrt_llm::runtime::bufferCast<T>(*mRuntimeLogitsDevice);
     }
+
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept;
 
 private:
     void initialize();
     void allocateWorkspace();
     void allocateBuffer();
-    void freeBuffer();
 
 private:
-    using BaseLayer::mWorkspaceSize;
-    using BaseLayer::mAllocatedSize;
-
-    using BaseLayer::mStream;
-    using BaseLayer::mAllocator;
-
     using BaseLayer::mDecoderDomain;
 
     executor::DecodingMode mDecodingMode;
 
-    float* mTemperatureDevice{nullptr};
-    float* mRepetitionPenaltyDevice{nullptr};
-    float* mPresencePenaltyDevice{nullptr};
-    float* mFrequencyPenaltyDevice{nullptr};
-    runtime::SizeType32* mMinLengthDevice{nullptr};
-    T* mRuntimeLogitsDevice{nullptr};
+    TensorPtr mTemperatureDevice;
+    TensorPtr mRepetitionPenaltyDevice;
+    TensorPtr mPresencePenaltyDevice;
+    TensorPtr mFrequencyPenaltyDevice;
+    TensorPtr mMinLengthDevice;
+    TensorPtr mRuntimeLogitsDevice;
 
-    std::vector<float> mTemperature;
-    std::vector<float> mRepetitionPenalty;
-    std::vector<float> mPresencePenalty;
-    std::vector<float> mFrequencyPenalty;
-    std::vector<SizeType32> mMinLength;
+    TensorPtr mTemperature;
+    TensorPtr mRepetitionPenalty;
+    TensorPtr mPresencePenalty;
+    TensorPtr mFrequencyPenalty;
+    TensorPtr mMinLength;
 
     bool mUseTemperature{false};
     bool mUseRepetitionPenalty{false};
@@ -94,9 +88,9 @@ private:
     runtime::SizeType32 mRuntimeMaxSeqLen{0};
     runtime::SizeType32 mConfiguredBeamWidth{-1};
 
-    runtime::TokenIdType* mPenaltyWorkspaceDevice{nullptr};
-    runtime::TokenIdType* mPenaltyWorkspacePrevDevice{nullptr};
-    runtime::ITensor::SharedPtr mLogitsPtrsHost;
+    BufferPtr mPenaltyWorkspaceDevice;
+    BufferPtr mPenaltyWorkspacePrevDevice;
+    TensorPtr mLogitsPtrsHost;
 };
 
 } // namespace tensorrt_llm::layers

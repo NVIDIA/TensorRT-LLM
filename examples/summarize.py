@@ -63,6 +63,7 @@ def main(args):
         vocab_file=args.vocab_file,
         model_name=model_name,
         model_version=model_version,
+        tokenizer_type=args.tokenizer_type,
     )
     profiler.stop('load tokenizer')
     logger.info(
@@ -176,9 +177,8 @@ def main(args):
             curr_text = curr_text.strip().replace(" n't", "n't")
 
             # TODO: The below lines are used to be compatible with the original code; may need fix
-            if model_name == 'ChatGLMForCausalLM' and model_version in [
-                    'chatglm2', 'chatglm3'
-            ]:
+            if 'GLM' in model_name and model_version in ('chatglm2',
+                                                         'chatglm3'):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
@@ -194,7 +194,7 @@ def main(args):
                 )
                 input_ids = torch.tensor(input_id_list)
             else:
-                if model_name == 'QWenForCausalLM' and model_version == 'qwen2':
+                if model_name == 'QWenForCausalLM' and 'qwen2' in model_version:
                     messages = [{
                         "role": "system",
                         "content": "You are a helpful assistant."
@@ -445,7 +445,7 @@ def main(args):
                 kv_cache_free_gpu_memory_fraction=args.
                 kv_cache_free_gpu_memory_fraction,
                 enable_chunked_context=args.enable_chunked_context,
-            )
+                multi_block_mode=args.multi_block_mode)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
@@ -486,6 +486,7 @@ def main(args):
                 min_input_length=args.min_input_length)
             if output_tensorrt_llm == []:
                 data_point_idx += max_batch_size
+                ite_count += 1
                 continue
             profiler.stop('tensorrt_llm')
             if runtime_rank == 0:
@@ -535,9 +536,9 @@ def main(args):
         }
         args.hf_data_type = dtype_alias_mapping.get(args.hf_data_type,
                                                     args.hf_data_type)
-        if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+        if 'GLM' in model_name and model_version == 'glm':
             auto_model_cls = AutoModelForSeq2SeqLM
-        elif model_name == 'ChatGLMForCausalLM' and model_version == 'chatglm':
+        elif 'GLM' in model_name and model_version == 'chatglm':
             auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
@@ -599,6 +600,7 @@ def main(args):
             profiler.stop('hf')
             if output_hf == []:
                 data_point_idx += max_batch_size
+                ite_count += 1
                 continue
             if runtime_rank == 0:
                 seq_lengths = [len(tokens) for tokens in token_list]

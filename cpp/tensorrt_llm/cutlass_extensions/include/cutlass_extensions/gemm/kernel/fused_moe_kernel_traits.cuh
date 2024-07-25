@@ -31,7 +31,7 @@ struct Routine_Arguments
     ElementWeight* ptr_fc1{};
     ElementInput* ptr_bias{};
     ElementOutput* ptr_output{};
-    int64_t* total_rows_before_expert{};
+    int64_t const* total_rows_before_expert{};
     int gemm_n{};
     int gemm_k{};
     int num_expert{};
@@ -44,7 +44,7 @@ struct Routine_Params
     ElementWeight* ptr_fc1{};
     ElementInput* ptr_bias{};
     ElementOutput* ptr_output{};
-    int64_t* total_rows_before_expert{};
+    int64_t const* total_rows_before_expert{};
     int gemm_n{};
     int gemm_k{};
     int num_expert{};

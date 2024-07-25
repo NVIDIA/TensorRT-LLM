@@ -15,7 +15,8 @@
  */
 
 #pragma once
-#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "torch/csrc/cuda/Stream.h"
 #include "torch/extension.h"
 #include <ATen/cuda/CUDAContext.h>
@@ -69,13 +70,10 @@ inline T get_val(torch::Tensor& t, int idx)
     return reinterpret_cast<T*>(t.data_ptr())[idx];
 }
 
-std::vector<size_t> convert_shape(torch::Tensor tensor);
+tensorrt_llm::runtime::ITensor::Shape convert_shape(torch::Tensor tensor);
 
 template <typename T>
-tensorrt_llm::common::Tensor convert_tensor(torch::Tensor tensor);
-
-template <typename T>
-tensorrt_llm::common::Tensor convert_tensor(torch::Tensor tensor, tensorrt_llm::common::MemoryType memory_type);
+tensorrt_llm::runtime::ITensor::UniquePtr convert_tensor(torch::Tensor tensor);
 
 size_t sizeBytes(torch::Tensor tensor);
 

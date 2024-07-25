@@ -46,7 +46,7 @@ The following table shows the supported software for TensorRT-LLM.
     * - Container
       - [24.05](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
     * - TensorRT
-      - [10.1](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+      - [10.2](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
     * - Precision
       -
         - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
@@ -83,7 +83,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [mT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt)
         - [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi)
-        - [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
+        - [Qwen/Qwen1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
         - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
         - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
         - [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)

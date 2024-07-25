@@ -635,7 +635,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.mp_stats_queue = Fifo(stats_queue_addr, is_server=True)
 
         self._results: Dict[int, GenerationResult] = {}
-        self._request_id_dispatcher_queue = Queue(maxsize=100)
+        self._request_id_dispatcher_queue = Queue()
 
         if mpi_session is None:
             self.mpi_session = MpiPoolSession(n_workers=model_world_size)
@@ -708,10 +708,11 @@ class ExecutorBindingsProxy(GenerationExecutor):
         while (res := self.result_queue.get()) is not None:
             req_id, *_ = res
             # Wait for this result ready in self._results
-            while req_id not in self._results or self._request_id_dispatcher_queue.full(
-            ):
+            while req_id not in self._results:
                 self._request_id_dispatcher_queue.get()
             self._results[req_id].queue.put(res)
+            while not self._request_id_dispatcher_queue.empty():
+                self._request_id_dispatcher_queue.get()
 
     def stats_main(self):
         while (stats := self.mp_stats_queue.get()) is not None:

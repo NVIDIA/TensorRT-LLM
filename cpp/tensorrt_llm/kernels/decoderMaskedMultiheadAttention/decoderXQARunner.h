@@ -116,7 +116,7 @@ private:
     int mMultiProcessorCount;
 
     std::unique_ptr<DecoderXQAImpl> mJITImpl, mPrecompiledImpl;
-    DecoderXQAImpl* getImplFromXQAParams(XQAParams const& params);
+    DecoderXQAImpl* getImplFromXQAParams(XQAParams const& params, bool for_configure_plugin);
 
     friend DecoderXQAImplPrecompiled;
     friend DecoderXQAImplJIT;

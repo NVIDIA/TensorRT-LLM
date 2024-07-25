@@ -109,10 +109,6 @@ def test_model_config():
     model_config.model_variant = model_variant
     assert model_config.model_variant == model_variant
 
-    assert not model_config.use_custom_all_reduce
-    model_config.use_custom_all_reduce = True
-    assert model_config.use_custom_all_reduce
-
 
 def test_world_config():
     tensor_parallelism = 2
@@ -231,7 +227,6 @@ def test_gpt_json_config():
             "tokens_per_block": 0,
             "gpt_attention_plugin": False,
             "remove_input_padding": False,
-            "use_custom_all_reduce": False,
             "context_fmha": False,
             "use_paged_context_fmha": False,
             "lora_plugin": False,

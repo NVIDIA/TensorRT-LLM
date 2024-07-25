@@ -5,9 +5,12 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from transformers import AutoConfig
+
 import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAConfig, LLaMAForCausalLM
 from tensorrt_llm.models.convert_utils import has_safetensors
@@ -55,6 +58,8 @@ def parse_arguments():
     parser.add_argument('--n_kv_head', type=int, default=None)
     parser.add_argument('--n_embd', type=int, default=4096)
     parser.add_argument('--inter_size', type=int, default=11008)
+    parser.add_argument('--multiple_of', type=int, default=None)
+    parser.add_argument('--ffn_dim_multiplier', type=float, default=None)
     parser.add_argument('--rms_norm_eps', type=float, default=1e-06)
 
     parser.add_argument(
@@ -121,10 +126,21 @@ def parse_arguments():
         'By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV'
     )
     parser.add_argument(
+        '--fp8_kv_cache',
+        default=False,
+        action="store_true",
+        help=
+        'By default, we use dtype for KV cache. fp8_kv_cache chooses int8 quantization for KV'
+    )
+    parser.add_argument(
         '--quant_ckpt_path',
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .safetensors format')
+    parser.add_argument("--use_fp8_rowwise",
+                        action="store_true",
+                        default=False,
+                        help="Enable Fp8 per-token per-channel quantization")
 
     parser.add_argument(
         '--per_group',
@@ -208,6 +224,7 @@ def parse_arguments():
         help=
         'Only save the model config w/o read and converting weights, be careful, this is for debug only'
     )
+    parser.add_argument('--log_level', type=str, default='info')
 
     args = parser.parse_args()
     # changing the default to be consistent as the cli help said.
@@ -237,9 +254,16 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
                 quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
             else:
                 quant_config.quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
+    elif args.use_fp8_rowwise:
+        quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+        # this will be overwritten if specified in the hf config.
+        quant_config.clamp_val = [-1200.0, 1200.0]
 
     if args.int8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.INT8
+
+    if args.fp8_kv_cache:
+        quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
     if args.weight_only_precision == 'int4_gptq':
         quant_config.group_size = args.group_size
@@ -250,6 +274,21 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     return quant_config
 
 
+def update_quant_config_from_hf(quant_config, hf_config) -> QuantConfig:
+    hf_config_dict = hf_config.to_dict()
+    if hf_config_dict.get('quantization_config'):
+        # update the quant_algo, and clamp_val.
+        if hf_config_dict['quantization_config'].get(
+                'quant_method') == 'fbgemm_fp8':
+            logger.info(
+                "Load quantization configs from huggingface model_config.")
+            quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+            activation_scale_ub = hf_config_dict['quantization_config'].get(
+                'activation_scale_ub', 1200.0)
+            quant_config.clamp_val = [-activation_scale_ub, activation_scale_ub]
+    return quant_config
+
+
 def convert_and_save_meta(args, rank):
     mapping = Mapping(world_size=args.tp_size * args.pp_size,
                       tp_size=args.tp_size,
@@ -257,11 +296,10 @@ def convert_and_save_meta(args, rank):
                       moe_tp_size=args.moe_tp_size,
                       moe_ep_size=args.moe_ep_size,
                       rank=rank)
-    assert not args_to_quant_config(args).quant_mode.has_any_quant(), \
-        "quantization from meta checkpoint or empty model were never supported"
     llama = LLaMAForCausalLM.from_meta_ckpt(
         args.meta_ckpt_dir,
         args.dtype,
+        quant_config=args_to_quant_config(args),
         mapping=mapping,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim)
@@ -288,6 +326,8 @@ def from_cli_args(args):
         'num_attention_heads': args.n_head,
         'hidden_size': args.n_embd,
         'intermediate_size': args.inter_size,
+        'ffn_dim_multiplier': args.ffn_dim_multiplier,
+        'multiple_of': args.multiple_of,
         'num_key_value_heads': n_kv_head,
         'vocab_size': args.vocab_size,
         'position_embedding_type': 'rope_gpt_neox',
@@ -326,9 +366,16 @@ def convert_and_save_hf(args):
 
     quant_config = args_to_quant_config(args)
 
+    try:
+        hf_config = AutoConfig.from_pretrained(model_dir,
+                                               trust_remote_code=True)
+        quant_config = update_quant_config_from_hf(quant_config, hf_config)
+    except:
+        # llava_llama needs its own defined config.
+        logger.warning("AutoConfig cannot load the huggingface config.")
+
     if args.smoothquant is not None or args.int8_kv_cache:
         assert not args.load_by_shard, "When using quantization, TRT-LLM needs to load the whole HF model, thus load by shard not supported"
-        assert not args.load_model_on_cpu, "When using quantization, TRT-LLM needs to load the model to GPU"
         mapping = Mapping(
             world_size=world_size,
             rank=-1,  #intentinoally make -1 to avoid mistake
@@ -337,13 +384,15 @@ def convert_and_save_hf(args):
             moe_tp_size=args.moe_tp_size,
             moe_ep_size=args.moe_ep_size)
         # TODO: support moe quantization for tp + ep
-        LLaMAForCausalLM.quantize(args.model_dir,
-                                  args.output_dir,
-                                  dtype=args.dtype,
-                                  mapping=mapping,
-                                  quant_config=quant_config,
-                                  calib_dataset=args.calib_dataset,
-                                  **override_fields)
+        LLaMAForCausalLM.quantize(
+            args.model_dir,
+            args.output_dir,
+            dtype=args.dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            device='cpu' if args.load_model_on_cpu else 'cuda',
+            calib_dataset=args.calib_dataset,
+            **override_fields)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
@@ -417,6 +466,7 @@ def execute(workers, func, args):
 def main():
     print(tensorrt_llm.__version__)
     args = parse_arguments()
+    logger.set_level(args.log_level)
 
     world_size = args.tp_size * args.pp_size
     if (args.moe_tp_size == -1 and args.moe_ep_size == -1):

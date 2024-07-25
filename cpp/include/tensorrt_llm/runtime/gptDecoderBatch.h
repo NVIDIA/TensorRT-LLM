@@ -45,7 +45,7 @@ public:
     };
 
     GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream,
-        SpeculativeDecodingMode const& speculativeDecodingMode);
+        SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
 
     //! Setup the decoder before calling `forward()`
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -279,19 +279,19 @@ private:
     std::vector<SizeType32> mBeamWidths;
     std::vector<SizeType32> mNumDecodingEngineTokens;
 
-    TensorPtr mFinishedSteps;   // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
-                                // for each generated token of maxTokensPerStep, on gpu
-    TensorPtr mDraftProbs;      // [batchSize, maxDraftTokens+1, beamWidth, vocabPadded], temporary data for speculative
-                                // decoding accept by logits kernel, on gpu
-    TensorPtr mTargetProbs;     // [batchSize, maxDraftTokens+1, beamWidth, vocabPadded], temporary data for speculative
-                                // decoding accept by logits kernel, on gpu
-    TensorPtr mDraftTokenIds;   // [batchSize, maxDraftTokens+1], draft token indices, on gpu
-    TensorPtr mDraftLogits;     // [batchSize, maxDraftTokens+1, vocabSizePadded], draft token logits, on gpu
+    TensorPtr mFinishedSteps;     // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
+                                  // for each generated token of maxTokensPerStep, on gpu
+    TensorPtr mDraftProbs;        // [batchSize, maxTokensPerEngineStep, beamWidth, vocabPadded], temporary data for
+                                  // speculative decoding accept by logits kernel, on gpu
+    TensorPtr mTargetProbs;       // [batchSize, maxTokensPerEngineStep, beamWidth, vocabPadded], temporary data for
+                                  // speculative decoding accept by logits kernel, on gpu
+    TensorPtr mDraftTokenIds;     // [batchSize, maxTokensPerEngineStep], draft token indices, on gpu
+    TensorPtr mDraftLogits;       // [batchSize, maxTokensPerEngineStep, vocabSizePadded], draft token logits, on gpu
 
-    TensorPtr mBatchSlotsSetup; // [maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsDecoder;      // [maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsAcceptTokens; // [maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsAcceptLogits; // [maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsDecoder; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsAcceptTokens; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsAcceptLogits; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
     TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
     SizeType32 mMaxSequenceLength{};
     SizeType32 mMaxAttentionWindow{};
