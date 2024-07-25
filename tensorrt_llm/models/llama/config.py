@@ -154,7 +154,7 @@ class LLaMAConfig(PretrainedConfig):
 
         dense_ffn_hidden_size = None
         if hasattr(hf_config, "dense_ffn_hidden_size"):
-            dense_ffn_hidden_size = hf_config.dense_ffn_hidden_size,
+            dense_ffn_hidden_size = hf_config.dense_ffn_hidden_size
         moe_layers = None
         if hasattr(hf_config, "moe_layers"):
             moe_layers = hf_config.moe_layers
