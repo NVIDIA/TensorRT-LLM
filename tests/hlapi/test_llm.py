@@ -21,6 +21,10 @@ from utils.util import force_ampere, similar
 
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
+skip_single_gpu = pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="The test needs at least 2 GPUs, skipping")
+
 # The unittests are based on the tiny-llama, which is fast to build and run.
 # There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
 # test_llm_multi_gpu.py.

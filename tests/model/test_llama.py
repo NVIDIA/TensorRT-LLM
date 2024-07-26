@@ -86,8 +86,9 @@ class TestLLaMA(unittest.TestCase):
 
             # Initialize model
             config = tensorrt_llm.models.LLaMAConfig.from_dict(config)
-            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             weights = load_weights_from_hf_model(hf_llama, config)
+
+            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             tensorrt_llm_llama.load(weights)
             optimize_model(tensorrt_llm_llama, **opt_flags)
 

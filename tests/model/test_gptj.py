@@ -29,12 +29,9 @@ from transformers import GPTJConfig, GPTJForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
+from tensorrt_llm.models.gptj.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
-from examples.gptj.convert_checkpoint import convert_hf_gptj
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -82,10 +79,7 @@ class TestGPTJ(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_gptj(hf_gpt,
-                                  gpt_config,
-                                  config.mapping,
-                                  dtype=dtype)
+        weights = load_weights_from_hf_model(hf_gpt, config)
         trtllm_model = tensorrt_llm.models.GPTJForCausalLM(config)
         trtllm_model.load(weights)
 

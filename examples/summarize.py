@@ -182,7 +182,7 @@ def main(args):
                 input_ids = tokenizer.encode(curr_text,
                                              return_tensors='pt').squeeze(0)
                 input_ids = input_ids[:test_token_num]
-            elif model_name == 'QWenForCausalLM' and model_version == 'qwen':
+            elif 'qwen' in model_name.lower() and model_version == 'qwen':
                 # use make_content to generate prompt
                 system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
                 _, input_id_list = make_context(
@@ -194,7 +194,7 @@ def main(args):
                 )
                 input_ids = torch.tensor(input_id_list)
             else:
-                if model_name == 'QWenForCausalLM' and 'qwen2' in model_version:
+                if 'qwen' in model_name.lower() and 'qwen2' in model_version:
                     messages = [{
                         "role": "system",
                         "content": "You are a helpful assistant."
@@ -527,7 +527,7 @@ def main(args):
             ite_count += 1
         del runner
 
-    if test_hf:
+    if test_hf and runtime_rank == 0:
         profiler.start('load HF model')
         dtype_alias_mapping = {
             'fp32': 'float32',

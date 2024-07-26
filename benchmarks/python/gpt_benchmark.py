@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import os
-from dataclasses import asdict
 from math import ceil
 
 import pandas as pd
@@ -22,11 +20,11 @@ import tensorrt as trt
 import torch
 
 import tensorrt_llm
-from tensorrt_llm.profiler import bytes_to_target_unit
+from tensorrt_llm.builder import Engine
+from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
+                                  SamplingConfig)
 
-from allowed_configs import get_build_config, BuildConfig  # isort:skip
 from base_benchmark import BaseBenchmark  # isort:skip
-from build import build_gpt, get_quant_config  # isort:skip
 
 
 def element_size(dtype: str):
@@ -46,80 +44,26 @@ class GPTBenchmark(BaseBenchmark):
     def __init__(self, args, batch_sizes, in_out_lens, gpu_weights_percents,
                  rank, world_size):
         super().__init__(args.engine_dir, args.model, args.dtype, rank,
-                         world_size, args.serial_build)
+                         world_size)
         self.batch_sizes = batch_sizes
         self.in_out_lens = in_out_lens
         self.gpu_weights_percents = gpu_weights_percents
         self.num_beams = args.num_beams
-        self.mode = args.mode
-        self.build_time = 0
-
         self.cuda_graph_mode = args.enable_cuda_graph
-        self.build_config = None
-        # this dtype may be modified based on quantization mode later, when the fp8/int8 kv cache is used
-        self.kv_dtype = args.dtype
-
-        # approximate the weights size in the engine by using engine size
-        # the actual weights size shall be smaller because there are some other data in the engine file.
-        # for large model, this approximate is close enough.
-        self.weights_size_approx = 0
-
         self.dump_layer_info = args.dump_layer_info
-        # change profiling_verbosity to detailed when enabling dump layer info
-        if self.dump_layer_info:
-            args.profiling_verbosity = "detailed"
 
-        if args.engine_dir is not None:
-            # Get build configs from engine directory is done in base class
-            # Deserialize engine from engine directory
-            self.serialize_path = os.path.join(args.engine_dir,
-                                               self.engine_name)
-            with open(self.serialize_path, 'rb') as f:
-                engine_buffer = f.read()
-                self.weights_size_approx = len(engine_buffer)
-        else:
-            self.build_config = get_build_config(args.model, return_dict=False)
-
-            for key, value in asdict(self.build_config).items():
-                setattr(self, key, value)
-            if args.force_num_layer_1:
-                self.num_layers = 1
-            if args.max_batch_size is not None:
-                self.max_batch_size = args.max_batch_size
-            if args.max_input_len is not None:
-                self.max_input_len = args.max_input_len
-            if args.max_seq_len is not None:
-                self.max_seq_len = args.max_seq_len
-
-            self.quant_config = get_quant_config(args.quantization)
-            self.quant_mode = self.quant_config.quant_mode
-            self.enable_fp8 = self.quant_mode.has_fp8_qdq()
-            self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
-            if self.quant_mode.has_fp8_kv_cache():
-                self.kv_dtype = 'fp8'
-            if self.quant_mode.has_int8_kv_cache():
-                self.kv_dtype = 'int8'
-
-            # Plugins
-            self.use_gpt_attention_plugin = False
-            self.remove_input_padding = False
-            self.use_mamba_conv1d_plugin = False
-            if args.mode == 'plugin':
-                self.use_gpt_attention_plugin = True
-                self.remove_input_padding = True
-                self.use_moe_plugin = True
-                self.use_mamba_conv1d_plugin = True
-            elif args.mode == 'ootb-except-mha':
-                self.use_gpt_attention_plugin = True
-                self.remove_input_padding = True
-
-            engine_buffer, build_time = build_gpt(args)
-            self.weights_size_approx = engine_buffer.nbytes
-            self.build_time = build_time
-
+        # Get build configs from engine directory is done in base class
+        # Deserialize engine from engine directory
+        engine = Engine.from_dir(args.engine_dir, rank)
+        engine_buffer = engine.engine
         assert engine_buffer is not None
-        if args.build_only:
-            return
+        pretrained_config = engine.config.pretrained_config
+        if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
+                'glm', 'chatglm'
+        ]:
+            session_cls = ChatGLMGenerationSession
+        else:
+            session_cls = GenerationSession
 
         if not hasattr(self, 'num_kv_heads') or self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
@@ -155,50 +99,11 @@ class GPTBenchmark(BaseBenchmark):
             gpu_weights_percent=list(sorted(gpu_weights_percents))[0],
             **rnn_configs_kwargs,
         )
-        if args.model == 'chatglm_6b':
-            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=130005,
-                pad_id=3,
-                num_beams=self.num_beams,
-                top_k=args.top_k,
-                top_p=args.top_p)
-            self.decoder = tensorrt_llm.runtime.ChatGLMGenerationSession(
-                model_config, engine_buffer, self.runtime_mapping)
-        elif args.model in ['chatglm2_6b', 'chatglm3_6b']:
-            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=2,
-                pad_id=0,
-                num_beams=self.num_beams,
-                top_k=args.top_k,
-                top_p=args.top_p)
-            self.decoder = tensorrt_llm.runtime.GenerationSession(
-                model_config, engine_buffer, self.runtime_mapping)
-        if args.model == 'glm_10b':
-            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=50258,
-                pad_id=50256,
-                num_beams=self.num_beams,
-                top_k=args.top_k,
-                top_p=args.top_p)
-            self.decoder = tensorrt_llm.runtime.ChatGLMGenerationSession(
-                model_config, engine_buffer, self.runtime_mapping)
-        else:
-            end_id = 50256
-            pad_id = 50256
-            if "llama" in args.model:
-                end_id = 2
-                pad_id = 0
-            self.sampling_config = tensorrt_llm.runtime.SamplingConfig(
-                end_id=end_id,
-                pad_id=pad_id,
-                num_beams=self.num_beams,
-                top_k=args.top_k,
-                top_p=args.top_p)
-            self.decoder = tensorrt_llm.runtime.GenerationSession(
-                model_config,
-                engine_buffer,
-                self.runtime_mapping,
-                cuda_graph_mode=self.cuda_graph_mode)
+        self.sampling_config = SamplingConfig(end_id=2, pad_id=0)
+        self.decoder = session_cls(model_config,
+                                   engine_buffer,
+                                   self.runtime_mapping,
+                                   cuda_graph_mode=self.cuda_graph_mode)
 
         # Print context memory size for CI/CD to track.
         context_mem_size = self.decoder.context_mem_size
@@ -260,72 +165,6 @@ class GPTBenchmark(BaseBenchmark):
                                 benchmark_profiler=benchmark_profiler)
         torch.cuda.synchronize()
 
-    @staticmethod
-    def kv_cache_elem_per_token(config: BuildConfig, tp_size, pp_size) -> int:
-        # you need to multiply the size by element size, and multiply by the seq length
-        # Warning: this function returns the upper bound between different ranks when any one of the following is true:
-        # num_layer % pp_size !=0, hidden_size % num_kv_heads != 0, num_kv_heads % tp_size != 0
-        local_nlayers = ceil(config.num_layers / pp_size)
-        kv_heads = config.num_kv_heads if config.num_kv_heads is not None else config.num_heads
-        size_per_head = ceil(config.hidden_size / kv_heads)
-        local_heads = ceil(kv_heads / tp_size)
-        return 2 * local_nlayers * size_per_head * local_heads
-
-    def check_memory(self, io_shapes: list, raise_exception=False):
-        '''Compare the estimated GPU memory requirements for weights + activations + kv cache with the total GPU memory and log it.
-           Raise exception when the \p raise_exception parameter is true.
-        '''
-        # we don't want to block the test due to this
-        if self.build_config is None:
-            tensorrt_llm.logger.warning(
-                "Didn't have the build config object, skipping check the memory"
-            )
-            return
-        assert isinstance(self.build_config, BuildConfig)
-        batch_size, inlen, outlen = io_shapes[0], io_shapes[1], io_shapes[2]
-        kv_cache_size_in_bytes = batch_size*self.num_beams*(inlen + outlen)* \
-            self.kv_cache_elem_per_token(self.build_config, self.runtime_mapping.tp_size, self.runtime_mapping.pp_size) * element_size(self.kv_dtype)
-        # when MHA is OOTB, it requires extra KV cache size, because OOTB don't support inplace updating KV cache.
-        if not self.use_gpt_attention_plugin:
-            local_n_layer = ceil(self.build_config.num_layers /
-                                 self.runtime_mapping.pp_size)
-            kv_cache_size_in_bytes = kv_cache_size_in_bytes / local_n_layer * (
-                local_n_layer + 1)
-
-        kv_cache_size_in_mb = bytes_to_target_unit(kv_cache_size_in_bytes,
-                                                   "MiB")
-        activation_size_in_mb = bytes_to_target_unit(
-            self.decoder.runtime.engine.device_memory_size, "MiB")
-        weights_size_in_mb = bytes_to_target_unit(self.weights_size_approx,
-                                                  "MiB")
-        total_memory_approx_in_mb = kv_cache_size_in_mb + activation_size_in_mb + weights_size_in_mb
-        _, _, total = tensorrt_llm.profiler.device_memory_info()
-        total_in_mb = bytes_to_target_unit(total, 'MiB')
-        prefix = "[Memory Estimation]"
-
-        mem_msg = f"{prefix} activation memory:{activation_size_in_mb:.3f} MiB, kv_cache:{kv_cache_size_in_mb:.3f} MiB, weights approximate:{weights_size_in_mb:.3f} MiB, " \
-                  f"approximate required GPU memory: {total_memory_approx_in_mb:.3f} MiB, total GPU memory: {total_in_mb:.3f} MiB"
-        tensorrt_llm.logger.info(mem_msg)
-
-        build_args = dict(batch_size=batch_size,
-                          num_beams=self.num_beams,
-                          input_length=inlen,
-                          output_length=outlen,
-                          max_batch_size=self.build_config.max_batch_size,
-                          max_input_len=self.build_config.max_input_len,
-                          max_seq_len=self.build_config.max_seq_len,
-                          max_beam_width=self.build_config.max_beam_width)
-        for k, v in build_args.items():
-            tensorrt_llm.logger.info(f"{prefix} {k}:{v}")
-
-        tensorrt_llm.logger.info(
-            "grep the \"Total Activation\" and \"Total Weights\" from verbose TRT engine build log to see the precise memory size for those."
-        )
-        if raise_exception and total_memory_approx_in_mb >= total_in_mb:
-            raise Exception(
-                "Total memory estimation bigger than total gpu memory, the case will likely to OOM, needs enhancement of waive the test case, see logs about the memory usage details"
-            )
-
     def report(self,
                config,
                latency,
@@ -348,7 +187,6 @@ class GPTBenchmark(BaseBenchmark):
         report_dict["input_length"] = inlen
         report_dict["output_length"] = outlen
         report_dict["latency(ms)"] = latency
-        report_dict["build_time(s)"] = self.build_time
         report_dict["tokens_per_sec"] = tokens_per_sec
         report_dict["percentile95(ms)"] = percentile95
         report_dict["percentile99(ms)"] = percentile99

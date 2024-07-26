@@ -37,7 +37,10 @@ DEFAULT_HF_MODEL_DIRS = {
     'MPTForCausalLM': 'mosaicml/mpt-7b',
     'PhiForCausalLM': 'microsoft/phi-2',
     'OPTForCausalLM': 'facebook/opt-350m',
+    'QWenLMHeadModel': 'Qwen/Qwen-7B',
     'QWenForCausalLM': 'Qwen/Qwen-7B',
+    'Qwen2ForCausalLM': 'Qwen/Qwen1.5-7B',
+    'Qwen2MoeForCausalLM': 'Qwen/Qwen1.5-MoE-A2.7B',
     'RecurrentGemmaForCausalLM': 'google/recurrentgemma-2b',
 }
 
@@ -46,14 +49,16 @@ INTERNLM_META_INSTRUCTION = """You are an AI assistant whose name is InternLM (�
 - InternLM (书生·浦语) can understand and communicate fluently in the language chosen by the user such as English and 中文.
 """
 
+QWEN_PROMPT_TEMPLATE = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n"
+
 DEFAULT_PROMPT_TEMPLATES = {
-    'InternLMForCausalLM':
-    "<|User|>:{input_text}<eoh>\n<|Bot|>:",
-    'InternLM2ForCausalLM':
-    "<|im_start|>system\n" + INTERNLM_META_INSTRUCTION +
+    'InternLMForCausalLM': "<|User|>:{input_text}<eoh>\n<|Bot|>:",
+    'InternLM2ForCausalLM': "<|im_start|>system\n" + INTERNLM_META_INSTRUCTION +
     "<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
-    'QWenForCausalLM':
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{input_text}<|im_end|>\n<|im_start|>assistant\n",
+    'QWenLMHeadModel': QWEN_PROMPT_TEMPLATE,
+    'QWenForCausalLM': QWEN_PROMPT_TEMPLATE,
+    'Qwen2ForCausalLM': QWEN_PROMPT_TEMPLATE,
+    'Qwen2MoeForCausalLM': QWEN_PROMPT_TEMPLATE,
 }
 
 
@@ -83,7 +88,7 @@ def read_model_name(engine_dir: str):
     model_version = None
     if 'GLM' in model_arch:
         model_version = config['pretrained_config']['chatglm_version']
-    if model_arch == 'QWenForCausalLM':
+    if 'qwen' in model_arch.lower():
         model_version = config['pretrained_config']['qwen_type']
     return model_arch, model_version
 
@@ -134,7 +139,7 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                                 padding_side='left',
                                 truncation_side='left',
                                 legacy=False)
-    if model_name == 'QWenForCausalLM' and model_version == 'qwen':
+    if 'qwen' in model_name.lower() and model_version == 'qwen':
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
             gen_config = json.load(f)
         pad_id = gen_config['pad_token_id']

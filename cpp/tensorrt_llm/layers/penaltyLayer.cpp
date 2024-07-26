@@ -98,6 +98,8 @@ void PenaltyLayer<T>::allocateBuffer()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     mLogitsPtrsHost = mBufferManager->pinnedPool(ITensor::makeShape({}), TRTDataType<T*>::value);
+    mLogitsPtrsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<T*>::value);
     auto const batchSizeShape = ITensor::makeShape({mDecoderDomain.getBatchSize()});
     mTemperature = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mRepetitionPenalty = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
@@ -233,6 +235,7 @@ void PenaltyLayer<T>::forwardAsync(
     mCyclicStep = mCyclicStep % mRuntimeMaxSeqLen;
 
     TensorPtr logitsPtrsHost = ITensor::slice(mLogitsPtrsHost, mCyclicStep, 1);
+    logitsPtrsHost->squeeze(0);
     auto logitsPtrsHostData = bufferCast<T*>(*logitsPtrsHost);
     for (SizeType32 bi = 0; bi < localDecoderDomain.getBatchSize(); bi++)
     {
@@ -274,7 +277,13 @@ void PenaltyLayer<T>::forwardAsync(
     auto const tokensPerStep = bufferCastOrNull<SizeType32>(params->curTokensPerStep);
 
     InvokeBatchApplyPenaltyParams<T> penaltyParams;
-    penaltyParams.inputLogits = reinterpret_cast<T const* const*>(logitsPtrsHostData);
+
+    { // Moving the logits ptrs to device for faster access during kernel execution.
+        TensorPtr logitsPtrsDeviceSlice = ITensor::slice(mLogitsPtrsDevice, 0, localDecoderDomain.getBatchSize());
+        TensorPtr logitsPtrsHostSlice = ITensor::slice(logitsPtrsHost, 0, localDecoderDomain.getBatchSize());
+        mBufferManager->copy(*logitsPtrsHostSlice, *logitsPtrsDeviceSlice);
+        penaltyParams.inputLogits = reinterpret_cast<T const* const*>(bufferCast<T const*>(*logitsPtrsDeviceSlice));
+    }
     penaltyParams.outputLogits = bufferCast<T>(*mRuntimeLogitsDevice);
     penaltyParams.biases = embeddingBias;
     penaltyParams.penaltyWorkspace = bufferCastOrNull<TokenIdType>(mPenaltyWorkspaceDevice);

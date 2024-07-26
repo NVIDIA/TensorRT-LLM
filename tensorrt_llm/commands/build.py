@@ -27,7 +27,6 @@ import torch
 from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.builder import BuildConfig, Engine, build
-from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
@@ -443,48 +442,6 @@ def main():
             cluster_config = dict(cluster_key=args.cluster_key)
         else:
             cluster_config = infer_cluster_config()
-
-        # Extract rotary scaling which will be used for checks and default value of max_seq_len
-        rotary_scaling = getattr(model_config, "rotary_scaling", None)
-        if rotary_scaling is not None:
-            rotary_type = rotary_scaling.get('type',
-                                             rotary_scaling.get('rope_type'))
-            rotary_factor = rotary_scaling.get(
-                'factor', 1.0) if rotary_type != 'su' else 1
-        else:
-            rotary_factor = 1
-
-        if args.max_seq_len is None:
-            # Step 1: Find the upper bound of max_seq_len
-            deduced_max_seq_len = 2048
-            if model_config.max_position_embeddings is not None:
-                deduced_max_seq_len = model_config.max_position_embeddings
-
-            # Step 2: Scale max_seq_len with rotary scaling
-            if rotary_factor != 1:
-                deduced_max_seq_len *= rotary_factor
-                logger.warning(
-                    f'max_seq_len is scaled to {deduced_max_seq_len} by rotary scaling {rotary_factor}'
-                )
-
-            # Step 3: Assign the new max_seq_len
-            args.max_seq_len = deduced_max_seq_len
-            logger.info(
-                f'max_seq_len is not specified, using value {deduced_max_seq_len}'
-            )
-        else:
-            if not plugin_config.streamingllm and model_config.max_position_embeddings is not None \
-                and model_config.position_embedding_type != PositionEmbeddingType.relative:
-                if args.max_seq_len > model_config.max_position_embeddings * rotary_factor:
-                    logger.warning(
-                        f'max_seq_len {args.max_seq_len} is larger than max_position_embeddings {model_config.max_position_embeddings} * rotary scaling {rotary_factor}, '
-                        'the model accuracy might be affected')
-
-        if args.max_input_len > args.max_seq_len:
-            logger.warning(
-                f'max_input_len is {args.max_input_len} is larger than max_seq_len {args.max_seq_len}, clipping it to max_seq_len'
-            )
-            args.max_input_len = args.max_seq_len
 
         build_config = BuildConfig.from_dict(
             {

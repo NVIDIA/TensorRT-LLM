@@ -4975,6 +4975,7 @@ def gpt_attention(
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
+    assert attn_plug
     plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
     if use_cache:
         plug_inputs += [
@@ -5510,7 +5511,7 @@ def lora_plugin(
     transa: bool = False,
     transb: bool = False,
     host_context_lengths: Tensor = None,  # for pad-free input mode
-    max_context_length: int = 0,
+    max_num_tokens: int = 0,
     max_low_rank: int = 0,
     lora_ranks: List[Tensor] = None,
     lora_weights_pointers: List[Tensor] = None,
@@ -5541,8 +5542,8 @@ def lora_plugin(
         host_context_lengths: cpu Tensor = None
             A host tensor that contains the lengths of the different inputs,
 
-        max_context_length : int
-            Maximum length during context phase, used to determine the workspace size.
+        max_num_tokens : int
+            Maximum number of tokens, used to determine the workspace size.
 
         max_low_rank : int
             Maximum low_rank, used to determine the workspace size.
@@ -5591,8 +5592,8 @@ def lora_plugin(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
-    max_context_length_field = trt.PluginField(
-        "max_context_length", np.array(max_context_length, dtype=np.int32),
+    max_num_tokens_field = trt.PluginField(
+        "max_num_tokens", np.array(max_num_tokens, dtype=np.int32),
         trt.PluginFieldType.INT32)
     max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
@@ -5607,7 +5608,7 @@ def lora_plugin(
 
     pfc = trt.PluginFieldCollection([
         in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
-        remove_input_padding, max_context_length_field, max_low_rank_field,
+        remove_input_padding, max_num_tokens_field, max_low_rank_field,
         weight_index_field
     ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)

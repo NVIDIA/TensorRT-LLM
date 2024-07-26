@@ -27,6 +27,7 @@ from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
 from .gpt.model import GPTForCausalLM, GPTModel
+from .gptj.config import GPTJConfig
 from .gptj.model import GPTJForCausalLM, GPTJModel
 from .gptneox.model import GPTNeoXForCausalLM, GPTNeoXModel
 from .grok.model import GrokForCausalLM
@@ -65,6 +66,7 @@ __all__ = [
     'MedusaConfig',
     'MedusaForCausalLm',
     'ReDrafterForCausalLM',
+    'GPTJConfig',
     'GPTJModel',
     'GPTJForCausalLM',
     'GPTNeoXModel',

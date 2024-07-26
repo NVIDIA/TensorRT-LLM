@@ -612,7 +612,7 @@ class Attention(Module):
                     ],
                     host_request_types=q_lora_params.host_request_types,
                     host_context_lengths=q_lora_params.host_context_lengths,
-                    max_context_length=q_lora_params.max_context_length,
+                    max_num_tokens=q_lora_params.max_num_tokens,
                     max_encoder_context_length=q_lora_params.
                     max_encoder_context_length,
                     host_encoder_input_lengths=q_lora_params.
@@ -1337,7 +1337,7 @@ class BertAttention(Module):
                     ],
                     host_request_types=q_lora_params.host_request_types,
                     host_context_lengths=q_lora_params.host_context_lengths,
-                    max_context_length=q_lora_params.max_context_length)
+                    max_num_tokens=q_lora_params.max_num_tokens)
 
                 q_lora, k_lora, v_lora = self.qkv_lora(hidden_states,
                                                        qkv_lora_params)

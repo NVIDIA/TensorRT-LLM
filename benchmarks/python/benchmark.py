@@ -20,26 +20,15 @@ import torch
 
 
 def parse_arguments():
-    from allowed_configs import get_allowed_models
     parser = argparse.ArgumentParser(
         description='Benchmark TensorRT-LLM models.')
     parser.add_argument('-m',
                         '--model',
                         type=str,
-                        default="gpt_350m",
-                        choices=get_allowed_models(),
-                        help='Specify model you want to benchmark.')
-    parser.add_argument(
-        '--mode',
-        type=str,
-        default="plugin",
-        choices=['ootb', 'plugin', 'ootb-except-mha'],
-        help=
-        ('Choose mode between ootb/plugin. '
-         '\"ootb\" means the engines will be built without any plugins, '
-         '\"plugin\" means the engines will be built with tuned recipe of using plugins.'
-         '\"ootb-except-mha\" means the engines will be built with only attention plugins.'
-         ))
+                        default="dec",
+                        choices=["dec", "enc", "enc-dec"],
+                        help='Specify type of the model you want to benchmark. '
+                        'Choose model between dec/enc/enc-dec.')
 
     parser.add_argument('--batch_size',
                         type=str,
@@ -69,13 +58,6 @@ def parse_arguments():
         default='float16',
         choices=['float16', 'bfloat16', 'float32'],
         help='Choose data type between float16/bfloat16/float32.')
-    parser.add_argument(
-        '--refit',
-        default=False,
-        action="store_true",
-        help=
-        'If this option is specified, a refit flag is added to TensorRT engines.'
-    )
 
     parser.add_argument('--num_beams',
                         type=int,
@@ -101,14 +83,6 @@ def parse_arguments():
                         default='model.cache',
                         help='The path to write timing cache')
     parser.add_argument(
-        '--profiling_verbosity',
-        type=str,
-        default='layer_names_only',
-        choices=['layer_names_only', 'detailed', 'none'],
-        help=
-        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
-    )
-    parser.add_argument(
         '--log_level',
         type=str,
         default="error",
@@ -132,74 +106,13 @@ def parse_arguments():
         help='Minimal duration of iterations to measure in seconds.')
 
     parser.add_argument(
-        '--output_dir',
-        type=str,
-        default=None,
-        help=
-        'If this option is specified, TensorRT engines will be saved to the specified path.'
-    )
-    parser.add_argument(
         '--engine_dir',
         type=str,
         default=None,
+        required=True,
         help=
         ('If this option is specified, instead of building engines on-air before benchmarking, '
          'the engines contained in the engine_dir will be used.'))
-    parser.add_argument(
-        '--max_beam_width',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max beam width of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
-        '--max_input_len',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max input len of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
-        '--max_encoder_input_len',
-        type=int,
-        default=None,
-        help=
-        ('This argument is only for encoder-decoder models'
-         'If this option is specified, it will override the max encoder input len of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max encoder input len'
-         ))
-    parser.add_argument(
-        '--max_decoder_input_len',
-        type=int,
-        default=None,
-        help=
-        ('This argument is only for encoder-decoder models'
-         'If this option is specified, it will override the max decoder input len of TRT engines to the specified value instead of using pre-defined one'
-         'By default when this option is not used, it will use pre-defined max decoder input len'
-         ))
-    parser.add_argument(
-        '--max_seq_len',
-        '--max_decoder_seq_len',
-        dest='max_seq_len',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max sequence len of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
-        '--max_batch_size',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max batch size of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
-        '--force_num_layer_1',
-        default=False,
-        action='store_true',
-        help=
-        'Quick sanity check with num_layer=1; will be silently ignored if --engine_dir is specified.'
-    )
     parser.add_argument(
         '--gpu_weights_percent',
         type=str,
@@ -207,13 +120,6 @@ def parse_arguments():
         help='Specify the percentage of weights that reside on GPU (from 0 to 1).'
         'Multiple percentages can be separated by \";\", '
         'example: \"0;0.5;1\".')
-    parser.add_argument(
-        '--multiple_profiles',
-        default=False,
-        action='store_true',
-        help=
-        'This option will benefit performance, but will increase the engine build time.'
-    )
 
     parser.add_argument('--csv',
                         default=False,
@@ -234,40 +140,7 @@ def parse_arguments():
             'int8_sq_per_channel_ootb'
         ],
         help="Optimize the model with specified quantization recipe")
-    parser.add_argument(
-        '--build_only',
-        default=False,
-        action='store_true',
-        help=
-        "Build engine only and skip inference, this can help to benchmark the build time on single gpu node for multi GPU model, where the inference is not possible"
-    )
 
-    parser.add_argument('--serial_build',
-                        default=False,
-                        action='store_true',
-                        help="Build engines serially")
-
-    parser.add_argument(
-        '--rank',
-        type=int,
-        default=None,
-        help=
-        "The rank of the model to be built, only used when --build_only and --serial_build is specified"
-    )
-    parser.add_argument(
-        '--world_size',
-        type=int,
-        default=None,
-        help=
-        "The number of gpus to be used for inference, only used when --build_only and --serial_build is specified"
-    )
-    parser.add_argument(
-        '--debug_memory',
-        default=False,
-        action='store_true',
-        help=
-        "Check the estimated memory usage against the total GPU memory. Raise error if the estimated memory requirement is bigger than the total GPU memory"
-        "Warning: only GPT model family is supported for now")
     parser.add_argument(
         '--dump_profile',
         default=False,
@@ -281,25 +154,6 @@ def parse_arguments():
         help=
         "Print layer information of the engine to console (default = disabled)")
 
-    parser.add_argument(
-        '--opt_batch_size',
-        type=int,
-        default=None,
-        help=
-        "If opt_batch_size option is specified, it will override the opt batch size."
-        "This flag only takes effect when `--mode=ootb` is added. For other modes, please use --opt_num_tokens to replace it."
-    )
-
-    parser.add_argument(
-        '--opt_num_tokens',
-        type=int,
-        default=None,
-        help="It equals to max_batch_size*max_beam_width by default, set this "
-        "value as close as possible to the actual number of tokens on your workload. "
-        "Note that this argument might be removed in the future."
-        "This flag only takes effect when `--mode` is not `ootb`. For ootb mode, please use --opt_batch_size to replace it."
-    )
-
     return parser.parse_args()
 
 
@@ -308,7 +162,6 @@ def main(args):
     # tensorrt_llm is imported, but mpi4py does not work well with
     # the start method `spawn` of Python multiprocessing,
     # so we set the start method first, then initialize MPI.
-    from allowed_configs import get_allowed_models
     from benchmark_profiler import BenchmarkProfiler
     from bert_benchmark import BERTBenchmark
     from enc_dec_benchmark import EncDecBenchmark
@@ -341,17 +194,8 @@ def main(args):
             )
     args.weight_streaming = any([p != 1 for p in gpu_weights_percents])
 
-    if args.serial_build and not args.build_only:
-        raise Exception(
-            f"--serial_build must be used with --build_only, always need to parallel build to do inference in the same process"
-        )
-
-    if args.build_only and args.serial_build and args.rank is not None and args.world_size is not None:
-        rank = args.rank
-        world_size = args.world_size
-    else:
-        rank = tensorrt_llm.mpi_rank()
-        world_size = tensorrt_llm.mpi_world_size()
+    rank = tensorrt_llm.mpi_rank()
+    world_size = tensorrt_llm.mpi_world_size()
 
     # TODO: Re-enable memory monitor for multi-gpu benchmarks.
     # Current Mem Monitor will cause benchmark script hang
@@ -361,30 +205,25 @@ def main(args):
         from mem_monitor import MemoryMonitor
 
     benchmark_profiler = None
-    if args.model in get_allowed_models(benchmark_type="gpt"):
+    if args.model == "dec":
         benchmark_profiler = BenchmarkProfiler()
         benchmarker = GPTBenchmark(args, batch_size_options, in_out_len_options,
                                    gpu_weights_percents, rank, world_size)
-    elif args.model in get_allowed_models(benchmark_type="bert"):
+    elif args.model == "enc":
         benchmarker = BERTBenchmark(args, batch_size_options, input_len_options,
                                     gpu_weights_percents, rank, world_size)
-    elif args.model in get_allowed_models(benchmark_type="enc_dec"):
+    elif args.model == "enc-dec":
         benchmarker = EncDecBenchmark(args, batch_size_options,
                                       in_out_len_options, gpu_weights_percents,
                                       rank, world_size)
     else:
         raise Exception(f'Unexpected model: {args.model}')
 
-    if args.build_only:
-        return
-
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     benchmarker.print_report_header(args.csv,
                                     benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
-        if isinstance(benchmarker, GPTBenchmark):
-            benchmarker.check_memory(config, raise_exception=args.debug_memory)
         try:
             if args.weight_streaming:
                 # We pass in config instead of the gpu_weights_percent here to keep this benchmark script
