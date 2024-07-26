@@ -18,14 +18,13 @@ import os
 # isort: off
 import torch
 #isort: on
-from allowed_configs import get_build_config
-from base_benchmark import BaseBenchmark, get_engine_name
-from build import build_enc_dec
+from base_benchmark import BaseBenchmark
 
 import tensorrt_llm
 from tensorrt_llm._utils import (trt_dtype_to_torch, str_dtype_to_trt)
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.session import TensorInfo
+from tensorrt_llm.runtime import ModelConfig
 
 
 class EncDecBenchmark(BaseBenchmark):
@@ -34,10 +33,8 @@ class EncDecBenchmark(BaseBenchmark):
                  rank, world_size):
         self.engine_dir = args.engine_dir
         self.model_name = args.model
-        self.mode = args.mode
         self.enable_fp8 = False  # hardcode for enc-dec models
         self.dtype = args.dtype
-        self.output_dir = args.output_dir
         self.runtime_rank = rank
         self.world_size = world_size
         self.csv_filename = ""  # lazy init
@@ -63,87 +60,93 @@ class EncDecBenchmark(BaseBenchmark):
                                            "config.json")
                 with open(config_path, "r") as f:
                     config = json.load(f)
-                # Sanity checks
-                config_dtype = config["builder_config"]["precision"]
-                assert (
-                    self.dtype == config_dtype
-                ), f"Engine dtype ({config_dtype}) != Runtime dtype ({self.dtype})"
-                world_size = config["builder_config"]["tensor_parallel"]
-                assert (
-                    world_size == self.world_size
-                ), f"Engine world size ({world_size}) != Runtime world size ({self.world_size})"
-                tp_size = config["builder_config"]["tensor_parallel"]
-                # TP only for benchmarking
-                assert (
-                    tp_size == self.world_size
-                ), f"Engine tensor parallel size ({tp_size}) should be equal to world size ({self.world_size})"
-                assert (
-                    config["plugin_config"]["remove_input_padding"] == False
-                ), "remove_input_padding should be False for enc-dec benchmarks"
-                num_heads = config["builder_config"]["num_heads"]
+
+                builder_config = config['build_config']
+                plugin_config = builder_config['plugin_config']
+                pretrained_config = config['pretrained_config']
+                lora_config = builder_config['lora_config']
+                builder_config['auto_parallel_config']
+                use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
+                remove_input_padding = plugin_config["remove_input_padding"]
+                use_lora_plugin = plugin_config["lora_plugin"]
+                tp_size = pretrained_config['mapping']['tp_size']
+                pp_size = pretrained_config['mapping']['pp_size']
+                world_size = tp_size * pp_size
+                assert world_size == tensorrt_llm.mpi_world_size(), \
+                    f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
+                num_heads = pretrained_config["num_attention_heads"]
+                hidden_size = pretrained_config["hidden_size"]
+                head_size = pretrained_config["head_size"]
+                vocab_size = pretrained_config["vocab_size"]
+                max_batch_size = builder_config["max_batch_size"]
+                max_beam_width = builder_config["max_beam_width"]
+                num_layers = pretrained_config["num_hidden_layers"]
+                num_kv_heads = pretrained_config.get('num_kv_heads', num_heads)
+
                 assert (num_heads % tp_size) == 0
-                # Get model config
                 num_heads = num_heads // tp_size
-                hidden_size = config["builder_config"]["hidden_size"] // tp_size
-                num_kv_heads = config["builder_config"].get(
-                    "num_kv_heads", config["builder_config"]["num_heads"])
+                hidden_size = hidden_size // tp_size
                 num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
-                model_config = tensorrt_llm.runtime.ModelConfig(
+                cross_attention = pretrained_config[
+                    "architecture"] == "DecoderModel"
+                skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
+                has_position_embedding = pretrained_config[
+                    "has_position_embedding"]
+                has_token_type_embedding = hasattr(pretrained_config,
+                                                   "type_vocab_size")
+                dtype = pretrained_config["dtype"]
+
+                paged_kv_cache = plugin_config['paged_kv_cache']
+                tokens_per_block = plugin_config['tokens_per_block']
+
+                gather_context_logits = builder_config.get(
+                    'gather_context_logits', False)
+                gather_generation_logits = builder_config.get(
+                    'gather_generation_logits', False)
+                max_prompt_embedding_table_size = builder_config.get(
+                    'max_prompt_embedding_table_size', 0)
+
+                self.max_batch_size = config["build_config"]["max_batch_size"]
+                self.max_input_len = config["build_config"][
+                    "max_encoder_input_len"]
+                self.max_seq_len = config["build_config"]["max_seq_len"]
+
+                model_config = ModelConfig(
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
                     hidden_size=hidden_size,
-                    head_size=config["builder_config"]["head_size"],
-                    max_batch_size=config["builder_config"]["max_batch_size"],
-                    max_beam_width=config["builder_config"]["max_beam_width"],
-                    vocab_size=config["builder_config"]["vocab_size"],
-                    num_layers=config["builder_config"]["num_layers"],
-                    gpt_attention_plugin=config["plugin_config"]
-                    ["gpt_attention_plugin"],
-                    remove_input_padding=config["plugin_config"]
-                    ["remove_input_padding"],
-                    cross_attention=config["builder_config"]["cross_attention"],
-                    skip_cross_qkv=config["builder_config"]["skip_cross_qkv"],
-                    has_position_embedding=config["builder_config"]
-                    ["has_position_embedding"],
-                    has_token_type_embedding=config["builder_config"]
-                    ["has_token_type_embedding"],
-                    dtype=config_dtype,
+                    head_size=head_size,
+                    max_batch_size=max_batch_size,
+                    max_beam_width=max_beam_width,
+                    vocab_size=vocab_size,
+                    num_layers=num_layers,
+                    gpt_attention_plugin=use_gpt_attention_plugin,
+                    remove_input_padding=remove_input_padding,
+                    paged_kv_cache=paged_kv_cache,
+                    tokens_per_block=tokens_per_block,
+                    cross_attention=cross_attention,
+                    has_position_embedding=has_position_embedding,
+                    has_token_type_embedding=has_token_type_embedding,
+                    dtype=dtype,
+                    gather_context_logits=gather_context_logits,
+                    gather_generation_logits=gather_generation_logits,
+                    max_prompt_embedding_table_size=
+                    max_prompt_embedding_table_size,
+                    lora_plugin=use_lora_plugin,
+                    lora_target_modules=lora_config.get('lora_target_modules'),
+                    trtllm_modules_to_hf_modules=lora_config.get(
+                        'trtllm_modules_to_hf_modules'),
+                    skip_cross_qkv=skip_cross_qkv,
                 )
-                self.max_batch_size = config["builder_config"]["max_batch_size"]
-                self.max_input_len = config["builder_config"][
-                    "max_encoder_input_len"]
-                self.max_seq_len = config["builder_config"]["max_seq_len"]
-                self.n_mels = config["builder_config"][
-                    'n_mels'] if 'whisper' in self.model_name else 0
 
-                for key, value in config["builder_config"].items():
-                    if key == "name":
-                        engine_model_name = value
-                        break
-                return engine_model_name, model_config
+                return model_config
 
-            (
-                self.encoder_engine_model_name,
-                self.encoder_model_config,
-            ) = read_config("encoder")
-            (
-                self.decoder_engine_model_name,
-                self.decoder_model_config,
-            ) = read_config("decoder")
+            self.encoder_model_config = read_config("encoder")
+            self.decoder_model_config = read_config("decoder")
 
-        self.encoder_engine_name = get_engine_name(
-            self.encoder_engine_model_name,
-            self.dtype,
-            self.world_size,
-            self.runtime_rank,
-        )
-        self.decoder_engine_name = get_engine_name(
-            self.decoder_engine_model_name,
-            self.dtype,
-            self.world_size,
-            self.runtime_rank,
-        )
+        self.encoder_engine_name = 'rank{}.engine'.format(self.runtime_rank)
+        self.decoder_engine_name = 'rank{}.engine'.format(self.runtime_rank)
         self.encoder_runtime_mapping = tensorrt_llm.Mapping(
             world_size=self.world_size,
             rank=self.runtime_rank,
@@ -155,47 +158,21 @@ class EncDecBenchmark(BaseBenchmark):
             tp_size=self.world_size,
         )
 
-        if not args.serial_build:
-            torch.cuda.set_device(self.runtime_rank %
-                                  self.encoder_runtime_mapping.gpus_per_node)
+        torch.cuda.set_device(self.runtime_rank %
+                              self.encoder_runtime_mapping.gpus_per_node)
         self.device = torch.cuda.current_device()
 
-        if self.engine_dir is not None:
-            # Deserialize engine from engine directory
-            self.encoder_serialize_path = os.path.join(self.engine_dir,
-                                                       "encoder",
-                                                       self.encoder_engine_name)
-            with open(self.encoder_serialize_path, "rb") as f:
-                encoder_engine_buffer = f.read()
-            self.decoder_serialize_path = os.path.join(self.engine_dir,
-                                                       "decoder",
-                                                       self.decoder_engine_name)
-            with open(self.decoder_serialize_path, "rb") as f:
-                decoder_engine_buffer = f.read()
-        else:
-            build_config = get_build_config(self.model_name)
-            self.max_batch_size = build_config['max_batch_size'] \
-                if args.max_batch_size is None else args.max_batch_size
-            self.max_input_len = build_config['max_encoder_input_len'] \
-                if args.max_input_len is None else args.max_input_len
-            self.max_seq_len = build_config['max_seq_len'] \
-                if args.max_seq_len is None else args.max_seq_len
-            self.n_mels = build_config[
-                'n_mels'] if 'whisper' in self.model_name else 0
-            # Build engine
-            (
-                encoder_engine_buffer,
-                decoder_engine_buffer,
-                self.encoder_model_config,
-                self.decoder_model_config,
-                encoder_build_time,
-                decoder_build_time,
-            ) = build_enc_dec(args)
-
-            self.build_time = encoder_build_time + decoder_build_time
-
-        assert encoder_engine_buffer is not None
-        assert decoder_engine_buffer is not None
+        # Deserialize engine from engine directory
+        self.encoder_serialize_path = os.path.join(self.engine_dir, "encoder",
+                                                   self.encoder_engine_name)
+        with open(self.encoder_serialize_path, "rb") as f:
+            encoder_engine_buffer = f.read()
+            assert encoder_engine_buffer is not None
+        self.decoder_serialize_path = os.path.join(self.engine_dir, "decoder",
+                                                   self.decoder_engine_name)
+        with open(self.decoder_serialize_path, "rb") as f:
+            decoder_engine_buffer = f.read()
+            assert decoder_engine_buffer is not None
 
         # session setup
         self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -216,11 +193,10 @@ class EncDecBenchmark(BaseBenchmark):
                 f"[WARNING] whisper benchmark is input_len=1500, no text prompt, output_len=arbitrary"
             )
         for inlen, outlen in self.in_out_lens:
-            if (inlen > self.max_input_len
-                    or inlen + outlen > self.max_seq_len):
+            if (inlen > self.max_input_len or outlen > self.max_seq_len):
                 print(
                     f"[WARNING] check inlen({inlen}) <= max_inlen({self.max_input_len}) and "
-                    f"inlen({inlen}) + outlen({outlen}) <= max_seqlen({self.max_seq_len}) failed, skipping."
+                    f"outlen({outlen}) <= max_seqlen({self.max_seq_len}) failed, skipping."
                 )
                 continue
             for batch_size in self.batch_sizes:

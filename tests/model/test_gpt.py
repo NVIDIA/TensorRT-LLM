@@ -33,15 +33,13 @@ from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.models.gpt.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 from tensorrt_llm.runtime.kv_cache_manager import (GenerationSequence,
                                                    KVCacheManager)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gpt.convert_checkpoint import convert_hf_gpt
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -86,12 +84,9 @@ class TestGPT(unittest.TestCase):
             'bias': getattr(gpt_config, 'bias', True),
             'apply_query_key_layer_scaling': apply_query_key_layer_scaling,
         }
-        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
-        weights = convert_hf_gpt(hf_gpt,
-                                 gpt_config,
-                                 "gpt2",
-                                 config.mapping,
-                                 dtype=dtype)
+        config = tensorrt_llm.models.GPTConfig.from_dict(config)
+        weights = load_weights_from_hf_model(hf_gpt, config)
+
         tensorrt_llm_gpt = tensorrt_llm.models.GPTForCausalLM(config)
         tensorrt_llm_gpt.load(weights)
 

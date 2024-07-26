@@ -14,7 +14,6 @@
 # limitations under the License.
 import copy
 import functools
-import json
 import os
 import sys
 import time
@@ -473,8 +472,8 @@ def fp8_per_channel_quant_weight_gpu(weight, clamp_val, rank=0):
     xmax = x.abs().max(-1, keepdim=True).values
     # minimum scaling factor.
     torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
+    out = x / torch_weight_scales
     torch_weight_scales = torch_weight_scales.reshape(-1)
-    out = x * 448.0 / xmax
     out = torch.clamp(out, -448, 448)
     processed_torch_weights = out.to(torch.float8_e4m3fn)
 
@@ -1315,13 +1314,12 @@ def quantize(hf_model_dir: str,
     '''
     #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
 
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config.to_dict(), f, indent=4)
+    config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
     assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
-    quant_config = config.quantization
 
+    quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 

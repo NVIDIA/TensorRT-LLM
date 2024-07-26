@@ -32,13 +32,13 @@ def get_compute_cap():
     return str(int(float(csv_value) * 10))
 
 
-def get_csv_filename(model, dtype, tp_size, mode, **kwargs):
+def get_csv_filename(model, dtype, tp_size, **kwargs):
     sm = get_compute_cap()
     if len(kwargs) == 0:
         kw_pairs = ""
     else:
         kw_pairs = "_" + "_".join([str(k) + str(v) for k, v in kwargs.items()])
-    return f'{model}_{dtype}_tp{tp_size}_{mode}{kw_pairs}_sm{sm}.csv'
+    return f'{model}_{dtype}_tp{tp_size}_{kw_pairs}_sm{sm}.csv'
 
 
 def get_engine_name(model, dtype, tp_size, rank):
@@ -59,13 +59,7 @@ def serialize_engine(engine, path):
 
 class BaseBenchmark(object):
 
-    def __init__(self,
-                 engine_dir,
-                 model_name,
-                 dtype,
-                 rank,
-                 world_size,
-                 serial_build: bool = False):
+    def __init__(self, engine_dir, model_name, dtype, rank, world_size):
         self.engine_dir = engine_dir
         self.model_name = model_name
         self.dtype = dtype
@@ -74,73 +68,67 @@ class BaseBenchmark(object):
         self.engine_model_name = model_name
         self.quant_mode = QuantMode(0)
         self.enable_fp8 = False
-        if engine_dir is not None:
+        # Read config from engine directory
+        config_path = os.path.join(engine_dir, 'config.json')
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
+        # Sanity checks
+        if 'pretrained_config' in self.config:  # new build api branch
+            config_dtype = self.config['pretrained_config']['dtype']
+            assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
+            world_size = self.config['pretrained_config']['mapping'][
+                'world_size']
+            assert world_size == self.world_size, \
+                (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
+            # Load config into self
+            for key, value in self.config['pretrained_config'].items():
+                setattr(self, key, value)
+
+            self.quant_mode = QuantMode.from_quant_algo(
+                quant_algo=self.quantization['quant_algo'],
+                kv_cache_quant_algo=self.quantization['kv_cache_quant_algo'])
+            self.enable_fp8 = self.quant_mode.has_fp8_qdq()
+            self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
+
+            for key, value in self.config['build_config'].items():
+                setattr(self, key, value)
+
+            for key, value in self.plugin_config.items():
+                if "plugin" in key:
+                    key = "use_" + key
+                setattr(self, key, value)
+
+            self.engine_name = f"rank{self.runtime_rank}.engine"
+
+            self.num_kv_heads = self.num_key_value_heads
+            self.num_layers = self.num_hidden_layers
+            self.num_heads = self.num_attention_heads
+        else:
             # Read config from engine directory
             config_path = os.path.join(engine_dir, 'config.json')
             with open(config_path, 'r') as f:
                 self.config = json.load(f)
             # Sanity checks
-            if 'pretrained_config' in self.config:  # new build api branch
-                config_dtype = self.config['pretrained_config']['dtype']
-                assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
-                world_size = self.config['pretrained_config']['mapping'][
-                    'world_size']
-                assert world_size == self.world_size, \
-                    (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
-                # Load config into self
-                for key, value in self.config['pretrained_config'].items():
+            config_dtype = self.config['builder_config']['precision']
+            assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
+            world_size = self.config['builder_config']['tensor_parallel']
+            assert world_size == self.world_size, \
+                (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
+            # Load config into self
+            for key, value in self.config['builder_config'].items():
+                if key == "quant_mode":
+                    self.quant_mode = QuantMode(value)
+                elif key in "name":
+                    self.engine_model_name = value
+                else:
                     setattr(self, key, value)
-
-                self.quant_mode = QuantMode.from_quant_algo(
-                    quant_algo=self.quantization['quant_algo'],
-                    kv_cache_quant_algo=self.quantization['kv_cache_quant_algo']
-                )
-                self.enable_fp8 = self.quant_mode.has_fp8_qdq()
-                self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
-
-                for key, value in self.config['build_config'].items():
-                    setattr(self, key, value)
-
-                for key, value in self.plugin_config.items():
-                    if "plugin" in key:
-                        key = "use_" + key
-                    setattr(self, key, value)
-
-                self.engine_name = f"rank{self.runtime_rank}.engine"
-
-                self.num_kv_heads = self.num_key_value_heads
-                self.num_layers = self.num_hidden_layers
-                self.num_heads = self.num_attention_heads
-            else:
-                # Read config from engine directory
-                config_path = os.path.join(engine_dir, 'config.json')
-                with open(config_path, 'r') as f:
-                    self.config = json.load(f)
-                # Sanity checks
-                config_dtype = self.config['builder_config']['precision']
-                assert dtype == config_dtype, f"Engine dtype ({config_dtype}) != Runtime dtype ({dtype})"
-                world_size = self.config['builder_config']['tensor_parallel']
-                assert world_size == self.world_size, \
-                    (f'Engine world size ({world_size}) != Runtime world size ({self.world_size})')
-                # Load config into self
-                for key, value in self.config['builder_config'].items():
-                    if key == "quant_mode":
-                        self.quant_mode = QuantMode(value)
-                    elif key in "name":
-                        self.engine_model_name = value
-                    else:
-                        setattr(self, key, value)
-                self.enable_fp8 = self.quant_mode.has_fp8_qdq()
-                self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
-                for key, value in self.config['plugin_config'].items():
-                    # Same effect as self.use_foo_plugin = config.json["foo_plugin"]
-                    if "plugin" in key:
-                        key = "use_" + key
-                    setattr(self, key, value)
-                self.engine_name = get_engine_name(self.engine_model_name,
-                                                   self.dtype, self.world_size,
-                                                   self.runtime_rank)
-        else:
+            self.enable_fp8 = self.quant_mode.has_fp8_qdq()
+            self.fp8_kv_cache = self.quant_mode.has_fp8_kv_cache()
+            for key, value in self.config['plugin_config'].items():
+                # Same effect as self.use_foo_plugin = config.json["foo_plugin"]
+                if "plugin" in key:
+                    key = "use_" + key
+                setattr(self, key, value)
             self.engine_name = get_engine_name(self.engine_model_name,
                                                self.dtype, self.world_size,
                                                self.runtime_rank)
@@ -148,9 +136,9 @@ class BaseBenchmark(object):
         self.runtime_mapping = tensorrt_llm.Mapping(world_size=self.world_size,
                                                     rank=self.runtime_rank,
                                                     tp_size=self.world_size)
-        if not serial_build:
-            torch.cuda.set_device(self.runtime_rank %
-                                  self.runtime_mapping.gpus_per_node)
+
+        torch.cuda.set_device(self.runtime_rank %
+                              self.runtime_mapping.gpus_per_node)
 
         self.csv_filename = ""  # lazy init
 
@@ -189,7 +177,6 @@ class BaseBenchmark(object):
             self.csv_filename = get_csv_filename(self.model_name,
                                                  self.dtype,
                                                  self.world_size,
-                                                 self.mode,
                                                  fp8linear=int(self.enable_fp8))
         return self.csv_filename
 

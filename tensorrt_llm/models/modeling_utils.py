@@ -615,7 +615,7 @@ class PretrainedModel(Module,
                 model_inputs['lora_ranks'],
                 model_inputs['lora_weights_pointers'],
                 host_context_lengths=model_inputs['host_context_lengths'],
-                max_context_length=max_input_len,
+                max_num_tokens=max_num_tokens,
                 host_request_types=model_inputs['host_request_types'])
         if model_inputs['spec_decoding_params'] is not None:
             result['spec_decoding_params'] = model_inputs[
@@ -757,6 +757,10 @@ def fuse_gate_mlp(
     from ..quantization.quantize import fp8_quantize
 
     quant_algo = model.config.quantization.quant_algo
+    if quant_algo != QuantAlgo.FP8 and quant_algo is not None:
+        logger.warning("fuse_gate_mlp cannot be done for this model. Skipping.")
+        return model
+
     for name, mlp, layer in model.named_modules_with_parent():
         if isinstance(mlp, GatedMLP):
             init_params = get_init_params(mlp)

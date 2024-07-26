@@ -522,12 +522,6 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
                 timeout=timeout)  # expecting ~ 1200s
-    cpp_blocking_env = copy.copy(cpp_env)
-    cpp_blocking_env["CUDA_LAUNCH_BLOCKING"] = '1'
-    run_command(trt_model_test,
-                cwd=tests_dir,
-                env=cpp_blocking_env,
-                timeout=timeout)  # expecting ~ 1200s
 
     #Executor test in leader mode
     new_env = copy.copy(cpp_env)

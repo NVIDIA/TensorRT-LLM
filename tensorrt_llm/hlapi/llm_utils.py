@@ -288,6 +288,12 @@ class LlmArgs:
         else:
             self.tokenizer = tokenizer_factory(self.tokenizer)
 
+        if torch.cuda.get_device_properties(0).major < 8:
+            if self.dtype == 'auto':
+                self.dtype = 'float16'
+            if self.dtype == 'bfloat16':
+                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
+
         self._engine_config: Optional[EngineConfig] = None
 
         self.auto_parallel_config = AutoParallelConfig(
@@ -1021,7 +1027,10 @@ class ModelLoader:
             raise NotImplementedError(
                 f"Unsupported model architecture in HLAPI: {architecture}")
 
-        if self.llm_args.quant_config.quant_mode.has_any_quant():
+        use_weight_only = self.llm_args.quant_config.quant_algo in (
+            QuantAlgo.W4A16, QuantAlgo.W8A16)
+        if self.llm_args.quant_config.quant_mode.has_any_quant(
+        ) and not use_weight_only:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:

@@ -22,15 +22,11 @@ from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 try:
     from .test_llm import (_test_llm_generate_async, default_model_name,
                            get_model_path, llama_model_path, mixtral_model_name,
-                           prompts)
+                           prompts, skip_single_gpu)
 except ImportError:
     from test_llm import (_test_llm_generate_async, default_model_name,
                           get_model_path, llama_model_path, mixtral_model_name,
-                          prompts)
-
-skip_single_gpu = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="The test needs at least 2 GPUs, skipping")
+                          prompts, skip_single_gpu)
 
 
 @pytest.fixture(scope="module")

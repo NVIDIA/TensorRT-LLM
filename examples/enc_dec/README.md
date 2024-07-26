@@ -241,17 +241,19 @@ In `benchmarks/python/`:
 ```bash
 # Example 1: Single-GPU benchmark
 python benchmark.py \
-    -m t5_small \
+    -m enc-dec \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
     --dtype float32 \
     --csv # optional
 
 # Example 2: Multi-GPU benchmark
 mpirun --allow-run-as-root -np 4 python benchmark.py \
-    -m t5_small \
+    -m enc-dec \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
     --dtype float32 \
     --csv # optional
 ```

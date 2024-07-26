@@ -91,6 +91,7 @@ private:
     BufferPtr mPenaltyWorkspaceDevice;
     BufferPtr mPenaltyWorkspacePrevDevice;
     TensorPtr mLogitsPtrsHost;
+    TensorPtr mLogitsPtrsDevice;
 };
 
 } // namespace tensorrt_llm::layers

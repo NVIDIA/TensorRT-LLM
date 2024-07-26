@@ -24,12 +24,11 @@ from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
 from .._utils import int32_array
-from ..functional import (AllReduceFusionParams, AllReduceStrategy,
-                          _add_plugin_info, _create_tensor, allreduce, cast,
-                          concat, constant, div, expand, gather_nd,
-                          is_gated_activation, non_gated_version, nonzero,
-                          repeat_interleave, scatter_nd, shape, softmax, split,
-                          sum, topk)
+from ..functional import (AllReduceFusionParams, _add_plugin_info,
+                          _create_tensor, allreduce, cast, concat, constant,
+                          div, expand, gather_nd, is_gated_activation,
+                          non_gated_version, nonzero, repeat_interleave,
+                          scatter_nd, shape, softmax, split, sum, topk)
 from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -531,7 +530,7 @@ class MoeOOTB(MOE):
                 gate_lora_weights_pointers,
             }],
             host_context_lengths=lora_layer_params.host_context_lengths,
-            max_context_length=lora_layer_params.max_context_length,
+            max_num_tokens=lora_layer_params.max_num_tokens,
             max_encoder_context_length=lora_layer_params.
             max_encoder_context_length,
             host_request_types=lora_layer_params.host_request_types,
@@ -603,6 +602,10 @@ class MoeOOTB(MOE):
         expert_weights = split(experts_weights, 1, dim=0)
 
         for i, expert in enumerate(self.experts):
+            if self.mapping.has_moe_ep():
+                index = i + self.experts_per_node * self.mapping.moe_ep_rank
+            else:
+                index = i
             # get mask token index
             non_zero_index = nonzero(experts_mask[i].view(
                 concat([-1, hidden_size])))
@@ -627,16 +630,9 @@ class MoeOOTB(MOE):
 
         output = output.view(shape(hidden_states))
 
-        need_ep_reduce = self.mapping.has_moe_ep(
-        ) and self.mapping.moe_ep_group is not None
-        need_tp_reduce = self.mapping.has_moe_tp(
-        ) and self.mapping.moe_tp_group is not None
-        if need_tp_reduce or need_ep_reduce:
-            group = self.mapping.moe_ep_group if need_ep_reduce else self.mapping.moe_tp_group
-            # TODO: remove this NCCL strategy WAR after fixed https://nvbugspro.nvidia.com/bug/4740067
+        if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
-                               group,
-                               strategy=AllReduceStrategy.NCCL,
+                               self.mapping.tp_group,
                                reduce_fusion_params=reduce_fusion_params)
 
         return output

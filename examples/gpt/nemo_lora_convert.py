@@ -22,10 +22,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from convert_checkpoint import cpu_map_location, unpack_nemo_ckpt
 
 from tensorrt_llm._utils import str_dtype_to_torch, to_json_file, torch_to_numpy
 from tensorrt_llm.lora_manager import LoraManager, get_all_nemo_lora_weights
+from tensorrt_llm.models.gpt.convert import cpu_map_location, unpack_nemo_ckpt
 
 log_format = "%(asctime)s %(name)s [%(levelname)s] %(message)s"
 logging.basicConfig(format=log_format)

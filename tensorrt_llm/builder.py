@@ -28,6 +28,7 @@ from ._common import _is_building, check_max_num_tokens, serialize_engine
 from ._utils import str_dtype_to_trt, to_json_file
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
+from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
 from .logger import logger
 from .lora_manager import LoraConfig
@@ -466,34 +467,6 @@ class BuildConfig:
     dry_run: bool = False
     visualize_network: bool = False
 
-    def __post_init__(self):
-        """
-        Check and may modify max_num_tokens and opt_num_tokens after instantiation
-        """
-        max_num_tokens, opt_num_tokens = check_max_num_tokens(
-            max_num_tokens=self.max_num_tokens,
-            opt_num_tokens=self.opt_num_tokens,
-            max_batch_size=self.max_batch_size,
-            max_input_len=self.max_input_len,
-            max_seq_len=self.max_seq_len,
-            max_beam_width=self.max_beam_width,
-            remove_input_padding=self.plugin_config.remove_input_padding,
-            enable_context_fmha=self.plugin_config.context_fmha,
-            tokens_per_block=self.plugin_config.tokens_per_block,
-            multiple_profiles=self.plugin_config.multiple_profiles,
-        )
-        self.max_num_tokens, self.opt_num_tokens = max_num_tokens, opt_num_tokens
-
-        if self.plugin_config.remove_input_padding and self.plugin_config.context_fmha:
-            if self.max_input_len:
-                logger.warning(
-                    'padding removal and fMHA are both enabled, max_input_len is not required and will be ignored'
-                )
-        else:
-            assert self.max_input_len is not None, 'padding removal and fMHA aren\'t both enabled, max_input_len is required'
-            if self.max_seq_len:
-                assert self.max_input_len <= self.max_seq_len, 'max_input_len should not be larger than max_seq_len'
-
     @classmethod
     def from_dict(cls, config, plugin_config=None):
         max_input_len = config.pop('max_input_len')
@@ -507,7 +480,7 @@ class BuildConfig:
             'max_prompt_embedding_table_size', 0)
         gather_context_logits = config.pop('gather_context_logits', False)
         gather_generation_logits = config.pop('gather_generation_logits', False)
-        strongly_typed = config.pop('strongly_typed', False)
+        strongly_typed = config.pop('strongly_typed', True)
         builder_opt = config.pop('builder_opt', None)
         force_num_profiles = config.pop('force_num_profiles', None)
         weight_sparsity = config.pop('weight_sparsity', False)
@@ -730,6 +703,79 @@ def optimize_model_with_config(model: PretrainedModel,
     return model
 
 
+def _init_max_seq_len(model_config, build_config):
+    """
+    If max_seq_len is not specified, set it to max_position_embeddings * rotary_factor
+    Additional checks to ensure max_seq_len, max_input_len, and max_num_tokens have valid values.
+    """
+    # Extract rotary scaling which will be used for checks and default value of max_seq_len
+    rotary_scaling = getattr(model_config, "rotary_scaling", None)
+    if rotary_scaling is not None:
+        rotary_type = rotary_scaling.get('type',
+                                         rotary_scaling.get('rope_type'))
+        rotary_factor = rotary_scaling.get('factor',
+                                           1.0) if rotary_type != 'su' else 1
+    else:
+        rotary_factor = 1
+
+    if build_config.max_seq_len is None:
+        # Step 1: Find the upper bound of max_seq_len
+        deduced_max_seq_len = 2048
+        if model_config.max_position_embeddings is not None:
+            deduced_max_seq_len = model_config.max_position_embeddings
+
+        # Step 2: Scale max_seq_len with rotary scaling
+        if rotary_factor != 1:
+            deduced_max_seq_len *= rotary_factor
+            logger.warning(
+                f'max_seq_len is scaled to {deduced_max_seq_len} by rotary scaling {rotary_factor}'
+            )
+
+        # Step 3: Assign the new max_seq_len
+        build_config.max_seq_len = deduced_max_seq_len
+        logger.info(
+            f'max_seq_len is not specified, using deduced value {deduced_max_seq_len}'
+        )
+    else:
+        if not build_config.plugin_config.streamingllm and model_config.max_position_embeddings is not None \
+            and model_config.position_embedding_type != PositionEmbeddingType.relative:
+            if build_config.max_seq_len > model_config.max_position_embeddings * rotary_factor:
+                logger.warning(
+                    f'max_seq_len {build_config.max_seq_len} is larger than max_position_embeddings {model_config.max_position_embeddings} * rotary scaling {rotary_factor}, '
+                    'the model accuracy might be affected')
+
+    if build_config.max_input_len > build_config.max_seq_len:
+        logger.warning(
+            f'max_input_len is {build_config.max_input_len} is larger than max_seq_len {build_config.max_seq_len}, clipping it to max_seq_len'
+        )
+        build_config.max_input_len = build_config.max_seq_len
+
+    # Check and may modify max_num_tokens and opt_num_tokens (need to happen after max_seq_len is deduced)
+    max_num_tokens, opt_num_tokens = check_max_num_tokens(
+        max_num_tokens=build_config.max_num_tokens,
+        opt_num_tokens=build_config.opt_num_tokens,
+        max_batch_size=build_config.max_batch_size,
+        max_input_len=build_config.max_input_len,
+        max_seq_len=build_config.max_seq_len,
+        max_beam_width=build_config.max_beam_width,
+        remove_input_padding=build_config.plugin_config.remove_input_padding,
+        enable_context_fmha=build_config.plugin_config.context_fmha,
+        tokens_per_block=build_config.plugin_config.tokens_per_block,
+        multiple_profiles=build_config.plugin_config.multiple_profiles,
+    )
+    build_config.max_num_tokens, build_config.opt_num_tokens = max_num_tokens, opt_num_tokens
+
+    if build_config.plugin_config.remove_input_padding and build_config.plugin_config.context_fmha:
+        if build_config.max_input_len:
+            logger.warning(
+                'padding removal and fMHA are both enabled, max_input_len is not required and will be ignored'
+            )
+    else:
+        assert build_config.max_input_len is not None, 'padding removal and fMHA aren\'t both enabled, max_input_len is required'
+        if build_config.max_seq_len:
+            assert build_config.max_input_len <= build_config.max_seq_len, 'max_input_len should not be larger than max_seq_len'
+
+
 def build(model: PretrainedModel,
           build_config: BuildConfig,
           return_build_config: bool = False) -> Engine | BuildConfig:
@@ -742,6 +788,8 @@ def build(model: PretrainedModel,
     # avoid changing the input config
     build_config = copy.deepcopy(build_config)
     build_config.plugin_config.dtype = model.config.dtype
+
+    _init_max_seq_len(model.config, build_config)
 
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
