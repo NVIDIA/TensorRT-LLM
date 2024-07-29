@@ -15,6 +15,11 @@ class PluginNode(Node):
                                                        layer.name)
         layer.to_base_class()
 
+    def _collect_strategies(self, device_mesh):
+        raise NotImplementedError(
+            f"Auto parallel does not support {self.plugin_type} plugin right now."
+        )
+
     def _default_strategy(self, device_mesh):
         strategies_vector = StrategiesVector(self)
         dim_partition_dict_mapping = {}

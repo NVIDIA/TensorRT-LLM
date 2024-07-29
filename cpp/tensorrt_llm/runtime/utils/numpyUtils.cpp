@@ -144,7 +144,8 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
 }
 
 //! \brief Create new tensor from numpy file.
-[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager& manager, std::string const& npyFile, const MemoryType where)
+[[nodiscard]] ITensor::UniquePtr loadNpy(
+    BufferManager const& manager, std::string const& npyFile, const MemoryType where)
 {
     FILE* f_ptr = fopen(npyFile.c_str(), "rb");
     if (f_ptr == nullptr)
@@ -180,7 +181,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     return tensor;
 }
 
-void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& filename)
+void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename)
 {
     // Save tensor to NPY 1.0 format (see https://numpy.org/neps/nep-0001-npy-format.html)
     auto const tensorSize = tensor.getSize();
@@ -226,14 +227,14 @@ void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& f
         }
     }
     header_stream << ")}";
-    int base_length = 6 + 4 + header_stream.str().size();
+    int base_length = 6 + 4 + static_cast<int>(header_stream.str().size());
     int pad_length = 16 * ((base_length + 1 + 15) / 16); // Take ceiling of base_length + 1 (for '\n' ending)
     for (int i = 0; i < pad_length - base_length; ++i)
     {
         header_stream << ((i == pad_length - base_length - 1) ? "\n" : "\x20");
     }
     std::string header = header_stream.str();
-    const uint16_t header_len = header.size();
+    auto const header_len = static_cast<uint16_t>(header.size());
 
     FILE* f_ptr = fopen(filename.c_str(), "wb");
     TLLM_CHECK_WITH_INFO(f_ptr != nullptr, tc::fmtstr("Unable to open %s for writing.\n", filename.c_str()));

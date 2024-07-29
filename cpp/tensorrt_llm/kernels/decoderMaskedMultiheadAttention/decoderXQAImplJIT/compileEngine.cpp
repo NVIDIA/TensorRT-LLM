@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include <string>
 #include <vector>
 
@@ -51,6 +52,7 @@ namespace jit
 CubinObj CompileEngine::compile() const
 {
     tllmXqaJitProgram program;
+    bool useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
         /*num_q_heads=*/static_cast<uint32_t>(mXqaParams.num_q_heads),
@@ -60,7 +62,8 @@ CubinObj CompileEngine::compile() const
         /*multi_query_tokens=*/mXqaParams.multi_query_tokens,
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
-        /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type)};
+        /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
+        /*kernel_type=*/useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA};
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));
 

@@ -150,7 +150,7 @@ The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpo
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
-Using ChatGLM2-6B-32K / ChatGLM3-6B-32K models, we need to guarantee `max_batch_size * max_beam_width * (max_input_len + max_output_len) <= 78398 = 2^31 / (13696 * 2)` due to constrain of TensorRT. For example, we will fail to build engine while using default max_batch_size (8) and adding arguments `--max_beam_width=4 --max_input_len=20000 --max_output_len=100`.
+Using ChatGLM2-6B-32K / ChatGLM3-6B-32K models, we need to guarantee `max_batch_size * max_beam_width * max_seq_len <= 78398 = 2^31 / (13696 * 2)` due to constrain of TensorRT. For example, we will fail to build engine while using default max_batch_size (8) and adding arguments `--max_beam_width=4 --max_input_len=20000 --max_seq_len=20100`.
 
 ```bash
 # ChatGLM3-6B: single-gpu engine
@@ -363,7 +363,6 @@ python ../quantization/quantize.py --model_dir chatglm3_6b \
 # ChatGLM3-6B: single-gpu engine with fp8 quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/chatglm3_6b/fp8/1-gpu \
         --gemm_plugin float16 \
-        --strongly_typed \
         --output_dir trt_engines/chatglm3_6b/fp8/1-gpu
 
 # Run inference.
@@ -371,6 +370,76 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
         --max_output_len 50 \
         --tokenizer_dir chatglm3_6b \
         --engine_dir trt_engines/chatglm3_6b/fp8/1-gpu
+```
+
+### Long context evaluation
+
+* SlimPajama-6B with PPL evaluation
+
+SlimPajama-6B is a dataset which contains long context inputs. We use this dataset to run PPL evaluation.
+
+```bash
+git-lfs clone https://huggingface.co/datasets/DKYoon/SlimPajama-6B
+```
+
+```bash
+git-lfs clone https://huggingface.co/THUDM/chatglm3-6b-128k
+
+
+python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
+                              --output_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+                              --dtype float16
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+            --output_dir /tmp/chatglm3-6b-128k/trt_engines \
+            --gemm_plugin float16 \
+            --gather_all_token_logits \
+            --max_batch_size 8 \
+            --max_input_len 25600
+
+python examples/summarize.py --engine_dir /tmp/chatglm3-6b-128k/trt_engines \
+                             --tokenizer_dir chatglm3-6b-128k \
+                             --dataset_dir ./ \
+                             --eval_task eval_context_ppl \
+                             --test_trt_llm \
+                             --hf_model_dir chatglm3-6b-128k  \
+                             --max_input_len 25600 \
+                             --batch_size 1 \
+                             --max_ite 1600 \
+                             --check_accuracy \
+                             --tensorrt_llm_ppl_threshold 14 \
+                             --use_py_session
+
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM (total latency: 71.61979579925537 sec)
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1599)
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 22.32622953131381)
+[05/14/2024-08:01:49] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[05/14/2024-08:01:53] [TRT-LLM] [I]   Per-token perplexity: 13.595022946447134
+```
+
+* needle in haystack (passkey) evaluation
+
+```bash
+python3 examples/infinitebench/construct_synthetic_dataset.py --test_case build_passkey
+
+python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
+                              --output_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+                              --dtype float16
+
+python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
+            --output_dir /tmp/chatglm3-6b-128k/trt_engines \
+            --gemm_plugin float16 \
+            --gather_all_token_logits \
+            --max_batch_size 1 \
+            --max_input_len 12800
+
+python examples/eval_long_context.py  --task passkey \
+                                      --engine_dir /tmp/chatglm3-6b-128k/trt_engines \
+                                      --tokenizer_dir chatglm3-6b-128k \
+                                      --stop_idx 20 \
+                                      --max_input_length 12800 \
+                                      --use_py_session
+
 ```
 
 ## Benchmark

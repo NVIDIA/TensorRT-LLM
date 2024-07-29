@@ -1,7 +1,8 @@
 import random
 
 import click
-from utils.utils import dataset_dump, gen_random_tokens, get_norm_dist_tokens
+from utils.utils import (dataset_dump, gen_random_tokens, get_norm_dist_tokens,
+                         print_dataset)
 
 
 @click.command()
@@ -55,15 +56,21 @@ def token_norm_dist(root_args, **kwargs):
         min_id, max_id = root_args.rand_task_id
         task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
 
-    dataset_dump(
-        input_lens, input_ids, output_lens, task_ids, {
-            "workload_type": "token-norm-dist",
-            "input_mean": kwargs['input_mean'],
-            "input_stdev": kwargs['input_stdev'],
-            "output_mean": kwargs['output_mean'],
-            "output_stdev": kwargs['output_stdev'],
-            "num_requests": kwargs['num_requests'],
-            "tokenize_vocabsize": root_args.tokenizer.vocab_size,
-            "max_input_len": max_input_len,
-            "max_output_len": max_output_len
-        }, root_args.output)
+    if not root_args.std_out:
+        dataset_dump(
+            input_lens, input_ids, output_lens, task_ids, {
+                "workload_type": "token-norm-dist",
+                "input_mean": kwargs['input_mean'],
+                "input_stdev": kwargs['input_stdev'],
+                "output_mean": kwargs['output_mean'],
+                "output_stdev": kwargs['output_stdev'],
+                "num_requests": kwargs['num_requests'],
+                "tokenize_vocabsize": root_args.tokenizer.vocab_size,
+                "max_input_len": max_input_len,
+                "max_output_len": max_output_len
+            }, root_args.output)
+    else:
+        print_dataset(
+            input_ids,
+            output_lens,
+        )

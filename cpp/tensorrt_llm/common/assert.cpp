@@ -21,7 +21,7 @@ namespace
 
 bool initCheckDebug()
 {
-    auto constexpr kDebugEnabled = "TRT_LLM_DEBUG_MODE";
+    auto constexpr kDebugEnabled = "TLLM_DEBUG_MODE";
     auto const debugEnabled = std::getenv(kDebugEnabled);
     return debugEnabled && debugEnabled[0] == '1';
 }

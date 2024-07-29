@@ -58,7 +58,7 @@ public:
 
     static at::Tensor buffer(IBuffer::SharedPtr buffer)
     {
-        auto const shape = ITensor::makeShape({static_cast<runtime::SizeType>(buffer->getSize())});
+        auto const shape = ITensor::makeShape({static_cast<runtime::SizeType32>(buffer->getSize())});
         return tensor(ITensor::view(std::move(buffer), shape));
     }
 

@@ -26,8 +26,8 @@ from transformers import MistralConfig, MistralForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_trt
-from tensorrt_llm.models.llama.weight import load_from_hf_llama
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.models.llama.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
@@ -71,27 +71,26 @@ class TestArctic(unittest.TestCase):
                 'mapping': {
                     'world_size': tensor_parallel,
                     'tp_size': tensor_parallel,
+                    'moe_tp_size': 1,
+                    'moe_ep_size': tensor_parallel,
+                    'rank': rank,
                 },
                 'use_parallel_embedding': False,
                 'embedding_sharding_dim': 0,
-                'moe_num_experts': 0,
-                'moe_top_k': 0,
-                'moe_tp_mode': 1,
-                'moe_normalization_mode': 1,
+                'moe': {
+                    'num_experts': 0,
+                    'top_k': 0,
+                    'normalization_mode': 1,
+                },
                 'use_fused_mlp': False,
             }
 
             # Initialize model
-            tensorrt_llm_mistral = tensorrt_llm.models.LLaMAForCausalLM(
-                PretrainedConfig.from_dict(config))
+            config = PretrainedConfig.from_dict(config)
+            tensorrt_llm_mistral = tensorrt_llm.models.LLaMAForCausalLM(config)
+
             if not mistral_config.residual_mlp:
-                weights = load_from_hf_llama(tensorrt_llm_mistral,
-                                             hf_mistral,
-                                             dtype=dtype,
-                                             mapping=tensorrt_llm.Mapping(
-                                                 world_size=tensor_parallel,
-                                                 rank=rank,
-                                                 tp_size=tensor_parallel))
+                weights = load_weights_from_hf_model(hf_mistral, config)
                 tensorrt_llm_mistral.load(weights)
             # Prepare
             network.set_named_parameters(
@@ -100,6 +99,7 @@ class TestArctic(unittest.TestCase):
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=beam_width)
             # Forward
@@ -133,16 +133,16 @@ class TestArctic(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=(dtype in ["float16", "bfloat16"]),
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, hf_llama, llama_config,

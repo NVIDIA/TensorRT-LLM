@@ -31,7 +31,45 @@ namespace tc = tensorrt_llm::common;
 
 ITensor::UniquePtr ITensor::slice(SharedPtr tensor, std::size_t offset, std::size_t size)
 {
+    TLLM_CHECK(tensor);
     return std::make_unique<TensorView>(std::move(tensor), offset, size);
+}
+
+ITensor::UniquePtr ITensor::slice(SharedPtr tensor, Shape const& offsetDims, ITensor::DimType64 size)
+{
+    auto shape = tensor->getShape();
+    TLLM_CHECK(offsetDims.nbDims >= 0);
+    TLLM_CHECK(shape.nbDims >= offsetDims.nbDims);
+    TLLM_CHECK(size >= 0);
+
+    Shape strides = ITensor::strides(shape);
+    DimType64 offset{0};
+    for (SizeType32 di = 0; di < offsetDims.nbDims - 1; di++)
+    {
+        TLLM_CHECK(0 <= offsetDims.d[di] && offsetDims.d[di] < shape.d[di]);
+        offset += offsetDims.d[di] * strides.d[di];
+    }
+
+    if (TLLM_LIKELY(offsetDims.nbDims > 0))
+    {
+        TLLM_CHECK(offsetDims.d[offsetDims.nbDims - 1] + size <= shape.d[offsetDims.nbDims - 1]);
+        offset += offsetDims.d[offsetDims.nbDims - 1] * strides.d[offsetDims.nbDims - 1];
+    }
+    else
+    {
+        TLLM_CHECK(size >= 0 && size <= 1);
+        TLLM_CHECK(shape.nbDims == 0 ? size == 0 : true);
+    }
+
+    Shape dims;
+    dims.nbDims = shape.nbDims - offsetDims.nbDims + 1;
+    dims.d[0] = size;
+    for (SizeType32 di = 1; di < dims.nbDims; di++)
+    {
+        dims.d[di] = shape.d[di - 1 + offsetDims.nbDims];
+    }
+
+    return std::make_unique<TensorView>(std::move(tensor), offset, volume(dims), dims);
 }
 
 ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const& dims)
@@ -40,7 +78,7 @@ ITensor::UniquePtr ITensor::view(IBuffer::SharedPtr buffer, nvinfer1::Dims const
     return std::make_unique<TensorView>(std::move(buffer), 0, size, dims);
 }
 
-nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType> const& dims)
+nvinfer1::Dims ITensor::makeShape(std::initializer_list<ITensor::DimType64> const& dims)
 {
     TLLM_CHECK_WITH_INFO(dims.size() <= nvinfer1::Dims::MAX_DIMS, "Number of dimensions is too large");
     nvinfer1::Dims shape{};
@@ -99,7 +137,7 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     return result;
 }
 
-ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType dim)
+ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(0 < shape.nbDims, "Cannot squeeze 1-dimensional tensor");
     TLLM_CHECK_WITH_INFO(
@@ -112,7 +150,7 @@ ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType dim)
     return newDims;
 }
 
-ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType dim)
+ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType32 dim)
 {
     TLLM_CHECK_WITH_INFO(shape.nbDims < Shape::MAX_DIMS, "Too many dimensions to unsqueeze");
     TLLM_CHECK_WITH_INFO(

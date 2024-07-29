@@ -41,50 +41,85 @@ std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
     return &dtypeMap;
 }
 
-std::map<std::set<int>, ncclComm_t>* getCommMap()
+namespace
 {
-    static std::map<std::set<int>, ncclComm_t> commMap;
-    return &commMap;
-}
 
-void initCommMap(std::set<int> const& group)
+// Get NCCL unique ID for a group of ranks.
+ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
 {
-    auto& commMap = *getCommMap();
-    // [] operator inserts T() if it does not exist
-    if (isBuilding() || commMap[group] != nullptr)
-    {
-        return;
-    }
-    auto& comm = COMM_SESSION;
-    auto const myRank = comm.getRank();
-
-    int groupRank = 0;
-    for (int it : group)
-    {
-        if (it == myRank)
-        {
-            break;
-        }
-        ++groupRank;
-    }
-
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     ncclUniqueId id;
-    if (myRank == *group.begin())
+    if (rank == *group.begin())
     {
-        ncclGetUniqueId(&id);
+        NCCLCHECK(ncclGetUniqueId(&id));
         for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
         {
-            comm.sendValue(id, *it, 0);
+            COMM_SESSION.sendValue(id, *it, 0);
         }
     }
     else
     {
-        comm.recvValue(id, *group.begin(), 0);
+        COMM_SESSION.recvValue(id, *group.begin(), 0);
+    }
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
+    return id;
+}
+} // namespace
+
+std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
+{
+    auto const rank = COMM_SESSION.getRank();
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
+    static std::map<std::set<int>, std::weak_ptr<ncclComm_t>> commMap;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::ostringstream oss;
+    int index = 0;
+    for (auto const& rank : group)
+    {
+        if (index != 0)
+        {
+            oss << ",";
+        }
+        oss << rank;
+        index++;
+    }
+    auto groupStr = oss.str();
+    auto it = commMap.find(group);
+    if (it != commMap.end())
+    {
+        // If the weak_ptr can be locked, return the shared_ptr
+        auto ncclComm = it->second.lock();
+        if (ncclComm)
+        {
+            TLLM_LOG_TRACE("NCCL comm for group(%s) is cached for rank %d", groupStr.c_str(), rank);
+            return ncclComm;
+        }
     }
 
-    commMap[group] = nullptr;
-    NCCLCHECK(ncclCommInitRank(&commMap[group], group.size(), id, groupRank));
+    TLLM_LOG_TRACE("Init NCCL comm for group(%s) for rank %d", groupStr.c_str(), rank);
+    ncclUniqueId id = getUniqueId(group);
+    int groupRank = 0;
+    for (auto const& currentRank : group)
+    {
+        if (rank == currentRank)
+            break;
+        ++groupRank;
+    }
+    TLLM_CHECK(groupRank < group.size());
+    std::shared_ptr<ncclComm_t> ncclComm(new ncclComm_t,
+        [](ncclComm_t* comm)
+        {
+            ncclCommDestroy(*comm);
+            delete comm;
+        });
+    NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+    commMap[group] = ncclComm;
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
+    return ncclComm;
 }
+#endif // ENABLE_MULTI_DEVICE
 
 void* tensorrt_llm::plugins::getCommSessionHandle()
 {
@@ -94,8 +129,6 @@ void* tensorrt_llm::plugins::getCommSessionHandle()
     return nullptr;
 #endif // ENABLE_MULTI_DEVICE
 }
-
-#endif // ENABLE_MULTI_DEVICE
 
 namespace
 {

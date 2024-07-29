@@ -76,6 +76,15 @@ class TestModule(unittest.TestCase):
 
         self.assertEqual(4, len(list(m.named_modules())))
         self.assertEqual(5, len(list(m.named_network_outputs())))
+        self.assertEqual(
+            [("", m), ("m1", m.m1), ("m1.m1", m.m1.m1), ("m1.m2", m.m1.m2)],
+            list(m.named_modules()),
+        )
+        self.assertEqual(
+            [("", m, None), ("m1", m.m1, m), ("m1.m1", m.m1.m1, m.m1),
+             ("m1.m2", m.m1.m2, m.m1)],
+            list(m.named_modules_with_parent()),
+        )
 
     def test_module_list(self):
         m = Module4()

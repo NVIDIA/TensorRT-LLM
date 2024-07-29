@@ -49,21 +49,36 @@ public:
     using UniqueConstPtr = std::unique_ptr<ITensor const>;
     using SharedConstPtr = std::shared_ptr<ITensor const>;
     using Shape = nvinfer1::Dims;
-    using DimType = std::remove_reference_t<decltype(Shape::d[0])>;
+    using DimType64 = std::remove_reference_t<decltype(Shape::d[0])>;
 
-#ifdef TRT_LLM_USE_DIM64
-    static_assert(
-        std::is_same_v<DimType, std::int64_t>, "TRT_LLM_USE_DIM64 must be defined when TRT uses int64 as DimType");
-#else
-    static_assert(
-        std::is_same_v<DimType, std::int32_t>, "TRT_LLM_USE_DIM64 must be undefined when TRT uses int32 as DimType");
-#endif
+    static_assert(std::is_same_v<DimType64, std::int64_t>, "This version of TRT-LLM requires TensorRT 10.0 or later.");
+
     ~ITensor() override = default;
 
     //!
     //! \brief Returns the tensor dimensions.
     //!
     [[nodiscard]] virtual Shape const& getShape() const = 0;
+
+    //!
+    //! \brief Returns the tensor n-th dimension. If n is negative, returns the (nbDims - n)th dimension.
+    //! TODO: replace with constexpr parameter when moving to C++20.
+    //!
+    template <SizeType32 n>
+    [[nodiscard]] DimType64 getDimension() const
+    {
+        auto const shape = getShape();
+        static_assert(n < shape.MAX_DIMS && n >= -shape.MAX_DIMS,
+            "Trying to access the dimension of a tensor, when its maximal shape cannot have that dimension.");
+        if constexpr (n < 0)
+        {
+            return shape.d[shape.nbDims + n];
+        }
+        else
+        {
+            return shape.d[n];
+        }
+    }
 
     //!
     //! \brief Sets the tensor dimensions. The new size of the tensor will be `volume(dims)`
@@ -112,13 +127,32 @@ public:
     }
 
     //!
+    //! \brief Returns the strides of each dimemsion in a Shape.
+    //!
+    static Shape strides(Shape const& dims)
+    {
+        auto const nbDims = dims.nbDims;
+        Shape strides{};
+        strides.nbDims = nbDims;
+        if (nbDims > 0)
+        {
+            strides.d[nbDims - 1] = 1;
+        }
+        for (int i = nbDims - 2; i >= 0; i--)
+        {
+            strides.d[i] = dims.d[i + 1] * strides.d[i + 1];
+        }
+        return strides;
+    }
+
+    //!
     //! \brief Removes the given *unit* dimension from `shape`.
     //!
     //! \param shape The shape to squeeze.
     //! \param dim The dimension that should be removed ("squeezed").
     //! \return A new shape without the unit dimension.
     //!
-    static Shape squeeze(Shape const& shape, SizeType dim);
+    static Shape squeeze(Shape const& shape, SizeType32 dim);
 
     //!
     //! \brief Add a *unit* dimension to `shape` at the specified position.
@@ -127,12 +161,12 @@ public:
     //! \param dim The dimension where unit dimension should be added.
     //! \return A new shape with the added unit dimension.
     //!
-    static Shape unsqueeze(Shape const& shape, SizeType dim);
+    static Shape unsqueeze(Shape const& shape, SizeType32 dim);
 
     //!
     //! \brief Removes the given *unit* dimensions from this tensor.
     //!
-    void squeeze(SizeType dim)
+    void squeeze(SizeType32 dim)
     {
         reshape(squeeze(getShape(), dim));
     }
@@ -140,7 +174,7 @@ public:
     //!
     //! \brief Adds a *unit* dimension at the specified position
     //!
-    void unsqueeze(SizeType dim)
+    void unsqueeze(SizeType32 dim)
     {
         reshape(unsqueeze(getShape(), dim));
     }
@@ -175,6 +209,95 @@ public:
     }
 
     //!
+    //! \param offsetDims The offset in multiple dimensions.
+    //!
+    //! \param tensor The tensor to view.
+    //! \param offsetDims The offset dimensions of the view.
+    //! \param size The size of the view w.r.t. the last dimension in offsetDims.
+    //! \return A view of shape [size, the rest dimensions]
+    //!         or [size] when \param offsetDims specifies all dimensions.
+    //! \throw Whenever offset overflows or the last dimension offset+size overflows.
+    //!
+    static UniquePtr slice(SharedPtr tensor, Shape const& offsetDims, DimType64 size);
+
+    static UniquePtr slice(SharedPtr tensor, std::initializer_list<DimType64> const& offsetDims, DimType64 size)
+    {
+        return slice(std::move(tensor), makeShape(offsetDims), size);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(TConstPtr&& tensor, Shape const& offsetDims, std::size_t size)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims, size);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(
+        TConstPtr&& tensor, std::initializer_list<DimType64> const& offsetDims, std::size_t size)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims, size);
+    }
+
+    //!
+    //! \brief return the rest slices at the last dimension when `size` omitted.
+    //!
+    static UniquePtr slice(SharedPtr tensor, Shape const& offsetDims)
+    {
+        auto const dims = tensor->getShape();
+        auto const nbDims = offsetDims.nbDims;
+        auto const size = (dims.nbDims > 0 && nbDims > 0) ? dims.d[nbDims - 1] - offsetDims.d[nbDims - 1] : 0;
+        return ITensor::slice(std::move(tensor), offsetDims, size);
+    }
+
+    static UniquePtr slice(SharedPtr tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return slice(std::move(tensor), makeShape(offsetDims));
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(TConstPtr&& tensor, Shape const& offsetDims)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr slice(TConstPtr&& tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return slice(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    //!
+    //! \return Just the block at the point, with shape of [the rest dimensions]
+    //!         or [1] when \param offsetDims specifies all dimensions.
+    //!
+    static UniquePtr at(SharedPtr tensor, Shape const& offsetDims)
+    {
+        auto result = slice(std::move(tensor), offsetDims, 1);
+        if (result->getShape().nbDims > 1)
+        {
+            result->squeeze(0);
+        }
+        return result;
+    }
+
+    static UniquePtr at(SharedPtr tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return at(std::move(tensor), makeShape(offsetDims));
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static UniqueConstPtr at(TConstPtr&& tensor, Shape const& offsetDims)
+    {
+        return at(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    template <typename TConstPtr, std::enable_if_t<std::is_const_v<PointerElementType<TConstPtr>>, int> = 0>
+    static ITensor::UniqueConstPtr at(TConstPtr&& tensor, std::initializer_list<DimType64> const& offsetDims)
+    {
+        return at(constPointerCast(std::forward<TConstPtr>(tensor)), offsetDims);
+    }
+
+    //!
     //! \brief Returns a view on the underlying `buffer` (or tensor) with the given shape.
     //!
     //! \param tensor The tensor to view.
@@ -199,6 +322,23 @@ public:
     {
         auto shapes = tensor->getShape();
         return ITensor::view(std::move(tensor), shapes);
+    }
+
+    //!
+    //! \brief Returns a flattened view on the underlying `tensor` which can be independently reshaped.
+    //!
+    //! \param tensor The tensor to flatten.
+    //! \param sliceN Slice the first N elements after flattening. -1 means take the whole flattened tensor.
+    //! \return A flatten view on the `tensor`.
+    //!
+    static UniquePtr flattenN(SharedPtr tensor, std::int64_t sliceN = -1)
+    {
+        UniquePtr flatten = ITensor::view(tensor, ITensor::makeShape({ITensor::volume(tensor->getShape()), 1}));
+        if (sliceN > 0)
+        {
+            flatten = ITensor::slice(std::move(flatten), 0, sliceN);
+        }
+        return flatten;
     }
 
     //!
@@ -238,7 +378,7 @@ public:
     //!
     //! \brief A convenience function to create a tensor shape with the given dimensions.
     //!
-    static Shape makeShape(std::initializer_list<DimType> const& dims);
+    static Shape makeShape(std::initializer_list<DimType64> const& dims);
 
     //!
     //! \brief A convenience function for converting a tensor shape to a `string`.
@@ -257,7 +397,7 @@ public:
     //! \brief A convenience function to compare shapes.
     //!
     template <typename T>
-    static bool shapeEquals(Shape const& lhs, T const* dims, SizeType count)
+    static bool shapeEquals(Shape const& lhs, T const* dims, SizeType32 count)
     {
         return lhs.nbDims == count && std::equal(lhs.d, lhs.d + lhs.nbDims, dims);
     }
@@ -267,13 +407,13 @@ public:
         return shapeEquals(getShape(), other);
     }
 
-    bool shapeEquals(std::initializer_list<SizeType> const& other) const
+    bool shapeEquals(std::initializer_list<SizeType32> const& other) const
     {
         return shapeEquals(getShape(), other.begin(), other.size());
     }
 
     template <typename T>
-    bool shapeEquals(T const* dims, SizeType count) const
+    bool shapeEquals(T const* dims, SizeType32 count) const
     {
         return shapeEquals(getShape(), dims, count);
     }
@@ -281,11 +421,11 @@ public:
 protected:
     ITensor() = default;
 
-    static DimType castSize(size_t newSize)
+    static DimType64 castSize(size_t newSize)
     {
         TLLM_CHECK_WITH_INFO(
-            newSize <= std::numeric_limits<DimType>::max(), "New size is too large. Use reshape() instead.");
-        return static_cast<DimType>(newSize);
+            newSize <= std::numeric_limits<DimType64>::max(), "New size is too large. Use reshape() instead.");
+        return static_cast<DimType64>(newSize);
     }
 };
 
@@ -297,5 +437,53 @@ inline std::ostream& operator<<(std::ostream& output, ITensor::Shape const& dims
 
 //! \brief Utility function to print a tensor with its shape.
 std::ostream& operator<<(std::ostream& output, ITensor const& tensor);
+
+/// @brief Retrieves a T const typed pointer to the underlying data of the tensor pointed to by the tensorPtr, or
+/// nullptr if the tensorPtr is null.
+/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
+/// @tparam T The type of the underlying data.
+/// @param tensorPtr A possibly null shared ptr.
+/// @return A pointer to T const, possibly nullptr.
+template <typename T>
+T const* bufferCastOrNull(ITensor::SharedConstPtr const& tensorPtr)
+{
+    return bufferCastOrNull<T>(static_cast<IBuffer::SharedConstPtr>(tensorPtr));
+}
+
+/// @brief Retrieves a T typed pointer to the underlying data of the buffer pointed to by the tensorPtr, or nullptr if
+/// the tensorPtr is null.
+/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
+/// @tparam T The type of the underlying data.
+/// @param tensorPtr A possibly null shared ptr.
+/// @return A pointer to T, possibly nullptr.
+template <typename T>
+T* bufferCastOrNull(ITensor::SharedPtr const& tensorPtr)
+{
+    return bufferCastOrNull<T>(static_cast<IBuffer::SharedPtr>(tensorPtr));
+}
+
+/// @brief Retrieves a T typed pointer to the underlying data of the tensor pointed to by the tensor pointer
+/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
+/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
+/// @tparam T The type of the underlying data.
+/// @param optionalBufferPtr A possibly empty optional.
+/// @return A pointer to T, possibly nullptr.
+template <typename T>
+T* bufferCastOrNull(std::optional<ITensor::SharedPtr> const& optionalTensorPtr)
+{
+    return bufferCastOrNull<T>(static_cast<std::optional<IBuffer::SharedPtr>>(optionalTensorPtr));
+}
+
+/// @brief Retrieves a T const typed pointer to the underlying data of the tensor pointed to by the tensor pointer
+/// contained in the optionalBufferPtr, or nullptr if the optional doesn't have a value.
+/// @details This overload has to be declared to avoid ambiguity when an implicit conversion to IBuffer is involved.
+/// @tparam T The type of the underlying data.
+/// @param optionalBufferPtr A possibly empty optional.
+/// @return A pointer to const T, possibly nullptr.
+template <typename T>
+T const* bufferCastOrNull(std::optional<ITensor::SharedConstPtr> const& optionalTensorPtr)
+{
+    return bufferCastOrNull<T>(static_cast<std::optional<IBuffer::SharedConstPtr>>(optionalTensorPtr));
+}
 
 } // namespace tensorrt_llm::runtime

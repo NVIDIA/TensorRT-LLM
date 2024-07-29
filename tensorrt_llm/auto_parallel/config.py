@@ -45,7 +45,6 @@ class AutoParallelConfig(DictConversion):
     same_buffer_io: Dict[str, str] = field(default_factory=dict)
     same_spec_io: Dict[str, str] = field(default_factory=dict)
     sharded_io_allowlist: List[str] = field(default_factory=list)
-    fast_reduce: bool = True
     fill_weights: bool = False
 
     # debug configuration

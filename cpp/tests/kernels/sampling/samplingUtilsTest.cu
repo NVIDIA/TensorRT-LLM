@@ -29,12 +29,14 @@ namespace tk = tensorrt_llm::kernels;
 namespace
 {
 
-__global__ void generateRandomNumber(int32_t* vals, curandState_t* states, int const batch_size)
+__global__ void generateRandomNumber(
+    SizeType32* vals, SizeType32 const* batchSlots, curandState_t* states, SizeType32 batchSize)
 {
-    int idx = threadIdx.x;
-    if (idx < batch_size)
+    auto const bid = static_cast<SizeType32>(threadIdx.x);
+    if (bid < batchSize)
     {
-        vals[idx] = curand(states + idx);
+        auto const batchSlot = batchSlots ? batchSlots[bid] : bid;
+        vals[bid] = curand(states + batchSlot);
     }
 }
 
@@ -57,7 +59,7 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
         // Generate random numbers using initialized curand states.MemoryType
         auto randValsDevice = this->mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
         generateRandomNumber<<<1, batchSize, 0, this->mStream->get()>>>(
-            bufferCast<int32_t>(*randValsDevice), curandStates, batchSize);
+            bufferCast<int32_t>(*randValsDevice), nullptr, curandStates, batchSize);
         auto randValsHost = this->mBufferManager->copyFrom(*randValsDevice, MemoryType::kCPU);
         this->mStream->synchronize();
 
@@ -90,10 +92,10 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
 
 TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
 {
-    int32_t batchSize = 127;
+    SizeType32 batchSize = 127;
 
     curandState_t* curandStates;
-    cudaMalloc(&curandStates, sizeof(curandState_t) * batchSize);
+    cudaMalloc(&curandStates, sizeof(curandState_t) * 2 * batchSize);
 
     auto randomSeedsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT64);
     auto randomSeedsHostPtr = bufferCast<int64_t>(*randomSeedsHost);
@@ -106,10 +108,10 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
 
     auto batchSlots = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
-    auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
-    for (SizeType bi = 0; bi < batchSize; ++bi)
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
+    for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
-        batchSlotsPtr[batchSize - bi - 1] = bi;
+        batchSlotsPtr[bi] = 2 * bi;
     }
 
     // Initialize curand states.
@@ -120,20 +122,19 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     // Generate random numbers using initialized curand states.
     auto randValsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
     generateRandomNumber<<<1, batchSize, 0, this->mStream->get()>>>(
-        bufferCast<int32_t>(*randValsDevice), curandStates, batchSize);
+        bufferCast<SizeType32>(*randValsDevice), batchSlotsPtr, curandStates, batchSize);
     auto const randValsHost = mBufferManager->copyFrom(*randValsDevice, MemoryType::kCPU);
     this->mStream->synchronize();
 
-    auto const randValsHostPtr = bufferCast<int32_t>(*randValsHost);
+    auto const randValsHostPtr = bufferCast<SizeType32>(*randValsHost);
 
     // The same seed produces the same random number.
-    for (size_t i = 0; i + periodSize - 1 < batchSize; i += periodSize)
+    for (SizeType32 bi = 0; bi + periodSize - 1 < batchSize; bi += periodSize)
     {
-        for (size_t j = 1; j < periodSize; ++j)
+        for (size_t pi = 1; pi < periodSize; ++pi)
         {
-            // FIXME(nkorobov): this has to be accessed via batchSlot
-            EXPECT_TRUE(randValsHostPtr[i] == randValsHostPtr[i + j])
-                << tc::fmtstr("Fail at val[%d]=%d <> val[%d]=%d", i, randValsHostPtr[i], i + j, randValsHostPtr[i + j]);
+            EXPECT_TRUE(randValsHostPtr[bi] == randValsHostPtr[bi + pi]) << tc::fmtstr(
+                "Fail at val[%d]=%d <> val[%d]=%d", bi, randValsHostPtr[bi], bi + pi, randValsHostPtr[bi + pi]);
         }
     }
 
@@ -145,7 +146,7 @@ template <typename T>
 class SamplingUtilsTypedKernelTest : public SamplingKernelTest<T>
 {
 public:
-    void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax, bool useLogitsPtrs, SizeType beamWidth)
+    void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax, bool useLogitsPtrs, SizeType32 beamWidth)
     {
         auto const dataType = TRTDataType<T>::value;
         auto const ptrType = TRTDataType<T*>::value;
@@ -167,7 +168,7 @@ public:
         auto batchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
@@ -179,7 +180,7 @@ public:
         initRandom(biasHostPtr, vocabSize, -3.0f, 3.0f);
 
         auto logitsHostPtrsData = reinterpret_cast<T**>(bufferCast<int64_t>(*logitsHostPtrs));
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             logitsHostPtrsData[bi] = logitsHostPtr + bi * beamWidth * vocabSizePadded;
         }
@@ -196,10 +197,10 @@ public:
             0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
         std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
 
-        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
         {
             endIdsHostPtr[bi] = endIdsDistr(gen);
-            for (SizeType bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
             {
                 finishedHostPtr[bwi * maxBatchSize + bi]
                     = finishedDist(gen) < 0.3 ? tk::FinishedState::finished() : tk::FinishedState::empty();
@@ -225,13 +226,13 @@ public:
 
         bool const IS_FP16 = std::is_same<T, half>::value;
         T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            for (SizeType bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
             {
                 float maxLogit = -1 * FLT_MAX;
-                for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                 {
                     auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                     auto refLogit = logitsHostPtr[idx];
@@ -253,14 +254,14 @@ public:
                 if (computeSoftmax)
                 {
                     float sumExp = 0.f;
-                    for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                    for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
                         auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                         float refLogit = refLogitsHostPtr[idx];
                         refLogitsHostPtr[idx] = std::exp(refLogit - maxLogit);
                         sumExp += static_cast<float>(refLogitsHostPtr[idx]);
                     }
-                    for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                    for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
                         auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                         float refLogit = refLogitsHostPtr[idx];
@@ -269,11 +270,11 @@ public:
                 }
             }
         }
-        for (SizeType bi = 0; bi < batchSize; ++bi)
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            for (SizeType bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
             {
-                for (SizeType vi = 0; vi < vocabSizePadded; ++vi)
+                for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                 {
                     auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
                     auto refLogit = refLogitsHostPtr[idx];

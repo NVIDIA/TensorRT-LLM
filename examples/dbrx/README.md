@@ -111,12 +111,11 @@ trtllm-build --checkpoint_dir dbrx/trt_ckpt/bf16/tp4pp2 \
 
 ```bash
 # Build DBRX with expert parallelism for DbrxExperts layer and tensor parallelism for rest
-# `moe_tp_mode` decides sharding for expert weights:
-# 1 is for expert parallelism, 2 for tensor parallelism
 python convert_checkpoint.py --model_dir dbrx-base \
         --dtype bfloat16 \
         --tp_size 8 \
-        --moe_tp_mode 1 \
+        --moe_tp_size 1 \
+        --moe_ep_size 8 \
         --workers 8 \
         --output_dir dbrx/trt_ckpt/bf16/ep8
 
@@ -186,7 +185,6 @@ trtllm-build --checkpoint_dir dbrx/trt_ckpt/int8kv/tp4 \
         --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
         --moe_plugin float16 \
-        --strongly_typed \
         --workers 4 \
         --output_dir dbrx/trt_engines/int8kv/tp4
 ```

@@ -37,8 +37,8 @@ class LoraCachePageManagerConfig
 {
 public:
     explicit constexpr LoraCachePageManagerConfig(runtime::MemoryType memType, nvinfer1::DataType dType,
-        SizeType totalNumPages, SizeType maxPagesPerBlock, SizeType slotsPerPage, SizeType pageWidth,
-        SizeType numCopyStreams)
+        SizeType32 totalNumPages, SizeType32 maxPagesPerBlock, SizeType32 slotsPerPage, SizeType32 pageWidth,
+        SizeType32 numCopyStreams)
         : mMemoryType(memType)
         , mDataType(dType)
         , mTotalNumPages(totalNumPages)
@@ -69,42 +69,42 @@ public:
         mDataType = dtype;
     }
 
-    [[nodiscard]] SizeType constexpr getTotalNumPages() const noexcept
+    [[nodiscard]] SizeType32 constexpr getTotalNumPages() const noexcept
     {
         return mTotalNumPages;
     }
 
-    void constexpr setTotalNumPage(SizeType const& totalNumPages) noexcept
+    void constexpr setTotalNumPage(SizeType32 const& totalNumPages) noexcept
     {
         mTotalNumPages = totalNumPages;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxPagesPerBlock() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxPagesPerBlock() const noexcept
     {
         return mMaxPagesPerBlock;
     }
 
-    void constexpr setMaxPagesPerBlock(SizeType const& maxPagesPerBlock) noexcept
+    void constexpr setMaxPagesPerBlock(SizeType32 const& maxPagesPerBlock) noexcept
     {
         mMaxPagesPerBlock = maxPagesPerBlock;
     }
 
-    [[nodiscard]] SizeType constexpr getSlotsPerPage() const noexcept
+    [[nodiscard]] SizeType32 constexpr getSlotsPerPage() const noexcept
     {
         return mSlotsPerPage;
     }
 
-    void constexpr setSlotsPerPage(SizeType const& slotsPerPage) noexcept
+    void constexpr setSlotsPerPage(SizeType32 const& slotsPerPage) noexcept
     {
         mSlotsPerPage = slotsPerPage;
     }
 
-    [[nodiscard]] SizeType constexpr getPageWidth() const noexcept
+    [[nodiscard]] SizeType32 constexpr getPageWidth() const noexcept
     {
         return mPageWidth;
     }
 
-    void constexpr setPageWidth(SizeType const& pageWidth) noexcept
+    void constexpr setPageWidth(SizeType32 const& pageWidth) noexcept
     {
         mPageWidth = pageWidth;
     }
@@ -119,12 +119,12 @@ public:
         mInitToZero = initToZero;
     }
 
-    [[nodiscard]] SizeType constexpr getNumCopyStreams() const noexcept
+    [[nodiscard]] SizeType32 constexpr getNumCopyStreams() const noexcept
     {
         return mNumCopyStreams;
     }
 
-    void constexpr setNumCopyStreams(SizeType numCopyStreams) noexcept
+    void constexpr setNumCopyStreams(SizeType32 numCopyStreams) noexcept
     {
         mNumCopyStreams = numCopyStreams;
     }
@@ -137,15 +137,15 @@ private:
      * Number cache pages in the cache.
      * Generally corresponds to the number of opt sized LoRAs that can be stored in the cache
      */
-    SizeType mTotalNumPages;
+    SizeType32 mTotalNumPages;
     // number of pages to allocate in one block
-    SizeType mMaxPagesPerBlock;
+    SizeType32 mMaxPagesPerBlock;
     // number of slots per page, where a slot corresponds to a adapterSize=1, 1-layer, 1-module set or weights
-    SizeType mSlotsPerPage;
-    SizeType mPageWidth;
+    SizeType32 mSlotsPerPage;
+    SizeType32 mPageWidth;
 
     // number of streams used to copy pages to device cache
-    SizeType mNumCopyStreams = 1;
+    SizeType32 mNumCopyStreams = 1;
 
     bool mInitToZero; // for testing
 };

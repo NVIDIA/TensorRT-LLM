@@ -24,7 +24,6 @@ using namespace tensorrt_llm::layers;
 using namespace tensorrt_llm::common;
 
 namespace tk = tensorrt_llm::kernels;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace trk = tensorrt_llm::runtime::kernels;
 
 template <typename T>
@@ -79,71 +78,71 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     trk::invokeFill(*mEndIdsDevice, int32_t{mEndId}, *mStream);
 
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-    for (SizeType bi = 0; bi < mBatchSize; ++bi)
+    for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
         batchSlotsPtr[bi] = 2 * bi;
     }
 
     auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
     auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
-    for (SizeType bi = 0; bi < mMaxBatchSize; bi++)
+    for (SizeType32 bi = 0; bi < mMaxBatchSize; bi++)
     {
         idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
     }
 
     auto setupParams = std::make_shared<SamplingSetupParams>();
     setupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-    setupParams->runtime_top_k
-        = params.topKs.size() ? std::make_optional<std::vector<SizeType>>(params.topKs) : std::nullopt;
-    setupParams->runtime_top_p
+    setupParams->runtimeTopK
+        = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
+    setupParams->runtimeTopP
         = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
-    setupParams->top_p_decay
-        = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
-    setupParams->top_p_min
+    setupParams->topPDecay = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
+    setupParams->topPMin
         = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
-    setupParams->top_p_reset_ids
+    setupParams->topPResetIds
         = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
 
-    mSamplingLayer->setup(mBatchSize, mBeamWidth, batchSlotsPtr, setupParams);
+    mSamplingLayer->setup(mBatchSize, mBeamWidth, mBatchSlots, setupParams);
 
     mStream->synchronize();
 }
 
 template <typename T>
-std::shared_ptr<SamplingInputParams> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
+std::shared_ptr<SamplingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
-    auto decodeInputTensors = std::make_shared<SamplingInputParams>(
-        step, ite, tcc::toTllmTensor(*mLogitsDevice), tcc::toTllmTensor(*mEndIdsDevice), mMaxSeqLen);
+    auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, step, ite, mBatchSize);
 
-    decodeInputTensors->input_lengths = tcc::toTllmTensor(*mContextLengthDevice);
+    decodeInputTensors->logits = mLogitsDevice;
 
-    decodeInputTensors->finished = tcc::toTllmTensor(*mFinishedDevice);
+    decodeInputTensors->inputLengths = mContextLengthDevice;
 
-    decodeInputTensors->batch_slots = tcc::toTllmTensor(*mBatchSlots);
+    decodeInputTensors->finished = mFinishedDevice;
 
-    decodeInputTensors->probs_computed = mComputeProbs;
+    decodeInputTensors->batchSlots = mBatchSlots;
 
-    decodeInputTensors->curand_states = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    decodeInputTensors->probsComputed = mComputeProbs;
 
-    decodeInputTensors->sampling_workspace = reinterpret_cast<void*>(bufferCast<int8_t>(*mSamplingWorkspaceDevice));
+    decodeInputTensors->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+
+    decodeInputTensors->samplingWorkspace = reinterpret_cast<void*>(bufferCast<int8_t>(*mSamplingWorkspaceDevice));
 
     return decodeInputTensors;
 }
 
 template <typename T>
-std::shared_ptr<SamplingOutputParams> BaseSamplingLayerTest<T>::createOutputTensors()
+std::shared_ptr<BaseDecodingOutputs> BaseSamplingLayerTest<T>::createOutputTensors()
 {
-    auto decodeOutputs = std::make_shared<SamplingOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
-    decodeOutputs->output_ids_ptr = tcc::toTllmTensor(*mIdsPtrHost);
+    auto decodeOutputs = std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
+    decodeOutputs->outputIdsPtr = mIdsPtrHost;
 
-    decodeOutputs->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
+    decodeOutputs->sequenceLength = mSeqLengthsDevice;
 
-    decodeOutputs->finished = tcc::toTllmTensor(*mFinishedDevice);
+    decodeOutputs->finished = mFinishedDevice;
 
-    decodeOutputs->output_log_probs = tcc::toTllmTensor(*mOutputLogProbsDevice);
+    decodeOutputs->outputLogProbs = mOutputLogProbsDevice;
 
-    decodeOutputs->cum_log_probs = tcc::toTllmTensor(*mCumLogProbsDevice);
+    decodeOutputs->cumLogProbs = mCumLogProbsDevice;
 
     // TODO(nkorobov): check log probs and cum_log_probs
     return decodeOutputs;
@@ -216,7 +215,7 @@ void BaseSamplingLayerTest<T>::runTest(
             // Reset by the test value since the sampling layer internally updates the logit buffer.
             batchCopy(step);
             inputTensors->step = step;
-            mSamplingLayer->forward(outputTensors, inputTensors);
+            mSamplingLayer->forwardAsync(outputTensors, inputTensors);
             mStream->synchronize();
         }
 

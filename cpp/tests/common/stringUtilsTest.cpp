@@ -77,3 +77,25 @@ TEST(StringUtil, FormatFixedDecimals)
         EXPECT_EQ(prefix, formatFixed(num));
     }
 }
+
+TEST(StringUtil, str2set)
+{
+    {
+        char delimiter{','};
+
+        std::vector<std::string> inputs{
+            {"apple,car,dog"}, {",apple,car,dog"}, {"apple,car,dog"}, {"apple,car,dog,,"}, {"apple,,,car,dog,"}};
+
+        for (auto const& input : inputs)
+        {
+
+            auto out = str2set(input, delimiter);
+
+            EXPECT_EQ(out.size(), 3);
+            EXPECT_EQ(out.count("apple"), 1);
+            EXPECT_EQ(out.count("car"), 1);
+            EXPECT_EQ(out.count("dog"), 1);
+            EXPECT_EQ(out.count("cat"), 0);
+        }
+    }
+}

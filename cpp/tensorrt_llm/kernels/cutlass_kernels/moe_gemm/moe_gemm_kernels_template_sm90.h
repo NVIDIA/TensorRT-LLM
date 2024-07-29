@@ -103,8 +103,8 @@ template <typename CTAShape, typename ClusterShape>
 constexpr bool are_tile_shapes_supported()
 {
     using namespace cute;
-    constexpr int cta_m = get<0>(CTAShape{});
-    constexpr int cta_n = get<1>(CTAShape{});
+    [[maybe_unused]] constexpr int cta_m = get<0>(CTAShape{});
+    [[maybe_unused]] constexpr int cta_n = get<1>(CTAShape{});
     constexpr int cga_m = get<0>(ClusterShape{});
     constexpr int cga_n = get<1>(ClusterShape{});
 
@@ -190,6 +190,7 @@ void dispatchMoeGemmSelectTileShapeSM90(HopperGroupedGemmInput hopper_input, int
         SHAPE_CASE(128, 64, 128)
         SHAPE_CASE(128, 128, 128)
         SHAPE_CASE(128, 256, 128)
+        SHAPE_CASE(256, 128, 128)
 
 #undef SHAPE_CASE
     case cutlass_extensions::CutlassTileConfigSM90::Undefined: TLLM_THROW("GEMM config undefined."); break;

@@ -36,12 +36,12 @@ namespace tensorrt_llm::plugins
 
 struct GemmDims
 {
-    using DimType = utils::DimType;
+    using DimType64 = utils::DimType64;
 
-    DimType minM;
-    DimType maxM;
-    DimType n;
-    DimType k;
+    DimType64 minM;
+    DimType64 maxM;
+    DimType64 n;
+    DimType64 k;
 
     GemmDims()
         : minM(-1)
@@ -51,7 +51,7 @@ struct GemmDims
     {
     }
 
-    GemmDims(DimType minM_, DimType maxM_, DimType n_, DimType k_)
+    GemmDims(DimType64 minM_, DimType64 maxM_, DimType64 n_, DimType64 k_)
         : minM(minM_)
         , maxM(maxM_)
         , n(n_)
@@ -172,8 +172,6 @@ template <typename Config, typename RunnerPtr, typename GemmIdType, typename Gem
 class GemmPluginProfiler
 {
 public:
-    static constexpr int MAX_PROFILE_M = 8192;
-
     // Map for single GEMM for different Ms (GEMM dimension) to the best config for particular M
     using MProfileMap = std::unordered_map<int, std::optional<Config>>;
     using MProfileMapPtr = std::shared_ptr<MProfileMap>;
@@ -209,7 +207,7 @@ public:
             {
                 std::ostringstream msg;
                 msg << "Cannot find ID (" << id << ") in the profile map. Abort.";
-                TLLM_LOG_ERROR(msg.str());
+                TLLM_THROW(msg.str());
             }
             return iter->second;
         }
@@ -244,6 +242,8 @@ public:
 
     std::optional<Config> getBestConfig(int m, GemmIdType const& gemmId) const;
 
+    virtual int getMaxProfileM() const;
+
 protected:
     virtual void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) = 0;
 
@@ -256,7 +256,7 @@ protected:
 
     virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
 
-    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream){};
+    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream);
 
 private:
     void allocateTmpData();

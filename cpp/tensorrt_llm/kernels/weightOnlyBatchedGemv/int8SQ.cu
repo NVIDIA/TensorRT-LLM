@@ -167,6 +167,9 @@ void int8_sq_launcher(Params& params, cudaStream_t s)
 template void int8_sq_launcher<float>(Params& params, cudaStream_t s);
 template void int8_sq_launcher<half>(Params& params, cudaStream_t s);
 template void int8_sq_launcher<int>(Params& params, cudaStream_t s);
+#ifdef ENABLE_BF16
+template void int8_sq_launcher<__nv_bfloat16>(Params& params, cudaStream_t s);
+#endif
 } // namespace smooth_quant
 } // namespace kernels
 } // namespace tensorrt_llm

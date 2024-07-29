@@ -1,9 +1,8 @@
-import json
 import os
 from pathlib import Path
 
 import click
-from utils.benchmarkers import gptSessionBenchmarker
+from benchmarkers.static import gptSessionBenchmarker
 from utils.dataclasses import BenchmarkConfig, BenchmarkResults
 
 
@@ -29,16 +28,6 @@ from utils.dataclasses import BenchmarkConfig, BenchmarkResults
     default=Path(os.path.dirname(os.path.realpath(__file__)), "../../..",
                  "cpp/build/benchmarks/gptSessionBenchmark").absolute(),
     help="Path to TRT-LLM gptSession benchmark binary.")
-@click.option("--max-tokens-in-kv-cache",
-              type=int,
-              default=None,
-              help="Maximum number of tokens to store in KV cache")
-@click.option(
-    "--kv-cache-mem-percent",
-    type=float,
-    default=0.9,
-    help="The percentage of free memory that the KV Cache is allowed to occupy.",
-)
 @click.option("--warm-up-runs",
               type=int,
               default=2,
@@ -54,23 +43,20 @@ from utils.dataclasses import BenchmarkConfig, BenchmarkResults
 @click.pass_obj
 def static_benchmark(benchmark_cfg: BenchmarkConfig, batch: int, isl: int,
                      osl: int, gpt_session_path: Path, warm_up_runs: int,
-                     num_runs: int, duration: int, max_tokens_in_kv_cache: int,
-                     kv_cache_mem_percent: float):
+                     num_runs: int, duration: int):
     """Run a static benchmark with a fixed batch size, ISL, and OSL."""
-    if max_tokens_in_kv_cache is None:
-        max_tokens_in_kv_cache = batch * isl
 
+    benchmark_cfg.max_batch_size = batch
     benchmarker = gptSessionBenchmarker(
         benchmark_cfg,
         gpt_session_path,
-        batch,
+        benchmark_cfg.max_batch_size,
         isl,
         osl,
         warm_up_runs,
         num_runs,
         duration,
-        max_tokens_in_kv_cache,
-        kv_cache_mem_percent,
+        benchmark_cfg.kv_cache_mem_percentage,
     )
 
     print(f"Building TRT-LLM engine for '{benchmark_cfg.model}'...")
@@ -79,5 +65,5 @@ def static_benchmark(benchmark_cfg: BenchmarkConfig, batch: int, isl: int,
     print("Build complete. Running benchmark...")
     result: BenchmarkResults = benchmarker.benchmark()
 
-    print(f"JSON: {json.dumps(result.model_dump())}")
+    print(f"JSON: {result.model_dump_json()}")
     print(result.get_summary(benchmarker.config))

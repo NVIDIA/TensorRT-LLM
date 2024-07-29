@@ -29,9 +29,9 @@ from transformers import MistralConfig, MistralForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_str
-from tensorrt_llm.models.llama.weight import (load_from_hf_llama,
-                                              load_from_meta_llama)
-from tensorrt_llm.models.modeling_utils import PretrainedConfig, optimize_model
+from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.models.llama.convert import (load_weights_from_hf_model,
+                                               load_weights_from_meta_ckpt)
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
@@ -75,26 +75,22 @@ class TestMistral(unittest.TestCase):
                 'mapping': {
                     'world_size': tensor_parallel,
                     'tp_size': tensor_parallel,
+                    'rank': rank,
                 },
                 'use_parallel_embedding': False,
                 'embedding_sharding_dim': 0,
-                'moe_num_experts': 0,
-                'moe_top_k': 0,
-                'moe_tp_mode': 1,
-                'moe_normalization_mode': 1,
+                "moe": {
+                    "num_experts": 0,
+                    "top_k": 0,
+                    "normalization_mode": 1,
+                },
                 'use_fused_mlp': False,
             }
 
             # Initialize model
-            tensorrt_llm_mistral = tensorrt_llm.models.LLaMAForCausalLM(
-                PretrainedConfig.from_dict(config))
-            weights = load_from_hf_llama(tensorrt_llm_mistral,
-                                         hf_mistral,
-                                         dtype=dtype,
-                                         mapping=tensorrt_llm.Mapping(
-                                             world_size=tensor_parallel,
-                                             rank=rank,
-                                             tp_size=tensor_parallel))
+            config = PretrainedConfig.from_dict(config)
+            tensorrt_llm_mistral = tensorrt_llm.models.LLaMAForCausalLM(config)
+            weights = load_weights_from_hf_model(hf_mistral, config)
             tensorrt_llm_mistral.load(weights)
             # Prepare
             network.set_named_parameters(
@@ -103,6 +99,7 @@ class TestMistral(unittest.TestCase):
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=beam_width)
             # Forward
@@ -136,16 +133,16 @@ class TestMistral(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=(dtype in ["float16", "bfloat16"]),
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, hf_llama, llama_config,
@@ -293,6 +290,10 @@ class TestMistral(unittest.TestCase):
                        device='cuda')
         ]  # ping-pong buffers
 
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -300,6 +301,7 @@ class TestMistral(unittest.TestCase):
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
             'host_request_types': ctx_host_request_types,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -360,6 +362,9 @@ class TestMistral(unittest.TestCase):
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+
         step1_buffer = {
             'input_ids': step1_id,
             'context_lengths': gen_context_lengths,
@@ -367,6 +372,7 @@ class TestMistral(unittest.TestCase):
             'last_token_ids': gen_last_token_ids,
             'host_request_types': gen_host_request_types,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
@@ -457,7 +463,6 @@ class TestMistral(unittest.TestCase):
 
         tp_size = tp_info[0]
         rank = tp_info[1]
-        dtype = "float16"
         use_parallel_embedding = (emb_sharding_dim >= 0)
         embedding_sharding_dim = abs(emb_sharding_dim)
         hf_mistral = MistralForCausalLM.from_pretrained(
@@ -491,53 +496,28 @@ class TestMistral(unittest.TestCase):
             'mapping': {
                 'world_size': tp_size,
                 'tp_size': tp_size,
+                'rank': rank,
             },
-            "moe_config": {
+            "moe": {
                 "num_experts": 0,
                 "top_k": 0,
-                "tp_mode": 2,
                 "normalization_mode": 1
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'moe_num_experts': 0,
-            'moe_top_k': 0,
-            'moe_tp_mode': 1,
-            'moe_normalization_mode': 1,
             'use_fused_mlp': False,
         }
-        cfg = PretrainedConfig.from_dict(config)
 
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_mistral_wHF = tensorrt_llm.models.LLaMAForCausalLM(config)
         # print_layers(tensorrt_llm_mistral_wHF)
-        tensorrt_llm_mistral_wHF = tensorrt_llm.models.LLaMAForCausalLM(cfg)
-        tensorrt_llm_mistral_wHF = optimize_model(
-            tensorrt_llm_mistral_wHF,
-            use_parallel_embedding=use_parallel_embedding)
-
-        weights = load_from_hf_llama(tensorrt_llm_mistral_wHF,
-                                     hf_mistral,
-                                     mapping=tensorrt_llm.Mapping(
-                                         world_size=tp_size,
-                                         rank=rank,
-                                         tp_size=tp_size),
-                                     dtype=dtype)
-
+        weights = load_weights_from_hf_model(hf_mistral, config)
         tensorrt_llm_mistral_wHF.load(weights)
-
         # print_layers(tensorrt_llm_mistral_wHF)
 
-        tensorrt_llm_mistral_wMAI = tensorrt_llm.models.LLaMAForCausalLM(cfg)
-        tensorrt_llm_mistral_wMAI = optimize_model(
-            tensorrt_llm_mistral_wMAI,
-            use_parallel_embedding=use_parallel_embedding)
-
+        tensorrt_llm_mistral_wMAI = tensorrt_llm.models.LLaMAForCausalLM(config)
         # print_layers(tensorrt_llm_mistral_wMAI)
-        weights = load_from_meta_llama(mistralai_path,
-                                       mapping=tensorrt_llm.Mapping(
-                                           world_size=tp_size,
-                                           rank=rank,
-                                           tp_size=tp_size),
-                                       dtype=dtype)
+        weights = load_weights_from_meta_ckpt(mistralai_path, config)
         tensorrt_llm_mistral_wMAI.load(weights)
         # print_layers(tensorrt_llm_mistral_wMAI)
         # token embedding

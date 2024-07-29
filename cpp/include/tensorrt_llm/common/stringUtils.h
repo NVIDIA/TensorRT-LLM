@@ -24,6 +24,7 @@
 #include <memory>  // std::make_unique
 #include <sstream> // std::stringstream
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace tensorrt_llm::common
@@ -105,5 +106,8 @@ inline bool strStartsWith(std::string const& str, std::string const& prefix)
 {
     return str.rfind(prefix, 0) == 0;
 }
+
+/// @brief Split a string into a set of strings using a delimiter
+std::unordered_set<std::string> str2set(std::string const& input, char delimiter);
 
 } // namespace tensorrt_llm::common

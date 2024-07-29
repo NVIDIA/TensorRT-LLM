@@ -1,8 +1,9 @@
 # TensorRT-LLM for Windows
 
 ```{note}
-  The Windows release of TensorRT-LLM is currently in beta. We recommend using the `rel` branch for the most stable experience.
-  ```
+  The Windows release of TensorRT-LLM is currently in beta.
+  We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.10.0) for the most stable experience.
+```
 
 TensorRT-LLM is supported on bare-metal Windows for single-GPU inference. The release supports GeForce 40-series GPUs.
 

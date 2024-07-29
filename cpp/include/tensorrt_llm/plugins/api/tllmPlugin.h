@@ -43,11 +43,6 @@ private:
     nvinfer1::ILoggerFinder* mLoggerFinder{nullptr};
     std::mutex mMutex;
 };
-#if NV_TENSORRT_MAJOR >= 10
-using IPluginCreatorInterface = nvinfer1::IPluginCreatorInterface;
-#else
-using IPluginCreatorInterface = nvinfer1::IPluginCreator;
-#endif // NV_TENSORRT_MAJOR >= 10
 } // namespace tensorrt_llm::plugins::api
 
 extern "C"
@@ -60,4 +55,5 @@ extern "C"
     // see https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#generating-plugin-library
     [[maybe_unused]] void setLoggerFinder([[maybe_unused]] nvinfer1::ILoggerFinder* finder);
     [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(int32_t& nbCreators);
+    [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators);
 }

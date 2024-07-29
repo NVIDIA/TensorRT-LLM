@@ -29,6 +29,10 @@ if(ENABLE_MULTI_DEVICE EQUAL 1)
   include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
+if(NOT WIN32)
+  set(DECODER_SHARED_TARGET decoder_attention)
+endif()
+
 add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
@@ -204,12 +208,22 @@ else()
         "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so"
     )
   else()
+    set(NVRTC_WRAPPER_LIB_BINARY_REL_DIR
+        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
+    )
+    set(NVRTC_WRAPPER_DLL_NAME "tensorrt_llm_nvrtc_wrapper.dll")
+    set(NVRTC_WRAPPER_LIB_NAME "tensorrt_llm_nvrtc_wrapper.lib")
+
     set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/${NVRTC_WRAPPER_TARGET_ARCH}/libtensorrt_llm_nvrtc_wrapper.dll"
+        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_DLL_NAME}"
     )
     set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.dll"
+        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_DLL_NAME}")
+    set(NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC
+        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_LIB_NAME}"
     )
+    set(NVRTC_WRAPPER_IMPLIB_BINARY_REL_LOC
+        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_LIB_NAME}")
   endif()
   set(NVRTC_WRAPPER_LIB_LOC
       "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}")
@@ -218,6 +232,15 @@ else()
                  ${NVRTC_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
   set_property(TARGET ${NVRTC_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
                                                        ${NVRTC_WRAPPER_LIB_LOC})
+  if(WIN32)
+    set(NVRTC_WRAPPER_IMPLIB_LOC
+        "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
+    configure_file(${NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC}
+                   ${NVRTC_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
+    set_property(TARGET ${NVRTC_WRAPPER_TARGET}
+                 PROPERTY IMPORTED_IMPLIB ${NVRTC_WRAPPER_IMPLIB_LOC})
+  endif()
+
   file(SIZE ${NVRTC_WRAPPER_LIB_LOC} NVRTC_WRAPPER_LIB_SIZE)
   if(NVRTC_WRAPPER_LIB_SIZE LESS 1024)
     message(
@@ -234,13 +257,15 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
-    context_attention_src
     decoder_attention_src
     fpA_intB_gemm_src
     moe_gemm_src
+    fb_gemm_src
+    gemm_swiglu_sm90_src
     cutlass_src
     layers_src
-    runtime_src)
+    runtime_src
+    ${DECODER_SHARED_TARGET})
 
 if(ENABLE_MULTI_DEVICE EQUAL 1)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})

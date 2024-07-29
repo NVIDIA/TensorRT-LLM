@@ -38,22 +38,22 @@ namespace tensorrt_llm::runtime
 class TorchUtils
 {
 public:
-    using SizeType = at::IntArrayRef::value_type;
+    using SizeType32 = at::IntArrayRef::value_type;
 
-    static std::vector<SizeType> shape(ITensor::Shape const& dims)
+    static std::vector<SizeType32> shape(ITensor::Shape const& dims)
     {
         TLLM_CHECK(dims.nbDims >= 0);
-        std::vector<SizeType> shape{};
+        std::vector<SizeType32> shape{};
         shape.reserve(dims.nbDims);
         std::transform(
-            dims.d, dims.d + dims.nbDims, std::back_inserter(shape), [](auto x) { return static_cast<SizeType>(x); });
+            dims.d, dims.d + dims.nbDims, std::back_inserter(shape), [](auto x) { return static_cast<SizeType32>(x); });
         return shape;
     }
 
     static ITensor::Shape shape(at::IntArrayRef const& sizes)
     {
         TLLM_CHECK(sizes.size() <= ITensor::Shape::MAX_DIMS);
-        ITensor::Shape shape{static_cast<runtime::SizeType>(sizes.size())};
+        ITensor::Shape shape{static_cast<runtime::SizeType32>(sizes.size())};
         using dimType = std::remove_reference_t<decltype(shape.d[0])>;
         for (std::size_t i = 0; i < sizes.size(); ++i)
         {
@@ -63,7 +63,7 @@ public:
         return shape;
     }
 
-    static std::vector<SizeType> makeShape(std::initializer_list<runtime::ITensor::DimType> sizes)
+    static std::vector<SizeType32> makeShape(std::initializer_list<runtime::ITensor::DimType64> sizes)
     {
         return shape(ITensor::makeShape(sizes));
     }

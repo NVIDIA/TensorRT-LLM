@@ -8,14 +8,15 @@
 
     ```bash
     # Obtain and start the basic docker image environment (optional).
-    docker run --rm --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.1.0-devel-ubuntu22.04
+    docker run --rm --ipc=host --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.4.1-devel-ubuntu22.04
     ```
+    Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 
 2. Install TensorRT-LLM.
 
     ```bash
     # Install dependencies, TensorRT-LLM requires Python 3.10
-    apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev git
+    apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev git git-lfs
 
     # Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
     # If you want to install the stable version (corresponding to the release branch), please
@@ -25,6 +26,10 @@
     # Check installation
     python3 -c "import tensorrt_llm"
     ```
+
+    Please note that TensorRT-LLM depends on TensorRT. In earlier versions that include TensorRT 8,
+    overwriting an upgraded to a new version may require explicitly running `pip uninstall tensorrt`
+    to uninstall the old version.
 
 3. Install the requirements for running the example.
 

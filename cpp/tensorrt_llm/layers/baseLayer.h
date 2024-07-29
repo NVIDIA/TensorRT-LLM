@@ -16,27 +16,27 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/allocator.h"
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm
-{
-namespace layers
+#include <utility>
+
+namespace tensorrt_llm::layers
 {
 
 class BaseLayer
 {
 public:
-    using SizeType = runtime::SizeType;
-    using TokenIdType = runtime::TokenIdType;
     using SizeType32 = runtime::SizeType32;
+    using TokenIdType = runtime::TokenIdType;
+    using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
+    using BufferPtr = runtime::IBuffer::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
-    BaseLayer(DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator)
-        : mStream(stream)
-        , mAllocator(std::move(allocator))
+    BaseLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager)
+        : mBufferManager(bufferManager)
         , mDecoderDomain(decoderDomain)
     {
     }
@@ -46,26 +46,14 @@ public:
     //! @returns cuda stream associated with layer
     [[nodiscard]] cudaStream_t getStream() const noexcept
     {
-        return mStream;
-    }
-
-    //! @brief set stream to the layer
-    void setStream(cudaStream_t stream) noexcept
-    {
-        mStream = stream;
+        return mBufferManager->getStream().get();
     }
 
     //! @returns workspace needed for this layer in bytes
-    [[nodiscard]] size_t getWorkspaceSize() const noexcept
+    [[nodiscard]] virtual size_t getWorkspaceSize() const noexcept
     {
-        return mWorkspaceSize;
-    }
-
-    //! @returns size of memory allocated by layer in bytes
-    [[nodiscard]] size_t getAllocatedSize() const noexcept
-    {
-        return mAllocatedSize;
-    }
+        return 0;
+    };
 
     // clang-format off
     //! \brief Virtual function to setup internal states of the layer with sampling params
@@ -75,38 +63,43 @@ public:
     //!
     //! \param batchSize current batch size configured in the system
     //! \param beamWidth current beam width configured in the system
-    //! \param batchSlots input tensor [maxBatchSize], address map of the new requests, in pinned memory
+    //! \param batchSlots input buffer [maxBatchSize], address map of the new requests, in pinned memory
     //! \param setupParams shared pointer to params inherited from BaseSetupParams
     // clang-format on
-    virtual void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams)
+    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams)
         = 0;
 
     // clang-format off
-    //! \brief Virtual function to execute layer.
+    //! \brief Virtual function to execute layer async on GPU.
+    //! There must be no stream synchronization inside this function.
     //!
-    //! \param outputs shared pointer to params inherited from BaseOutputParams
+    //! \param outputs shared pointer to params inherited from BaseDecodingOutputs
     //! \param inputs shared pointer to params inherited from BaseForwardParams
     // clang-format on
-    virtual void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) = 0;
+    virtual void forwardAsync(
+        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+        = 0;
+
+    // clang-format off
+    //! \brief Virtual function to execute layer synchronously on CPU / GPU.
+    //! It is allowed (but not necassary) to synchronize on stream inside this function.
+    //! It is targeted mainly for prototyping.
+    //!
+    //! \param outputs shared pointer to params inherited from BaseDecodingOutputs
+    //! \param inputs shared pointer to params inherited from BaseForwardParams
+    // clang-format on
+    virtual void forwardSync(
+        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+    {
+    }
 
 protected:
-    // Cuda stream
-    cudaStream_t mStream;
-    // Memory allocator
-    std::shared_ptr<tensorrt_llm::common::IAllocator> mAllocator;
-
-    // Required workspace size in bytes
-    size_t mWorkspaceSize{0};
-    // Allocated memory size in bytes
-    size_t mAllocatedSize{0};
+    // Buffer Manager
+    std::shared_ptr<runtime::BufferManager> mBufferManager;
 
     // Domain in which token decoding is computed
     DecoderDomain mDecoderDomain;
-
-    // TODO to be deprecated
-    bool mIsAllocateBuffer{false};
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

@@ -15,8 +15,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ## Support Matrix
   * FP16/BF16
-  * Checkpoint type: Jax, Torch, Keras, Huggingface (HF)
-  * python runtime
+  * Checkpoint type: Jax, Huggingface (HF)
 
 ## Usage
 
@@ -26,11 +25,6 @@ Please install required packages first and setup `git-lfs`:
 
 ```bash
 pip install -r requirements.txt
-git clone https://github.com/google-deepmind/recurrentgemma.git
-pip install ./recurrentgemma/[full]
-pip install "transformers>=4.40.0"
-
-# Setup git-lfs
 git lfs install
 ```
 
@@ -55,7 +49,7 @@ The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts JAX weigh
 
 ```bash
 # recurrentgemma-2b
-CKPT_2B_PATH=./recurrentgemma/recurrentgemma-2b
+CKPT_2B_PATH=./recurrentgemma_model/recurrentgemma-2b
 UNIFIED_CKPT_2B_PATH=./recurrentgemma_model/recurrentgemma-2b/trt_ckpt/fp16/1-gpu/
 python convert_checkpoint.py --model_dir ${CKPT_2B_PATH} \
                              --ckpt_type hf \
@@ -63,7 +57,7 @@ python convert_checkpoint.py --model_dir ${CKPT_2B_PATH} \
                              --output_dir ${UNIFIED_CKPT_2B_PATH}
 
 # recurrentgemma-2b-it
-CKPT_2B_IT_PATH=./recurrentgemma/recurrentgemma-2b-it
+CKPT_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it
 UNIFIED_CKPT_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_ckpt/fp16/1-gpu/
 python convert_checkpoint.py --model_dir ${CKPT_2B_IT_PATH} \
                              --ckpt_type hf \
@@ -94,45 +88,37 @@ After getting checkpoint, we can use `trtllm-build` command to build TensorRT-LL
 # recurrentgemma-2b
 ENGINE_2B_PATH=./recurrentgemma_model/recurrentgemma-2b/trt_engines/fp16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_PATH} \
-             --gpt_attention_plugin float16 \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_PATH}
 
 # recurrentgemma-2b-it
 ENGINE_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_engines/bf16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_PATH} \
-             --gpt_attention_plugin bfloat16 \
-             --gemm_plugin bfloat16 \
-             --mamba_conv1d_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_IT_PATH}
 
 # recurrentgemma-2b-flax
 ENGINE_2B_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-flax/trt_engines/fp16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_FLAX_PATH} \
-             --gpt_attention_plugin float16 \
-             --gemm_plugin float16 \
-             --mamba_conv1d_plugin float16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_FLAX_PATH}
 
 # recurrentgemma-2b-it-flax
 ENGINE_2B_IT_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-it-flax/trt_engines/bf16/1-gpu/
 trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_FLAX_PATH} \
-             --gpt_attention_plugin bfloat16 \
-             --gemm_plugin bfloat16 \
-             --mamba_conv1d_plugin bfloat16 \
+             --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
-             --max_output_len 100 \
+             --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_IT_FLAX_PATH}
 ```
 
@@ -150,16 +136,18 @@ Note that we need to download the dataset of MMLU first and the evaluation of MM
 
 ```bash
 # recurrentgemma-2b
-TOKENIZER_DIR_2B_PATH=./recurrentgemma/recurrentgemma-2b
+TOKENIZER_DIR_2B_PATH=./recurrentgemma_model/recurrentgemma-2b
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
+                  --max_attention_window_size 2048 \
                   --tokenizer_dir ${TOKENIZER_DIR_2B_PATH} \
                   --engine_dir ${ENGINE_2B_PATH}
 
 # recurrentgemma-2b-it
-TOKENIZER_DIR_2B_IT_PATH=./recurrentgemma/recurrentgemma-2b-it
+TOKENIZER_DIR_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
+                  --max_attention_window_size 2048 \
                   --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
                   --engine_dir ${ENGINE_2B_IT_PATH}
 
@@ -167,6 +155,7 @@ python3 ../run.py --max_output_len=100 \
 VOCAB_FILE_2B_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-flax/tokenizer.model
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
+                  --max_attention_window_size 2048 \
                   --vocab_file ${VOCAB_FILE_2B_FLAX_PATH} \
                   --engine_dir ${ENGINE_2B_FLAX_PATH}
 
@@ -174,6 +163,7 @@ python3 ../run.py --max_output_len=100 \
 VOCAB_FILE_2B_IT_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-it-flax/tokenizer.model
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
+                  --max_attention_window_size 2048 \
                   --vocab_file ${VOCAB_FILE_2B_IT_FLAX_PATH} \
                   --engine_dir ${ENGINE_2B_IT_FLAX_PATH}
 ```
@@ -186,6 +176,7 @@ python3 ../summarize.py --test_trt_llm \
                         --use_py_session \
                         --engine_dir ${ENGINE_2B_PATH} \
                         --batch_size 8 \
+                        --max_attention_window_size 2048 \
                         --tokenizer_dir ${TOKENIZER_DIR_2B_PATH}
 
 # recurrentgemma-2b-it
@@ -193,6 +184,7 @@ python3 ../summarize.py --test_trt_llm \
                         --use_py_session \
                         --engine_dir ${ENGINE_2B_IT_PATH} \
                         --batch_size 8 \
+                        --max_attention_window_size 2048 \
                         --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH}
 
 # recurrentgemma-2b-flax
@@ -200,6 +192,7 @@ python3 ../summarize.py --test_trt_llm \
                         --use_py_session \
                         --engine_dir ${ENGINE_2B_FLAX_PATH} \
                         --batch_size 8 \
+                        --max_attention_window_size 2048 \
                         --vocab_file ${VOCAB_FILE_2B_FLAX_PATH}
 
 # recurrentgemma-2b-it-flax
@@ -207,6 +200,7 @@ python3 ../summarize.py --test_trt_llm \
                         --use_py_session \
                         --engine_dir ${ENGINE_2B_IT_FLAX_PATH} \
                         --batch_size 8 \
+                        --max_attention_window_size 2048 \
                         --vocab_file ${VOCAB_FILE_2B_IT_FLAX_PATH}
 ```
 
@@ -226,21 +220,25 @@ Evaluate on MMLU dataset.
 ```bash
 # recurrentgemma-2b
 python3 ../mmlu.py --test_trt_llm \
+                   --max_attention_window_size 2048 \
                    --tokenizer_dir ${TOKENIZER_DIR_2B_PATH} \
                    --engine_dir ${ENGINE_2B_PATH}
 
 # recurrentgemma-2b-it
 python3 ../mmlu.py --test_trt_llm \
+                   --max_attention_window_size 2048 \
                    --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
                    --engine_dir ${ENGINE_2B_IT_PATH}
 
 # recurrentgemma-2b-flax
 python3 ../mmlu.py --test_trt_llm \
+                   --max_attention_window_size 2048 \
                    --vocab_file ${VOCAB_FILE_2B_FLAX_PATH} \
                    --engine_dir ${ENGINE_2B_FLAX_PATH}
 
 # recurrentgemma-2b-it-flax
 python3 ../mmlu.py --test_trt_llm \
+                   --max_attention_window_size 2048 \
                    --vocab_file ${VOCAB_FILE_2B_IT_FLAX_PATH} \
                    --engine_dir ${ENGINE_2B_IT_FLAX_PATH}
 ```

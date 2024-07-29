@@ -16,11 +16,10 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
 from parameterized import parameterized
 
-import tensorrt_llm  # NOQA
+import tensorrt_llm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_bf16_pre_ampere, unittest_name_func
@@ -32,6 +31,7 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(42)
+        tensorrt_llm.logger.set_level('error')
 
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
@@ -41,10 +41,9 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         A = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=dtype)
         _, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(A)
-        s_ref = (torch.max(A, -1)[0].float() / FP8_E4M3_MAX).to(dtype)
+        s_ref = (torch.max(A, -1)[0].float() / FP8_E4M3_MAX)
 
-        np.testing.assert_allclose(s_ref.float().numpy(),
-                                   s.squeeze().float().numpy())
+        torch.testing.assert_close(s_ref.to(dtype), s.squeeze().to(dtype))
 
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
@@ -54,10 +53,9 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         A = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=dtype)
         _, s = torch.ops.tensorrt_llm.quantize_e4m3_weight(A)
-        s_ref = (torch.max(A, 0)[0].float() / FP8_E4M3_MAX).to(dtype)
+        s_ref = (torch.max(A, 0)[0].float() / FP8_E4M3_MAX)
 
-        np.testing.assert_allclose(s_ref.float().numpy(),
-                                   s.squeeze().float().numpy())
+        torch.testing.assert_close(s_ref.to(dtype), s.squeeze().to(dtype))
 
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
@@ -67,10 +65,9 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
 
         A = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=dtype)
         _, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(A)
-        s_ref = (A.flatten().max().float() / FP8_E4M3_MAX).to(dtype)
+        s_ref = (A.flatten().max().float() / FP8_E4M3_MAX)
 
-        np.testing.assert_allclose(s_ref.float().numpy(),
-                                   s.squeeze().float().numpy())
+        torch.testing.assert_close(s_ref.to(dtype), s.squeeze().to(dtype))
 
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
@@ -92,18 +89,15 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert s.dtype == A.dtype
         assert qA.dtype == torch.int8
 
-        s_ref = (torch.max(A.float().abs(), -1)[0] / FP8_E4M3_MAX).to(dtype)
-        np.testing.assert_allclose(s_ref.float().numpy(),
-                                   s.squeeze().float().numpy())
+        s_ref = (torch.max(A.float().abs(), -1)[0] / FP8_E4M3_MAX)
+        torch.testing.assert_close(s_ref.to(dtype), s.squeeze().to(dtype))
 
         B = torch.ops.tensorrt_llm.dequantize_e4m3_activation(qA, s)
 
         assert B.shape == A.shape
         assert B.dtype == A.dtype
 
-        np.testing.assert_allclose(A.float().numpy(),
-                                   B.float().numpy(),
-                                   atol=0.2)
+        torch.testing.assert_close(A, B, atol=0.2, rtol=0.01)
 
         # testing exact match
         A = torch.randint(0, 8, (n, m), dtype=dtype)
@@ -111,7 +105,7 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         qA, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(A)
         B = torch.ops.tensorrt_llm.dequantize_e4m3_activation(qA, s)
 
-        np.testing.assert_allclose(A.float().numpy(), B.float().numpy())
+        torch.testing.assert_close(A, B)
 
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
@@ -131,15 +125,12 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert qA.shape[1:] == s.shape[1:]
         assert s.shape[0] == 1
 
-        s_ref = (torch.max(A.float().abs(), 0)[0] / FP8_E4M3_MAX).to(dtype)
-        np.testing.assert_allclose(s_ref.float().numpy(),
-                                   s.squeeze().float().numpy())
+        s_ref = (torch.max(A.float().abs(), 0)[0] / FP8_E4M3_MAX)
+        torch.testing.assert_close(s_ref.to(dtype), s.squeeze().to(dtype))
 
         B = torch.ops.tensorrt_llm.dequantize_e4m3_weight(qA, s)
 
-        np.testing.assert_allclose(A.float().numpy(),
-                                   B.float().numpy(),
-                                   atol=0.2)
+        torch.testing.assert_close(A, B, atol=0.2, rtol=0)
 
         # testing exact match
         A = torch.randint(0, 8, (n, m), dtype=dtype)
@@ -147,7 +138,7 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         qA, s = torch.ops.tensorrt_llm.quantize_e4m3_weight(A)
         B = torch.ops.tensorrt_llm.dequantize_e4m3_weight(qA, s)
 
-        np.testing.assert_allclose(A.float().numpy(), B.float().numpy())
+        torch.testing.assert_close(A, B)
 
     @parameterized.expand([(torch.float32), (torch.float16), (torch.bfloat16)],
                           name_func=unittest_name_func)
@@ -165,16 +156,13 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         assert qA.dim() == s.dim()
         assert s.numel() == 1
 
-        s_ref = (A.flatten().float().abs().max() / FP8_E4M3_MAX).to(dtype)
-        np.testing.assert_allclose(s_ref.float().numpy(),
-                                   s.squeeze().float().numpy())
+        s_ref = (A.flatten().float().abs().max() / FP8_E4M3_MAX)
+        torch.testing.assert_close(s_ref.to(dtype), s.squeeze().to(dtype))
 
         B = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(qA, s)
 
         # per tensor is less accurate than others, so larger atol is used.
-        np.testing.assert_allclose(A.float().numpy(),
-                                   B.float().numpy(),
-                                   atol=0.25)
+        torch.testing.assert_close(A, B, atol=0.25, rtol=0)
 
         # testing exact match
         A = torch.randint(0, 8, (n, m), dtype=dtype)
@@ -182,4 +170,8 @@ class TestDynamicFP8QuantDequant(unittest.TestCase):
         qA, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(A)
         B = torch.ops.tensorrt_llm.dequantize_e4m3_per_tensor(qA, s)
 
-        np.testing.assert_allclose(A.float().numpy(), B.float().numpy())
+        torch.testing.assert_close(A, B)
+
+
+if __name__ == '__main__':
+    unittest.main()

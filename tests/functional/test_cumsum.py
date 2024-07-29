@@ -15,20 +15,19 @@
 import os
 import sys
 import unittest
+from itertools import product
 
-import numpy as np
 import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session, unittest_name_func
 
 
-class TestFunctional(unittest.TestCase):
+class TestCumsum(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -42,37 +41,51 @@ class TestFunctional(unittest.TestCase):
         ('float16', (5, 6, 8), 1),
         ('float16', (5, 6, 8), 2),
         ('float16', (5, 6, 8), -3),
+        ('float32', (1, 512), -1),
+        ('float16', (3, 5, 5, 6), -1),
+        ('int32', (1, 33), -1),
+        ('int32', (1, 65), -1),
+        ('float32', (1, 50000), -1),
+        ('float32', (1, 2, 50000), -1),
+        ('float32', (3, 5, 5, 50000), -1),
     ],
                           name_func=unittest_name_func)
     def test_cumsum(self, dtype, x_shape, dim):
+        torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
         if 'float' in dtype:
-            x_data = torch.rand(
-                x_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            x_data = torch.rand(x_shape, dtype=torch_dtype, device="cuda")
         else:
-            x_data = torch.randint(
-                -100,
-                100,
-                x_shape,
-                dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+            x_data = torch.randint(-100,
+                                   100,
+                                   x_shape,
+                                   dtype=torch_dtype,
+                                   device="cuda")
 
+        # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.cumsum(x, dim=dim).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.cumsum(x, dim=dim)
+            output.mark_output('output', dtype)
 
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(fp16=(dtype == 'float16')))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        # trt run
+        session = create_session(
+            builder,
+            network,
+            precision='float32' if 'int32' in dtype else dtype)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
-        ref = torch.cumsum(x_data.cuda(), dim=dim)
+        # pytorch run
+        ref = torch.cumsum(x_data, dim=dim).to(torch_dtype)
+
+        # compare diff
         tols = {
             "float32": {
                 "rtol": 1e-05,
@@ -87,5 +100,69 @@ class TestFunctional(unittest.TestCase):
                 "atol": 0
             },
         }
-        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'],
-                                   **tols[dtype])
+        torch.testing.assert_close(outputs['output'], ref, **tols[dtype])
+
+    @parameterized.expand(
+        list(
+            product(['float32', 'float16', 'int32'],
+                    [(256, ), (3, 16), (5, 6, 8)], [True, False])) +
+        list(product(['float32'], [(3, 5, 5, 50000)],
+                     [True])),  # False seems to be running into a TRT bug
+        name_func=unittest_name_func)
+    def test_cumsum_dynamic_last_dim(self, dtype, x_shape, prefer_plugin=True):
+        dim = -1
+        torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
+        if 'float' in dtype:
+            x_data = torch.rand(x_shape, dtype=torch_dtype, device="cuda")
+        else:
+            x_data = torch.randint(-100,
+                                   100,
+                                   x_shape,
+                                   dtype=torch_dtype,
+                                   device="cuda")
+
+        shape_except_last_dim = list(x_data.shape[:-1])
+        last_dim_size = x_data.shape[-1]
+        assert last_dim_size >= 1
+        builder = tensorrt_llm.Builder()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+            x = Tensor(
+                name='x',
+                shape=shape_except_last_dim + [-1],  # last dim dynamic
+                dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            output = tensorrt_llm.functional.cumsum(x,
+                                                    dim=dim,
+                                                    prefer_plugin=prefer_plugin)
+            output.mark_output('output', dtype)
+        # needs profile for dynamic shape
+        profile = builder.trt_builder.create_optimization_profile()
+        profile.set_shape('x', shape_except_last_dim + [1],
+                          shape_except_last_dim + [last_dim_size],
+                          shape_except_last_dim + [last_dim_size * 2])
+        session = create_session(
+            builder,
+            network,
+            precision='float32' if 'int32' in dtype else dtype,
+            optimization_profiles=[profile])
+        inputs = {'x': x_data}
+        outputs = run_session(session, inputs)
+
+        ref = torch.cumsum(x_data, dim=dim).to(torch_dtype)
+
+        # compare diff
+        tols = {
+            "float32": {
+                "rtol": 1e-05,
+                "atol": 1e-05
+            },
+            "float16": {
+                "rtol": 1e-02,
+                "atol": 1e-02
+            },
+            "int32": {
+                "rtol": 0,
+                "atol": 0
+            },
+        }
+        torch.testing.assert_close(outputs['output'], ref, **tols[dtype])

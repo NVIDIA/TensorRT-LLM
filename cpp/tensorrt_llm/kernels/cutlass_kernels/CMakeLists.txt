@@ -67,21 +67,30 @@ file(GLOB_RECURSE GROUPED_CU_INSTANTIATIONS
 file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
 file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
 
+# Get the sources for FP8 Rowwise GEMM launchers
+file(GLOB_RECURSE FBGEMM_CU_INSTANTIATIONS
+     ${INSTANTIATION_GENERATION_DIR}/fbgemm_gpu/*.cu)
+file(GLOB_RECURSE FBGEMM_SRC_CU fbgemm_gpu/*.cu)
+
 # Get the sources for all the remaining sources
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fbgemm_gpu/.*")
+list(REMOVE_ITEM ALL_SRCS
+     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
 message(
-  STATUS
-    "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
+  VERBOSE
+  "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
 message(
-  STATUS
-    "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
+  VERBOSE
+  "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
 )
-message(STATUS "All srcs ${ALL_SRCS}")
+message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
+message(VERBOSE "All srcs ${ALL_SRCS}")
 
 add_library(cutlass_src STATIC ${ALL_SRCS})
 set_property(TARGET cutlass_src PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -89,9 +98,16 @@ set_property(TARGET cutlass_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
                                      ${MIXED_CU_INSTANTIATIONS})
+# WARNING: Building with `-G` flag may generate invalid results for this target
 add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
                                 ${GROUPED_CU_INSTANTIATIONS})
-foreach(target_name fpA_intB_gemm_src;moe_gemm_src)
+add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
+
+set(GEMM_SWIGLU_SM90_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
+add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
+foreach(target_name
+        fpA_intB_gemm_src;moe_gemm_src;fb_gemm_src;gemm_swiglu_sm90_src)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -99,8 +115,8 @@ foreach(target_name fpA_intB_gemm_src;moe_gemm_src)
   # specified). This is because sm_90a has arch conditional instructions that
   # are not forward compatible. As a result, it does not make sense to embed PTX
   # into the binary anyway.
-  if("9.0" IN_LIST TORCH_CUDA_ARCH_LIST
-     OR "9.0+PTX" IN_LIST TORCH_CUDA_ARCH_LIST
+  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
      OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
 
     message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")

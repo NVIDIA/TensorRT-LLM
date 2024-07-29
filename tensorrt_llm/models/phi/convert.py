@@ -3,7 +3,7 @@ import torch
 from ..._utils import str_dtype_to_torch
 
 
-def convert_hf_weights(hf_model, dtype, **kwargs):
+def convert_hf_weights(hf_model, dtype, args=None):
     torch_dtype = str_dtype_to_torch(dtype)
     hf_state_dict = hf_model.state_dict()
     weights = {}
@@ -45,7 +45,7 @@ def convert_hf_weights(hf_model, dtype, **kwargs):
     return weights
 
 
-def convert_hf_config(hf_config, dtype, **kwargs):
+def convert_hf_config(hf_config, dtype, args):
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': dtype,
@@ -59,5 +59,10 @@ def convert_hf_config(hf_config, dtype, **kwargs):
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.hidden_act,
         'share_embedding_table': False,
+        'mapping': {
+            'world_size': args.tp_size * args.pp_size,
+            'tp_size': args.tp_size,
+            'pp_size': args.pp_size,
+        }
     }
     return config

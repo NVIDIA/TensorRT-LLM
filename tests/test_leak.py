@@ -36,13 +36,14 @@ def create_optimize_network():
     builder = tllm.Builder()
     model = create_model()
     network = builder.create_network()
-    network.plugin_config.set_gpt_attention_plugin(dtype='float16')
+    network.plugin_config.gpt_attention_plugin = 'float16'
     profiler.print_memory_usage('Before creating Network')
     with tllm.net_guard(network):
         # Forward
         inputs = model.prepare_inputs(max_batch_size=1,
                                       max_input_len=1024,
                                       max_seq_len=1024 + 32,
+                                      max_num_tokens=1024,
                                       use_cache=True,
                                       max_beam_width=1)
         model(**inputs)

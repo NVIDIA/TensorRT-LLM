@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -28,13 +29,13 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelism, SizeType rank, SizeType gpusPerNode,
-    std::optional<std::vector<SizeType>> const& deviceIds)
+WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 rank,
+    SizeType32 gpusPerNode, std::optional<std::vector<SizeType32>> const& deviceIds)
     : mTensorParallelism{tensorParallelism}
     , mPipelineParallelism{pipelineParallelism}
     , mRank{rank}
     , mGpusPerNode{gpusPerNode}
-    , mDeviceIds{deviceIds.value_or(std::vector<SizeType>(mGpusPerNode))}
+    , mDeviceIds{deviceIds.value_or(std::vector<SizeType32>(mGpusPerNode))}
 {
 #if ENABLE_MULTI_DEVICE
     auto const numDevices = mDeviceIds.size();
@@ -48,7 +49,7 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
     else
     {
         // total number is at most mGpusPerNode
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType>(numDevices) <= mGpusPerNode,
+        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(numDevices) <= mGpusPerNode,
             "Number of device IDs %zu is greater than GPUs per node %d", numDevices, mGpusPerNode);
 
         // all deviceIds is within the range
@@ -56,7 +57,7 @@ WorldConfig::WorldConfig(SizeType tensorParallelism, SizeType pipelineParallelis
         TLLM_CHECK(*std::min_element(mDeviceIds.begin(), mDeviceIds.end()) >= 0);
 
         // all ids are unique
-        std::set<SizeType> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
+        std::set<SizeType32> const deviceIdSet(mDeviceIds.begin(), mDeviceIds.end());
         TLLM_CHECK_WITH_INFO(
             deviceIdSet.size() == numDevices, "Device IDs are not unique %zu != %zu", deviceIdSet.size(), numDevices);
 
@@ -85,18 +86,47 @@ bool WorldConfig::validMpiConfig() const
     return COMM_SESSION.getSize() == getSize();
 }
 
-WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tensorParallelism,
-    std::optional<SizeType> pipelineParallelism, std::optional<std::vector<SizeType>> const& deviceIds)
+WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> tensorParallelism,
+    std::optional<SizeType32> pipelineParallelism, std::optional<std::vector<SizeType32>> const& deviceIds)
 {
 #if ENABLE_MULTI_DEVICE
     auto& comm = COMM_SESSION;
     auto const mpiSize = comm.getSize();
     auto const mpiRank = comm.getRank();
-    TLLM_LOG_INFO("MPI size: %d, rank: %d", mpiSize, mpiRank);
+    auto const mpiLocalSize = LOCAL_COMM_SESSION.getSize();
+    TLLM_LOG_INFO("MPI size: %d, MPI local size: %d, rank: %d", mpiSize, mpiLocalSize, mpiRank);
     auto const pp = pipelineParallelism.value_or(1);
     auto const tp = tensorParallelism.value_or(mpiSize / pp);
-    TLLM_LOG_DEBUG("TP: %d, PP: %d", tp, pp);
-    TLLM_CHECK(mpiSize == tp * pp);
+    TLLM_LOG_DEBUG("TP: %d, PP: %d, gpusPerNode: %d", tp, pp, gpusPerNode);
+    TLLM_CHECK_WITH_INFO(mpiSize == tp * pp, "MPI size %d != TP size %d * PP size %d", mpiSize, tp, pp);
+    SizeType32 deviceCount{0};
+    TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if ((mpiSize < gpusPerNode && deviceCount < mpiSize) || (mpiSize >= gpusPerNode && deviceCount < gpusPerNode))
+    {
+        TLLM_CHECK_WITH_INFO(deviceCount == 1,
+            "Detect %d GPUs, the GPU number is incompatible with %d gpusPerNode when MPI size is %d", deviceCount,
+            gpusPerNode, mpiSize);
+        TLLM_LOG_WARNING("gpusPerNode is %d but only detect single GPU, will set gpusPerNode to 1", gpusPerNode);
+        if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr || std::getenv("NVIDIA_VISIBLE_DEVICES") != nullptr)
+        {
+            std::ostringstream oss;
+            if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr)
+            {
+                oss << " CUDA_VISIBLE_DEVICES=" << std::getenv("CUDA_VISIBLE_DEVICES");
+            }
+            if (std::getenv("NVIDIA_VISIBLE_DEVICES") != nullptr)
+            {
+                oss << " NVIDIA_VISIBLE_DEVICES=" << std::getenv("NVIDIA_VISIBLE_DEVICES");
+            }
+            std::string envStr = oss.str();
+            TLLM_LOG_WARNING(
+                "Detect%s, please provide the full device list instead of limiting to single device, "
+                "otherwise allreduce performance may be sub-optimal "
+                "since custom allreduce kernel relies on P2P access to peer devices.",
+                envStr);
+        }
+        gpusPerNode = 1;
+    }
 
     return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
 #else
@@ -104,16 +134,30 @@ WorldConfig WorldConfig::mpi(SizeType gpusPerNode, std::optional<SizeType> tenso
 #endif
 }
 
-std::vector<SizeType> WorldConfig::getPipelineParallelGroup() const
+std::vector<SizeType32> WorldConfig::getPipelineParallelGroup() const
 {
     auto const pp = getPipelineParallelism();
     auto const tp = getTensorParallelism();
     auto const worldSize = getSize();
-    std::vector<SizeType> group;
+    std::vector<SizeType32> group;
     group.reserve(pp);
-    for (SizeType idx = getTensorParallelRank(); idx < worldSize; idx += tp)
+    for (SizeType32 idx = getTensorParallelRank(); idx < worldSize; idx += tp)
     {
         group.push_back(idx);
+    }
+    return group;
+}
+
+std::vector<SizeType32> WorldConfig::getTensorParallelGroup() const
+{
+    auto const tp = getTensorParallelism();
+    auto const rank = getRank();
+    auto const tpRank = getTensorParallelRank();
+    std::vector<SizeType32> group;
+    group.reserve(tp);
+    for (SizeType32 idx = 0; idx < tp; idx++)
+    {
+        group.push_back(rank - tpRank + idx);
     }
     return group;
 }

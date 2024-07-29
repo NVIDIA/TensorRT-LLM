@@ -33,8 +33,6 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/common/tllmException.h"
 
 namespace tensorrt_llm::tests::layers::sampling
@@ -77,7 +75,7 @@ void computeProb(T* probs, T const* logits, int batchSize, int vocabSize)
 
 struct TestSamplingParams
 {
-    std::vector<runtime::SizeType> topKs;
+    std::vector<runtime::SizeType32> topKs;
     std::vector<float> topPs;
     std::vector<float> temperatures;
     std::vector<float> repetitionPenalties;
@@ -98,7 +96,7 @@ protected:
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
     int32_t seed = 0;
-    const static uint64_t mMaxSeed = 32;
+    static uint64_t const mMaxSeed = 32;
     int32_t const mBatchSize = 6;
     int32_t const mMaxBatchSize = 2 * mBatchSize;
     int32_t const mBeamWidth = 1;
@@ -132,12 +130,8 @@ protected:
     TensorPtr mPenaltyWorkspaceDevice;
     BufferPtr mSamplingWorkspaceDevice;
 
-    const tensorrt_llm::common::DataType data_type = tensorrt_llm::common::getTensorType<T>();
-
-    // Order is important because we pass mAllocator to mSamplingLayer and it is used in destructor
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::common::CudaAllocator> mAllocator;
     std::shared_ptr<tensorrt_llm::layers::BaseLayer> mSamplingLayer;
 
     std::vector<T> mTestLogitsInit;
@@ -146,9 +140,9 @@ protected:
 
     virtual void initLayer(TestSamplingParams const& params) = 0;
 
-    std::shared_ptr<tensorrt_llm::layers::SamplingInputParams> createInputTensors(int32_t step);
+    std::shared_ptr<tensorrt_llm::layers::SamplingInputs> createInputTensors(int32_t step);
 
-    std::shared_ptr<tensorrt_llm::layers::SamplingOutputParams> createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::BaseDecodingOutputs> createOutputTensors();
 
     void batchCopy(int32_t step);
     bool checkResult(int32_t* outputIds, std::vector<std::set<int32_t>>& expectedIds);

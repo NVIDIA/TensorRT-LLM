@@ -27,8 +27,8 @@ namespace kernels
 
 template <typename T>
 __global__ void ban_repeat_ngram(T* logits, TokenIdType const** output_ids_buf, FinishedState const* finished_buf,
-    SizeType32 const** parent_ids_buf, SizeType32 const* batch_slots, SizeType batch_size, SizeType beam_width,
-    SizeType max_seq_len, SizeType32 const* no_repeat_ngram_size_buf, SizeType vocab_size_padded,
+    SizeType32 const** parent_ids_buf, SizeType32 const* batch_slots, SizeType32 batch_size, SizeType32 beam_width,
+    SizeType32 max_seq_len, SizeType32 const* no_repeat_ngram_size_buf, SizeType32 vocab_size_padded,
     SizeType32 const* sequence_lengths)
 {
     /**
@@ -138,8 +138,8 @@ __global__ void ban_repeat_ngram(T* logits, TokenIdType const** output_ids_buf, 
 template <typename T>
 void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf, FinishedState const* finished_buf,
     SizeType32 const** parent_ids_buf, SizeType32 const* batch_slot, SizeType32 const* sequence_lengths,
-    SizeType batch_size, SizeType beam_width, SizeType max_seq_len, SizeType32 const* no_repeat_ngram_size_buf,
-    SizeType vocab_size_padded, SizeType max_step, cudaStream_t stream)
+    SizeType32 batch_size, SizeType32 beam_width, SizeType32 max_seq_len, SizeType32 const* no_repeat_ngram_size_buf,
+    SizeType32 vocab_size_padded, SizeType32 max_step, cudaStream_t stream)
 {
     // each input in the local batch can have different no_repeat_ngram_size. Use max for shmem allocation
     // getting the max of current batch and allocate shmem as needed is ideal. But here the ngram_buf is on GPU, while
@@ -149,7 +149,7 @@ void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf, Finishe
 
     // step (current generated length, except start token) is from 1 ~ max_seq_len
     dim3 block, grid;
-    constexpr SizeType max_blocks{256};
+    constexpr SizeType32 max_blocks{256};
     block.x = min(((max_step + 32 - 1) / 32) * 32, max_blocks);
     grid.x = (max_step + block.x - 1) / block.x;
     grid.y = batch_size * beam_width;
@@ -165,8 +165,8 @@ void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf, Finishe
 #define INVOKE_BAN_REPEAT_NGRAM(T)                                                                                     \
     template void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf,                                  \
         const FinishedState* finished_buf, SizeType32 const** parent_ids_buf, SizeType32 const* batch_slot,            \
-        SizeType32 const* sequence_lengths, SizeType batch_size, SizeType beam_width, SizeType max_seq_len,            \
-        SizeType32 const* no_repeat_ngram_size_buf, SizeType vocab_size_padded, SizeType max_step,                     \
+        SizeType32 const* sequence_lengths, SizeType32 batch_size, SizeType32 beam_width, SizeType32 max_seq_len,      \
+        SizeType32 const* no_repeat_ngram_size_buf, SizeType32 vocab_size_padded, SizeType32 max_step,                 \
         cudaStream_t stream);
 
 INVOKE_BAN_REPEAT_NGRAM(float)

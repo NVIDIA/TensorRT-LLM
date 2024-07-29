@@ -58,7 +58,7 @@ public:
      * \brief same as fillInputTensors but for an entire batch
      */
     void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftTable const& peftTable,
-        ReqIdsVec const& reqIds, std::vector<SizeType> const& reqBeamWidth, ModelConfig const& modelConfig,
+        ReqIdsVec const& reqIds, std::vector<SizeType32> const& reqBeamWidth, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     /**
@@ -73,8 +73,8 @@ public:
      * \param[in] modelConfig: a ModelConfig
      * \param[in] worldConfig: a WorldConfig
      */
-    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues, SizeType batchIdx,
-        SizeType beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues,
+        SizeType32 batchIdx, SizeType32 beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     /**
      * \brief fill tensor map for trt engine context
@@ -88,7 +88,7 @@ public:
         ModelConfig const& modelConfig, WorldConfig const& worldConfig) const;
 
 private:
-    std::unordered_map<SizeType, LoraModule> mModuleIdToModule;
-    std::unordered_map<SizeType, SizeType> mModuleOffset;
+    std::unordered_map<SizeType32, LoraModule> mModuleIdToModule;
+    std::unordered_map<SizeType32, SizeType32> mModuleOffset;
 };
 } // namespace tensorrt_llm::runtime

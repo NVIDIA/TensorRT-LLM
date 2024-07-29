@@ -13,18 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional, Union
+
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor, allreduce
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, LayerNorm)
+from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+                              check_share_embedding)
+from .config import GPTJConfig
+from .convert import load_weights_from_hf_model
 
 
 class GPTJDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: GPTJConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -104,7 +109,7 @@ class GPTJDecoderLayer(Module):
 
 class GPTJModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: GPTJConfig):
         super().__init__()
         self.config = config
 
@@ -144,9 +149,9 @@ class GPTJModel(Module):
 
 
 class GPTJForCausalLM(DecoderModelForCausalLM):
+    config_class = GPTJConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: GPTJConfig):
         transformer = GPTJModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -162,5 +167,36 @@ class GPTJForCausalLM(DecoderModelForCausalLM):
             lm_head = None
         super().__init__(config, transformer, lm_head)
 
-    def check_config(self, config):
-        config.set_if_not_exist('rotary_dim', 64)
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config=None,
+            **kwargs):
+        import transformers
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = GPTJConfig.from_hugging_face(hf_config_or_dir,
+                                              dtype=dtype,
+                                              mapping=mapping,
+                                              quant_config=quant_config,
+                                              **kwargs)
+
+        if not use_preloading:
+            hf_model = transformers.AutoModelForCausalLM.from_pretrained(
+                hf_model_dir, torch_dtype='auto', trust_remote_code=True)
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = GPTJForCausalLM(config)
+        model.load(weights)
+        return model

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "allgatherPlugin.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 
 #include <nccl.h>
 
@@ -100,8 +101,8 @@ int AllgatherPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         size *= inputDesc[0].dims.d[i];
     }
 
-    NCCLCHECK(ncclAllGather(
-        inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], (*getCommMap())[mGroup], stream));
+    TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
+    NCCLCHECK(ncclAllGather(inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], *mNcclComm, stream));
 
     return 0;
 }
@@ -133,21 +134,17 @@ int AllgatherPlugin::getNbOutputs() const noexcept
 
 int AllgatherPlugin::initialize() noexcept
 {
-    initCommMap(mGroup);
+    if (isBuilding())
+    {
+        return 0;
+    }
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+    mNcclComm = getComm(mGroup);
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
     return 0;
 }
 
-void AllgatherPlugin::terminate() noexcept
-{
-    auto* commMap = getCommMap();
-    // [] operator inserts T() if it does not exist
-    if (isBuilding() || (*commMap)[mGroup] == nullptr)
-    {
-        return;
-    }
-    NCCLCHECK(ncclCommDestroy((*commMap)[mGroup]));
-    (*commMap)[mGroup] = nullptr;
-}
+void AllgatherPlugin::terminate() noexcept {}
 
 size_t AllgatherPlugin::getSerializationSize() const noexcept
 {

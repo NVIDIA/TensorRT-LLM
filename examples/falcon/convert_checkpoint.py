@@ -12,8 +12,9 @@ from transformers import AutoModelForCausalLM, FalconConfig, FalconForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.utils import (  # TODO: move the utils to common dir shared by models
-    iterate_shard_files, load_state_dict, retrieved_layer_index_from_name)
+from tensorrt_llm.models.convert_utils import (iterate_shard_files,
+                                               load_state_dict,
+                                               retrieved_layer_index_from_name)
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -103,7 +104,6 @@ def load_falcon_config(model_dir: str) -> FalconConfig:
     """
 
     config = FalconConfig.from_pretrained(model_dir)
-    config.architectures = ["FalconForCausalLM"]
     # Falcon-7B config may not have num_kv_heads or n_head_kv.
     # Although Falcon-180B uses GQA (num_kv_heads=8), its config
     # has multi_query=True.

@@ -17,22 +17,14 @@
 
 #pragma once
 
-#include <curand_kernel.h>
-
-#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/layers/samplingParams.h"
-#include "tensorrt_llm/layers/topKSamplingLayer.h"
-#include "tensorrt_llm/layers/topPSamplingLayer.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
 
-namespace tc = tensorrt_llm::common;
+#include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 //! \brief Top class for sampling layers.
@@ -43,42 +35,39 @@ class SamplingLayer : public BaseLayer
 public:
     using Base = BaseLayer;
 
-    SamplingLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    SamplingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~SamplingLayer() override = default;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 private:
-    using Base::mWorkspaceSize;
-    using Base::mAllocatedSize;
-
-    using Base::mStream;
-    using Base::mAllocator;
-
     using Base::mDecoderDomain;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 
-    void* mSamplingWorkspaceDevice{nullptr};
-    curandState_t* mCurandStatesDevice{nullptr};
-    uint64_t* mRandomSeedsDevice{nullptr};
+    BufferPtr mSamplingWorkspaceDevice;
+    TensorPtr mCurandStatesDevice;
+    TensorPtr mRandomSeedsDevice;
 
-    bool* mSkipDecodeDevice{nullptr};
+    TensorPtr mSkipDecodeDevice;
 
-    bool* mSkipDecodeHost{nullptr};
+    TensorPtr mSkipDecodeHost;
     bool mSkipAny{false};
+
+    bool mOutputLogProbs{false};
+    bool mCumLogProbs{false};
 
     std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 
 private:
-    void allocateBuffer(runtime::SizeType batchSize);
-    void freeBuffer();
+    void allocateBuffer(runtime::SizeType32 batchSize);
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

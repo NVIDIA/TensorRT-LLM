@@ -158,7 +158,6 @@ python convert_checkpoint.py --model_dir ./bloom/560m/ \
 trtllm-build --checkpoint_dir ./bloom/560m/trt_ckpt/int8/1-gpu/ \
                 --gemm_plugin float16 \
                 --output_dir ./bloom/560m/trt_engines/int8/1-gpu/ \
-                --strongly_typed
 ```
 
 
@@ -206,7 +205,6 @@ trtllm-build --checkpoint_dir /tmp/bloom/3b/trt_ckpts/fp8/1-gpu/ \
              --output_dir /tmp/bloom/3b/trt_engines/fp8/1-gpu/ \
              --gemm_plugin float16 \
              --use_fp8_context_fmha enable \
-             --strongly_typed \
              --workers 1
 ```
 

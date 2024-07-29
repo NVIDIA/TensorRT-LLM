@@ -27,7 +27,7 @@ namespace fs = std::filesystem;
 namespace tensorrt_llm::batch_manager
 {
 
-using runtime::SizeType;
+using runtime::SizeType32;
 
 struct PeftCacheManagerConfig
 {
@@ -35,10 +35,10 @@ struct PeftCacheManagerConfig
     static float constexpr kDefaultDeviceCachePercent = 0.05;
     static size_t constexpr kDefaultHostCacheSize = 1024 * 1024 * 1024;
 
-    explicit PeftCacheManagerConfig(SizeType numHostModuleLayer = 0, SizeType numDeviceModuleLayer = 0,
-        SizeType optimalAdapterSize = 8, SizeType maxAdapterSize = 64, SizeType numPutWorkers = 1,
-        SizeType numEnsureWorkers = 1, SizeType numCopyStreams = 1, SizeType maxPagesPerBlockHost = 24,
-        SizeType maxPagesPerBlockDevice = 8, std::optional<float> deviceCachePercent = std::nullopt,
+    explicit PeftCacheManagerConfig(SizeType32 numHostModuleLayer = 0, SizeType32 numDeviceModuleLayer = 0,
+        SizeType32 optimalAdapterSize = 8, SizeType32 maxAdapterSize = 64, SizeType32 numPutWorkers = 1,
+        SizeType32 numEnsureWorkers = 1, SizeType32 numCopyStreams = 1, SizeType32 maxPagesPerBlockHost = 24,
+        SizeType32 maxPagesPerBlockDevice = 8, std::optional<float> deviceCachePercent = std::nullopt,
         std::optional<size_t> hostCacheSize = std::nullopt)
         : numHostModuleLayer(numHostModuleLayer)
         , numDeviceModuleLayer(numDeviceModuleLayer)
@@ -70,23 +70,23 @@ struct PeftCacheManagerConfig
     }
 
     // number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache
-    SizeType numHostModuleLayer;
+    SizeType32 numHostModuleLayer;
     // number of max sized 1-layer 1-module sets of weights that can be stored in host cache
-    SizeType numDeviceModuleLayer;
+    SizeType32 numDeviceModuleLayer;
     // optimal adapter size used to set page width
-    SizeType optimalAdapterSize;
+    SizeType32 optimalAdapterSize;
     // max supported adapter size. Used to compute minimum
-    SizeType maxAdapterSize;
+    SizeType32 maxAdapterSize;
     // number of worker threads used to put weights into host cache
-    SizeType numPutWorkers;
+    SizeType32 numPutWorkers;
     // number of worker threads used to copy weights from host to device
-    SizeType numEnsureWorkers;
+    SizeType32 numEnsureWorkers;
     // number of streams used to copy weights from host to device
-    SizeType numCopyStreams;
+    SizeType32 numCopyStreams;
     // Number of cache pages per allocation block (host)
-    SizeType maxPagesPerBlockHost;
+    SizeType32 maxPagesPerBlockHost;
     // Number of cache pages per allocation block (device)
-    SizeType maxPagesPerBlockDevice;
+    SizeType32 maxPagesPerBlockDevice;
     // percent of memory after engine load to use for cache
     std::optional<float> deviceCachePercent;
     // size in bytes to use for host cache
