@@ -131,7 +131,6 @@ python convert_checkpoint.py --model_dir ./internlm-chat-7b  \
 trtllm-build --checkpoint_dir ./internlm-chat-7b/smooth_internlm/int8_kv_cache/ \
              --output_dir ./engine_outputs \
              --gemm_plugin float16 \
-             --strongly_typed
 ```
 
 
@@ -150,7 +149,6 @@ python convert_checkpoint.py --model_dir ./internlm-chat-20b  \
 trtllm-build --checkpoint_dir ./internlm-chat-20b/smooth_internlm/int8_kv_cache/ \
   --output_dir ./engine_outputs \
   --gemm_plugin float16 \
-  --strongly_typed
 ```
 
 

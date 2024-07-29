@@ -101,11 +101,11 @@ struct TopKSamplingKernelParams
     //! probability for topP sampling.
     float maxTopP{1.0f};
 
-    runtime::SizeType batchSize{-1};
-    runtime::SizeType maxBatchSize{-1};
-    runtime::SizeType vocabSizePadded{-1};
-    runtime::SizeType maxTokensPerStep{-1};
-    runtime::SizeType maxSeqLen{-1};
+    runtime::SizeType32 batchSize{-1};
+    runtime::SizeType32 maxBatchSize{-1};
+    runtime::SizeType32 vocabSizePadded{-1};
+    runtime::SizeType32 maxTokensPerStep{-1};
+    runtime::SizeType32 maxSeqLen{-1};
 
     //! when set to True outputLogProbs are normalized to TopK
     bool normalizeLogProbs{false};
@@ -162,13 +162,13 @@ template <typename T>
 void invokeBatchTopKSampling(TopKSamplingKernelParams<T> const& params, cudaStream_t stream);
 
 template <typename T>
-[[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(runtime::SizeType batchSize, runtime::SizeType maxTokensPerStep,
-    runtime::SizeType maxTopK, runtime::SizeType vocabSizePadded)
+[[nodiscard]] std::vector<size_t> getTopKWorkspaceSizes(runtime::SizeType32 batchSize,
+    runtime::SizeType32 maxTokensPerStep, runtime::SizeType32 maxTopK, runtime::SizeType32 vocabSizePadded)
 {
-    runtime::SizeType constexpr maxBlockPerBeam = 8;
+    runtime::SizeType32 constexpr maxBlockPerBeam = 8;
     auto const tempLogProbsBufSize = sizeof(T) * batchSize * maxTokensPerStep * vocabSizePadded;         // type T
     auto const topKTmpIdsBufSize
-        = sizeof(runtime::SizeType) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam;          // type int
+        = sizeof(runtime::SizeType32) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam;        // type int
     auto const topKTmpValBufSize = sizeof(T) * batchSize * maxTokensPerStep * maxTopK * maxBlockPerBeam; // type T
 
     return {tempLogProbsBufSize, topKTmpIdsBufSize, topKTmpValBufSize};
@@ -180,8 +180,8 @@ template <typename T>
 //! \param maxTopK maximum among all topKs K for topK sampling
 //! \param vocabSizePadded size of padded vocab
 template <typename T>
-[[nodiscard]] size_t getTopKWorkspaceSize(runtime::SizeType batchSize, runtime::SizeType maxTokensPerStep,
-    runtime::SizeType maxTopK, runtime::SizeType vocabSizePadded)
+[[nodiscard]] size_t getTopKWorkspaceSize(runtime::SizeType32 batchSize, runtime::SizeType32 maxTokensPerStep,
+    runtime::SizeType32 maxTopK, runtime::SizeType32 vocabSizePadded)
 {
     auto const workspaceSizes = getTopKWorkspaceSizes<T>(batchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
     return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);

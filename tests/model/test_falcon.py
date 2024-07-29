@@ -125,12 +125,13 @@ class TestFalcon(unittest.TestCase):
         with net_guard(network):
             # Initialize model
             network.set_named_parameters(trtllm_model.named_parameters())
-            inputs = trtllm_model.prepare_inputs(max_batch_size=batch_size,
-                                                 max_input_len=input_len,
-                                                 max_seq_len=input_len +
-                                                 output_len,
-                                                 use_cache=True,
-                                                 max_beam_width=beam_width)
+            inputs = trtllm_model.prepare_inputs(
+                max_batch_size=batch_size,
+                max_input_len=input_len,
+                max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
+                use_cache=True,
+                max_beam_width=beam_width)
             # Prepare
             trtllm_model(**inputs)
 
@@ -163,17 +164,17 @@ class TestFalcon(unittest.TestCase):
             use_alibi=hf_config.alibi,
             parallel_attention=hf_config.parallel_attn,
             use_refit=use_refit,
-            strongly_typed=(dtype == "float16"),
+            strongly_typed=True,
         )
 
         network = builder.create_network()
         network.plugin_config.to_legacy_setting()
         if use_gpt_attengion_plugin:
-            network.plugin_config.set_gpt_attention_plugin(dtype)
+            network.plugin_config.gpt_attention_plugin = dtype
         if use_gemm_plugin:
-            network.plugin_config.set_gemm_plugin(dtype)
+            network.plugin_config.gemm_plugin = dtype
         if enable_remove_input_padding:
-            network.plugin_config.enable_remove_input_padding()
+            network.plugin_config.remove_input_padding = True
         if world_size > 1:
             network.plugin_config.set_nccl_plugin(dtype)
         network.plugin_config.set_context_fmha(context_fmha_type)
@@ -210,10 +211,10 @@ class TestFalcon(unittest.TestCase):
              ContextFMHAType.disabled, 'float16'),
             ('MQA', False, True, False, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
-            # TC for Falcon-40B arch: GQA + RoPE + new_decoder_architecture
-            ('GQA', False, False, True, False, True, True, False,
+            # TC for Falcon-40B arch: GQA + RoPE + parallel_attention + new_decoder_architecture
+            ('GQA', False, True, True, False, True, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('GQA', False, False, True, False, True, True, False,
+            ('GQA', False, True, True, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
         ]
         return test_cases
@@ -350,6 +351,10 @@ class TestFalcon(unittest.TestCase):
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_input_ids.contiguous(),
             'position_ids': ctx_position_ids.contiguous(),
@@ -362,6 +367,7 @@ class TestFalcon(unittest.TestCase):
             'host_past_key_value_lengths':
             host_past_key_value_lengths.contiguous(),
             'host_sink_token_length': host_sink_token_length,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -436,6 +442,9 @@ class TestFalcon(unittest.TestCase):
         # For step 1, the sequence_lengths = context_lengths + 1.
         sequence_length = torch.add(sequence_length, 1)
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+
         step1_buffer = {
             'input_ids': gen_id,
             'context_lengths': gen_context_lengths.contiguous(),
@@ -448,6 +457,7 @@ class TestFalcon(unittest.TestCase):
             'host_past_key_value_lengths':
             host_past_key_value_lengths.contiguous(),
             'host_sink_token_length': host_sink_token_length,
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

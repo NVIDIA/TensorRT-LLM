@@ -16,18 +16,16 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session, unittest_name_func
 
 
-class TestFunctional(unittest.TestCase):
+class TestTopK(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -44,35 +42,27 @@ class TestFunctional(unittest.TestCase):
         indices_dtype = 'int32'
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
+        network = builder.create_network()
+        input_data = torch.rand(*input_shape,
+                                dtype=torch.float32,
+                                device="cuda")
+        with tensorrt_llm.net_guard(network):
 
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
-            input_data = np.random.rand(*input_shape).astype(np.float32)
-            m = tensorrt_llm.functional.constant(input_data)
+            m = tensorrt_llm.functional.constant(input_data.cpu().numpy())
             topk_values, topk_indices = tensorrt_llm.functional.topk(
                 m, k, d, largest=largest)
-            topk_values = topk_values.trt_tensor
-            topk_indices = topk_indices.trt_tensor
-            topk_values.name = 'output_values'
-            topk_indices.name = 'output_indices'
-            network.mark_output(topk_values)
-            network.mark_output(topk_indices)
-            topk_values.dtype = tensorrt_llm.str_dtype_to_trt(value_dtype)
-            topk_indices.dtype = tensorrt_llm.str_dtype_to_trt(indices_dtype)
+            topk_values.mark_output('output_values', value_dtype)
+            topk_indices.mark_output('topk_indices', indices_dtype)
 
-            # trt run
-            build_engine = EngineFromNetwork(
-                (builder.trt_builder, net.trt_network))
-            with TrtRunner(build_engine) as runner:
-                outputs = runner.infer(feed_dict={})
-            values, indices = torch.topk(torch.Tensor(input_data),
-                                         k,
-                                         dim=d,
-                                         largest=largest)
+        # trt run
+        session = create_session(builder, network)
+        inputs = {}
+        outputs = run_session(session, inputs)
 
-            np.testing.assert_allclose(values.cpu().numpy(),
-                                       outputs['output_values'],
-                                       atol=1e-5)
-            np.testing.assert_allclose(indices.cpu().numpy(),
-                                       outputs['output_indices'])
+        # pytorch run
+        values, indices = torch.topk(input_data, k, dim=d, largest=largest)
+
+        # compare diff
+        torch.testing.assert_close(values, outputs['output_values'])
+        # dtype does not match
+        torch.testing.assert_close(indices.int(), outputs['topk_indices'].int())

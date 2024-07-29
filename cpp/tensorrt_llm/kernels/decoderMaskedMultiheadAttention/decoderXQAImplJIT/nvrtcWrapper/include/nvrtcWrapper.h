@@ -35,6 +35,14 @@ extern "C"
 {
 #endif
 
+    typedef enum
+    {
+        // sm >= 80
+        TLLM_XQA_JIT_HMMA = 0,
+        // sm == 90
+        TLLM_XQA_JIT_QGMMA = 1
+    } tllmXqaJitKernelType;
+
     typedef struct
     {
         // Compute capability, e.g. 89.
@@ -51,6 +59,8 @@ extern "C"
         // Actual type: tensorrt_llm::kernels::Data_type
         int data_type;
         int kv_cache_data_type;
+
+        tllmXqaJitKernelType kernel_type;
     } tllmXqaJitContext;
 
     // tllmXqaJitProgram is an opaque handle for a program.

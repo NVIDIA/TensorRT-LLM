@@ -34,8 +34,8 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-__global__ void topPInitialize(TokenIdType* topPIdValBuf, SizeType* topPOffsetBuf, SizeType* beginTopPOffsetBuf,
-    SizeType batchSize, SizeType vocabSize)
+__global__ void topPInitialize(TokenIdType* topPIdValBuf, SizeType32* topPOffsetBuf, SizeType32* beginTopPOffsetBuf,
+    SizeType32 batchSize, SizeType32 vocabSize)
 {
     auto const tid = static_cast<SizeType32>(threadIdx.x);
     auto const bid = static_cast<SizeType32>(blockIdx.x);
@@ -60,8 +60,8 @@ __global__ void topPInitialize(TokenIdType* topPIdValBuf, SizeType* topPOffsetBu
     }
 }
 
-void invokeTopPInitialize(TokenIdType* topPIdValBuf, SizeType* topPOffsetBuf, SizeType* beginTopPOffsetBuf,
-    SizeType batchSize, SizeType vocabSize, cudaStream_t stream)
+void invokeTopPInitialize(TokenIdType* topPIdValBuf, SizeType32* topPOffsetBuf, SizeType32* beginTopPOffsetBuf,
+    SizeType32 batchSize, SizeType32 vocabSize, cudaStream_t stream)
 {
     // vocabSize: the column number of logits_buffer for top_p sampling
     // TODO(nkorobov): launch based on available resources
@@ -70,8 +70,8 @@ void invokeTopPInitialize(TokenIdType* topPIdValBuf, SizeType* topPOffsetBuf, Si
 
 template <typename T, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* probs, // prob.
-    TokenIdType* topKTmpIdBuf, T* topKTmpValBuf, FinishedState const* finishedInput, SizeType vocabSize,
-    SizeType* offsetBuf, SizeType* beginOffsetBuf, float const* topPs, bool const* skipDecode,
+    TokenIdType* topKTmpIdBuf, T* topKTmpValBuf, FinishedState const* finishedInput, SizeType32 vocabSize,
+    SizeType32* offsetBuf, SizeType32* beginOffsetBuf, float const* topPs, bool const* skipDecode,
     SizeType32 const* batchSlots)
 {
     /**
@@ -167,7 +167,7 @@ struct BlockPrefixCallbackOp
 template <typename T>
 __device__ void epilogue(SizeType32 batchId, SizeType32 currentStep, SizeType32 offset, TokenIdType** ids,
     TokenIdType* sortedIdVals, T* sortedProbs, float* cumLogProbs, float* outputLogProbs, TokenIdType const* endIds,
-    SizeType32* sequenceLengths, FinishedState* finishedOutput, SizeType maxBatchSize)
+    SizeType32* sequenceLengths, FinishedState* finishedOutput, SizeType32 maxBatchSize)
 {
     ids[batchId][currentStep] = sortedIdVals[offset];
 
@@ -201,8 +201,8 @@ __device__ void epilogue(SizeType32 batchId, SizeType32 currentStep, SizeType32 
 template <typename T, int blockSize>
 __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenIdType** ids, SizeType32* sequenceLength,
     FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    SizeType const* beginOffsetBuf, SizeType const* offsetBuf, SizeType vocabSize, curandState_t* curandState,
-    float const* topPs, TokenIdType const* endIds, SizeType maxBatchSize, bool const* skipDecode,
+    SizeType32 const* beginOffsetBuf, SizeType32 const* offsetBuf, SizeType32 vocabSize, curandState_t* curandState,
+    float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize, bool const* skipDecode,
     SizeType32 const* batchSlots)
 {
     /**
@@ -297,18 +297,18 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
 }
 
 template <typename T>
-std::vector<size_t> getTopPWorkspaceSizes(SizeType batchSize, SizeType vocabSize)
+std::vector<size_t> getTopPWorkspaceSizes(SizeType32 batchSize, SizeType32 vocabSize)
 {
     auto const sortedLogProbBufSize = sizeof(T) * batchSize * vocabSize;
     auto const sortedIdValsBufSize = sizeof(TokenIdType) * batchSize * vocabSize;
     auto const topPIdValsSize = sizeof(TokenIdType) * batchSize * vocabSize;
-    auto const topPOffsetSize = sizeof(SizeType) * (batchSize + 1);
-    auto const beginTopPOffsetSize = sizeof(SizeType) * (batchSize + 1);
+    auto const topPOffsetSize = sizeof(SizeType32) * (batchSize + 1);
+    auto const beginTopPOffsetSize = sizeof(SizeType32) * (batchSize + 1);
 
     size_t cubTempStorageSize;
     tensorrt_llm::common::check_cuda_error(cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,
         cubTempStorageSize, static_cast<T*>(nullptr), static_cast<T*>(nullptr), static_cast<SizeType32*>(nullptr),
-        static_cast<SizeType32*>(nullptr), static_cast<SizeType>(vocabSize * batchSize), batchSize,
+        static_cast<SizeType32*>(nullptr), static_cast<SizeType32>(vocabSize * batchSize), batchSize,
         static_cast<SizeType32*>(nullptr), static_cast<SizeType32*>(nullptr),
         0,             // begin_bit
         sizeof(T) * 8, // end_bit = sizeof(KeyT) * 8
@@ -318,18 +318,18 @@ std::vector<size_t> getTopPWorkspaceSizes(SizeType batchSize, SizeType vocabSize
         beginTopPOffsetSize};
 }
 
-template std::vector<size_t> getTopPWorkspaceSizes<float>(SizeType batchSize, SizeType vocabSize);
-template std::vector<size_t> getTopPWorkspaceSizes<half>(SizeType batchSize, SizeType vocabSize);
+template std::vector<size_t> getTopPWorkspaceSizes<float>(SizeType32 batchSize, SizeType32 vocabSize);
+template std::vector<size_t> getTopPWorkspaceSizes<half>(SizeType32 batchSize, SizeType32 vocabSize);
 
 template <typename T>
-size_t getTopPWorkspaceSize(SizeType batchSize, SizeType vocabSizePadded)
+size_t getTopPWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSizePadded)
 {
     auto const workspaceSizes = getTopPWorkspaceSizes<T>(batchSize, vocabSizePadded);
     return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
 }
 
-template size_t getTopPWorkspaceSize<float>(SizeType batchSize, SizeType vocabSizePadded);
-template size_t getTopPWorkspaceSize<half>(SizeType batchSize, SizeType vocabSizePadded);
+template size_t getTopPWorkspaceSize<float>(SizeType32 batchSize, SizeType32 vocabSizePadded);
+template size_t getTopPWorkspaceSize<half>(SizeType32 batchSize, SizeType32 vocabSizePadded);
 
 template <typename T>
 void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStream_t stream)
@@ -347,8 +347,8 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     auto sortedProbs = static_cast<T*>(alignedPointers[1]);
     auto sortedIdVals = static_cast<TokenIdType*>(alignedPointers[2]);
     auto idVals = static_cast<TokenIdType*>(alignedPointers[3]);
-    auto offsetBuf = static_cast<SizeType*>(alignedPointers[4]);
-    auto beginOffsetBuf = static_cast<SizeType*>(alignedPointers[5]);
+    auto offsetBuf = static_cast<SizeType32*>(alignedPointers[4]);
+    auto beginOffsetBuf = static_cast<SizeType32*>(alignedPointers[5]);
 
     invokeTopPInitialize(idVals, offsetBuf, beginOffsetBuf, params.batchSize, params.vocabSizePadded, stream);
     sync_check_cuda_error();
@@ -366,9 +366,9 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     check_cuda_error(cub::DeviceSegmentedRadixSort::SortPairsDescending(cubTempStorage, cubWorkspaceSize, params.probs,
         sortedProbs, idVals, sortedIdVals, params.vocabSizePadded * params.batchSize, params.batchSize, beginOffsetBuf,
         offsetBuf + 1,
-        0,                                    // begin_bit
-        static_cast<SizeType>(sizeof(T) * 8), // end_bit = sizeof(KeyT) * 8
-        stream));                             // cudaStream_t
+        0,                                      // begin_bit
+        static_cast<SizeType32>(sizeof(T) * 8), // end_bit = sizeof(KeyT) * 8
+        stream));                               // cudaStream_t
 
     SizeType32 constexpr SAMPLING_BLOCK_SIZE = 256;
     dim3 grid(params.batchSize);
@@ -390,7 +390,7 @@ __global__ void computeToppDecay(float* runtimeTopP, float const* runtimeInitial
     float const* topPDecay, float const* topPMin, TokenIdType const* topPResetIds, SizeType32 const* sequenceLengths,
     SizeType32 const* batchSlots)
 {
-    auto const idx = static_cast<SizeType>(blockDim.x * blockIdx.x + threadIdx.x);
+    auto const idx = static_cast<SizeType32>(blockDim.x * blockIdx.x + threadIdx.x);
     auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
     auto const currentStep{sequenceLengths[batchSlot]};
     if (outputIds[batchSlot][currentStep] == topPResetIds[batchSlot])
@@ -405,7 +405,7 @@ __global__ void computeToppDecay(float* runtimeTopP, float const* runtimeInitial
 
 void invokeComputeToppDecay(float* runtimeTopP, float const* runtimeInitialTopP, TokenIdType const** outputIds,
     float const* topPDecay, float const* topPMin, TokenIdType const* topPResetIds, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots, SizeType localBatchSize, cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 localBatchSize, cudaStream_t stream)
 {
     dim3 block(min(localBatchSize, 512));
     dim3 grid((localBatchSize + block.x - 1) / block.x);

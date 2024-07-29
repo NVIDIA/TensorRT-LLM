@@ -16,7 +16,7 @@ Note that multi GPU can also support the chat scenario, need to add additional c
 The example only targets to demonstrate the TRT-LLM API usage here, so it uses pre-defined dataset for simplicity.
 
 ```bash
-python ./llama_multi_gpu.py --hf_model_dir <hf llama path> --engine_dir ./llama.engine.tp2 -c --tp_size 2
+python ./llama_multi_gpu.py --hf_model_dir <hf llama path> --engine_dir ./llama.engine.tp2 --tp_size 2
 ```
 
 # Quantization

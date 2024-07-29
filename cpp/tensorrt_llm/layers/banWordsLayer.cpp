@@ -15,123 +15,141 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/banWordsLayer.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
+#include "banWordsLayer.h"
 #include "tensorrt_llm/kernels/banBadWords.h"
 #include "tensorrt_llm/kernels/banRepeatNgram.h"
+#include "tensorrt_llm/layers/defaultDecodingParams.h"
+#include "tensorrt_llm/layers/layerUtils.h"
 
-#include <algorithm>
-
-using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 template <typename T>
-BanWordsLayer<T>::BanWordsLayer(DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
-    std::shared_ptr<IAllocator> allocator)
-    : BaseLayer(decoderDomain, stream, std::move(allocator))
+BanWordsLayer<T>::BanWordsLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+    std::shared_ptr<BufferManager> bufferManager)
+    : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    allocateBuffer();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void BanWordsLayer<T>::setup(
-    SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams)
+void BanWordsLayer<T>::allocateBuffer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
 
-template <typename T>
-void BanWordsLayer<T>::banRepeatNGrams(Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded, cudaStream_t stream)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const max_step = inputs->step;
-    if (inputs->no_repeat_ngram_size)
+    if (mDecodingMode.isUseNoRepeatNgramSize())
     {
-        SizeType32 const* noRepeatNgramSizeBuf
-            = inputs->no_repeat_ngram_size.value().template getPtr<SizeType32 const>();
+        mNoRepeatNgramSizeDevice
+            = mBufferManager->gpu(ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<SizeType32>::value);
+    }
 
-        invokeBanRepeatNgram(logits.template getPtr<T>(), outputs->output_ids_ptr.template getPtr<TokenIdType const*>(),
-            reinterpret_cast<FinishedState*>(
-                inputs->finished.value_or(Tensor{}).template getPtr<FinishedState::UnderlyingType>()),
-            outputs->parent_ids_ptr.template getPtr<SizeType32 const*>(), batchSlots,
-            outputs->sequence_length->template getPtr<SizeType32>(), batchSize, beamWidth, maxSeqLen,
-            inputs->no_repeat_ngram_size.value().template getPtr<SizeType32 const>(), vocabSizePadded, max_step,
-            stream);
+    mNoRepeatNgramSize = mBufferManager->pinnedPool(
+        ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<SizeType32>::value);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void BanWordsLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
+    auto batchSlotsHost = batchSlots ? batchSlots : getDefaultBatchSlots(batchSize, *mBufferManager);
+    auto const& banWordsParams = setupParams->banWordsParams;
+    TLLM_CHECK_WITH_INFO(banWordsParams, "banWordsParams for setup is not set");
+    bool const useNoRepeatNgramSize
+        = mDecodingMode.isUseNoRepeatNgramSize() && banWordsParams->noRepeatNgramSize.has_value();
+    FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
+    mUseNoRepeatNgramSize |= useNoRepeatNgramSize;
+    if (mUseNoRepeatNgramSize)
+    {
+        fillBuffers(banWordsParams->noRepeatNgramSize, DefaultDecodingParams::getNoRepeatNgramSize(),
+            mNoRepeatNgramSize, mNoRepeatNgramSizeDevice, batchSlotsHost,
+            std::make_pair(0.f, std::numeric_limits<float>::max()), "no_repeat_ngram_size");
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void BanWordsLayer<T>::banBadWords(Tensor& logits, std::shared_ptr<DynamicDecodeOutputParams> const& outputs,
-    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, SizeType vocabSizePadded, cudaStream_t stream)
+void BanWordsLayer<T>::banRepeatNGrams(TensorPtr logits, std::shared_ptr<BaseDecodingOutputs> const& outputs,
+    std::shared_ptr<DecodingInputs> const& inputs, BufferConstPtr batchSlots, BufferPtr noRepeatNgramSizeDevice,
+    DecoderDomain const& decoderDomain, SizeType32 maxSeqLen, bool useNoRepeatNgramSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const maxBadWordsLength = inputs->max_bad_words_len;
+    if (useNoRepeatNgramSize)
+    {
+        // auto const maxStep = inputs->step; // TODO (bhsueh) Should we use step? but current inputs->step is always 0.
+        auto const maxStep = maxSeqLen;
+        // Temporary variables to store dereferenced inputs
+        auto logitsPtr = bufferCast<T>(*logits);
+        auto outputIdsPtr = bufferCast<TokenIdType const*>(*outputs->outputIdsPtr);
+        auto finishedPtr
+            = reinterpret_cast<FinishedState const*>(bufferCastOrNull<FinishedState::UnderlyingType>(inputs->finished));
+        auto parentIdsPtr = bufferCast<SizeType32 const*>(*outputs->parentIdsPtr);
+        auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+        auto sequenceLengthPtr = bufferCast<SizeType32>(*outputs->sequenceLength.value());
+        auto noRepeatNgramSizeDevicePtr = bufferCastOrNull<SizeType32>(noRepeatNgramSizeDevice);
+
+        // Call to invokeBanRepeatNgram with dereferenced inputs
+        invokeBanRepeatNgram(logitsPtr, outputIdsPtr, finishedPtr, parentIdsPtr, batchSlotsPtr, sequenceLengthPtr,
+            decoderDomain.getBatchSize(), decoderDomain.getBeamWidth(), maxSeqLen, noRepeatNgramSizeDevicePtr,
+            decoderDomain.getVocabSizePadded(), maxStep, getStream());
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void BanWordsLayer<T>::banBadWords(TensorPtr logits, std::shared_ptr<BaseDecodingOutputs> const& outputs,
+    std::shared_ptr<DecodingInputs> const& inputs, BufferConstPtr batchSlots, DecoderDomain const& decoderDomain,
+    SizeType32 maxSeqLen)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto const maxBadWordsLength = inputs->banWordsInputs->maxBadWordsLen;
     if (maxBadWordsLength)
     {
-        auto const** badWordsPtr = inputs->bad_words_ptr->template getPtr<TokenIdType const*>();
-        auto const* badWordsLens = inputs->bad_words_lengths->template getPtr<SizeType32>();
+        // Temporary variables to store dereferenced inputs
+        auto badWordsPtr = bufferCast<TokenIdType const*>(*inputs->banWordsInputs->badWordsPtr.value());
+        auto badWordsLens = bufferCast<SizeType32>(*inputs->banWordsInputs->badWordsLengths.value());
+        auto logitsPtr = bufferCast<T>(*logits);
+        auto outputIdsPtr = bufferCast<TokenIdType const*>(*outputs->outputIdsPtr);
+        auto parentIdsPtr
+            = decoderDomain.getBeamWidth() > 1 ? bufferCast<SizeType32 const*>(*outputs->parentIdsPtr) : nullptr;
+        auto sequenceLengthPtr = bufferCast<SizeType32>(*outputs->sequenceLength.value());
+        auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
 
-        invokeBanBadWords((T*) logits.template getPtr<T>(),
-            outputs->output_ids_ptr.template getPtr<TokenIdType const*>(),
-            beamWidth > 1 ? outputs->parent_ids_ptr.template getPtr<SizeType32 const*>() : nullptr, batchSlots,
-            batchSize, beamWidth, badWordsPtr, badWordsLens, maxBadWordsLength, vocabSizePadded,
-            outputs->sequence_length->template getPtr<SizeType32>(), maxSeqLen, stream);
+        // Call to invokeBanBadWords with dereferenced inputs
+        invokeBanBadWords(logitsPtr, outputIdsPtr, parentIdsPtr, batchSlotsPtr, decoderDomain.getBatchSize(),
+            decoderDomain.getBeamWidth(), badWordsPtr, badWordsLens, maxBadWordsLength,
+            decoderDomain.getVocabSizePadded(), sequenceLengthPtr, maxSeqLen, getStream());
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void BanWordsLayer<T>::forward(
-    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+void BanWordsLayer<T>::forwardAsync(
+    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
-    auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
+    auto inputs = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
+    auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
 
-    SizeType batchSize{0};
-    SizeType beamWidth{0};
-    SizeType vocabSize{0};
-    auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
-    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    if (inputs->logits)
-    {
-        auto const& logitsShape = inputs->logits->shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        batchSize = logitsShape[0];
-        auto const idxOffset = logitsShape.size() - 3;
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
-    }
-    else
-    {
-        TLLM_CHECK(inputs->logits_vec->size());
-        auto const& logitsShape = inputs->logits_vec.value()[0].shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        auto const idxOffset = logitsShape.size() - 3;
-        batchSize = inputs->logits_vec->size();
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
-    }
+    TLLM_CHECK_WITH_INFO(inputs->banWordsInputs, "banWordsInputs for forward is not set");
 
-    banRepeatNGrams(
-        inputs->logits.value(), outputs, inputs, batchSlots, batchSize, beamWidth, maxSeqLen, vocabSize, mStream);
+    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
+    auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
+
+    banRepeatNGrams(inputs->logits.value(), outputs, inputs, inputs->batchSlots.value_or(nullptr),
+        mNoRepeatNgramSizeDevice, localDecoderDomain, maxSeqLen, mUseNoRepeatNgramSize);
     banBadWords(
-        inputs->logits.value(), outputs, inputs, batchSlots, batchSize, beamWidth, maxSeqLen, vocabSize, mStream);
+        inputs->logits.value(), outputs, inputs, inputs->batchSlots.value_or(nullptr), localDecoderDomain, maxSeqLen);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -139,5 +157,4 @@ void BanWordsLayer<T>::forward(
 template class BanWordsLayer<float>;
 template class BanWordsLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

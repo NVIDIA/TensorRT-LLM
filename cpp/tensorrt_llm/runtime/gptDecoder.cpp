@@ -16,107 +16,184 @@
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
-#include "tensorrt_llm/kernels/parallelDecoding/kvCacheUpdateKernels.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 
 #include <memory>
 
 #include <NvInferRuntime.h>
 
+namespace tle = tensorrt_llm::executor;
 namespace tc = tensorrt_llm::common;
 namespace tl = tensorrt_llm::layers;
-namespace tcc = tensorrt_llm::common::conversion;
+namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
 using namespace tensorrt_llm::runtime;
 
+using BufferConstPtr = IBuffer::SharedConstPtr;
+using BufferPtr = IBuffer::SharedPtr;
+using TensorConstPtr = ITensor::SharedConstPtr;
+using TensorPtr = ITensor::SharedPtr;
+
 template <typename T>
-GptDecoder<T>::GptDecoder(DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
-    size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
-    std::optional<runtime::SizeType> maxTokensPerStep, std::optional<runtime::SizeType> maxNumMedusaHeads)
-    : mManager{stream}
+GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth,
+    size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+    std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
+    : mManager{std::make_shared<BufferManager>(stream)}
     , mMaxBatchSize(maxBatchSize)
+    , mDecodingMode{mode}
 {
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
-        maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, maxTokensPerStep, maxNumMedusaHeads);
-    auto allocator = std::make_shared<common::CudaAllocator>(mManager);
-    mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(
-        mode, decodingDomain, stream->get(), std::move(allocator));
-
+        maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
+    mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
     auto constexpr nvFloatType = TRTDataType<float>::value;
-    mLogProbsTiled = mManager.gpu(ITensor::makeShape({static_cast<SizeType>(maxSequenceLength),
-                                      static_cast<SizeType>(maxBatchSize), static_cast<SizeType>(maxBeamWidth)}),
+    mLogProbsTiled = mManager->gpu(ITensor::makeShape({static_cast<SizeType32>(maxSequenceLength),
+                                       static_cast<SizeType32>(maxBatchSize), static_cast<SizeType32>(maxBeamWidth)}),
         nvFloatType);
-    mManager.setZero(*mLogProbsTiled);
+    mManager->setZero(*mLogProbsTiled);
 }
 
 template <typename T>
-void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType maxSequenceLength,
-    std::optional<TensorPtr> const& batchSlots)
+void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize,
+    std::optional<TensorConstPtr> const& batchSlots, std::optional<DecodingOutput> const& output)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mSamplingConfig = samplingConfig;
     auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
 
-    setupParams->penaltyParams.repetitionPenalty = samplingConfig.repetitionPenalty;
-    setupParams->penaltyParams.presencePenalty = samplingConfig.presencePenalty;
-    setupParams->penaltyParams.frequencyPenalty = samplingConfig.frequencyPenalty;
-    setupParams->penaltyParams.temperature = samplingConfig.temperature;
-    setupParams->penaltyParams.minLength = samplingConfig.minLength;
+    TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Sampling config is invalid");
 
-    setupParams->randomSeed = samplingConfig.randomSeed;
+    auto penaltyParams = std::make_shared<tl::PenaltySetupParams>();
+    penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
+    penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
+    penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->temperature = mSamplingConfig.temperature;
+    penaltyParams->minLength = mSamplingConfig.minLength;
 
-    setupParams->samplingParams.normalize_log_probs = samplingConfig.normalizeLogProbs;
-    // signed to unsigned
-    if (samplingConfig.topK)
+    setupParams->penaltyParams = std::move(penaltyParams);
+
+    auto banWordsParams = std::make_shared<tl::BanWordsSetupParams>();
+    banWordsParams->noRepeatNgramSize = mSamplingConfig.noRepeatNgramSize;
+
+    setupParams->banWordsParams = std::move(banWordsParams);
+
+    if (mDecodingMode.isTopKorTopP())
     {
-        auto const& topK = samplingConfig.topK.value();
-        setupParams->samplingParams.runtime_top_k = std::vector<SizeType>(std::begin(topK), std::end(topK));
+        auto samplingParams = std::make_shared<tl::SamplingSetupParams>();
+        samplingParams->normalizeLogProbs = mSamplingConfig.normalizeLogProbs;
+        // signed to unsigned
+        if (mSamplingConfig.topK)
+        {
+            auto const& topK = mSamplingConfig.topK.value();
+            samplingParams->runtimeTopK = std::vector<SizeType32>(std::begin(topK), std::end(topK));
+        }
+
+        samplingParams->runtimeTopP = mSamplingConfig.topP;
+        samplingParams->topPDecay = mSamplingConfig.topPDecay;
+        samplingParams->topPMin = mSamplingConfig.topPMin;
+        samplingParams->topPResetIds = mSamplingConfig.topPResetIds;
+        samplingParams->outputLogProbs = mSamplingConfig.outputLogProbs;
+        samplingParams->cumLogProbs = mSamplingConfig.cumLogProbs;
+
+        setupParams->decodingParams = std::move(samplingParams);
+    }
+    else if (mDecodingMode.isBeamSearch())
+    {
+        auto beamSearchParams = std::make_shared<tl::BeamSearchSetupParams>();
+        beamSearchParams->beamSearchDiversityRate = mSamplingConfig.beamSearchDiversityRate;
+        beamSearchParams->lengthPenalty = mSamplingConfig.lengthPenalty;
+        beamSearchParams->earlyStopping = mSamplingConfig.earlyStopping;
+
+        setupParams->decodingParams = std::move(beamSearchParams);
+    }
+    else if (mDecodingMode.isMedusa())
+    {
+        auto medusaParams = std::make_shared<tl::MedusaSetupParams>();
+        // signed to unsigned
+        if (mSamplingConfig.topK)
+        {
+            auto const& topK = mSamplingConfig.topK.value();
+            medusaParams->runtimeTopK = std::vector<SizeType32>(std::begin(topK), std::end(topK));
+        }
+        medusaParams->runtimeHeadsTopK = mSamplingConfig.topKMedusaHeads;
+
+        setupParams->decodingParams = std::move(medusaParams);
+    }
+    else if (mDecodingMode.isExplicitDraftTokens())
+    {
+        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for ExplicitDraftTokens");
+        auto explicitDraftTokensParams = std::make_shared<tl::ExplicitDraftTokensSetupParams>();
+        explicitDraftTokensParams->temperature = mSamplingConfig.temperature;
+        explicitDraftTokensParams->randomDataSample = output->explicitDraftTokensBuffers->randomDataSample;
+        explicitDraftTokensParams->temperatures = output->explicitDraftTokensBuffers->temperatures;
+
+        setupParams->decodingParams = explicitDraftTokensParams;
     }
 
-    setupParams->samplingParams.runtime_top_p = samplingConfig.topP;
-    setupParams->samplingParams.top_p_decay = samplingConfig.topPDecay;
-    setupParams->samplingParams.top_p_min = samplingConfig.topPMin;
-    setupParams->samplingParams.top_p_reset_ids = samplingConfig.topPResetIds;
+    setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
-    setupParams->beamSearchParams.beam_search_diversity_rate = samplingConfig.beamSearchDiversityRate;
-    setupParams->beamSearchParams.length_penalty = samplingConfig.lengthPenalty;
-    setupParams->beamSearchParams.early_stopping = samplingConfig.earlyStopping;
+    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots.value_or(nullptr), setupParams);
 
-    setupParams->medusaParams.topKMedusaHeads = samplingConfig.topKMedusaHeads;
-
-    auto const batchSlotsPtr = batchSlots.has_value() ? bufferCast<SizeType>(*(batchSlots.value())) : nullptr;
-    mDynamicDecodeLayer->setup(batchSize, samplingConfig.beamWidth, batchSlotsPtr, setupParams);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 namespace
 {
-void safeInsert(tc::TensorMap& map, std::string const& key, DecodingOutput::TensorPtr const& tensor)
+
+std::shared_ptr<tl::BanWordsDecodingInputs> prepareBanWordsInputs(DecodingInput const& input)
 {
-    if (tensor)
+    auto banWordsParams = std::make_shared<tl::BanWordsDecodingInputs>(input.batchSize);
+    if (input.badWordsPtrs)
     {
-        ITensor const& t{*tensor};
-        map.insert({key, tcc::toTllmTensor(t)});
+        TLLM_CHECK_WITH_INFO(input.badWordsPtrs, "Bad word lengths must be provided when badWordsPtrs is given");
+        banWordsParams->badWordsPtr = input.badWordsPtrs;
+        banWordsParams->badWordsLengths = input.badWordsLens;
+        banWordsParams->maxBadWordsLen = input.maxBadWordsLen;
     }
+
+    return banWordsParams;
 }
 
-template <typename T>
-tl::DynamicDecodeInputParams::MedusaInputs prepareMedusaInputs(DecodingInput const& inputs, size_t maxBatchSize)
+std::shared_ptr<tl::StopCriteriaDecodingInputs> prepareStopCriteriaInputs(DecodingInput const& input)
+{
+    auto stopCriteriaParams = std::make_shared<tl::StopCriteriaDecodingInputs>(input.batchSize);
+    if (input.stopWordsPtrs)
+    {
+        TLLM_CHECK_WITH_INFO(input.stopWordsLens, "Stop word lengths must be provided when stopWordsPtrs is given");
+
+        stopCriteriaParams->stopWordsPtr = input.stopWordsPtrs;
+        stopCriteriaParams->stopWordsLengths = input.stopWordsLens;
+        stopCriteriaParams->maxStopWordsLen = input.maxStopWordsLen;
+    }
+
+    if (input.sequenceLimitLength)
+    {
+        stopCriteriaParams->sequenceLimitLength = input.sequenceLimitLength;
+    }
+
+    return stopCriteriaParams;
+}
+
+void prepareMedusaInputs(
+    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    auto inputParams = std::dynamic_pointer_cast<tl::MedusaDecodingInputs>(baseInputs);
+
     auto const& medusaInputs = inputs.medusaInputs.value();
 
-    tl::DynamicDecodeInputParams::MedusaInputs medusaDecodingInputs;
-    medusaDecodingInputs.medusaCurTokensPerStep = tcc::toTllmTensor(*medusaInputs.medusaCurTokensPerStep);
-    medusaDecodingInputs.medusaTargetTokensPerStep = tcc::toTllmTensor(*medusaInputs.medusaTargetTokensPerStep);
-    medusaDecodingInputs.medusaPaths = tcc::toTllmTensor(*medusaInputs.medusaPaths);
-    medusaDecodingInputs.medusaTreeIds = tcc::toTllmTensor(*medusaInputs.medusaTreeIds);
-    auto const batchSlots = bufferCast<SizeType>(*inputs.batchSlots);
+    inputParams->curTokensPerStep = medusaInputs.medusaCurTokensPerStep;
+    inputParams->targetTokensPerStep = medusaInputs.medusaTargetTokensPerStep;
+    inputParams->paths = medusaInputs.medusaPaths;
+    inputParams->treeIds = medusaInputs.medusaTreeIds;
+    auto const batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     if (medusaInputs.medusaLogits.size())
     {
-        std::vector<std::vector<tc::Tensor>> medusaLogits;
+        std::vector<std::vector<TensorPtr>> medusaLogits;
         auto const batchSize = medusaInputs.medusaLogits.size();
         medusaLogits.resize(maxBatchSize);
         for (size_t bi = 0; bi < batchSize; ++bi)
@@ -129,89 +206,133 @@ tl::DynamicDecodeInputParams::MedusaInputs prepareMedusaInputs(DecodingInput con
             {
                 if (logitsHeads[hi])
                 {
-                    medusaLogits[slot][hi] = tcc::toTllmTensor(*logitsHeads[hi]);
+                    medusaLogits[slot][hi] = logitsHeads[hi];
                 }
             }
         }
-        medusaDecodingInputs.medusaLogits = medusaLogits;
+        inputParams->medusaLogits = medusaLogits;
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return medusaDecodingInputs;
+}
+
+void prepareExplicitDraftTokensInput(
+    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto inputParams = std::dynamic_pointer_cast<tl::ExplicitDraftTokensInputs>(baseInputs);
+
+    auto& explicitDraftTokensInputs = inputs.explicitDraftTokensInputs;
+
+    TLLM_CHECK_WITH_INFO(explicitDraftTokensInputs.has_value(), "ExplicitDraftTokensInputs are not set");
+
+    inputParams->nextDraftTokens = explicitDraftTokensInputs->nextDraftTokens;
+    inputParams->nextFlatTokens = explicitDraftTokensInputs->nextFlatTokens;
+    inputParams->nextDraftIndices = explicitDraftTokensInputs->nextDraftIndices;
+    inputParams->nextDraftProbs = explicitDraftTokensInputs->nextDraftProbs;
+    inputParams->lastDraftTokens = explicitDraftTokensInputs->lastDraftTokens;
+    inputParams->lastDraftIndices = explicitDraftTokensInputs->lastDraftIndices;
+    inputParams->masks = explicitDraftTokensInputs->masks;
+    inputParams->packedPosIds = explicitDraftTokensInputs->packedPositionIds;
+    inputParams->bestPathLengths = explicitDraftTokensInputs->bestPathLengths;
+    inputParams->bestPathIndices = explicitDraftTokensInputs->bestPathIndices;
+    inputParams->generationLengths = explicitDraftTokensInputs->nextGenerationLengths;
+    inputParams->positionIdsBase = explicitDraftTokensInputs->lastPositionIdsBase;
+    inputParams->lastGenerationLengths = explicitDraftTokensInputs->lastGenerationLengths;
+    inputParams->maxGenLengthDevice = explicitDraftTokensInputs->maxGenLengthDevice;
+    inputParams->seqSlots = explicitDraftTokensInputs->seqSlots;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-std::shared_ptr<tl::DynamicDecodeInputParams> prepareInputs(DecodingInput const& input, size_t maxBatchSize)
+std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input, size_t maxBatchSize,
+    tle::DecodingMode const& decodingMode, std::shared_ptr<BufferManager> bufferManager)
 {
-    auto constexpr ite = 0; // no pipeline parallelism
-    auto forwardParams = std::make_shared<tl::DynamicDecodeInputParams>(input.step, ite, input.maxLength,
-        input.maxAttentionWindow, input.sinkTokenLength, input.maxBatchSize, tcc::toTllmTensor(*input.endIds));
+    auto constexpr ite = 0;
 
-    if (input.logitsVec)
+    std::shared_ptr<tl::DecodingInputs> forwardParams;
+    if (decodingMode.isTopKorTopP())
     {
-        std::vector<tc::Tensor> logitsVec;
-        for (auto const& logits : input.logitsVec.value())
-        {
-            TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
-            logitsVec.push_back(tcc::toTllmTensor(*logits));
-        }
-        forwardParams->logits_vec = logitsVec;
+        forwardParams = std::make_shared<tl::SamplingInputs>(input.endIds, input.step, ite, input.batchSize);
     }
-    else
+    else if (decodingMode.isBeamSearch())
     {
-        TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
-        forwardParams->logits = tcc::toTllmTensor(*input.logits);
+        forwardParams = std::make_shared<tl::DecodingInputs>(
+            input.endIds, input.step, ite, input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
+    }
+    else if (decodingMode.isMedusa())
+    {
+        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(input.endIds, input.batchSize);
+    }
+    else if (decodingMode.isLookahead())
+    {
+        // TODO add lookahead inputs
+    }
+    else if (decodingMode.isExplicitDraftTokens())
+    {
+        forwardParams = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSize);
+    }
+
+    // No logits for explicit draft tokens
+    if (!decodingMode.isExplicitDraftTokens())
+    {
+        if (input.logitsVec)
+        {
+            std::vector<TensorPtr> logitsVec;
+            for (auto const& logits : input.logitsVec.value())
+            {
+                TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
+                logitsVec.push_back(logits);
+            }
+            forwardParams->logitsVec = logitsVec;
+        }
+        else if (input.logits)
+        {
+            TLLM_CHECK(input.logits->getDataType() == TRTDataType<T>::value);
+            forwardParams->logits = input.logits;
+        }
     }
 
     if (input.cacheIndirection)
     {
-        forwardParams->src_cache_indirection = tcc::toTllmTensor(*input.cacheIndirection);
-    }
-
-    if (input.sequenceLimitLength)
-    {
-        forwardParams->sequence_limit_length = tcc::toTllmTensor(*input.sequenceLimitLength);
+        forwardParams->srcCacheIndirection = input.cacheIndirection;
     }
 
     if (input.embeddingBias)
     {
-        forwardParams->embedding_bias = tcc::toTllmTensor(*input.embeddingBias);
+        forwardParams->embeddingBias = input.embeddingBias;
     }
 
     if (input.lengths)
     {
-        forwardParams->input_lengths = tcc::toTllmTensor(*input.lengths);
+        forwardParams->inputLengths = input.lengths;
     }
 
-    if (input.badWordsPtrs)
-    {
-        TLLM_CHECK_WITH_INFO(input.badWordsPtrs, "Bad word lengths must be provided when badWordsPtrs is given");
-        forwardParams->bad_words_ptr = tcc::toTllmTensor(*input.badWordsPtrs);
-        forwardParams->bad_words_lengths = tcc::toTllmTensor(*input.badWordsLens);
-        forwardParams->max_bad_words_len = input.maxBadWordsLen;
-    }
+    forwardParams->banWordsInputs = prepareBanWordsInputs(input);
 
-    if (input.stopWordsPtrs)
-    {
-        TLLM_CHECK_WITH_INFO(input.stopWordsLens, "Stop word lengths must be provided when stopWordsPtrs is given");
-        forwardParams->stop_words_ptr = tcc::toTllmTensor(*input.stopWordsPtrs);
-        forwardParams->stop_words_lengths = tcc::toTllmTensor(*input.stopWordsLens);
-        forwardParams->max_stop_words_len = input.maxStopWordsLen;
-    }
+    forwardParams->stopCriteriaInputs = prepareStopCriteriaInputs(input);
 
     if (input.finished)
     {
-        forwardParams->finished = tcc::toTllmTensor(*input.finished);
+        forwardParams->finished = input.finished;
     }
 
     if (input.batchSlots)
     {
-        forwardParams->batch_slots = tcc::toTllmTensor(*input.batchSlots);
+        forwardParams->batchSlots = input.batchSlots;
     }
 
     // Medusa
-    if (input.medusaInputs)
+    if (decodingMode.isMedusa())
     {
-        forwardParams->medusaInputs = prepareMedusaInputs<T>(input, maxBatchSize);
+        prepareMedusaInputs(input, maxBatchSize, forwardParams);
+    }
+
+    // Explicit draft tokens
+    if (decodingMode.isExplicitDraftTokens())
+    {
+        prepareExplicitDraftTokensInput(input, maxBatchSize, forwardParams);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -219,82 +340,27 @@ std::shared_ptr<tl::DynamicDecodeInputParams> prepareInputs(DecodingInput const&
     return forwardParams;
 }
 
-template <typename T>
-tl::DynamicDecodeOutputParams::MedusaOutputs prepareMedusaOutputs(DecodingOutput::MedusaOutputs& output)
+void prepareBeamSearchOutputs(DecodingOutput& output, std::shared_ptr<tl::BaseDecodingOutputs>& baseOutputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    tl::DynamicDecodeOutputParams::MedusaOutputs medusaOutputs;
-    medusaOutputs.nextDraftTokens = tcc::toTllmTensor(*output.medusaNextDraftTokens);
-    medusaOutputs.acceptedLengths = tcc::toTllmTensor(*output.medusaAcceptedTokensLen);
-    medusaOutputs.acceptedLengthsCumSum = tcc::toTllmTensor(*output.medusaAcceptedLengthsCumSum);
-    medusaOutputs.pathsOffsets = tcc::toTllmTensor(*output.medusaPathsOffsets);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return medusaOutputs;
-}
-
-template <typename T>
-std::shared_ptr<tl::DynamicDecodeOutputParams> prepareOutputs(
-    DecodingOutput& output, DecodingInput::TensorPtr const& inputLengths, DecodingOutput::TensorPtr& logProbsTiled)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto outputParams = std::make_shared<tl::DynamicDecodeOutputParams>(tcc::toTllmTensor(*output.ids));
-
-    outputParams->newTokens = tcc::toTllmTensor(*output.newTokens);
-
-    if (output.cumLogProbs)
-    {
-        outputParams->cum_log_probs = tcc::toTllmTensor(*output.cumLogProbs);
-    }
-
-    if (output.parentIds)
-    {
-        outputParams->parent_ids = tcc::toTllmTensor(*output.parentIds);
-    }
-
-    if (output.cacheIndirection)
-    {
-        outputParams->tgt_cache_indirection = tcc::toTllmTensor(*output.cacheIndirection);
-    }
-
-    if (output.finished)
-    {
-        outputParams->finished = tcc::toTllmTensor(*output.finished);
-    }
-
-    if (output.finishedSum)
-    {
-        outputParams->finished_sum = tcc::toTllmTensor(*output.finishedSum);
-    }
-
-    if (output.lengths)
-    {
-        outputParams->sequence_length = tcc::toTllmTensor(*output.lengths);
-    }
-
-    if (output.logProbs)
-    {
-        outputParams->output_log_probs = tcc::toTllmTensor(*output.logProbs);
-        outputParams->output_log_probs_tiled = tcc::toTllmTensor(*logProbsTiled);
-    }
-
+    auto outputParams = std::dynamic_pointer_cast<tl::BeamSearchOutputs>(baseOutputs);
     outputParams->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
-    if (output.beamHypotheses.batchDones)
+    if (output.beamHypotheses.outputIdsCBA)
     {
-        outputParams->beamHypotheses->batchDones = bufferCast<bool>(*output.beamHypotheses.batchDones);
-    }
-    if (output.beamHypotheses.cumLogProbsCBA)
-    {
-        outputParams->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*output.beamHypotheses.cumLogProbsCBA);
+        outputParams->beamHypotheses->outputIdsCBA = bufferCast<int>(*output.beamHypotheses.outputIdsCBA);
     }
     if (output.beamHypotheses.logProbsCBA)
     {
         outputParams->beamHypotheses->logProbsCBA = bufferCast<float>(*output.beamHypotheses.logProbsCBA);
     }
-    if (output.beamHypotheses.minNormedScoresCBA)
+    if (output.beamHypotheses.sequenceLengthsCBA)
     {
-        outputParams->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*output.beamHypotheses.minNormedScoresCBA);
+        outputParams->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*output.beamHypotheses.sequenceLengthsCBA);
+    }
+    if (output.beamHypotheses.cumLogProbsCBA)
+    {
+        outputParams->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*output.beamHypotheses.cumLogProbsCBA);
     }
     if (output.beamHypotheses.normedScoresCBA)
     {
@@ -304,23 +370,136 @@ std::shared_ptr<tl::DynamicDecodeOutputParams> prepareOutputs(
     {
         outputParams->beamHypotheses->numBeamsCBA = bufferCast<int>(*output.beamHypotheses.numBeamsCBA);
     }
-    if (output.beamHypotheses.outputIdsCBA)
+    if (output.beamHypotheses.minNormedScoresCBA)
     {
-        outputParams->beamHypotheses->outputIdsCBA = bufferCast<int>(*output.beamHypotheses.outputIdsCBA);
+        outputParams->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*output.beamHypotheses.minNormedScoresCBA);
     }
-    if (output.beamHypotheses.sequenceLengthsCBA)
+    if (output.beamHypotheses.batchDones)
     {
-        outputParams->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*output.beamHypotheses.sequenceLengthsCBA);
-    }
-    if (inputLengths)
-    {
-        outputParams->beamHypotheses->inputLengths = bufferCast<int32_t>(*inputLengths);
+        outputParams->beamHypotheses->batchDones = bufferCast<bool>(*output.beamHypotheses.batchDones);
     }
 
-    // Medusa
-    if (output.medusaOutputs)
+    if (output.cacheIndirection)
     {
-        outputParams->medusaOutputs = prepareMedusaOutputs<T>(output.medusaOutputs.value());
+        outputParams->tgtCacheIndirection = output.cacheIndirection;
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<tl::BaseDecodingOutputs>& baseOutputs,
+    tle::DecodingMode const& decodingMode)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto outputParams = std::dynamic_pointer_cast<tl::SpeculativeDecodingOutputs>(baseOutputs);
+
+    auto const& speculativeDecodingOutputs = output.speculativeDecodingOutputs;
+    TLLM_CHECK_WITH_INFO(speculativeDecodingOutputs.has_value(), "speculativeDecodingOutputs is not set");
+
+    outputParams->nextDraftTokens = speculativeDecodingOutputs->nextDraftTokens;
+    outputParams->numNewTokens = speculativeDecodingOutputs->acceptedTokensLen;
+    outputParams->numNewTokensCumSum = speculativeDecodingOutputs->acceptedLengthsCumSum;
+    outputParams->pathsOffsets = speculativeDecodingOutputs->pathsOffsets;
+    if (speculativeDecodingOutputs->nextDraftTokensLen)
+    {
+        outputParams->nextDraftLengths = speculativeDecodingOutputs->nextDraftTokensLen;
+    }
+    if (speculativeDecodingOutputs->prevDraftTokensLen)
+    {
+        outputParams->prevDraftLengths = speculativeDecodingOutputs->prevDraftTokensLen;
+    }
+
+    if (decodingMode.isExplicitDraftTokens())
+    {
+        auto outputParams = std::dynamic_pointer_cast<tl::ExplicitDraftTokensOutputs>(baseOutputs);
+        auto const& explicitDraftTokensBuffers = output.explicitDraftTokensBuffers;
+        TLLM_CHECK_WITH_INFO(explicitDraftTokensBuffers.has_value(), "explicitDraftTokensBuffers is not set");
+        outputParams->packedMasks = explicitDraftTokensBuffers->packedMasks;
+        outputParams->nextDraftPosIds = explicitDraftTokensBuffers->positionIds;
+
+        outputParams->unpackedNextDraftTokens = explicitDraftTokensBuffers->draftTokens;
+        outputParams->unpackedNextDraftIndices = explicitDraftTokensBuffers->draftIndices;
+        outputParams->nextDraftProbs = explicitDraftTokensBuffers->draftProbs;
+        outputParams->positionIdsBase = explicitDraftTokensBuffers->positionIdsBase;
+        outputParams->randomDataSample = explicitDraftTokensBuffers->randomDataSample;
+        outputParams->randomDataValidation = explicitDraftTokensBuffers->randomDataValidation;
+        outputParams->temperatures = explicitDraftTokensBuffers->temperatures;
+        outputParams->generationLengths = explicitDraftTokensBuffers->generationLengths;
+        outputParams->generationLengthsHost = explicitDraftTokensBuffers->generationLengthsHost;
+        outputParams->maxGenLengthHost = explicitDraftTokensBuffers->maxGenLengthHost;
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(
+    DecodingOutput& output, DecodingOutput::TensorPtr& logProbsTiled, tle::DecodingMode const& decodingMode)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    std::shared_ptr<tl::BaseDecodingOutputs> outputParams;
+
+    if (decodingMode.isBeamSearch())
+    {
+        outputParams = std::make_shared<tl::BeamSearchOutputs>(output.ids);
+    }
+    else if (decodingMode.isMedusa() || decodingMode.isLookahead())
+    {
+        outputParams = std::make_shared<tl::SpeculativeDecodingOutputs>(output.ids);
+    }
+    else if (decodingMode.isExplicitDraftTokens())
+    {
+        outputParams = std::make_shared<tl::ExplicitDraftTokensOutputs>(output.ids);
+    }
+    else
+    {
+        outputParams = std::make_shared<tl::BaseDecodingOutputs>(output.ids);
+    }
+
+    // Common outputs
+    outputParams->newTokens = output.newTokens;
+
+    if (output.cumLogProbs)
+    {
+        outputParams->cumLogProbs = output.cumLogProbs;
+    }
+
+    if (output.parentIds)
+    {
+        outputParams->parentIds = output.parentIds;
+    }
+
+    if (output.finished)
+    {
+        outputParams->finished = output.finished;
+    }
+
+    if (output.finishedSum)
+    {
+        outputParams->finishedSum = output.finishedSum;
+    }
+
+    if (output.lengths)
+    {
+        outputParams->sequenceLength = output.lengths;
+    }
+
+    if (output.logProbs)
+    {
+        outputParams->outputLogProbs = output.logProbs;
+        outputParams->outputLogProbsTiled = logProbsTiled;
+    }
+
+    // Beam search outputs
+    if (decodingMode.isBeamSearch())
+    {
+        prepareBeamSearchOutputs(output, outputParams);
+    }
+
+    // Speculative decoding outputs
+    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens())
+    {
+        prepareSpeculativeDecodingOutputs(output, outputParams, decodingMode);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -330,61 +509,25 @@ std::shared_ptr<tl::DynamicDecodeOutputParams> prepareOutputs(
 } // namespace
 
 template <typename T>
-bool GptDecoder<T>::forward(DecodingOutput& output, DecodingInput const& input)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize);
-    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
-    auto const maxBatchSize = input.maxBatchSize;
-
-    BufferManager::ITensorPtr finishedSum;
-    std::int32_t* finishedSumHost = nullptr;
-    if (input.sequenceLimitLength && output.finished)
-    {
-        if (output.finishedSum)
-        {
-            finishedSumHost = bufferCast<std::int32_t>(*output.finishedSum);
-        }
-        else
-        {
-            finishedSum = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
-            outputParams->finished_sum = tcc::toTllmTensor(*finishedSum);
-            finishedSumHost = bufferCast<std::int32_t>(*finishedSum);
-        }
-        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
-        {
-            finishedSumHost[bi] = 0;
-        }
-    }
-
-    mDynamicDecodeLayer->forward(outputParams, forwardParams);
-
-    if (finishedSumHost)
-    {
-        auto const numToFinish = output.finished->getSize();
-        TLLM_CUDA_CHECK(::cudaStreamSynchronize(mDynamicDecodeLayer->getStream()));
-
-        SizeType finishedSum = 0;
-        for (SizeType bi = 0; bi < maxBatchSize; ++bi)
-        {
-            finishedSum += finishedSumHost[bi];
-        }
-        return numToFinish == static_cast<std::size_t>(finishedSum);
-    }
-    else
-    {
-        return false;
-    }
-}
-
-template <typename T>
 void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize);
-    auto outputParams = prepareOutputs<T>(output, input.lengths, mLogProbsTiled);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode, mManager);
+    auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
 
-    mDynamicDecodeLayer->forward(outputParams, forwardParams);
+    mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& input)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode, mManager);
+    auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
+
+    mDynamicDecodeLayer->forwardSync(outputParams, forwardParams);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -392,7 +535,8 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 template <typename T>
 void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-    DecodingInput const& decodingInput, BufferManager const& manager)
+    DecodingInput const& decodingInput, BufferManager const& manager,
+    std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
@@ -419,23 +563,48 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();
 
+    // Prepare length penalty, use the value from samplingConfig or 1.0f by default
+    SamplingConfig const& samplingConf = samplingConfig ? (*samplingConfig).get() : mSamplingConfig;
+    std::vector<float> lengthPenaltyVec;
+    TensorPtr lengthPenaltyPtr
+        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
+    if (!samplingConf.lengthPenalty.has_value() || samplingConf.lengthPenalty.value().size() == 0)
+    {
+        lengthPenaltyVec = std::vector<float>(batchSize, 1.0f);
+    }
+    else if (long int const size = samplingConf.lengthPenalty.value().size(); size == 1)
+    {
+        lengthPenaltyVec = std::vector<float>(batchSize, samplingConf.lengthPenalty.value()[0]);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(size == batchSize,
+            common::fmtstr("Size of lengthPenalty in SamplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
+                           ")",
+                size, batchSize));
+        lengthPenaltyVec = samplingConf.lengthPenalty.value();
+    }
+
+    lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);
+
     tensorrt_llm::kernels::BeamHypotheses bh;
+    bh.nMaxBatchSize = batchSize;
     bh.nBatchSize = batchSize;
     bh.nBeamWidth = beamWidth;
     bh.nMaxSeqLen = maxSeqLength;
-    bh.lengthPenalties = nullptr; // TODO (bhsueh): A gpu tensor used in invokeInsertUnfinishedPath
-                                  // default value (1.0f) will be used when it is nullptr
-    bh.inputLengths = bufferCast<SizeType>(*decodingInput.lengths);
+    bh.lengthPenalties = bufferCast<float>(*lengthPenaltyPtr);
+    bh.inputLengths = bufferCast<SizeType32>(*decodingInput.lengths);
     bh.outputIds = bufferCast<TokenIdType>(finalOutputIds);
-    bh.logProbs = bufferCast<float>(*mLogProbsTiled);
-    bh.sequenceLengths = bufferCast<SizeType>(*decodingOutput.lengths);
+    bh.logProbs = bufferCastOrNull<float>(decodingOutput.logProbs);
+    bh.logProbsTiled = bufferCast<float>(*mLogProbsTiled);
+    bh.sequenceLengths = bufferCast<SizeType32>(*decodingOutput.lengths);
     bh.cumLogProbs = bufferCast<float>(*decodingOutput.cumLogProbs);
     bh.outputIdsCBA = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsCBA);
     bh.logProbsCBA = bufferCast<float>(*decodingOutput.beamHypotheses.logProbsCBA);
-    bh.sequenceLengthsCBA = bufferCast<SizeType>(*decodingOutput.beamHypotheses.sequenceLengthsCBA);
+    bh.sequenceLengthsCBA = bufferCast<SizeType32>(*decodingOutput.beamHypotheses.sequenceLengthsCBA);
     bh.cumLogProbsCBA = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbsCBA);
     bh.normedScoresCBA = bufferCast<float>(*decodingOutput.beamHypotheses.normedScoresCBA);
-    bh.numBeamsCBA = bufferCast<SizeType>(*decodingOutput.beamHypotheses.numBeamsCBA);
+    bh.numBeamsCBA = bufferCast<SizeType32>(*decodingOutput.beamHypotheses.numBeamsCBA);
     bh.minNormedScoresCBA = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScoresCBA);
     bh.batchDones = bufferCast<bool>(*decodingOutput.beamHypotheses.batchDones);
     bh.finished = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
@@ -472,7 +641,7 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
     auto const targetTokenIdsShape = targetTokenIds.getShape();
     auto const beamWidth = targetTokenIdsShape.d[1];
     auto const maxSeqLength = targetTokenIdsShape.d[2];
-    auto const maxDraftTokens = draftTokenIds.getShape().d[1];
+    auto const maxDraftTokens = draftTokenIds.getDimension<1>();
 
     TLLM_CHECK_WITH_INFO(beamWidth == 1,
         common::fmtstr("Beam width (" FMT_DIM ") > 1 is not supported for the speculative decoding", beamWidth));
@@ -481,30 +650,30 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
         common::fmtstr("Batch size (" FMT_DIM ") is not smaller or equal to max batch size (" FMT_DIM ")", batchSize,
             maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(draftTokenIds.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(draftTokenIds.getDimension<0>() == maxBatchSize,
         common::fmtstr("Draft tokens batch size (" FMT_DIM ") is not equal to target batch size (" FMT_DIM ")",
-            draftTokenIds.getShape().d[0], maxBatchSize));
+            draftTokenIds.getDimension<0>(), maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(contextLengths.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(contextLengths.getDimension<0>() == maxBatchSize,
         common::fmtstr("Context length batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            contextLengths.getShape().d[0], maxBatchSize));
+            contextLengths.getDimension<0>(), maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(numDraftTokens.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(numDraftTokens.getDimension<0>() == maxBatchSize,
         common::fmtstr("Num draft tokens batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            numDraftTokens.getShape().d[0], maxBatchSize));
+            numDraftTokens.getDimension<0>(), maxBatchSize));
 
-    TLLM_CHECK_WITH_INFO(sequenceLengths.getShape().d[0] == maxBatchSize,
+    TLLM_CHECK_WITH_INFO(sequenceLengths.getDimension<0>() == maxBatchSize,
         common::fmtstr("Sequence length batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            sequenceLengths.getShape().d[0], maxBatchSize));
+            sequenceLengths.getDimension<0>(), maxBatchSize));
 
-    tensorrt_llm::kernels::invokeAcceptDraftTokensByIds(bufferCast<SizeType>(draftTokenIds),
-        bufferCast<SizeType>(targetTokenIds), bufferCast<SizeType>(contextLengths),
-        bufferCast<SizeType>(numDraftTokens), bufferCast<SizeType>(sequenceLengths),
+    tksd::invokeAcceptDraftTokensByIds(bufferCast<TokenIdType>(draftTokenIds), bufferCast<TokenIdType>(targetTokenIds),
+        bufferCast<SizeType32>(contextLengths), bufferCast<SizeType32>(numDraftTokens),
+        bufferCast<SizeType32>(sequenceLengths),
         reinterpret_cast<tensorrt_llm::kernels::FinishedState const*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedVec)),
         reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedFinal)),
-        bufferCast<int>(finishedSum), bufferCast<SizeType>(batchSlots), batchSize, maxBatchSize, beamWidth,
+        bufferCast<int>(finishedSum), bufferCast<SizeType32>(batchSlots), batchSize, maxBatchSize, beamWidth,
         maxSeqLength, maxDraftTokens, stream->get());
 
     sync_check_cuda_error();
@@ -514,7 +683,7 @@ void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor 
 
 void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
     ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
-    SizeType vocabSize, SizeType vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
+    SizeType32 vocabSize, SizeType32 vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
     curandState_t* curandState, BufferManager::CudaStreamPtr const& stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -533,22 +702,22 @@ void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const&
 
     if (draftLogits.getDataType() == nvinfer1::DataType::kFLOAT)
     {
-        tensorrt_llm::kernels::acceptDraftTokensByLogits(bufferCast<float>(draftLogits),
+        tksd::acceptDraftTokensByLogits(bufferCast<float>(draftLogits),
             const_cast<float**>(reinterpret_cast<float const* const*>(bufferCast<int64_t>(targetLogits))),
-            bufferCast<float>(draftProbs), bufferCast<float>(targetProbs), bufferCast<SizeType>(numDraftTokens),
+            bufferCast<float>(draftProbs), bufferCast<float>(targetProbs), bufferCast<SizeType32>(numDraftTokens),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
                 bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finished)),
-            curandState, bufferCast<SizeType>(batchSlots), batchSize, maxBatchSize, beamWidth, vocabSize,
+            curandState, bufferCast<SizeType32>(batchSlots), batchSize, maxBatchSize, beamWidth, vocabSize,
             vocabSizePadded, maxTokensPerStep, useRandomAcceptThreshold, randomAcceptThreshold, stream->get());
     }
     else if (draftLogits.getDataType() == nvinfer1::DataType::kHALF)
     {
-        tensorrt_llm::kernels::acceptDraftTokensByLogits(bufferCast<half>(draftLogits),
+        tksd::acceptDraftTokensByLogits(bufferCast<half>(draftLogits),
             const_cast<half**>(reinterpret_cast<half const* const*>(bufferCast<int64_t>(targetLogits))),
-            bufferCast<half>(draftProbs), bufferCast<half>(targetProbs), bufferCast<SizeType>(numDraftTokens),
+            bufferCast<half>(draftProbs), bufferCast<half>(targetProbs), bufferCast<SizeType32>(numDraftTokens),
             reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
                 bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finished)),
-            curandState, bufferCast<SizeType>(batchSlots), batchSize, maxBatchSize, beamWidth, vocabSize,
+            curandState, bufferCast<SizeType32>(batchSlots), batchSize, maxBatchSize, beamWidth, vocabSize,
             vocabSizePadded, maxTokensPerStep, useRandomAcceptThreshold, randomAcceptThreshold, stream->get());
     }
     else

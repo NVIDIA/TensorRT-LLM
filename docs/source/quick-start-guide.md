@@ -23,7 +23,7 @@ git clone https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
 (quick-start-guide-compile)=
 ## Compile the Model into a TensorRT Engine
 
-Use the included [Llama model definition](https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/models/llama/model.html#LLaMAModel). This is a minimal example that includes some of the optimizations available in TensorRT-LLM.
+Use the included [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama). This is a minimal example that includes some of the optimizations available in TensorRT-LLM.
 
 ```bash
 # Launch the Tensorrt-LLM container
@@ -138,3 +138,7 @@ In this Quick Start Guide, you:
 For more examples, refer to:
 
 - [examples/](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for showcases of how to run a quick benchmark on latest LLMs.
+
+## Links
+ - [Best Practices Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md)
+ - [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)

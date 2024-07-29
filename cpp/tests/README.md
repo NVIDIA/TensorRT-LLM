@@ -31,7 +31,7 @@ From the top-level directory call:
 ```bash
 CPP_BUILD_DIR=cpp/build
 python3 scripts/build_wheel.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR} --trt_root /usr/local/tensorrt
-pip install -r requirements-dev.txt --extra-index-url https://pypi.ngc.nvidia.com
+pip install -r requirements-dev.txt
 pip install build/tensorrt_llm*.whl
 cd $CPP_BUILD_DIR && make -j$(nproc) google-tests
 ```
@@ -58,6 +58,7 @@ PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/build_g
 PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
 PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm_engines.py
 PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
+PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py --has_tllm_checkpoint
 ```
 
 It is possible to build engines with tensor and pipeline parallelism for LLaMA using 4 GPUs.
@@ -76,6 +77,7 @@ PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_exp
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_medusa_output.py
+PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_redrafter_output.py
 ```
 
 #### Generate data with tensor and pipeline parallelism

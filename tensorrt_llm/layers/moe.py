@@ -12,21 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import IntEnum
-from typing import List, Union
+from typing import List, Optional, Type, Union
 
 import numpy as np
 import tensorrt as trt
 
-from tensorrt_llm._utils import str_dtype_to_trt
+from tensorrt_llm._utils import get_init_params, str_dtype_to_trt
+from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
-from ..functional import (_create_tensor, allreduce, cast, div,
-                          is_gated_activation, non_gated_version, softmax, sum,
-                          topk)
+from .._utils import int32_array
+from ..functional import (AllReduceFusionParams, _add_plugin_info,
+                          _create_tensor, allreduce, cast, concat, constant,
+                          div, expand, gather_nd, is_gated_activation,
+                          non_gated_version, nonzero, repeat_interleave,
+                          scatter_nd, shape, softmax, split, sum, topk)
 from ..layers import MLP, GatedMLP
-from ..module import Module
+from ..mapping import Mapping
+from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from ..quantization import QuantMode
@@ -47,11 +52,6 @@ activation_str_to_int_map = {
 
 @dataclass
 class MoeConfig:
-    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h
-    class ParallelismMode(IntEnum):
-        NONE = 0
-        EXPERT_PARALLEL = 1
-        TENSOR_PARALLEL = 2
 
     class ExpertScaleNormalizationMode(IntEnum):
         NONE = 0
@@ -59,8 +59,8 @@ class MoeConfig:
 
     num_experts: int = 0
     top_k: int = 0
-    tp_mode: ParallelismMode = ParallelismMode.TENSOR_PARALLEL
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
+    tp_mode: int = 0
 
     def validate(self) -> "MoeConfig":
         if (self.num_experts == 0) != (self.top_k == 0):
@@ -72,13 +72,20 @@ class MoeConfig:
     def has_moe(self) -> bool:
         return self.num_experts > 1
 
+    @classmethod
+    def from_dict(cls, config: dict):
+        return cls(**config)
+
+    def to_dict(self):
+        return asdict(self)
+
 
 def _moe_plugin(moe_config,
                 hidden_states,
                 routing,
                 finished,
-                expert_weight_1,
-                expert_weight_2,
+                expert_weights_1,
+                expert_weights_2,
                 expert_bias_1,
                 expert_bias_2,
                 expert_scale_1,
@@ -93,7 +100,9 @@ def _moe_plugin(moe_config,
                 output_dtype,
                 quant_mode=QuantMode(0),
                 tp_size=1,
-                tp_rank=0):
+                ep_size=1,
+                tp_rank=0,
+                ep_rank=0):
     if isinstance(dtype, str):
         dtype = str_dtype_to_trt(dtype)
 
@@ -108,8 +117,8 @@ def _moe_plugin(moe_config,
             return x.value
         return x
 
-    expert_weight_1 = from_parameter(expert_weight_1)
-    expert_weight_2 = from_parameter(expert_weight_2)
+    expert_weights_1 = from_parameter(expert_weights_1)
+    expert_weights_2 = from_parameter(expert_weights_2)
     expert_bias_1 = from_parameter(expert_bias_1)
     expert_bias_2 = from_parameter(expert_bias_2)
     expert_scale_1 = from_parameter(expert_scale_1)
@@ -119,7 +128,7 @@ def _moe_plugin(moe_config,
 
     # Create the plugin with our required state
     num_experts = moe_config.num_experts
-    # We pass the full number of experts (not divided by tp_size) even for EP mode
+    # We pass the full number of experts (not divided by ep_size) even for EP mode
     p_num_experts = trt.PluginField("number_of_experts",
                                     np.array(num_experts, dtype=np.int32),
                                     trt.PluginFieldType.INT32)
@@ -159,9 +168,10 @@ def _moe_plugin(moe_config,
                                 trt.PluginFieldType.INT32)
     p_tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
-    p_parallelism_mode = trt.PluginField(
-        "parallelism_mode", np.array(moe_config.tp_mode, dtype=np.int32),
-        trt.PluginFieldType.INT32)
+    p_ep_size = trt.PluginField("ep_size", np.array(ep_size, dtype=np.int32),
+                                trt.PluginFieldType.INT32)
+    p_ep_rank = trt.PluginField("ep_rank", np.array(ep_rank, dtype=np.int32),
+                                trt.PluginFieldType.INT32)
     p_normalization_mode = trt.PluginField(
         "normalization_mode",
         np.array(moe_config.normalization_mode, dtype=np.int32),
@@ -171,7 +181,7 @@ def _moe_plugin(moe_config,
         p_num_experts, p_top_k, p_expert_hidden_size, p_expert_inter_size,
         p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
         p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
-        p_parallelism_mode, p_normalization_mode
+        p_ep_size, p_ep_rank, p_normalization_mode
     ])
 
     # Create the plugin with our constant inputs to the constructor
@@ -181,7 +191,7 @@ def _moe_plugin(moe_config,
     moe_plugin = plugin_creator.create_plugin("mixture_of_experts", pfc)
 
     # Instantiate the plugin with our specific inputs
-    plugin_inputs = [hidden_states, routing, expert_weight_1, expert_weight_2]
+    plugin_inputs = [hidden_states, routing, expert_weights_1, expert_weights_2]
 
     if expert_bias_1:
         assert expert_bias_2
@@ -208,6 +218,7 @@ def _moe_plugin(moe_config,
 
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
+    _add_plugin_info(layer, plugin_creator, "mixture_of_experts", pfc)
     if not default_net().strongly_typed:
         for ii in range(layer.num_inputs):
             if layer.get_input(ii).dtype == str_dtype_to_trt("int8"):
@@ -266,11 +277,11 @@ class MixtureOfExperts(Module):
                  hidden_size: int,
                  ffn_hidden_size: int,
                  hidden_act: str,
+                 mapping: Mapping = Mapping(),
                  bias: bool = True,
                  dtype=None,
                  tp_group: List[int] = None,
                  tp_size: int = 1,
-                 tp_rank: int = 0,
                  quant_mode=QuantMode(0)):
         super().__init__()
 
@@ -281,31 +292,31 @@ class MixtureOfExperts(Module):
         self.hidden_act = hidden_act
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
+        self.expert_inter_size = ffn_hidden_size
         self.dtype = dtype
         self.weight_dtype = dtype
         self.tp_group = tp_group
         self.tp_size = tp_size
-        self.tp_rank = tp_rank
+        self.mapping = mapping
         self.quant_mode = quant_mode
-        self.has_bias = bias
+        self.bias = bias
 
         self.experts_per_node = self.num_experts
-        self.tp_mode = moe_config.tp_mode
-        if moe_config.tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
-            if self.num_experts % self.tp_size != 0:
+        if self.mapping.has_moe_ep():
+            if self.num_experts % self.mapping.moe_ep_size != 0:
                 raise ValueError(
-                    f"MixtureOfExperts - Number of experts {self.num_experts} is not a multiple of EP size {self.tp_size}"
+                    f"MixtureOfExperts - Number of experts {self.num_experts} is not a multiple of EP size {self.mapping.moe_ep_size}"
                 )
-            self.experts_per_node = self.experts_per_node // tp_size
+            self.experts_per_node = self.experts_per_node // self.mapping.moe_ep_size
 
-        elif moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-            if self.ffn_hidden_size % self.tp_size != 0:
+        if self.mapping.has_moe_tp():
+            if self.ffn_hidden_size % self.mapping.moe_tp_size != 0:
                 raise ValueError(
-                    f"MixtureOfExperts - FFN Hidden Size {self.ffn_hidden_size} is not a multiple of TP size {self.tp_size}"
+                    f"MixtureOfExperts - FFN Hidden Size {self.ffn_hidden_size} is not a multiple of TP size {self.mapping.moe_tp_size}"
                 )
-            self.ffn_hidden_size = self.ffn_hidden_size // tp_size
+            self.expert_inter_size = self.ffn_hidden_size // self.mapping.moe_tp_size
 
-        if quant_mode.has_fp8_qdq() and self.has_bias:
+        if quant_mode.has_fp8_qdq() and self.bias:
             # TODO (dastokes) We will need to revisit this if we have a use case for it
             raise ValueError(
                 f"MixtureOfExperts - Bias is not supported with FP8")
@@ -330,172 +341,353 @@ class MixtureOfExperts(Module):
             tp_size=1,
             strict_dtype=True)
 
+        self.init_experts()
+
+    def init_experts(self):
         # Note we use horizontal fusion for gated activation to do the operation in one GEMM invocation
         #  The left matrix is a linear projection (no activation applied)
         #  The right matrix is the gating value (activation applied)
         # The naming convention is the inverse of GatedMLP, but the same as `tensorrt_llm/functional.py`
-        expert_1_out_size = self.ffn_hidden_size * 2 if is_gated_activation(
-            hidden_act) else self.ffn_hidden_size
+        fc_out_size = self.expert_inter_size * 2 if is_gated_activation(
+            self.hidden_act) else self.expert_inter_size
 
-        self.fc = MOEWeightWrapper(hidden_size, expert_1_out_size,
+        self.fc = MOEWeightWrapper(self.hidden_size, fc_out_size,
                                    self.experts_per_node, self.quant_mode,
-                                   self.dtype, self.weight_dtype, self.has_bias)
-        self.proj = MOEWeightWrapper(self.ffn_hidden_size, hidden_size,
+                                   self.dtype, self.weight_dtype, self.bias)
+        self.proj = MOEWeightWrapper(self.expert_inter_size, self.hidden_size,
                                      self.experts_per_node, self.quant_mode,
-                                     self.dtype, self.weight_dtype,
-                                     self.has_bias)
+                                     self.dtype, self.weight_dtype, self.bias)
 
-        ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
-
-        # In OOTB mode, when ParallelismMode mode is TENSOR_PARALLEL, using MLP class to do TP settings
-        # pass self.ffn_hidden_size to original size,
-        # self.experts only inference in OOTB mode.
-        if moe_config.tp_mode == MoeConfig.ParallelismMode.TENSOR_PARALLEL:
-            ffn_hidden_size = self.ffn_hidden_size * self.tp_size
-        else:
-            tp_size = 1
-            tp_group = None
-            ffn_hidden_size = self.ffn_hidden_size
-        self.experts = [
-            ClsMLP(self.hidden_size, ffn_hidden_size,
-                   non_gated_version(self.hidden_act), bias, dtype, tp_group,
-                   tp_size, quant_mode) for _ in range(self.experts_per_node)
-        ]
-
-    def set_ootb_weight(self):
-        for i, expert in enumerate(self.experts):
-            is_gated_act = is_gated_activation(self.hidden_act)
-            # Gated weight pack in expert1 weights
-            # expert_weight_1
-            experts_weight_1_raw = self.fc.weight.raw_value
-            expert.fc.weight.value = experts_weight_1_raw[
-                i, -self.ffn_hidden_size:, :]
-            if is_gated_act:
-                expert.gate.weight.value = experts_weight_1_raw[
-                    i, :self.ffn_hidden_size, :]
-
-            # expert_weight_2
-            experts_weight_2_raw = self.proj.weight.raw_value
-            expert.proj.weight.value = experts_weight_2_raw[i, :, :]
-
-            has_bias = self.has_bias
-            if has_bias:
-                experts_bias_1_raw = self.fc.bias.raw_value
-                expert.fc.bias.value = experts_bias_1_raw[
-                    i, -self.ffn_hidden_size:]
-                experts_bias_2_raw = self.proj.bias.raw_value
-                expert.proj.bias.value = experts_bias_2_raw[i, :]
-                if is_gated_act:
-                    expert.gate.bias.value = experts_bias_1_raw[
-                        i, :self.ffn_hidden_size]
-
-    def forward(self, hidden_states, finished=None, lora_layer_params=None):
-        assert lora_layer_params is None, "LoRA + MoE is not supported for the moment"
+    def forward(self,
+                hidden_states,
+                finished=None,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+        moe_router_lora_params = None
+        if lora_layer_params is not None:
+            moe_router_lora_params = lora_layer_params.get_runtime_params(
+                0, "moe_router")
         routing_input = cast(hidden_states, trt.float32)
-        routing = self.router(routing_input)
+        routing = self.router(routing_input, moe_router_lora_params)
+        return self.forward_experts(hidden_states, routing, finished,
+                                    lora_layer_params, reduce_fusion_params)
 
-        if not default_net().plugin_config.moe_plugin:
-            # Depending on the value of plugin_config.moe_plugin, weights must be assigned differently. Hence the need to do that in .forward().
-            self.set_ootb_weight()
+    def forward_experts(self, hidden_states, routing, finished,
+                        lora_layer_params,
+                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+        if lora_layer_params is not None:
+            for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
+                if lora_layer_params.get_runtime_params(0, module) is not None:
+                    raise RuntimeError(
+                        f"MoE plugin does not support {module} LoRA module, please disable MoE plugin"
+                    )
+        if self.quant_mode.has_fp8_qdq():
+            assert self.fc.weight.value.dtype == trt.fp8, (
+                "mlp fc weight dtype should be fp8 in the fp8 quantization mode."
+            )
+            assert self.proj.weight.value.dtype == trt.fp8, (
+                "mlp proj weight dtype should be fp8 in the fp8 quantization mode."
+            )
+            hidden_states_quant = hidden_states
+            if hidden_states_quant.dtype != trt.fp8:
+                hidden_states_quant = quantize(
+                    hidden_states, self.fc.activation_scaling_factor.value,
+                    'fp8')
 
-            if self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
-                topk_values, topk_indices = topk(routing, self.top_k, dim=-1)
-                topk_values = softmax(topk_values, -1)
-            else:
-                router_probs = softmax(routing, -1)
-                topk_values, topk_indices = topk(router_probs,
-                                                 self.top_k,
-                                                 dim=-1)
+            dtype_quant = trt.fp8
+            weight_dtype_quant = trt.fp8
 
-            output = hidden_states * 0.0  # Create output space
-            # Experts inference
-            for i, expert in enumerate(self.experts):
-                if self.tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
-                    index = i + self.experts_per_node * self.tp_rank
-                else:
-                    index = i
-                # inference expert
-                out = expert(hidden_states)
+            fc1_dequant = self.fc.weights_scaling_factor.value * self.fc.activation_scaling_factor.value
+            fc2_quant = div(1.0, self.proj.activation_scaling_factor.value)
+            fc2_dequant = self.proj.weights_scaling_factor.value * self.proj.activation_scaling_factor.value
 
-                expert_mask = topk_indices == index
-                expert_weights = cast(
-                    sum(topk_values * cast(expert_mask, topk_values.dtype),
-                        dim=-1,
-                        keepdim=True), self.dtype)
+            scale_1 = fc1_dequant
+            scale_2 = fc2_quant
+            scale_3 = fc2_dequant
+            scale_4 = None
 
-                output += out * expert_weights
-            if self.tp_size > 1 and self.tp_group is not None and self.moe_config.tp_mode == MoeConfig.ParallelismMode.EXPERT_PARALLEL:
-                output = allreduce(output, self.tp_group)
+            output_dtype_quant = self.dtype
+
+            if output_dtype_quant == trt.fp8 and scale_4 is None:
+                raise RuntimeError(
+                    "Cannot output FP8 value without knowing quantization parameter"
+                )
 
         else:
-            if self.quant_mode.has_fp8_qdq():
-                assert self.fc.weight.value.dtype == trt.fp8, (
-                    "mlp fc weight dtype should be fp8 in the fp8 quantization mode."
-                )
-                assert self.proj.weight.value.dtype == trt.fp8, (
-                    "mlp proj weight dtype should be fp8 in the fp8 quantization mode."
-                )
-                hidden_states_quant = hidden_states
-                if hidden_states_quant.dtype != trt.fp8:
-                    hidden_states_quant = quantize(
-                        hidden_states, self.fc.activation_scaling_factor.value,
-                        'fp8')
+            hidden_states_quant = hidden_states
+            dtype_quant = self.dtype
+            weight_dtype_quant = self.weight_dtype
+            output_dtype_quant = self.dtype
 
-                dtype_quant = trt.fp8
-                weight_dtype_quant = trt.fp8
+            scale_1 = self.fc.per_channel_scale
+            scale_2 = self.proj.per_channel_scale
+            scale_3 = None
+            scale_4 = None
+        output = _moe_plugin(self.moe_config,
+                             hidden_states_quant,
+                             routing,
+                             expert_weights_1=self.fc.weight.value,
+                             expert_weights_2=self.proj.weight.value,
+                             expert_bias_1=self.fc.bias,
+                             expert_bias_2=self.proj.bias,
+                             expert_scale_1=scale_1,
+                             expert_scale_2=scale_2,
+                             expert_scale_3=scale_3,
+                             expert_scale_4=scale_4,
+                             finished=finished,
+                             hidden_size=self.hidden_size,
+                             ffn_hidden_size=self.expert_inter_size,
+                             act_fn=self.hidden_act,
+                             dtype=dtype_quant,
+                             weight_dtype=weight_dtype_quant,
+                             output_dtype=output_dtype_quant,
+                             quant_mode=self.quant_mode,
+                             tp_size=self.mapping.moe_tp_size,
+                             tp_rank=self.mapping.moe_tp_rank,
+                             ep_size=self.mapping.moe_ep_size,
+                             ep_rank=self.mapping.moe_ep_rank)
 
-                fc1_dequant = self.fc.weights_scaling_factor.value * self.fc.activation_scaling_factor.value
-                fc2_quant = div(1.0, self.proj.activation_scaling_factor.value)
-                fc2_dequant = self.proj.weights_scaling_factor.value * self.proj.activation_scaling_factor.value
-
-                scale_1 = fc1_dequant
-                scale_2 = fc2_quant
-                scale_3 = fc2_dequant
-                scale_4 = None
-
-                output_dtype_quant = self.dtype
-
-                if output_dtype_quant == trt.fp8 and scale_4 is None:
-                    raise RuntimeError(
-                        "Cannot output FP8 value without knowing quantization parameter"
-                    )
-
-            else:
-                hidden_states_quant = hidden_states
-                dtype_quant = self.dtype
-                weight_dtype_quant = self.weight_dtype
-                output_dtype_quant = self.dtype
-
-                scale_1 = self.fc.per_channel_scale
-                scale_2 = self.proj.per_channel_scale
-                scale_3 = None
-                scale_4 = None
-            output = _moe_plugin(self.moe_config,
-                                 hidden_states_quant,
-                                 routing,
-                                 expert_weight_1=self.fc.weight.value,
-                                 expert_weight_2=self.proj.weight.value,
-                                 expert_bias_1=self.fc.bias,
-                                 expert_bias_2=self.proj.bias,
-                                 expert_scale_1=scale_1,
-                                 expert_scale_2=scale_2,
-                                 expert_scale_3=scale_3,
-                                 expert_scale_4=scale_4,
-                                 finished=finished,
-                                 hidden_size=self.hidden_size,
-                                 ffn_hidden_size=self.ffn_hidden_size,
-                                 act_fn=self.hidden_act,
-                                 dtype=dtype_quant,
-                                 weight_dtype=weight_dtype_quant,
-                                 output_dtype=output_dtype_quant,
-                                 quant_mode=self.quant_mode,
-                                 tp_size=self.tp_size,
-                                 tp_rank=self.tp_rank)
-
-            if self.tp_size > 1 and self.tp_group is not None and self.moe_config.tp_mode != MoeConfig.ParallelismMode.NONE:
-                output = allreduce(output, self.tp_group)
+        if self.tp_size > 1 and self.tp_group is not None:
+            output = allreduce(output,
+                               self.tp_group,
+                               reduce_fusion_params=reduce_fusion_params)
 
         return output
 
+    def load_weights(self, moe: "MixtureOfExperts"):
+        '''
+        Load weights from base MOE layer
+        '''
+        raise NotImplementedError("Subclass shall override this")
+
+    def to(self,
+           moe_cls: Type["MixtureOfExperts"],
+           quant_config=None) -> "MixtureOfExperts":
+        from ..quantization.quantize import quantize
+        if isinstance(self, moe_cls):
+            return self
+
+        new_moe = moe_cls(**get_init_params(self))
+        # If config is not None, set quantization from config
+        if quant_config is not None:
+            quantize(new_moe, quant_config)
+
+        new_moe.load_weights(self)
+        new_moe.router = self.router
+        return new_moe
+
 
 MOE = MixtureOfExperts
+
+
+class MoeOOTB(MOE):
+
+    def init_experts(self):
+        if self.quant_mode.is_weight_only():
+            raise ValueError(
+                f"OOTB MOE does not support weight only quantization now, current quant mode: {self.quant_mode}"
+            )
+        ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
+
+        tp_size = 1
+        tp_group = None
+        self.experts = ModuleList([
+            ClsMLP(self.hidden_size, self.expert_inter_size,
+                   non_gated_version(self.hidden_act), self.bias, self.dtype,
+                   tp_group, tp_size, self.quant_mode)
+            for _ in range(self.experts_per_node)
+        ])
+
+    def moe_to_expert_lora_params(self, lora_layer_params, expert_idx):
+
+        def get_params(module):
+            ranks = lora_layer_params.get_runtime_params(0,
+                                                         module).lora_ranks[0]
+            weights_pointers = lora_layer_params.get_runtime_params(
+                0, module).lora_weights_pointers[0]
+            return ranks, weights_pointers
+
+        if lora_layer_params is None:
+            return None
+        fc_lora_ranks, fc_lora_weights_pointers = get_params("moe_h_to_4h")
+        proj_lora_ranks, proj_lora_weights_pointers = get_params("moe_4h_to_h")
+        gate_lora_ranks = None
+        gate_lora_weights_pointers = None
+        if is_gated_activation(self.hidden_act):
+            gate_lora_ranks, gate_lora_weights_pointers = get_params("moe_gate")
+        return LoraParams(
+            lora_ranks=[{
+                "mlp_h_to_4h_lora_ranks": fc_lora_ranks,
+                "mlp_4h_to_h_lora_ranks": proj_lora_ranks,
+                "mlp_gate_lora_ranks": gate_lora_ranks,
+            }],
+            lora_weights_pointers=[{
+                "mlp_h_to_4h_lora_weights_pointers":
+                fc_lora_weights_pointers,
+                "mlp_4h_to_h_lora_weights_pointers":
+                proj_lora_weights_pointers,
+                "mlp_gate_lora_weights_pointers":
+                gate_lora_weights_pointers,
+            }],
+            host_context_lengths=lora_layer_params.host_context_lengths,
+            max_num_tokens=lora_layer_params.max_num_tokens,
+            max_encoder_context_length=lora_layer_params.
+            max_encoder_context_length,
+            host_request_types=lora_layer_params.host_request_types,
+            host_encoder_input_lengths=lora_layer_params.
+            host_encoder_input_lengths,
+            weight_index=expert_idx,
+        )
+
+    def forward_experts(self, hidden_states, routing, finished,
+                        lora_layer_params,
+                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+
+        if self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
+            topk_values, topk_indices = topk(routing, self.top_k, dim=-1)
+            topk_values = softmax(topk_values, -1)
+        else:
+            router_probs = softmax(routing, -1)
+            topk_values, topk_indices = topk(router_probs, self.top_k, dim=-1)
+
+        hidden_size = shape(hidden_states, -1)
+        # [B*sq, hidden]
+        inputs_merged = hidden_states.view(concat([-1, hidden_size]))
+        flat_topk_indices = topk_indices.view(
+            concat([-1, shape(topk_indices, -1)]))
+        flat_topk_values = topk_values.view(concat([-1,
+                                                    shape(topk_values, -1)]))
+
+        # Create output space
+        zero_buffer = inputs_merged * 0.0
+        output = zero_buffer
+
+        expert_indices_stack = []
+        indices_stack = []
+        # When topk indices are equal to expert index, the expert will inference the tokens.
+        # Bundle all indices and experts index, then do mask once.
+        for i, expert in enumerate(self.experts):
+            if self.mapping.has_moe_ep():
+                index = i + self.experts_per_node * self.mapping.moe_ep_rank
+            else:
+                index = i
+            expert_indices_stack.append(
+                flat_topk_indices.view(concat([1, shape(flat_topk_indices)])))
+
+            indices_stack.append(constant(int32_array(index)))
+
+        all_expert_indices = concat(expert_indices_stack, dim=0)
+        indices = expand(
+            concat(indices_stack).view(concat([len(self.experts), 1, 1])),
+            shape(all_expert_indices))
+
+        # Create all experts mask
+        all_expert_mask = all_expert_indices == indices
+
+        experts_weights = cast(
+            sum(flat_topk_values *
+                cast(all_expert_mask, flat_topk_values.dtype),
+                dim=-1,
+                keepdim=True), self.dtype)
+
+        all_expert_mask = cast(
+            sum(cast(all_expert_mask, flat_topk_values.dtype),
+                dim=-1,
+                keepdim=True), 'bool')
+        all_expert_mask = repeat_interleave(all_expert_mask, shape(output, -1),
+                                            2)
+
+        # split the mask and weights for each expert
+        experts_mask = split(all_expert_mask, 1, dim=0)
+        expert_weights = split(experts_weights, 1, dim=0)
+
+        for i, expert in enumerate(self.experts):
+            if self.mapping.has_moe_ep():
+                index = i + self.experts_per_node * self.mapping.moe_ep_rank
+            else:
+                index = i
+            # get mask token index
+            non_zero_index = nonzero(experts_mask[i].view(
+                concat([-1, hidden_size])))
+            non_zero_index = non_zero_index.transpose(1, 0)
+            input_for_expert = gather_nd(inputs_merged, non_zero_index, 0)
+            input_for_expert = input_for_expert.view(concat([-1, hidden_size]),
+                                                     zero_is_placeholder=False)
+
+            # Expert inference
+            expert_output = expert(
+                input_for_expert,
+                lora_layer_params=self.moe_to_expert_lora_params(
+                    lora_layer_params, index))
+
+            # scatter expert output to real position
+            expert_finialized_output = zero_buffer
+            expert_finialized_output = scatter_nd(
+                expert_finialized_output, non_zero_index,
+                expert_output.view([-1])) * expert_weights[i]
+
+            output += expert_finialized_output
+
+        output = output.view(shape(hidden_states))
+
+        if self.tp_size > 1 and self.tp_group is not None:
+            output = allreduce(output,
+                               self.mapping.tp_group,
+                               reduce_fusion_params=reduce_fusion_params)
+
+        return output
+
+    def load_weights(self, moe: MOE):
+        for i, expert in enumerate(self.experts):
+            is_gated_act = is_gated_activation(self.hidden_act)
+            # Gated weight pack in expert1 weights
+            # expert_weights_1
+            experts_weight_1_raw = moe.fc.weight.raw_value
+            fc1_weight_scale = None
+            fc1_activation_scale = None
+            fc2_weight_scale = None
+            fc2_activation_scale = None
+
+            if self.quant_mode.has_fp8_qdq():
+                fc1_weight_scale = moe.fc.weights_scaling_factor.raw_value
+                fc1_activation_scale = moe.fc.activation_scaling_factor.raw_value
+                fc2_weight_scale = moe.proj.weights_scaling_factor.raw_value
+                fc2_activation_scale = moe.proj.activation_scaling_factor.raw_value
+
+            if self.quant_mode.is_weight_only():
+                expert.fc.weight.value = experts_weight_1_raw[
+                    i, :, -self.expert_inter_size:]
+                if is_gated_act:
+                    expert.gate.weight.value = experts_weight_1_raw[
+                        i, :, :self.expert_inter_size]
+            else:
+                expert.fc.weight.value = experts_weight_1_raw[
+                    i, -self.expert_inter_size:, :]
+                if is_gated_act:
+                    expert.gate.weight.value = experts_weight_1_raw[
+                        i, :self.expert_inter_size, :]
+
+            if self.quant_mode.has_fp8_qdq():
+                expert.fc.activation_scaling_factor.value = fc1_activation_scale
+                expert.fc.weights_scaling_factor.value = fc1_weight_scale[i]
+                expert.proj.activation_scaling_factor.value = fc2_activation_scale
+                expert.proj.weights_scaling_factor.value = fc2_weight_scale[i]
+                if is_gated_act:
+                    expert.gate.activation_scaling_factor.value = fc1_activation_scale
+                    expert.gate.weights_scaling_factor.value = fc1_weight_scale[
+                        i]
+
+            # expert_weights_2
+            experts_weight_2_raw = moe.proj.weight.raw_value
+            expert.proj.weight.value = experts_weight_2_raw[i, :, :]
+
+            has_bias = self.bias
+            if has_bias:
+                experts_bias_1_raw = moe.fc.bias.raw_value
+                expert.fc.bias.value = experts_bias_1_raw[
+                    i, -self.expert_inter_size:]
+                experts_bias_2_raw = moe.proj.bias.raw_value
+                expert.proj.bias.value = experts_bias_2_raw[i, :]
+                if is_gated_act:
+                    expert.gate.bias.value = experts_bias_1_raw[
+                        i, :self.expert_inter_size]

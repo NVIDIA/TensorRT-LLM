@@ -50,7 +50,7 @@ def parse_arguments():
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
-    parser.add_argument('--modelopt_quant_ckpt_path',
+    parser.add_argument('--quant_ckpt_path',
                         type=str,
                         default=None,
                         help='Path of a quantized model checkpoint')
@@ -285,7 +285,8 @@ def load_from_gptq_gptneox(quant_ckpt_path,
         GPTQ_FLAG = 1
 
         qweight_interleaved = preprocessor(packer(qweight_unpacked_int8),
-                                           torch.quint4x2).view(torch.float16)
+                                           torch.quint4x2,
+                                           torch.float16).view(torch.float16)
 
         # zeros = zeros * scales
         zeros_x_scales_fp16 = (-qzeros_unpacked_int8 + 8 * UINT4_TO_INT4_FLAG -
@@ -707,8 +708,7 @@ if __name__ == '__main__':
             'has_zero_point':
             True,
             'group_size':
-            get_gptq_gptneox_group_size(args.modelopt_quant_ckpt_path,
-                                        hf_config)
+            get_gptq_gptneox_group_size(args.quant_ckpt_path, hf_config)
         })
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
@@ -722,7 +722,7 @@ if __name__ == '__main__':
 
         if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
             weights = load_from_gptq_gptneox(
-                args.modelopt_quant_ckpt_path,
+                args.quant_ckpt_path,
                 hf_config,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,

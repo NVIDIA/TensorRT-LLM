@@ -35,7 +35,8 @@ class Parameter:
     def __init__(self,
                  value: Optional[Union[np.ndarray, torch.Tensor]] = None,
                  shape: Sequence[int] = None,
-                 dtype: Union[str, trt.DataType] = None):
+                 dtype: Union[str, trt.DataType] = None,
+                 is_buffer: bool = False):
         if dtype is None:
             logger.warning(
                 f'Parameter dtype is None, using default dtype: {self._DEFAULT_DTYPE}, it is recommended to always specify dtype explicitly'
@@ -45,12 +46,23 @@ class Parameter:
             dtype = str_dtype_to_trt(dtype)
         self._dtype: trt.DataType = dtype
         if value is None:
-            assert isinstance(shape, (list, tuple))
+            assert isinstance(shape, (
+                list,
+                tuple)), f"shape must be list or tuple, receive {(type(shape))}"
             self._shape = tuple(shape)
             self._value = None
         else:
             self._shape = value.shape
             self._value = self._regularize_value(value)
+        self.is_buffer = is_buffer
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def dtype(self):
+        return self._dtype
 
     @property
     def value(self) -> Tensor:
@@ -58,9 +70,8 @@ class Parameter:
                 and self._value.flags['C_CONTIGUOUS']):
             self._value = constant(self._value)
         elif self._value is None or isinstance(self._value, np.ndarray):
-            shape = self._shape
-            dtype = trt_dtype_to_np(self._dtype)
-            ndarray = np.empty(shape, dtype)
+            dtype = trt_dtype_to_np(self.dtype)
+            ndarray = np.empty(self.shape, dtype)
             value = self._value
             self._value = constant(ndarray)
             default_net()._register_unfilled_weights(self._value.producer.name,
@@ -85,14 +96,14 @@ class Parameter:
                                   device='cuda')
             # value ~ U[int(-128 * v_range), int(128 * v_range)]
         elif dtype == trt.DataType.FP8:
-            value = torch.randn((shape), device='cuda') * 2 - 1
-            # value ~ N[-v_range, v_range]
+            value = torch.rand((shape), device='cuda') * 2 - 1
+            # value ~ U[-v_range, v_range]
             value = value * v_range
             value = value.to(trt_dtype_to_torch(dtype))
         else:
-            value = torch.randn(
+            value = torch.rand(
                 (shape), dtype=trt_dtype_to_torch(dtype), device='cuda') * 2 - 1
-            # value ~ N[-v_range, v_range]
+            # value ~ U[-v_range, v_range]
             value = value * v_range
 
         stream = torch.cuda.Stream()
@@ -105,9 +116,8 @@ class Parameter:
     @property
     def raw_value(self) -> np.ndarray:
         if self._value is None:
-            shape = self._shape
-            dtype = trt_dtype_to_np(self._dtype)
-            self._value = np.empty(shape, dtype)
+            dtype = trt_dtype_to_np(self.dtype)
+            self._value = np.empty(self.shape, dtype)
             Parameter.xavier_init(self._value)
         assert isinstance(
             self._value, np.ndarray
@@ -117,15 +127,27 @@ class Parameter:
     @value.setter
     def value(self, v: Union[np.ndarray, torch.Tensor]):
         v = self._regularize_value(v)
-        assert v.shape == self._shape, \
+
+        if v.shape != self.shape and v.ndim == 0 and max(self.shape) == 1:
+            # convert the scalar into a tensor which each dim is 1.
+            v = v.reshape(self.shape)
+
+        assert v.shape == self.shape, \
             f'The value updated is not the same shape as the original. ' \
-            f'Updated: {v.shape}, original: {self._shape}'
+            f'Updated: {v.shape}, original: {self.shape}'
         dtype = np_dtype_to_trt(v.dtype)
-        if self._dtype != dtype:
+        if self.dtype != dtype:
             logger.warning(
-                f"Parameter was initialized as {self._dtype} but set to {dtype}"
-            )
+                f"Parameter was initialized as {self.dtype} but set to {dtype}")
         self._value = v
+
+    def set_value_or_dummy(self, v: Union[np.ndarray, torch.Tensor]):
+        v = self._regularize_value(v)
+        if v.shape != self._shape:
+            self.value = np.empty(self._shape, trt_dtype_to_np(self._dtype))
+            return
+
+        self.value = v
 
     def _get_weights(self) -> trt.Weights:
         if isinstance(self._value, Tensor):

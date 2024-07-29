@@ -29,9 +29,10 @@ from transformers import LlamaConfig, LlamaForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_str
-from tensorrt_llm.models.llama.weight import (load_from_hf_llama,
-                                              load_from_meta_llama)
-from tensorrt_llm.models.modeling_utils import PretrainedConfig, optimize_model
+from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.models.llama.convert import (load_weights_from_hf_model,
+                                               load_weights_from_meta_ckpt)
+from tensorrt_llm.models.modeling_utils import optimize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
@@ -48,7 +49,7 @@ class TestLLaMA(unittest.TestCase):
     def _gen_tensorrt_llm_network(self, network, hf_llama,
                                   llama_config: LlamaConfig, batch_size,
                                   beam_width, input_len, output_len, dtype,
-                                  rank, tensor_parallel):
+                                  rank, tensor_parallel, **opt_flags):
         list(range(tensor_parallel))
 
         with net_guard(network):
@@ -73,39 +74,31 @@ class TestLLaMA(unittest.TestCase):
                 'mapping': {
                     'world_size': tensor_parallel,
                     'tp_size': tensor_parallel,
+                    'rank': rank,
                 },
-                "moe_config": {
+                "moe": {
                     "num_experts": 0,
-                    "top_k": 0,
-                    "tp_mode": 2,
                     "normalization_mode": 1
                 },
                 'use_parallel_embedding': False,
                 'embedding_sharding_dim': 0,
-                'moe_num_experts': 0,
-                'moe_top_k': 0,
-                'moe_tp_mode': 2,
-                'moe_normalization_mode': 1,
-                'use_fused_mlp': False,
             }
 
             # Initialize model
-            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
-                PretrainedConfig.from_dict(config))
-            weights = load_from_hf_llama(tensorrt_llm_llama,
-                                         hf_llama,
-                                         dtype=dtype,
-                                         mapping=tensorrt_llm.Mapping(
-                                             world_size=tensor_parallel,
-                                             rank=rank,
-                                             tp_size=tensor_parallel))
+            config = tensorrt_llm.models.LLaMAConfig.from_dict(config)
+            weights = load_weights_from_hf_model(hf_llama, config)
+
+            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             tensorrt_llm_llama.load(weights)
+            optimize_model(tensorrt_llm_llama, **opt_flags)
+
             # Prepare
             network.set_named_parameters(tensorrt_llm_llama.named_parameters())
             inputs = tensorrt_llm_llama.prepare_inputs(
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=beam_width)
             # Forward
@@ -128,7 +121,8 @@ class TestLLaMA(unittest.TestCase):
                                  use_refit,
                                  fast_building=False,
                                  context_fmha_flag=ContextFMHAType.disabled,
-                                 enable_remove_input_padding=False):
+                                 enable_remove_input_padding=False,
+                                 **opt_flags):
 
         builder = Builder()
 
@@ -139,21 +133,22 @@ class TestLLaMA(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=(dtype in ["float16", "bfloat16"]),
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if fast_building:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, hf_llama, llama_config,
                                            batch_size, beam_width, input_len,
-                                           output_len, dtype, rank, world_size)
+                                           output_len, dtype, rank, world_size,
+                                           **opt_flags)
 
             engine_buffer = builder.build_engine(network, builder_config)
             return engine_buffer
@@ -174,14 +169,15 @@ class TestLLaMA(unittest.TestCase):
                                   use_refit,
                                   fast_building=False,
                                   context_fmha_flag=ContextFMHAType.disabled,
-                                  enable_remove_input_padding=False):
+                                  enable_remove_input_padding=False,
+                                  **opt_flags):
         tensorrt_llm.logger.set_level(log_level)
         mapping = tensorrt_llm.Mapping(world_size, rank, tp_size=world_size)
         engine_buffer = self._gen_tensorrt_llm_engine(
             dtype, rank, world_size, llama_config, hf_llama, model_name,
             use_plugin, batch_size, beam_width, input_len, output_len,
             use_refit, fast_building, context_fmha_flag,
-            enable_remove_input_padding)
+            enable_remove_input_padding, **opt_flags)
         runtime = tensorrt_llm.runtime.generation._Runtime(
             engine_buffer, mapping)
         return runtime, engine_buffer
@@ -191,24 +187,41 @@ class TestLLaMA(unittest.TestCase):
             product([False], [False, True], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], [False, True], ['float16'], [0]))
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'bfloat16', 0))
-        test_cases.append(
-            (False, True, ContextFMHAType.enabled, False, 'float16', 1))  # MQA
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'float32', 0))
+            ], [False, True], ['float16'], [0], ['silu'],
+                    [{
+                        "use_fused_mlp": True
+                    }, {
+                        "use_fused_mlp": False
+                    }]))
         test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'bfloat16', 2))  # GQA
+                           'bfloat16', 0, 'silu', dict()))
         test_cases.append(
-            (False, True, ContextFMHAType.enabled, False, 'float16', 2))  # GQA
+            (False, True, ContextFMHAType.enabled, False, 'float16', 1, 'silu',
+             dict()))  # MQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float32', 0, 'silu',
+             dict()))
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'bfloat16', 2, 'silu', dict()))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.enabled, False, 'float16', 2, 'silu',
+             dict()))  # GQA
         test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
-                           False, 'float16', 4))  # GQA
+                           False, 'float16', 4, 'silu', dict()))  # GQA
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'float16', 2, 'gelu', {
+                               "use_fused_mlp": True
+                           }))  # GQA
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'float16', 2, 'silu', {
+                               "use_fused_mlp": True
+                           }))  # GQA
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_llama(self, use_refit, fast_building, context_fmha_flag,
-                   enable_remove_input_padding, dtype, num_kv_heads):
+                   enable_remove_input_padding, dtype, num_kv_heads, hidden_act,
+                   opt_flags):
 
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
@@ -227,7 +240,7 @@ class TestLLaMA(unittest.TestCase):
         head_size = 32
         rank = 0
         llama_config = LlamaConfig()
-        llama_config.hidden_act = 'silu'
+        llama_config.hidden_act = hidden_act
         llama_config.num_hidden_layers = 2
         llama_config.max_position_embeddings = 64
         llama_config.vocab_size = 128
@@ -250,7 +263,7 @@ class TestLLaMA(unittest.TestCase):
             log_level, dtype, world_size, rank, llama_config, hf_llama, model,
             use_plugin, batch_size, beam_width, input_len, output_len,
             use_refit, fast_building, context_fmha_flag,
-            enable_remove_input_padding)
+            enable_remove_input_padding, **opt_flags)
         key_value_cache_buffers = []
         head_size = llama_config.hidden_size // llama_config.num_attention_heads
         for i in range(llama_config.num_hidden_layers):
@@ -312,6 +325,11 @@ class TestLLaMA(unittest.TestCase):
                        device='cuda')
         ]  # ping-pong buffers
 
+        perf_knob_tensor_size = 16
+        # runtime_perf_knobs is not used in context phase
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -319,6 +337,7 @@ class TestLLaMA(unittest.TestCase):
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
             'host_request_types': ctx_host_request_types,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -378,6 +397,8 @@ class TestLLaMA(unittest.TestCase):
             gen_last_token_ids = torch.ones_like(
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
 
         step1_buffer = {
             'input_ids': step1_id,
@@ -386,6 +407,7 @@ class TestLLaMA(unittest.TestCase):
             'last_token_ids': gen_last_token_ids,
             'host_request_types': gen_host_request_types,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()
@@ -487,7 +509,6 @@ class TestLLaMA(unittest.TestCase):
 
         tp_size = tp_info[0]
         rank = tp_info[1]
-        dtype = "float16"
         use_parallel_embedding = (emb_sharding_dim >= 0)
         embedding_sharding_dim = abs(emb_sharding_dim)
         hf_llama = LlamaForCausalLM.from_pretrained(
@@ -519,48 +540,28 @@ class TestLLaMA(unittest.TestCase):
             'mapping': {
                 'world_size': tp_size,
                 'tp_size': tp_size,
+                'rank': rank,
             },
-            "moe_config": {
+            "moe": {
                 "num_experts": 0,
                 "top_k": 0,
-                "tp_mode": 2,
-                "normalization_mode": 1
+                "normalization_mode": 1,
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'moe_num_experts': 0,
-            'moe_top_k': 0,
-            'moe_tp_mode': 1,
-            'moe_normalization_mode': 1,
             'use_fused_mlp': False,
         }
-        cfg = PretrainedConfig.from_dict(config)
-        tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(cfg)
-        tensorrt_llm_llama_wHF = optimize_model(
-            tensorrt_llm_llama_wHF,
-            use_parallel_embedding=use_parallel_embedding)
+
+        config = PretrainedConfig.from_dict(config)
+        tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(config)
         # print_layers(tensorrt_llm_llama_wHF)
-        weights_wHF = load_from_hf_llama(tensorrt_llm_llama_wHF,
-                                         hf_llama,
-                                         mapping=tensorrt_llm.Mapping(
-                                             world_size=tp_size,
-                                             rank=rank,
-                                             tp_size=tp_size),
-                                         dtype=dtype)
+        weights_wHF = load_weights_from_hf_model(hf_llama, config)
         tensorrt_llm_llama_wHF.load(weights_wHF)
         # print_layers(tensorrt_llm_llama_wHF)
 
-        tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(cfg)
-        tensorrt_llm_llama_wMETA = optimize_model(
-            tensorrt_llm_llama_wMETA,
-            use_parallel_embedding=use_parallel_embedding)
+        tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(config)
         # print_layers(tensorrt_llm_llama_wMETA)
-        weights_wMETA = load_from_meta_llama(meta_path,
-                                             mapping=tensorrt_llm.Mapping(
-                                                 world_size=tp_size,
-                                                 rank=rank,
-                                                 tp_size=tp_size),
-                                             config=cfg)
+        weights_wMETA = load_weights_from_meta_ckpt(meta_path, config)
         tensorrt_llm_llama_wMETA.load(weights_wMETA)
         # print_layers(tensorrt_llm_llama_wMETA)
         # token embedding

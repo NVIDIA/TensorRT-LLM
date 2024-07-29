@@ -69,7 +69,7 @@ def fuse_qkv_one_layer(params, attn_module_name, trtllm_layer_name, tp_size,
 
 
 def get_qkv_module_name(model_type):
-    if model_type == "t5":
+    if model_type in ["t5", "blip2"]:
         q = "q"
         k = "k"
         v = "v"

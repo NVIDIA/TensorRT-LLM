@@ -15,7 +15,7 @@
 
 from typing import Optional
 
-from .lora_manager import LoraBuildConfig
+from .lora_manager import LoraConfig
 from .mapping import Mapping
 from .plugin.plugin import PluginConfig
 
@@ -56,7 +56,7 @@ class TopModelMixin:
         '''
         raise NotImplementedError("Subclass shall override this")
 
-    def use_lora(self, lora_config: LoraBuildConfig):
+    def use_lora(self, lora_config: LoraConfig):
         '''
         Load lora weights from the give config to the module
         Parameters:
@@ -68,15 +68,10 @@ class TopModelMixin:
                           prompt_table_path: str):
         '''Enable p tuning when build the TRT engine, call this before to_trt
         '''
-        # TODO: this is build time API, so pack the p-tuning table data together as engine,
-        #  otherwise, if the build and runtime path has different p tuning table path, it will fail.
-        self.prompt_table_path = prompt_table_path
-        # TODO: change the embedding layer member after this.
-        self.max_prompt_embedding_table_size = max_prompt_embedding_table_size
-        raise NotImplementedError  # Fill more details later
+        raise NotImplementedError
 
-    def default_plugin_config(self, **kwargs) -> 'PluginConfig':
+    def default_plugin_config(self, **kwargs) -> PluginConfig:
         '''Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.
            If users need to set different plugin configs, they can start from the return object and change it.
         '''
-        return PluginConfig(**kwargs)
+        return PluginConfig.from_dict(kwargs)

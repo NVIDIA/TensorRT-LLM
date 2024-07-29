@@ -22,7 +22,7 @@ python -m pip install --upgrade pip
 python -m pip install nvidia-cudnn-cu11==8.9.4.25 --no-cache-dir
 python -m pip install --pre --extra-index-url https://pypi.nvidia.com/ tensorrt==9.2.0.post12.dev5 --no-cache-dir
 python -m pip uninstall -y nvidia-cudnn-cu11
-python -m pip install tensorrt_llm  --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://download.pytorch.org/whl/cu121
+python -m pip install tensorrt_llm  --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://download.pytorch.org/whl/cu121
 ```
 
 

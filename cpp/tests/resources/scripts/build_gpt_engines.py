@@ -21,7 +21,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
 def convert_ckpt(model_dir: str,
@@ -42,14 +47,21 @@ def build_engine(
     engine_dir: str,
     *args,
     max_input_len: int = 256,
-    max_output_len: int = 128,
+    max_seq_len: int = 384,
 ):
+
+    if os.path.exists(engine_dir):
+        assert False
     build_cmd = [
-        "trtllm-build", '--log_level=error',
-        f'--checkpoint_dir={checkpoint_dir}', f'--output_dir={engine_dir}',
-        '--max_batch_size=64', f'--max_input_len={max_input_len}',
-        f'--max_output_len={max_output_len}', '--max_beam_width=2',
-        '--builder_opt=0'
+        "trtllm-build",
+        '--log_level=error',
+        f'--checkpoint_dir={checkpoint_dir}',
+        f'--output_dir={engine_dir}',
+        '--max_batch_size=64',
+        f'--max_input_len={max_input_len}',
+        f'--max_seq_len={max_seq_len}',
+        '--max_beam_width=2',
+        '--builder_opt=0',
     ]
     legacy_args = [
         "--gpt_attention_plugin=disable",
@@ -135,11 +147,14 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
                  world_size=tp_size,
                  dtype='float32')
 
+    input_file = 'input_tokens.npy'
     print("\nBuilding fp32 engines")
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FLOAT)
     build_engine(str(fp32_ckpt_dir),
-                 str(engine_dir / 'fp32-default' / tp_pp_dir))
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir))
+    model_spec_obj.use_gpt_plugin()
     build_engine(str(fp32_ckpt_dir),
-                 str(engine_dir / 'fp32-plugin' / tp_pp_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
                  '--gpt_attention_plugin=float32', '--context_fmha=enable',
                  '--context_fmha_fp32_acc=enable')
 
@@ -151,13 +166,16 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
                  dtype='float16')
 
     print("\nBuilding fp16 engines")
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
     build_engine(str(fp16_ckpt_dir),
-                 str(engine_dir / 'fp16-default' / tp_pp_dir))
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir))
+    model_spec_obj.use_gpt_plugin()
     build_engine(str(fp16_ckpt_dir),
-                 str(engine_dir / 'fp16-plugin' / tp_pp_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
                  '--gpt_attention_plugin=float16')
+    model_spec_obj.use_packed_input()
     build_engine(str(fp16_ckpt_dir),
-                 str(engine_dir / 'fp16-plugin-packed' / tp_pp_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
                  '--gpt_attention_plugin=float16',
                  '--remove_input_padding=enable')
 
@@ -171,26 +189,57 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
         '--max_num_tokens=10000',
         '--use_paged_context_fmha=enable',
     ]
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
+
     build_engine(str(fp16_ckpt_dir),
-                 str(engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir),
+                 str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
                  *ifb_args)
+
+    model_spec_current = model_spec_obj.__copy__()
+    max_draft_tokens = 5
+    model_spec_current.use_draft_tokens_external_decoding()
+    model_spec_current.set_draft_tokens(max_draft_tokens)
+
     build_engine(
         str(fp16_ckpt_dir),
-        str(engine_dir / 'fp16-plugin-packed-paged-draft-tokens' / tp_pp_dir),
-        '--max_draft_len=5',
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        f'--max_draft_len={max_draft_tokens}',
         '--speculative_decoding_mode=draft_tokens_external', *ifb_args)
+
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.use_multiple_profiles()
+
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        '--multiple_profiles=enable', *ifb_args)
+
+    model_spec_current = model_spec_obj.__copy__()
+    max_input_len = 128
+    model_spec_current.set_max_input_length(max_input_len)
+
     build_engine(str(fp16_ckpt_dir),
-                 str(engine_dir / 'fp16-plugin-packed-paged-in128' / tp_pp_dir),
+                 str(engine_dir / model_spec_current.get_model_path() /
+                     tp_pp_dir),
                  *ifb_args,
-                 max_input_len=128)
+                 max_input_len=max_input_len)
 
     # Build the target model with return accepted token logits
     # Build with '--max_draft_len', '--speculative_decoding_mode' and '--gather_generation_logits'
+    model_spec_current = model_spec_obj.__copy__()
+    max_draft_len = 5
+    model_spec_current.use_draft_tokens_external_decoding()
+    model_spec_current.set_draft_tokens(max_draft_len)
+    model_spec_current.gather_logits()
+    model_spec_current.return_accepted_tokens_logits()
+
     build_engine(
         str(fp16_ckpt_dir),
-        str(engine_dir /
-            'fp16-plugin-packed-paged-return-accepted-tokens-logits' /
-            tp_pp_dir), '--max_draft_len=5',
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        f'--max_draft_len={max_draft_len}',
         '--speculative_decoding_mode=draft_tokens_external',
         '--gather_generation_logits', *ifb_args)
 
@@ -198,36 +247,57 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
     # which uses context FMHA for draft tokens prediction.
     # Currently the gather_all_token_logits is not supported with target model of speculative decoding
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.gather_logits()
+
     build_engine(
         str(fp16_ckpt_dir),
-        str(engine_dir / 'fp16-plugin-packed-paged-gather' / tp_pp_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
         '--gather_all_token_logits', *ifb_args)
-    # '--use_context_fmha_for_generation', *ifb_args) # Commented out because of `--use_context_fmha_for_generation` has bugs now: https://nvbugspro.nvidia.com/bug/4476681
+
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.use_look_ahead_decoding()
+    max_draft_len = 64
+    model_spec_current.set_draft_tokens(max_draft_len)
     build_engine(
         str(fp16_ckpt_dir),
-        str(engine_dir / 'fp16-plugin-packed-paged-context-fmha-for-gen' /
-            tp_pp_dir), '--use_context_fmha_for_generation=enable',
-        '--max_draft_len=5',
-        '--speculative_decoding_mode=draft_tokens_external', *ifb_args)
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        f'--max_draft_len={max_draft_len}',
+        '--speculative_decoding_mode=lookahead_decoding', *ifb_args)
 
     # build engine with lora enabled
-    build_engine(str(fp16_ckpt_dir),
-                 str(engine_dir / "fp16-plugin-packed-paged-lora" / tp_pp_dir),
-                 "--lora_target_modules=attn_qkv", '--lora_plugin=float16',
-                 *ifb_args)
+    model_spec_current = model_spec_obj.__copy__()
+    model_spec_current.use_lora_plugin()
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        "--lora_target_modules=attn_qkv", '--lora_plugin=float16', *ifb_args)
 
+    if model_cache:
+        llm_datasets_root = Path(model_cache) / "datasets"
+        calib_dataset = llm_datasets_root / "cimec/lambada/"
+    else:
+        calib_dataset = "lambada"
     print("\nConverting to fp16 SQ")
     fp16_sq_ckpt_dir = ckpt_dir / 'fp16-sq' / tp_dir
     convert_ckpt(str(hf_dir),
                  str(fp16_sq_ckpt_dir),
                  "--smoothquant=0.5",
+                 f"--calib_dataset={calib_dataset}",
                  world_size=tp_size,
                  dtype='float16')
 
     print("\nBuilding fp16 SQ engines")
-    build_engine(str(fp16_sq_ckpt_dir),
-                 str(engine_dir / 'fp16-plugin-packed-paged-sq' / tp_pp_dir),
-                 *ifb_args)
+    model_spec_current = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_current.use_gpt_plugin()
+    model_spec_current.use_packed_input()
+    model_spec_current.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_current.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
+
+    build_engine(
+        str(fp16_sq_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
+        *ifb_args)
 
     if has_safetensor:
         Path(str(safetensor_file) + ".bak").rename(safetensor_file)

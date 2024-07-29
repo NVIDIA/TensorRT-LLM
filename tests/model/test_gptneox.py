@@ -68,7 +68,7 @@ class TestGPTNeoX(unittest.TestCase):
 
     def _gen_tensorrt_llm_network(self, network, builder, hf_gpt, gpt_config,
                                   batch_size, beam_width, input_len, output_len,
-                                  fp16, gpt_attention_plugin, rank,
+                                  dtype, gpt_attention_plugin, rank,
                                   tensor_parallel,
                                   apply_query_key_layer_scaling):
         num_layers = gpt_config.num_hidden_layers
@@ -80,7 +80,6 @@ class TestGPTNeoX(unittest.TestCase):
 
         list(range(tensor_parallel))
 
-        dtype = 'float16' if fp16 else 'float32'
         config = {
             'architecture': 'GPTNeoXForCausalLM',
             'dtype': dtype,
@@ -117,6 +116,7 @@ class TestGPTNeoX(unittest.TestCase):
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
+                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=beam_width)
             # Prepare
@@ -147,7 +147,6 @@ class TestGPTNeoX(unittest.TestCase):
 
         runtime = None
         builder = Builder()
-        fp16 = (dtype == 'float16')
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             builder_config = builder.create_builder_config(
@@ -156,21 +155,21 @@ class TestGPTNeoX(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=fp16,
+                strongly_typed=True,
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
             if use_attention_plugin:
-                network.plugin_config.set_gpt_attention_plugin(dtype)
+                network.plugin_config.gpt_attention_plugin = dtype
             if use_ln_gemm_plugin:
-                network.plugin_config.set_gemm_plugin(dtype)
+                network.plugin_config.gemm_plugin = dtype
             if enable_remove_input_padding:
-                network.plugin_config.enable_remove_input_padding()
+                network.plugin_config.remove_input_padding = True
             network.plugin_config.set_context_fmha(context_fmha_flag)
 
             self._gen_tensorrt_llm_network(network, builder, hf_gpt, gpt_config,
                                            batch_size, beam_width, input_len,
-                                           output_len, fp16,
+                                           output_len, dtype,
                                            use_attention_plugin, rank,
                                            world_size,
                                            apply_query_key_layer_scaling)
@@ -284,6 +283,11 @@ class TestGPTNeoX(unittest.TestCase):
                        dtype=torch.int32,
                        device='cuda')
         ]  # ping-pong buffers
+
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -291,6 +295,7 @@ class TestGPTNeoX(unittest.TestCase):
             'position_ids': ctx_position_ids,
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -385,6 +390,9 @@ class TestGPTNeoX(unittest.TestCase):
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+
         step1_buffer = {
             'input_ids': step1_id,
             'context_lengths': gen_context_lengths,
@@ -392,6 +400,7 @@ class TestGPTNeoX(unittest.TestCase):
             'position_ids': gen_position_ids,
             'last_token_ids': gen_last_token_ids,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

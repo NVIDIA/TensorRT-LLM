@@ -59,9 +59,19 @@ namespace tensorrt_llm::plugins
 //     8.2 host_pool_pointers [2] if paged kv cache (optional)
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
-//     11. alibi_slopes [num_heads] (optional for ALiBi position embedding)
-//     12. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
-//     13. qkv_bias (optional) [local_hidden_size * 3]
+//     11. attention_output_quantization_scale [1] (on device, optional)
+//     12. rotary_inv_freq [head_size / 2] or [head_size] (longrope type) (float) (on device, optional)
+//     13. rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
+//     14. alibi_slopes [num_heads] (optional for ALiBi position embedding)
+//     15. relative_attention_bias [num_heads] (optional for ALiBi position embedding)
+//     16. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
+//     17. qkv_bias (optional) [local_hidden_size * 3]
+//     18. spec_decoding_generation_lengths (optional, required when medusa is enabled) (int32_t) [batch_size]
+//     19. spec_decoding_packed_mask (optional, required when medusa is enabled) (int32_t) [num_tokens, packed_mask_dim]
+//                                    packed_mask_dim = divUp(max_num_spec_decoding_tokens + 1, 32)
+//     20. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
+//     max_num_spec_decoding_tokens + 1]
+//     20. host_runtime_perf_knobs (int64)
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
@@ -72,19 +82,22 @@ class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
     GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int head_size, int unidirectional, float q_scaling,
+        int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-        float rotary_embedding_scale, float rotary_embedding_m_scale, int rotary_embedding_max_positions, int tp_size,
+        float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
+        int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
-        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
-        bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
-        bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
-        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
-        bool use_cache = true, bool is_spec_decoding_enabled = false);
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
+        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
+        nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
+        int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
+        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
+        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
+        int spec_decoding_max_generation_length = 1);
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -101,11 +114,11 @@ public:
     int enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
-    template <typename T, typename KVCacheBuffer>
+    template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    template <typename T>
+    template <typename T, typename AttentionOutT = T>
     int enqueueDispatchKVCacheType(nvinfer1::PluginTensorDesc const* inputDesc,
         nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
         cudaStream_t stream);
@@ -142,7 +155,7 @@ public:
     };
 
 private:
-    template <typename T, typename KVCacheBuffer>
+    template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
         nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
@@ -169,8 +182,8 @@ private:
         KV_CACHE_QUANTIZATION_SCALE,
         KV_CACHE_DEQUANTIZATION_SCALE,
         ATTENTION_OUTPUT_QUANTIZATION_SCALE,
+        ROTARY_INV_FREQ,
         ROTARY_COS_SIN,
-        ROTARY_EMBEDDING_SCALING_FACTORS,
         ALIBI_SLOPES,
         RELATIVE_ATTENTION_BIAS,
         CROSS_QKV,
@@ -178,8 +191,10 @@ private:
         ENCODER_INPUT_LENGTH,
         HOST_CONTEXT_LENGTH,
         QKV_BIAS_TENSOR,
+        SPEC_DECODING_GENERATION_LENGTHS,
         SPEC_DECODING_PACKED_MASK,
         SPEC_DECODING_POSITION_OFFSETS,
+        HOST_RUNTIME_PERF_KNOBS,
         ENUM_SIZE,
     };
 

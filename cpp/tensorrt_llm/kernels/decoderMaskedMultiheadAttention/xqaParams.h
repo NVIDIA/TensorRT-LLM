@@ -36,6 +36,7 @@ struct XQAParams
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;
     int32_t const* host_context_lengths = nullptr;
+    int32_t* semaphores = nullptr;
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
@@ -44,11 +45,15 @@ struct XQAParams
     int32_t sink_token_length = 0;
     int timestep = 0;
     void const* qkv_bias;
-    int32_t const* sequence_lengths;           //
-    int32_t const* context_lengths;            // maybe not used now
-    void const* alibi_slopes;                  // maybe not used now
+    int32_t const* sequence_lengths;                  //
+    int32_t const* context_lengths;                   // maybe not used now
+    void const* alibi_slopes;                         // maybe not used now
+    float const* rotary_embedding_inv_freq_cache;     // precomputed rotary inv freq
     int32_t const* spec_decoding_packed_mask;
-    int const* spec_decoding_position_offsets; // rotary embedding.
+    int const* spec_decoding_position_offsets;        // for position embedding.
+    int const* spec_decoding_generation_lengths;      // variable input lengths.
+    bool spec_decoding_is_generation_length_variable; // whether the generation lengths actually vary
+    int32_t spec_decoding_max_generation_length;      // max possible input length
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
@@ -64,6 +69,8 @@ struct XQAParams
     tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type;
     float rotary_embedding_scale;
     int rotary_embedding_max_positions;
+    int rotary_vision_start;
+    int rotary_vision_length;
     tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type;
     bool position_shift_enabled = false;
     bool remove_padding = false;
@@ -80,6 +87,10 @@ struct XQAParams
     int max_distance = 0;
     bool multi_block_mode;
     bool multi_query_tokens = false;
+
+    int32_t total_num_input_tokens;       // total number of input tokens. may differ from batch_size due to medusa.
+    float const* fp8_out_scale = nullptr; // fp8 output scale in case we need post-processing to convert output to fp8.
+                                          // nullptr means no conversion.
 };
 
 } // namespace kernels

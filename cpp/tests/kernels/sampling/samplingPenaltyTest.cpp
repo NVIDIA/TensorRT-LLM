@@ -177,7 +177,7 @@ protected:
         trk::invokeFill(*mOutLogitsDevice, T{0.0f}, *mStream);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
@@ -188,14 +188,14 @@ protected:
         mBufferManager->copy(*mLogitsHost, *mLogitsDevice);
 
         auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
-        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {
             logitsPtrs[bi]
                 = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mMaxTokensPerStep * mVocabSizePadded;
         }
 
         auto tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
-        for (SizeType bi = 0; bi < mMaxBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mMaxBatchSize; ++bi)
         {
             tokensPerStepPtr[bi] = (std::rand() % mMaxTokensPerStep) + 1;
         }
@@ -259,7 +259,7 @@ public:
         InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
             bufferCast<T>(*mOutLogitsDevice), bufferCast<T>(*mBiasDevice),
             bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, bufferCast<float>(*mTemperaturesDevice), nullptr,
-            nullptr, nullptr, false, mBatchSize, 1, 1, mVocabSize, mVocabSizePadded, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, mBatchSize, 1, 1, mVocabSize, mVocabSizePadded, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep,
             bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
         tk::invokeBatchApplyPenalty(penaltyParams);
@@ -546,7 +546,7 @@ protected:
         mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
@@ -566,7 +566,7 @@ protected:
         auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
         auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
         auto tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
-        for (SizeType bi = 0; bi < mMaxBatchSize; bi++)
+        for (SizeType32 bi = 0; bi < mMaxBatchSize; bi++)
         {
             idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mSequenceLength;
             tokensPerStepPtr[bi] = (std::rand() % mMaxTokensPerStep) + 1;
@@ -579,7 +579,7 @@ protected:
         mBufferManager->copy(*mIdsPtrHost, *mIdsPtrDevice);
 
         auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
-        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {
             logitsPtrs[bi]
                 = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mMaxTokensPerStep * mVocabSizePadded;
@@ -661,8 +661,8 @@ public:
         InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
             bufferCast<T>(*mOutLogitsDevice), nullptr, bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
             bufferCast<float>(*mRepetitionPenaltiesDevice), bufferCast<float>(*mPresencePenaltiesDevice),
-            bufferCast<float>(*mFrequencyPenaltiesDevice), true, mBatchSize, 1, mSequenceLength, mVocabSize,
-            mVocabSizePadded, reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
+            bufferCast<float>(*mFrequencyPenaltiesDevice), mBatchSize, 1, mSequenceLength, mVocabSize, mVocabSizePadded,
+            reinterpret_cast<int32_t const**>(bufferCast<int64_t>(*mIdsPtrDevice)), nullptr,
             bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice), nullptr, nullptr,
             bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep, bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
         tk::invokeBatchApplyPenalty(penaltyParams);
@@ -1170,7 +1170,7 @@ protected:
         mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
         }
@@ -1188,7 +1188,7 @@ protected:
         auto contextLengthHostPtr = bufferCast<int32_t>(*mContextLengthHost);
         auto minLengthHostPtr = bufferCast<int32_t>(*mMinLengthHost);
         auto tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
-        for (SizeType bi = 0; bi < mMaxBatchSize; bi++)
+        for (SizeType32 bi = 0; bi < mMaxBatchSize; bi++)
         {
             // Current generated seq len is randomly either smaller than min length or larger
             auto const generatedSeqLen = std::max(0,
@@ -1205,7 +1205,7 @@ protected:
         mBufferManager->copy(*mEndIdsHost, *mEndIdsDevice);
 
         auto logitsPtrs = BufferRange<T*>(*mLogitsPtrs);
-        for (SizeType bi = 0; bi < mBatchSize; ++bi)
+        for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {
             logitsPtrs[bi]
                 = bufferCast<T>(*mLogitsDevice) + (mBatchSize - bi - 1) * mMaxTokensPerStep * mVocabSizePadded;
@@ -1256,8 +1256,8 @@ public:
 
         InvokeBatchApplyPenaltyParams<T> penaltyParams{reinterpret_cast<T**>(bufferCast<int64_t>(*mLogitsPtrs)),
             bufferCast<T>(*mOutLogitsDevice), nullptr, bufferCast<int32_t>(*mPenaltyWorkspaceDevice), nullptr, nullptr,
-            nullptr, nullptr, nullptr, false, mBatchSize, 1, mSequenceLength, mVocabSize, mVocabSizePadded, nullptr,
-            nullptr, bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
+            nullptr, nullptr, nullptr, mBatchSize, 1, mSequenceLength, mVocabSize, mVocabSizePadded, nullptr, nullptr,
+            bufferCast<int32_t>(*mContextLengthDevice), bufferCast<int32_t>(*mSeqLengthDevice),
             bufferCast<int32_t>(*mMinLengthDevice), bufferCast<int32_t>(*mEndIdsDevice),
             bufferCast<int32_t>(*mBatchSlots), mMaxTokensPerStep, bufferCast<int32_t>(*mTokensPerStep), mStream->get()};
         tk::invokeBatchApplyPenalty(penaltyParams);

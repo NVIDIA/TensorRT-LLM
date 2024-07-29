@@ -21,7 +21,12 @@ import platform as _pf
 import sys as _sys
 import typing as _tp
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
 def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
@@ -42,7 +47,7 @@ def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
                                          '--gemm_plugin=disable',
                                          '--max_batch_size=8',
                                          '--max_input_len=924',
-                                         '--max_output_len=100',
+                                         '--max_seq_len=1024',
                                          '--max_beam_width=1',
                                      ] + list(args)
     run_command(build_args)
@@ -51,30 +56,30 @@ def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
 def build_engines(model_cache: _tp.Optional[str] = None):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    model_name = 'mamba-2.8b'
+    model_name = 'mamba-2.8b-hf'
 
-    # Clone or update the model directory without lfs
-    hf_dir = models_dir / model_name
-    if hf_dir.exists():
-        assert hf_dir.is_dir()
-        run_command(["git", "pull"], cwd=hf_dir)
-    else:
+    if model_cache:
+        print("Copy model from model_cache")
+        model_cache_dir = _pl.Path(model_cache) / 'mamba' / model_name
         if _pf.system() == "Windows":
-            url_prefix = ""
+            wincopy(source=str(model_cache_dir),
+                    dest=model_name,
+                    isdir=True,
+                    cwd=models_dir)
         else:
-            url_prefix = "file://"
-        model_url = url_prefix + str(
-            _pl.Path(model_cache) / model_name
-        ) if model_cache else "https://huggingface.co/state-spaces/mamba-2.8b"
-        run_command([
-            "git", "clone", model_url, "--single-branch", "--no-local",
-            model_name
-        ],
-                    cwd=hf_dir.parent,
-                    env={
-                        **_os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
-                    })
-
+            run_command(
+                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
+    else:
+        print("Clone model from HF")
+        hf_dir = _pl.Path(models_dir) / model_name
+        run_command(
+            [
+                "git", "clone",
+                "https://huggingface.co/state-spaces/mamba-2.8b-hf", model_name
+            ],
+            cwd=models_dir,
+        )
+    hf_dir = models_dir / model_name
     assert (hf_dir.is_dir())
 
     # Clone or update the tokenizer directory without lfs
@@ -100,50 +105,36 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                         **_os.environ, "GIT_LFS_SKIP_SMUDGE": "1"
                     })
 
-    # Download the model file
-    model_file_name = "pytorch_model.bin"
-    if model_cache:
-        if _pf.system() == "Windows":
-            wincopy(source=str(
-                _pl.Path(model_cache) / model_name / model_file_name),
-                    dest=model_file_name,
-                    isdir=False,
-                    cwd=hf_dir)
-        else:
-            run_command([
-                "rsync", "-av",
-                str(_pl.Path(model_cache) / model_name / model_file_name), "."
-            ],
-                        cwd=hf_dir)
-    else:
-        run_command(["git", "lfs", "pull", "--include", model_file_name],
-                    cwd=hf_dir)
-
-    assert ((hf_dir / model_file_name).is_file())
-
     tp_size = 1
     pp_size = 1
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
 
     ckpt_dir = models_dir / 'rt_ckpt' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
+    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.use_tensor_parallelism(tp_size)
+    model_spec_obj.use_pipeline_parallelism(pp_size)
 
     print("\nBuilding fp16 engine")
-    build_engine(hf_dir, ckpt_dir / 'fp16-default' / tp_pp_dir,
-                 engine_dir / 'fp16-default' / tp_pp_dir,
+    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                  '--remove_input_padding=disable', '--paged_state=disable',
                  '--mamba_conv1d_plugin=disable')
     print("\nBuilding fp16-plugin engine")
-    build_engine(hf_dir, ckpt_dir / 'fp16-plugin' / tp_pp_dir,
-                 engine_dir / 'fp16-plugin' / tp_pp_dir,
+    model_spec_obj.use_mamba_plugin()
+    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                  '--remove_input_padding=disable', '--paged_state=disable')
     print("\nBuilding fp16-plugin-packed engine")
-    build_engine(hf_dir, ckpt_dir / 'fp16-plugin-packed' / tp_pp_dir,
-                 engine_dir / 'fp16-plugin-packed' / tp_pp_dir,
+    model_spec_obj.use_packed_input()
+    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                  '--remove_input_padding=enable', '--paged_state=disable')
     print("\nBuilding fp16-plugin-packed-paged engine")
-    build_engine(hf_dir, ckpt_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
-                 engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                  '--remove_input_padding=enable', '--paged_state=enable')
     print("Done.")
 

@@ -80,7 +80,7 @@ test_gptq() {
     python convert_checkpoint.py --model_dir ${MODEL} \
                                  --output_dir ./tllm_checkpoint/2gpu_gptq \
                                  --dtype float16 \
-                                 --modelopt_quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
+                                 --quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \
@@ -113,7 +113,7 @@ test_lora() {
             --lora_dir ${lora_dir} \
             --max_batch_size 1 \
             --max_input_len 512 \
-            --max_output_len 50
+            --max_seq_len 562
 
     mpirun -n 2 --allow-run-as-root \
     python ../run.py --engine_dir ./trt_engines/llama-v2-13b-with-lora \
@@ -167,7 +167,7 @@ test_llava() {
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 576 # 1 (max_batch_size) * 576 (num_visual_features)
 }
 

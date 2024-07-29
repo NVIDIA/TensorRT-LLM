@@ -80,13 +80,13 @@ template <
     typename SmemIteratorB_,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB,
-    /// Data type for the scales
+    /// Iterators over scales in global memory
     typename IteratorScale_,
     /// Iterators over scales in shared memory
     typename SmemIteratorScale_,
     /// Data type of accumulator matrix
     typename ElementC_,
-    /// Data type of accumulator matrix
+    /// Layout of accumulator matrix
     typename LayoutC_,
     /// Policy describing tuning details (concept: MmaPolicy)
     typename Policy_,

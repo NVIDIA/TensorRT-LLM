@@ -47,8 +47,9 @@ def expand_choices_if_needed(medusa_choices: List[List[int]]):
     return expanded_choices
 
 
-def get_packed_mask(num_medusa_tokens, medusa_mask):
-    num_packed_masks = (num_medusa_tokens + 1 + 32 - 1) // 32
+def get_packed_mask(num_medusa_tokens, medusa_mask, max_medusa_tokens=None):
+    max_medusa_tokens = num_medusa_tokens if max_medusa_tokens is None else max_medusa_tokens
+    num_packed_masks = (max_medusa_tokens + 1 + 32 - 1) // 32
     medusa_packed_mask = torch.zeros((num_medusa_tokens + 1, num_packed_masks),
                                      dtype=torch.int32)
     for token_idx in range(num_medusa_tokens + 1):
@@ -71,7 +72,8 @@ def get_packed_mask(num_medusa_tokens, medusa_mask):
                 valid_num_bits = len(mask_32bits_str)
                 first_bit1 = mask_32bits_str[0] == '1'
                 mask_31bits_str = mask_32bits_str[1:]
-                mask_31bits = int(mask_31bits_str, 2)
+                mask_31bits = 0 if mask_31bits_str == "" else int(
+                    mask_31bits_str, 2)
                 if valid_num_bits == 32:
                     mask_32bits = mask_31bits - first_bit1 * (2**(
                         valid_num_bits - 1))

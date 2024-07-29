@@ -94,7 +94,7 @@ public:
     using TensorPtr = TTensor;
 
     explicit GenericGenerationInput(
-        SizeType const endId, SizeType const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
+        SizeType32 const endId, SizeType32 const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
         : endId{endId}
         , padId{padId}
         , ids{std::move(ids)}
@@ -107,17 +107,17 @@ public:
     }
 
     // mandatory parameters
-    SizeType endId;
-    SizeType padId;
+    SizeType32 endId;
+    SizeType32 padId;
     TensorPtr ids;     // [packedLength] or [batchSize, maxInputLength], on gpu
     TensorPtr lengths; // [batchSize], on gpu
     bool packed;       // indicates if ids are packed or padded to maxInputLength
 
     // optional parameters
-    TensorPtr embeddingBias;              // [vocabSizePadded], on gpu
-    TensorPtr badWordsList;               // [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
-    TensorPtr stopWordsList;              // [batchSize, 2, stopWordsLength], on gpu
-    std::optional<SizeType> maxNewTokens; // max number of tokens to generate
+    TensorPtr embeddingBias;                // [vocabSizePadded], on gpu
+    TensorPtr badWordsList;                 // [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
+    TensorPtr stopWordsList;                // [batchSize, 2, stopWordsLength], on gpu
+    std::optional<SizeType32> maxNewTokens; // max number of tokens to generate
 
     // Ptuning parameters
     PromptTuningParams promptTuningParams; // See promptTuningParams.h for expected shapes
@@ -130,7 +130,7 @@ public:
     using TensorPtr = Base::TensorPtr;
 
     explicit GenerationInput(
-        SizeType const endId, SizeType const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
+        SizeType32 const endId, SizeType32 const padId, TensorPtr ids, TensorPtr lengths, bool packed = false)
         : GenericGenerationInput(endId, padId, std::move(ids), std::move(lengths), packed)
     {
     }

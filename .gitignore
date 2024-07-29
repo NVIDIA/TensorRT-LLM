@@ -6,9 +6,9 @@ __pycache__/
 *.nsys-rep
 .VSCodeCounter
 build*/
+!builders/
 *.egg-info/
 .coverage
-*.csv
 *.onnx
 tmp/
 venv/
@@ -28,7 +28,9 @@ config.json
 /*.svg
 cpp/cmake-build-*
 cpp/.ccache/
+tensorrt_llm/bin
 tensorrt_llm/libs
+tensorrt_llm/bindings.*.so
 tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/*.pyi
 *docs/cpp_docs*
@@ -41,3 +43,14 @@ tensorrt_llm/bindings/*.pyi
 # Testing
 .coverage.*
 results_trt/
+
+# build/debug
+*.safetensors
+*/tllm_debug/**
+*.patch
+
+# Generated files
+cpp/include/tensorrt_llm/executor/version.h
+
+# User config files
+CMakeUserPresets.json

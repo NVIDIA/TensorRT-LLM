@@ -30,20 +30,19 @@
 #include <memory>
 #include <optional>
 
-namespace tb = tensorrt_llm::batch_manager;
+namespace texec = tensorrt_llm::executor;
 
 namespace tensorrt_llm::pybind::batch_manager
 {
 
-GptManager::GptManager(std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType, int32_t maxBeamWidth,
-    tb::batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback const& getInferenceRequestsCb,
-    SendResponseCallback const& sendResponseCb, tb::PollStopSignalCallback const& pollStopSignalCb,
+GptManager::GptManager(std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType,
+    GetInferenceRequestsCallback const& getInferenceRequestsCb, SendResponseCallback const& sendResponseCb,
+    tb::PollStopSignalCallback const& pollStopSignalCb,
     tb::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb,
     tb::TrtGptModelOptionalParams const& optionalParams, std::optional<uint64_t> terminateReqId)
 {
-    mManager = std::make_unique<tb::GptManager>(trtEnginePath, modelType, maxBeamWidth, schedulerPolicy,
-        callbackAdapter(getInferenceRequestsCb), callbackAdapter(sendResponseCb), pollStopSignalCb,
-        returnBatchManagerStatsCb, optionalParams, terminateReqId);
+    mManager = std::make_unique<tb::GptManager>(trtEnginePath, modelType, callbackAdapter(getInferenceRequestsCb),
+        callbackAdapter(sendResponseCb), pollStopSignalCb, returnBatchManagerStatsCb, optionalParams, terminateReqId);
 }
 
 py::object GptManager::enter()
@@ -101,11 +100,11 @@ tb::SendResponseCallback callbackAdapter(SendResponseCallback const& callback)
 void GptManager::initBindings(py::module_& m)
 {
     py::class_<GptManager>(m, "GptManager")
-        .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, int32_t, tb::batch_scheduler::SchedulerPolicy,
-                 GetInferenceRequestsCallback, SendResponseCallback, tb::PollStopSignalCallback,
-                 tb::ReturnBatchManagerStatsCallback, tb::TrtGptModelOptionalParams const&, std::optional<uint64_t>>(),
-            py::arg("trt_engine_path"), py::arg("model_type"), py::arg("max_beam_width"), py::arg("scheduler_policy"),
-            py::arg("get_inference_requests_cb"), py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
+        .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, GetInferenceRequestsCallback,
+                 SendResponseCallback, tb::PollStopSignalCallback, tb::ReturnBatchManagerStatsCallback,
+                 tb::TrtGptModelOptionalParams const&, std::optional<uint64_t>>(),
+            py::arg("trt_engine_path"), py::arg("model_type"), py::arg("get_inference_requests_cb"),
+            py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
             py::arg("return_batch_manager_stats_cb") = nullptr,
             py::arg_v("optional_params", tb::TrtGptModelOptionalParams(), "TrtGptModelOptionalParams"),
             py::arg("terminate_req_id") = std::nullopt)

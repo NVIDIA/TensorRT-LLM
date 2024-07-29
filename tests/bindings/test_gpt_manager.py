@@ -1,29 +1,50 @@
 import json as _json
-import os
+import os as _os
 import pathlib as _pl
-import sys
+import sys as _sys
 import time as _time
 import typing as _tp
 
 import numpy as _np
+import pytest
 import torch as _tor
 from binding_test_utils import *
 from transformers import AutoTokenizer
 
 import tensorrt_llm.bindings as _tb
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+from utils.cpp_paths import *
+from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere
+
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..', '..'))
+from cpp.tests.resources.scripts.build_engines_utils import \
+    init_model_spec_module
+
+init_model_spec_module()
+
+import model_spec
+
+
+def get_model_spec() -> model_spec.ModelSpec:
+    if not hasattr(get_model_spec, 'model_spec_obj'):
+        model_spec_obj = model_spec.ModelSpec(
+            'input_tokens.npy',
+            _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
+                model_spec.KVCacheType.PAGED).use_packed_input()
+        get_model_spec.model_spec_obj = model_spec_obj
+
+    return get_model_spec.model_spec_obj
 
 
 @pytest.mark.parametrize("variant, results_file", [
-    ("fp16-plugin-packed-paged",
-     "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
+    (get_model_spec().get_model_path(), get_model_spec().get_results_file()),
 ])
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
                      resource_path: _pl.Path, engine_path: _pl.Path,
-                     data_path: _pl.Path, llm_model_root):
+                     data_path: _pl.Path):
 
     model_dir = "gpt2"
     tp_size = 1
@@ -51,9 +72,9 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
         if beam_width == 1 else f"beam_search_{beam_width}") / results_file
 
     if not results_path.exists():
-        model_cache_arg = ["--model_cache",
-                           str(llm_model_root)
-                           ] if llm_model_root is not None else []
+        model_cache = llm_models_root()
+        model_cache_arg = ["--model_cache", str(model_cache)
+                           ] if model_cache is not None else []
         prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
 
     assert results_path.is_file()
@@ -99,8 +120,8 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
         inference_request_list.append(ir)
 
     def logits_post_processor(req_id: int, logits: _tor.Tensor,
-                              ids: _tp.List[_tp.List[int]],
-                              stream: _tor.Stream):
+                              ids: _tp.List[_tp.List[int]], stream: _tor.Stream,
+                              client_id: _tp.Optional[int]):
         del req_id, ids
 
         cuda_stream = _tor.cuda.Stream(
@@ -173,15 +194,18 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
         assert _json.loads(stats_json)
 
     opt_params = _tb.TrtGptModelOptionalParams()
+    opt_params.max_beam_width = 1
+    opt_params.scheduler_config = _tb.executor.SchedulerConfig(
+        _tb.executor.CapacitySchedulerPolicy.MAX_UTILIZATION)
+
     memory_counters = _tb.MemoryCounters.instance()
     init_gpu_mem = memory_counters.gpu
 
     for _ in range(3):
         remaining_requests = len(inference_request_list)
-        with _tb.GptManager(model_path, _tb.TrtGptModelType.InflightBatching, 1,
-                            _tb.SchedulerPolicy.MAX_UTILIZATION, fetch_requests,
-                            response_cb, should_stop, stats_cb, opt_params,
-                            10000) as manager:
+        with _tb.GptManager(model_path, _tb.TrtGptModelType.InflightBatching,
+                            fetch_requests, response_cb, should_stop, stats_cb,
+                            opt_params, 10000) as manager:
             while remaining_requests > 0:
                 _time.sleep(0.1)
             assert manager is not None
@@ -191,12 +215,13 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
 
 
 @pytest.mark.parametrize("variant, results_file", [
-    ("fp16-plugin-packed-paged",
-     "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
+    (get_model_spec().get_model_path(), get_model_spec().get_results_file()),
 ])
-def test_gpt_manager_constrained_generation(
-        variant, results_file, llm_root: _pl.Path, resource_path: _pl.Path,
-        engine_path: _pl.Path, data_path: _pl.Path, llm_model_root):
+def test_gpt_manager_constrained_generation(variant, results_file,
+                                            llm_root: _pl.Path,
+                                            resource_path: _pl.Path,
+                                            engine_path: _pl.Path,
+                                            data_path: _pl.Path):
     try:
         from lmformatenforcer import (JsonSchemaParser, TokenEnforcer,
                                       TokenEnforcerTokenizerData)
@@ -263,8 +288,8 @@ def test_gpt_manager_constrained_generation(
         return fetched
 
     def logits_post_processor(req_id: int, logits: _tor.Tensor,
-                              ids: _tp.List[_tp.List[int]],
-                              stream: _tor.Stream):
+                              ids: _tp.List[_tp.List[int]], stream: _tor.Stream,
+                              client_id: _tp.Optional[int]):
         del req_id
 
         cuda_stream = _tor.cuda.Stream(
@@ -311,9 +336,10 @@ def test_gpt_manager_constrained_generation(
 
     remaining_requests = len(inference_request_list)
     opt_params = _tb.TrtGptModelOptionalParams()
-    with _tb.GptManager(model_path, _tb.TrtGptModelType.InflightBatching, 1,
-                        _tb.SchedulerPolicy.MAX_UTILIZATION, fetch_requests,
-                        response_cb, should_stop, stats_cb, opt_params, 10000):
+    opt_params.max_beam_width = 1
+    with _tb.GptManager(model_path, _tb.TrtGptModelType.InflightBatching,
+                        fetch_requests, response_cb, should_stop, stats_cb,
+                        opt_params, 10000):
         while remaining_requests > 0:
             _time.sleep(0.1)
 

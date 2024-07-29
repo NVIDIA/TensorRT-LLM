@@ -13,17 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional, Union
+
 from ..._utils import pad_vocab_size
 from ...functional import (Tensor, is_gated_activation, non_gated_version, recv,
                            send)
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, LayerNorm, MoeConfig,
                        PositionEmbeddingType)
-from ...lora_manager import LoraBuildConfig, use_lora
+from ...lora_manager import LoraConfig, use_lora
+from ...mapping import Mapping
 from ...module import Module
-from ...quantization import QuantMode
+from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+                              QuantConfig, check_share_embedding)
+from .config import GPTConfig
+from .convert import (load_hf_gpt, load_weights_from_hf_model,
+                      load_weights_from_nemo)
 
 
 def MLPFactory(hidden_size,
@@ -34,18 +40,20 @@ def MLPFactory(hidden_size,
                moe_config: MoeConfig = MoeConfig(),
                tp_group=None,
                tp_size=1,
-               tp_rank=0,
-               quant_mode=QuantMode(0)):
+               mapping=Mapping(),
+               quant_mode=QuantMode(0),
+               inner_layernorm=False,
+               eps=1e-05):
     if moe_config.has_moe():
         return MOE(moe_config,
                    hidden_size,
                    ffn_hidden_size,
                    hidden_act,
-                   bias,
-                   dtype,
-                   tp_group,
-                   tp_size,
-                   tp_rank,
+                   mapping=mapping,
+                   bias=bias,
+                   dtype=dtype,
+                   tp_group=tp_group,
+                   tp_size=tp_size,
                    quant_mode=quant_mode)
     MLPClass = GatedMLP if is_gated_activation(hidden_act) else MLP
     hidden_act = non_gated_version(hidden_act)
@@ -58,12 +66,14 @@ def MLPFactory(hidden_size,
         tp_group,
         tp_size,
         quant_mode,
+        inner_layernorm=inner_layernorm,
+        eps=eps,
     )
 
 
 class GPTDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -78,6 +88,10 @@ class GPTDecoderLayer(Module):
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         local_layer_idx = layer_idx - layers_range[0]
+        inner_layernorm = config.inner_layernorm if hasattr(
+            config, "inner_layernorm") else False
+        attention_head_size = config.head_size if hasattr(config,
+                                                          "head_size") else None
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -85,9 +99,11 @@ class GPTDecoderLayer(Module):
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             num_layers=config.num_hidden_layers,
+            q_scaling=config.q_scaling,
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
+            attention_head_size=attention_head_size,
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_percentage=config.rotary_pct,
             rotary_embedding_base=config.rotary_base,
@@ -97,28 +113,26 @@ class GPTDecoderLayer(Module):
             tp_size=tp_size,
             tp_rank=tp_rank,
             quant_mode=config.quant_mode,
-            qk_layernorm=config.qk_layernorm)
+            qk_layernorm=config.qk_layernorm,
+            inner_layernorm=inner_layernorm,
+            eps=config.norm_epsilon)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
+        self.norm_before_bmm1 = config.norm_before_bmm1 if hasattr(
+            config, "norm_before_bmm1") else False
 
-        moe_config = MoeConfig()
-        if config.moe_num_experts > 1:
-            moe_config = MoeConfig(
-                config.moe_num_experts,
-                config.moe_top_k,
-                config.moe_tp_mode,
-                config.moe_normalization_mode,
-            )
         self.mlp = MLPFactory(hidden_size=config.hidden_size,
                               ffn_hidden_size=mlp_hidden_size,
                               hidden_act=config.hidden_act,
                               dtype=config.dtype,
                               bias=config.bias,
-                              moe_config=moe_config,
+                              moe_config=config.moe,
                               tp_group=tp_group,
                               tp_size=tp_size,
-                              tp_rank=tp_rank,
-                              quant_mode=config.quant_mode)
+                              mapping=config.mapping,
+                              quant_mode=config.quant_mode,
+                              inner_layernorm=inner_layernorm,
+                              eps=config.norm_epsilon)
 
         self.post_layernorm = LayerNorm(normalized_shape=config.hidden_size,
                                         eps=config.norm_epsilon,
@@ -131,8 +145,7 @@ class GPTDecoderLayer(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 lora_layer_params=None,
-                spec_decoding_position_offsets=None,
-                spec_decoding_packed_mask=None):
+                spec_decoding_params=None):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -144,11 +157,11 @@ class GPTDecoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
-            spec_decoding_packed_mask=spec_decoding_packed_mask)
+            norm_before_bmm1=self.norm_before_bmm1)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -158,7 +171,8 @@ class GPTDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_layer_params=lora_layer_params)
 
         hidden_states = residual + hidden_states
 
@@ -169,15 +183,16 @@ class GPTDecoderLayer(Module):
 
 class GPTModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.mapping = config.mapping
         self.position_embedding_type = config.position_embedding_type
-
         if config.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
                                              dtype=config.dtype)
+
+            self.embedding_scale = config.embedding_scale
 
             if config.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 self.position_embedding = Embedding(
@@ -204,28 +219,27 @@ class GPTModel(Module):
                 prompt_tasks=None,
                 prompt_vocab_size=None,
                 lora_params=None,
-                spec_decoding_position_offsets=None,
-                spec_decoding_packed_mask=None):
+                spec_decoding_params=None):
         if self.mapping.is_first_pp_rank():
             ptuning_args = [
                 prompt_embedding_table, prompt_tasks, prompt_vocab_size
             ] if prompt_embedding_table is not None else []
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            if self.embedding_scale is not None:
+                hidden_states *= self.embedding_scale
             if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 hidden_states = hidden_states + self.position_embedding(
                     position_ids)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        hidden_states = self.layers(
-            hidden_states,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            lora_params=lora_params,
-            spec_decoding_position_offsets=spec_decoding_position_offsets,
-            spec_decoding_packed_mask=spec_decoding_packed_mask)
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params,
+                                    lora_params=lora_params,
+                                    spec_decoding_params=spec_decoding_params)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -240,9 +254,9 @@ class GPTModel(Module):
 
 
 class GPTForCausalLM(DecoderModelForCausalLM):
+    config_class = GPTConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: GPTConfig):
         transformer = GPTModel(config)
 
         if config.mapping.is_last_pp_rank():
@@ -257,21 +271,133 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                    gather_output=True)
         else:
             lm_head = None
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_k": "k_proj",
+            "attn_v": "v_proj",
+            "attn_dense": "o_proj",
+            "mlp_h_to_4h": "c_fc",
+            "mlp_4h_to_h": "c_proj",
+        }
         super().__init__(config, transformer, lm_head)
 
-    def check_config(self, config: PretrainedConfig):
-        config.set_if_not_exist('bias', True)
-        config.set_if_not_exist('apply_query_key_layer_scaling', False)
-        config.set_if_not_exist('rotary_pct', 1.0)
-        config.set_if_not_exist('rotary_base', 10000.0)
-        config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('moe_num_experts', 0)
-        config.set_if_not_exist('moe_top_k', 0)
-        config.set_if_not_exist('moe_tp_mode',
-                                MoeConfig.ParallelismMode.TENSOR_PARALLEL)
-        config.set_if_not_exist(
-            'moe_normalization_mode',
-            MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE)
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a LLaMAForCausalLM object from give parameters
+        '''
+        import transformers
 
-    def use_lora(self, lora_config: LoraBuildConfig):
-        use_lora(self, lora_config)
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = GPTConfig.from_hugging_face(hf_config_or_dir,
+                                             dtype=dtype,
+                                             mapping=mapping,
+                                             quant_config=quant_config,
+                                             **kwargs)
+
+        if not use_preloading:
+            hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
+        **kwargs,
+    ):
+        DEFAULT_MODELOPT_FLOW = [
+            QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
+            QuantAlgo.W4A8_AWQ
+        ]
+        config = GPTConfig.from_hugging_face(hf_model_dir,
+                                             dtype=dtype,
+                                             mapping=mapping,
+                                             quant_config=quant_config,
+                                             **kwargs)
+
+        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=config.dtype,
+                             mapping=config.mapping,
+                             quant_config=config.quantization,
+                             device=device,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        else:
+            # non-modelopt, the legacy TRT-LLM native quantization algorithm:
+            # sq, int4/int8 weights only, int8 kv cache
+            NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None
+                                 ] + W8A8_SQ_PLUGIN_LIST
+            is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
+                (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
+            assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
+                "There is no point to call the quantize function if both quant_algo and kv_cache_quant_algo is None"
+            assert is_valid_native_quant, f"Internal error: shall call Modelopt for this quantization {quant_config}"
+
+            from . import convert
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             device=device,
+                             calib_dataset=calib_dataset)
+
+    @classmethod
+    def from_nemo(cls,
+                  nemo_ckpt_dir: str,
+                  dtype: str = 'auto',
+                  mapping: Optional[Mapping] = None,
+                  quant_config: Optional[QuantConfig] = None,
+                  **kwargs):
+        config = GPTConfig.from_nemo(nemo_ckpt_dir,
+                                     dtype=dtype,
+                                     mapping=mapping,
+                                     quant_config=quant_config,
+                                     **kwargs)
+
+        weights = load_weights_from_nemo(nemo_ckpt_dir, config, **kwargs)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

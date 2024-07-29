@@ -18,18 +18,20 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-template <typename input_t>
-size_t invokeComputeCumsumLastDimWorkspaceSize(int input_length);
+template <typename T>
+size_t invokeComputeCumsumLastDimWorkspaceSize(SizeType32 inputLength);
 
-template <typename input_t>
-void invokeCumsumLastDim(int batch_size, int input_length, void const* __restrict__ input, void* __restrict__ output,
-    void* workspace, size_t temp_storage_bytes, cudaStream_t stream);
+template <typename T>
+void invokeCumsumLastDim(SizeType32 batchSize, SizeType32 inputLength, void const* __restrict__ input,
+    void* __restrict__ output, void* workspace, size_t tempStorageBytes, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

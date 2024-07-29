@@ -1,4 +1,5 @@
 import json
+import os
 from enum import Enum
 
 import evaluate
@@ -82,9 +83,11 @@ def calculate_toks_per_sample(preds, eos_id):
     return avg_len / num_samples
 
 
-def calculate_rouge_score(preds, targets):
+def calculate_rouge_score(preds, targets, rouge_dir=None):
     print("Calculating ROUGE scores...")
-    metric = evaluate.load("rouge")
+    rouge_dir = rouge_dir if rouge_dir and os.path.exists(
+        rouge_dir) else "rouge"
+    metric = evaluate.load(rouge_dir)
     preds, targets = postprocess_text(preds, targets[0:len(preds)])
     result = metric.compute(predictions=preds,
                             references=targets,
@@ -114,6 +117,15 @@ def parse_arguments():
     parser.add_argument("--base_model",
                         type=str,
                         help="Location of the model used (to create tokenizer)")
+
+    parser.add_argument(
+        '--rouge_dir',
+        default=None,
+        type=str,
+        help=
+        "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
+    )
+
     args = parser.parse_args()
 
     return args
@@ -146,7 +158,8 @@ def main():
     tps_score = calculate_toks_per_sample(pred_toks, tokenizer.eos_token)
 
     pred_texts = tokenizer.batch_decode(pred_toks, skip_special_tokens=True)
-    achieved_scores = calculate_rouge_score(pred_texts, target_texts)
+    achieved_scores = calculate_rouge_score(pred_texts, target_texts,
+                                            args.rouge_dir)
 
     achieved_scores['tokens_per_sample'] = tps_score
     targets = ACCURACY_TARGETS[model]

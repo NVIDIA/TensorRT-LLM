@@ -30,8 +30,6 @@ class TopPSamplingLayerTest : public BaseSamplingLayerTest<T>
         this->mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
         this->mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(this->mStream);
 
-        this->mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*this->mBufferManager);
-
         int device;
         cudaGetDevice(&device);
         cudaGetDeviceProperties(&mDeviceProp, device);
@@ -44,7 +42,7 @@ class TopPSamplingLayerTest : public BaseSamplingLayerTest<T>
         auto const decodingDomain
             = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
         this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopPSamplingLayer<T>>(
-            decodingDomain, this->mStream->get(), this->mAllocator, &mDeviceProp);
+            decodingDomain, this->mBufferManager, &mDeviceProp);
     }
 
     struct cudaDeviceProp mDeviceProp;
@@ -54,7 +52,7 @@ TYPED_TEST_SUITE(TopPSamplingLayerTest, FloatAndHalfTypes);
 
 TYPED_TEST(TopPSamplingLayerTest, TopKSkipDecode)
 {
-    SizeType topK = 2;
+    SizeType32 topK = 2;
     float topP = 0.0f;
     TestSamplingParams params;
     params.topKs = {topK};
@@ -71,7 +69,7 @@ TYPED_TEST(TopPSamplingLayerTest, TopKSkipDecode)
 
 TYPED_TEST(TopPSamplingLayerTest, TopKTopPSkipDecode)
 {
-    SizeType topK = 2;
+    SizeType32 topK = 2;
     float topP = 1.0f;
     TestSamplingParams params;
     params.topKs = {topK};
@@ -88,7 +86,7 @@ TYPED_TEST(TopPSamplingLayerTest, TopKTopPSkipDecode)
 
 TYPED_TEST(TopPSamplingLayerTest, BatchTopKTopP)
 {
-    std::vector<SizeType> topKs = {0, 1, 1, 0, 1, 0};
+    std::vector<SizeType32> topKs = {0, 1, 1, 0, 1, 0};
     std::vector<float> topPs = {0.3f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
     TestSamplingParams params;
     params.topKs = topKs;
@@ -105,7 +103,7 @@ TYPED_TEST(TopPSamplingLayerTest, BatchTopKTopP)
 
 TYPED_TEST(TopPSamplingLayerTest, TopP)
 {
-    SizeType topK = 0;
+    SizeType32 topK = 0;
     float topP = 0.3f;
     TestSamplingParams params;
     params.topKs = {topK};

@@ -60,7 +60,7 @@ def build_engine(checkpoint_dir: str, engine_dir: str, *args):
         '--log_level=verbose',
         '--max_batch_size=256',
         '--max_input_len=40',
-        '--max_output_len=20',
+        '--max_seq_len=60',
         '--max_beam_width=2',
         '--builder_opt=0',
     ]
@@ -112,30 +112,27 @@ def build_engines():
     convert_ckpt(str(gpt2_dir), str(fp16_ckpt_dir), "--dtype=float16")
 
     print("\nBuilding fp16 engines")
-    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-default/1-gpu'),
-                 '--strongly_typed')
+    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-default/1-gpu'))
     build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-plugin/1-gpu'),
-                 '--gpt_attention_plugin=float16', '--strongly_typed')
+                 '--gpt_attention_plugin=float16')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(str(fp16_ckpt_dir),
                      str(engine_dir / 'fp16-plugin-fmha/1-gpu'),
-                     '--gpt_attention_plugin=float16', '--context_fmha=enable',
-                     '--strongly_typed')
+                     '--gpt_attention_plugin=float16', '--context_fmha=enable')
 
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / 'fp16-plugin-packed/1-gpu'),
                  '--gpt_attention_plugin=float16',
-                 '--remove_input_padding=enable', '--strongly_typed')
+                 '--remove_input_padding=enable')
 
     # Skip tests that are not supported in pre-ampere architecture
     if getSMVersion() >= 80:
         build_engine(fp16_ckpt_dir,
                      str(engine_dir / 'fp16-plugin-packed-fmha/1-gpu'),
                      '--gpt_attention_plugin=float16',
-                     '--remove_input_padding=enable', '--context_fmha=enable',
-                     '--strongly_typed')
+                     '--remove_input_padding=enable', '--context_fmha=enable')
 
     print("Done.")
 

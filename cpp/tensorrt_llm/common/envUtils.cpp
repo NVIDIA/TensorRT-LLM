@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cstdlib>
 
@@ -55,23 +56,32 @@ std::optional<int32_t> envXqaNbCtaPerKVHead()
     return ret;
 }
 
-bool getEnvDisableXQAJIT()
+std::optional<bool> getEnvEnableXQAJIT()
 {
     static bool init = false;
-    static bool disableXQAJIT = false;
+    static bool exists = false;
+    static bool enableXQAJIT = false;
     if (!init)
     {
         init = true;
-        char const* disable_xqa_jit_var = std::getenv("TRTLLM_DISABLE_XQA_JIT");
-        if (disable_xqa_jit_var)
+        char const* enable_xqa_jit_var = std::getenv("TRTLLM_ENABLE_XQA_JIT");
+        if (enable_xqa_jit_var)
         {
-            if (disable_xqa_jit_var[0] == '1' && disable_xqa_jit_var[1] == '\0')
+            exists = true;
+            if (enable_xqa_jit_var[0] == '1' && enable_xqa_jit_var[1] == '\0')
             {
-                disableXQAJIT = true;
+                enableXQAJIT = true;
             }
         }
     }
-    return disableXQAJIT;
+    if (exists)
+    {
+        return enableXQAJIT;
+    }
+    else
+    {
+        return std::nullopt;
+    }
 }
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
@@ -132,6 +142,30 @@ int getEnvMmhaKernelBlockSize()
         }
     }
     return mmhaKernelBlockSize;
+}
+
+bool getEnvEnableFDL()
+{
+    static bool init = false;
+    static bool enableFDL = false;
+    if (!init)
+    {
+        init = true;
+        // FDL only available when arch >= 90
+        if (getSMVersion() >= 90)
+        {
+            char const* enable_fdl = std::getenv("TRTLLM_ENABLE_FDL");
+            if (enable_fdl)
+            {
+                // FDL will be enabled by setting the env variables `TRTLLM_ENABLE_FDL` to `1`
+                if (enable_fdl[0] == '1' && enable_fdl[1] == '\0')
+                {
+                    enableFDL = true;
+                }
+            }
+        }
+    }
+    return enableFDL;
 }
 
 } // namespace tensorrt_llm::common

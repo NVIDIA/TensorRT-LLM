@@ -17,7 +17,9 @@
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fbgemm_gpu/fp8_rowwise_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fused_gated_gemm/fused_gated_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 
@@ -94,6 +96,19 @@ size_t GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getSer
 }
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
+int GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::getMaxProfileM() const
+{
+    return 8192;
+}
+
+template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
+void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::initTmpData(
+    int m, int n, int k, char* workspace, size_t size, cudaStream_t stream)
+{
+    /* Do nothing */
+}
+
+template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTactics(
     RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId)
 {
@@ -107,7 +122,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     mRunner = runner;
     mType = type;
 
-    int const maxM = std::min(nextPowerOfTwo(dims.maxM), MAX_PROFILE_M);
+    int const maxM = std::min(nextPowerOfTwo(dims.maxM), getMaxProfileM());
     computeTmpSize(maxM, dims.n, dims.k);
 
     if (!mMNKProfileMap->existsMProfileMap(gemmId))
@@ -122,11 +137,18 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     }
 
     auto mProfileMap = mMNKProfileMap->getMProfileMap(gemmId);
+    bool isAllocated{false};
 
-    auto profileTactics = [&mProfileMap, this](int m, int n, int k)
+    auto profileTactics = [&mProfileMap, &isAllocated, this](int m, int n, int k)
     {
         if (mProfileMap->count(m) == 0)
         {
+            if (!isAllocated)
+            {
+                // Allocate tmp data to run GEMMs
+                allocateTmpData();
+                isAllocated = true;
+            }
             initTmpData(m, n, k, mWorkspaceTmp, mTmpWorkspaceSizeInBytes, mStream);
             const auto tactics = this->getTactics(m, n, k);
             // Profile different tactics for particular m and insert best config to the map
@@ -135,18 +157,20 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     };
 
     common::check_cuda_error(cudaStreamCreate(&mStream));
-    // Allocate tmp data to run GEMMs
-    allocateTmpData();
 
     int const startMinMRounded = nextPowerOfTwo(dims.minM);
-    for (int m = startMinMRounded; m < maxM; m *= 2)
+    for (int m = std::max(1, startMinMRounded); m < maxM; m *= 2)
     {
         profileTactics(m, dims.n, dims.k);
     }
 
     profileTactics(maxM, dims.n, dims.k);
-    // Free tmp data
-    freeTmpData();
+
+    if (isAllocated)
+    {
+        // Free tmp data
+        freeTmpData();
+    }
     common::check_cuda_error(cudaStreamDestroy(mStream));
 }
 
@@ -158,10 +182,11 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
 
     if (mSkip)
     {
+        TLLM_LOG_TRACE("Skip is set, no best config is set for this instance");
         return std::nullopt;
     }
 
-    int const mRounded = std::min(nextPowerOfTwo(m), MAX_PROFILE_M);
+    int const mRounded = std::min(std::max(1, nextPowerOfTwo(m)), getMaxProfileM());
     fflush(stdout);
     return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
 }
@@ -209,7 +234,12 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
         catch (std::exception const& e)
         {
             std::ostringstream msg;
-            msg << "Cannot profile configuration " << ii << " (for"
+            msg << "Cannot profile configuration " << ii;
+            if constexpr (std::is_same_v<Config, tensorrt_llm::cutlass_extensions::CutlassGemmConfig>)
+            {
+                msg << ": " << candidateConfig.toString();
+            }
+            msg << "\n (for"
                 << " m=" << m << ", n=" << n << ", k=" << k << ")"
                 << ", reason: \"" << e.what() << "\". Skipped";
             TLLM_LOG_TRACE(msg.str());
@@ -291,5 +321,13 @@ template class GemmPluginProfiler<cublasLtMatmulHeuristicResult_t,
 // TODO I dont like the dependency on the MOE plugin here, but MOE needs the full context to run profiles
 template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig, MixtureOfExpertsPlugin*,
     GemmIDMoe, GemmIDMoeHash>;
+
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFusedGatedGemmRunnerInterface>, GemmIdCore,
+    GemmIdCoreHash>;
+
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface>, GemmIdCore,
+    GemmIdCoreHash>;
 
 } // namespace tensorrt_llm::plugins

@@ -82,7 +82,7 @@ trtllm-build --checkpoint_dir ./trt_ckpt/gptj_fp16_tp1/ \
              --gemm_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1919 \
-             --max_output_len=128
+             --max_seq_len=2047
 ```
 
 INT8 weight-only

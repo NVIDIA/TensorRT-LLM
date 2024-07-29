@@ -16,6 +16,8 @@ VALID_QUANT_ALGOS = Literal["None", f"{QuantAlgo.W8A16}", f"{QuantAlgo.W4A16}",
                             f"{QuantAlgo.W4A16_AWQ}", f"{QuantAlgo.W4A8_AWQ}",
                             f"{QuantAlgo.W4A16_GPTQ}", f"{QuantAlgo.FP8}",
                             f"{QuantAlgo.INT8}"]
+VALID_SCHEDULING_POLICIES = \
+    Literal["max_utilization", "guaranteed_no_evict", "static"]
 
 
 class _MethodFunctionAdapter:
@@ -130,6 +132,7 @@ def run_process(cmd: List[Any],
     Returns:
         subprocess.CompletedProcess: _description_
     """
+    run_dir.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [str(x) for x in cmd],
         cwd=run_dir,

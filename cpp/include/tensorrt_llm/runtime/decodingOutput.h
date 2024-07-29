@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <optional>
 #include <utility>
@@ -35,25 +36,25 @@ public:
     class BeamHypotheses
     {
     public:
-        // The same as cpp/tensorrt_llm/kernels/beamSearchKernels.h
+        // Keep same as cpp/tensorrt_llm/kernels/beamSearchKernels.h
         TensorPtr outputIdsCBA;       // [BS, BM*2, MSL]
-        TensorPtr sequenceLengthsCBA; // [BS, BM]
+        TensorPtr logProbsCBA;        // [BS, BM*2, MSL]
+        TensorPtr sequenceLengthsCBA; // [BS, BM*2]
         TensorPtr cumLogProbsCBA;     // [BS, BM*2]
         TensorPtr normedScoresCBA;    // [BS, BM*2]
-        TensorPtr logProbsCBA;        // [BS, BM*2, MSL]
-        TensorPtr minNormedScoresCBA; // [BS]
         TensorPtr numBeamsCBA;        // [BS]
+        TensorPtr minNormedScoresCBA; // [BS]
         TensorPtr batchDones;         // [BS]
 
         void empty(BufferManager& manager);
 
-        void reshape(SizeType batchSize, SizeType beamWidth, SizeType maxSequenceLength);
+        void reshape(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
         void release();
 
         void init(BufferManager& manager, TokenIdType endId);
 
-        BeamHypotheses slice(SizeType batchIndex, SizeType size) const;
+        BeamHypotheses slice(SizeType32 batchIndex, SizeType32 size) const;
     };
 
     static float constexpr kNegativeInfinity = -1e20f;
@@ -88,17 +89,21 @@ public:
 
     BeamHypotheses beamHypotheses;
 
-    // Medusa
-    class MedusaOutputs
+    // Speculative decoding
+    class SpeculativeDecodingOutputs
     {
     public:
-        TensorPtr medusaNextDraftTokens;       // [maxBatchSize, maxTokensPerStep]
-        TensorPtr medusaAcceptedTokensLen;     // [maxBatchSize]
-        TensorPtr medusaAcceptedLengthsCumSum; // [maxBatchSize + 1]
-        TensorPtr medusaPathsOffsets;          // [maxBatchSize * maxNumHeads]
+        TensorPtr nextDraftTokens;       // [maxBatchSize, maxDraftTokens]
+        TensorPtr nextDraftTokensLen;    // [maxBatchSize]
+        TensorPtr prevDraftTokensLen;    // [maxBatchSize]
+        TensorPtr acceptedTokensLen;     // [maxBatchSize]
+        TensorPtr acceptedLengthsCumSum; // [maxBatchSize + 1]
+        TensorPtr pathsOffsets;          // [maxBatchSize, maxAcceptedDraftTokensPerStep]
     };
 
-    std::optional<MedusaOutputs> medusaOutputs;
+    std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
+
+    std::optional<ExplicitDraftTokensBuffers::Inputs> explicitDraftTokensBuffers;
 };
 
 } // namespace tensorrt_llm::runtime

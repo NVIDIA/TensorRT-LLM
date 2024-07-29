@@ -15,9 +15,11 @@
  */
 
 #pragma once
-#include "tensorrt_llm/common/assert.h"
+
 #include <functional>
 #include <numeric>
+#include <optional>
+#include <sstream>
 
 namespace tensorrt_llm::common::stl_utils
 {
@@ -82,6 +84,40 @@ constexpr TOutputIt exclusiveScan(TInputIt first, TInputIt last, TOutputIt dFirs
 #else
     return std::exclusive_scan(first, last, dFirst, std::move(init));
 #endif
+}
+
+template <typename T, typename = void>
+struct HasOperatorOutput : std::false_type
+{
+};
+
+template <typename T>
+struct HasOperatorOutput<T, std::void_t<decltype((std::declval<std::ostream&>() << std::declval<T>()))>>
+    : std::true_type
+{
+};
+
+template <typename T>
+std::string toString(T const& t, typename std::enable_if_t<HasOperatorOutput<T>::value, int> = 0)
+{
+    std::ostringstream oss;
+    oss << t;
+    return oss.str();
+}
+
+template <typename T>
+std::string toString(std::optional<T> const& t, typename std::enable_if_t<HasOperatorOutput<T>::value, int> = 0)
+{
+    std::ostringstream oss;
+    if (t)
+    {
+        oss << t.value();
+    }
+    else
+    {
+        oss << "None";
+    }
+    return oss.str();
 }
 
 } // namespace tensorrt_llm::common::stl_utils

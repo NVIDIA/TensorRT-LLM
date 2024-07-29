@@ -6,34 +6,6 @@ import sys as _sys
 import typing as _tp
 
 import numpy as _np
-import pytest
-
-
-@pytest.fixture(scope="module")
-def llm_root() -> _pl.Path:
-    environ_root = _os.environ.get("LLM_ROOT", None)
-    return _pl.Path(environ_root) if environ_root is not None else _pl.Path(
-        __file__).parent.parent.parent
-
-
-@pytest.fixture(scope="module")
-def llm_model_root() -> _pl.Path | None:
-    return _os.environ.get("LLM_MODEL_ROOT", None)
-
-
-@pytest.fixture(scope="module")
-def resource_path(llm_root: _pl.Path) -> _pl.Path:
-    return llm_root / "cpp" / "tests" / "resources"
-
-
-@pytest.fixture(scope="module")
-def engine_path(resource_path: _pl.Path) -> _pl.Path:
-    return resource_path / "models" / "rt_engine"
-
-
-@pytest.fixture(scope="module")
-def data_path(resource_path: _pl.Path) -> _pl.Path:
-    return resource_path / "data"
 
 
 def run_command(command: _tp.Sequence[str],
@@ -66,6 +38,19 @@ def prepare_model_tests(
         str(scripts_dir / f"generate_expected_{model_name}_output.py")
     ]
     run_command(generate_expected_output, cwd=llm_root, env=model_env)
+
+
+def prepare_lora_configs(llm_root: _pl.Path, resource_path: _pl.Path,
+                         lora_config_path: _pl.Path):
+    python_exe = _sys.executable
+    generate_lora_data_args_tp1 = [
+        python_exe,
+        str(resource_path / "scripts" / "generate_test_lora_weights.py"),
+        f"--out-dir={str(lora_config_path)}", "--tp-size=1",
+        "--hidden-size=768", "--num-layers=12", "--config-ids-filter=0",
+        "--no-generate-cache-pages"
+    ]
+    run_command(generate_lora_data_args_tp1, cwd=llm_root)
 
 
 def sequence_lengths(sequences: _np.ndarray, pad_id: int) -> _np.ndarray:

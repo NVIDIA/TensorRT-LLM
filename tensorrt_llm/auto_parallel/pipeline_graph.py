@@ -7,12 +7,13 @@ import torch
 
 from tensorrt_llm._utils import trt_dtype_to_str, trt_dtype_to_torch
 from tensorrt_llm.logger import logger
-from tensorrt_llm.network import get_plugin_info, set_plugin_info
+from tensorrt_llm.network import Network, get_plugin_info, set_plugin_info
+from tensorrt_llm.plugin.plugin import PluginConfig
 from tensorrt_llm.runtime.session import Session
 
-from .utils import (get_builder_flags, get_sorted_layer_ids, get_strongly_typed,
-                    get_trt_network, set_trt_network, to_base_class_layer,
-                    to_subclass_layer)
+from .utils import (current_flags, get_builder_flags, get_sorted_layer_ids,
+                    get_strongly_typed, get_trt_network, set_trt_network,
+                    to_base_class_layer, to_subclass_layer)
 
 
 class Tensor:
@@ -263,6 +264,7 @@ class PipelineGraph:
         self._io_buffer_mapping = {}
         self._unfilled_weights = {}
         self._auto_parallel_config = None
+        self._plugin_config: PluginConfig = None
 
     @staticmethod
     def create_graph():
@@ -508,6 +510,7 @@ class PipelineGraph:
         if prefix is not None:
             layer_name = prefix + layer_name
         new_layer.name = layer_name
+        new_layer.metadata = new_layer.name
         if layer.precision_is_set:
             new_layer.precision = layer.precision
         for i in range(layer.num_outputs):
@@ -682,6 +685,14 @@ class PipelineGraph:
             graph._outputs[tensor_name] = output_tensor
 
         return graph
+
+    @staticmethod
+    def from_network(network: Network, builder_config):
+        builder_flags = builder_config.trt_builder_config.flags
+        with current_flags(builder_flags, network.strongly_typed):
+            graph = PipelineGraph.from_trt(network.trt_network)
+            graph.infer_shapes(network._generate_optimization_profiles()[-1])
+            return graph
 
     def assign_shapes(self, shape_info=None, is_partial=False):
         if shape_info is None:

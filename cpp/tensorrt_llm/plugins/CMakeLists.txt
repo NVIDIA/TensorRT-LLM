@@ -26,6 +26,9 @@ if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 endif()
 
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --Wno-deprecated-declarations")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 997")
+
 set(PLUGIN_SOURCES)
 set(PLUGIN_CU_SOURCES)
 
@@ -35,6 +38,8 @@ set(PLUGIN_LISTS
     gptAttentionPlugin
     identityPlugin
     gemmPlugin
+    gemmSwigluPlugin
+    fp8RowwiseGemmPlugin
     smoothQuantGemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin
@@ -124,6 +129,7 @@ target_link_libraries(
   ${CUBLASLT_LIB}
   nvinfer
   ${CUDA_DRV_LIB}
+  ${CUDA_NVML_LIB}
   ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${SHARED_TARGET})

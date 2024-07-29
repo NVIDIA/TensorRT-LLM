@@ -16,52 +16,49 @@ import os
 import sys
 import unittest
 
-import numpy as np
 import torch
-from parameterized import parameterized
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 from torch_ref import geglu
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session
 
 
-class TestFunctional(unittest.TestCase):
+class TestGeglu(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float32', )], name_func=unittest_name_func)
-    def test_geglu(self, dtype):
+    def test_geglu(self):
+        dtype = 'float32'
         # test data
         x_shape = (12, 2, 96)
         x_data = torch.rand(x_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
+                            device="cuda")
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
+
             x = Tensor(name='x',
                        shape=x_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.geglu(x).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.geglu(x)
+            output.mark_output('output')
 
         # trt run
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
+        session = create_session(builder, network, precision=dtype)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
         # pytorch run
-        ref = geglu(x_data.cuda())
+        ref = geglu(x_data)
 
         # compare diff
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=1e-3)
+        torch.testing.assert_close(ref, outputs['output'], atol=1e-3, rtol=1e-2)

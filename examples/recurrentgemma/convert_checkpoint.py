@@ -58,7 +58,9 @@ class JAXParser:
 
     def get_config(self, checkpoint_path, ckpt_params):
         config = recurrentgemma_jax.GriffinConfig.from_flax_params_or_variables(
-            ckpt_params)._asdict()
+            ckpt_params,
+            preset=recurrentgemma_jax.Preset.RECURRENT_GEMMA_2B_V1,
+        )._asdict()
         if config["lru_width"] is None:
             config["lru_width"] = config["width"]
         layer_types = []
@@ -83,31 +85,31 @@ class JAXParser:
             (r"blocks.(\d+).temporal_pre_norm.scale",
              r"layers.\1.input_layernorm.weight"),
             (r"blocks.(\d+).recurrent_block.conv_1d.w",
-             r"layers.\1.temporal_block.conv1d.weight"),
+             r"layers.\1.recurrent.conv1d.weight"),
             (r"blocks.(\d+).recurrent_block.conv_1d.b",
-             r"layers.\1.temporal_block.conv1d.bias"),
+             r"layers.\1.recurrent.conv1d.bias"),
             (r"blocks.(\d+).recurrent_block.linear_out.kernel",
-             r"layers.\1.temporal_block.linear_out.weight"),
+             r"layers.\1.recurrent.linear_out.weight"),
             (r"blocks.(\d+).recurrent_block.linear_out.bias",
-             r"layers.\1.temporal_block.linear_out.bias"),
+             r"layers.\1.recurrent.linear_out.bias"),
             (r"blocks.(\d+).recurrent_block.linear_x.kernel",
-             r"layers.\1.temporal_block.linear_x.weight"),
+             r"layers.\1.recurrent.linear_x.weight"),
             (r"blocks.(\d+).recurrent_block.linear_x.bias",
-             r"layers.\1.temporal_block.linear_x.bias"),
+             r"layers.\1.recurrent.linear_x.bias"),
             (r"blocks.(\d+).recurrent_block.linear_y.kernel",
-             r"layers.\1.temporal_block.linear_y.weight"),
+             r"layers.\1.recurrent.linear_y.weight"),
             (r"blocks.(\d+).recurrent_block.linear_y.bias",
-             r"layers.\1.temporal_block.y_bias"),
+             r"layers.\1.recurrent.y_bias"),
             (r"blocks.(\d+).recurrent_block.rg_lru.a_gate.w",
-             r"layers.\1.temporal_block.a_gate.weight"),
+             r"layers.\1.recurrent.rg_lru.recurrent_gate.weight"),
             (r"blocks.(\d+).recurrent_block.rg_lru.a_gate.b",
-             r"layers.\1.temporal_block.a_gate.bias"),
+             r"layers.\1.recurrent.rg_lru.recurrent_gate.bias"),
             (r"blocks.(\d+).recurrent_block.rg_lru.input_gate.w",
-             r"layers.\1.temporal_block.input_gate.weight"),
+             r"layers.\1.recurrent.rg_lru.input_gate.weight"),
             (r"blocks.(\d+).recurrent_block.rg_lru.input_gate.b",
-             r"layers.\1.temporal_block.input_gate.bias"),
+             r"layers.\1.recurrent.rg_lru.input_gate.bias"),
             (r"blocks.(\d+).recurrent_block.rg_lru.a_param",
-             r"layers.\1.temporal_block.A"),
+             r"layers.\1.recurrent.rg_lru.recurrent_param"),
             (r"blocks.(\d+).mlp_block.ffw_up.w", r"layers.\1.mlp.fc.weight"),
             (r"blocks.(\d+).mlp_block.ffw_up.b", None),
             (r"blocks.(\d+).mlp_block.ffw_down.kernel",
@@ -115,14 +117,14 @@ class JAXParser:
             (r"blocks.(\d+).mlp_block.ffw_down.bias",
              r"layers.\1.mlp.proj.bias"),
             (r"blocks.(\d+).attention_block.proj_q.kernel",
-             r"layers.\1.temporal_block.qkv.weight"),
+             r"layers.\1.attention.qkv.weight"),
             (r"blocks.(\d+).attention_block.proj_k.kernel", None),
             (r"blocks.(\d+).attention_block.proj_v.kernel", None),
             (r"blocks.(\d+).attention_block.proj_final.kernel",
-             r"layers.\1.temporal_block.dense.weight"),
+             r"layers.\1.attention.dense.weight"),
             (r"blocks.(\d+).attention_block.proj_final.bias",
-             r"layers.\1.temporal_block.dense.bias"),
-            (r"final_norm.scale", r"norm_f.weight"),
+             r"layers.\1.attention.dense.bias"),
+            (r"final_norm.scale", r"ln_f.weight"),
         )
 
         for source, target in sub_patterns:
@@ -131,7 +133,7 @@ class JAXParser:
                     return target
                 else:
                     name = re.sub(source, target, name)
-                    return ".".join(("backbone", name))
+                    return ".".join(("transformer", name))
         else:
             raise ValueError(f"Don't know how to rename {name}")
 
@@ -176,31 +178,31 @@ class HfParser:
             (r"model.layers.(\d+).channel_pre_norm.weight",
              r"layers.\1.post_layernorm.weight"),
             (r"model.layers.(\d+).temporal_block.conv_1d.weight",
-             r"layers.\1.temporal_block.conv1d.weight"),
+             r"layers.\1.recurrent.conv1d.weight"),
             (r"model.layers.(\d+).temporal_block.conv_1d.bias",
-             r"layers.\1.temporal_block.conv1d.bias"),
+             r"layers.\1.recurrent.conv1d.bias"),
             (r"model.layers.(\d+).temporal_block.linear_out.weight",
-             r"layers.\1.temporal_block.linear_out.weight"),
+             r"layers.\1.recurrent.linear_out.weight"),
             (r"model.layers.(\d+).temporal_block.linear_out.bias",
-             r"layers.\1.temporal_block.linear_out.bias"),
+             r"layers.\1.recurrent.linear_out.bias"),
             (r"model.layers.(\d+).temporal_block.linear_x.weight",
-             r"layers.\1.temporal_block.linear_x.weight"),
+             r"layers.\1.recurrent.linear_x.weight"),
             (r"model.layers.(\d+).temporal_block.linear_x.bias",
-             r"layers.\1.temporal_block.linear_x.bias"),
+             r"layers.\1.recurrent.linear_x.bias"),
             (r"model.layers.(\d+).temporal_block.linear_y.weight",
-             r"layers.\1.temporal_block.linear_y.weight"),
+             r"layers.\1.recurrent.linear_y.weight"),
             (r"model.layers.(\d+).temporal_block.linear_y.bias",
-             r"layers.\1.temporal_block.y_bias"),
+             r"layers.\1.recurrent.y_bias"),
             (r"model.layers.(\d+).temporal_block.rg_lru.recurrent_gate_weight",
-             r"layers.\1.temporal_block.a_gate.weight"),
+             r"layers.\1.recurrent.rg_lru.recurrent_gate.weight"),
             (r"model.layers.(\d+).temporal_block.rg_lru.recurrent_gate_bias",
-             r"layers.\1.temporal_block.a_gate.bias"),
+             r"layers.\1.recurrent.rg_lru.recurrent_gate.bias"),
             (r"model.layers.(\d+).temporal_block.rg_lru.input_gate_weight",
-             r"layers.\1.temporal_block.input_gate.weight"),
+             r"layers.\1.recurrent.rg_lru.input_gate.weight"),
             (r"model.layers.(\d+).temporal_block.rg_lru.input_gate_bias",
-             r"layers.\1.temporal_block.input_gate.bias"),
+             r"layers.\1.recurrent.rg_lru.input_gate.bias"),
             (r"model.layers.(\d+).temporal_block.rg_lru.recurrent_param",
-             r"layers.\1.temporal_block.A"),
+             r"layers.\1.recurrent.rg_lru.recurrent_param"),
             (r"model.layers.(\d+).mlp_block.up_proj.weight",
              r"layers.\1.mlp.gate.weight"),
             (r"model.layers.(\d+).mlp_block.up_proj.bias",
@@ -214,14 +216,14 @@ class HfParser:
             (r"model.layers.(\d+).mlp_block.down_proj.bias",
              r"layers.\1.mlp.proj.bias"),
             (r"model.layers.(\d+).temporal_block.q_proj.weight",
-             r"layers.\1.temporal_block.qkv.weight"),
+             r"layers.\1.attention.qkv.weight"),
             (r"model.layers.(\d+).temporal_block.k_proj.weight", None),
             (r"model.layers.(\d+).temporal_block.v_proj.weight", None),
             (r"model.layers.(\d+).temporal_block.o_proj.weight",
-             r"layers.\1.temporal_block.dense.weight"),
+             r"layers.\1.attention.dense.weight"),
             (r"model.layers.(\d+).temporal_block.o_proj.bias",
-             r"layers.\1.temporal_block.dense.bias"),
-            (r"model.final_norm.weight", r"norm_f.weight"),
+             r"layers.\1.attention.dense.bias"),
+            (r"model.final_norm.weight", r"ln_f.weight"),
         )
 
         for source, target in sub_patterns:
@@ -230,7 +232,7 @@ class HfParser:
                     return target
                 else:
                     name = re.sub(source, target, name)
-                    return ".".join(("backbone", name))
+                    return ".".join(("transformer", name))
         else:
             raise ValueError(f"Don't know how to rename {name}")
 
@@ -329,6 +331,8 @@ def convert_from_checkpoint(
                     intermediate_size)
                 gate_bias = model_params[bias_name][1, ].reshape(
                     intermediate_size)
+                fc_bias = split_matrix_tp(fc_bias, tp_size, tp_rank, dim=0)
+                gate_bias = split_matrix_tp(gate_bias, tp_size, tp_rank, dim=0)
                 trt_llm_fc_name = trt_llm_name
                 trt_llm_gate_name = trt_llm_name.replace(
                     "fc.weight", "gate.weight")
@@ -378,21 +382,8 @@ def convert_from_checkpoint(
                     "ffw_down.kernel",
                     "linear_out.kernel",
                     "o_proj.weight",
-                    "up_proj.weight",
-                    "gate_proj.weight",
                     "down_proj.weight",
                     "linear_out.weight",
-            )):
-                if isinstance(ckpt_parser, JAXParser):
-                    param = param.transpose(1, 0)
-                param = split_matrix_tp(param, tp_size, tp_rank, dim=0)
-                add_trt_llm_weight(weights, trt_llm_name, param,
-                                   trt_llm_config.dtype)
-            elif any(keyword in name for keyword in (
-                    "linear_x.kernel",
-                    "linear_y.kernel",
-                    "linear_x.weight",
-                    "linear_y.weight",
             )):
                 if isinstance(ckpt_parser, JAXParser):
                     param = param.transpose(1, 0)
@@ -400,10 +391,25 @@ def convert_from_checkpoint(
                 add_trt_llm_weight(weights, trt_llm_name, param,
                                    trt_llm_config.dtype)
             elif any(keyword in name for keyword in (
+                    "linear_x.kernel",
+                    "linear_y.kernel",
+                    "linear_x.weight",
+                    "linear_y.weight",
+                    "up_proj.weight",
+                    "gate_proj.weight",
+            )):
+                if isinstance(ckpt_parser, JAXParser):
+                    param = param.transpose(1, 0)
+                param = split_matrix_tp(param, tp_size, tp_rank, dim=0)
+                add_trt_llm_weight(weights, trt_llm_name, param,
+                                   trt_llm_config.dtype)
+            elif any(keyword in name for keyword in (
                     "linear_x.bias",
                     "linear_y.bias",
                     "rg_lru",
                     "conv_1d.b",
+                    "gate_proj.bias",
+                    "up_proj.bias",
             )):
                 param = split_matrix_tp(param, tp_size, tp_rank, dim=0)
                 add_trt_llm_weight(weights, trt_llm_name, param,
@@ -421,8 +427,6 @@ def convert_from_checkpoint(
                     "ffw_down.bias",
                     "linear_out.bias",
                     "o_proj.bias",
-                    "up_proj.bias",
-                    "gate_proj.bias",
                     "down_proj.bias",
             )):
                 add_trt_llm_weight(weights, trt_llm_name, param,
@@ -465,6 +469,7 @@ def main():
         dtype=args.dtype or ckpt_params_dtype,
         logits_dtype="float32",
         vocab_size=ckpt_config["vocab_size"],
+        # follow the setting of gemma models
         max_position_embeddings=8192,
         hidden_size=ckpt_config["hidden_size"],
         num_hidden_layers=ckpt_config["num_hidden_layers"],
@@ -476,17 +481,22 @@ def main():
         intermediate_size=ckpt_config["intermediate_size"],
         norm_epsilon=1e-6,
         position_embedding_type="rope_gpt_neox",
-        world_size=args.world_size,
-        tp_size=args.world_size,
-        pp_size=1,
+        mapping={
+            'world_size': args.world_size,
+            'tp_size': args.world_size,
+            'pp_size': 1
+        },
         gpus_per_node=8,
         quantization=quant_config,
         conv_kernel=4,
-        rotary_percentage=0.5,
+        state_size=1,
+        state_dtype='float32',
+        rotary_pct=0.5,
         layer_types=ckpt_config["block_types"],
         rnn_hidden_size=ckpt_config["lru_width"],
         logits_soft_cap=ckpt_config["logits_soft_cap"],
         emb_scale_by_sqrt_dim=ckpt_config["embeddings_scale_by_sqrt_dim"],
+        rnn_conv_dim_size=ckpt_config["lru_width"],
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

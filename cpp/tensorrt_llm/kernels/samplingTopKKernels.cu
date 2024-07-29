@@ -41,8 +41,8 @@ namespace kernels
 template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
 __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restrict logProbsPtrs, T* tmpLogProbs,
     SizeType32* topKTmpIdBuf, T* topKTmpValBuf, FinishedState const* finished, SizeType32 maxTopK,
-    SizeType32 const* topKs, SizeType vocabSize, TokenIdType const* endIds, bool const* skipDecode,
-    SizeType32 const* batchSlots, SizeType32 const* tokensPerStep, SizeType maxTokensPerStep)
+    SizeType32 const* topKs, SizeType32 vocabSize, TokenIdType const* endIds, bool const* skipDecode,
+    SizeType32 const* batchSlots, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep)
 {
     typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -134,10 +134,10 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
 template <typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
 __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T* topKTmpValBuf, TokenIdType** idsPtrs,
     TokenIdType* ids, SizeType32* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput,
-    float* cumLogProbs, float* outputLogProbs, SizeType maxTopK, SizeType32 const* topKs, float topP,
-    float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType vocabSize,
-    bool const* skipDecode, SizeType32 const* batchSlots, SizeType maxBatchSize, bool normalizeLogProbs,
-    bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType maxTokensPerStep, SizeType maxSeqLen,
+    float* cumLogProbs, float* outputLogProbs, SizeType32 maxTopK, SizeType32 const* topKs, float topP,
+    float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType32 vocabSize,
+    bool const* skipDecode, SizeType32 const* batchSlots, SizeType32 maxBatchSize, bool normalizeLogProbs,
+    bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep, SizeType32 maxSeqLen,
     bool returnAllTopK)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;
@@ -280,7 +280,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     }
 }
 
-#define CASE_K(K_MAX, BLOCK_SIZE_1_, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_, normalizeLogProbs)                               \
+#define CASE_K(K_MAX, BLOCK_SIZE_1_, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_)                                                  \
     do                                                                                                                 \
     {                                                                                                                  \
         {                                                                                                              \
@@ -300,7 +300,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     params.finishedInput, params.finishedOutput, params.cumLogProbs, params.outputLogProbs,            \
                     params.maxTopK, params.topKs, params.maxTopP, params.topPs, params.curandState, params.endIds,     \
                     params.vocabSizePadded, params.skipDecode, params.batchSlots, params.maxBatchSize,                 \
-                    normalizeLogProbs, params.logitsHasProbs, params.tokensPerStep, params.maxTokensPerStep,           \
+                    params.normalizeLogProbs, params.logitsHasProbs, params.tokensPerStep, params.maxTokensPerStep,    \
                     params.maxSeqLen, params.returnAllTopK);                                                           \
         }                                                                                                              \
     } while (0)
@@ -341,19 +341,19 @@ void invokeBatchTopKSampling(TopKSamplingKernelParams<T> const& params, cudaStre
     case 1:
     case 2:
     case 3: // 0 < maxTopK <= 16
-        CASE_K(16, 128, 128, 8, params.normalizeLogProbs);
+        CASE_K(16, 128, 128, 8);
         break;
     case 4: // 16 < maxTopK <= 32
-        CASE_K(32, 256, 128, 8, params.normalizeLogProbs);
+        CASE_K(32, 256, 128, 8);
         break;
     case 5: // 32 < maxTopK <= 64
-        CASE_K(64, 256, 256, 8, params.normalizeLogProbs);
+        CASE_K(64, 256, 256, 8);
         break;
     case 6:
     case 7:
     case 8:
     case 9: // 64 < maxTopK <= 1024
-        CASE_K(1024, 256, 256, 8, params.normalizeLogProbs);
+        CASE_K(1024, 256, 256, 8);
         break;
     default: TLLM_CHECK_WITH_INFO(false, "TopK kernel supports 1 <= k <= 1024 but got k=%d", params.maxTopK);
     }

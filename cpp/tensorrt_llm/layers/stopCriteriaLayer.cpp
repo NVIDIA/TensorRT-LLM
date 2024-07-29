@@ -15,26 +15,22 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/stopCriteriaLayer.h"
+#include "stopCriteriaLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
-
-#include <algorithm>
+#include "tensorrt_llm/layers/layerUtils.h"
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 template <typename T>
-StopCriteriaLayer<T>::StopCriteriaLayer(DecodingMode const& mode, DecoderDomain const& decoderDomain,
-    cudaStream_t stream, std::shared_ptr<IAllocator> allocator)
-    : BaseLayer(decoderDomain, stream, std::move(allocator))
+StopCriteriaLayer<T>::StopCriteriaLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+    std::shared_ptr<BufferManager> bufferManager)
+    : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -42,96 +38,108 @@ StopCriteriaLayer<T>::StopCriteriaLayer(DecodingMode const& mode, DecoderDomain 
 }
 
 template <typename T>
-void StopCriteriaLayer<T>::setup(
-    SizeType batchSize, SizeType beamWidth, SizeType const* batchSlots, std::shared_ptr<BaseSetupParams> setupParams)
+void StopCriteriaLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& setupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void StopCriteriaLayer<T>::forward(
-    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
+void StopCriteriaLayer<T>::forwardAsync(
+    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto inputs = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
-    auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
+    auto inputs = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
+    auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
 
-    SizeType batchSize{0};
-    SizeType beamWidth{0};
-    SizeType vocabSize{0};
-    auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
-    auto batchSlots = inputs->batch_slots ? inputs->batch_slots->template getPtr<SizeType32 const>() : nullptr;
-    if (inputs->logits)
-    {
-        auto const& logitsShape = inputs->logits->shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        batchSize = logitsShape[0];
-        auto const idxOffset = logitsShape.size() - 3;
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
-    }
-    else
-    {
-        TLLM_CHECK(inputs->logits_vec->size());
-        auto const& logitsShape = inputs->logits_vec.value()[0].shape;
-        TLLM_CHECK(logitsShape.size() == 3 || logitsShape.size() == 4);
-        auto const idxOffset = logitsShape.size() - 3;
-        batchSize = inputs->logits_vec->size();
-        beamWidth = logitsShape[idxOffset + 1];
-        vocabSize = logitsShape[idxOffset + 2];
-    }
+    auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
+    auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
+    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(inputs->batchSlots);
 
-    if (!mDecodingMode.isMedusa())
+    TLLM_CHECK_WITH_INFO(inputs->stopCriteriaInputs, "stopCriteriaInputs for forward is not set");
+
+    if (mDecodingMode.isUseStopWords())
     {
-        checkStopWordsStopCriteria(outputs, inputs, batchSlots, batchSize, beamWidth, maxSeqLen, mStream);
+        checkStopWordsStopCriteria(outputs, inputs, batchSlotsPtr, localDecoderDomain, maxSeqLen, getStream());
     }
-    checkMaxLengthStopCriteria(outputs, inputs, batchSlots, batchSize, beamWidth, maxSeqLen, mStream);
+    if (mDecodingMode.isUseExplicitEosStop())
+    {
+        checkEosToken(outputs, inputs, batchSlotsPtr, localDecoderDomain, maxSeqLen, getStream());
+    }
+    if (mDecodingMode.isUseMaxLengthStop())
+    {
+        checkMaxLengthStopCriteria(outputs, inputs, batchSlotsPtr, localDecoderDomain, maxSeqLen, getStream());
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void StopCriteriaLayer<T>::checkStopWordsStopCriteria(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
-    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
+void StopCriteriaLayer<T>::checkStopWordsStopCriteria(std::shared_ptr<BaseDecodingOutputs>& outputs,
+    std::shared_ptr<DecodingInputs> const& inputs, SizeType32 const* batchSlotsPtr, DecoderDomain const& decoderDomain,
+    SizeType32 maxSeqLen, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const maxStopWordsLength = inputs->max_stop_words_len;
+    auto const maxStopWordsLength = inputs->stopCriteriaInputs->maxStopWordsLen;
     if (maxStopWordsLength)
     {
-        invokeStopWordsCriterion(outputs->output_ids_ptr.template getPtr<TokenIdType const*>(),
-            outputs->parent_ids_ptr.template getPtr<SizeType32 const*>(),
-            inputs->stop_words_ptr->template getPtr<TokenIdType const*>(),
-            reinterpret_cast<FinishedState*>(outputs->finished->template getPtr<FinishedState::UnderlyingType>()),
-            outputs->sequence_length->template getPtr<SizeType32>(), batchSlots,
-            inputs->stop_words_lengths->template getPtr<SizeType32 const>(), maxStopWordsLength, batchSize, beamWidth,
-            maxSeqLen, stream);
+        auto numNewTokens = bufferCastOrNull<SizeType32>(outputs->numNewTokens);
+        auto outputIdsPtr = bufferCast<SizeType32 const*>(*outputs->outputIdsPtr);
+        auto parentIdsPtr = bufferCast<SizeType32 const*>(*outputs->parentIdsPtr);
+        invokeStopWordsCriterion(outputIdsPtr, parentIdsPtr,
+            bufferCastOrNull<TokenIdType const*>(inputs->stopCriteriaInputs->stopWordsPtr),
+            reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished)),
+            bufferCastOrNull<SizeType32>(outputs->sequenceLength), batchSlotsPtr,
+            bufferCastOrNull<SizeType32>(inputs->stopCriteriaInputs->stopWordsLengths), numNewTokens,
+            maxStopWordsLength, decoderDomain.getBatchSize(), decoderDomain.getBeamWidth(), maxSeqLen, stream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void StopCriteriaLayer<T>::checkMaxLengthStopCriteria(std::shared_ptr<DynamicDecodeOutputParams>& outputs,
-    std::shared_ptr<DynamicDecodeInputParams> const& inputs, SizeType32 const* batchSlots, SizeType batchSize,
-    SizeType beamWidth, SizeType maxSeqLen, cudaStream_t stream)
+void StopCriteriaLayer<T>::checkMaxLengthStopCriteria(std::shared_ptr<BaseDecodingOutputs>& outputs,
+    std::shared_ptr<DecodingInputs> const& inputs, SizeType32 const* batchSlotsPtr, DecoderDomain const& decoderDomain,
+    SizeType32 maxSeqLen, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    if (inputs->sequence_limit_length)
+    if (inputs->stopCriteriaInputs->sequenceLimitLength)
     {
+        auto numNewTokens = bufferCastOrNull<SizeType32>(outputs->numNewTokens);
+
         invokeLengthCriterion(
-            reinterpret_cast<FinishedState*>(outputs->finished->template getPtr<FinishedState::UnderlyingType>()),
-            outputs->finished_sum ? outputs->finished_sum->template getPtr<SizeType32>() : nullptr,
-            inputs->sequence_limit_length->template getPtr<SizeType32 const>(),
-            outputs->sequence_length->template getPtr<SizeType32>(), batchSlots, batchSize, beamWidth, stream);
+            reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished)),
+            bufferCastOrNull<SizeType32>(outputs->finishedSum),
+            bufferCastOrNull<SizeType32>(inputs->stopCriteriaInputs->sequenceLimitLength),
+            bufferCastOrNull<SizeType32>(outputs->sequenceLength), numNewTokens, batchSlotsPtr,
+            decoderDomain.getBatchSize(), decoderDomain.getBeamWidth(), stream);
         sync_check_cuda_error();
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void StopCriteriaLayer<T>::checkEosToken(std::shared_ptr<BaseDecodingOutputs>& outputs,
+    std::shared_ptr<DecodingInputs> const& inputs, SizeType32 const* batchSlotsPtr, DecoderDomain const& decoderDomain,
+    SizeType32 maxSeqLen, cudaStream_t stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto numNewTokens = bufferCastOrNull<SizeType32>(outputs->numNewTokens);
+
+    auto sequenceLengthsPtr = bufferCastOrNull<SizeType32>(outputs->sequenceLength);
+    auto endIdsPtr = bufferCastOrNull<TokenIdType>(inputs->endIds);
+    auto finishedStatePtr
+        = reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished));
+    invokeExplicitEOSCriterion(bufferCastOrNull<TokenIdType const*>(outputs->outputIdsPtr), endIdsPtr, finishedStatePtr,
+        sequenceLengthsPtr, numNewTokens, batchSlotsPtr, decoderDomain.getBatchSize(), decoderDomain.getBeamWidth(),
+        decoderDomain.getMaxDecodingTokens(), stream);
+    sync_check_cuda_error();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template class StopCriteriaLayer<float>;
 template class StopCriteriaLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

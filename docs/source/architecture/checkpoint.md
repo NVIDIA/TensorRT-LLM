@@ -179,7 +179,7 @@ Let's take OPT as an example and deploy the model with tensor parallelism 2:
 cd examples/opt
 python3 convert_checkpoint.py --model_dir ./opt-125m \
                 --dtype float16 \
-                --world_size 2 \
+                --tp_size 2 \
                 --output_dir ./opt/125M/trt_ckpt/fp16/2-gpu/
 ```
 
@@ -229,7 +229,7 @@ trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
-                --max_output_len 100 \
+                --max_seq_len 1024 \
                 --output_dir ./opt/125M/trt_engines/fp16/2-gpu/
 ```
 

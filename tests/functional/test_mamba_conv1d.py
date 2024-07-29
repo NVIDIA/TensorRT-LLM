@@ -36,23 +36,34 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand(list(
-        product([2048], [4], ['context', 'generation'],
-                ['float16', 'float32', 'bfloat16'], [5], [16], [False, True],
-                [False, True], [False, True])),
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        list(
+            product([2048], [4], ['context', 'generation'],
+                    ['float16', 'float32', 'bfloat16'], [5], [16], [0, 64],
+                    [False, True], [False, True])) +
+        # long sequence tests to cover the int overflow issue
+        list(
+            product([5376], [4], ['context'], ['float16', 'bfloat16'], [2],
+                    [131072], [10240], [False, True], [False, True])),
+        name_func=unittest_name_func)
     def test_mamba_conv1d(self, dim, dconv, req_type, dtype, batch_size,
-                          max_seq_len, remove_padding, use_mamba_conv1d_plugin,
-                          apply_silu):
+                          max_seq_len, stride_size, remove_padding, apply_silu):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
-
-        if not use_mamba_conv1d_plugin and remove_padding:
-            pytest.skip(
-                "Skipping remove input padding without mamba conv1d plugin")
+        if max_seq_len == 131072:
+            total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
+            if total_gpu_mem <= 33 * 1024**3:
+                pytest.skip(
+                    "The long sequence test needs at least 33GB memory, skipping"
+                )
 
         device = "cuda"
         seq_len = max_seq_len if req_type == 'context' else 1
+        with_stride = stride_size > 0
+        pre_stride = stride_size
+        post_stride = 64 if with_stride else 0
+        mean = 0.0
+        std_dev = 1.0 if dtype == "float32" else 0.5
 
         # test data
         last_token_ids_trt = None
@@ -61,14 +72,16 @@ class TestFunctional(unittest.TestCase):
             last_token_ids = torch.randint(1,
                                            seq_len + 1, (batch_size, ),
                                            dtype=torch.int32)
+            last_token_ids[0] = seq_len
+            host_context_length = last_token_ids.detach().clone().cpu()
             last_token_ids_trt = torch.cumsum(last_token_ids,
                                               dim=0,
                                               dtype=torch.int32).to(device)
         else:
             last_token_ids = torch.ones(
                 (batch_size, ), dtype=torch.int32, device=device) * seq_len
+            host_context_length = last_token_ids.detach().clone().cpu()
             last_token_ids_trt = last_token_ids
-        host_context_length = last_token_ids.cpu()
         if req_type == 'context':
             past_conv_state = torch.zeros([batch_size, dim, dconv - 1],
                                           dtype=str_dtype_to_torch(dtype),
@@ -79,6 +92,8 @@ class TestFunctional(unittest.TestCase):
                                           dconv - 1,
                                           dtype=str_dtype_to_torch(dtype),
                                           device=device)
+            past_conv_state.normal_(mean, std_dev)
+
         conv_weight = torch.randn([dim, 1, dconv],
                                   dtype=str_dtype_to_torch(dtype),
                                   device=device)
@@ -89,11 +104,12 @@ class TestFunctional(unittest.TestCase):
         host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
                                           batch_size,
                                           dtype=torch.int32)
-        x = torch.randn(batch_size,
+        x = torch.empty(batch_size,
                         dim,
                         seq_len,
                         device=device,
                         dtype=str_dtype_to_torch(dtype))
+        x.normal_(mean, std_dev)
 
         x_trt = x.detach().permute(0, 2, 1).contiguous()
         if remove_padding and req_type == 'context':
@@ -106,16 +122,23 @@ class TestFunctional(unittest.TestCase):
 
         output_trt = torch.zeros_like(x_trt)
         present_conv_state_trt = torch.zeros_like(past_conv_state_trt)
+        if with_stride:
+            base_shape = [x_trt.shape[i] for i in range(len(x_trt.shape) - 1)]
+            pad_pre_shape = base_shape + [pre_stride]
+            pad_post_shape = base_shape + [post_stride]
+            pad_pre = torch.randn(pad_pre_shape,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
+            pad_post = torch.randn(pad_post_shape,
+                                   device=device,
+                                   dtype=str_dtype_to_torch(dtype))
+            x_trt = torch.cat([pad_pre, x_trt, pad_post], dim=-1).contiguous()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
-        if use_mamba_conv1d_plugin:
-            net.plugin_config.set_mamba_conv1d_plugin(dtype)
-        else:
-            net.plugin_config.set_mamba_conv1d_plugin(None)
         if remove_padding:
-            net.plugin_config.enable_remove_input_padding()
+            net.plugin_config.remove_input_padding = True
         else:
             net.plugin_config.remove_input_padding = False
         net.plugin_config.paged_state = False
@@ -159,6 +182,8 @@ class TestFunctional(unittest.TestCase):
                 dim,
                 dconv,
                 dtype,
+                pre_stride=pre_stride,
+                post_stride=post_stride,
                 host_context_lengths=host_context_length_tensor,
                 apply_silu=apply_silu)
             net._mark_output(outputs[0],

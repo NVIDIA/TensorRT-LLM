@@ -12,43 +12,47 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
 import unittest
 
-import numpy as np
 import torch
-from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.util import create_session, run_session
 
-class TestFunctional(unittest.TestCase):
+
+class TestExp(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
     def test_exp(self):
         dtype = 'float32'
-        x_data = torch.randn(2, 3, 4, 5)
+        x_data = torch.randn(2, 3, 4, 5, device="cuda")
 
+        # construct trt network
         builder = tensorrt_llm.Builder()
-        net = builder.create_network()
-        with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
+        network = builder.create_network()
+        with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.exp(x).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
+            output = tensorrt_llm.functional.exp(x)
+            output.mark_output('output', dtype)
 
-        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict={
-                'x': x_data.numpy(),
-            })
+        # trt run
+        session = create_session(builder, network, precision=dtype)
+        inputs = {
+            'x': x_data,
+        }
+        outputs = run_session(session, inputs)
 
+        # pytorch run
         ref = torch.exp(x_data)
-        np.testing.assert_allclose(ref.cpu().numpy(),
-                                   outputs['output'],
-                                   atol=1e-5)
+
+        # compare diff
+        torch.testing.assert_close(ref, outputs['output'])

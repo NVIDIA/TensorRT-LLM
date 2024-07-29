@@ -10,9 +10,11 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
       - [INT8 KV cache](#int8-kv-cache)
       - [SmoothQuant](#smoothquant)
+      - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
       - [INT4-GPTQ](#int4-gptq)
       - [INT4-AWQ](#int4-awq)
     - [Run](#run)
+    - [Run models with LoRA](#run-models-with-lora)
     - [Summarization using the Qwen model](#summarization-using-the-qwen-model)
   - [Credits](#credits)
 
@@ -28,19 +30,26 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-|   Model Name       | FP16/BF16  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
-| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
-| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-14B(-Chat)    |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen-72B(-Chat)    |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-72B(-Chat) |     Y      |   Y   |   -   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+|   Model Name       | FP16/BF16  |  FP8  |  WO   |  AWQ  | GPTQ  |  SQ   |  TP   |  PP   |  Arch   |
+| :-------------:    |   :---:    | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :-----: |
+| Qwen-1_8B(-Chat)   |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
+| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-7B(-Instruct)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-57B-A14B(-Instruct)|  Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
+| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
 *Please note that these models supports AWQ only with single GPU.
 
@@ -76,14 +85,6 @@ Download one or more Qwen models that you would like to build to TensorRT-LLM en
 git clone https://huggingface.co/Qwen/Qwen-7B-Chat   ./tmp/Qwen/7B
 git clone https://huggingface.co/Qwen/Qwen-14B-Chat  ./tmp/Qwen/14B
 git clone https://huggingface.co/Qwen/Qwen-72B-Chat  ./tmp/Qwen/72B
-```
-
-Or download from the [ModelScope](https://www.modelscope.cn) hub:
-
-```bash
-git clone https://www.modelscope.cn/qwen/Qwen-7B-Chat.git   ./tmp/Qwen/7B
-git clone https://www.modelscope.cn/qwen/Qwen-14B-Chat.git  ./tmp/Qwen/14B
-git clone https://www.modelscope.cn/qwen/Qwen-72B-Chat.git  ./tmp/Qwen/72B
 ```
 
 ### Build TensorRT engine(s)
@@ -187,7 +188,7 @@ INT8 KV cache could be enabled to reduce memory footprint. It will bring more pe
 
 For INT8 KV cache, [`convert_checkpoint.py`](./convert_checkpoint.py) features a
 `--int8_kv_cache` option. Setting `--int8_kv_cache` will calibrate the model,
-and then export the scaling factors needed for INT8 KV cache inference. Remember to set `--strongly_typed` when building the engine if you are not using INT8 weight only quantization at the same time.
+and then export the scaling factors needed for INT8 KV cache inference.
 
 Example:
 
@@ -199,7 +200,6 @@ python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/   \
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --output_dir ./engine_outputs \
-             --strongly_typed \
              --gemm_plugin float16
 ```
 
@@ -239,6 +239,29 @@ python3 convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_sq \
              --output_dir ./engine_outputs \
              --gemm_plugin float16
+```
+
+#### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+
+```bash
+# Quantize model into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin float16 \
 ```
 
 #### INT4-GPTQ
@@ -392,6 +415,72 @@ What is your name?<|im_end|>
 <|im_start|>assistant
 "
 Output [Text 0 Beam 0]: "I am QianWen, a large language model created by Alibaba Cloud."
+```
+
+### Run models with LoRA
+
+Download the lora model from HF:
+
+```bash
+git clone https://huggingface.co/Jungwonchang/Ko-QWEN-7B-Chat-LoRA ./tmp/Ko-QWEN-7B-Chat-LoRA
+```
+
+Build engine, setting `--lora_plugin` and `--lora_dir`. If lora has separate lm_head and embedding, they will replace lm_head and embedding of base model.
+
+```bash
+python convert_checkpoint.py --model_dir ./tmp/Qwen/7B/ \
+                              --output_dir ./tllm_checkpoint_1gpu_fp16 \
+                              --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16 \
+            --output_dir ./tmp/qwen/7B_lora/trt_engines/fp16/1-gpu \
+            --gemm_plugin auto \
+            --lora_plugin auto \
+            --lora_dir ./tmp/Ko-QWEN-7B-Chat-LoRA
+```
+
+Run inference:
+
+```bash
+python ../run.py --engine_dir ./tmp/qwen/7B_lora/trt_engines/fp16/1-gpu \
+              --max_output_len 50 \
+              --tokenizer_dir ./tmp/Qwen/7B/ \
+              --input_text "안녕하세요, 혹시 이름이 뭐에요?" \
+              --lora_task_uids 0 \
+              --use_py_session
+
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+안녕하세요, 혹시 이름이 뭐에요?<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "안녕하세요! 저는 인공지능 어시스턴트로, 여러분의 질문에 답하고 도움을 드리기 위해 여기 있습니다. 제가 무엇을 도와드릴까요?<|im_end|>
+<|im_start|>0
+<|im_start|><|im_end|>
+<|im_start|>"
+```
+
+Users who want to skip LoRA module may pass uid -1 with `--lora_task_uids -1`.
+In that case, the model will not run the LoRA module and the results will be
+different.
+
+```bash
+python ../run.py --engine_dir ./tmp/qwen/7B_lora/trt_engines/fp16/1-gpu \
+              --max_output_len 50 \
+              --tokenizer_dir ./tmp/Qwen/7B/ \
+              --input_text "안녕하세요, 혹시 이름이 뭐에요?" \
+              --lora_task_uids -1 \
+              --use_py_session
+
+Input [Text 0]: "<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+안녕하세요, 혹시 이름이 뭐에요?<|im_end|>
+<|im_start|>assistant
+"
+Output [Text 0 Beam 0]: "안녕하세요! 저는 "QianWen"입니다.<|im_end|>
+"
 ```
 
 ### Summarization using the Qwen model

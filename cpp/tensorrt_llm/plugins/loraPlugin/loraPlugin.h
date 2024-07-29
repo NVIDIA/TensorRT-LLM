@@ -39,8 +39,8 @@ public:
     LoraPlugin() = delete;
 
     LoraPlugin(int in_hidden_size, std::vector<int> out_hidden_sizes, int transA, int transB, int num_lora_modules,
-        nvinfer1::DataType type, PluginProfilerPtr const& profiler, bool remove_input_padding, int max_context_length,
-        int max_low_rank);
+        nvinfer1::DataType type, PluginProfilerPtr const& profiler, bool remove_input_padding, int max_num_tokens,
+        int max_low_rank, int weight_index);
 
     LoraPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
 
@@ -121,9 +121,10 @@ private:
     int mTransB;
     nvinfer1::DataType mType;
     bool mRemoveInputPadding;
-    int mMaxContextLength;
+    int mMaxNumTokens;
     int mMaxLowRank;
     int mNumLoraModules;
+    int mWeightIndex;
     int const mSplitKSlices = 16;
 
     // @fixme: seems this is shared across multiple clones.

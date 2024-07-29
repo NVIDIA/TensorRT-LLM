@@ -19,7 +19,6 @@
 #include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/schedulerPolicy.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -44,18 +43,17 @@ class TrtGptModel;
 class GptManager
 {
 public:
-    using SizeType = tensorrt_llm::runtime::SizeType;
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using TokenIdType = tensorrt_llm::runtime::TokenIdType;
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType maxBeamWidth,
-        batch_scheduler::SchedulerPolicy schedulerPolicy, GetInferenceRequestsCallback getInferenceRequestsCb,
-        SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
+    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType,
+        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
+        PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams(),
-        std::optional<uint64_t> terminateReqId = std::nullopt, std::optional<SizeType> maxDraftTokens = std::nullopt,
-        bool excludeInputInOutput = false);
+        std::optional<uint64_t> terminateReqId = std::nullopt, bool excludeInputInOutput = false);
 
     /* Wraps the user-provided callback for requests.
        Adds requests to request table.
@@ -74,7 +72,7 @@ public:
 
     BatchManagerErrorCode_t shutdown();
 
-    SizeType getNumActiveRequests();
+    SizeType32 getNumActiveRequests();
 
     virtual ~GptManager();
 
@@ -92,16 +90,16 @@ protected:
         RequestList& activeRequests, std::unordered_set<uint64_t>& activeRequestsIds);
 
 private:
-    [[nodiscard]] SizeType getMaxInputLen() const;
-    [[nodiscard]] SizeType getMaxSequenceLen() const;
-    [[nodiscard]] SizeType getMaxNumSequences() const;
-    [[nodiscard]] SizeType getMaxDraftLen() const;
+    [[nodiscard]] SizeType32 getMaxInputLen() const;
+    [[nodiscard]] SizeType32 getMaxSequenceLen() const;
+    [[nodiscard]] SizeType32 getMaxNumSequences() const;
+    [[nodiscard]] SizeType32 getMaxDraftLen() const;
 
     void validateLlmRequest(
         LlmRequest& newReq, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const;
     static std::shared_ptr<LlmRequest> fillLlmRequest(std::shared_ptr<InferenceRequest> newReq);
     static std::shared_ptr<std::vector<TokenIdType>> getReqInputTokens(std::shared_ptr<InferenceRequest> newReq);
-    static SizeType getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
+    static SizeType32 getMaxNewTokens(std::shared_ptr<InferenceRequest> newReq);
 
     GetInferenceRequestsCallback mGetInferenceRequestsCb;
     SendResponseCallback mSendResponseCb;
@@ -110,7 +108,6 @@ private:
 
     std::shared_ptr<TrtGptModel> mTrtGptModel;
     std::optional<uint64_t> mTerminateReqId;
-    std::optional<SizeType> mMaxDraftTokens;
 
     // Iteration counter - incremented every iteration of the generation loop
     int64_t mIterationCounter;
@@ -125,6 +122,9 @@ private:
     void decoupled_execution_loop();
     std::shared_ptr<std::thread> worker_thread_;
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
+
+    inline static std::string const kPROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP";
+    inline static std::string const kLEGACY_PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_GPTM_PROFILE_START_STOP";
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -15,10 +15,10 @@ WORKDIR "C:\\\\workspace"
 
 COPY setup_env.ps1 C:\\workspace\\setup_env.ps1
 # TRT is installed along with build-time dependencies
-RUN C:\workspace\setup_env.ps1 -skipTRT
+RUN C:\workspace\setup_env.ps1 -skipTRT -skipCUDNN
 RUN Remove-Item "C:\workspace\setup_env.ps1" -Force
-# CUDNN paths are populated in the env variable CUDNN, add it to PATH
-RUN [Environment]::SetEnvironmentVariable('Path', $Env:Path + ';' + $Env:CUDNN, [EnvironmentVariableTarget]::Machine)
+# If enabling CUDNN, CUDNN paths are populated in the env variable CUDNN, add it to PATH
+# RUN [Environment]::SetEnvironmentVariable('Path', $Env:Path + ';' + $Env:CUDNN, [EnvironmentVariableTarget]::Machine)
 
 # -----------------------------------------------------------------------------
 # Install build-time dependencies

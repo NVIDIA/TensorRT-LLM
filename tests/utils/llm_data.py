@@ -1,9 +1,9 @@
 import os
 from pathlib import Path
-from typing import Union
+from typing import Optional
 
 
-def llm_models_root(check=False) -> Union[Path, None]:
+def llm_models_root(check=False) -> Optional[Path]:
     root = Path("/home/scratch.trt_llm_data/llm-models/")
 
     if "LLM_MODELS_ROOT" in os.environ:

@@ -17,21 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+
 #include <curand_kernel.h>
 
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/layers/baseLayer.h"
-#include "tensorrt_llm/layers/beamSearchLayer.h"
-#include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/layers/medusaDecodingLayer.h"
-#include "tensorrt_llm/layers/samplingLayer.h"
-#include "tensorrt_llm/runtime/decodingMode.h"
-
-namespace tc = tensorrt_llm::common;
-
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 //! \brief Layer performs token decoding using sampling (beamWidth=1), beam search (beamWidth>1) or Medusa.
@@ -39,32 +32,35 @@ template <typename T>
 class DecodingLayer : public BaseLayer
 {
 public:
-    DecodingLayer(runtime::DecodingMode const& mode, DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    DecodingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
+        std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~DecodingLayer() override = default;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
-    void setup(runtime::SizeType batchSize, runtime::SizeType beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
-
-    //! \brief Calls single SamplingLayer::forward in batched mode
-    //! or runs BeamSearchLayer::forward in the loop for each request.
+    //! \brief Calls single SamplingLayer::forwardAsync or MedusaDecodingLayer::forwardAsync in batched mode
+    //! or runs BeamSearchLayer::forwardAsync in the loop for each request.
     //! Modifies outputs->logits in-place.
-    void forward(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+
+    //! \brief Calls forwardSync of configired decoding layer.
+    void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 private:
-    using BaseLayer::mWorkspaceSize;
-    using BaseLayer::mAllocatedSize;
+    [[nodiscard]] std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInputs>> prepareParams(
+        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs) const;
 
-    using BaseLayer::mStream;
-    using BaseLayer::mAllocator;
+private:
+    using BaseLayer::mDecoderDomain;
 
-    runtime::DecodingMode mDecodingMode;
+    executor::DecodingMode mDecodingMode;
 
     std::unique_ptr<BaseLayer> mDecodingLayer;
-
-    bool mHasDiffRuntimeArgs{false};
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

@@ -19,8 +19,11 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/loraModule.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
+#include "tensorrt_llm/runtime/speculativeDecodingMode.h"
+#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
+
 #include <NvInferRuntime.h>
+#include <array>
 
 namespace tensorrt_llm::runtime
 {
@@ -28,25 +31,29 @@ namespace tensorrt_llm::runtime
 class ModelConfig
 {
 public:
+    // See `split_point` defined in `tensorrt_llm/models/generation_mixin.py`.
+    // The split points are tuned to get better perf, if we need to let
+    // users tune that, we can support that by writing and reading the
+    // points in `config.json`.
+    static constexpr std::array kOPT_PROFILES_SPLIT_POINTS{64, 128, 256, 512, 1024};
+
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
-        kMamba = 2,          // https://github.com/state-spaces/mamba
-        kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
-    };
-
-    struct MambaConfig
-    {
-        SizeType dState = 0;
-        SizeType dConv = 0;
-        SizeType expand = 0;
+        kChatGlm = 1,        // https://github.com/THUDM/ChatGLM-6B
+        kGlm = 2,            // https://github.com/THUDM/GLM
+        kMamba = 3,          // https://github.com/state-spaces/mamba
+        kRecurrentGemma = 4, // https://github.com/google-deepmind/recurrentgemma
+        kEncDec = 5,
     };
 
     struct RnnConfig
     {
-        SizeType dConv = 0;
-        SizeType hiddenSize = 0;
+        SizeType32 stateSize = 0;
+        SizeType32 convKernel = 0;
+        SizeType32 rnnHiddenSize = 0;
+        SizeType32 rnnHeadSize = 0;
+        SizeType32 rnnConvDimSize = 0;
     };
 
     enum class LayerType : std::int32_t
@@ -55,11 +62,11 @@ public:
         kRECURRENT,
     };
 
-    explicit ModelConfig(SizeType vocabSize, SizeType nbAttentionLayers, SizeType nbSsmLayers, SizeType nbHeads,
-        SizeType hiddenSize, nvinfer1::DataType dtype)
+    explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbAttentionLayers, SizeType32 nbRnnLayers, SizeType32 nbHeads,
+        SizeType32 hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
         , mNbAttentionLayers(nbAttentionLayers)
-        , mNbSsmLayers(nbSsmLayers)
+        , mNbRnnLayers(nbRnnLayers)
         , mNbHeads(nbHeads)
         , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
@@ -80,69 +87,82 @@ public:
         , mComputeContextLogits(false)
         , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
-        , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
-        , mMaxDraftLen(0)
-        , mUseContextFMHAForGeneration(false)
+        , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
-        , mMedusaModule(std::nullopt)
         , mUseCrossAttention(false)
-        , mUsePositionEmbedding(true) // TODO: remove these two properties?
+        , mUsePositionEmbedding(false)
         , mUseTokenTypeEmbedding(false)
+        , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
+        , mLogitsDtype(nvinfer1::DataType::kFLOAT)
+        , mUseShapeInference(true)
     {
     }
 
-    [[nodiscard]] SizeType constexpr getVocabSize() const noexcept
+    [[nodiscard]] static std::vector<SizeType32> getOptProfilesSplitPoints() noexcept
+    {
+        return {kOPT_PROFILES_SPLIT_POINTS.begin(), kOPT_PROFILES_SPLIT_POINTS.end()};
+    }
+
+    [[nodiscard]] SizeType32 constexpr getVocabSize() const noexcept
     {
         return mVocabSize;
     }
 
-    [[nodiscard]] SizeType constexpr getVocabSizePadded(SizeType worldSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize) const noexcept
     {
         return (mVocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
-    [[nodiscard]] SizeType constexpr getNbAttentionLayers(SizeType pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbAttentionLayers % pipelineParallelism == 0);
         return mNbAttentionLayers / pipelineParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getNbSsmLayers(SizeType pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
     {
-        TLLM_CHECK(mNbSsmLayers % pipelineParallelism == 0);
-        return mNbSsmLayers / pipelineParallelism;
+        return mNbRnnLayers / pipelineParallelism;
     }
 
-    [[nodiscard]] SizeType constexpr getNbHeads() const noexcept
+    [[nodiscard]] SizeType32 constexpr getNbHeads() const noexcept
     {
         return mNbHeads;
     }
 
-    [[nodiscard]] SizeType constexpr getNbKvHeads() const noexcept
+    [[nodiscard]] SizeType32 constexpr getNbKvHeads() const noexcept
     {
         return mNbKvHeads;
     }
 
-    void constexpr setNbKvHeads(SizeType nbKvHeads) noexcept
+    void constexpr setNbKvHeads(SizeType32 nbKvHeads) noexcept
     {
         mNbKvHeads = nbKvHeads;
     }
 
-    [[nodiscard]] SizeType constexpr getHiddenSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
     {
         return mHiddenSize;
     }
 
-    [[nodiscard]] SizeType constexpr getSizePerHead() const noexcept
+    [[nodiscard]] SizeType32 constexpr getEncoderHiddenSize() const noexcept
+    {
+        return mEncoderHiddenSize;
+    }
+
+    void constexpr setEncoderHiddenSize(SizeType32 encoderHiddenSize) noexcept
+    {
+        mEncoderHiddenSize = encoderHiddenSize;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getSizePerHead() const noexcept
     {
         return mSizePerHead;
     }
 
-    void constexpr setSizePerHead(SizeType sizePerHead) noexcept
+    void constexpr setSizePerHead(SizeType32 sizePerHead) noexcept
     {
         mSizePerHead = sizePerHead;
     }
@@ -202,12 +222,12 @@ public:
         mPagedState = pagedState;
     }
 
-    [[nodiscard]] SizeType constexpr getTokensPerBlock() const noexcept
+    [[nodiscard]] SizeType32 constexpr getTokensPerBlock() const noexcept
     {
         return mTokensPerBlock;
     }
 
-    void constexpr setTokensPerBlock(SizeType TokensPerBlock) noexcept
+    void constexpr setTokensPerBlock(SizeType32 TokensPerBlock) noexcept
     {
         mTokensPerBlock = TokensPerBlock;
     }
@@ -225,57 +245,67 @@ public:
     [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
     {
         return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked && mPagedKvCache)
-            || (isSsmBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
+            || (isRnnBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
     }
 
-    [[nodiscard]] SizeType constexpr getMaxBatchSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxBatchSize() const noexcept
     {
         return mMaxBatchSize;
     }
 
-    void constexpr setMaxBatchSize(SizeType maxBatchSize) noexcept
+    void constexpr setMaxBatchSize(SizeType32 maxBatchSize) noexcept
     {
         mMaxBatchSize = maxBatchSize;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxBeamWidth() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxBeamWidth() const noexcept
     {
         return mMaxBeamWidth;
     }
 
-    void constexpr setMaxBeamWidth(SizeType maxBeamWidth) noexcept
+    void constexpr setMaxBeamWidth(SizeType32 maxBeamWidth) noexcept
     {
         mMaxBeamWidth = maxBeamWidth;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxInputLen() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxInputLen() const noexcept
     {
         return mMaxInputLen;
     }
 
-    void constexpr setMaxInputLen(SizeType maxInputLen) noexcept
+    void constexpr setMaxInputLen(SizeType32 maxInputLen) noexcept
     {
         mMaxInputLen = maxInputLen;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxSequenceLen() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxSequenceLen() const noexcept
     {
         return mMaxSequenceLen;
     }
 
-    void constexpr setMaxSequenceLen(SizeType maxSequenceLen) noexcept
+    void constexpr setMaxSequenceLen(SizeType32 maxSequenceLen) noexcept
     {
         mMaxSequenceLen = maxSequenceLen;
     }
 
-    [[nodiscard]] std::optional<SizeType> constexpr getMaxNumTokens() const noexcept
+    [[nodiscard]] std::optional<SizeType32> constexpr getMaxNumTokens() const noexcept
     {
         return mMaxNumTokens;
     }
 
-    void constexpr setMaxNumTokens(std::optional<SizeType> maxNumTokens) noexcept
+    void constexpr setMaxNumTokens(std::optional<SizeType32> maxNumTokens) noexcept
     {
         mMaxNumTokens = maxNumTokens;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getMaxEncoderLen() const noexcept
+    {
+        return mMaxEncoderLen;
+    }
+
+    void constexpr setMaxEncoderLen(SizeType32 maxEncoderLen) noexcept
+    {
+        mMaxEncoderLen = maxEncoderLen;
     }
 
     [[nodiscard]] bool constexpr usePromptTuning() const noexcept
@@ -283,12 +313,12 @@ public:
         return mMaxPromptEmbeddingTableSize > 0;
     }
 
-    [[nodiscard]] SizeType constexpr getMaxPromptEmbeddingTableSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxPromptEmbeddingTableSize() const noexcept
     {
         return mMaxPromptEmbeddingTableSize;
     }
 
-    void constexpr setMaxPromptEmbeddingTableSize(SizeType maxPromptEmbeddingTableSize) noexcept
+    void constexpr setMaxPromptEmbeddingTableSize(SizeType32 maxPromptEmbeddingTableSize) noexcept
     {
         mMaxPromptEmbeddingTableSize = maxPromptEmbeddingTableSize;
     }
@@ -323,39 +353,24 @@ public:
         mModelVariant = modelVariant;
     }
 
-    [[nodiscard]] bool constexpr useCustomAllReduce() const noexcept
+    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
     {
-        return mUseCustomAllReduce;
+        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
     }
 
-    void constexpr useCustomAllReduce(bool customAllReduce) noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
     {
-        mUseCustomAllReduce = customAllReduce;
+        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
     }
 
-    void constexpr setMaxDraftLen(SizeType maxDraftLen) noexcept
+    void constexpr setContextFMHA(bool contextFMHA) noexcept
     {
-        mMaxDraftLen = maxDraftLen;
+        mContextFMHA = contextFMHA;
     }
 
-    [[nodiscard]] SizeType getMaxDraftLen() const
+    [[nodiscard]] bool constexpr getContextFMHA() const noexcept
     {
-        return mMaxDraftLen;
-    }
-
-    [[nodiscard]] SizeType constexpr getMaxTokensPerStep() const noexcept
-    {
-        return mMaxDraftLen + 1;
-    }
-
-    void constexpr setUseContextFMHAForGeneration(bool useContextFMHAForGeneration) noexcept
-    {
-        mUseContextFMHAForGeneration = useContextFMHAForGeneration;
-    }
-
-    [[nodiscard]] bool constexpr getContextFMHAForGeneration() const noexcept
-    {
-        return mUseContextFMHAForGeneration;
+        return mContextFMHA;
     }
 
     void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
@@ -398,12 +413,12 @@ public:
         mLoraModules = loraModules;
     }
 
-    [[nodiscard]] SizeType constexpr getMlpHiddenSize() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMlpHiddenSize() const noexcept
     {
         return mMlpHiddenSize;
     }
 
-    void constexpr setMlpHiddenSize(SizeType mlpHiddenSize) noexcept
+    void constexpr setMlpHiddenSize(SizeType32 mlpHiddenSize) noexcept
     {
         mMlpHiddenSize = mlpHiddenSize;
     }
@@ -413,9 +428,9 @@ public:
         return mUseCrossAttention;
     }
 
-    void constexpr useCrossAttention(bool newCrossAttention) noexcept
+    void constexpr setUseCrossAttention(bool useCrossAttention) noexcept
     {
-        mUseCrossAttention = newCrossAttention;
+        mUseCrossAttention = useCrossAttention;
     }
 
     [[nodiscard]] bool constexpr usePositionEmbedding() const noexcept
@@ -423,9 +438,9 @@ public:
         return mUsePositionEmbedding;
     }
 
-    void constexpr usePositionEmbedding(bool newPositionEmbedding) noexcept
+    void constexpr setUsePositionEmbedding(bool usePositionEmbedding) noexcept
     {
-        mUsePositionEmbedding = newPositionEmbedding;
+        mUsePositionEmbedding = usePositionEmbedding;
     }
 
     [[nodiscard]] bool constexpr useTokenTypeEmbedding() const noexcept
@@ -433,44 +448,53 @@ public:
         return mUseTokenTypeEmbedding;
     }
 
-    void constexpr useTokenTypeEmbedding(bool newTokenTypeEmbedding) noexcept
+    void constexpr setUseTokenTypeEmbedding(bool useTokenTypeEmbedding) noexcept
     {
-        mUseTokenTypeEmbedding = newTokenTypeEmbedding;
+        mUseTokenTypeEmbedding = useTokenTypeEmbedding;
     }
 
-    [[nodiscard]] SizeType constexpr getFfnHiddenSize() const noexcept
-    {
-        return mFfnHiddenSize;
-    }
-
-    void constexpr setFfnHiddenSize(SizeType ffnHiddenSize) noexcept
-    {
-        mFfnHiddenSize = ffnHiddenSize;
-    }
-
-    [[nodiscard]] SizeType constexpr getMaxLoraRank() const noexcept
+    [[nodiscard]] SizeType32 constexpr getMaxLoraRank() const noexcept
     {
         return mMaxLoraRank;
     }
 
-    void constexpr setMaxLoraRank(SizeType maxLoraRank) noexcept
+    void constexpr setMaxLoraRank(SizeType32 maxLoraRank) noexcept
     {
         mMaxLoraRank = maxLoraRank;
     }
 
-    [[nodiscard]] bool constexpr useMedusa() const noexcept
+    void setSpeculativeDecodingMode(SpeculativeDecodingMode mode) noexcept
     {
-        return mMedusaModule.has_value();
+        mSpeculativeDecodingMode = mode;
     }
 
-    [[nodiscard]] std::optional<MedusaModule> getMedusaModule() const noexcept
+    [[nodiscard]] bool hasSpeculativeDecodingModule() const noexcept
     {
-        return mMedusaModule;
+        return mSpeculativeDecodingModule != nullptr;
     }
 
-    void setMedusaModule(MedusaModule const& medusaModule) noexcept
+    [[nodiscard]] SpeculativeDecodingModule const& getSpeculativeDecodingModule() const noexcept
     {
-        mMedusaModule = medusaModule;
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set");
+        return *mSpeculativeDecodingModule;
+    }
+
+    [[nodiscard]] std::shared_ptr<SpeculativeDecodingModule const> getSpeculativeDecodingModulePtr() const noexcept
+    {
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set");
+        return mSpeculativeDecodingModule;
+    }
+
+    [[nodiscard]] std::shared_ptr<SpeculativeDecodingModule> getSpeculativeDecodingModulePtr() noexcept
+    {
+        TLLM_CHECK_WITH_INFO(mSpeculativeDecodingModule, "Speculative decoding module is not set");
+        return mSpeculativeDecodingModule;
+    }
+
+    void setSpeculativeDecodingModule(
+        std::shared_ptr<SpeculativeDecodingModule> const& speculativeDecodingModule) noexcept
+    {
+        mSpeculativeDecodingModule = speculativeDecodingModule;
     }
 
     [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
@@ -492,27 +516,7 @@ public:
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
     {
         return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm
-            || mModelVariant == ModelVariant::kRecurrentGemma;
-    }
-
-    [[nodiscard]] bool hasMambaConfig() const noexcept
-    {
-        return mMambaConfig.has_value();
-    }
-
-    [[nodiscard]] std::optional<MambaConfig> getMambaConfig() const noexcept
-    {
-        return mMambaConfig;
-    }
-
-    void setMambaConfig(MambaConfig const& mambaConfig) noexcept
-    {
-        mMambaConfig = mambaConfig;
-    }
-
-    [[nodiscard]] bool constexpr isSsmBased() const noexcept
-    {
-        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+            || mModelVariant == ModelVariant::kChatGlm || mModelVariant == ModelVariant::kRecurrentGemma;
     }
 
     [[nodiscard]] bool hasRnnConfig() const noexcept
@@ -530,6 +534,11 @@ public:
         mRnnConfig = rnnConfig;
     }
 
+    [[nodiscard]] bool constexpr isRnnBased() const noexcept
+    {
+        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+    }
+
     [[nodiscard]] std::vector<LayerType> const& getLayerTypes() const noexcept
     {
         return mLayerTypes;
@@ -540,57 +549,85 @@ public:
         mLayerTypes = layerTypes;
     }
 
+    [[nodiscard]] SpeculativeDecodingMode constexpr getSpeculativeDecodingMode() const noexcept
+    {
+        return mSpeculativeDecodingMode;
+    }
+
+    void setLogitsDtype(nvinfer1::DataType inputDtype) noexcept
+    {
+        mLogitsDtype = inputDtype;
+    }
+
+    [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
+    {
+        return mLogitsDtype;
+    }
+
+    void setUseShapeInference(bool useShapeInference) noexcept
+    {
+        mUseShapeInference = useShapeInference;
+    }
+
+    [[nodiscard]] bool useShapeInference() const noexcept
+    {
+        return mUseShapeInference;
+    }
+
 private:
-    SizeType mVocabSize;
-    SizeType mNbAttentionLayers;
-    SizeType mNbSsmLayers;
-    SizeType mNbHeads;
-    SizeType mNbKvHeads;
-    SizeType mHiddenSize;
-    SizeType mSizePerHead;
+    SizeType32 mVocabSize;
+    SizeType32 mNbAttentionLayers;
+    SizeType32 mNbRnnLayers;
+    SizeType32 mNbHeads;
+    SizeType32 mNbKvHeads;
+    SizeType32 mHiddenSize;
+    SizeType32 mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
     bool mPagedKvCache;
     bool mPagedState;
-    SizeType mTokensPerBlock;
+    SizeType32 mTokensPerBlock;
     common::QuantMode mQuantMode;
-    SizeType mMaxBatchSize;
-    SizeType mMaxBeamWidth;
-    SizeType mMaxInputLen;
-    SizeType mMaxSequenceLen;
-    std::optional<SizeType> mMaxNumTokens;
+    SizeType32 mMaxBatchSize;
+    SizeType32 mMaxBeamWidth;
+    SizeType32 mMaxInputLen;
+    SizeType32 mMaxSequenceLen;
+    std::optional<SizeType32> mMaxNumTokens;
 
     bool mComputeContextLogits;
     bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
-    bool mUseCustomAllReduce;
 
-    SizeType mMaxPromptEmbeddingTableSize;
-    SizeType mMaxDraftLen;
+    SizeType32 mMaxPromptEmbeddingTableSize;
 
-    bool mUseContextFMHAForGeneration;
+    bool mContextFMHA;
     bool mPagedContextFMHA;
     bool mUseXQA;
 
     bool mUseLoraPlugin;
     std::vector<LoraModule> mLoraModules;
-    SizeType mMlpHiddenSize;
-    SizeType mMaxLoraRank;
-
-    std::optional<MedusaModule> mMedusaModule;
-    std::optional<MambaConfig> mMambaConfig;
-
-    // Configs related to encoder / enc-dec models
-    bool mUseCrossAttention;
-    bool mUsePositionEmbedding;
-    bool mUseTokenTypeEmbedding;
-    SizeType mFfnHiddenSize; // indicates encoder output hidden size
+    SizeType32 mMlpHiddenSize;
+    SizeType32 mMaxLoraRank;
 
     std::optional<RnnConfig> mRnnConfig;
 
+    // Configs related to encoder / enc-dec models
+    SizeType32 mMaxEncoderLen{};
+    SizeType32 mEncoderHiddenSize{};
+    bool mUseCrossAttention;
+    bool mUsePositionEmbedding;
+    bool mUseTokenTypeEmbedding;
+
     std::vector<LayerType> mLayerTypes;
+    // Speculative decoding members
+    std::shared_ptr<SpeculativeDecodingModule> mSpeculativeDecodingModule;
+    SpeculativeDecodingMode mSpeculativeDecodingMode;
+
+    // Logits datatype
+    nvinfer1::DataType mLogitsDtype;
+    bool mUseShapeInference;
 };
 
 } // namespace tensorrt_llm::runtime

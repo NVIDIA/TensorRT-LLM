@@ -142,8 +142,10 @@ Tensor preprocess_weights_for_mixed_gemm(
     int8_t* input_byte_ptr = get_ptr<int8_t>(row_major_quantized_weight);
     int8_t* output_byte_ptr = get_ptr<int8_t>(processed_tensor);
 
+    bool force_interleave = row_major_quantized_weight.dim() == 3; // WAR for MoE 3-D tensors.
+
     preprocess_weights_for_mixed_gemm(
-        output_byte_ptr, input_byte_ptr, {num_experts, num_rows, num_cols}, ft_quant_type);
+        output_byte_ptr, input_byte_ptr, {num_experts, num_rows, num_cols}, ft_quant_type, force_interleave);
 
     return processed_tensor;
 }

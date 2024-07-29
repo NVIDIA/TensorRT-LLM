@@ -75,7 +75,7 @@ class GenericGenerationOutput
 {
 public:
     using TensorPtr = TTensor;
-    using Callback = std::function<void(TensorPtr const& ids, SizeType step, bool finished)>;
+    using Callback = std::function<void(TensorPtr const& ids, SizeType32 step, bool finished)>;
 
     explicit GenericGenerationOutput(TensorPtr ids, TensorPtr lengths)
         : ids{std::move(ids)}

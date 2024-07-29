@@ -122,13 +122,15 @@ When using V1 batching, the following additional statistics are reported per V1 
 Users can alter the logits produced the network, with a callback attached to an `InferenceRequest`:
 
 ```
-  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream)>;
+  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
 ```
 
-The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.
+The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id.
 
 Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
+
+Multiple requests can share same client id and callback can use different logic based on client id.
 
 Note: this feature isn't supported with the `V1` batching scheme for the moment.
 
@@ -139,7 +141,7 @@ Note: this feature isn't supported with the `V1` batching scheme for the moment.
   - `InflightBatching` refers to a scheme where newly arrived requests are dynamically incorporated into the batch under execution, and requests are returned as soon as the end condition is met without any padding.
   - `InflightFusedBatching` is an improvement on `InflightBatching`, leveraging additional operation fusion opportunities and is expected to be strictly superior to it.
 * `maxBeamWidth`, the maximum beam width GptManager will allow for any request.
-* `schedulerPolicy`, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.
+* `capacitySchedulerPolicy`, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.
   - `MAX_UTILIZATION` packs as many requests as the underlying TRT engine can support in any iteration of the InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some requests be paused and restarted depending on peak KV cache memory availability.
   - `GUARANTEED_NO_EVICT` uses KV cache more conservatively guaranteeing that a request, once started, will run to completion without eviction.
 
@@ -150,7 +152,7 @@ Note: this feature isn't supported with the `V1` batching scheme for the moment.
     - `maxAttentionWindow` (default: unspecified) refers to the maximum number of tokens attended to in the model when using features like sliding window attention or StreamingLLM. If unspecified, each generated tokens attends to all previous tokens like traditional MHA or MQA.
     - `freeGpuMemoryFraction` (default: 0.9) a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache. If `maxTokens` is specified, allocated KV cache is the minimum of `maxTokens` and the value inferred from `freeGpuMemoryFraction`.
     - `enableBlockReuse` (default: `false`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
-  - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. However, it may not give performance benefits when the size of the model is not big enough to overlap the host overhead, or when the number of requests is too small.
+  - `enableTrtOverlap` (default: `false`) when `true`, GptManager partitions available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime. Note however that thanks to recent optimization work, the exposed CPU runtime has been reduced significantly and therefore, we do not recommend setting `enableTrtOverlap` to `true`, as it does not give noticeable throughput improvements and may hurt latency.
   - `enableChunkedContext` (default: `false`) Whether to enable context chunking. Context chunking increases the possibility of batching the context and generation phases, which in turn improves performance. When set to `false`, it indicates that the context chunk is disabled.
   - `peftCacheManagerConfig` (currently only supports LoRA, and requires `--use_lora_plugin` during engine build)
     - `numHostModuleLayer` (default: 0) number of adapter_size 1 single module single layer LoRA weight rows the host cache can hold.  Overrides `hostCacheSize` if non-zero.
@@ -171,7 +173,7 @@ The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tenso
 [1, beamWidth, maxSeqLength].
 * sequence length: a CPU tensor that indicates the length of inputID + outputID. Its shape is [1, 1].
 * context logits: a CPU tensor that contains context logits. Its shape is [1, promptLength, vocabSizePadded] if the engine is built with `gather_context_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1].
-* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1]. If you are using gptManagerBenchmark.cpp, please remember to pass corresponding parameters `--return-context-logits` and/or `--return-generation-logits` to obtain these logits. Note that enabling return logits will require more device memory for converting and storing logits. To reduce redundant memory buffer allocation as much as possible, we recommend that the `max_batch_size`, `max_beam_width`, `max_input_len`, `max_output_len`, and other parameters set when building the engine are close to the values required during actual inference.
+* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1]. If you are using gptManagerBenchmark.cpp, please remember to pass corresponding parameters `--return-context-logits` and/or `--return-generation-logits` to obtain these logits. Note that enabling return logits will require more device memory for converting and storing logits. To reduce redundant memory buffer allocation as much as possible, we recommend that the `max_batch_size`, `max_beam_width`, `max_input_len`, `max_seq_len`, and other parameters set when building the engine are close to the values required during actual inference.
 
 * logProb: a CPU tensor that stores the log-prob of the generated tokens. Its shape is [1, beamWidth, outputLength]
 * cumLogProb: a CPU tensor that stores the cumLogProb. Its shape is [1, beamWidth]
@@ -205,7 +207,7 @@ using namespace tensorrt_llm::batch_manager;
 GptManager batchManager(pathToTrtEngine,                   // Path to the TensorRT engine of the model,
                         TrtGptModelType::InflightFusedBatching, // Use in-flight batching,
                         maxBeamWidth,                      // Maximum beam width (must be >= 1),
-                        schedulerPolicy,                   // Scheduling policy (see below),
+                        schedulerConfig,                   // Scheduler configuration (see below),
                         getInferenceRequestsCb,            // The Get callback (see above),
                         sendResponseCb,                    // The Send callback (see above),
                         pollStopSignalCb,                  // The Stop signals callback (see above),
@@ -214,14 +216,14 @@ GptManager batchManager(pathToTrtEngine,                   // Path to the Tensor
 
 The scheduler policy helps the batch manager adjust how requests are scheduled
 for execution. The batch manager can try to maximize the utilization of the
-GPUs by aggressively scheduling requests (`schedulerPolicy` set to
-`MAX_UTILIZATION`) at the risk of having to pause requests if it runs short on
-memory for KV caches. Note that any paused request will be automatically resumed
+GPUs by aggressively scheduling requests (`SchedulerConfig::capacitySchedulerPolicy`
+set to `kMAX_UTILIZATION`) at the risk of having to pause requests if it runs short
+on memory for KV caches. Note that any paused request will be automatically resumed
 and the only user-visible effect may be increased latency.
 It can also adopt a more conservative approach and schedule requests only when it
 knows that the memory allocation will be sufficient to process all active requests
 even in the worst case of KV cache consumption. That mode corresponds to a
-`schedulerPolicy` set to `GUARANTEED_NO_EVICT`.
+`SchedulerConfig::capacitySchedulerPolicy` set to `kGUARANTEED_NO_EVICT`.
 
 The `GptManager`'s worker thread terminates when the `GptManager` destructor is
 called and there are no more active requests.

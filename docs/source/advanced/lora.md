@@ -23,7 +23,7 @@ trtllm-build --checkpoint_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
     --lora_plugin float16 \
     --max_batch_size 128 \
     --max_input_len 512 \
-    --max_output_len 50 \
+    --max_seq_len 562 \
     --lora_dir Japanese-Alpaca-LoRA-7b-v0 \
     --max_lora_rank 8 \
     --lora_target_modules "attn_q" "attn_k" "attn_v"
@@ -108,6 +108,11 @@ The following tensors are for a LoRA which has a `q` and `k` adapter.
 | cross_attn_k | 10 | k adapter for cross attention |
 | cross_attn_v | 11 | v adapter for cross attention |
 | cross_attn_dense | 12 | adapter for the dense layer in cross attention |
+| moe_h_to_4h | 13 | for mixtral adapter for expert mlp layer: up projection |
+| moe_4h_to_h | 14 | for mixtral adapter for expert mlp layer: down projection |
+| moe_gate | 15 | for mixtral adapter for expert mlp layer: gate |
+| moe_router | 16 | for mixtral adapter for expert router layer |
+| mlp_router | 17 | for qwen2-moe adapter for shared expert gate layer |
 
 #### LoraCache configuration
 
@@ -116,3 +121,11 @@ The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. 
 The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.
 
 As requests are scheduled for execution LoRAs are loaded into the GPU cache. Refer to the {ref}`batch-manager` section for more information.
+
+#### LoRA with tensor parallel
+
+The partition of tensor parallel for LoRA is special. There are two cases: `RowLinear` and `ColumnLinear`. Assume we have a linear layer and the input feature size is `K` and the output feature size is `N`. Then, the shape of the weight is `[K, N]`.
+
+First, consider this linear layer is a `ColumnLinear` layer. When we partition the weight, we split the weight by column with `tp_size`. Then, there are `tp_size` split weights and the shapes of these weights are `[K, N // tp_size]`. When we apply LoRA adapter on such `ColumnLinear` layer, the shapes of original two weights are `[K, lora_rank]` and `[lora_rank, N]`. So, we only partition the second weight and get `tp_size` split weights with shapes `[lora_rank, N // tp_size]`. For the first weight, each GPU maintains the same entire weight (with shape `[K, lora_rank]`).
+
+Next, consider this linear layer is a `RowLinear` layer. When we partition the weight, we split the weight by row with `tp_size`. Then, there are `tp_size` split weights and the shapes of these weights are `[K // tp_size, N]`. When we apply LoRA adapter on such `RowLinear` layer, the shapes of original two weights are `[K, lora_rank]` and `[lora_rank, N]`. So, we only partition the first weight and get `tp_size` split weights with shapes `[K // tp_size, lora_rank]`. For the second weight, each GPU maintains the same entire weight (with shape `[lora_rank, N]`).
