@@ -154,7 +154,7 @@ The following tables are references for commands that are used as part of the be
 
 | Stage | Description | Command |
 | :- | - | - |
-| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-build --model_config $model_cfg --use_fused_mlp --gpt_attention_plugin float16 --output_dir $engine_dir --max_batch_size $max_batch_size --max_input_len 2048 --max_output_len 2048 --reduce_fusion disable --workers $tp_size --max_num_tokens $max_num_tokens --use_paged_context_fmha enable --multiple_profiles enable` |
+| [Build](#engine-building) | Build a TensorRT-LLM engine | `trtllm-build --model_config $model_cfg --use_fused_mlp --gpt_attention_plugin float16 --output_dir $engine_dir --max_batch_size $max_batch_size --max_input_len 2048 --max_seq_len 2048 --reduce_fusion disable --workers $tp_size --max_num_tokens $max_num_tokens --use_paged_context_fmha enable --multiple_profiles enable` |
 | [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `benchmarks/cpp/prepare_dataset.py --output=$dataset_file --tokenizer=$model_name token-norm-dist --num-requests=2000 --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0` |
 | [Run](#running-the-benchmark) | Run a benchmark with a dataset | `mpirun -n $tp_size --allow-run-as-root --oversubscribe cpp/build/benchmarks/gptManagerBenchmark --engine_dir $engine_dir --type IFB --dataset $dataset_file --eos_id -1 --scheduler_policy guaranteed_no_evict --kv_cache_free_gpu_mem_fraction 0.99 --output_csv result.csv --request_rate -1.0 --enable_chunked_context --warm_up 0` |
 
@@ -187,7 +187,7 @@ for the model that you would like to build (see [below](#network-configuration-f
 command is as follows:
 
 ```shell
-trtllm-build --model_config $model_cfg --use_fused_mlp --gpt_attention_plugin float16 --output_dir $engine_dir --max_batch_size $max_batch_size --max_input_len 2048 --max_output_len 2048 --reduce_fusion disable --workers $tp_size --max_num_tokens $max_num_tokens --use_paged_context_fmha enable --multiple_profiles enable
+trtllm-build --model_config $model_cfg --use_fused_mlp --gpt_attention_plugin float16 --output_dir $engine_dir --max_batch_size $max_batch_size --max_input_len 2048 --max_seq_len 2048 --reduce_fusion disable --workers $tp_size --max_num_tokens $max_num_tokens --use_paged_context_fmha enable --multiple_profiles enable
 ```
 
 Some notes about the command:
