@@ -250,6 +250,10 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
         self.gather_context_logits = False
         self.logits_soft_cap = config.logits_soft_cap
 
+        # Create constant attention parameters to be reused by all layers.
+        Attention.create_attention_const_params(self, config)
+        self.position_embedding_type = config.position_embedding_type
+
         if isinstance(logits_dtype, str):
             self._logits_dtype = str_dtype_to_trt(logits_dtype)
         else:
@@ -279,6 +283,11 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 last_token_ids_for_logits=None,
                 host_context_lengths=None,
                 slot_mapping=None):
+
+        # fill attention params.
+        attention_params = Attention.fill_attention_params(
+            self, attention_params)
+
         hidden_states, present_kvs, present_convs, present_rnns = self.transformer(
             input_ids, use_cache, attention_mask, kv_cache_params,
             attention_params, conv_states, rnn_states, host_request_types,

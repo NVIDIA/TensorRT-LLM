@@ -22,10 +22,10 @@ from .._common import default_net, precision
 from .._utils import fp32_array, is_same_dtype
 from ..functional import (ACT2FN, AllReduceFusionOp, AllReduceFusionParams,
                           AttentionMaskType, PositionEmbeddingType,
-                          RopeEmbeddingUtils, RotaryScalingType, Tensor,
-                          allgather, allreduce, cast, concat, constant,
-                          embedding, generate_alibi_slopes, gpt_attention,
-                          matmul, mul, shape, slice, softmax, split, where)
+                          RotaryScalingType, Tensor, allgather, allreduce, cast,
+                          concat, constant, embedding, generate_alibi_slopes,
+                          gpt_attention, matmul, mul, shape, slice, softmax,
+                          split, where)
 from ..layers import SpecDecodingParams
 from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
@@ -1461,18 +1461,6 @@ class SmoothQuantAttention(Module):
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
                                             rotary_embedding_percentage)
-            rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-                self.max_position_embeddings, self.rotary_embedding_dim,
-                self.rotary_embedding_base, self.rotary_embedding_scale,
-                self.rotary_embedding_scale_type, rotary_embedding_scaling)
-            self.register_parameter(
-                'rotary_inv_freq',
-                Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
-            self.register_parameter(
-                'embed_positions_for_gpt_attention',
-                Parameter(embed_positions_for_gpt_attention,
-                          dtype='float32',
-                          is_buffer=True))
         elif self.position_embedding_type.is_alibi():
             alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
             alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
@@ -1576,8 +1564,8 @@ class SmoothQuantAttention(Module):
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
             if self.position_embedding_type.is_rope():
-                rotary_inv_freq = self.rotary_inv_freq.value
-                rotary_cos_sin = self.embed_positions_for_gpt_attention.value
+                rotary_inv_freq = attention_params.rotary_inv_freq
+                rotary_cos_sin = attention_params.embed_positions_for_gpt_attention
             else:
                 rotary_inv_freq = None
                 rotary_cos_sin = None

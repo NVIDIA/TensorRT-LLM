@@ -1034,6 +1034,17 @@ if __name__ == '__main__':
     elif chatglm_version in ['chatglm2', 'chatglm3']:
         position_embedding_type = 'rope_gptj'
 
+    rotary_base = 10000.0
+    rotary_embedding_scaling = None
+    if chatglm_version == 'chatglm2':
+        if hf_config.rope_ratio > 1:
+            rotary_embedding_scaling = {
+                'type': 'linear',
+                'factor': hf_config.rope_ratio
+            }
+    elif chatglm_version == 'chatglm3':
+        rotary_base *= hf_config.rope_ratio
+
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
@@ -1047,6 +1058,9 @@ if __name__ == '__main__':
         'vocab_size': hf_config.vocab_size,
         'position_embedding_type': position_embedding_type,
         'max_position_embeddings': hf_config.max_position_embeddings,
+        'rotary_pct': 0.5,
+        'rotary_base': rotary_base,
+        'rotary_scaling': rotary_embedding_scaling,
         'hidden_act': hf_config.hidden_act,
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,

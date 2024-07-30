@@ -210,6 +210,10 @@ class PretrainedConfig:
             raise NotImplementedError(
                 "Embedding table cannot be shared for pipeline parallelism")
 
+        if share_embedding_table and mapping.cp_size > 1:
+            raise NotImplementedError(
+                "Embedding table cannot be shared for context parallelism")
+
         if head_size is None:
             head_size = hidden_size // num_attention_heads
         self.head_size = head_size
@@ -276,6 +280,7 @@ class PretrainedConfig:
     def set_rank(self, rank):
         self.mapping = Mapping(self.mapping.world_size,
                                rank=rank,
+                               cp_size=self.mapping.cp_size,
                                tp_size=self.mapping.tp_size,
                                pp_size=self.mapping.pp_size,
                                moe_tp_size=self.mapping.moe_tp_size,
@@ -678,6 +683,9 @@ class DecoderModelForCausalLM(PretrainedModel):
         self.lm_head = lm_head
         self.mup_width_multiplier = getattr(config, 'mup_width_multiplier',
                                             None)
+        # Create constant attention parameters to be reused by all layers.
+        Attention.create_attention_const_params(self, config)
+        self.position_embedding_type = config.position_embedding_type
 
     def forward(self,
                 input_ids: Tensor,
@@ -693,6 +701,11 @@ class DecoderModelForCausalLM(PretrainedModel):
                 prompt_vocab_size: Optional[Tensor] = None,
                 lora_params=None,
                 spec_decoding_params=None):
+
+        # fill attention params.
+        attention_params = Attention.fill_attention_params(
+            self, attention_params)
+
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,

@@ -156,8 +156,8 @@ void MixtureOfExpertsPlugin::init()
 {
     TLLM_CHECK_WITH_INFO(
         mType == DataType::kFP8 || mOutputType == mType, "MOE plugin only supports a different output type for FP8");
-    TLLM_CHECK_WITH_INFO(mType != DataType::kFP8 || tensorrt_llm::common::getSMVersion() >= 90,
-        "MoE FP8 is not supported for architectures less than SM90");
+    TLLM_CHECK_WITH_INFO(mType != DataType::kFP8 || tensorrt_llm::common::getSMVersion() >= 89,
+        "MoE FP8 is not supported for architectures less than SM89");
 
     if (mWeightType == nvinfer1::DataType::kINT8 && mQuantMode.hasInt4Weights())
     {
@@ -226,6 +226,7 @@ void MixtureOfExpertsPlugin::init()
         mType, mWeightType, mQuantMode};
     mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
         mType, mWeightType, mQuantMode};
+    mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mK);
 }
 
 // IPluginV2DynamicExt Methods
@@ -689,7 +690,7 @@ char const* MixtureOfExpertsPluginCreator::getPluginNamespace() const noexcept
     return mNamespace.c_str();
 }
 
-void MixtureOfExpertsGemmProfiler::computeTmpSize(int maxM, int n, int k)
+void MixtureOfExpertsGemmProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     checkInit();
     size_t bytes = backend.getWorkspaceSize(maxM);

@@ -36,6 +36,7 @@ class LLaMAConfig(PretrainedConfig):
                  residual_mlp: bool = False,
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
+                 remove_duplicated_kv_heads: bool = False,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -55,6 +56,7 @@ class LLaMAConfig(PretrainedConfig):
             moe = MoeConfig.from_dict(moe)
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
+        self.remove_duplicated_kv_heads = remove_duplicated_kv_heads
 
         super().__init__(**kwargs)
 
@@ -122,6 +124,8 @@ class LLaMAConfig(PretrainedConfig):
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)
+        remove_duplicated_kv_heads = kwargs.pop('remove_duplicated_kv_heads',
+                                                False)
 
         if hf_config.model_type == "mixtral" or hf_config.model_type == "arctic":
             # HF LLaMA-type models are implicitly using gated activation.
@@ -168,6 +172,7 @@ class LLaMAConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            remove_duplicated_kv_heads=remove_duplicated_kv_heads,
             **kwargs)
 
     @classmethod

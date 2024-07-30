@@ -446,8 +446,6 @@ public:
             // Epilogue
             //
 
-            EpilogueOutputOp output_op(params.output_op);
-
             ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
             ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
 
@@ -468,7 +466,20 @@ public:
             Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
 
             // Execute the epilogue operator to update the destination tensor.
-            epilogue(output_op, iterator_D, accumulators, iterator_C);
+            if constexpr (platform::is_same<EpilogueOutputOp,
+                              cutlass::epilogue::thread::LinearCombination<typename EpilogueOutputOp::ElementOutput,
+                                  EpilogueOutputOp::kCount, typename EpilogueOutputOp::ElementAccumulator,
+                                  typename EpilogueOutputOp::ElementCompute, EpilogueOutputOp::kScale,
+                                  EpilogueOutputOp::kRound>>::value)
+            {
+                EpilogueOutputOp output_op(params.output_op, problem_idx);
+                epilogue(output_op, iterator_D, accumulators, iterator_C);
+            }
+            else
+            {
+                EpilogueOutputOp output_op(params.output_op);
+                epilogue(output_op, iterator_D, accumulators, iterator_C);
+            }
 
             // Next tile
             problem_visitor.advance(gridDim.x);
@@ -501,8 +512,19 @@ public:
         run_kernel<arch::Sm70>(params, shared_storage);
 #elif (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
         run_kernel<arch::Sm75>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 890)
         run_kernel<arch::Sm80>(params, shared_storage);
+#elif (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
+        constexpr bool isFp8 = platform::is_same<ElementA, cutlass::float_e4m3_t>::value
+            || platform::is_same<ElementA, cutlass::float_e5m2_t>::value;
+        if constexpr (isFp8)
+        {
+            run_kernel<arch::Sm89>(params, shared_storage);
+        }
+        else
+        { // reuse sm80 kernel for other types, align with dispatchToArch
+            run_kernel<arch::Sm80>(params, shared_storage);
+        }
 #elif (__CUDA_ARCH__ >= 900)
         run_kernel<arch::Sm80>(params, shared_storage);
 #else

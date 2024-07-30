@@ -40,6 +40,10 @@ def parse_arguments():
                         type=str,
                         default=None,
                         help='Directory containing visual TRT engines')
+    parser.add_argument('--visual_engine_name',
+                        type=str,
+                        default='model.engine',
+                        help='Name of visual TRT engine')
     parser.add_argument('--llm_engine_dir',
                         type=str,
                         default=None,
@@ -314,7 +318,7 @@ class MultimodalModelRunner:
 
     def init_image_encoder(self):
         vision_encoder_path = os.path.join(self.args.visual_engine_dir,
-                                           'visual_encoder.engine')
+                                           self.args.visual_engine_name)
         logger.info(f'Loading engine from {vision_encoder_path}')
         with open(vision_encoder_path, 'rb') as f:
             engine_buffer = f.read()

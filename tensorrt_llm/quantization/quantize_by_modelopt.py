@@ -513,6 +513,31 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
+        # Set rotary parameters correctly for chatglm.
+        if model_type == 'chatglm':
+            rotary_base = 10000.0
+            rotary_embedding_scaling = None
+            chatglm_config = AutoConfig.from_pretrained(model_dir,
+                                                        trust_remote_code=True)
+            chatglm_version = tensorrt_llm_config['chatglm_version']
+            rope_ratio = tensorrt_llm_config.get('rope_ratio', 1.0)
+            if chatglm_version == 'chatglm2':
+                if rope_ratio > 1:
+                    rotary_embedding_scaling = {
+                        'type': 'linear',
+                        'factor': rope_ratio
+                    }
+            elif chatglm_version == 'chatglm3':
+                rotary_base *= rope_ratio
+
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            tensorrt_llm_config['rotary_base'] = rotary_base
+            tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
+            tensorrt_llm_config['rotary_pct'] = 0.5
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
         torch.cuda.empty_cache(
         )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
 

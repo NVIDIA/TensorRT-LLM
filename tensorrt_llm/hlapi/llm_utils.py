@@ -1017,7 +1017,8 @@ class ModelLoader:
         assert self._model_dir is not None
 
         import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(self._model_dir)
+        hf_config = transformers.AutoConfig.from_pretrained(
+            self._model_dir, trust_remote_code=True)
         architecture = hf_config.architectures[0]
 
         if architecture not in MODEL_MAP:
@@ -1262,7 +1263,8 @@ class CachedModelLoader:
         # dtype. That's why the model will be downloaded from HF if necessary to get the accurate dtype.
 
         import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(model_dir)
+        hf_config = transformers.AutoConfig.from_pretrained(
+            model_dir, trust_remote_code=True)
         architecture = hf_config.architectures[0]
 
         if architecture not in MODEL_MAP:

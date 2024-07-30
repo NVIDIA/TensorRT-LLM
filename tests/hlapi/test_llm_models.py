@@ -1,9 +1,10 @@
+import subprocess
 from typing import List, Optional
 
 import pytest
 import torch
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import LLM, BuildConfig, SamplingParams
 from tensorrt_llm.hlapi import QuantAlgo, QuantConfig
 
 try:
@@ -20,6 +21,11 @@ from utils.util import force_ampere, similar, skip_pre_hopper
 gptj_model_path = get_model_path('gpt-j-6b')
 gpt2_model_path = get_model_path('gpt2-medium')
 starcoder2_model_path = get_model_path('starcoder2-3b')
+phi_1_5_model_path = get_model_path('phi-1_5')
+phi_2_model_path = get_model_path('phi-2')
+phi_3_mini_4k_model_path = get_model_path('Phi-3/Phi-3-mini-4k-instruct')
+phi_3_small_8k_model_path = get_model_path('Phi-3/Phi-3-small-8k-instruct')
+phi_3_medium_4k_model_path = get_model_path('Phi-3/Phi-3-medium-4k-instruct')
 
 sampling_params = SamplingParams(max_new_tokens=10)
 
@@ -43,6 +49,7 @@ def llm_test_harness(model_dir: str,
 
     llm = LLM(model_dir, tokenizer=model_dir, **llm_kwargs)
     outputs = llm.generate(prompts, sampling_params=sampling_params)
+    print(outputs)
     for out, ref in zip(outputs, references):
         assert similar(out.outputs[0].text, ref, threshold=similar_threshold)
 
@@ -110,5 +117,54 @@ def test_llm_starcoder2_fp8():
                      quant_config=quant_config)
 
 
+def test_llm_phi_1_5():
+    llm_test_harness(phi_1_5_model_path,
+                     prompts=['A B C'],
+                     references=[' D E F G H I J K L M'],
+                     sampling_params=sampling_params)
+
+
+#@force_ampere
+def test_llm_phi_2():
+    llm_test_harness(phi_2_model_path,
+                     prompts=['A B C'],
+                     references=[' D E F G H I J K L M'],
+                     sampling_params=sampling_params)
+
+
+force_ampere
+
+
+def test_llm_phi_3_mini_4k():
+    phi_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
+                                        "examples/phi/requirements.txt")
+    command = f"pip install -r {phi_requirement_path}"
+    subprocess.run(command, shell=True, check=True, env=os.environ)
+    llm_test_harness(phi_3_mini_4k_model_path,
+                     prompts=['A B C'],
+                     references=[' D E F G H I J K L M'],
+                     sampling_params=sampling_params)
+
+
+@force_ampere
+def test_llm_phi_3_small_8k():
+    phi_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
+                                        "examples/phi/requirements.txt")
+    command = f"pip install -r {phi_requirement_path}"
+    subprocess.run(command, shell=True, check=True, env=os.environ)
+    build_config = BuildConfig()
+    build_config.plugin_config._gemm_plugin = 'auto'
+    llm_test_harness(
+        phi_3_small_8k_model_path,
+        prompts=["where is France's capital?"],
+        references=[' Paris is the capital of France. It is known'],
+        sampling_params=sampling_params,
+        build_config=build_config)
+
+
 if __name__ == '__main__':
-    test_llm_gpt2()
+    test_llm_gptj()
+    test_llm_phi_1_5()
+    test_llm_phi_2()
+    test_llm_phi_3_mini_4k()
+    test_llm_phi_3_small_8k()

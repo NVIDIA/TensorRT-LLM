@@ -74,7 +74,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
         tactic, workspacePtr, wsSize, stream);
 }
 
-void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16)
     int const originalN = n * FP16_INT4_RATIO;
