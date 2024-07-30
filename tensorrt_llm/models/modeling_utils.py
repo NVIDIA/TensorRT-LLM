@@ -1123,6 +1123,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
     """
     quant_algo = model_config.quantization.quant_algo
     kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
+    exclude_modules = model_config.quantization.exclude_modules
 
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
@@ -1193,6 +1194,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
     elif quant_algo in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         weights = weight_only_quantize_dict(weights=weights,
                                             quant_algo=quant_algo,
+                                            exclude_modules=exclude_modules,
                                             plugin=True)
 
     # FP8 kv_cache_scaling_factor is always 1.0
