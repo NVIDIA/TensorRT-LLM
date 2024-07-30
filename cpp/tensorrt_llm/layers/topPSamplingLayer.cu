@@ -196,7 +196,10 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopK.size()) == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
-        mBufferManager->copy(runtimeTopK.data(), *mSetupWorkspaceDevice, runtime::MemoryType::kCPU);
+        const auto runtimeTopKBytes = runtimeTopK.size() * sizeof(std::remove_cv_t<decltype(runtimeTopK)>::value_type);
+        BufferPtr runtimeTopKSetupWorkspaceSlice = IBuffer::slice(mSetupWorkspaceDevice, 0, runtimeTopKBytes);
+        TLLM_CHECK(runtimeTopKBytes == runtimeTopKSetupWorkspaceSlice->getSizeInBytes());
+        mBufferManager->copy(runtimeTopK.data(), *runtimeTopKSetupWorkspaceSlice, runtime::MemoryType::kCPU);
         invokeScatterDecodingParams(
             setupWorkspaceDevicePtr, runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
     }
@@ -205,7 +208,10 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopP.size()) == batchSize,
             fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopP.size(), batchSize));
-        mBufferManager->copy(runtimeTopP.data(), *mSetupWorkspaceDevice, runtime::MemoryType::kCPU);
+        const auto runtimeTopPBytes = runtimeTopP.size() * sizeof(std::remove_cv_t<decltype(runtimeTopP)>::value_type);
+        BufferPtr runtimeTopPSetupWorkspaceSlice = IBuffer::slice(mSetupWorkspaceDevice, 0, runtimeTopPBytes);
+        TLLM_CHECK(runtimeTopPBytes == runtimeTopPSetupWorkspaceSlice->getSizeInBytes());
+        mBufferManager->copy(runtimeTopP.data(), *runtimeTopPSetupWorkspaceSlice, runtime::MemoryType::kCPU);
         invokeScatterDecodingParams(
             setupWorkspaceDeviceAsFloatPtr, runtimeTopPDevicePtr, batchSlotsPtr, batchSize, getStream());
     }
