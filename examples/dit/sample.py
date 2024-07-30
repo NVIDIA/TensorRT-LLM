@@ -37,11 +37,15 @@ class TllmDiT(object):
         self.dtype = config['pretrained_config']['dtype']
 
         rank = tensorrt_llm.mpi_rank()
-        world_size = tp = config['pretrained_config']['mapping'][
-            'world_size']  # Only support TP
+        world_size = config['pretrained_config']['mapping']['world_size']
+        cp_size = config['pretrained_config']['mapping']['cp_size']
+        tp_size = config['pretrained_config']['mapping']['tp_size']
+        pp_size = config['pretrained_config']['mapping']['pp_size']
+        assert pp_size == 1
         self.mapping = tensorrt_llm.Mapping(world_size=world_size,
                                             rank=rank,
-                                            tp_size=tp,
+                                            cp_size=cp_size,
+                                            tp_size=tp_size,
                                             pp_size=1,
                                             gpus_per_node=args.gpus_per_node)
 

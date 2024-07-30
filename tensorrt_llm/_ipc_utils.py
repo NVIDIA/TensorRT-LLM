@@ -102,7 +102,9 @@ class IpcMemory():
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
-        comm = mpi_comm().Split(mapping.pp_rank, mapping.tp_rank)
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.tp_rank)
 
         error, local_ptr = cudart.cudaMalloc(size)
         _raise_if_error(error)

@@ -311,7 +311,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                mapping=mapping,
                                                quant_config=quant_config,
                                                **kwargs)
-
+        if config.remove_duplicated_kv_heads:
+            config.num_key_value_heads /= 2
         if use_preloading:
             assert not load_by_shard
             weights = load_weights_from_hf_model(hf_model, config)

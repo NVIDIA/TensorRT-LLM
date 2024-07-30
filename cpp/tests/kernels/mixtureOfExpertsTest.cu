@@ -135,7 +135,7 @@ protected:
         static_assert(!FP8, "FP8 Tests enabled on unsupported CUDA version");
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
-        bool should_skip_unsupported_fp8 = getSMVersion() < 90 && FP8;
+        bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
         return should_skip_no_device || should_skip_unsupported_fp8;
     }
 

@@ -157,14 +157,19 @@ class MoeGemmRunner
 public:
     MoeGemmRunner();
 
-    void moeGemmBiasAct(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
-        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, ActivationType activation_type, bool use_fused_moe, cudaStream_t stream,
+    using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>;
+    static constexpr bool use_fp8 = std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value;
+
+    void moeGemmBiasAct(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales,
+        HopperGemmOutputType const* biases, HopperGemmOutputType* C, int64_t const* total_rows_before_expert,
+        HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
+        ActivationType activation_type, bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
         cutlass_extensions::CutlassGemmConfig chosen_conf);
 
-    void moeGemm(T const* A, WeightType const* B, T const* weight_scales, T* C, int64_t const* total_rows_before_expert,
-        HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
-        bool use_fused_moe, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
+    void moeGemm(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales, HopperGemmOutputType* C,
+        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
+        int64_t gemm_k, int num_experts, bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
+        cutlass_extensions::CutlassGemmConfig chosen_conf);
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
     static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
@@ -183,15 +188,17 @@ public:
 
 private:
     template <typename EpilogueTag>
-    void dispatchToArch(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
-        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe,
+    void dispatchToArch(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales,
+        HopperGemmOutputType const* biases, HopperGemmOutputType* C, int64_t const* total_rows_before_expert,
+        HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
+        cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe, float const** alpha_scale_ptr_array,
         cudaStream_t stream, int* occupancy = nullptr);
 
     template <typename EpilogueTag>
-    void runGemm(T const* A, WeightType const* B, T const* weight_scales, T const* biases, T* C,
-        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, bool use_fused_moe, cudaStream_t stream,
+    void runGemm(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales,
+        HopperGemmOutputType const* biases, HopperGemmOutputType* C, int64_t const* total_rows_before_expert,
+        HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
+        bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
         cutlass_extensions::CutlassGemmConfig chosen_conf);
 
 private:

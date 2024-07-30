@@ -1,8 +1,6 @@
-import json
+import copy
 import os
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import safetensors
@@ -13,10 +11,13 @@ from ...functional import PositionEmbeddingType, Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, BlockSparseAttnParams,
                        Embedding, LayerNorm, ParallelLMHead, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
+from ...mapping import Mapping
 from ...module import Module
+from ...quantization import QuantAlgo
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
-from .convert import convert_hf_config, convert_hf_weights
+                              PretrainedConfig, QuantConfig)
+from .config import Phi3Config
+from .convert import load_weights_from_hf_model
 
 
 class Phi3DecoderLayer(Module):
@@ -234,50 +235,99 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
         super().__init__(config, transformer, lm_head)
 
     @classmethod
-    def convert_hf_checkpoint(cls,
-                              hf_model_dir: str,
-                              dtype: Optional[str] = "float16",
-                              output_dir: Optional[str] = None,
-                              args=None):
-        '''
-        Convert Huggingface checkpoint to TRT-LLM checkpoint
-        '''
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        import transformers
 
-        hf_model = AutoModelForCausalLM.from_pretrained(hf_model_dir,
-                                                        torch_dtype="auto",
-                                                        trust_remote_code=True)
-        config = convert_hf_config(hf_model.config, dtype, args)
-        with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-            json.dump(config, f, indent=4)
-
-        small_variant = config['architecture'] == "Phi3SmallForCausalLM"
-
-        def covert_and_save(rank):
-            weights = convert_hf_weights(hf_model, dtype, config, small_variant,
-                                         args, rank)
-            safetensors.torch.save_file(
-                weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
-
-        world_size = args.tp_size * args.pp_size
-        if args.workers == 1:
-            for rank in range(world_size):
-                covert_and_save(rank)
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
         else:
-            with ThreadPoolExecutor(max_workers=args.workers) as p:
-                futures = [
-                    p.submit(covert_and_save, rank)
-                    for rank in range(world_size)
-                ]
-                exceptions = []
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        traceback.print_exc()
-                        exceptions.append(e)
-                assert len(
-                    exceptions
-                ) == 0, "Checkpoint conversion failed, please check error log."
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+        config = Phi3Config.from_hugging_face(hf_config_or_dir,
+                                              dtype=dtype,
+                                              mapping=mapping,
+                                              quant_config=quant_config,
+                                              **kwargs)
+
+        if not use_preloading:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
+
+        assert isinstance(hf_model, transformers.PreTrainedModel)
+
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
+        **kwargs,
+    ):
+        DEFAULT_MODELOPT_FLOW = [
+            QuantAlgo.W4A16_AWQ,
+            QuantAlgo.FP8,
+            QuantAlgo.W8A8_SQ_PER_CHANNEL,
+        ]
+        NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None]
+
+        config = Phi3Config.from_hugging_face(hf_model_dir,
+                                              dtype=dtype,
+                                              mapping=mapping,
+                                              quant_config=quant_config,
+                                              **kwargs)
+
+        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=config.dtype,
+                             mapping=config.mapping,
+                             quant_config=config.quantization,
+                             device=device,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        else:
+            assert quant_config.quant_algo in NATIVE_QUANT_FLOW, f"Internal error: shall call Modelopt for this quantization {quant_config}"
+
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
+
+            for rank in range(mapping.world_size):
+                weights = load_weights_from_hf_model(hf_model, config)
+                config = copy.deepcopy(config)
+                config.set_rank(rank)
+                safetensors.torch.save_file(
+                    weights, os.path.join(output_dir,
+                                          f'rank{rank}.safetensors'))
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

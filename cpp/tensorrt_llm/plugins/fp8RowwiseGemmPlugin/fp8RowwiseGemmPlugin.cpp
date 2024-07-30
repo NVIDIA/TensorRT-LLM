@@ -93,7 +93,7 @@ int Fp8RowwiseGemmPluginProfiler::getMaxProfileM() const
     return 16384;
 }
 
-void Fp8RowwiseGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void Fp8RowwiseGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     std::vector<size_t> workspaces = {
         maxM * k * getBytePerElement(nvinfer1::DataType::kFP8), // A

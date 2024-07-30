@@ -112,7 +112,7 @@ bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& 
     return checkResult;
 }
 
-void CublasLtGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void CublasLtGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     size_t dataSize = typeSize(mType);
     size_t outputDataSize = typeSize(mOutputType);

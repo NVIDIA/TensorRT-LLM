@@ -105,6 +105,7 @@ def parse_arguments():
         help='It equals to max_batch_size*max_beam_width by default, set this '
         'value as close as possible to the actual number of tokens on your workload. '
         'Note that this argument might be removed in the future.')
+    parser.add_argument('--cp_size', type=int, default=1)
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument(
@@ -269,6 +270,7 @@ def build_model(
     bool = False,  # return the modified BuildConfig without actually building the engine
     **kwargs
 ) -> Union[Engine, BuildConfig]:
+
     model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
@@ -412,6 +414,7 @@ def main():
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
+        'cp_size': args.cp_size,
         'tp_size': args.tp_size,
         'pp_size': args.pp_size,
         'lora_dir': args.lora_dir,

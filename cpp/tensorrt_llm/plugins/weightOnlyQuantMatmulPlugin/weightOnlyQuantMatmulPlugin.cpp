@@ -59,7 +59,7 @@ void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     }
 }
 
-void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     int const originalN = n * getWeightTypeMultiplier(mWeightTypeId);
     std::vector<size_t> workspaces = {

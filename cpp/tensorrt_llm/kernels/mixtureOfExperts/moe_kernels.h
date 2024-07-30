@@ -173,14 +173,14 @@ public:
         int64_t const* const num_valid_tokens_ptr, void const* const fc1_int_scales, float const* const fc1_fp8_dequant,
         float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts_per_node, ActivationType fc1_activation_type,
-        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config)
+        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config)
         = 0;
 
     virtual void gemm2(void const* const input, void* const output, int64_t const* const total_rows_before_expert,
         HopperGroupedGemmInput hopper_input_template, void const* const fc2_expert_weights,
         void const* const fc2_int_scales, float const* const fc2_fp8_dequant, int64_t const expanded_num_rows,
-        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, cudaStream_t stream,
-        cutlass_extensions::CutlassGemmConfig config)
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
+        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config)
         = 0;
 
     virtual size_t getGemmWorkspaceSize(int num_experts) const = 0;
@@ -193,12 +193,12 @@ public:
 // Avoid making several duplicates of this class.
 template <typename T,        /*The type used for activations/scales/compute*/
     typename WeightType,     /* The type for the MoE weights */
-    typename OutputType = T, /* The type for the MoE final output */
+    typename OutputType = T, /* The type for the MoE weights */
     typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 {
     using Self = CutlassMoeFCRunner<T, WeightType, OutputType>;
-
+    using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>; /* Internal gemm output type*/
 public:
     CutlassMoeFCRunner() = default;
 
@@ -242,16 +242,18 @@ public:
     static void gemm1(MoeGemmRunner<T, WeightType>& gemm_runner, T const* const input, T* const output,
         void* const intermediate_result, int64_t const* const total_rows_before_expert,
         HopperGroupedGemmInput const hopper_input_template, WeightType const* const fc1_expert_weights,
-        T const* const fc1_expert_biases, int64_t const* const num_valid_tokens_ptr, T const* const fc1_int_scales,
-        float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant, int64_t const expanded_num_rows,
-        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
-        ActivationType fc1_activation_type, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config);
+        HopperGemmOutputType const* const fc1_expert_biases, int64_t const* const num_valid_tokens_ptr,
+        HopperGemmOutputType const* const fc1_int_scales, float const* const fc1_fp8_dequant,
+        float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts_per_node, ActivationType fc1_activation_type,
+        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config);
 
     static void gemm2(MoeGemmRunner<T, WeightType>& gemm_runner, T const* const input, void* const output,
         int64_t const* const total_rows_before_expert, HopperGroupedGemmInput hopper_input_template,
-        WeightType const* const fc2_expert_weights, T const* const fc2_int_scales, float const* const fc2_fp8_dequant,
-        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int const num_experts_per_node, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config);
+        WeightType const* const fc2_expert_weights, HopperGemmOutputType const* const fc2_int_scales,
+        float const* const fc2_fp8_dequant, int64_t const expanded_num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts_per_node, float const** alpha_scale_ptr_array,
+        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config);
 
     // Overrides to allow us to forward on to the internal functions with the pointers using the correct type
     void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -260,25 +262,25 @@ public:
         int64_t const* const num_valid_tokens_ptr, void const* const fc1_int_scales, float const* const fc1_fp8_dequant,
         float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts_per_node, ActivationType fc1_activation_type,
-        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config) override
+        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config) override
     {
         return Self::gemm1(moe_gemm_runner_, static_cast<T const*>(input), static_cast<T*>(output), intermediate_result,
             total_rows_before_expert, hopper_input_template, static_cast<WeightType const*>(fc1_expert_weights),
-            static_cast<T const*>(fc1_expert_weights), num_valid_tokens_ptr, static_cast<T const*>(fc1_int_scales),
-            fc1_fp8_dequant, fc2_fp8_quant, expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
-            fc1_activation_type, stream, config);
+            static_cast<HopperGemmOutputType const*>(fc1_expert_weights), num_valid_tokens_ptr,
+            static_cast<HopperGemmOutputType const*>(fc1_int_scales), fc1_fp8_dequant, fc2_fp8_quant, expanded_num_rows,
+            hidden_size, inter_size, num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array, stream, config);
     }
 
     void gemm2(void const* const input, void* const output, int64_t const* const total_rows_before_expert,
         HopperGroupedGemmInput hopper_input_template, void const* const fc2_expert_weights,
         void const* const fc2_int_scales, float const* const fc2_fp8_dequant, int64_t const expanded_num_rows,
-        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, cudaStream_t stream,
-        cutlass_extensions::CutlassGemmConfig config) override
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
+        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config) override
     {
-        return Self::gemm2(moe_gemm_runner_, static_cast<T const*>(input), output, total_rows_before_expert,
-            hopper_input_template, static_cast<WeightType const*>(fc2_expert_weights),
-            static_cast<T const*>(fc2_int_scales), fc2_fp8_dequant, expanded_num_rows, hidden_size, inter_size,
-            num_experts_per_node, stream, config);
+        return Self::gemm2(moe_gemm_runner_, static_cast<T const*>(input), static_cast<HopperGemmOutputType*>(output),
+            total_rows_before_expert, hopper_input_template, static_cast<WeightType const*>(fc2_expert_weights),
+            static_cast<HopperGemmOutputType const*>(fc2_int_scales), fc2_fp8_dequant, expanded_num_rows, hidden_size,
+            inter_size, num_experts_per_node, alpha_scale_ptr_array, stream, config);
     }
 
     virtual size_t getGemmWorkspaceSize(int num_experts) const override
@@ -287,7 +289,7 @@ public:
     }
 
 private:
-    using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>;
+    static constexpr bool use_fp8 = std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value;
 
     static void computeTotalRowsBeforeExpert(int const* sorted_indices, int const total_indices, int const num_experts,
         int64_t* total_rows_before_expert, cudaStream_t stream);
@@ -305,7 +307,8 @@ private:
     bool mayHaveDifferentGEMMOutputType() const
     {
         // We just check if its supported because we need to know when calculating workspace size
-        return moe_gemm_runner_.supportsHopperSpecialisation() && !std::is_same_v<T, HopperGemmOutputType>;
+        return (
+            (moe_gemm_runner_.supportsHopperSpecialisation() && !std::is_same_v<T, HopperGemmOutputType>) || use_fp8);
     }
 
     CubKeyValueSorter sorter_;
@@ -327,6 +330,7 @@ private:
     void* glu_inter_result_{};
     void* fc2_result_{};
     T* fc1_result_{};
+    float const** alpha_scale_ptr_array_ = nullptr;
 
     HopperGroupedGemmInput hopper_grouped_gemm_input_;
 };

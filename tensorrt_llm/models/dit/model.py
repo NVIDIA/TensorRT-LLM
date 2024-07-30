@@ -19,9 +19,10 @@ from collections import OrderedDict
 import numpy as np
 import tensorrt as trt
 
-from ..._utils import str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str
-from ...functional import (Tensor, arange, chunk, concat, constant, cos, exp,
-                           expand, shape, silu, sin, slice, split, unsqueeze)
+from ..._utils import str_dtype_to_trt, trt_dtype_to_str
+from ...functional import (Tensor, allgather, arange, chunk, concat, constant,
+                           cos, exp, expand, shape, silu, sin, slice, split,
+                           unsqueeze)
 from ...layers import MLP, BertAttention, Conv2d, Embedding, LayerNorm, Linear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -33,7 +34,7 @@ from ..modeling_utils import PretrainedConfig, PretrainedModel
 def modulate(x, shift, scale, dtype):
     ones = 1.0
     if dtype is not None:
-        ones = constant(np.ones(1, dtype=trt_dtype_to_np(dtype)))
+        ones = constant(np.ones(1, dtype=np.float32)).cast(dtype)
     return x * (ones + unsqueeze(scale, 1)) + unsqueeze(shift, 1)
 
 
@@ -129,6 +130,8 @@ class DiTBlock(Module):
                                   tp_group=mapping.tp_group,
                                   tp_size=mapping.tp_size,
                                   tp_rank=mapping.tp_rank,
+                                  cp_group=mapping.cp_group,
+                                  cp_size=mapping.cp_size,
                                   dtype=dtype)
         self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = MLP(hidden_size=hidden_size,
@@ -203,6 +206,7 @@ class DiT(PretrainedModel):
         self.num_heads = config.num_attention_heads
         self.dtype = str_dtype_to_trt(config.dtype)
         self.cfg_scale = config.cfg_scale
+        self.mapping = config.mapping
 
         self.x_embedder = PatchEmbed(config.input_size,
                                      config.patch_size,
@@ -284,11 +288,19 @@ class DiT(PretrainedModel):
         c = t + y
         input_length = constant(np.array([x.shape[1]], dtype=np.int32))
         input_lengths = expand(input_length, unsqueeze(shape(x, 0), 0))
+        # Split squeence for CP here
+        if self.mapping.cp_size > 1:
+            assert x.shape[1] % self.mapping.cp_size == 0
+            x = chunk(x, self.mapping.cp_size, dim=1)[self.mapping.cp_rank]
         for block in self.blocks:
             x = block(x, c, input_lengths)  # (N, T, D)
         self.register_network_output('before_final_layer', x)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
         self.register_network_output('final_layer', x)
+
+        # All gather after CP
+        if self.mapping.cp_size > 1:
+            x = allgather(x, self.mapping.cp_group, gather_dim=1)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         self.register_network_output('unpatchify', x)
         return x
