@@ -363,6 +363,15 @@ endif()
 # "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
 # set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
+# Add the option with CMAKE_CUDA_FLAGS causes error. Add G and Lineinfo.
+if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-G>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:--host-linker-script>")
+elseif(${CMAKE_BUILD_TYPE} MATCHES "RelWithDebInfo")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:--host-linker-script>")
+endif()
+
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
 )
