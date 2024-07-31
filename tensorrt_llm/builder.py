@@ -389,7 +389,7 @@ class Builder():
                         param._get_weights(), name):
                     raise RuntimeError(f'Failed to set weight: {name}')
                 # This mark_weights_refittable has no side effect when refit_individual is not enabled.
-                network.trt_network.mark_weights_refittable(name)
+                # network.trt_network.mark_weights_refittable(name)
 
         network._fill_weights()
         # Build engine
