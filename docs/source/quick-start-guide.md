@@ -34,7 +34,7 @@ make -C docker release_run LOCAL_USER=1
 huggingface-cli login --token *****
 
 # Convert the model into TensorrtLLM checkpoint format
-cd exammples/llama
+cd examples/llama
 python3 convert_checkpoint.py --model_dir meta-llama/Llama-2-7b-chat-hf --output_dir llama-2-7b-ckpt
 
 # Compile model
