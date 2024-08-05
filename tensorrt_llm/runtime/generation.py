@@ -2420,6 +2420,8 @@ class GenerationSession(object):
 
         if self.is_redrafter_mode:
             self.buffer['position_ids_base'] = context_lengths.clone()
+            # NOTE: Generate random tensors using torch
+            redrafter_prepare_random_tensors(self, batch_size, initialize=True)
 
         return ret
 
@@ -2459,24 +2461,25 @@ class GenerationSession(object):
             torch.cuda.nvtx.range_pop()
         ret = {'last_token_ids': last_token_ids}
 
-        if self.is_redrafter_mode:
-            torch.cuda.nvtx.range_push("position_ids_update")
-            #  set position_ids
-            # buffers are swapped but sequence_length is not updated at this point
+        if use_gpt_attention_plugin:
+            if self.is_redrafter_mode:
+                torch.cuda.nvtx.range_push("position_ids_update")
+                #  set position_ids
+                # buffers are swapped but sequence_length is not updated at this point
 
-            if step != 0:
-                self.buffer['position_ids_base'] += self.buffer[
-                    'num_accepted_tokens']
-            position_ids = self.buffer['packed_position_ids'].view(
-                -1)[:self.host_total_gen_token]
-            if step == 0:
-                position_ids -= 1
+                if step != 0:
+                    self.buffer['position_ids_base'] += self.buffer[
+                        'num_accepted_tokens']
+                position_ids = self.buffer['packed_position_ids'].view(
+                    -1)[:self.host_total_gen_token]
+                if step == 0:
+                    position_ids -= 1
 
-            torch.cuda.nvtx.range_pop()
-        elif use_gpt_attention_plugin:
-            position_ids = context_lengths + step
-            if not remove_input_padding:
-                position_ids = torch.unsqueeze(position_ids, 1)
+                torch.cuda.nvtx.range_pop()
+            else:
+                position_ids = context_lengths + step
+                if not remove_input_padding:
+                    position_ids = torch.unsqueeze(position_ids, 1)
 
             perf_knob_tensor_size = 16
             gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
@@ -2505,19 +2508,7 @@ class GenerationSession(object):
             redrafter_convert_spec_decoding_mask_to_packed_mask(
                 self, self.buffer['spec_decoding_generation_lengths'])
             # NOTE: Generate random tensors using torch
-            torch.cuda.nvtx.range_push("torch_rand")
-            # NOTE: Tried a single rand() instead of 2, no change in perf
-            torch.manual_seed(self.sequence_length_buffer.max())
-            self.buffer['rand_data_sample'] = torch.rand([batch_size],
-                                                         dtype=self.dtype,
-                                                         device=self.device)
-            self.buffer['rand_data_validation'] = torch.rand([
-                batch_size, self._model_config.redrafter_num_beams,
-                self._model_config.redrafter_draft_len_per_beam
-            ],
-                                                             dtype=self.dtype,
-                                                             device=self.device)
-            torch.cuda.nvtx.range_pop()
+            redrafter_prepare_random_tensors(self, batch_size)
         torch.cuda.nvtx.range_pop()
 
         return ret

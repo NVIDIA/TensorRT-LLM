@@ -336,12 +336,6 @@ class CustomAllReduceHelper:
         Globally visible class to help usage of custom_all_reduce plugin.
         Provides the following utilities:
 
-        gen_id: int
-            Used for synchronization with custom kernels. Plugins instances MUST have the same
-            id across GPUs. I.e.: GPU#0's allreduce after MLP at layer i must have the same id as
-            GPU#1, GPU#2... Also, ids MUST be unique per model. There should not be two allreduce instances
-            in GPU#0 that have the same id.
-
         workspace: Tensor
             When using CUSTOM or AUTO mode, a tensor containing pointers to memory
             visible to all GPUs. It should be 3 pointers per TP rank -
@@ -349,26 +343,19 @@ class CustomAllReduceHelper:
             It must be initialized using IpcMemory class.
 
         Usage:
-            - Use `init_all_reduce_helper` to reset the id counter. This must be done in main model class.
             - Set custom_all_reduce_helper.workspace with the required tensor.
               Then, each instance of allreduce will reference that tensor automatically.
     """
     POINTERS_PER_RANK = 4
 
     def __init__(self) -> None:
-        self.current_id: int = 1
         self.workspace: Optional[Tensor] = None
-
-    def gen_id(self) -> int:
-        result = self.current_id
-        self.current_id += 1
-        return result
 
     def set_workspace_tensor(self,
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
         from ..functional import Tensor
-        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 1
 
         dim_range = None
         if num_profiles is not None:
@@ -407,7 +394,7 @@ class CustomAllReduceHelper:
 
         return buffers, torch.tensor(
             ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
-            ipc_barriers_in.serialize() + ipc_barriers_out.serialize(),
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() + [0],
             dtype=torch.int64,
             device="cpu")
 

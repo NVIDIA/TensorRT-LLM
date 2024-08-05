@@ -71,6 +71,10 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way tensor parallelism size')
+    parser.add_argument('--cp_size',
+                        type=int,
+                        default=1,
+                        help='Context parallelism size')
     parser.add_argument('--pp_size',
                         type=int,
                         default=1,
@@ -221,7 +225,8 @@ def save_config(args):
         'learn_sigma': args.learn_sigma,
         'cfg_scale': args.cfg_scale,
         'mapping': {
-            'world_size': args.tp_size * args.pp_size,
+            'world_size': args.cp_size * args.tp_size * args.pp_size,
+            'cp_size': args.cp_size,
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         }
@@ -235,8 +240,9 @@ def covert_and_save(args, rank):
     if rank == 0:
         save_config(args)
 
-    mapping = Mapping(world_size=args.tp_size * args.pp_size,
+    mapping = Mapping(world_size=args.cp_size * args.tp_size * args.pp_size,
                       rank=rank,
+                      cp_size=args.cp_size,
                       tp_size=args.tp_size,
                       pp_size=args.pp_size)
 
@@ -268,7 +274,7 @@ def execute(workers, func, args):
 def main():
     print(tensorrt_llm.__version__)
     args = parse_arguments()
-    world_size = args.tp_size * args.pp_size
+    world_size = args.cp_size * args.tp_size * args.pp_size
 
     assert args.pp_size == 1, "PP is not supported yet."
 

@@ -154,9 +154,12 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         mIpcMemoryHandles.emplace_back(size, manager, worldConfig);
     }
 
-    mAllReduceCommPtrs = BufferManager::cpu(
-        ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize}), nvinfer1::DataType::kINT64);
+    mAllReduceCommPtrs
+        = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 1}),
+            nvinfer1::DataType::kINT64);
     auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
+    auto const flagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
+    *flagPtr = 0;
 
     for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
     {

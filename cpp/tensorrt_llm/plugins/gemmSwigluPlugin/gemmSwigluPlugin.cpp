@@ -87,7 +87,7 @@ int GemmSwigluPluginProfiler::getMaxProfileM() const
     return 32768;
 }
 
-void GemmSwigluPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void GemmSwigluPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     std::vector<size_t> workspaces = {
         maxM * k * getBytePerElement(mType),       // A

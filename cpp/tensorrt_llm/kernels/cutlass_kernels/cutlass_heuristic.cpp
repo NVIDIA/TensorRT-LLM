@@ -66,6 +66,7 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config)
     case CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64: return TileShape{128, 128};
     case CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64: return TileShape{128, 256};
     case CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64: return TileShape{256, 128};
+    case CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128: return TileShape{16, 256};
     default: TLLM_THROW("[get_grid_shape_for_config] Invalid config");
     }
 }
@@ -118,7 +119,8 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
         Default,
         WeightOnly,
         Simt,
-        Int8
+        Int8,
+        Fp8
     };
 
     CutlassGemmType gemm_type = CutlassGemmType::Default;
@@ -133,6 +135,10 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     else if (config_type_param & CutlassGemmConfig::INT8_ONLY)
     {
         gemm_type = CutlassGemmType::Int8;
+    }
+    else if (config_type_param & CutlassGemmConfig::FP8_ONLY)
+    {
+        gemm_type = CutlassGemmType::Fp8;
     }
 
     std::vector<CutlassTileConfig> base_configs{
@@ -166,6 +172,25 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
             CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
             CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
             CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+    case CutlassGemmType::Fp8:
+        if (config_type_param & CutlassGemmConfig::GROUPED_GEMM)
+        {
+            if (sm == 89)
+            {
+                return {CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128,
+                    CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+                    CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
+                    CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+                    CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
+                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+            }
+            else
+            {
+                // no valid ampere style fp8 configs for sm90
+                return {};
+            }
+        }
     default: return base_configs;
     }
 }

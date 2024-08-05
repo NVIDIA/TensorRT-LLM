@@ -2,6 +2,8 @@ from typing import List
 
 import torch
 
+REDRAFTER_DEFAULT_SEED = 0
+
 
 def get_redrafter_specific_tensor_names() -> List[str]:
     return [
@@ -128,18 +130,7 @@ def init_allocate_redrafter_tensors(session, batch_size):
     session.total_gen_token = torch.zeros(1,
                                           dtype=torch.int32,
                                           device=session.device)
-    torch.manual_seed(0)  # use seed=0 for context
-    session.rand_data_sample = torch.rand([batch_size],
-                                          dtype=session.dtype,
-                                          device=session.device)
-    # print(session.rand_data_sample)
-    session.rand_data_validation = torch.rand([
-        batch_size, session._model_config.redrafter_num_beams,
-        session._model_config.redrafter_draft_len_per_beam
-    ],
-                                              dtype=session.dtype,
-                                              device=session.device)
-    # print(session.rand_data_validation)
+
     session.buffer['flat_tokens'] = session.flat_tokens
     session.buffer['next_flat_tokens'] = session.next_flat_tokens
     session.buffer['num_accepted_tokens'] = session.accept_lengths
@@ -154,8 +145,6 @@ def init_allocate_redrafter_tensors(session, batch_size):
         'spec_decoding_position_offsets'] = session.spec_decoding_position_offsets
     session.buffer[
         'spec_decoding_packed_mask'] = session.spec_decoding_packed_mask
-    session.buffer['rand_data_sample'] = session.rand_data_sample
-    session.buffer['rand_data_validation'] = session.rand_data_validation
     session.buffer[
         'next_spec_decoding_generation_lengths'] = session.next_spec_decoding_generation_lengths
     session.buffer['next_draft_tokens'] = session.next_draft_tokens
@@ -304,3 +293,43 @@ def process_redrafter_outputs(session, step, batch_size, last_draft_tokens,
         session.end_ids[0])  #FIXME  end id padding.
     torch.cuda.nvtx.range_pop()
     return best_path, best_path_lengths
+
+
+def redrafter_prepare_random_tensors(session, batch_size, initialize=False):
+    torch.cuda.nvtx.range_push("torch_rand")
+
+    def get_rand_tensors():
+        rds = torch.rand([1], dtype=session.dtype, device=session.device)
+        rdv = torch.rand([
+            1, session._model_config.redrafter_num_beams,
+            session._model_config.redrafter_draft_len_per_beam
+        ],
+                         dtype=session.dtype,
+                         device=session.device)
+        return rds, rdv
+
+    rand_data_sample = []
+    rand_data_validation = []
+    if initialize:  # context phase
+        random_seed = session.random_seed
+        if random_seed is None:
+            random_seed = torch.full([batch_size],
+                                     REDRAFTER_DEFAULT_SEED,
+                                     dtype=torch.int64)
+        session.saved_rng_states = []
+    for b in range(batch_size):
+        if initialize:  # context phase
+            torch.manual_seed(random_seed[b].item())
+        else:  # generation phase
+            assert session.saved_rng_states is not None, "Couldn't find random states."
+            torch.set_rng_state(session.saved_rng_states[b])
+        rds, rdv = get_rand_tensors()
+        session.saved_rng_states.append(torch.get_rng_state())
+        rand_data_sample.append(rds)
+        rand_data_validation.append(rdv)
+    session.rand_data_sample = torch.concat(rand_data_sample, dim=0)
+    session.rand_data_validation = torch.concat(rand_data_validation, dim=0)
+    session.buffer["rand_data_sample"] = session.rand_data_sample
+    session.buffer["rand_data_validation"] = session.rand_data_validation
+    torch.cuda.nvtx.range_pop()
+    return

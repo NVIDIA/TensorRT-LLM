@@ -718,16 +718,9 @@ public:
         mReturnGenerationLogits = returnGenerationLogits;
     }
 
-    // Return all generation logits for model w/o draft token
     [[nodiscard]] bool getReturnGenerationLogits() const
     {
-        return mReturnGenerationLogits && (getNumDraftTokens() == 0);
-    }
-
-    // Return accepted tokens logits for target model
-    [[nodiscard]] bool getReturnTargetModelAcceptedLogits() const
-    {
-        return mReturnGenerationLogits && (getNumDraftTokens() > 0);
+        return mReturnGenerationLogits;
     }
 
     [[nodiscard]] TensorPtr const& getContextLogitsHost() const
@@ -735,6 +728,7 @@ public:
         return mContextLogitsHost;
     }
 
+    /// @param contextLogitsHost Expected shape [promtLen, vocabSizePadded]
     void setContextLogitsHost(TensorPtr contextLogitsHost)
     {
         mContextLogitsHost = std::move(contextLogitsHost);
@@ -751,6 +745,9 @@ public:
         return mGenerationLogitsHost;
     }
 
+    /// @param generationLogitsHost Expected shape
+    /// * [beamWidth, maxNewTokens, vocabSizePadded] for non-speculative decoding
+    /// * [1, numDraftTokens + 1, vocabSizePadded] for speculative decoding
     void setGenerationLogitsHost(TensorPtr generationLogitsHost)
     {
         mGenerationLogitsHost = std::move(generationLogitsHost);
@@ -765,7 +762,7 @@ public:
     void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
         mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-            runtime::ITensor::makeShape({getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
+            runtime::ITensor::makeShape({1, getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
     }
 
     [[nodiscard]] std::vector<TensorPtr> const& getGenerationLogitsFragments() const
@@ -964,18 +961,6 @@ public:
                 if (getReturnGenerationLogits())
                 {
                     result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
-                }
-
-                if (getReturnTargetModelAcceptedLogits())
-                {
-                    auto targetModelAcceptedTokenLogitsShape = getGenerationLogitsHost()->getShape();
-                    TLLM_CHECK(targetModelAcceptedTokenLogitsShape.nbDims == 2);
-                    auto numAcceptedToken = targetModelAcceptedTokenLogitsShape.d[0];
-                    auto vocabSizePadded = targetModelAcceptedTokenLogitsShape.d[1];
-                    // Align the shape of accepted token logits and generation logits
-                    TensorPtr targetModelAcceptedTokenLogitsHostView = runtime::ITensor::view(
-                        getGenerationLogitsHost(), runtime::ITensor::makeShape({1, numAcceptedToken, vocabSizePadded}));
-                    result.generationLogits = executor::detail::ofITensor(targetModelAcceptedTokenLogitsHostView);
                 }
 
                 if (getReturnEncoderOutput())

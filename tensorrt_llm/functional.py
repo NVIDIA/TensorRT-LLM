@@ -3706,7 +3706,6 @@ def create_allreduce_plugin(
     strategy: AllReduceStrategy,
     dtype: trt.DataType,
     config: AllReduceConfig,
-    counter: int,
     reduce_fusion_params: AllReduceFusionParams,
 ):
     allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -3727,9 +3726,6 @@ def create_allreduce_plugin(
         "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_fusion_op)
-    p_counter = trt.PluginField("counter", np.array([counter], np.int32),
-                                trt.PluginFieldType.INT32)
-    pfc.append(p_counter)
     p_eps = trt.PluginField(
         "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
@@ -3805,10 +3801,8 @@ def allreduce(
         strategy = AllReduceStrategy.NCCL
 
     workspace = None
-    counter = 0
     if strategy != AllReduceStrategy.NCCL:
         workspace = current_all_reduce_helper().workspace.trt_tensor
-        counter = current_all_reduce_helper().gen_id()
 
     if reduce_fusion_params is None:
         reduce_fusion_params = AllReduceFusionParams()
@@ -3822,7 +3816,6 @@ def allreduce(
         strategy=strategy,
         dtype=str_dtype_to_trt(dtype),
         config=config,
-        counter=counter,
         reduce_fusion_params=reduce_fusion_params,
     )
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
