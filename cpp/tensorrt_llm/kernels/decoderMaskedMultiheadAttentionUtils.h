@@ -2431,6 +2431,15 @@ inline __device__ float4 mul(float4 a, int32_t b)
     return fc;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+inline __device__ Float4_ mul(float4 a, int32_t b)
+{
+    float4 fc = mul<float4, float4, int32_t>(a, b);
+    return reinterpret_cast<Float4_&>(fc);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ float sum(float v)
