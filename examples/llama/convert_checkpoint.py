@@ -224,6 +224,13 @@ def parse_arguments():
         help=
         'Only save the model config w/o read and converting weights, be careful, this is for debug only'
     )
+    parser.add_argument(
+        '--remove_duplicated_kv_heads',
+        action="store_true",
+        default=False,
+        help=
+        'Only used to remove the duplicated kv heads of llama-3.1 405B HF model.'
+    )
     parser.add_argument('--log_level', type=str, default='info')
 
     args = parser.parse_args()
@@ -312,7 +319,8 @@ def args_to_build_options(args):
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
         'disable_weight_only_quant_plugin':
-        args.disable_weight_only_quant_plugin
+        args.disable_weight_only_quant_plugin,
+        'remove_duplicated_kv_heads': args.remove_duplicated_kv_heads,
     }
 
 

@@ -16,7 +16,7 @@ PET_dict = {
     "meta-llama/Llama-2-70b-hf": "rope_gpt_neox",
     "meta-llama/Meta-Llama-3-8B": "rope_gpt_neox",
     "meta-llama/Meta-Llama-3-70B": "rope_gpt_neox",
-    "EleutherAI/gpt-j-6b": "rope_gptj",
+    "gpt-j-6b": "rope_gptj",
     "bigscience/bloom-560m": "alibi",
     "mistralai/Mistral-7B-v0.1": "rope_gpt_neox",
     "mistralai/Mixtral-8x7B-v0.1": "rope_gpt_neox",
@@ -126,7 +126,7 @@ class TRTLLMConfig(BaseModel):
     moe_top_k: Optional[int] = Field(
         default=0, validation_alias=AliasChoices("num_experts_per_tok"))
     rotary_base: Optional[float] = Field(
-        default=None, validation_alias=AliasChoices("rope_theta"))
+        default=10000.0, validation_alias=AliasChoices("rope_theta"))
 
     mapping: TRTLLM_Mapping
     quantization: TRTLLM_Quantization
@@ -176,8 +176,9 @@ class TRTLLMConfig(BaseModel):
                 "quant_algo": quant_dtype,
                 "kv_cache_quant_algo": kv_cache_quant_dtype,
             }
-        if model_name in PET_dict:
-            build_config["position_embedding_type"] = PET_dict.get(model_name)
+        for name, pet in PET_dict.items():
+            if name in str(model_name):
+                build_config["position_embedding_type"] = pet
         return build_config
 
     @classmethod

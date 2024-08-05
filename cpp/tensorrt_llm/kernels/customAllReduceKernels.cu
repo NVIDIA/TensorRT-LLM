@@ -1117,9 +1117,14 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     }
 }
 
-AllReduceParams AllReduceParams::deserialize(int32_t const* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value)
+AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank)
 {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
+    auto const flag_ptr = &buffer[4 * tpSize];
+    // cannot use 0 since 0 represents released state for barrier
+    *flag_ptr += 1;
+    TLLM_LOG_TRACE("AllReduceParams's flag value is %d", *flag_ptr);
+    uint32_t flag_value = *flag_ptr;
     AllReduceParams params;
     // Even plugins use ping buffers, odd plugins use pong.
     // That way, we don't need to wait for other GPUs to be done

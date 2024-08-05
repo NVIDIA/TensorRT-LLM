@@ -15,11 +15,16 @@
 import argparse
 import os
 import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from transformers import AutoConfig
 
 import tensorrt_llm
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import Phi3ForCausalLM, PhiForCausalLM
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments():
@@ -68,6 +73,38 @@ def parse_arguments():
     return args
 
 
+def execute(workers, func, args):
+    if workers == 1:
+        for rank, f in enumerate(func):
+            f(args, rank)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as p:
+            futures = [p.submit(f, args, rank) for rank, f in enumerate(func)]
+            exceptions = []
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    traceback.print_exc()
+                    exceptions.append(e)
+            assert len(
+                exceptions
+            ) == 0, "Checkpoint conversion failed, please check error log."
+
+
+def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
+    '''return config dict with quantization info based on the command line args
+    '''
+    quant_config = QuantConfig()
+    if args.use_weight_only:
+        if args.weight_only_precision == 'int8':
+            quant_config.quant_algo = QuantAlgo.W8A16
+        elif args.weight_only_precision == 'int4':
+            quant_config.quant_algo = QuantAlgo.W4A16
+
+    return quant_config
+
+
 if __name__ == '__main__':
     print(tensorrt_llm.__version__)
     args = parse_arguments()
@@ -84,15 +121,37 @@ if __name__ == '__main__':
         'PhiForCausalLM', 'Phi3ForCausalLM', 'Phi3VForCausalLM',
         'Phi3SmallForCausalLM'
     ]
-    modelForCausalLM = None
+
     if model_type not in supported_models:
         assert False, "Invalid model type"
-    modelForCausalLM = PhiForCausalLM if model_type == 'PhiForCausalLM' else Phi3ForCausalLM
 
-    modelForCausalLM.convert_hf_checkpoint(args.model_dir,
-                                           dtype=args.dtype,
-                                           output_dir=args.output_dir,
-                                           args=args)
+    phi_model = Phi3ForCausalLM if model_type.find(
+        'Phi3') != -1 else PhiForCausalLM
+
+    hf_model = None
+
+    override_fields = {}
+    # override_fields.update(args_to_build_options(args))
+    quant_config = args_to_quant_config(args)
+
+    def convert_and_save_rank(args, rank):
+        mapping = Mapping(world_size=args.tp_size * args.pp_size,
+                          rank=rank,
+                          tp_size=args.tp_size,
+                          pp_size=args.pp_size)
+
+        phi = phi_model.from_hugging_face(
+            args.model_dir if hf_model is None else hf_model,
+            args.dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            **override_fields,
+        )
+        phi.save_checkpoint(args.output_dir, save_config=(rank == 0))
+        del phi
+
+    execute(args.workers, [convert_and_save_rank] * args.tp_size * args.pp_size,
+            args)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

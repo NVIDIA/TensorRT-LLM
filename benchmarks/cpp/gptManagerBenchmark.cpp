@@ -155,6 +155,7 @@ struct BenchmarkParams
     std::optional<SizeType32> maxNumTokens{std::nullopt};
     int randomSeed = 430;
     std::optional<int> maxAttentionWindow{std::nullopt};
+    std::optional<int> sinkTokenLength{std::nullopt};
     bool multiBlockMode{false};
 
     // lora / peft params
@@ -784,10 +785,12 @@ private:
 class ExecutorServer
 {
 public:
-    ExecutorServer(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, int32_t maxBeamWidth,
-        texec::CapacitySchedulerPolicy capacitySchedulerPolicy, BenchmarkParams const& benchmarkParams,
-        std::shared_ptr<Recorder> recorder, std::chrono::milliseconds waitSleep,
-        std::optional<uint64_t> const staticEmulatedBatchSize, bool logIterationData)
+    ExecutorServer(std::optional<std::filesystem::path> const& decoderTrtEnginePath,
+        std::optional<std::filesystem::path> const& encoderTrtEnginePath, TrtGptModelType modelType,
+        int32_t maxBeamWidth, texec::CapacitySchedulerPolicy capacitySchedulerPolicy,
+        BenchmarkParams const& benchmarkParams, std::shared_ptr<Recorder> recorder, std::chrono::milliseconds waitSleep,
+        std::optional<uint64_t> const staticEmulatedBatchSize, bool logIterationData,
+        texec::ModelType executorModelType)
         : mRecorder(std::move(recorder))
         , mWaitSleep(waitSleep)
         , mStaticEmulatedBatchSize(staticEmulatedBatchSize)
@@ -799,7 +802,7 @@ public:
 
         texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy);
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
-            benchmarkParams.maxAttentionWindow, std::nullopt, benchmarkParams.freeGpuMemoryFraction,
+            benchmarkParams.maxAttentionWindow, benchmarkParams.sinkTokenLength, benchmarkParams.freeGpuMemoryFraction,
             benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
@@ -823,7 +826,25 @@ public:
             std::nullopt, benchmarkParams.medusaChoices));
         executorConfig.setMultiBlockMode(benchmarkParams.multiBlockMode);
 
-        mExecutor = std::make_unique<texec::Executor>(trtEnginePath, texec::ModelType::kDECODER_ONLY, executorConfig);
+        if (executorModelType == texec::ModelType::kDECODER_ONLY)
+        {
+            mExecutor
+                = std::make_unique<texec::Executor>(decoderTrtEnginePath.value(), executorModelType, executorConfig);
+        }
+        else if (executorModelType == texec::ModelType::kENCODER_DECODER)
+        {
+            mExecutor = std::make_unique<texec::Executor>(
+                encoderTrtEnginePath.value(), decoderTrtEnginePath.value(), executorModelType, executorConfig);
+        }
+        else if (executorModelType == texec::ModelType::kENCODER_ONLY)
+        {
+            mExecutor
+                = std::make_unique<texec::Executor>(encoderTrtEnginePath.value(), executorModelType, executorConfig);
+        }
+        else
+        {
+            TLLM_LOG_ERROR("not a supported executor model type in executor server.");
+        }
 
         if (logIterationData)
         {
@@ -1347,7 +1368,8 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
 texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamWidth,
     std::optional<SizeType32> const& eosId, std::optional<SizeType32> const& padId, bool streaming = false,
     bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
-    std::optional<texec::LoraConfig> const& loraConfig = std::nullopt)
+    std::optional<texec::LoraConfig> const& loraConfig = std::nullopt,
+    std::optional<texec::VecTokens> encoderInputTokenIds = std::nullopt)
 {
     auto samplingConfig = texec::SamplingConfig{beamWidth};
     auto outputConfig = texec::OutputConfig{false, returnContextLogits, returnGenerationLogits, false};
@@ -1357,7 +1379,9 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt, // embeddingBias
         std::nullopt, // speculativeDecoding
         std::nullopt, // pTuning
-        loraConfig);
+        loraConfig,
+        std::nullopt, // logitsPostProcessorName
+        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
 }
 
 void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType modelType,
@@ -1382,6 +1406,10 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     if (benchmarkParams.maxAttentionWindow)
     {
         optionalParams.kvCacheConfig.maxAttentionWindow = benchmarkParams.maxAttentionWindow;
+    }
+    if (benchmarkParams.sinkTokenLength)
+    {
+        optionalParams.kvCacheConfig.sinkTokenLength = benchmarkParams.sinkTokenLength;
     }
     optionalParams.kvCacheConfig.enableBlockReuse = benchmarkParams.enableBlockReuse;
     optionalParams.enableChunkedContext = benchmarkParams.enableChunkedContext;
@@ -1526,12 +1554,13 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     gptServer->waitBatchManager();
 }
 
-void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType modelType,
+void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngineDir,
+    std::optional<std::filesystem::path> const& encoderEngineDir, TrtGptModelType modelType,
     std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
     std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
     texec::CapacitySchedulerPolicy capacitySchedulerPolicy, std::chrono::milliseconds waitSleep,
     bool returnContextLogits, bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize,
-    bool logIterationData, std::optional<SizeType32> const maxPromptLen)
+    bool logIterationData, std::optional<SizeType32> const maxPromptLen, texec::ModelType executorModelType)
 {
     auto const& world = tensorrt_llm::mpi::MpiComm::world();
     auto worldRank = world.getRank();
@@ -1541,9 +1570,57 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
     auto const numSamples = samples.size();
 
     auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, beamWidth);
+    int32_t decoderStartTokenId = 0;
+    std::shared_ptr<ExecutorServer> executorServer;
 
-    auto executorServer = std::make_shared<ExecutorServer>(engineDir, modelType, beamWidth, capacitySchedulerPolicy,
-        benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize, logIterationData);
+    if (executorModelType == texec::ModelType::kDECODER_ONLY)
+    {
+        TLLM_CHECK_WITH_INFO(
+            decoderEngineDir.has_value(), "decoder models require a path to decoder engine in executor benchmark.");
+        executorServer = std::make_shared<ExecutorServer>(decoderEngineDir.value(), std::nullopt, modelType, beamWidth,
+            capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize, logIterationData,
+            executorModelType);
+    }
+    else if (executorModelType == texec::ModelType::kENCODER_DECODER)
+    {
+        TLLM_CHECK_WITH_INFO(encoderEngineDir.has_value(),
+            "encoder-decoder models require a path to encoder engine in executor benchmark.");
+        executorServer = std::make_shared<ExecutorServer>(decoderEngineDir.value(), encoderEngineDir.value(), modelType,
+            beamWidth, capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize,
+            logIterationData, executorModelType);
+        try
+        {
+            std::ifstream decoderJsonConfigPath(decoderEngineDir.value() / "config.json");
+            auto const decoderPretrainedConfig
+                = nlohmann::json::parse(decoderJsonConfigPath, nullptr, true, true).at("pretrained_config");
+            decoderStartTokenId = decoderPretrainedConfig.at("decoder_start_token_id").template get<int32_t>();
+        }
+        catch (nlohmann::json::out_of_range& e)
+        {
+            TLLM_LOG_ERROR(
+                "Parameter %s cannot be read from decoder config.json in pretrained_config. Using default id %d.",
+                std::string("decoder_start_token_id").c_str(), decoderStartTokenId);
+        }
+        catch (nlohmann::json::type_error const& e)
+        {
+            TLLM_LOG_ERROR(
+                "Parameter %s has error type in decoder config.json in pretrained_config. Using default id %d.",
+                std::string("decoder_start_token_id").c_str(), decoderStartTokenId);
+        }
+    }
+    else if (executorModelType == texec::ModelType::kENCODER_ONLY)
+    {
+        TLLM_CHECK_WITH_INFO(
+            encoderEngineDir.has_value(), "encoder models require a path to encoder engine in executor benchmark.");
+        executorServer = std::make_shared<ExecutorServer>(std::nullopt, encoderEngineDir.value(), modelType, beamWidth,
+            capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, staticEmulatedBatchSize, logIterationData,
+            executorModelType);
+    }
+    else
+    {
+        TLLM_LOG_ERROR("not a supported executor model type in executor benchmark.");
+        return;
+    }
 
     if (worldRank == 0)
     {
@@ -1559,8 +1636,18 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
                 p.second->squeeze(0);
                 texec::LoraConfig loraConfig(
                     taskId, texec::detail::ofITensor(p.first), texec::detail::ofITensor(p.second));
-                Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, static_cast<int32_t>(taskId)};
-                requests.emplace_back(makeExecutorRequest(s, beamWidth, eosId, padId, false, false, false, loraConfig));
+                if (executorModelType == texec::ModelType::kENCODER_DECODER)
+                {
+                    Sample s{std::vector<int32_t>{decoderStartTokenId}, 1, static_cast<int32_t>(taskId)};
+                    requests.emplace_back(makeExecutorRequest(s, beamWidth, eosId, padId, false, false, false,
+                        loraConfig, std::vector<int32_t>{1, 2, 3, 4, 5}));
+                }
+                else
+                {
+                    Sample s{std::vector<int32_t>{1, 2, 3, 4, 5}, 1, static_cast<int32_t>(taskId)};
+                    requests.emplace_back(
+                        makeExecutorRequest(s, beamWidth, eosId, padId, false, false, false, loraConfig));
+                }
             }
             executorServer->enqueue(std::move(requests), true);
             executorServer->waitForResponses(loras.getLoras().size(), true);
@@ -1573,8 +1660,17 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
             std::vector<texec::Request> requests;
             for (auto i = 0; i < warmUp; ++i)
             {
-                requests.emplace_back(makeExecutorRequest(samples[0], beamWidth, eosId, padId,
-                    benchmarkParams.streaming, returnContextLogits, returnGenerationLogits));
+                if (executorModelType == texec::ModelType::kENCODER_DECODER)
+                {
+                    Sample s{std::vector<int32_t>{decoderStartTokenId}, samples[0].outputLen, samples[0].taskId};
+                    requests.emplace_back(makeExecutorRequest(s, beamWidth, eosId, padId, benchmarkParams.streaming,
+                        returnContextLogits, returnGenerationLogits, std::nullopt, samples[0].inputIds));
+                }
+                else
+                {
+                    requests.emplace_back(makeExecutorRequest(samples[0], beamWidth, eosId, padId,
+                        benchmarkParams.streaming, returnContextLogits, returnGenerationLogits));
+                }
             }
             executorServer->enqueue(std::move(requests), true);
             executorServer->waitForResponses(warmUp, true);
@@ -1595,8 +1691,17 @@ void benchmarkExecutor(std::filesystem::path const& engineDir, TrtGptModelType m
                 {
                     loraConfig = texec::LoraConfig(samples[i].taskId);
                 }
-                requests.emplace_back(makeExecutorRequest(samples[i], beamWidth, eosId, padId,
-                    benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig));
+                if (executorModelType == texec::ModelType::kENCODER_DECODER)
+                {
+                    Sample s{std::vector<int32_t>{decoderStartTokenId}, samples[i].outputLen, samples[i].taskId};
+                    requests.emplace_back(makeExecutorRequest(s, beamWidth, eosId, padId, benchmarkParams.streaming,
+                        returnContextLogits, returnGenerationLogits, loraConfig, samples[i].inputIds));
+                }
+                else
+                {
+                    requests.emplace_back(makeExecutorRequest(samples[i], beamWidth, eosId, padId,
+                        benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig));
+                }
             }
 
             bool const hasDelay
@@ -1687,7 +1792,8 @@ int main(int argc, char* argv[])
     cxxopts::Options options(
         "TensorRT-LLM BatchManager Benchmark", "TensorRT-LLM BatchManager Benchmark for GPT and GPT-like models.");
     options.add_options()("h,help", "Print usage");
-    options.add_options()("engine_dir", "Directory that store the engines.", cxxopts::value<std::string>());
+    options.add_options()("engine_dir, decoder_engine_dir", "Directory that store the engines of decoder models.",
+        cxxopts::value<std::string>());
     options.add_options()(
         "api", "API type: gptManager or executor.", cxxopts::value<std::string>()->default_value("executor"));
     options.add_options()("type", "Batching type: IFB, UIFB (unfused IFB) or V1 (non-IFB) batching.",
@@ -1707,6 +1813,7 @@ int main(int argc, char* argv[])
     options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<TokenIdType>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
     options.add_options()("max_attention_window", "Max KV cache length per sequence", cxxopts::value<int>());
+    options.add_options()("sink_token_len", "Sink token length in kv cache per sequence.", cxxopts::value<int>());
     options.add_options()(
         "random_seed", "integer random seed for exponential time delays.", cxxopts::value<int>()->default_value("420"));
     options.add_options()(
@@ -1781,6 +1888,8 @@ int main(int argc, char* argv[])
     options.add_options()("multi_block_mode",
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel",
         cxxopts::value<bool>()->default_value("false"));
+    options.add_options()(
+        "encoder_engine_dir", "Directory that store the engines of the encoder models.", cxxopts::value<std::string>());
 
     auto result = options.parse(argc, argv);
 
@@ -1791,7 +1900,7 @@ int main(int argc, char* argv[])
     }
 
     // Argument: Engine directory
-    if (!result.count("engine_dir"))
+    if (!result.count("engine_dir") && !result.count("encoder_engine_dir"))
     {
         std::cout << options.help() << std::endl;
         TLLM_LOG_ERROR("Please specify engine directory.");
@@ -1846,6 +1955,12 @@ int main(int argc, char* argv[])
     if (result.count("max_attention_window"))
     {
         benchmarkParams.maxAttentionWindow = result["max_attention_window"].as<int>();
+    }
+
+    // Argument: Sink token length
+    if (result.count("sink_token_len"))
+    {
+        benchmarkParams.sinkTokenLength = result["sink_token_len"].as<int>();
     }
 
     if (result.count("random_seed"))
@@ -2049,12 +2164,33 @@ int main(int argc, char* argv[])
     }
     else if (api == "executor")
     {
+        texec::ModelType executorModelType;
+        std::optional<std::string> decoderEngineDir = std::nullopt, encoderEngineDir = std::nullopt;
+        if (result.count("encoder_engine_dir") && result.count("engine_dir"))
+        {
+            TLLM_CHECK_WITH_INFO(api == "executor", "encoder-decoder only support executor api.");
+            TLLM_CHECK_WITH_INFO(
+                modelType == TrtGptModelType::InflightFusedBatching, "encoder-decoder only support inflight batching.");
+            executorModelType = texec::ModelType::kENCODER_DECODER;
+            decoderEngineDir = result["engine_dir"].as<std::string>();
+            encoderEngineDir = result["encoder_engine_dir"].as<std::string>();
+        }
+        else if (result.count("engine_dir"))
+        {
+            executorModelType = texec::ModelType::kDECODER_ONLY;
+            decoderEngineDir = result["engine_dir"].as<std::string>();
+        }
+        else
+        {
+            executorModelType = texec::ModelType::kENCODER_ONLY;
+            encoderEngineDir = result["encoder_engine_dir"].as<std::string>();
+        }
         try
         {
-            benchmarkExecutor(result["engine_dir"].as<std::string>(), modelType, datasetPath, opCsvFile, maxNumSamples,
+            benchmarkExecutor(decoderEngineDir, encoderEngineDir, modelType, datasetPath, opCsvFile, maxNumSamples,
                 beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, capacitySchedulerPolicy,
                 waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData,
-                maxPromptLen);
+                maxPromptLen, executorModelType);
         }
         catch (std::exception const& e)
         {

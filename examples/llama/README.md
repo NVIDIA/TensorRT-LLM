@@ -1217,7 +1217,8 @@ Users can run the LLaMA-3.1 model with higher precision (bf16/fp16) or fp8. Here
 
 To use the fp8 quantization, please add the `--use_fp8_rowwise` flag during the checkpoint conversion. In this demonstration, we convert the Meta checkpoint to bfloat16 with TP8-PP2 and the HF checkpoint to FP8 with TP8.
 
-Note that you may need to update your transformers installation via `pip install --upgrade transformers`.
+Note: You may need to update your transformers installation via `pip install --upgrade transformers`.
+Note: For 405B HF model, there are duplicated kv head weights. Users could use `--remove_duplicated_kv_heads` to remove them.
 
 ```bash
 # Run BF16 model by BF16
@@ -1227,7 +1228,7 @@ python examples/llama/convert_checkpoint.py --meta_ckpt_dir llama_3.1_405B_meta_
                             --tp_size 8 \
                             --pp_size 2 \
                             --load_by_shard \
-                            --workers 8
+                            --workers 2
 
 # Run BF16 model by FP8
 python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_model/ \
@@ -1237,7 +1238,8 @@ python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_model/
                             --tp_size 8 \
                             --pp_size 1 \
                             --load_by_shard \
-                            --workers 8
+                            --workers 8 \
+                            --remove_duplicated_kv_heads
 
 # Run FP8 model by FP8
 python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_FP8_model/ \
@@ -1246,7 +1248,8 @@ python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_FP8_mo
                             --tp_size 8 \
                             --pp_size 1 \
                             --load_by_shard \
-                            --workers 8
+                            --workers 8 \
+                            --remove_duplicated_kv_heads
 ```
 
 ### Build Engine

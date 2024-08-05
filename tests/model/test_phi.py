@@ -30,7 +30,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
-from tensorrt_llm.models.phi.convert import convert_hf_weights
+from tensorrt_llm.models.phi.convert import load_weights_from_hf_model
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -66,7 +66,8 @@ class TestPhi(unittest.TestCase):
             'dtype': dtype,
             'num_hidden_layers': hf_config.num_hidden_layers,
             'num_attention_heads': hf_config.num_key_value_heads,
-            'partial_rotary_factor': hf_config.partial_rotary_factor,
+            'rotary_pct': hf_config.partial_rotary_factor,
+            'position_embedding_type': 'rope_gpt_neox',
             'rope_theta': hf_config.rope_theta,
             'hidden_size': hf_config.hidden_size,
             'intermediate_size': hf_config.intermediate_size,
@@ -84,7 +85,7 @@ class TestPhi(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_weights(hf_model, dtype=dtype)
+        weights = load_weights_from_hf_model(hf_model, config)
         trtllm_model = tensorrt_llm.models.PhiForCausalLM(config)
         trtllm_model.load(weights)
 

@@ -87,7 +87,7 @@ class TestGPTNeoX(unittest.TestCase):
             "num_attention_heads": num_heads,
             "hidden_size": hidden_size,
             "vocab_size": vocab_size,
-            "position_embedding_type": "learned_absolute",
+            "position_embedding_type": "rope_gpt_neox",
             "max_position_embeddings": max_position_embeddings,
             "rotary_emb_base": 10000,
             "rotary_pct": gpt_config.rotary_pct,

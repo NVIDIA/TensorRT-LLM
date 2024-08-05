@@ -93,16 +93,55 @@ cd cpp/build
 ./benchmarks/gptManagerBenchmark --help
 ```
 
-Take GPT-350M as an example for 2-GPU inflight batching
-```
-mpirun -n 2 ./benchmarks/gptManagerBenchmark \
-    --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
-    --request_rate 10 \
-    --dataset ../../benchmarks/cpp/preprocessed_dataset.json
-    --max_num_samples 500
-```
+`gptManagerBenchmark` now supports decoder-only models and encoder-decoder models.
 
-`gptManagerBenchmark` by default uses the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`).
+1. Decoder-only Models
+
+    To benchmark decoder-only models, pass in the engine path with `--engine_dir` as executable input argument.
+
+    Take GPT-350M as an example for 2-GPU inflight batching
+    ```
+    mpirun -n 2 ./benchmarks/gptManagerBenchmark \
+        --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
+        --request_rate 10 \
+        --dataset ../../benchmarks/cpp/preprocessed_dataset.json \
+        --max_num_samples 500
+    ```
+
+    `gptManagerBenchmark` by default uses the high-level C++ API defined by the `executor::Executor` class (see `cpp/include/tensorrt_llm/executor/executor.h`).
+
+2. Encoder-Decoder Models
+    To benchmark encoder-decoder models, pass in the encoder engine path with `--encoder_engine_dir` and the decoder engine path with `--decoder_engine_dir` as executable input arguments. `--decoder_engine_dir` is an alias of `--engine_dir`.
+
+    Currently encoder-decoder engines only support `--api executor`, `--type IFB`, `--enable_kv_cache_reuse false`, which are all default values so no specific settings required.
+
+    Prepare t5-small engine from [examples/enc_dec](/examples/enc_dec/README.md#convert-and-split-weights) for the encoder-decoder 4-GPU inflight batching example.
+
+    Prepare the dataset suitable for engine input lengths.
+    ```
+    python prepare_dataset.py \
+        --tokenizer <path/to/tokenizer> \
+        --output cnn_dailymail.json \
+        dataset \
+        --dataset-name cnn_dailymail \
+        --dataset-split validation \
+        --dataset-config-name 3.0.0 \
+        --dataset-input-key article \
+        --dataset-prompt "Summarize the following article:" \
+        --dataset-output-key "highlights" \
+        --num-requests 100 \
+        --max-input-len 512 \
+        --output-len-dist 128,20
+    ```
+
+    Run the benchmark
+    ```
+    mpirun --allow-run-as-root -np 4 ./benchmarks/gptManagerBenchmark \
+        --encoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/encoder \
+        --decoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/decoder \
+        --dataset cnn_dailymail.json
+    ```
+
 
 #### Emulated static batching
 
@@ -125,7 +164,7 @@ Take GPT-350M as an example for single GPU with static batching
 ```
 ./benchmarks/gptManagerBenchmark \
     --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
-    --request-rate -1 \
+    --request_rate -1 \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
     --dataset ../../benchmarks/cpp/tokens-fixed-lengths.json
@@ -221,7 +260,7 @@ python benchmarks/cpp/utils/generate_rand_loras.py ${CPP_LORA} ${EG_DIR}/loras 1
 # First run inference without LoRAs
 mkdir -p ${EG_DIR}/log-base-lora
 mpirun -n ${TP} --output-filename ${EG_DIR}/log-base-lora \
-    cpp/build_Debug/benchmarks/gptManagerBenchmark \
+    cpp/build/benchmarks/gptManagerBenchmark \
     --engine_dir $LORA_ENGINE \
     --type IFB \
     --dataset "${EG_DIR}/data/token-norm-dist.json" \
@@ -239,7 +278,7 @@ mpirun -n ${TP} --output-filename ${EG_DIR}/log-base-lora \
 for nloras in ${NUM_LORAS[@]}; do
     mkdir -p ${EG_DIR}/log-lora-${nloras}
     mpirun -n ${TP} --output-filename "${EG_DIR}/log-lora-${nloras}" \
-        cpp/build_Debug/benchmarks/gptManagerBenchmark \
+        cpp/build/benchmarks/gptManagerBenchmark \
         --engine_dir $LORA_ENGINE \
         --type IFB \
         --dataset "${EG_DIR}/data/token-norm-dist-lora-${nloras}.json" \

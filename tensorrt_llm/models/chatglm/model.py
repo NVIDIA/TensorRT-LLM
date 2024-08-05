@@ -39,8 +39,6 @@ class ChatGLMDecoderLayer(Module):
         tp_rank = config.mapping.tp_rank
         layernorm_epsilon = config.norm_epsilon
 
-        rope_base = 10000.0
-        rotary_embedding_scaling = None
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.alpha = (2 * config.num_hidden_layers)**0.5
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
@@ -51,14 +49,8 @@ class ChatGLMDecoderLayer(Module):
             attention_mask_type = AttentionMaskType.bidirectional
         elif config.chatglm_version == 'chatglm2':
             attention_mask_type = AttentionMaskType.causal
-            if config.rope_ratio > 1:
-                rotary_embedding_scaling = {
-                    'type': 'linear',
-                    'factor': config.rope_ratio
-                }
         elif config.chatglm_version == 'chatglm3':
             attention_mask_type = AttentionMaskType.causal
-            rope_base *= config.rope_ratio
 
         self.input_layernorm = norm_cls(
             normalized_shape=hidden_size,
@@ -82,9 +74,9 @@ class ChatGLMDecoderLayer(Module):
             dense_bias=config.add_bias_linear,
             dtype=config.dtype,
             position_embedding_type=config.position_embedding_type,
-            rotary_embedding_base=rope_base,
-            rotary_embedding_scaling=rotary_embedding_scaling,
-            rotary_embedding_percentage=0.5,
+            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_scaling=config.rotary_scaling,
+            rotary_embedding_percentage=config.rotary_pct,
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,

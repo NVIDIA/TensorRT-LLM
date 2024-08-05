@@ -72,7 +72,7 @@ def config_is_allowed(config):
     # TODO: Support ootb path with getSMVersion() < 90:
     enable_ootb = getSMVersion() >= 90
     enable_bf16 = getSMVersion() >= 80
-    enable_fp8 = getSMVersion() >= 90
+    enable_fp8 = getSMVersion() >= 89
 
     DATA_TYPE_INDEX = 5
     WEIGHT_TYPE_INDEX = 6
@@ -310,7 +310,7 @@ class TestMoE(unittest.TestCase):
                 num_experts=8,
                 topk=2,
                 norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
-                hidden_size=4096,
+                hidden_size=2048,
                 dtype='bfloat16',
                 actfn='swiglu')
         ]

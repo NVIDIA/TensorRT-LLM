@@ -42,7 +42,6 @@ AllreducePlugin::AllreducePlugin(std::set<int> group, nvinfer1::DataType type, A
     , mStrategy(strategy)
     , mConfig(config)
     , mOp(op)
-    , mCounter(counter)
     , mEps(eps)
     , mAffine(affine)
     , mBias(bias)
@@ -65,7 +64,6 @@ AllreducePlugin::AllreducePlugin(void const* data, size_t length)
     }
     read(d, mConfig);
     read(d, mOp);
-    read(d, mCounter);
     read(d, mEps);
     read(d, mAffine);
     read(d, mBias);
@@ -256,17 +254,17 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
     case AllReduceStrategyType::NCCL:
     {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d layer %d: NCCL", rank, mCounter);
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
         break;
     }
     case AllReduceStrategyType::ONESHOT:
     {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d layer %d: ONESHOT", rank, mCounter);
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: ONESHOT", rank);
         break;
     }
     case AllReduceStrategyType::TWOSHOT:
     {
-        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d layer %d: TWOSHOT", rank, mCounter);
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: TWOSHOT", rank);
         break;
     }
     default: break;
@@ -305,10 +303,16 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     else
     {
         auto const tpSize = mGroup.size();
-        auto const tpRank = rank % tpSize;
+        int tpRank = 0;
+        for (auto const& currentRank : mGroup)
+        {
+            if (rank == currentRank)
+                break;
+            ++tpRank;
+        }
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int32_t const*>(inputs[1]), tpSize, tpRank, mCounter);
+            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank);
 
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
@@ -593,7 +597,7 @@ void AllreducePlugin::terminate() noexcept {}
 size_t AllreducePlugin::getSerializationSize() const noexcept
 {
     return sizeof(int) * mGroup.size() + sizeof(mType) + sizeof(mStrategy) + sizeof(mConfig) + sizeof(mOp)
-        + sizeof(mCounter) + sizeof(mEps) + sizeof(mAffine) + sizeof(mBias);
+        + sizeof(mEps) + sizeof(mAffine) + sizeof(mBias);
 }
 
 void AllreducePlugin::serialize(void* buffer) const noexcept
@@ -603,7 +607,6 @@ void AllreducePlugin::serialize(void* buffer) const noexcept
     write(d, mStrategy);
     write(d, mConfig);
     write(d, mOp);
-    write(d, mCounter);
     write(d, mEps);
     write(d, mAffine);
     write(d, mBias);

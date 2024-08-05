@@ -60,7 +60,11 @@ enum class CutlassTileConfig
     CtaShape256x128x64_WarpShape64x64x64,
 
     // TensorCore config CTA_N = 256, CTA_K = 64
-    CtaShape16x256x64_WarpShape16x64x64
+    CtaShape16x256x64_WarpShape16x64x64,
+
+    // TensorCore config CTA_N = 256, CTA_K = 128
+    CtaShape16x256x128_WarpShape16x64x128
+
 };
 
 enum class SplitKStyle
@@ -129,6 +133,7 @@ struct CutlassGemmConfig
         INT8_ONLY = 1u << 2,
         HOPPER = 1u << 3,
         GROUPED_GEMM = 1u << 4,
+        FP8_ONLY = 1u << 5,
     };
 
     CutlassTileConfig tile_config = CutlassTileConfig::ChooseWithHeuristic;

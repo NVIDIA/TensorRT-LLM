@@ -13,7 +13,7 @@ The TensorRT-LLM DiT implementation can be found in [tensorrt_llm/models/dit/mod
 - [x] FP16
 - [x] TP
 - [ ] FP8
-- [ ] CP
+- [x] CP
 
 ## Usage
 
@@ -64,6 +64,34 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
                 --max_batch_size 8 \
                 --remove_input_padding disable \
                 --bert_attention_plugin disable
+# build vae engine
+python vae_decoder_trt.py --max_batch_size 8
+# run
+mpirun -n 4 --allow-run-as-root python sample.py
+```
+
+### Context Parallel
+
+Context parallel can also be used to reduce latency and memory consumption on each GPU.
+
+```
+# build dit engine
+python convert_checkpoint.py --cp_size 4
+trtllm-build --checkpoint_dir ./tllm_checkpoint/ --max_batch_size 8 --remove_input_padding disable --bert_attention_plugin disable
+# build vae engine
+python vae_decoder_trt.py --max_batch_size 8
+# run
+mpirun -n 4 --allow-run-as-root python sample.py
+```
+
+### Combine Tensor Parallel and Context Parallel
+
+Tensor Parallel and Context Parallel can be used together to better balance latency and memory consumption.
+
+```
+# build dit engine
+python convert_checkpoint.py --cp_size 2 --tp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint/ --max_batch_size 8 --remove_input_padding disable --bert_attention_plugin disable
 # build vae engine
 python vae_decoder_trt.py --max_batch_size 8
 # run

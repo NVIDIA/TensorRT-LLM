@@ -83,7 +83,6 @@ private:
     kernels::AllReduceStrategyConfig mConfig;
     kernels::AllReduceFusionOp mOp;
     float mEps;
-    int32_t mCounter;
     std::shared_ptr<ncclComm_t> mNcclComm;
     int8_t mAffine;
     int8_t mBias;

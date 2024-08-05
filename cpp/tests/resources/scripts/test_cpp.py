@@ -192,10 +192,35 @@ def run_tests(build_dir: _pl.Path,
                              timeout=test_timeout)
 
         if run_gpt:
-            run_benchmarks(python_exe=python_exe,
+            run_benchmarks(model_name="gpt",
+                           python_exe=python_exe,
                            root_dir=root_dir,
                            build_dir=build_dir,
-                           resources_dir=resources_dir)
+                           resources_dir=resources_dir,
+                           model_cache=model_cache,
+                           test_gpt_session_benchmark=True,
+                           batching_types=["IFB", "V1"],
+                           api_types=["gptManager", "executor"])
+        elif run_t5:
+            run_benchmarks(model_name="t5",
+                           python_exe=python_exe,
+                           root_dir=root_dir,
+                           build_dir=build_dir,
+                           resources_dir=resources_dir,
+                           model_cache=model_cache,
+                           test_gpt_session_benchmark=False,
+                           batching_types=["IFB"],
+                           api_types=["executor"])
+        elif run_bart:
+            run_benchmarks(model_name="bart",
+                           python_exe=python_exe,
+                           root_dir=root_dir,
+                           build_dir=build_dir,
+                           resources_dir=resources_dir,
+                           model_cache=model_cache,
+                           test_gpt_session_benchmark=False,
+                           batching_types=["IFB"],
+                           api_types=["executor"])
         else:
             _log.info("Skipping benchmarks")
 
@@ -562,8 +587,10 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
 
-def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
-                   resources_dir: _pl.Path):
+def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
+                   build_dir: _pl.Path, resources_dir: _pl.Path,
+                   model_cache: str, test_gpt_session_benchmark: bool,
+                   batching_types: list[str], api_types: list[str]):
 
     # At this moment, CI env might not installed tensorrt_llm before, so tensorrt_llm module might not be available.
     import pathlib
@@ -583,19 +610,45 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     run_command(make_benchmarks, cwd=build_dir, timeout=300)
 
     benchmark_exe_dir = build_dir / "benchmarks"
-    gpt_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
+    if model_name == "gpt":
+        model_engine_dir = resources_dir / "models" / "rt_engine" / "gpt2"
+        tokenizer_dir = resources_dir / "models" / "gpt2"
+    elif model_name in ('bart', 't5'):
+        if model_name == "t5":
+            hf_repo_name = "t5-small"
+        elif model_name == "bart":
+            hf_repo_name = "bart-large-cnn"
+        model_engine_dir = resources_dir / "models" / "enc_dec" / "trt_engines" / hf_repo_name
+        tokenizer_dir = model_cache + "/" + hf_repo_name
+        model_engine_path = model_engine_dir / "1-gpu" / "float16" / "decoder"
+        encoder_model_engine_path = model_engine_dir / "1-gpu" / "float16" / "encoder"
+        model_name = "enc_dec"
+    else:
+        _log.info(
+            f"run_benchmark test does not support {model_name}. Skipping benchmarks"
+        )
+        return NotImplementedError
 
-    input_file = 'input_tokens.npy'
-    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
-    model_spec_obj.use_gpt_plugin()
+    if test_gpt_session_benchmark:
+        if model_name == "gpt":
+            input_file = 'input_tokens.npy'
+            model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+            model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+            model_spec_obj.use_gpt_plugin()
+            model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
+            ) / "tp1-pp1-gpu"
+        else:
+            _log.info(
+                f"gptSessionBenchmark test does not support {model_name}. Skipping benchmarks"
+            )
+            return NotImplementedError
 
-    benchmark = [
-        str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
-        str(gpt_engine_dir / model_spec_obj.get_model_path() / "tp1-pp1-gpu"),
-        "--batch_size", "8", "--input_output_len", "10,20", "--duration", "10"
-    ]
-    run_command(benchmark, cwd=root_dir, timeout=600)
+        benchmark = [
+            str(benchmark_exe_dir / "gptSessionBenchmark"), "--engine_dir",
+            str(model_engine_path), "--batch_size", "8", "--input_output_len",
+            "10,20", "--duration", "10"
+        ]
+        run_command(benchmark, cwd=root_dir, timeout=600)
 
     prompt_datasets_args = [{
         '--dataset-name': "cnn_dailymail",
@@ -618,8 +671,14 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
     max_input_lens = ["256", "20"]
     num_reqs = ["50", "10"]
 
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
-    model_spec_obj.use_packed_input()
+    if model_name == "gpt":
+        input_file = 'input_tokens.npy'
+        model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.use_gpt_plugin()
+        model_spec_obj.use_packed_input()
+        model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
+        ) / "tp1-pp1-gpu"
 
     for prompt_ds_args, tokens_f, len, num_req in zip(prompt_datasets_args,
                                                       token_files,
@@ -630,7 +689,7 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
         prepare_dataset = [
             python_exe,
             str(benchmark_src_dir / "prepare_dataset.py"), "--tokenizer",
-            str(resources_dir / "models" / "gpt2"), "--output",
+            str(tokenizer_dir), "--output",
             str(data_dir / tokens_f), "dataset", "--max-input-len", len,
             "--num-requests", num_req
         ]
@@ -643,50 +702,69 @@ def run_benchmarks(python_exe: str, root_dir: _pl.Path, build_dir: _pl.Path,
                     timeout=300,
                     env={'HF_DATASETS_OFFLINE': '0'})
 
-        batching_types = ["IFB", "V1"]
-        api_types = ["gptManager", "executor"]
-
         for batching_type in batching_types:
             for api_type in api_types:
                 benchmark = [
                     str(benchmark_exe_dir / "gptManagerBenchmark"),
                     "--engine_dir",
-                    str(gpt_engine_dir / model_spec_obj.get_model_path() /
-                        "tp1-pp1-gpu"), "--type",
+                    str(model_engine_path), "--type",
                     str(batching_type), "--api",
                     str(api_type), "--dataset",
                     str(data_dir / tokens_f)
                 ]
+                if model_name == "enc_dec":
+                    benchmark += [
+                        "--encoder_engine_dir",
+                        str(encoder_model_engine_path)
+                    ]
+
                 run_command(benchmark, cwd=root_dir, timeout=600)
                 req_rate_benchmark = benchmark + ["--request_rate", "100"]
                 run_command(req_rate_benchmark, cwd=root_dir, timeout=600)
                 concurrency_benchmark = benchmark + ["--concurrency", "30"]
                 run_command(concurrency_benchmark, cwd=root_dir, timeout=600)
 
-        benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-            str(gpt_engine_dir / model_spec_obj.get_model_path() /
-                "tp1-pp1-gpu"), "--type", "IFB", "--dataset",
-            str(data_dir / tokens_f), "--api", "executor", "--streaming"
-        ]
-        run_command(benchmark, cwd=root_dir, timeout=600)
+        if "IFB" in batching_type and "executor" in api_types:
+            # executor streaming test
+            benchmark = [
+                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
+                str(model_engine_path), "--type", "IFB", "--dataset",
+                str(data_dir / tokens_f), "--api", "executor", "--streaming"
+            ]
+            if model_name == "enc_dec":
+                benchmark += [
+                    "--encoder_engine_dir",
+                    str(encoder_model_engine_path)
+                ]
+            run_command(benchmark, cwd=root_dir, timeout=600)
 
-        benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-            str(gpt_engine_dir / model_spec_obj.get_model_path() /
-                "tp1-pp1-gpu"), "--type", "IFB", "--dataset",
-            str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
-        ]
-        run_command(benchmark, cwd=root_dir, timeout=600)
+        if "IFB" in batching_type and "gptManager" in api_type:
+            # gptManager streaming test
+            benchmark = [
+                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
+                str(model_engine_path), "--type", "IFB", "--dataset",
+                str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
+            ]
+            if model_name == "enc_dec":
+                benchmark += [
+                    "--encoder_engine_dir",
+                    str(encoder_model_engine_path)
+                ]
+            run_command(benchmark, cwd=root_dir, timeout=600)
 
-        benchmark = [
-            str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-            str(gpt_engine_dir / model_spec_obj.get_model_path() /
-                "tp1-pp1-gpu"), "--type", "IFB", "--dataset",
-            str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
-            "request_rate", "100", "--enable_exp_delays"
-        ]
-        run_command(benchmark, cwd=root_dir, timeout=600)
+            # gptManager streaming test with delay
+            benchmark = [
+                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
+                str(model_engine_path), "--type", "IFB", "--dataset",
+                str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
+                "request_rate", "100", "--enable_exp_delays"
+            ]
+            if model_name == "enc_dec":
+                benchmark += [
+                    "--encoder_engine_dir",
+                    str(encoder_model_engine_path)
+                ]
+            run_command(benchmark, cwd=root_dir, timeout=600)
 
 
 if __name__ == "__main__":
