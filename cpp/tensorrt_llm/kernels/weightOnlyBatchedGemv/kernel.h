@@ -81,12 +81,12 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     GMemIterator<Mandatory, AccessTypeW, CtaN, Details::kAccessNumW, uint8_t> weight_iterator(weight,
         (interleaved_offset_n * interleaved_k + tid * StepK) / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW);
-    SHMemIterator<Mandatory, AccessTypeA, CtaN * Details::kInterleave * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> scales_iterator(scales,
+    SHMemIterator<Mandatory, CtaN * Details::kInterleave * sizeof(TypeA), TypeA> scales_iterator(scales,
         offset_k_group * n + blk_offset_n, vec_scale, thr_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
         (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)
         );
-    SHMemIterator<EnableZero, AccessTypeA, CtaN * Details::kInterleave * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> zeros_iterator(zeros,
+    SHMemIterator<EnableZero, CtaN * Details::kInterleave * sizeof(TypeA), TypeA> zeros_iterator(zeros,
         offset_k_group * n + blk_offset_n, vec_zero, thr_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave,
         (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : CtaN * Details::kInterleave)

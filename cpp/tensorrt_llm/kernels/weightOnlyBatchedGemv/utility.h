@@ -133,6 +133,7 @@ __device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* sca
         Converter::convert<K>(reinterpret_cast<uint8_t*>(quantized_w) + n * K / Details::kElemsPerByteW,
             reinterpret_cast<Type*>(w) + n * K);
         Type2 vec_scale, vec_zero;
+        __pipeline_wait_prior(0);
         if constexpr (ApplyAlphaInAdvance)
         {
             vec_scale = MathWrapper<typename Details::TypeDetailsA>::to_vec2(
@@ -307,7 +308,7 @@ private:
     int stride_;
 };
 
-template <bool Enable, typename TVec, int Continuous, typename T>
+template <bool Enable, int Continuous, typename T>
 class SHMemIterator
 {
 public:
@@ -327,17 +328,20 @@ public:
     {
         if constexpr (Enable)
         {
-#pragma unroll
-            for (int i = threadIdx.x % sz_size_; i < Continuous; i += sz_size_) {
-                __pipeline_memcpy_async(
-                    reinterpret_cast<TVec*>(sh_addr_) + i,
-                    reinterpret_cast<TVec*>(g_addr_ + iter * step_) + i,
-                    sizeof(TVec),
-                    0
-                );                    
-                __pipeline_commit();
-            }
-            __pipeline_wait_prior(0);
+          const int loadunit = 128 / sizeof(T);
+          int chunks = Continuous / sz_size_;
+          int i = (threadIdx.x % sz_size_) * chunks;
+          while (chunks >= loadunit) {
+            __pipeline_memcpy_async(sh_addr_ + i, g_addr_ + iter * step_ + i,
+                                    sizeof(T) * loadunit, 0);
+            chunks -= loadunit;
+            i += loadunit;
+          }
+          if (chunks > 0) {
+            __pipeline_memcpy_async(sh_addr_ + i, g_addr_ + iter * step_ + i,
+                                    sizeof(T) * chunks, 0);
+          }
+          __pipeline_commit();
         }
     }
 
