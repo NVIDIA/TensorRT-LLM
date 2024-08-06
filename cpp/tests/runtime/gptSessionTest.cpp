@@ -19,7 +19,6 @@
 
 #include <gtest/gtest.h>
 
-#include "modelSpec.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
@@ -36,10 +35,6 @@ using namespace tensorrt_llm::runtime;
 
 namespace tc = tensorrt_llm::common;
 namespace fs = std::filesystem;
-using tensorrt_llm::testing::ModelSpec;
-using tensorrt_llm::testing::KVCacheType;
-using tensorrt_llm::testing::QuantMethod;
-using tensorrt_llm::testing::OutputContentType;
 
 namespace
 {
@@ -54,10 +49,6 @@ auto const CHATGLM_MODEL_DIR = "chatglm-6b";
 auto const CHATGLM2_MODEL_DIR = "chatglm2-6b";
 auto const CHATGLM3_MODEL_DIR = "chatglm3-6b";
 auto const MAMBA_MODEL_DIR = "mamba-2.8b-hf";
-auto const INPUT_FILE = "input_tokens.npy";
-auto const CHATGLM_INPUT_FILE = "input_tokens_chatglm-6b.npy";
-auto const CHATGLM2_INPUT_FILE = "input_tokens_chatglm2-6b.npy";
-auto const CHATGLM3_INPUT_FILE = "input_tokens_chatglm3-6b.npy";
 
 // Engines need to be generated using cpp/tests/resources/scripts/build_*_engines.py.
 auto const FP32_GPT_DIR = "fp32-default";
@@ -88,6 +79,77 @@ struct ModelParams
 {
     char const* baseDir;
     ModelIds ids;
+};
+
+class ModelSpec
+{
+public:
+    ModelSpec(fs::path modelPath, fs::path resultsFile, nvinfer1::DataType dtype)
+        : mModelPath{std::move(modelPath)}
+        , mResultsFile{std::move(resultsFile)}
+        , mDataType{dtype}
+        , mUseGptAttentionPlugin{false}
+        , mUsePackedInput{false}
+        , mUsePagedKvCache{false}
+        , mDecoderPerRequest{false}
+        , mPPSize(1)
+        , mTPSize(1)
+        , mRandomEndId(false)
+    {
+    }
+
+    ModelSpec& useGptAttentionPlugin()
+    {
+        mUseGptAttentionPlugin = true;
+        return *this;
+    }
+
+    ModelSpec& usePackedInput()
+    {
+        mUsePackedInput = true;
+        return *this;
+    }
+
+    ModelSpec& usePagedKvCache()
+    {
+        mUsePagedKvCache = true;
+        return *this;
+    }
+
+    ModelSpec& useDecoderPerRequest()
+    {
+        mDecoderPerRequest = true;
+        return *this;
+    }
+
+    ModelSpec& usePipelineParallelism(int ppSize)
+    {
+        mPPSize = ppSize;
+        return *this;
+    }
+
+    ModelSpec& useTensorParallelism(int tpSize)
+    {
+        mTPSize = tpSize;
+        return *this;
+    }
+
+    ModelSpec& useRandomEndId()
+    {
+        mRandomEndId = true;
+        return *this;
+    }
+
+    fs::path mModelPath;
+    fs::path mResultsFile;
+    nvinfer1::DataType mDataType;
+    bool mUseGptAttentionPlugin;
+    bool mUsePackedInput;
+    bool mUsePagedKvCache;
+    bool mDecoderPerRequest;
+    int mPPSize;
+    int mTPSize;
+    bool mRandomEndId;
 };
 
 struct MicroBatchSizes
@@ -124,7 +186,7 @@ void verifyModelConfig(ModelConfig const& modelConfig, ModelSpec const& modelSpe
 {
     ASSERT_EQ(modelSpec.mUseGptAttentionPlugin, modelConfig.useGptAttentionPlugin());
     ASSERT_EQ(modelSpec.mUsePackedInput, modelConfig.usePackedInput());
-    ASSERT_EQ(modelSpec.mKVCacheType == KVCacheType::kPAGED, modelConfig.usePagedKvCache());
+    ASSERT_EQ(modelSpec.mUsePagedKvCache, modelConfig.usePagedKvCache());
     ASSERT_EQ(modelSpec.mDataType, modelConfig.getDataType());
 }
 
@@ -137,9 +199,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
 
     ASSERT_TRUE(fs::exists(DATA_PATH));
     std::string modelName{isChatGlmTest ? resultsFile.parent_path().parent_path().filename().string() : ""};
-
-    fs::path inputPath = DATA_PATH / modelSpec.mInputFile;
-
+    fs::path inputPath = DATA_PATH / (isChatGlmTest ? "input_tokens_" + modelName + ".npy" : "input_tokens.npy");
     auto const& givenInput = utils::loadNpy(manager, inputPath.string(), MemoryType::kCPU);
     auto const& inputShape = givenInput->getShape();
     ASSERT_EQ(inputShape.nbDims, 2);
@@ -403,7 +463,7 @@ std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
         name.append("AttentionPlugin");
     if (modelSpec.mUsePackedInput)
         name.append("Packed");
-    if (modelSpec.mKVCacheType == KVCacheType::kPAGED)
+    if (modelSpec.mUsePagedKvCache)
         name.append("PagedKvCache");
     if (modelSpec.mDecoderPerRequest)
         name.append("DecoderBatch");
@@ -451,10 +511,10 @@ TEST_P(ParamTest, Test)
 
     std::ostringstream gpuSizePath;
     gpuSizePath << "tp" << modelSpec.mTPSize << "-pp" << modelSpec.mPPSize << "-gpu";
-    auto const modelPath{ENGINE_PATH / modelDir / modelSpec.getModelPath() / gpuSizePath.str()};
+    auto const modelPath{ENGINE_PATH / modelDir / modelSpec.mModelPath / gpuSizePath.str()};
     auto const resultsPath
         = DATA_PATH / modelDir / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
-    fs::path const resultsFile{resultsPath / modelSpec.getResultsFile()};
+    fs::path const resultsFile{resultsPath / modelSpec.mResultsFile};
 
     // Warning: This should be the last check before running the test.
     // It will initialize MPI which can take significant time.
@@ -472,10 +532,11 @@ INSTANTIATE_TEST_SUITE_P(GptSessionOtbTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{GPT_MODEL_DIR, {50256, 50256}}),
         testing::Values(
             // single decoder
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kFLOAT}, ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF},
+            ModelSpec{FP32_GPT_DIR, FP32_RESULT_FILE, nvinfer1::DataType::kFLOAT},
+            ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF},
             // decoderBatch
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kFLOAT}.useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useDecoderPerRequest()
+            ModelSpec{FP32_GPT_DIR, FP32_RESULT_FILE, nvinfer1::DataType::kFLOAT}.useDecoderPerRequest(),
+            ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF}.useDecoderPerRequest()
 
                 ),
         testing::Values(1),           // beamWidth
@@ -492,30 +553,40 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
             // Disabled because of flakey beam search test
             // ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
             //     .useGptAttentionPlugin(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().usePackedInput(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().usePackedInput().setKVCacheType(
-                KVCacheType::kPAGED),
+            ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin(),
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput(),
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput()
+                .usePagedKvCache(),
 
             // decoderBatch
             // Disabled because of flakey beam search test
             // ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
             //     .useGptAttentionPlugin()
             //     .useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .useDecoderPerRequest(),
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest()
                 .useRandomEndId()
 
@@ -531,20 +602,29 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{GPTJ_MODEL_DIR, {50256, 50256}}),
         testing::Values(
             // single decoder
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().usePackedInput(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().usePackedInput().setKVCacheType(
-                KVCacheType::kPAGED),
+            ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin(),
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput(),
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput()
+                .usePagedKvCache(),
             // decoderBatch
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .useDecoderPerRequest(),
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_DIR, FP16_PLUGIN_PACKED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest()
 
                 ),
@@ -559,7 +639,7 @@ INSTANTIATE_TEST_SUITE_P(MambaSessionOOTBTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{MAMBA_MODEL_DIR, {0, 1}}),
         testing::Values(
             // single decoder
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}),
+            ModelSpec{FP16_GPT_DIR, FP16_RESULT_FILE, nvinfer1::DataType::kHALF}),
         testing::Values(1),     // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
@@ -568,7 +648,7 @@ INSTANTIATE_TEST_SUITE_P(MambaSessionOOTBTest, ParamTest,
     generateTestName);
 INSTANTIATE_TEST_SUITE_P(MambaSessionPluginTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{MAMBA_MODEL_DIR, {0, 1}}),
-        testing::Values(ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useMambaPlugin()),
+        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}),
         testing::Values(1),     // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
@@ -580,30 +660,37 @@ INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
         testing::Values(
             // single decoder
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin().usePackedInput().setKVCacheType(
-                KVCacheType::kPAGED),
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput()
+                .usePagedKvCache(),
             // decoderBatch
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{
+                FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP4_FILE,
+                nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest()
                 .usePipelineParallelism(4),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_TP4_PP1_FILE,
+                nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest()
                 .useTensorParallelism(4),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{FP16_GPT_ATTENTION_PACKED_PAGED_DIR, FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP2_FILE,
+                nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
+                .usePagedKvCache()
                 .useDecoderPerRequest()
                 .usePipelineParallelism(2)
                 .useTensorParallelism(2)
@@ -618,7 +705,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
 
 INSTANTIATE_TEST_SUITE_P(ChatGlmSessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{CHATGLM_MODEL_DIR, {130005, 3}}), // end_id, pad_id
-        testing::Values(ModelSpec{CHATGLM_INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin()
+        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                            .useGptAttentionPlugin()
 
                 ),
         testing::Values(1, 2),  // beamWidth
@@ -630,7 +718,8 @@ INSTANTIATE_TEST_SUITE_P(ChatGlmSessionTest, ParamTest,
 
 INSTANTIATE_TEST_SUITE_P(ChatGlm2SessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{CHATGLM2_MODEL_DIR, {2, 0}}), // end_id, pad_id
-        testing::Values(ModelSpec{CHATGLM2_INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin()
+        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                            .useGptAttentionPlugin()
 
                 ),
         testing::Values(1, 2),  // beamWidth
@@ -642,7 +731,8 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm2SessionTest, ParamTest,
 
 INSTANTIATE_TEST_SUITE_P(ChatGlm3SessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{CHATGLM3_MODEL_DIR, {2, 0}}), // end_id, pad_id
-        testing::Values(ModelSpec{CHATGLM3_INPUT_FILE, nvinfer1::DataType::kHALF}.useGptAttentionPlugin()
+        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+                            .useGptAttentionPlugin()
 
                 ),
         testing::Values(1, 2),  // beamWidth
@@ -663,12 +753,11 @@ TEST_F(LlamaSessionOnDemandTest, SamplingFP16WithAttentionPlugin)
     auto const engineDir = "llama_7bf_outputs_tp1";
     auto const modelPath{ENGINE_PATH / modelDir / engineDir};
     SizeType32 constexpr beamWidth{1};
+    fs::path resultsFile{DATA_PATH / modelDir / FP16_RESULT_FILE};
     auto const batchSizes = {8};
 
     auto constexpr dtype = nvinfer1::DataType::kHALF;
-    auto otherModelSpecPtr = std::make_shared<ModelSpec>(INPUT_FILE, dtype);
-    auto const modelSpec = ModelSpec{INPUT_FILE, dtype}.useGptAttentionPlugin();
-    fs::path resultsFile{DATA_PATH / modelDir / modelSpec.getResultsFile()};
+    auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin();
     auto const modeIds = ModelIds{2, 2};
 
     testGptSession(
@@ -681,15 +770,11 @@ TEST_F(LlamaSessionOnDemandTest, SamplingFP16AttentionPluginDecoderBatch)
     auto const modelDir = "llamav2";
     auto const modelPath{ENGINE_PATH / modelDir};
     SizeType32 constexpr beamWidth{1};
+    fs::path resultsFile{DATA_PATH / modelDir / FP16_RESULT_FILE};
     auto const batchSizes = {8};
 
     auto constexpr dtype = nvinfer1::DataType::kHALF;
-    auto otherModelSpecPtr = std::make_shared<ModelSpec>(INPUT_FILE, dtype);
-    auto const modelSpec = ModelSpec{INPUT_FILE, dtype, otherModelSpecPtr}
-                               .useGptAttentionPlugin()
-                               .usePackedInput()
-                               .useDecoderPerRequest();
-    fs::path resultsFile{DATA_PATH / modelDir / modelSpec.getResultsFile()};
+    auto const modelSpec = ModelSpec{"", "", dtype}.useGptAttentionPlugin().usePackedInput().useDecoderPerRequest();
     auto const modeIds = ModelIds{2, 2};
 
     testGptSession(
