@@ -83,6 +83,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::QKV_TENSOR: return true;
     case IdxEntry::K_TENSOR: return mUnfuseQkvGemm;
     case IdxEntry::V_TENSOR: return mUnfuseQkvGemm;
+    case IdxEntry::CONTEXT_FMHA_CUSTOM_MASK: return useCustomMask();
     case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
     case IdxEntry::HOST_MAX_ATTENTION_WINDOW: return true;
@@ -227,6 +228,10 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     else if (mFP8ContextFMHA && pos == getIdx(IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE))
     {
         return inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
+    }
+    else if (useCustomMask() && pos == getIdx(IdxEntry::CONTEXT_FMHA_CUSTOM_MASK))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (mPagedKVCache
         && (pos == getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS) || pos == getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)))
@@ -601,6 +606,14 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE)]);
     }
 
+    uint32_t const* context_fmha_custom_mask = nullptr;
+    if (useCustomMask())
+    {
+        assert(inputDesc[getIdx(IdxEntry::CONTEXT_FMHA_CUSTOM_MASK)].type == nvinfer1::DataType::kINT32);
+        context_fmha_custom_mask
+            = reinterpret_cast<uint32_t const*>(inputs[getIdx(IdxEntry::CONTEXT_FMHA_CUSTOM_MASK)]);
+    }
+
     int max_blocks_per_sequence = 0;
     kernels::KVBlockArray::DataType* block_offsets = nullptr;
     kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
@@ -690,6 +703,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         ? *std::max_element(max_context_kv_len_list, max_context_kv_len_list + localNbSeq)
         : max_context_q_len;
 
+    int64_t const* runtime_perf_knobs = static_cast<int64_t const*>(inputs[getIdx(IdxEntry::HOST_RUNTIME_PERF_KNOBS)]);
+
     if (is_context) // context stage
     {
         int const batch_size = localNbSeq;
@@ -708,12 +723,13 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             }
         }
 
-        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, rotary_inv_freq,
-            rotary_cos_sin, max_context_q_len, max_context_kv_len, max_attention_window_size,
+        EnqueueContextParams<T, KVCacheBuffer> enqueue_params{attention_input, qkv_bias, context_fmha_custom_mask,
+            rotary_inv_freq, rotary_cos_sin, max_context_q_len, max_context_kv_len, max_attention_window_size,
             cyclic_attention_window_size, sink_token_length, context_q_lengths, sequence_kv_length, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
             block_offsets, host_block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, batch_size,
             localNbTokens, max_blocks_per_sequence, workspace};
+        enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
         {
             enqueue_params.relative_attention_bias
@@ -753,10 +769,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             = beamWidth == 1 ? nullptr : reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::CACHE_INDIR)]);
         int const* host_context_lengths
             = mRemovePadding ? reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) : nullptr;
-
-        // multi block mode is only used in enqueueGeneration
-        int64_t const* runtime_perf_knobs
-            = static_cast<int64_t const*>(inputs[getIdx(IdxEntry::HOST_RUNTIME_PERF_KNOBS)]);
 
         // Medusa: the max input sequence length if variable sequence length is needed.
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);

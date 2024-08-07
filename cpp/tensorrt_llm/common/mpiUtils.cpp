@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <numeric>
+
 #include "tensorrt_llm/common/mpiUtils.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -93,7 +96,42 @@ namespace
 bool mpiInitialized = false;
 std::recursive_mutex mpiMutex;
 
+MpiComm initLocalSession()
+{
+#if ENABLE_MULTI_DEVICE
+    MPI_Comm localComm;
+    MPI_Comm_split_type(COMM_SESSION, OMPI_COMM_TYPE_HOST, COMM_SESSION.getRank(), MPI_INFO_NULL, &localComm);
+    MpiComm localSession{localComm, false};
+#else
+    MpiComm localSession{COMM_SESSION, false};
+#endif // ENABLE_MULTI_DEVICE
+    return localSession;
+}
+
 } // namespace
+
+std::vector<int> getWorldRanks(MpiComm const& comm)
+{
+#if ENABLE_MULTI_DEVICE
+    MPI_Group group, worldGroup;
+
+    MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
+    MPICHECK(MPI_Comm_group(comm, &group));
+
+    int groupSize;
+    MPICHECK(MPI_Group_size(group, &groupSize));
+    std::vector<int> ranks(groupSize), worldRanks(groupSize);
+    std::iota(ranks.begin(), ranks.end(), 0);
+
+    MPICHECK(MPI_Group_translate_ranks(group, groupSize, ranks.data(), worldGroup, worldRanks.data()));
+    MPICHECK(MPI_Group_free(&group));
+    MPICHECK(MPI_Group_free(&worldGroup));
+    std::sort(worldRanks.begin(), worldRanks.end());
+    return worldRanks;
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif
+}
 
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 {
@@ -305,7 +343,7 @@ MpiComm const& MpiComm::world()
     return commWorld;
 }
 
-MpiComm& MpiComm::session()
+MpiComm& MpiComm::mutableSession()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     static MpiComm commSession{MPI_COMM_WORLD, false};
@@ -314,24 +352,44 @@ MpiComm& MpiComm::session()
     return commSession;
 }
 
-MpiComm getLocalSession()
+MpiComm& MpiComm::mutableLocalSession()
 {
-#if ENABLE_MULTI_DEVICE
-    MPI_Comm localComm;
-    MPI_Comm_split_type(COMM_SESSION, OMPI_COMM_TYPE_HOST, 0, MPI_INFO_NULL, &localComm);
-    MpiComm localSession{localComm, false};
-#else
-    MpiComm localSession{COMM_SESSION, false};
-#endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    static MpiComm localSession = initLocalSession();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return localSession;
 }
 
-MpiComm& MpiComm::localSession()
+void MpiComm::refreshLocalSession()
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    static MpiComm localSession = getLocalSession();
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return localSession;
+#if ENABLE_MULTI_DEVICE
+    static std::vector<int> initSessionRanks;
+    static std::mutex mutex;
+    std::unique_lock lock(mutex);
+    if (initSessionRanks.empty())
+    {
+        auto initSessionRanks = getWorldRanks(MpiComm::session());
+        auto localSessionRanks = getWorldRanks(MpiComm::localSession());
+        std::vector<int> intersectionRanks;
+        std::set_intersection(initSessionRanks.begin(), initSessionRanks.end(), localSessionRanks.begin(),
+            localSessionRanks.end(), std::back_inserter(intersectionRanks));
+
+        MPI_Group worldGroup;
+        MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
+        MPI_Group localGroup;
+        MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
+        MPI_Comm localComm;
+        MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
+        MpiComm::mutableLocalSession().mFreeComm = true;
+        MpiComm::mutableLocalSession() = MpiComm{localComm, false};
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(getWorldRanks(MpiComm::session()) == initSessionRanks,
+            "Executors in the same process must use the same participant IDs.");
+    }
+    TLLM_LOG_INFO("Refreshed the MPI local session");
+#endif // ENABLE_MULTI_DEVICE
 }
 
 MpiComm::MpiComm(MPI_Comm g, bool freeComm)
@@ -344,9 +402,12 @@ MpiComm::MpiComm(MPI_Comm g, bool freeComm)
 MpiComm::~MpiComm() noexcept
 {
 #if ENABLE_MULTI_DEVICE
-    if (mFreeComm && mComm && MPI_Comm_free(&mComm) != MPI_SUCCESS)
+    if (mFreeComm && mComm)
     {
-        TLLM_LOG_ERROR("MPI_Comm_free failed");
+        if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
+        {
+            TLLM_LOG_ERROR("MPI_Comm_free failed");
+        }
     }
 #endif // ENABLE_MULTI_DEVICE
 }

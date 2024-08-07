@@ -1,8 +1,9 @@
 --extra-index-url https://pypi.nvidia.com
+--extra-index-url https://download.pytorch.org/whl/cu121
 accelerate==0.25.0
 build
 colored
-cuda-python==12.4.0
+cuda-python==12.5.0
 diffusers==0.27.0
 numpy<2
 onnx>=1.12.0
@@ -15,10 +16,10 @@ h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.1.99
-tensorrt-cu12==10.1.0
+tensorrt~=10.2.0
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
-torch @ https://download.pytorch.org/whl/cu121/torch-2.3.1%2Bcu121-cp310-cp310-win_amd64.whl
+torch==2.4.0+cu121
 nvidia-modelopt~=0.15.0
 transformers>=4.38.2
 wheel

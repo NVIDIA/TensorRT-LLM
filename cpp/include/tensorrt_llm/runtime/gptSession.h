@@ -281,7 +281,7 @@ private:
 
     //! @brief Collect final output ids and log probs on last PP rank and send them to first PP rank.
     //! @details Receives are asynchronous on host, so synchronization is required before access.
-    void finalize(SizeType32 microBatchId);
+    void finalize(SizeType32 microBatchId, SamplingConfig const& samplingConfig);
 
     void kvCacheAddSequences(SizeType32 beamWidth, SizeType32 microBatchId, SizeType32 firstBatchIdx);
 

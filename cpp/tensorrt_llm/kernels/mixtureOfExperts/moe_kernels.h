@@ -160,7 +160,7 @@ public:
         void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
         void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
-        bool const* finished, int64_t const active_rows, void* expert_scales,
+        bool const* finished, int64_t const active_rows, void* token_topk_unpermuted_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
         cudaStream_t stream)
@@ -168,7 +168,7 @@ public:
 
     // Aliases for profiling the gemms
     virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
-        int64_t const* const total_rows_before_expert, HopperGroupedGemmInput hopper_input_template,
+        int64_t const* const expert_first_token_offset, HopperGroupedGemmInput hopper_input_template,
         void const* const fc1_expert_weights, void const* const fc1_expert_biases,
         int64_t const* const num_valid_tokens_ptr, void const* const fc1_int_scales, float const* const fc1_fp8_dequant,
         float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
@@ -176,29 +176,49 @@ public:
         float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config)
         = 0;
 
-    virtual void gemm2(void const* const input, void* const output, int64_t const* const total_rows_before_expert,
-        HopperGroupedGemmInput hopper_input_template, void const* const fc2_expert_weights,
-        void const* const fc2_int_scales, float const* const fc2_fp8_dequant, int64_t const expanded_num_rows,
-        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
-        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config)
+    virtual void gemm2(void const* const input, void* const gemm_output, void* const final_output,
+        int64_t const* const expert_first_token_offset, HopperGroupedGemmInput const hopper_input_template,
+        void const* const fc2_expert_weights, void const* const fc2_expert_biases, void const* const fc2_int_scales,
+        float const* const fc2_fp8_dequant, float const* const token_topk_unpermuted_scales,
+        float const* const token_topk_permuted_scales, int const* const expanded_source_row_to_expanded_dest_row,
+        int const* expanded_dest_row_to_expanded_source_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        bool using_hopper_fused_finalize, float const** alpha_scale_ptr_array, cudaStream_t stream,
+        MOEParallelismConfig parallelism_config, cutlass_extensions::CutlassGemmConfig config)
         = 0;
 
     virtual size_t getGemmWorkspaceSize(int num_experts) const = 0;
 
     bool is_profiler = false;
+    bool use_deterministic_hopper_reduce_ = false;
 };
 
 // Assumes inputs activations are row major. Weights need to be preprocessed by th_op/weight_quantize.cc .
 // Nested in a class to avoid multiple calls to cudaGetDeviceProperties as this call can be expensive.
 // Avoid making several duplicates of this class.
-template <typename T,        /*The type used for activations/scales/compute*/
-    typename WeightType,     /* The type for the MoE weights */
-    typename OutputType = T, /* The type for the MoE weights */
+template <typename T,                    /*The type used for activations*/
+    typename WeightType,                 /* The type for the MoE weights */
+    typename OutputType = T,             /* The type for the MoE final output */
+    typename ScaleBiasType = OutputType, /* The type for scales and bias */
     typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 {
     using Self = CutlassMoeFCRunner<T, WeightType, OutputType>;
-    using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>; /* Internal gemm output type*/
+#if defined(ENABLE_FP8)
+    static constexpr bool use_fp8 = std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value;
+#else
+    static constexpr bool use_fp8 = false;
+#endif
+
+    // This should leave the variable unchanged in any currently supported configuration
+    using UnfusedGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<OutputType>;
+
+    static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3>, "Current logic requires output type to be non-FP8");
+    // We introduce this as a separate parameter, so that if we ever remove the above condition we can decouple
+    // ScaleBiasType and OutputType easily. For now these are required to be equivalent
+    static_assert(std::is_same_v<OutputType, ScaleBiasType>, "Scale and bias types must match OutputType");
+
 public:
     CutlassMoeFCRunner() = default;
 
@@ -233,31 +253,36 @@ public:
         void const* fc1_expert_biases, ActivationType fc1_activation_type, void const* fc2_expert_weights,
         void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const k, char* workspace_ptr, void* final_output,
-        bool const* finished, int64_t const active_rows, void* expert_scales,
+        bool const* finished, int64_t const active_rows, void* token_topk_unpermuted_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode,
         cudaStream_t stream) override;
 
     // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
-    static void gemm1(MoeGemmRunner<T, WeightType>& gemm_runner, T const* const input, T* const output,
-        void* const intermediate_result, int64_t const* const total_rows_before_expert,
+    static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner, T const* const input,
+        T* const output, void* const intermediate_result, int64_t const* const expert_first_token_offset,
         HopperGroupedGemmInput const hopper_input_template, WeightType const* const fc1_expert_weights,
-        HopperGemmOutputType const* const fc1_expert_biases, int64_t const* const num_valid_tokens_ptr,
-        HopperGemmOutputType const* const fc1_int_scales, float const* const fc1_fp8_dequant,
-        float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
-        int64_t const inter_size, int const num_experts_per_node, ActivationType fc1_activation_type,
-        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config);
-
-    static void gemm2(MoeGemmRunner<T, WeightType>& gemm_runner, T const* const input, void* const output,
-        int64_t const* const total_rows_before_expert, HopperGroupedGemmInput hopper_input_template,
-        WeightType const* const fc2_expert_weights, HopperGemmOutputType const* const fc2_int_scales,
-        float const* const fc2_fp8_dequant, int64_t const expanded_num_rows, int64_t const hidden_size,
-        int64_t const inter_size, int const num_experts_per_node, float const** alpha_scale_ptr_array,
+        ScaleBiasType const* const fc1_expert_biases, int64_t const* const num_valid_tokens_ptr,
+        ScaleBiasType const* const fc1_int_scales, float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant,
+        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
+        int const num_experts_per_node, ActivationType fc1_activation_type, float const** alpha_scale_ptr_array,
         cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config);
+
+    static void gemm2(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner, T const* const input,
+        void* const gemm_output, OutputType* const final_output, int64_t const* const expert_first_token_offset,
+        HopperGroupedGemmInput const hopper_input_template, WeightType const* const fc2_expert_weights,
+        ScaleBiasType const* const fc2_expert_biases, ScaleBiasType const* const fc2_int_scales,
+        float const* const fc2_fp8_dequant, float const* const token_topk_unpermuted_scales,
+        float const* const token_topk_permuted_scales, int const* const expanded_source_row_to_expanded_dest_row,
+        int const* expanded_dest_row_to_expanded_source_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        bool using_hopper_fused_finalize, float const** alpha_scale_ptr_array, cudaStream_t stream,
+        MOEParallelismConfig parallelism_config, cutlass_extensions::CutlassGemmConfig config);
 
     // Overrides to allow us to forward on to the internal functions with the pointers using the correct type
     void gemm1(void const* const input, void* const output, void* const intermediate_result,
-        int64_t const* const total_rows_before_expert, HopperGroupedGemmInput hopper_input_template,
+        int64_t const* const expert_first_token_offset, HopperGroupedGemmInput hopper_input_template,
         void const* const fc1_expert_weights, void const* const fc1_expert_biases,
         int64_t const* const num_valid_tokens_ptr, void const* const fc1_int_scales, float const* const fc1_fp8_dequant,
         float const* const fc2_fp8_quant, int64_t const expanded_num_rows, int64_t const hidden_size,
@@ -265,22 +290,31 @@ public:
         float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config) override
     {
         return Self::gemm1(moe_gemm_runner_, static_cast<T const*>(input), static_cast<T*>(output), intermediate_result,
-            total_rows_before_expert, hopper_input_template, static_cast<WeightType const*>(fc1_expert_weights),
-            static_cast<HopperGemmOutputType const*>(fc1_expert_weights), num_valid_tokens_ptr,
-            static_cast<HopperGemmOutputType const*>(fc1_int_scales), fc1_fp8_dequant, fc2_fp8_quant, expanded_num_rows,
+            expert_first_token_offset, hopper_input_template, static_cast<WeightType const*>(fc1_expert_weights),
+            static_cast<ScaleBiasType const*>(fc1_expert_biases), num_valid_tokens_ptr,
+            static_cast<ScaleBiasType const*>(fc1_int_scales), fc1_fp8_dequant, fc2_fp8_quant, expanded_num_rows,
             hidden_size, inter_size, num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array, stream, config);
     }
 
-    void gemm2(void const* const input, void* const output, int64_t const* const total_rows_before_expert,
-        HopperGroupedGemmInput hopper_input_template, void const* const fc2_expert_weights,
-        void const* const fc2_int_scales, float const* const fc2_fp8_dequant, int64_t const expanded_num_rows,
-        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
-        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config) override
+    void gemm2(void const* const input, void* const gemm_output, void* const final_output,
+        int64_t const* const expert_first_token_offset, HopperGroupedGemmInput const hopper_input_template,
+        void const* const fc2_expert_weights, void const* const fc2_expert_biases, void const* const fc2_int_scales,
+        float const* const fc2_fp8_dequant, float const* const token_topk_unpermuted_scales,
+        float const* const token_topk_permuted_scales, int const* const expanded_source_row_to_expanded_dest_row,
+        int const* expanded_dest_row_to_expanded_source_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        bool using_hopper_fused_finalize, float const** alpha_scale_ptr_array, cudaStream_t stream,
+        MOEParallelismConfig parallelism_config, cutlass_extensions::CutlassGemmConfig config) override
     {
-        return Self::gemm2(moe_gemm_runner_, static_cast<T const*>(input), static_cast<HopperGemmOutputType*>(output),
-            total_rows_before_expert, hopper_input_template, static_cast<WeightType const*>(fc2_expert_weights),
-            static_cast<HopperGemmOutputType const*>(fc2_int_scales), fc2_fp8_dequant, expanded_num_rows, hidden_size,
-            inter_size, num_experts_per_node, alpha_scale_ptr_array, stream, config);
+        return Self::gemm2(moe_gemm_runner_, static_cast<T const*>(input), gemm_output,
+            static_cast<OutputType*>(final_output), expert_first_token_offset, hopper_input_template,
+            static_cast<WeightType const*>(fc2_expert_weights), static_cast<ScaleBiasType const*>(fc2_expert_biases),
+            static_cast<ScaleBiasType const*>(fc2_int_scales), fc2_fp8_dequant, token_topk_unpermuted_scales,
+            token_topk_permuted_scales, expanded_source_row_to_expanded_dest_row,
+            expanded_dest_row_to_expanded_source_row, expert_for_source_row, num_valid_tokens_ptr, num_rows,
+            expanded_num_rows, hidden_size, inter_size, num_experts_per_node, k, using_hopper_fused_finalize,
+            alpha_scale_ptr_array, stream, parallelism_config, config);
     }
 
     virtual size_t getGemmWorkspaceSize(int num_experts) const override
@@ -289,13 +323,9 @@ public:
     }
 
 private:
-    static constexpr bool use_fp8 = std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value;
-
-    static void computeTotalRowsBeforeExpert(int const* sorted_indices, int const total_indices, int const num_experts,
-        int64_t* total_rows_before_expert, cudaStream_t stream);
-    static HopperGroupedGemmInput computeStridesHopper(int64_t const* total_rows_before_expert,
+    static HopperGroupedGemmInput computeStridesHopper(int64_t const* expert_first_token_offset,
         HopperGroupedGemmInput layout_info, int64_t gemm_n, int64_t gemm_k, int const num_experts, T const* in,
-        WeightType const* weights, float const* fp8_dequant, T const* bias, HopperGemmOutputType* output,
+        WeightType const* weights, float const* fp8_dequant, T const* bias, UnfusedGemmOutputType* output,
         cudaStream_t stream);
     std::vector<size_t> getWorkspaceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const num_experts_per_node, int const k,
@@ -308,11 +338,16 @@ private:
     {
         // We just check if its supported because we need to know when calculating workspace size
         return (
-            (moe_gemm_runner_.supportsHopperSpecialisation() && !std::is_same_v<T, HopperGemmOutputType>) || use_fp8);
+            (moe_gemm_runner_.supportsHopperSpecialisation() && !std::is_same_v<T, UnfusedGemmOutputType>) || use_fp8);
+    }
+
+    bool mayHaveFinalizeFused() const
+    {
+        return moe_gemm_runner_.supportsHopperSpecialisation() && !use_deterministic_hopper_reduce_;
     }
 
     CubKeyValueSorter sorter_;
-    MoeGemmRunner<T, WeightType> moe_gemm_runner_;
+    MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
 
     std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config_;
     std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config_;
@@ -324,8 +359,9 @@ private:
     char* sorter_ws_{};
     T* permuted_data_{};
     float* softmax_out_{};
+    float* permuted_scales_{};
 
-    int64_t* total_rows_before_expert_{};
+    int64_t* expert_first_token_offset_{};
 
     void* glu_inter_result_{};
     void* fc2_result_{};
@@ -350,13 +386,14 @@ public:
     };
 
     void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
-        nvinfer1::DataType wtype, int num_experts, int k, int64_t hidden_size, int64_t inter_size,
-        ActivationType activation_type, bool bias, MOEParallelismConfig parallelism_config)
+        nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
+        int64_t inter_size, ActivationType activation_type, bool bias, MOEParallelismConfig parallelism_config)
     {
         mInterface = &runner;
         mGemmToProfile = gemm_to_profile;
         mDType = dtype;
         mWType = wtype;
+        mOType = otype;
         mNumExperts = num_experts;
         mNumExpertsPerNode = num_experts / parallelism_config.ep_size;
         mK = k;
@@ -366,18 +403,20 @@ public:
         mBias = bias;
         mParallelismConfig = parallelism_config;
         mSM = common::getSMVersion();
-        // Reset the seed so the distributions are reproducible
-        mTwister = std::mt19937_64{0xD5};
+        mSorter.updateNumExperts(mNumExperts);
     }
 
     void prepare(int num_tokens, char* workspace, cudaStream_t stream);
 
     std::vector<size_t> getProfilerWorkspaces(int maxM, bool is_hopper);
+    std::function<void*()> getWorkspacePointerGenerator(char* ws, int maxM, bool is_hopper);
     size_t getWorkspaceSize(int maxM);
 
     void runProfiler(int num_tokens, Config const& tactic, char* workspace_ptr_char, cudaStream_t const& stream);
 
     CutlassMoeFCRunnerInterface* mInterface;
+    CubKeyValueSorter mSorter;
+
     GemmToProfile mGemmToProfile = GemmToProfile::Undefined;
     std::vector<Config> mAllTacticsSaved;
     int mSM{};
@@ -391,13 +430,12 @@ public:
 
     int mSampleIndex = 0;
 
-    std::mt19937_64 mTwister{};
-
-    nvinfer1::DataType mDType;
-    nvinfer1::DataType mWType;
+    nvinfer1::DataType mDType{};
+    nvinfer1::DataType mWType{};
+    nvinfer1::DataType mOType{};
 
     // This will be a unique value for every iteration of warmup and actual bench
-    constexpr static int NUM_ROUTING_SAMPLES = 16;
+    constexpr static int64_t NUM_ROUTING_SAMPLES = 16;
 
     bool mBias{};
 };

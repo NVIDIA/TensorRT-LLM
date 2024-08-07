@@ -94,22 +94,22 @@ void TopPSamplingLayer<T>::allocateBuffer(SizeType32 batchSize)
         mWorkspaceSize = getAirTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded(), mIsDeterministic);
     }
 
-    mRuntimeTopKDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<SizeType32>::value);
-    mRuntimeTopPDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mInitialTopPDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mTopPDecayDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mTopPMinDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mTopPResetIdsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<TokenIdType>::value);
-    mSkipDecodeDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<bool>::value);
-    mSkipDecodeHost = mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), TRTDataType<bool>::value);
+    auto const batchSizeShape = ITensor::makeShape({batchSize});
+    mRuntimeTopKDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
+    mRuntimeTopPDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mInitialTopPDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mTopPDecayDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mTopPMinDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mTopPResetIdsDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<TokenIdType>::value);
+    mSkipDecodeDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<bool>::value);
+    mSkipDecodeHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<bool>::value);
     auto skipDecodeHostRange = BufferRange<bool>(*mSkipDecodeHost);
     std::fill(skipDecodeHostRange.begin(), skipDecodeHostRange.end(), true);
 
     auto workspaceSize = std::max({mRuntimeTopKDevice->getSizeInBytes(), mRuntimeTopPDevice->getSizeInBytes(),
         mInitialTopPDevice->getSizeInBytes(), mTopPDecayDevice->getSizeInBytes(), mTopPMinDevice->getSizeInBytes(),
         mTopPResetIdsDevice->getSizeInBytes(), mSkipDecodeDevice->getSizeInBytes()});
-    mSetupWorkspaceDevice
-        = mBufferManager->gpu(ITensor::makeShape({static_cast<int64_t>(workspaceSize)}), TRTDataType<int8_t>::value);
+    mSetupWorkspaceDevice = mBufferManager->gpu(workspaceSize);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -189,23 +189,23 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     auto const topK = runtimeTopK.at(0);
     auto const topP = runtimeTopP.at(0);
 
-    auto setupWorkspaceDevicePtr = reinterpret_cast<SizeType32*>(bufferCastOrNull<int8_t>(mSetupWorkspaceDevice));
+    auto setupWorkspaceDevicePtr = reinterpret_cast<SizeType32*>(mSetupWorkspaceDevice->data());
     auto setupWorkspaceDeviceAsFloatPtr = reinterpret_cast<float*>(setupWorkspaceDevicePtr);
     auto runtimeTopKDevicePtr = bufferCastOrNull<SizeType32>(mRuntimeTopKDevice);
     if (runtimeTopKSize > 1)
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopK.size()) == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
-        mBufferManager->copy(runtimeTopK.data(), *mSetupWorkspaceDevice, runtime::MemoryType::kCPU);
+        copyToWorkspace(*mBufferManager, runtimeTopK, mSetupWorkspaceDevice);
         invokeScatterDecodingParams(
             setupWorkspaceDevicePtr, runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
     }
-    auto runtimeTopPDevicePtr = bufferCastOrNull<float>(mRuntimeTopPDevice);
+    auto runtimeTopPDevicePtr = bufferCast<float>(*mRuntimeTopPDevice);
     if (runtimeTopPSize > 1)
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopP.size()) == batchSize,
             fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopP.size(), batchSize));
-        mBufferManager->copy(runtimeTopP.data(), *mSetupWorkspaceDevice, runtime::MemoryType::kCPU);
+        copyToWorkspace(*mBufferManager, runtimeTopP, mSetupWorkspaceDevice);
         invokeScatterDecodingParams(
             setupWorkspaceDeviceAsFloatPtr, runtimeTopPDevicePtr, batchSlotsPtr, batchSize, getStream());
     }

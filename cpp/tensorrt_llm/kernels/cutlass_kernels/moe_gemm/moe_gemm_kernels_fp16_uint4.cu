@@ -18,5 +18,5 @@
 
 namespace tensorrt_llm
 {
-template class MoeGemmRunner<half, cutlass::uint4b_t>;
+template class MoeGemmRunner<half, cutlass::uint4b_t, half>;
 }

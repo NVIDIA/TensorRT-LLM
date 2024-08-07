@@ -222,6 +222,9 @@ def add_common_args(parser):
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
+    parser.add_argument('--enable_context_fmha_fp32_acc',
+                        action='store_true',
+                        help="Enable FMHA runner FP32 accumulation.")
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument(
         '--no_prompt_template',

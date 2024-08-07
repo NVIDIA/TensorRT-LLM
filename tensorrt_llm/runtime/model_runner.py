@@ -423,17 +423,21 @@ class ModelRunner(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
+        self.enable_context_fmha_fp32_acc = False
 
     @classmethod
-    def from_engine(cls,
-                    engine: Engine,
-                    lora_dir: Optional[List[str]] = None,
-                    rank: int = 0,
-                    debug_mode: bool = False,
-                    lora_ckpt_source: str = "hf",
-                    medusa_choices: List[List[int]] = None,
-                    stream: torch.cuda.Stream = None,
-                    gpu_weights_percent: float = 1) -> 'ModelRunner':
+    def from_engine(
+            cls,
+            engine: Engine,
+            lora_dir: Optional[List[str]] = None,
+            rank: int = 0,
+            debug_mode: bool = False,
+            lora_ckpt_source: str = "hf",
+            medusa_choices: List[List[int]] = None,
+            stream: torch.cuda.Stream = None,
+            gpu_weights_percent: float = 1,
+            enable_context_fmha_fp32_acc: Optional[bool] = None
+    ) -> 'ModelRunner':
         pretrained_config = engine.config.pretrained_config
         build_config = engine.config.build_config
 
@@ -533,23 +537,28 @@ class ModelRunner(ModelRunnerMixin):
         else:
             lora_manager = None
 
-        return cls(session=session,
-                   max_batch_size=max_batch_size,
-                   max_input_len=max_input_len,
-                   max_seq_len=max_seq_len,
-                   max_beam_width=max_beam_width,
-                   lora_manager=lora_manager)
+        runner = cls(session=session,
+                     max_batch_size=max_batch_size,
+                     max_input_len=max_input_len,
+                     max_seq_len=max_seq_len,
+                     max_beam_width=max_beam_width,
+                     lora_manager=lora_manager)
+        runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+        return runner
 
     @classmethod
-    def from_dir(cls,
-                 engine_dir: str,
-                 lora_dir: Optional[List[str]] = None,
-                 rank: int = 0,
-                 debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf",
-                 medusa_choices: List[List[int]] = None,
-                 stream: torch.cuda.Stream = None,
-                 gpu_weights_percent: float = 1) -> 'ModelRunner':
+    def from_dir(
+            cls,
+            engine_dir: str,
+            lora_dir: Optional[List[str]] = None,
+            rank: int = 0,
+            debug_mode: bool = False,
+            lora_ckpt_source: str = "hf",
+            medusa_choices: List[List[int]] = None,
+            stream: torch.cuda.Stream = None,
+            gpu_weights_percent: float = 1,
+            enable_context_fmha_fp32_acc: Optional[bool] = None
+    ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -631,12 +640,14 @@ class ModelRunner(ModelRunnerMixin):
                 "load tensorrt_llm engine")
             logger.info(f'Load engine takes: {loading_time} sec')
 
-            return cls(session=session,
-                       max_batch_size=max_batch_size,
-                       max_input_len=max_input_len,
-                       max_seq_len=max_input_len + max_output_len,
-                       max_beam_width=max_beam_width,
-                       lora_manager=lora_manager)
+            runner = cls(session=session,
+                         max_batch_size=max_batch_size,
+                         max_input_len=max_input_len,
+                         max_seq_len=max_input_len + max_output_len,
+                         max_beam_width=max_beam_width,
+                         lora_manager=lora_manager)
+            runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+            return runner
         else:
             # the new engine format
             engine = Engine.from_dir(engine_dir, rank)
@@ -647,9 +658,16 @@ class ModelRunner(ModelRunnerMixin):
                         f"{engine_dir}/{dir}" for dir in config_lora_dir
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
-            runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
-                                             lora_ckpt_source, medusa_choices,
-                                             stream, gpu_weights_percent)
+            runner = ModelRunner.from_engine(
+                engine,
+                lora_dir,
+                rank,
+                debug_mode,
+                lora_ckpt_source,
+                medusa_choices,
+                stream,
+                gpu_weights_percent,
+                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -795,7 +813,8 @@ class ModelRunner(ModelRunnerMixin):
             sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
             lora_uids=lora_uids,
-            medusa_choices=medusa_choices)
+            medusa_choices=medusa_choices,
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()

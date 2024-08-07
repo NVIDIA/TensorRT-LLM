@@ -79,10 +79,10 @@ struct Fused_Moe_Kernel_sm80
     static Params to_underlying_arguments(Arguments const& args)
     {
         return {{args.routine_args.ptr_input, args.routine_args.ptr_fc1, args.routine_args.ptr_bias,
-                    args.routine_args.ptr_output, args.routine_args.total_rows_before_expert, args.routine_args.gemm_n,
-                    args.routine_args.gemm_k, args.routine_args.num_expert},
+                    args.routine_args.ptr_output, args.routine_args.total_tokens_including_expert,
+                    args.routine_args.gemm_n, args.routine_args.gemm_k, args.routine_args.num_expert},
             args.threadblock_count,
-            {args.routine_args.total_rows_before_expert, args.routine_args.gemm_n, args.routine_args.gemm_k,
+            {args.routine_args.total_tokens_including_expert, args.routine_args.gemm_n, args.routine_args.gemm_k,
                 args.problem_count, nullptr, 0}};
     }
 

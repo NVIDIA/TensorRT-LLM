@@ -166,7 +166,7 @@ protected:
         assert(mBufferManager);
     }
 
-    void TearDown()
+    void TearDown() override
     {
         managed_buffers.clear();
     }
@@ -245,6 +245,9 @@ protected:
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
+    // Default this to true. This only matters for K>2, and so by doing this we will test the fused and unfused paths
+    bool mUseDeterminsiticHopperReduce = true;
+
     // If the test sets mOverrideSelectedConfig1 the BasicPermuteTest and *ParallelTests will use that instead of
     // looping over samples for the different architectures we support.
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mOverrideSelectedConfig1 = std::nullopt;
@@ -267,6 +270,7 @@ protected:
         managed_buffers.emplace_back(mBufferManager->gpu(size * sizeof(T)));
         EXPECT_EQ(cudaGetLastError(), cudaSuccess) << "Error allocating buffer of size: " << size;
         T* ptr = static_cast<T*>(managed_buffers.back()->data());
+        check_cuda_error(cudaMemsetAsync(ptr, 0xD5, size * sizeof(T), mStream->get()));
         return ptr;
     }
 
@@ -303,6 +307,8 @@ protected:
         std::vector<uint8_t> finished, MOEParallelismConfig parallelism_config)
     {
         managed_buffers.clear();
+
+        mMoERunner.use_deterministic_hopper_reduce_ = k > 2 && mUseDeterminsiticHopperReduce;
 
         mHiddenSize = hidden_size;
         mInterSize = hidden_size * 4;
@@ -672,10 +678,39 @@ protected:
         return std::tuple{weight_1, weight_2, bias_1, bias2_ptr, scale_1, scale_2, scale_3};
     }
 
+    auto getFilteredConfigs(int sm)
+    {
+        auto tactics = mMoERunner.getTactics();
+        if (sm == 89)
+        {
+            // Filter some unsupported configs for L40S
+            auto it = std::remove_if(tactics.begin(), tactics.end(),
+                [&](auto conf)
+                {
+                    using tensorrt_llm::cutlass_extensions::CutlassTileConfig;
+                    auto checks = std::vector{
+                        // Fail for BF16/FP16
+                        conf.tile_config == CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64,
+                        conf.tile_config == CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64 && conf.stages == 4,
+                        // Fail for FP8
+                        FP8 && conf.tile_config == CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128
+                            && conf.stages >= 3,
+                    };
+
+                    return std::any_of(checks.begin(), checks.end(), [](auto v) { return v; });
+                });
+            tactics.erase(it, tactics.end());
+        }
+
+        EXPECT_FALSE(tactics.empty());
+
+        return tactics;
+    }
+
     auto selectTacticsForArch(int sm)
     {
         bool is_sm90 = sm >= 90 && !INT_QUANT;
-        auto tactics = mMoERunner.getTactics();
+        auto tactics = getFilteredConfigs(sm);
         auto it = std::find_if(tactics.begin(), tactics.end(), [is_sm90](auto& c) { return c.is_sm90 == is_sm90; });
         if (it == tactics.end())
         {
@@ -683,10 +718,8 @@ protected:
             std::cout << "WARNING: Could not find config for sm version " << sm << std::endl;
             return std::pair{tactics[0], tactics[0]};
         }
-        else
-        {
-            return std::pair(*it, *it);
-        }
+
+        return std::pair(*it, *it);
     }
 
     using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
@@ -699,14 +732,12 @@ protected:
             return ConfigsToTestVec{std::pair{*mOverrideSelectedConfig1, *mOverrideSelectedConfig2}};
         }
 
-        ConfigsToTestVec tactics{};
-        if (!FP8)
+        int sm = getSMVersion();
+        ConfigsToTestVec tactics = {selectTacticsForArch(sm)};
+        if (sm >= 90)
         {
+            // SM90 should also grab some configs for SM80 to test them
             tactics.push_back(selectTacticsForArch(80));
-        }
-        if (getSMVersion() >= 90)
-        {
-            tactics.push_back(selectTacticsForArch(90));
         }
         return tactics;
     }
@@ -930,28 +961,6 @@ protected:
         return softmax;
     }
 
-    void compareSoftmax(std::vector<int> const& expected_experts, std::vector<float> const& expected_probs,
-        std::vector<float> scale_probs = {})
-    {
-        if (scale_probs.empty())
-            scale_probs = getDataFromDevice(mScaleProbs, mTotalTokens * mK);
-        auto softmax_probs = softmax(expected_probs);
-        for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
-        {
-            for (int k_idx = 0; k_idx < mK; k_idx++)
-            {
-                int selected_expert = expected_experts[token_id * mK + k_idx];
-                if (selected_expert < mNumExperts) // Ignore 'finished' values
-                {
-                    ASSERT_NEAR(softmax_probs[token_id * mNumExperts + selected_expert],
-                        scale_probs[token_id * mK + k_idx], getTolerance())
-                        << "Scales mismatched for token: " << token_id << " k: " << k_idx
-                        << " selected_expert: " << selected_expert;
-                }
-            }
-        }
-    }
-
     void renormScales(float* probs, int const* experts)
     {
         if (mNormMode == MOEExpertScaleNormalizationMode::NONE)
@@ -965,6 +974,30 @@ protected:
         for (int k_idx = 0; k_idx < mK; k_idx++)
         {
             probs[experts[k_idx]] *= norm_factor;
+        }
+    }
+
+    void compareSoftmax(std::vector<int> const& expected_experts, std::vector<float> const& expected_probs,
+        std::vector<float> scale_probs = {})
+    {
+        if (scale_probs.empty())
+            scale_probs = getDataFromDevice(mScaleProbs, mTotalTokens * mK);
+        auto softmax_probs = softmax(expected_probs);
+        for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
+        {
+            renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
+
+            for (int k_idx = 0; k_idx < mK; k_idx++)
+            {
+                int selected_expert = expected_experts[token_id * mK + k_idx];
+                if (selected_expert < mNumExperts) // Ignore 'finished' values
+                {
+                    ASSERT_NEAR(softmax_probs[token_id * mNumExperts + selected_expert],
+                        scale_probs[token_id * mK + k_idx], getTolerance())
+                        << "Scales mismatched for token: " << token_id << " k: " << k_idx
+                        << " selected_expert: " << selected_expert;
+                }
+            }
         }
     }
 
@@ -992,7 +1025,7 @@ protected:
                 }
 
                 ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
-                    << "Incorrect final value at position: " << token_id * mHiddenSize + hidden_id;
+                    << "Incorrect final value at for token: " << token_id << " offset: " << hidden_id;
             }
         }
     }
@@ -1147,6 +1180,13 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwiglu)
     this->mActType = tensorrt_llm::ActivationType::Swiglu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteNonDeterministic)
+{
+    this->mUseDeterminsiticHopperReduce = false;
+    // Just test case 3, cases 1&2 always use the fused paths
     this->BasicPermuteTest(3);
 }
 
@@ -1565,7 +1605,7 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 
     auto const actiavtion_pool = {
         tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Swiglu, tensorrt_llm::ActivationType::Geglu};
-    auto configs = this->mMoERunner.getTactics();
+    auto configs = this->getFilteredConfigs(getSMVersion());
     for (auto const activation_type : actiavtion_pool)
     {
         for (auto conf1 : configs)
@@ -1578,7 +1618,7 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
                 {
                     FAIL() << "Uninitialised tactic encountered";
                 }
-                EXPECT_NO_THROW({
+                ASSERT_NO_THROW({
                     this->mActType = activation_type;
                     for (int k = 1; k <= 3; k++)
                     {
@@ -1621,9 +1661,9 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     int64_t hidden_size = 2048ll;
     int64_t num_experts = 4;
     int64_t k = 1;
-    int64_t num_tokens = 1024ll * 1024ll + 1ll;
-    int64_t tokens_to_test = 10;
-    ASSERT_GT(hidden_size * num_tokens, (uint64_t) std::numeric_limits<int>::max() + 1ull);
+    int64_t tokens_to_test = 100;
+    int64_t num_tokens = 2ull * 1024ll * 1024ll + tokens_to_test + 1ll;
+    ASSERT_GT(hidden_size * (num_tokens - tokens_to_test), (uint64_t) std::numeric_limits<uint32_t>::max() + 1ull);
 
     if (!this->checkSufficientTestMemory(num_tokens, hidden_size, num_experts, k))
     {
@@ -1668,4 +1708,117 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
     // Create a default vector for the reference outputs of the correct type for FP8
     std::vector<typename TypeParam::OutputType> unquant_states(this->mTotalTokens * hidden_size);
     this->compareFinal(selected_expert, probs, unquant_states);
+}
+
+using MixtureOfExpertsProfilerTest = MixtureOfExpertsTest<WeightParams<half, half>>;
+
+TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
+{
+    //    int64_t num_tokens = 128;
+    int64_t num_experts = 8;
+    int64_t k = 2;
+
+    GemmProfilerBackend backend;
+
+    // We need to test different EP values to ensure the tokens are properly assigned
+    for (int64_t num_tokens : {1, 128})
+    {
+        int64_t expanded_num_tokens = num_tokens * k;
+        for (int ep : {1, 4, 8})
+        {
+            backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, {}, false,
+                MOEParallelismConfig{1, 0, ep, ep - 1});
+
+            auto ws_size = backend.getWorkspaceSize(num_tokens);
+            auto workspace = this->allocBuffer<char>(ws_size);
+
+            int64_t num_experts_per_node = num_experts / ep;
+
+            backend.prepare(num_tokens, workspace, mStream->get());
+
+            auto getNext = backend.getWorkspacePointerGenerator(workspace, num_tokens, getSMVersion() >= 90);
+            auto const* expert_first_token_offset_size = reinterpret_cast<int64_t*>(getNext());
+            auto const* source_to_dest_map = reinterpret_cast<int*>(getNext());
+            auto const* dest_to_source_map = reinterpret_cast<int*>(getNext());
+            auto const* token_selected_experts = reinterpret_cast<int*>(getNext());
+
+            for (int sample = 0; sample < backend.NUM_ROUTING_SAMPLES; sample++)
+            {
+                auto host_expert_first_token_offset_size = getDataFromDevice(
+                    expert_first_token_offset_size + sample * (num_experts_per_node + 1), num_experts_per_node + 1);
+                auto host_source_to_dest_map
+                    = getDataFromDevice(source_to_dest_map + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_dest_to_source_map
+                    = getDataFromDevice(dest_to_source_map + sample * expanded_num_tokens, expanded_num_tokens);
+                auto host_token_selected_experts
+                    = getDataFromDevice(token_selected_experts + sample * expanded_num_tokens, expanded_num_tokens);
+
+                std::vector<int64_t> calculated_routing_values(num_experts_per_node + 1, 0);
+                int skipped = 0;
+                for (auto v : host_token_selected_experts)
+                {
+                    ASSERT_TRUE(v < num_experts_per_node || (v == num_experts && ep > 1));
+                    skipped += (v == num_experts);
+                    if (v < num_experts_per_node)
+                    {
+                        calculated_routing_values[v]++;
+                    }
+                }
+
+                if (num_tokens > 1)
+                {
+                    // Check tokens are distributed between all EP ranks
+                    // Statistically possible, but so unlikely that it should be considered a bug
+                    ASSERT_TRUE(ep == 1 || skipped > 0);
+                    // Check all experts get some tokens
+                    ASSERT_EQ(std::count(calculated_routing_values.begin(), calculated_routing_values.end() - 1, 0), 0);
+
+                    float p = 1.f / num_experts;
+                    float variance = expanded_num_tokens * p * (1 - p);
+                    float stddev = sqrt(variance);
+                    float mean = expanded_num_tokens * p;
+                    for (int i = 0; i < num_experts_per_node; i++)
+                    {
+                        // All values should be within three standard deviations of the mean
+                        // 99.7% of values should fall within this range.
+                        // We have NUM_ROUTING_SAMPLES * (8 + 2 + 1) = 176 cases so this is unlikely
+                        // If the test changes to have a much larger number of cases this will need revisited
+                        EXPECT_LE(abs(calculated_routing_values[i] - mean), 3 * stddev)
+                            << "Expert " << i << " for sample " << sample << " has unbalanced token count "
+                            << calculated_routing_values[i] << " vs mean value " << mean << " with standard deviation "
+                            << stddev;
+                    }
+                }
+                ASSERT_EQ(host_expert_first_token_offset_size.back(), expanded_num_tokens - skipped);
+
+                std::exclusive_scan(calculated_routing_values.begin(), calculated_routing_values.end(),
+                    calculated_routing_values.begin(), 0);
+                ASSERT_TRUE(std::equal(calculated_routing_values.begin(), calculated_routing_values.end(),
+                    host_expert_first_token_offset_size.begin()));
+
+                std::fill(calculated_routing_values.begin(), calculated_routing_values.end(), 0);
+                for (int64_t token_idx = 0; token_idx < num_tokens; token_idx++)
+                {
+                    for (int64_t k_idx = 0; k_idx < k; k_idx++)
+                    {
+                        int64_t idx = token_idx * k + k_idx;
+                        int64_t expert_idx = host_token_selected_experts[idx];
+
+                        if (expert_idx < num_experts)
+                        {
+                            int64_t source_location = k_idx * num_tokens + token_idx;
+                            int64_t dest_location = host_expert_first_token_offset_size[expert_idx]
+                                + calculated_routing_values[expert_idx];
+
+                            ASSERT_EQ(host_source_to_dest_map[source_location], dest_location);
+                            ASSERT_EQ(host_dest_to_source_map[dest_location], source_location);
+
+                            calculated_routing_values[expert_idx]++;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

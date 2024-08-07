@@ -145,7 +145,7 @@ public:
         ElementC* ptr_C;
         ElementC* ptr_D;
 
-        int64_t const* total_rows_before_expert;
+        int64_t const* total_tokens_including_expert;
         int64_t gemm_n;
         int64_t gemm_k;
 
@@ -166,7 +166,7 @@ public:
             , weight_scales(nullptr)
             , ptr_C(nullptr)
             , ptr_D(nullptr)
-            , total_rows_before_expert(nullptr)
+            , total_tokens_including_expert(nullptr)
             , gemm_n(0)
             , gemm_k(0)
             , host_problem_sizes(nullptr)
@@ -177,7 +177,7 @@ public:
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count, int group_size, typename EpilogueOutputOp::Params output_op,
             ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales, ElementC const* ptr_C,
-            ElementC* ptr_D, int64_t const* total_rows_before_expert, int64_t gemm_n, int64_t gemm_k,
+            ElementC* ptr_D, int64_t const* total_tokens_including_expert, int64_t gemm_n, int64_t gemm_k,
             GemmCoord* host_problem_sizes = nullptr)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)
@@ -188,7 +188,7 @@ public:
             , weight_scales(const_cast<ElementScale*>(weight_scales))
             , ptr_C(const_cast<ElementC*>(ptr_C))
             , ptr_D(ptr_D)
-            , total_rows_before_expert(total_rows_before_expert)
+            , total_tokens_including_expert(total_tokens_including_expert)
             , gemm_n(gemm_n)
             , gemm_k(gemm_k)
             , host_problem_sizes(nullptr)
@@ -237,7 +237,7 @@ public:
         CUTLASS_HOST_DEVICE
         Params(Arguments const& args, void* workspace = nullptr, int tile_count = 0)
             : problem_visitor(
-                args.total_rows_before_expert, args.gemm_n, args.gemm_k, args.problem_count, workspace, tile_count)
+                args.total_tokens_including_expert, args.gemm_n, args.gemm_k, args.problem_count, workspace, tile_count)
             , threadblock_count(args.threadblock_count)
             , group_size(args.group_size)
             , output_op(args.output_op)
@@ -253,8 +253,8 @@ public:
         void update(Arguments const& args, void* workspace = nullptr, int tile_count = 0)
         {
 
-            problem_visitor = typename ProblemVisitor::Params(
-                args.total_rows_before_expert, args.gemm_n, args.gemm_k, args.problem_count, workspace, tile_count);
+            problem_visitor = typename ProblemVisitor::Params(args.total_tokens_including_expert, args.gemm_n,
+                args.gemm_k, args.problem_count, workspace, tile_count);
             threadblock_count = args.threadblock_count;
             output_op = args.output_op;
             ptr_A = args.ptr_A;

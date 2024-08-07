@@ -156,7 +156,7 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp1
 ```
 
 Note that when building Mamba models, you need to disable the `paged_kv_cache` as it is used for
-transformer-based models. Mamba models use `paged_state` instead and it is enabed by default.
+transformer-based models. Mamba models use `paged_state` instead and it is enabled by default.
 If `paged_state` is disabled, engine will be built with the contiguous stage cache.
 
 ### 4. Run summarization task with the TensorRT engine(s)

@@ -60,6 +60,7 @@ using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&
     std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
     std::vector<std::optional<IdType>> const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
+using PriorityType = float;
 
 enum class DataType
 {

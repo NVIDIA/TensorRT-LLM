@@ -82,6 +82,10 @@ def parse_arguments():
                         type=str,
                         default=",",
                         help='Path separator symbol')
+    parser.add_argument('--enable_context_fmha_fp32_acc',
+                        action='store_true',
+                        default=None,
+                        help="Enable FMHA runner FP32 accumulation.")
 
     return parser.parse_args()
 
@@ -340,7 +344,9 @@ class MultimodalModelRunner:
             self.model = ModelRunner.from_dir(self.args.llm_engine_dir,
                                               rank=tensorrt_llm.mpi_rank(),
                                               debug_mode=False,
-                                              stream=self.stream)
+                                              stream=self.stream,
+                                              enable_context_fmha_fp32_acc=self.
+                                              args.enable_context_fmha_fp32_acc)
             self.model_config = self.model.session._model_config
             self.runtime_mapping = self.model.session.mapping
         else:
@@ -349,7 +355,9 @@ class MultimodalModelRunner:
                 self.args.llm_engine_dir,
                 skip_encoder=self.model_type in ['nougat', 'pix2struct'],
                 debug_mode=False,
-                stream=self.stream)
+                stream=self.stream,
+                enable_context_fmha_fp32_acc=self.args.
+                enable_context_fmha_fp32_acc)
             if self.model_type in ['nougat', 'pix2struct']:
                 self.model_config = self.model.decoder_model_config
                 self.runtime_mapping = self.model.decoder_runtime_mapping

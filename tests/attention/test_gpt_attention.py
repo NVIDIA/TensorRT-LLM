@@ -194,6 +194,14 @@ class TestFunctional(unittest.TestCase):
                     [None], [2], [128], [4], [64], [0], [False], [False],
                     [1, 4], [True, False], [False], [10000.0], [None], [4]))
 
+        # test cases for custom mask input.
+        test_cases += list(
+            product(['llama_attention'], [
+                ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
+            ], ['float16', 'bfloat16'], [None], [4], [1056], [4], [32, 64, 128],
+                    [0], [False], [True], [1], [False], [False], [10000.0],
+                    [None], [0], [True]))
+
         # add gpu_arch_lists for testing (help reducing workload if there are duplicates).
         test_cases = [("all", ) + case for case in test_cases]
 
@@ -361,7 +369,8 @@ class TestFunctional(unittest.TestCase):
                            fuse_bias,
                            rope_base=10000.0,
                            rope_scaling=None,
-                           sink_token_len=0):
+                           sink_token_len=0,
+                           custom_mask_input=False):
         # if attention_type != "gpt_bigcode_attention" and attention_type != "llama_attention":
         #     assert num_kv_heads == 0 # safe guard against bad test case configs
 
@@ -399,11 +408,11 @@ class TestFunctional(unittest.TestCase):
         def _construct_execution(
                 session, input_tensor, weight, bias, past_key_value,
                 host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
-                sequence_length, host_past_key_value_lengths,
-                host_max_attention_window_sizes, host_sink_token_length,
-                context_lengths, host_context_lengths, cache_indirection,
-                host_request_types, num_heads, hidden_size, num_kv_heads,
-                output, dtype, max_context_length, shape_dict,
+                packed_mask_for_fmha, sequence_length,
+                host_past_key_value_lengths, host_max_attention_window_sizes,
+                host_sink_token_length, context_lengths, host_context_lengths,
+                cache_indirection, host_request_types, num_heads, hidden_size,
+                num_kv_heads, output, dtype, max_context_length, shape_dict,
                 kv_int8_quant_scale, kv_int8_dequant_scale, configuration,
                 host_runtime_perf_knobs):
             kv_cache_block_offsets = None
@@ -432,6 +441,12 @@ class TestFunctional(unittest.TestCase):
                 x_tensor = Tensor(name='input',
                                   shape=tuple(input_tensor.shape),
                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                context_fmha_custom_mask_tensor = None
+                if packed_mask_for_fmha is not None:
+                    context_fmha_custom_mask_tensor = Tensor(
+                        name='context_fmha_custom_mask',
+                        shape=tuple(packed_mask_for_fmha.shape),
+                        dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 sequence_length_tensor = Tensor(
                     name='sequence_length',
                     shape=tuple(sequence_length.shape),
@@ -564,6 +579,7 @@ class TestFunctional(unittest.TestCase):
                 ) if position_embedding_type.is_rope() else None
                 outputs = tensorrt_llm.functional.gpt_attention(
                     qkv=qkv,
+                    context_fmha_custom_mask=context_fmha_custom_mask_tensor,
                     past_key_value=past_key_value_tensor,
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
@@ -624,6 +640,8 @@ class TestFunctional(unittest.TestCase):
                 'host_request_types': host_request_types,
                 'host_runtime_perf_knobs': host_runtime_perf_knobs
             }
+            if packed_mask_for_fmha is not None:
+                inputs['context_fmha_custom_mask'] = packed_mask_for_fmha
             if paged_kv_cache:
                 inputs['kv_cache_block_offsets'] = kv_cache_block_offsets
                 inputs[
@@ -1072,9 +1090,12 @@ class TestFunctional(unittest.TestCase):
                     [-1] * perf_knob_tensor_size,
                     dtype=torch.int64,
                     device='cpu')
+
                 if enable_multi_block_mmha:
+                    context_host_runtime_perf_knobs[0] = 1  # multi_block_mode
+                if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                     context_host_runtime_perf_knobs[
-                        0] = 1  # enable multi_block_mode
+                        1] = 1  # enable_context_fmha_fp32_acc
 
                 input_tensor = torch.randn(shape_dict['input'],
                                            dtype=str_dtype_to_torch(dtype),
@@ -1088,6 +1109,21 @@ class TestFunctional(unittest.TestCase):
                     ctx_attention_mask,
                     dtype=str_dtype_to_torch(dtype),
                     tgt_len=in_len)
+                # create packed mask for fmha if using custom mask.
+                if custom_mask_input:
+                    full_attention_mask_for_fmha = attention_mask + AttentionMaskConverter._make_causal_mask(
+                        input_tensor.shape[:2],
+                        dtype=str_dtype_to_torch(dtype),
+                        device='cuda',
+                        past_key_values_length=0)
+                    packed_mask_for_fmha = torch.ops.tensorrt_llm.pack_fmha_mask_by_input(
+                        full_attention_mask_for_fmha.squeeze(), input_lengths,
+                        input_lengths, 0.0)
+                    # Note that you can also build the packed mask based on the attention mask type as shown below:
+                    # packed_mask_for_fmha = torch.ops.tensorrt_llm.pack_fmha_mask_by_type(
+                    #     input_lengths, input_lengths, AttentionMaskType.causal, batch_size, in_len, in_len)
+                else:
+                    packed_mask_for_fmha = None
                 if attention_type == 'gpt2_attention':
                     torch_output, torch_present = attention(
                         input_tensor,
@@ -1154,8 +1190,8 @@ class TestFunctional(unittest.TestCase):
                 session, output, present_key_value = _construct_execution(
                     session, input_tensor, weight_plugin, bias_plugin,
                     present_key_value, kv_cache_block_offsets,
-                    host_kv_cache_pool_pointers, sequence_length,
-                    host_past_key_value_lengths,
+                    host_kv_cache_pool_pointers, packed_mask_for_fmha,
+                    sequence_length, host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     input_lengths, host_context_lengths, cache_indirection,
                     host_request_types, num_heads, hidden_size, num_kv_heads,
@@ -1220,9 +1256,13 @@ class TestFunctional(unittest.TestCase):
                     [-1] * perf_knob_tensor_size,
                     dtype=torch.int64,
                     device='cpu')
+
                 if enable_multi_block_mmha:
                     generation_host_runtime_perf_knobs[
-                        0] = 1  # enable multi_block_mode
+                        0] = 1  # multi_block_mode
+                if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+                    generation_host_runtime_perf_knobs[
+                        1] = 1  # enable_context_fmha_fp32_acc
 
                 # torch execution
                 if attention_type == 'gpt2_attention':
@@ -1323,7 +1363,7 @@ class TestFunctional(unittest.TestCase):
                 session, tiled_output, present_key_value = _construct_execution(
                     session, tiled_input_tensor, weight_plugin, bias_plugin,
                     tiled_present_key_value, kv_cache_block_offsets,
-                    host_kv_cache_pool_pointers, tiled_sequence_length,
+                    host_kv_cache_pool_pointers, None, tiled_sequence_length,
                     tiled_host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     tiled_input_lengths, tiled_host_context_lengths,

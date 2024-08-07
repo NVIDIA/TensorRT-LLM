@@ -169,13 +169,12 @@ private:
 
     void setSSMParams(tensorrt_llm::kernels::SSMParamsBase& params,
         // sizes
-        const size_t batch, const size_t dim, const size_t maxSeqLen, const size_t dstate, const size_t dtRank,
-        const size_t nHeads, const size_t nGroups, const size_t chunkSize,
+        const size_t batch, const size_t dim, const size_t maxSeqLen, const size_t numTokens, const size_t dstate,
+        const size_t dtRank, const size_t nHeads, const size_t nGroups, const size_t chunkSize,
         // device pointers
         void* statePtr, void const* x, void const* delta, void const* deltaBias, void const* A, void const* BC,
-        void const* D, void const* z, void const* osPtr, void const* stPtr, void const* dcPtr, void const* dAPtr,
-        void const* cbPtr, int const* lastTokenIds, int const* slotMapping, void* out, bool deltaSoftplus,
-        bool removePadding);
+        void const* D, void const* z, void* osPtr, void* stPtr, void* dcPtr, void* dAPtr, void* cbPtr, void* descs,
+        int const* lastTokenIds, int const* slotMapping, void* out, bool deltaSoftplus, bool removePadding);
 
 private:
     int mDim;
@@ -190,6 +189,7 @@ private:
     bool mPagedState = false;
     bool mZEnabled = true;
     bool mIsMamba2 = false;
+    std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
 };
 
 class SelectiveScanPluginCreator : public BaseCreator

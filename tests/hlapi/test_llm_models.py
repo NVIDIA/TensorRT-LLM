@@ -26,6 +26,7 @@ phi_2_model_path = get_model_path('phi-2')
 phi_3_mini_4k_model_path = get_model_path('Phi-3/Phi-3-mini-4k-instruct')
 phi_3_small_8k_model_path = get_model_path('Phi-3/Phi-3-small-8k-instruct')
 phi_3_medium_4k_model_path = get_model_path('Phi-3/Phi-3-medium-4k-instruct')
+falcon_model_path = get_model_path('falcon-rw-1b')
 
 sampling_params = SamplingParams(max_new_tokens=10)
 
@@ -124,15 +125,11 @@ def test_llm_phi_1_5():
                      sampling_params=sampling_params)
 
 
-#@force_ampere
 def test_llm_phi_2():
     llm_test_harness(phi_2_model_path,
                      prompts=['A B C'],
                      references=[' D E F G H I J K L M'],
                      sampling_params=sampling_params)
-
-
-force_ampere
 
 
 def test_llm_phi_3_mini_4k():
@@ -160,6 +157,33 @@ def test_llm_phi_3_small_8k():
         references=[' Paris is the capital of France. It is known'],
         sampling_params=sampling_params,
         build_config=build_config)
+
+
+@force_ampere
+def test_llm_falcon():
+    llm_test_harness(falcon_model_path,
+                     prompts=['A B C'],
+                     references=['D E F G H I J K L M'],
+                     sampling_params=sampling_params)
+
+
+@force_ampere
+def test_llm_falcon_int4_weight_only():
+    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+    llm_test_harness(falcon_model_path,
+                     prompts=['A B C'],
+                     references=['D E F G H I J K L M'],
+                     sampling_params=sampling_params,
+                     quant_config=quant_config)
+
+
+@force_ampere
+def test_llm_falcon_tp2():
+    llm_test_harness(falcon_model_path,
+                     prompts=['A B C'],
+                     references=['D E F G H I J K L M'],
+                     sampling_params=sampling_params,
+                     tensor_parallel_size=2)
 
 
 if __name__ == '__main__':

@@ -47,9 +47,7 @@ class ChatGLMDecoderLayer(Module):
             attention_mask_type = AttentionMaskType.bidirectionalglm
         elif config.chatglm_version == 'chatglm':
             attention_mask_type = AttentionMaskType.bidirectional
-        elif config.chatglm_version == 'chatglm2':
-            attention_mask_type = AttentionMaskType.causal
-        elif config.chatglm_version == 'chatglm3':
+        elif config.chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
             attention_mask_type = AttentionMaskType.causal
 
         self.input_layernorm = norm_cls(

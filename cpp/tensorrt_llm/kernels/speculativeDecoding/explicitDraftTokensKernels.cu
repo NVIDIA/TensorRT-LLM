@@ -110,7 +110,7 @@ __global__ void getPackedMask(SizeType32 const* __restrict__ cumGenerationLength
     }
 
     auto const maxGenerationLength = maxGenerationLengths[0];
-    auto const numPackedMasks = divUp(maxDraftTokens, 32);
+    auto const numPackedMasks = divUp(maxDraftTokens + 1, 32);
     auto const outputStartId = batchSlots ? (batchSlots[batchIdx] * (maxDraftTokens + 1))
                                           : ((batchIdx == 0) ? 0 : cumGenerationLengths[batchIdx - 1]);
     auto* outputPtr = packedMask + (outputStartId + tokenIdx) * numPackedMasks;
@@ -306,14 +306,6 @@ __global__ void extractExplicitDraftTokens(ExtractExplicitDraftTokensParams<T> p
         params.outputPositionIds[batchSlot * maxDecodingTokens + ti] = params.packedPositionIds[startId + ti] - 1;
     }
 
-    for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < params.numPaths * (params.maxPathLength - 1);
-         ti += static_cast<SizeType32>(blockDim.x))
-    {
-        // Generate new random data for token verification.
-        auto const offset = flat_index2(batchSlot, ti, params.numPaths * (params.maxPathLength - 1));
-        params.randDataVerification[offset] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
-    }
-
     // When all threads are done.
     __syncthreads();
     if (threadIdx.x == 0)
@@ -335,6 +327,12 @@ __global__ void extractExplicitDraftTokens(ExtractExplicitDraftTokensParams<T> p
 
         // Generate new random data for sampling.
         params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
+        for (auto idx = 0; idx < params.numPaths * (params.maxPathLength - 1); idx++)
+        {
+            // Generate new random data for token verification.
+            auto const offset = flat_index2(batchSlot, idx, params.numPaths * (params.maxPathLength - 1));
+            params.randDataVerification[offset] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
+        }
 
         // Increase seqLen by accepted len.
         params.sequenceLengths[batchSlot] = curSeqLen + bestPathLength;
@@ -504,7 +502,7 @@ __global__ void packExplicitDraftTokens(PackExplicitDraftTokensParams<T> params)
 
         auto const maxGenerationLength = params.maxGenerationLength[0];
         auto const maxDecodingTokens = numDecodingDraftTokens + 1;
-        auto const numPackedMasks = divUp(maxGenerationLength, 32);
+        auto const numPackedMasks = divUp(maxDecodingTokens, 32);
         auto const outputStartId = (genIdx == 0) ? 0 : params.cumSumGenerationLengths[genIdx - 1];
         auto const numTokens = (genIdx == 0)
             ? params.cumSumGenerationLengths[0]

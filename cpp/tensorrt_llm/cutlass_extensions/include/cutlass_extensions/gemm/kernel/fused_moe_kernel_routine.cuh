@@ -42,7 +42,7 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         int const N1 = params.gemm_n;
         int const K1 = params.gemm_k;
 
-        int const row_jump = ((problem_index == 0) ? 0 : params.total_rows_before_expert[problem_index - 1]);
+        int const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
         typename KT::ElementInput const* ptr_input_ = params.ptr_input + row_jump * K1;
         typename KT::ElementWeight const* ptr_fc1_gate_
             = params.ptr_fc1 + (2 * problem_index + 1) * N1 * K1; // TODO: we only focus on gated activation..
@@ -404,7 +404,7 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         int const N1 = params.gemm_n;
         int const K1 = params.gemm_k;
 
-        int const row_jump = ((problem_index == 0) ? 0 : params.total_rows_before_expert[problem_index - 1]);
+        int const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
         typename KT::ElementInput const* ptr_input_ = params.ptr_input + row_jump * K1;
         typename KT::ElementWeight const* ptr_fc1_ = params.ptr_fc1 + problem_index * N1 * K1;
         typename KT::ElementInput const* ptr_bias_

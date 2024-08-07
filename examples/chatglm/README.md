@@ -47,6 +47,8 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | chatglm3_6b_base |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
 | chatglm3_6b_32k  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
 |     glm_10b      |   Y   |   Y   |   Y   |       |       |       |   Y   |       |   Y   |       |           |       |
+|     glm_4_9b     |   Y   |   Y   |   Y   |       |       |       |   Y   |       |       |   Y   |           |       |
+|  glm_4_9b_chat   |   Y   |   Y   |   Y   |       |       |       |   Y   |       |       |   Y   |           |       |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * FMHA: Fused MultiHead Attention (see introduction below)
@@ -72,6 +74,8 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | chatglm3_6b_base |  28   |  32   |   2   |  128  | 4096  | 13696 | 32768 | 65024  |   N   |   Y   |    N    |                                                                    |
 | chatglm3_6b_32k  |  28   |  32   |   2   |  128  | 4096  | 13696 | 32768 | 65024  |   N   |   Y   |    N    | RoPE base=500000 rather than 10000 in chatglm3_6b                  |
 |     glm_10b      |  48   |  64   |  32   |  64   | 4096  | 16384 | 1024  | 50304  |   Y   |   Y   |    Y    |                                                                    |
+|     glm_4_9b     |  40   |  32   |   2   |  128  | 4096  | 13696 | 8192  | 151552 |   N   |   Y   |    N    |                                                                    |
+|  glm_4_9b_chat   |  40   |  32   |   2   |  128  | 4096  | 13696 | 8192  | 151552 |   N   |   Y   |    N    |                                                                    |
 
 * nL: number of layers
 * nAH: number of attention heads
@@ -96,6 +100,8 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | chatglm2_6b_base | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            | 130000 |       |        |
 | chatglm2_6b_32k  | ChatGLMTokenizer |   1    |   2    |   0   |       |              |            | 130000 |       |        |
 |     glm_10b      | GLMGPT2Tokenizer | 50257  | 50256  | 50256 | 50259 |    50257     |   50258    | 50260  | 50264 | 50263  |
+|     glm_4_9b     | ChatGLM4Tokenizer |       | 151329 | 151329 |      |    151333    |            |        |       |        |
+|  glm_4_9b_chat   | ChatGLM4Tokenizer |       | 151329 | 151329 |      |    151333    |            |        |       |        |
 
 ## Usage
 
@@ -117,6 +123,7 @@ git clone https://huggingface.co/THUDM/chatglm3-6b      chatglm3_6b
 git clone https://huggingface.co/THUDM/chatglm3-6b-base chatglm3_6b_base
 git clone https://huggingface.co/THUDM/chatglm3-6b-32k  chatglm3_6b_32k
 git clone https://huggingface.co/THUDM/glm-10b          glm_10b
+git clone https://huggingface.co/THUDM/glm-4-9b         glm_4_9b
 
 # replace tokenization file if using transformers-4.36.1 for model ChatGLM-6B (this might be needless in the future)
 cp chatglm_6b/tokenization_chatglm.py chatglm_6b/tokenization_chatglm.py-backup
@@ -142,6 +149,9 @@ python3 convert_checkpoint.py --model_dir chatglm_6b --output_dir trt_ckpt/chatg
 
 # GLM-10B: single gpu, dtype float16
 python3 convert_checkpoint.py --model_dir glm_10b --output_dir trt_ckpt/glm_10b/fp16/1-gpu
+
+# GLM-4-9B: single gpu, dtype float16
+python3 convert_checkpoint.py --model_dir glm_4_9b --output_dir trt_ckpt/glm_4_9b/fp16/1-gpu
 ```
 
 ### 3. Build TensorRT engine(s)
@@ -177,6 +187,11 @@ trtllm-build --checkpoint_dir trt_ckpt/chatglm_6b/fp16/1-gpu \
 trtllm-build --checkpoint_dir trt_ckpt/glm_10b/fp16/1-gpu \
         --gemm_plugin float16 \
         --output_dir trt_engines/glm_10b/fp16/1-gpu
+
+# GLM-4-9B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
+trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/fp16/1-gpu \
+        --gemm_plugin float16 \
+        --output_dir trt_engines/glm_4_9b/fp16/1-gpu
 ```
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
@@ -197,9 +212,8 @@ If the engines are run successfully, you will see output like (ChatGLM3-6B as th
 
 * Use `--gpt_attention_plugin <DataType>` to configure GPT Attention plugin (default as float16)
 * Use `--gemm_plugin <DataType>` to configure GEMM plugin (default as float16)
-* Use `--context_fmha enable` or `--context_fmha_fp32_acc enable` to enable FMHA kernels, which can provide better performance and low GPU memory occupation.
+* Use `--context_fmha enable` to enable FMHA kernels, which can provide better performance and low GPU memory occupation.
   * `--gpt_attention_plugin float16` must be used when using FMHA.
-  * `--context_fmha enable` uses FP16 accumulator, which might cause low accuracy. In this case, `--context_fmha_fp32_acc enable` should be used to protect accuracy at a cost of small performance drop.
 
 #### In-flight batching
 
@@ -232,6 +246,12 @@ python3 ../run.py --input_text "Peking University is [MASK] than Tsinghua Univer
         --max_output_len 50 \
         --tokenizer_dir glm_10b \
         --engine_dir trt_engines/glm_10b/fp16/1-gpu
+
+# Run the default engine of GLM-4-9B on single GPU, other model name is available if built.
+python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?" \
+        --max_output_len 50 \
+        --tokenizer_dir glm_4_9b \
+        --engine_dir trt_engines/glm_4_9b/fp16/1-gpu
 ```
 
 #### Single node, multi GPU
@@ -246,6 +266,7 @@ mpirun -n 2 \
 ```
 
 * `--allow-run-as-root` might be needed if using `mpirun` as root.
+* `trtllm-build` flag `--context_fmha enable` uses FP16 accumulator, which might cause low accuracy. In this case, add `--enable_context_fmha_fp32_acc` to the inference command should be used to protect accuracy at a cost of small performance drop.
 
 If the engines are run successfully, you will see output like (ChatGLM3-6B as the example):
 
@@ -395,7 +416,8 @@ python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt
             --gemm_plugin float16 \
             --gather_all_token_logits \
             --max_batch_size 8 \
-            --max_input_len 25600
+            --max_input_len 25600 \
+            --max_num_tokens 25600
 
 python examples/summarize.py --engine_dir /tmp/chatglm3-6b-128k/trt_engines \
                              --tokenizer_dir chatglm3-6b-128k \
@@ -431,7 +453,8 @@ python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt
             --gemm_plugin float16 \
             --gather_all_token_logits \
             --max_batch_size 1 \
-            --max_input_len 12800
+            --max_input_len 12800 \
+            --max_num_tokens 12800
 
 python examples/eval_long_context.py  --task passkey \
                                       --engine_dir /tmp/chatglm3-6b-128k/trt_engines \

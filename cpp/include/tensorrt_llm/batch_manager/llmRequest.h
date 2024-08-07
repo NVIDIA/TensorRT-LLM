@@ -80,7 +80,8 @@ public:
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt)
+        std::optional<RequestIdType> clientId = std::nullopt,
+        executor::PriorityType priority = executor::Request::kDefaultPriority)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -116,6 +117,7 @@ public:
         , mEncoderTokens(std::move(encoderInputTokens))
         , mReturnEncoderOutput(returnEncoderOutput)
         , mDecodingIter(0)
+        , mPriority(priority)
     {
         if (mEncoderTokens.has_value())
         {
@@ -158,6 +160,7 @@ public:
         , mEncoderTokens(std::nullopt)
         , mReturnEncoderOutput(req.getOutputConfig().returnEncoderOutput)
         , mDecodingIter(0)
+        , mPriority(req.getPriority())
     {
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnAllGeneratedTokens == false)
         {
@@ -379,20 +382,22 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
-    /// @brief Add new generated tokens to the vector of tokens
+    /// @brief Add new generated tokens to the vector of tokens and set mLastTokens
     /// @param token The token to add
     /// @param beam The beam to which to add the new token
     void addNewToken(TokenIdType token, SizeType32 beam)
     {
+        mLastTokens[beam] = token;
         mTokens.at(beam).push_back(token);
     }
 
-    /// @brief Add new generated tokens to the vector of tokens
+    /// @brief Add new generated tokens to the vector of tokens and set mLastTokens
     /// @param beamTokens A vector containing the tokens to add for each beam index
     ///                   beamTokens is expected to be of size beamWidth
     void addNewTokens(VecTokens const& beamTokens)
     {
         assert(static_cast<size_t>(mSamplingConfig.beamWidth) == beamTokens.size());
+        mLastTokens = beamTokens;
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
             auto const outputId = beamTokens[beam];
@@ -411,6 +416,18 @@ public:
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beam].begin(), generatedBeamTokens[beam].end());
         }
+    }
+
+    /// @brief Return a vector of the last-generated tokens of shape [num_beams]
+    [[nodiscard]] VecTokens const& getLastTokens()
+    {
+        return mLastTokens;
+    }
+
+    /// @brief Return the last-generated token of from a particular beam
+    [[nodiscard]] TokenIdType const& getLastTokens(SizeType32 beam)
+    {
+        return mLastTokens[beam];
     }
 
     /// @brief Pause a request by moving the generated tokens to the prompt
@@ -696,6 +713,11 @@ public:
         mIsStreaming = isStreaming;
     }
 
+    void setPriority(executor::PriorityType priority) noexcept
+    {
+        mPriority = priority;
+    }
+
     void setReturnAllGeneratedTokens(bool const returnAllGeneratedTokens)
     {
         TLLM_CHECK_WITH_INFO(!mIsStreaming || mSamplingConfig.beamWidth == 1 || returnAllGeneratedTokens,
@@ -817,6 +839,11 @@ public:
         return isContextInitState() && !mContextChunkSize;
     }
 
+    void setContextCurrentPosition(SizeType32 contextCurrentPosition)
+    {
+        mContextCurrentPosition = contextCurrentPosition;
+    }
+
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
     /// or end of the context is returned.
     [[nodiscard]] SizeType32 getContextCurrentPosition() const noexcept
@@ -861,6 +888,11 @@ public:
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
         return isFullContextRequest() || getContextCurrentPosition() == 0;
+    }
+
+    [[nodiscard]] executor::PriorityType priority() const noexcept
+    {
+        return mPriority;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
@@ -999,6 +1031,11 @@ public:
 protected:
     bool mIsStreaming;
 
+    // A list of tokens generated at the current step.
+    // Used to pass the decoded tokens as the input to the next step.
+    // `mLastTokens[beam] != mTokens.back()[beam]` for streaming + beam search
+    // as `mTokens` will be overwritten by the gathered tokens.
+    VecTokens mLastTokens;
     BeamTokens mTokens;
     SizeType32 mOrigPromptLen;
     // Number of tokens already in KV cache before context phase.
@@ -1052,12 +1089,14 @@ protected:
     TensorPtr mEncoderOutputHost;
 
     SizeType32 mDecodingIter;
+    executor::PriorityType mPriority;
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
+        mLastTokens = VecTokens(mSamplingConfig.beamWidth);
 
         if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
             || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
@@ -1130,13 +1169,14 @@ public:
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt)
+        std::optional<RequestIdType> clientId = std::nullopt,
+        executor::PriorityType priority = executor::Request::kDefaultPriority)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
             returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
             excludeInputFromOutput, std::move(logitsPostProcessor), applyLogitsPostProcessorBatched,
-            std::move(encoderInputTokens), returnEncoderOutput, clientId)
+            std::move(encoderInputTokens), returnEncoderOutput, clientId, priority)
     {
     }
 

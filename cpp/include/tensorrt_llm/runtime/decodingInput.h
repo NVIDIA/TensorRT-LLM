@@ -82,13 +82,13 @@ public:
         sequenceLimitLength;      //!<  [batchSize], on gpu. The maximum sequence length for each sequence in the batch.
     TensorConstPtr embeddingBias; //!<  [batchSize, vocabSizePadded], on gpu
     TensorConstPtr lengths;       //!<  [batchSize, beamWidth], on gpu
-    TensorConstPtr badWordsList;  //!<  [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
-    TensorConstPtr badWordsPtrs;  //!<  [batchSize][2, badWordsLength], on gpu
-    TensorConstPtr badWordsLens;  //!<  [batchSize], on gpu
-    TensorConstPtr stopWordsList; //!<  [batchSize, 2, stopWordsLength], on gpu
-    TensorConstPtr stopWordsPtrs; //!<  [batchSize][2, stopWordsLength], on gpu
-    TensorConstPtr stopWordsLens; //!<  [batchSize], on gpu
-    TensorConstPtr noRepeatNgramSize; //!<  [batchSize], on gpu
+    std::vector<TensorPtr> badWordsLists;  // vector with batchSize elements of size [2, badWordsLength], on gpu
+    TensorConstPtr badWordsPtrs;           //!<  [batchSize][2, badWordsLength], on gpu
+    TensorConstPtr badWordsLens;           //!<  [batchSize], on gpu
+    std::vector<TensorPtr> stopWordsLists; // vector with batchSize elements of size [2, stopWordsLength], on gpu
+    TensorConstPtr stopWordsPtrs;          //!<  [batchSize][2, stopWordsLength], on gpu
+    TensorConstPtr stopWordsLens;          //!<  [batchSize], on gpu
+    TensorConstPtr noRepeatNgramSize;      //!<  [batchSize], on gpu
     TensorConstPtr
         batchSlots; //!<  [batchSize], optional, address map of the linear batch id to to the seq slots, int32_t, pinned
 

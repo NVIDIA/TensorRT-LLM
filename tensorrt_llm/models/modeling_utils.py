@@ -14,7 +14,8 @@ import torch
 from .._common import default_net
 from .._utils import (get_init_params, numpy_to_torch, release_gc,
                       str_dtype_to_torch, str_dtype_to_trt, trt_dtype_to_torch)
-from ..functional import PositionEmbeddingType, Tensor, gather_last_token_logits
+from ..functional import (PositionEmbeddingType, Tensor,
+                          gather_last_token_logits, tanh)
 from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
                       FusedRgLru, GatedMLP, KeyValueCacheParams, LoraParams,
                       PromptTuningEmbedding, RgLru)
@@ -744,6 +745,12 @@ class DecoderModelForCausalLM(PretrainedModel):
                 lm_logits *= getattr(self.config, 'output_multiplier_scale', 1)
             if self.mup_width_multiplier is not None:
                 lm_logits = lm_logits / self.mup_width_multiplier
+            if hasattr(self.config, "query_pre_attn_scalar"
+                       ) and self.config.final_logit_softcapping:
+                lm_logits = lm_logits * float(
+                    1 / self.config.final_logit_softcapping)
+                lm_logits = tanh(lm_logits) * float(
+                    self.config.final_logit_softcapping)
             lm_logits.mark_output('logits', self.config.logits_dtype)
         else:
             hidden_states.mark_output('hidden_states_output', self.config.dtype)
@@ -1123,6 +1130,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
     """
     quant_algo = model_config.quantization.quant_algo
     kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
+    exclude_modules = model_config.quantization.exclude_modules
 
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
@@ -1193,6 +1201,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
     elif quant_algo in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         weights = weight_only_quantize_dict(weights=weights,
                                             quant_algo=quant_algo,
+                                            exclude_modules=exclude_modules,
                                             plugin=True)
 
     # FP8 kv_cache_scaling_factor is always 1.0

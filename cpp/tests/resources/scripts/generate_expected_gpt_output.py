@@ -76,6 +76,10 @@ def generate_output(engine: str,
         str(output_logits_npy), '--use_py_session'
     ]
 
+    # Generate context_fmha_fp32_acc enabled results for GptExecutorTest.GenerationLogitsEarlyStop
+    if model_spec_obj.get_enable_context_fmha_fp32_acc():
+        args_list.extend(["--enable_context_fmha_fp32_acc"])
+
     assert not os.path.exists(results_file) and not os.path.exists(results_csv)
 
     if output_cum_log_probs:
@@ -96,10 +100,10 @@ def generate_output(engine: str,
 
 
 def generate_outputs(num_beams):
-    print('Generating GPT2 FP32 outputs')
     input_name = 'input_tokens.npy'
     input_name_long = 'input_tokens_long.npy'
 
+    print('Generating GPT2 FP32 outputs')
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.FLOAT)
     model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
     if num_beams == 1:
@@ -133,6 +137,15 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj)
     model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
     model_spec_obj.gather_logits()
+    generate_output(engine=model_spec_obj.get_model_path(),
+                    num_beams=num_beams,
+                    input_name=input_name,
+                    model_spec_obj=model_spec_obj,
+                    output_logits=True,
+                    output_log_probs=True,
+                    output_cum_log_probs=True)
+    # GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime
+    model_spec_obj.enable_context_fmha_fp32_acc()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,

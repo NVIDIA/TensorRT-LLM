@@ -9,7 +9,7 @@ param (
 )
 
 # Default CUDA version if not specified by user.
-$defaultCudaVersion = "12.4.1"
+$defaultCudaVersion = "12.5.1"
 
 # Set the error action preference to 'Stop' for the entire script.
 # Respond to non-terminating errors by stopping execution and displaying an error message.
@@ -41,6 +41,8 @@ if (-not $skipCUDA){
             $cudaUri = 'https://developer.download.nvidia.com/compute/cuda/12.4.0/local_installers/cuda_12.4.0_551.61_windows.exe'
         } elseif ($cudaVersion -eq "12.4.1"){
             $cudaUri = 'https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_551.78_windows.exe'
+        } elseif ($cudaVersion -eq "12.5.1"){
+            $cudaUri = 'https://developer.download.nvidia.com/compute/cuda/12.5.1/local_installers/cuda_12.5.1_555.85_windows.exe'
         } else {
             $cudaUri = Read-Host "Please go to https://developer.nvidia.com/cuda-downloads and input the url of the CUDA version you wish to use"
         }
@@ -179,10 +181,10 @@ if (-not ($skipTRT)) {
         Write-Output "Grabbing TensorRT..."
         $ProgressPreference = 'SilentlyContinue'
         New-Item -Path .\TensorRT -ItemType Directory
-        Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.1.0/zip/TensorRT-10.1.0.27.Windows.win10.cuda-12.4.zip' -OutFile .\TensorRT\trt.zip
+        Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.2.0/zip/TensorRT-10.2.0.19.Windows.win10.cuda-12.5.zip' -OutFile .\TensorRT\trt.zip
         Expand-Archive -Path .\TensorRT\trt.zip -DestinationPath .\TensorRT\
         Remove-Item -Path .\TensorRT\trt.zip -Force
-        $trtPath = Join-Path $TRT_BASE TensorRT-10.1.0.27
+        $trtPath = Join-Path $TRT_BASE TensorRT-10.2.0.19
         Write-Output "TensorRT installed at ${trtPath}"
 
         $trtSubPaths = @{

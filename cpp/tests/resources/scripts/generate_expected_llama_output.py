@@ -19,6 +19,7 @@ from pathlib import Path
 
 import run
 from build_engines_utils import init_model_spec_module
+from mpi4py.MPI import COMM_WORLD
 
 init_model_spec_module()
 import os
@@ -66,7 +67,16 @@ def generate_output(engine: str,
 
 
 def generate_outputs(num_beams, only_multi_gpu=False):
-    tp_pp_sizes = [(1, 1)] if not only_multi_gpu else [(4, 1), (2, 2), (1, 4)]
+    if not only_multi_gpu:
+        tp_pp_sizes = [(1, 1)]
+    elif COMM_WORLD.size == 4:
+        tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
+    elif COMM_WORLD.size == 2:
+        tp_pp_sizes = [(1, 2)]
+    else:
+        raise RuntimeError(
+            f"The world size of MPI {COMM_WORLD.size} is not equal to 1, 2, or 4."
+        )
     model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)

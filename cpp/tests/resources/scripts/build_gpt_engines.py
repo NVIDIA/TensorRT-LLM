@@ -155,8 +155,7 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
     model_spec_obj.use_gpt_plugin()
     build_engine(str(fp32_ckpt_dir),
                  str(engine_dir / model_spec_obj.get_model_path() / tp_pp_dir),
-                 '--gpt_attention_plugin=float32', '--context_fmha=enable',
-                 '--context_fmha_fp32_acc=enable')
+                 '--gpt_attention_plugin=float32', '--context_fmha=enable')
 
     print("\nConverting to fp16")
     fp16_ckpt_dir = ckpt_dir / 'fp16' / tp_dir
@@ -185,7 +184,6 @@ def build_engines(model_cache: Optional[str] = None, world_size: int = 1):
         '--remove_input_padding=enable',
         '--paged_kv_cache=enable',
         '--context_fmha=enable',
-        '--context_fmha_fp32_acc=enable',
         '--max_num_tokens=10000',
         '--use_paged_context_fmha=enable',
     ]

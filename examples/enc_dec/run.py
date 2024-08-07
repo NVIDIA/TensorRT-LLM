@@ -162,16 +162,15 @@ def parse_arguments():
 
 class TRTLLMEncDecModel:
 
-    def __init__(
-        self,
-        engine_name,
-        engine_dir,
-        lora_dir=None,
-        lora_task_uids=None,
-        debug_mode=False,
-        skip_encoder=False,
-        stream: torch.cuda.Stream = None,
-    ):
+    def __init__(self,
+                 engine_name,
+                 engine_dir,
+                 lora_dir=None,
+                 lora_task_uids=None,
+                 debug_mode=False,
+                 skip_encoder=False,
+                 stream: torch.cuda.Stream = None,
+                 enable_context_fmha_fp32_acc: bool = None):
         # in multi-node setup, it's important to set_device at the very beginning so .to('cuda') refers to current device
         # accordingly, all input & output tensors should be moved to current device
         # otherwise, it's default to 'cuda:0'
@@ -181,6 +180,7 @@ class TRTLLMEncDecModel:
         self.device = torch.cuda.current_device()
         self.skip_encoder = skip_encoder
         self.lora_task_uids = lora_task_uids
+        self.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
 
         # when enc-dec runs by itself, stream can be None and we create new stream here
         # when enc-dec has to run as a component in a bigger workflow (e.g., multimodal), earlier components in the workflow may have results in its stream, which we should pass that stream in to avoid unnecessary stream sync
@@ -278,14 +278,16 @@ class TRTLLMEncDecModel:
                     lora_task_uids=None,
                     debug_mode=False,
                     skip_encoder=False,
-                    stream=None):
+                    stream=None,
+                    enable_context_fmha_fp32_acc=None):
         return cls(engine_name,
                    engine_dir,
                    lora_dir,
                    lora_task_uids,
                    debug_mode=debug_mode,
                    skip_encoder=skip_encoder,
-                   stream=stream)
+                   stream=stream,
+                   enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
 
     def process_input(self,
                       input_ids,
@@ -389,11 +391,11 @@ class TRTLLMEncDecModel:
             device=self.device).contiguous()
 
         if self.encoder_runtime_mapping.tp_size > 1:
-            set_peer_access(self.encoder_runtime_mapping)
+            is_p2p_supported = set_peer_access(self.encoder_runtime_mapping)
             ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.encoder_runtime_mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.encoder_runtime_mapping.tp_size))
+                    self.encoder_runtime_mapping.tp_size), is_p2p_supported)
             inputs['all_reduce_workspace'] = all_reduce_workspace
 
         if self.encoder_model_config.lora_plugin:
@@ -578,7 +580,7 @@ class TRTLLMEncDecModel:
             encoder_max_input_length=encoder_max_input_length,
             lora_manager=self.decoder_lora_manager,
             lora_uids=self.lora_task_uids,
-        )
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
 
         output = self.decoder_session.decode(
             decoder_input_ids,

@@ -798,7 +798,7 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'],
                                    atol=1e-6)
 
-    # The activation memory usage baseline is acquired by `session.engine.device_memory_size` and hardcoded here since it shouldn't change much across platforms if we fused mha successfully.
+    # The activation memory usage baseline is acquired by `session.engine.device_memory_size_v2` and hardcoded here since it shouldn't change much across platforms if we fused mha successfully.
     @parameterized.expand(
         [
             (
@@ -1013,7 +1013,7 @@ class TestLayer(unittest.TestCase):
         engine_buffer = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)
-        act_mem = session.engine.device_memory_size
+        act_mem = session.engine.device_memory_size_v2
 
         # TRT doesn't support context fmha in pre-turing architecture.
         if act_mem_baseline != None and getSMVersion() >= 75:

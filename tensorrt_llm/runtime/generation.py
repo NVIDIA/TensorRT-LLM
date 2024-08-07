@@ -208,16 +208,17 @@ class _Runtime(object):
 
     def __init__(self, engine_buffer, mapping: Mapping):
         self.address = None
+        self.device_memory_size = 0
         self.__prepare(mapping, engine_buffer)
 
     def _serialize_engine(self) -> trt.IHostMemory:
         return self.engine.serialize()
 
-    def __create_and_setup_context(self, address, profile_idx,
+    def __create_and_setup_context(self, address, size, profile_idx,
                                    stream) -> trt.IExecutionContext:
         context = self.engine.create_execution_context_without_device_memory()
         assert context is not None, "Failed to create an execution context with the provided device memory!"
-        context.device_memory = address
+        context.set_device_memory(address, size)
         context.set_optimization_profile_async(profile_idx, stream)
         # If nvtx verbosity is DETAILED, change it to LAYER_NAMES_ONLY for inference performance
         if context.nvtx_verbosity == trt.ProfilingVerbosity.DETAILED:
@@ -247,6 +248,7 @@ class _Runtime(object):
 
         self.runtime = trt.Runtime(logger.trt_logger)
         self.engine = self.runtime.deserialize_cuda_engine(engine_buffer)
+        assert self.engine is not None
 
         self.input_tensor_names = set()
         self.output_tensor_names = set()
@@ -257,12 +259,7 @@ class _Runtime(object):
             else:
                 self.input_tensor_names.add(name)
 
-        assert self.engine is not None
-        # The device_memory_size stores the memory required by the largest profile
-        address = CUASSERT(cudart.cudaMalloc(self.engine.device_memory_size))[0]
-        self.address = address
         self.profiler = None
-
         self.engine_inspector = self.engine.create_engine_inspector()
         # cuda graph ping-pong instances
         self.cuda_graph_instances = [None for _ in range(2)]
@@ -275,26 +272,35 @@ class _Runtime(object):
         self.context_1 = None
         self.ctx_context = None
 
+        # The device_memory_size_v2 stores the memory required by the largest profile.
+        # When weight streaming is enable, it must be queried after the weight streaming budget set.
+        if (self.address):
+            assert self.device_memory_size == self.engine.device_memory_size_v2
+        else:
+            self.device_memory_size = self.engine.device_memory_size_v2
+            address = CUASSERT(cudart.cudaMalloc(self.device_memory_size))[0]
+            self.address = address
+
         with _scoped_stream() as stream:
             if self.engine.num_optimization_profiles == 1:
                 # At step = 0, context_1 is active
                 # At step = 1, context_0 is active
                 # At step = 2, context_1 is active
                 self.context_0 = self.__create_and_setup_context(
-                    self.address, 0, stream)
+                    self.address, self.device_memory_size, 0, stream)
                 self.context_1 = self.__create_and_setup_context(
-                    self.address, 0, stream)
+                    self.address, self.device_memory_size, 0, stream)
                 self.ctx_context = self.context_1
             elif self.engine.num_optimization_profiles == 2:
                 # At step = 0, ctx_context is active
                 # At step = 1, context_0 is active
                 # At step = 2, context_1 is active
                 self.ctx_context = self.__create_and_setup_context(
-                    self.address, 0, stream)
+                    self.address, self.device_memory_size, 0, stream)
                 self.context_0 = self.__create_and_setup_context(
-                    self.address, 1, stream)
+                    self.address, self.device_memory_size, 1, stream)
                 self.context_1 = self.__create_and_setup_context(
-                    self.address, 1, stream)
+                    self.address, self.device_memory_size, 1, stream)
             else:
                 logger.error(
                     f"Number of optimization profiles: {self.engine.num_optimization_profiles}"
@@ -371,13 +377,12 @@ class _Runtime(object):
         self.context_1 = None
         self.ctx_context = None
 
-        min = self.engine.minimum_weight_streaming_budget
+        min = 0
         max = self.engine.streamable_weights_size
-        budget = int(min + gpu_weights_percent * (max - min))
+        budget = int(gpu_weights_percent * max)
 
-        budget_config = budget if gpu_weights_percent != 1 else 0
-        self.engine.weight_streaming_budget = budget_config
-        assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
+        self.engine.weight_streaming_budget_v2 = budget
+        assert self.engine.weight_streaming_budget_v2 == budget, "Failed to set weight streaming budget!"
         logger.info(
             f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
         )
@@ -460,7 +465,7 @@ class _Runtime(object):
 
     @property
     def context_mem_size(self) -> int:
-        return self.engine.device_memory_size
+        return self.engine.device_memory_size_v2
 
 
 @dataclass
@@ -750,11 +755,11 @@ class GenerationSession(object):
                 self.mapping.pp_size, self.decoder_logits_dtype)
 
         if self.mapping.tp_size > 1:
-            set_peer_access(self.mapping)
+            is_p2p_supported = set_peer_access(self.mapping)
             self.ipc_buffers, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.mapping.tp_size))
+                    self.mapping.tp_size), is_p2p_supported)
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
@@ -1487,7 +1492,8 @@ class GenerationSession(object):
               lora_manager: LoraManager = None,
               lora_uids: List[str] = None,
               medusa_choices: List[List[int]] = None,
-              multi_block_mode: bool = None):
+              multi_block_mode: bool = None,
+              enable_context_fmha_fp32_acc: bool = None):
         # Store these params related to buffer size to check against
         # the input shape with the params given in decode()
         self.batch_size = batch_size
@@ -1499,6 +1505,7 @@ class GenerationSession(object):
         self.beam_width = beam_width
         self.encoder_max_input_length = encoder_max_input_length
         self.multi_block_mode = multi_block_mode
+        self.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
         if max_attention_window_size is None:
             self.max_attention_window_size = self.max_seq_length
             logger.debug(
@@ -2403,7 +2410,10 @@ class GenerationSession(object):
                                                       perf_knob_tensor_size,
                                                       dtype=torch.int64)
             if self.multi_block_mode:
-                context_runtime_perf_knobs[0] = 1
+                context_runtime_perf_knobs[0] = 1  # multi_block_mode
+            if self.enable_context_fmha_fp32_acc:
+                context_runtime_perf_knobs[
+                    1] = 1  # enable_context_fmha_fp32_acc
             ret['host_runtime_perf_knobs'] = context_runtime_perf_knobs
         else:
             if self.has_attn_layers:
@@ -2485,7 +2495,9 @@ class GenerationSession(object):
             gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
             if self.multi_block_mode:
-                gen_runtime_perf_knobs[0] = 1
+                gen_runtime_perf_knobs[0] = 1  # multi_block_mode
+            if self.enable_context_fmha_fp32_acc:
+                gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
             ret['host_runtime_perf_knobs'] = gen_runtime_perf_knobs
         elif self.has_attn_layers:
             attention_mask = kwargs.pop('attention_mask')

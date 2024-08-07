@@ -1,5 +1,4 @@
-#ifndef PLUGIN_UTILITY_SOURCE
-#define PLUGIN_UTILITY_SOURCE
+#include "plugin_common.h"
 
 using namespace nvinfer1::plugin;
 
@@ -95,5 +94,3 @@ void throwCudaError(char const* file, char const* function, int line, int status
 
 } // namespace plugin
 } // namespace nvinfer1
-
-#endif // end PLUGIN_UTILITY_SOURCE

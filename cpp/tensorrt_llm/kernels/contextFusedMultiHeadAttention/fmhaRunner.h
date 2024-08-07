@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include "fused_multihead_attention_common.h"
+#include "fused_multihead_attention_v2.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tmaDescriptor.h"
 
@@ -38,95 +39,63 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-class MHARunner
-{
-public:
-    MHARunner(Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize,
-        float const qScaling, float const qkTanhScale = 0.f);
-
-    MHARunner() = default;
-
-    virtual ~MHARunner() = default;
-
-    virtual void setup(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
-        int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen,
-        bool const has_alibi = false, bool const scale_alibi = false, int const tp_size = 1, int const tp_rank = 0)
-        = 0;
-
-    // Keep this for bert attention plugin.
-    virtual void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen) = 0;
-
-    static bool fmha_supported(int const headSize, int const sm);
-
-    virtual bool fmha_supported() = 0;
-
-    virtual void setup_flags(bool const force_fp32_acc, bool const is_s_padded, bool const causal_mask,
-        int const num_kv_heads /* MQA or GQA */)
-        = 0;
-
-    virtual void run(void const* qPtr, void const* pagedKVBlockOffsetsOnHost, KVBlockArray const& pagedKVCache,
-        void const* cuQSeqlenPtr, void const* cuKVSeqlenPtr, uint32_t* tileCounterPtr, float const* scaleBmm2Ptr,
-        void* outputPtr, cudaStream_t stream)
-        = 0;
-
-    // Keep this for bert attention plugin.
-    virtual void run(void const* inputPtr, void const* cuQSeqlenPtr, uint32_t* tileCounterPtr,
-        float const* scaleBmm2Ptr, void* outputPtr, cudaStream_t stream)
-        = 0;
-
-    virtual bool isValid(int s) const = 0;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 // Workflow of fmha runner:
 // 1. check if FMHA kernels are supported statically.
-// 2. construct FMHA runner object.
-// 3. setup_flags (used by all kernels).
-// 4. setup runtime parameters (used by this specific case).
-// 5. run the kernel (with all needed device pointers).
-
-class FusedMHARunnerV2 : public MHARunner
+// 2. construct FMHA runner object with the fixed params.
+// 3. run the kernel (with all needed device pointers).
+class FusedMHARunnerV2
 {
 public:
-    FusedMHARunnerV2(Data_type const dataType, bool const pagedKVFMHA, int const numHeads, int const headSize,
-        float const qScaling, float const qkTanhScale = 0.f);
+    // Constructor.
+    FusedMHARunnerV2(MHARunnerFixedParams fixedParams);
 
-    ~FusedMHARunnerV2(); // for pimpl
+    // Deconstructor.
+    ~FusedMHARunnerV2() = default; // for pimpl
 
-    void setup(int const b, int const s_q, int const s_kv, int const blocks_per_context_sequence,
-        int const tokens_per_kv_block, int const sliding_window_size, int const total_seqlen,
-        bool const has_alibi = false, bool const scale_alibi = false, int const tp_size = 1,
-        int const tp_rank = 0) override;
+    // Check if any fmha kernel meets the requirements.
+    bool isFmhaSupported();
 
-    // Keep this for bert attention plugin.
-    void setup(int const b, int const s, int const sliding_window_size, int const total_seqlen)
-    {
-        setup(b, s, s, 0, 0, sliding_window_size, total_seqlen);
-    }
-
-    bool fmha_supported() override;
-
-    void run(void const* qPtr, void const* pagedKVBlockOffsetsOnHost, KVBlockArray const& pagedKVCache,
-        void const* cuQSeqlenPtr, void const* cuKVSeqlenPtr, uint32_t* tileCounterPtr, float const* scaleBmm2Ptr,
-        void* outputPtr, cudaStream_t stream) override;
-
-    // Keep this for bert attention plugin.
-    void run(void const* inputPtr, void const* cuQSeqlenPtr, uint32_t* tileCounterPtr, float const* scaleBmm2Ptr,
-        void* outputPtr, cudaStream_t stream)
-    {
-        run(inputPtr, nullptr, KVBlockArray(), cuQSeqlenPtr, cuQSeqlenPtr, tileCounterPtr, scaleBmm2Ptr, outputPtr,
-            stream);
-    }
-
-    void setup_flags(bool const force_fp32_acc, bool const is_s_padded, bool const causal_mask,
-        int const num_kv_heads /* MQA or GQA */) override;
-
-    bool isValid(int s) const override;
+    // Run the fmha kernel.
+    void run(MHARunnerParams runnerParams);
 
 private:
-    class mhaImpl;
-    std::unique_ptr<mhaImpl> pimpl;
+    // Set the kernel params.
+    void setupKernelParams(MHARunnerParams runnerParams);
+
+    // Set the launch params to select kernels.
+    void setupLaunchParams(MHARunnerParams runnerParams);
+
+    // Set the tma descriptors for packed qkv input.
+    void setPackedQkvTmaDescriptors(MHARunnerParams runnerParams);
+
+    // Set the tma descriptors for separate q and kv input.
+    void setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams);
+
+    // Check if it is a valid sequence length (only used by non-flash-attention kernels).
+    bool isValidS(int s) const;
+
+    // Get the kernel sequence that support the max sequence length (only used by non-flash-attention kernels).
+    int getSFromMaxSeqLen(int const max_seq_len) const;
+
+private:
+    // The attention fixed params (mostly related to the attention structure).
+    MHARunnerFixedParams mFixedParams;
+    // The attention input params (runtime-known parameters).
+    MHARunnerParams mRunnerParams;
+    // The launch params to select the specific fmha kernel.
+    Launch_params mLaunchParams;
+    // The kernel params.
+    Fused_multihead_attention_params_v2 mKernelParams;
+    // The SM version.
+    int mSM = tensorrt_llm::common::getSMVersion();
+    // The multiple processor count.
+    int mMultiProcessorCount;
+    // The L2 cache size.
+    int mDeviceL2CacheSize;
+    // The total device memory.
+    size_t mTotalDeviceMemory;
+    // The class that stores all the kernels.
+    FusedMultiHeadAttentionXMMAKernelV2 const* xmmaKernel;
 };
 
 } // namespace kernels

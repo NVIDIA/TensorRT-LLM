@@ -121,7 +121,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 }
 #endif // ENABLE_MULTI_DEVICE
 
-void* tensorrt_llm::plugins::getCommSessionHandle()
+void const* tensorrt_llm::plugins::getCommSessionHandle()
 {
 #if ENABLE_MULTI_DEVICE
     return &COMM_SESSION;

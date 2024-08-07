@@ -105,7 +105,7 @@ def test_high_level_fake_weights():
 
 
 @force_ampere
-def test_inflight_batching():
+def test_async_io():
     max_batch_size, max_isl, max_osl = 8, 256, 256
     hf_model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
 
@@ -159,5 +159,5 @@ def test_inflight_batching():
 
 if __name__ == "__main__":
     test_save_load()
-    test_inflight_batching()
+    test_async_io()
     test_high_level_fake_weights()

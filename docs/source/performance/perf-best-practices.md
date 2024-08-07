@@ -85,6 +85,10 @@ select better kernels.
 
 However, this feature will increase the engine build time.
 
+**Known issue**: We observed that enabling multiple profiles can lead to extra
+unexpected GPU memory usage on some cases starting from v0.11. The issue will be
+addressed in future releases.
+
 ### GPT Attention Plugin and Context Fused Multi-Head Attention
 
 The GPT attention plugin and fused  multi-head attention kernel are enabled by

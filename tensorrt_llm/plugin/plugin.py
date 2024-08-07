@@ -158,7 +158,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     # Features
     _context_fmha: bool = field(default=True, init=False)
-    _context_fmha_fp32_acc: bool = field(
+    _bert_context_fmha_fp32_acc: bool = field(
         default=False, init=False)  # will use fp16 if disabled
     _paged_kv_cache: bool = field(default=True, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
@@ -219,7 +219,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     @property
     def context_fmha_type(self):
-        if self.context_fmha_fp32_acc:
+        if self.bert_context_fmha_fp32_acc:
             return ContextFMHAType.enabled_with_fp32_acc
         elif self.context_fmha:
             return ContextFMHAType.enabled
@@ -230,13 +230,13 @@ class PluginConfig(metaclass=PluginConfigMeta):
     def context_fmha_type(self, value):
         if value == ContextFMHAType.disabled:
             self.context_fmha = False
-            self.context_fmha_fp32_acc = False
+            self.bert_context_fmha_fp32_acc = False
         else:
             self.context_fmha = True
             if value == ContextFMHAType.enabled:
-                self.context_fmha_fp32_acc = False
+                self.bert_context_fmha_fp32_acc = False
             elif value == ContextFMHAType.enabled_with_fp32_acc:
-                self.context_fmha_fp32_acc = True
+                self.bert_context_fmha_fp32_acc = True
 
     def set_smooth_quant_plugins(self, dtype: str = "auto"):
         self.smooth_quant_gemm_plugin = dtype
@@ -285,7 +285,7 @@ cli_plugin_args = [
 
     # Features
     "context_fmha",
-    "context_fmha_fp32_acc",
+    "bert_context_fmha_fp32_acc",
     "paged_kv_cache",
     "remove_input_padding",
     "enable_xqa",
@@ -377,14 +377,20 @@ class CustomAllReduceHelper:
 
     @staticmethod
     def allocate_workspace(mapping: Mapping,
-                           size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+                           size: int,
+                           is_p2p_supported: bool = True
+                           ) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size)
+        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
+                                     is_p2p_supported)
+        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,
+                                     is_p2p_supported)
         ipc_barriers_in = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
         ipc_barriers_out = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
         buffers = [
             ipc_buffers_ping,
             ipc_buffers_pong,

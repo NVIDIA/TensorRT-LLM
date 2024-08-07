@@ -83,9 +83,9 @@ trtllm-build \
 
 You can enable the FMHA kernels for phi by adding `--context_fmha enable` to the invocation of `trtllm-build`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
 
-If you find that the default fp16 accumulation (`--context_fmha enable`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation (`--context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
 
-Note `--context_fmha enable` / `--context_fmha_fp32_acc enable` has to be used together with `--gpt_attention_plugin float16`.
+Note `--context_fmha` has to be used together with `--gpt_attention_plugin float16`.
 
 ### 3. Summarization using the Phi model
 

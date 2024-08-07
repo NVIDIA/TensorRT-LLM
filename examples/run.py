@@ -266,16 +266,6 @@ def main(args):
     if args.end_id:
         end_id = args.end_id
 
-    stop_words_list = None
-    if args.stop_words:
-        stop_words_list = tensorrt_llm.runtime.decode_words_list(
-            args.stop_words, tokenizer)
-
-    bad_words_list = None
-    if args.bad_words:
-        bad_words_list = tensorrt_llm.runtime.decode_words_list(
-            args.bad_words, tokenizer)
-
     prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
         prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
@@ -289,6 +279,23 @@ def main(args):
                                   num_prepend_vtokens=args.num_prepend_vtokens,
                                   model_name=model_name,
                                   model_version=model_version)
+
+    stop_words_list = None
+    if args.stop_words:
+        stop_words_list = tensorrt_llm.runtime.decode_words_list(
+            args.stop_words, tokenizer)
+    if model_version == 'glm-4':  # add default stop token ids for GLM-4
+        glm4_stop_ids = [[151329], [151336], [151338]]
+        if stop_words_list is None:
+            stop_words_list = [glm4_stop_ids] * len(batch_input_ids)
+        else:
+            for req_stop_words_list in stop_words_list:
+                req_stop_words_list.extend(glm4_stop_ids)
+
+    bad_words_list = None
+    if args.bad_words:
+        bad_words_list = tensorrt_llm.runtime.decode_words_list(
+            args.bad_words, tokenizer)
 
     if is_enc_dec:
         encoder_input_ids = batch_input_ids
@@ -365,6 +372,8 @@ def main(args):
             kv_cache_free_gpu_memory_fraction,
             enable_chunked_context=args.enable_chunked_context,
             multi_block_mode=args.multi_block_mode)
+    runner_kwargs.update(
+        enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
     runner = runner_cls.from_dir(**runner_kwargs)
 
     with torch.no_grad():

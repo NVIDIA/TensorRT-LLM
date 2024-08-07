@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tmaDescriptor.h"
+#include <algorithm>
 #include <assert.h>
 #include <memory>
 #include <mutex>
@@ -34,19 +35,15 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-// compute groups for warp-specialized kernels on Hopper
-#define NUM_COMPUTE_GROUPS 2
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Base Class
 
-template <typename TKernelMeta, typename TKernelParam, typename TPagedKVKernelParam>
+template <typename TKernelMeta, typename TKernelParam>
 class TFusedMultiHeadAttentionXMMAKernel
 {
 public:
     using KernelMeta = TKernelMeta;
     using KernelParam = TKernelParam;
-    using PagedKVKernelParam = TPagedKVKernelParam;
 
     inline uint64_t hashID(unsigned int s, unsigned int d) const
     {
@@ -128,17 +125,32 @@ public:
             mDriver);
     }
 
-    virtual void getStepSize(uint32_t& out_step_q, uint32_t& out_step_kv,
-        Fused_multihead_attention_paged_kv_params_v2 const& params, Launch_params const& launch_params) const
-        = 0;
+    virtual bool checkIfKernelExist(MHARunnerFixedParams params) const = 0;
 
-    virtual void getStepSize(uint32_t& out_step_q, uint32_t& out_step_kv,
-        Fused_multihead_attention_params_v2 const& params, Launch_params const& launch_params) const
+    virtual void getStepSize(uint32_t& out_step_q, uint32_t& out_step_kv, TKernelParam const& params,
+        Launch_params const& launch_params) const
         = 0;
-
-    virtual void run(PagedKVKernelParam& params, Launch_params& launch_params, cudaStream_t stream) const = 0;
 
     virtual ~TFusedMultiHeadAttentionXMMAKernel() = default;
+
+protected:
+    struct FusedMultiHeadAttentionKernelInfo;
+
+    struct KernelExistPredicate
+    {
+        KernelExistPredicate(uint64_t id)
+            : mId(id)
+        {
+        }
+
+        bool operator()(std::pair<uint64_t, FusedMultiHeadAttentionKernelInfo> const& v) const
+        {
+            return (v.first & mId) == mId;
+        }
+
+    private:
+        uint64_t mId;
+    };
 
 protected:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
@@ -209,29 +221,26 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// FMHA kernels that support Contiguous QKV input.
-// TODO: merge contiguous_qkv_fmha and paged_kv_fmha kernel selection into one.
 class FusedMultiHeadAttentionXMMAKernelV2
     : public TFusedMultiHeadAttentionXMMAKernel<FusedMultiHeadAttentionKernelMetaInfoV2,
-          Fused_multihead_attention_params_v2, Fused_multihead_attention_paged_kv_params_v2>
+          Fused_multihead_attention_params_v2>
 {
 public:
     FusedMultiHeadAttentionXMMAKernelV2(FusedMultiHeadAttentionKernelMetaInfoV2 const* pMetaStart,
         unsigned int nMetaCount, Data_type type, unsigned int sm)
         : TFusedMultiHeadAttentionXMMAKernel<FusedMultiHeadAttentionKernelMetaInfoV2,
-            Fused_multihead_attention_params_v2, Fused_multihead_attention_paged_kv_params_v2>(
-            pMetaStart, nMetaCount, type, sm)
+            Fused_multihead_attention_params_v2>(pMetaStart, nMetaCount, type, sm)
     {
     }
 
     inline uint64_t hashID(unsigned int s, unsigned int d, bool interleaved, bool unroll, bool force_fp32_acc,
-        bool flash_attention, bool warp_specialization, bool is_alibi_supported, int attention_mask_type, bool tiled,
-        bool paged_kv_input, bool has_qk_tanh_scale) const
+        bool flash_attention, bool warp_specialization, bool is_alibi_supported, int attention_mask_type,
+        int input_layout, bool tiled, bool has_qk_tanh_scale) const
     {
         s = flash_attention ? 0 : s;
         // D <= 2048
-        return (uint64_t) s << 32 | d << 16 | (attention_mask_type << 9) | (has_qk_tanh_scale ? 256ull : 0ull)
-            | (paged_kv_input ? 128ull : 0ull) | (is_alibi_supported ? 64ull : 0ull)
+        return (uint64_t) s << 32 | d << 16 | (attention_mask_type << 10) | (input_layout << 8)
+            | (has_qk_tanh_scale ? 128ull : 0ull) | (is_alibi_supported ? 64ull : 0ull)
             | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull) | (force_fp32_acc ? 8ull : 0ull)
             | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
     }
@@ -241,13 +250,12 @@ public:
 
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
             kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
-            kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mTiled, kernelMeta.mPagedKV,
-            kernelMeta.mEnableQKTanhScale);
+            kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mAttentionInputLayout,
+            kernelMeta.mTiled, kernelMeta.mEnableQKTanhScale);
     }
 
-    // Unified Contiguous QKV and Paged KV FMHA runner.
-    template <typename Kernel_params>
-    void run_template(Kernel_params& params, Launch_params& launch_params, cudaStream_t stream) const
+    // FMHA runner.
+    void run(Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
     {
         bool forceUnroll = useForceUnroll(params, launch_params);
         auto const findIter = mFunctions.find(hashFromParams(params, launch_params));
@@ -257,8 +265,8 @@ public:
             "FMHA kernels are not found (kernel meta info: %d %d %d %d %d %d %d %d %d %d %d %d) !",
             launch_params.kernel_s, params.d, launch_params.interleaved, forceUnroll, launch_params.force_fp32_acc,
             launch_params.flash_attention, launch_params.warp_specialization, !launch_params.useKernelWithoutAlibi,
-            static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling,
-            launch_params.paged_kv_input, launch_params.enableQKTanhScale);
+            static_cast<int>(launch_params.attention_mask_type), static_cast<int>(launch_params.attention_input_layout),
+            launch_params.granular_tiling, launch_params.enableQKTanhScale);
 
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
@@ -348,54 +356,38 @@ public:
         }
     }
 
-    // Dispatch contiguous qkv fmha.
-    void run(
-        Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const override
+    // Check if any kernels support the attention types during building the engines.
+    // Runtime parameters will be set to 0.
+    bool checkIfKernelExist(MHARunnerFixedParams params) const override
     {
-        run_template(params, launch_params, stream);
-    }
-
-    // Dispatch paged kv fmha.
-    void run(Fused_multihead_attention_paged_kv_params_v2& params, Launch_params& launch_params,
-        cudaStream_t stream) const override
-    {
-        run_template(params, launch_params, stream);
-    }
-
-    void getStepSize(uint32_t& out_step_q, uint32_t& out_step_kv,
-        Fused_multihead_attention_paged_kv_params_v2 const& params, Launch_params const& launch_params) const override
-    {
-        getStepSizeImpl(out_step_q, out_step_kv, params, launch_params);
+        uint64_t id = hashID(0, params.headSize, 0, 0, params.forceFp32Acc, false, false, false,
+            static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
+            params.qkTanhScale != 0.f);
+        auto const findIter = std::find_if(mFunctions.begin(), mFunctions.end(), KernelExistPredicate(id));
+        return findIter != mFunctions.end();
     }
 
     void getStepSize(uint32_t& out_step_q, uint32_t& out_step_kv, Fused_multihead_attention_params_v2 const& params,
         Launch_params const& launch_params) const override
     {
-        getStepSizeImpl(out_step_q, out_step_kv, params, launch_params);
-    }
-
-private:
-    template <typename Kernel_params>
-    void getStepSizeImpl(uint32_t& out_step_q, uint32_t& out_step_kv, Kernel_params const& params,
-        Launch_params const& launch_params) const
-    {
         auto const findIter = mFunctions.find(hashFromParams(params, launch_params));
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(),
-            "FMHA kernels are not found (kernel meta info: %d %d %d %d %d %d %d %d %d %d) !", launch_params.kernel_s,
+            "FMHA kernels are not found (kernel meta info: %d %d %d %d %d %d %d %d %d %d %d) !", launch_params.kernel_s,
             params.d, launch_params.interleaved, launch_params.force_fp32_acc, launch_params.flash_attention,
             launch_params.warp_specialization, !launch_params.useKernelWithoutAlibi,
-            static_cast<int>(launch_params.attention_mask_type), launch_params.granular_tiling,
-            launch_params.paged_kv_input);
+            static_cast<int>(launch_params.attention_mask_type), static_cast<int>(launch_params.attention_input_layout),
+            launch_params.granular_tiling, launch_params.enableQKTanhScale);
 
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         out_step_q = kernelMeta.mStepQ;
         out_step_kv = kernelMeta.mStepKV;
     }
 
-    template <typename Kernel_params>
-    bool useForceUnroll(Kernel_params const& params, Launch_params const& launch_params) const
+private:
+    bool useForceUnroll(Fused_multihead_attention_params_v2 const& params, Launch_params const& launch_params) const
     {
         bool forceUnroll = launch_params.force_unroll;
+        // Non-flash-attention path.
         if (!forceUnroll && !launch_params.ignore_b1opt && mSM >= kSM_80)
         {
             const struct
@@ -434,14 +426,14 @@ private:
         return forceUnroll;
     }
 
-    template <typename Kernel_params>
-    uint64_t hashFromParams(Kernel_params const& params, Launch_params const& launch_params) const
+    uint64_t hashFromParams(Fused_multihead_attention_params_v2 const& params, Launch_params const& launch_params) const
     {
         bool forceUnroll = useForceUnroll(params, launch_params);
         return hashID(launch_params.kernel_s, params.d, launch_params.interleaved, forceUnroll,
             launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
-            launch_params.granular_tiling, launch_params.paged_kv_input, launch_params.enableQKTanhScale);
+            static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
+            launch_params.enableQKTanhScale);
     }
 };
 

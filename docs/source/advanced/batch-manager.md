@@ -4,7 +4,7 @@
 
 TensorRT-LLM relies on a component, called the Batch Manager, to support
 in-flight batching of requests (also known in the community as continuous
-batching or iteration-level batching). That technique that aims at reducing
+batching or iteration-level batching). That technique aims at reducing
 wait times in queues, eliminating the need for padding requests and allowing
 for higher GPU utilization.
 
@@ -119,7 +119,7 @@ When using V1 batching, the following additional statistics are reported per V1 
 
 ### Logits Post-Processor (optional)
 
-Users can alter the logits produced the network, with a callback attached to an `InferenceRequest`:
+Users can alter the logits produced by the network, with a callback attached to an `InferenceRequest`:
 
 ```
   using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
@@ -127,7 +127,7 @@ Users can alter the logits produced the network, with a callback attached to an 
 
 The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id.
 
-Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
+Users *must* use the stream to access the logits tensor. For example, performing an addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
 
 Multiple requests can share same client id and callback can use different logic based on client id.
@@ -246,5 +246,5 @@ results.
 
 A Triton Inference Server C++ backend is provided with TensorRT-LLM that
 includes the mechanisms needed to serve models using in-flight batching. That
-backend is also a good starting example how to implement in-flight batching using
+backend is also a good starting example of how to implement in-flight batching using
 the TensorRT-LLM batch manager.

@@ -20,9 +20,11 @@ instead, and be sure to set DLL paths as specified in
 
 #### Prepare dataset
 
-Run a preprocessing script to prepare/generate dataset into a json that gptManagerBenchmark can consume later. The processed output json has *input tokens length, input token ids and output tokens length*.
+Run a preprocessing script to prepare/generate dataset into a json that `gptManagerBenchmark` can consume later. The processed output json has *input tokens length, input token ids and output tokens length*.
 
-This tool can be used in 2 different modes of traffic generation.
+For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
+
+This tool can be used in 3 different modes of traffic generation: `dataset`, `token-norm-dist` and `token-unif-dist`.
 
 ##### 1 – Dataset
 
@@ -63,8 +65,8 @@ python3 prepare_dataset.py \
 
 ##### 2 – Normal token length distribution
 
-This mode allows the user to generate normal token length distributions with a mean and std deviation specified.
-For example, setting mean=100 and std dev=10 would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting std dev=0 will generate all requests with the same mean number of tokens.
+This mode allows the user to generate normally distributed token lengths with a mean and std deviation specified.
+For example, setting `mean=100` and `stdev=10` would generate requests where 95.4% of values are in <80,120> range following the normal probability distribution. Setting `stdev=0` will generate all requests with the same mean number of tokens.
 
 ```
 python prepare_dataset.py \
@@ -76,7 +78,20 @@ python prepare_dataset.py \
    --output-mean 15 --output-stdev 0
 ```
 
-For `tokenizer`, specifying the path to the local tokenizer that have already been downloaded, or simply the name of the tokenizer from HuggingFace like `meta-llama/Llama-2-7b` will both work. The tokenizer will be downloaded automatically for the latter case.
+##### 2 – Uniform token length distribution
+
+This mode allows the user to generate uniformly distributed token lengths with min and max lengths specified.
+For example, setting `min=50` and  `max=100` would generate requests where lengths are in the range `[50, 100]` following the uniform probability distribution. Setting `min=x` and `max=x` will generate all requests with the same mean number of tokens `x`.
+
+```
+python prepare_dataset.py \
+  --output token-norm-dist.json \
+  --tokenizer <path/to/tokenizer> \
+   token-unif-dist \
+   --num-requests 100 \
+   --input-min 50 --input-max 100 \
+   --output-min 10 --output-max 15
+```
 
 
 #### Prepare TensorRT-LLM engines

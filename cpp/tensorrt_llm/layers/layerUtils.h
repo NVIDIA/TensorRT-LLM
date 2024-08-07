@@ -141,5 +141,19 @@ inline TensorConstPtr getDefaultBatchSlots(runtime::SizeType32 batchSize, runtim
     return defaultBatchSlots;
 }
 
+/// @brief A convenience function to copy the content of a standard vector to a layer workspace.
+template <typename T>
+inline void copyToWorkspace(
+    runtime::BufferManager const& bufferManager, std::vector<T> const& src, runtime::IBuffer::SharedPtr& workspace)
+{
+    auto const sizeOfWorkspaceInBytes = workspace->getSizeInBytes();
+    auto const sizeOfSrcInBytes = sizeof(T) * src.size();
+    TLLM_CHECK_WITH_INFO(sizeOfSrcInBytes <= sizeOfWorkspaceInBytes,
+        "The size of the workspace (%lu bytes) is insufficient for the data (%lu bytes)", sizeOfWorkspaceInBytes,
+        sizeOfSrcInBytes);
+    runtime::IBuffer::SharedPtr workspaceSlice = runtime::IBuffer::slice(workspace, 0, sizeOfSrcInBytes);
+    bufferManager.copy(src.data(), *workspaceSlice, runtime::MemoryType::kCPU);
+}
+
 } // namespace layers
 } // namespace tensorrt_llm

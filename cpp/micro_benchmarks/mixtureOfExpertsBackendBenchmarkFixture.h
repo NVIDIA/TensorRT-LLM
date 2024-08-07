@@ -525,14 +525,14 @@ public:
     // Runs for 3 iterations or 1 second and picks the best option
     int pickBestTactic(MOEParallelismConfig parallelism_config, GemmProfilerBackend::GemmToProfile gemm_to_profile)
     {
-        NVTX3_SCOPED_RANGE(WarmUpRun);
         auto tactics = mMoERunner.getTactics();
         ::nvtx3::scoped_range nvtx(tensorrt_llm::common::nvtx::nextColor(),
             "Tactic Profiling GEMM " + std::to_string(static_cast<int>(gemm_to_profile)));
 
         GemmProfilerBackend profiler;
-        profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(), mNumExperts,
-            mK, mHiddenSize, mInterSize, mActType, mUseBias, parallelism_config);
+        profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
+            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mActType, mUseBias,
+            parallelism_config);
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
 
@@ -542,6 +542,8 @@ public:
         int best_idx = -1;
         for (int tidx = 0; tidx < tactics.size(); tidx++)
         {
+            ::nvtx3::scoped_range nvtx(
+                tensorrt_llm::common::nvtx::nextColor(), "Tactic Profiling Tactic Index: " + std::to_string(tidx));
             try
             {
                 // Set the tactic
@@ -554,8 +556,8 @@ public:
                     check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
                 }
 
-                // Max of 10 iterations or 1 sec
-                int const max_iters = 10;
+                // Profile all samples or for 1 sec
+                int const max_iters = profiler.NUM_ROUTING_SAMPLES;
                 float const max_time_ms = 1000.f;
 
                 float time = 0.f;

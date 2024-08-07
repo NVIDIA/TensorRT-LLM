@@ -40,6 +40,13 @@ class GemmaDecoderLayer(Module):
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         local_layer_idx = layer_idx - layers_range[0]
+        q_scaling = 1.0
+        if hasattr(config, "query_pre_attn_scalar"):
+            q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
+                config.head_size)
+        max_attn_value = 0.0 if not hasattr(
+            config, "attn_logit_softcapping"
+        ) or config.attn_logit_softcapping is None else config.attn_logit_softcapping
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -56,6 +63,8 @@ class GemmaDecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
+            q_scaling=q_scaling,
+            max_attn_value=max_attn_value,
         )
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -68,6 +77,17 @@ class GemmaDecoderLayer(Module):
                             tp_group=config.mapping.tp_group,
                             tp_size=config.mapping.tp_size,
                             quant_mode=config.quant_mode)
+
+        if self.config.inter_layernorms:
+            self.pre_feedforward_layernorm = RmsNorm(
+                normalized_shape=config.hidden_size,
+                eps=config.norm_epsilon,
+                dtype=config.dtype)
+            self.post_feedforward_layernorm = RmsNorm(
+                normalized_shape=config.hidden_size,
+                eps=config.norm_epsilon,
+                dtype=config.dtype)
+
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
@@ -87,19 +107,26 @@ class GemmaDecoderLayer(Module):
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
                                           attention_params=attention_params,
+                                          norm_before_bmm1=True,
                                           lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output
+        if self.config.inter_layernorms:
+            attention_output = self.post_layernorm(attention_output)
 
         hidden_states = residual + attention_output
 
         residual = hidden_states
-        hidden_states = self.post_layernorm(hidden_states)
+        if self.config.inter_layernorms:
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        else:
+            hidden_states = self.post_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
-
+        if self.config.inter_layernorms:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         if use_cache:
             return (hidden_states, presents)
@@ -148,7 +175,6 @@ class GemmaModel(Module):
                                  hidden_states.dtype)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
-
         hidden_states = self.layers.forward(
             hidden_states,
             use_cache=use_cache,
@@ -300,3 +326,4 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         config.set_if_not_exist('rotary_base', 10000.0)
         config.set_if_not_exist('rotary_scaling', None)
         config.set_if_not_exist('use_fused_mlp', False)
+        config.set_if_not_exist('inter_layernorms', False)

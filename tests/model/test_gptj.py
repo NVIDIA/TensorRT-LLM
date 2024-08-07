@@ -332,6 +332,9 @@ class TestGPTJ(unittest.TestCase):
             context_runtime_perf_knobs = torch.tensor([-1] *
                                                       perf_knob_tensor_size,
                                                       dtype=torch.int64)
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+                context_runtime_perf_knobs[
+                    1] = 1  # enable_context_fmha_fp32_acc
 
             res = run_engine(
                 context=runtime.ctx_context,
@@ -425,6 +428,8 @@ class TestGPTJ(unittest.TestCase):
             perf_knob_tensor_size = 16
             gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+                gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
             res = run_engine(
                 context=runtime.context_1,

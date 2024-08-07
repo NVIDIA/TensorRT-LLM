@@ -113,8 +113,16 @@ public:
         unsigned int beam_width = xqaParams.beam_width;
         // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
         unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
-        // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-        unsigned int m_tilesize = xqaParams.multi_query_tokens ? 16 : num_q_heads_over_kv;
+        unsigned int m_tilesize;
+        if (xqaParams.multi_query_tokens)
+        {
+            // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
+            m_tilesize = xqaParams.generation_input_length <= 16 ? 16 : 32;
+        }
+        else
+        {
+            m_tilesize = num_q_heads_over_kv;
+        }
 
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
@@ -211,9 +219,6 @@ public:
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
         sync_check_cuda_error();
 
-        // Use mTileSize = 16 kernels when qSeqLen <= 16.
-        unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
-        unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
         XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
         auto const findIter = mFunctions.find(hash_key);
 
@@ -229,6 +234,9 @@ public:
             // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
             // mask). Input parameters for MultiQueryTokens kernels.
             unsigned int headGrpSize = num_q_heads_over_kv;
+            // Use mTileSize = 16 kernels when qSeqLen <= 16.
+            unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
+            unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
             unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
             int const* maskPtr = xqaParams.spec_decoding_packed_mask;
             int const* cuQSeqLens = launchParams.cu_seq_lens;

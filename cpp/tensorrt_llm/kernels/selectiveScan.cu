@@ -19,6 +19,7 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/pipeline>
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -28,11 +29,12 @@
 
 #include "selectiveScan.h"
 
-#include "chunkScan/bmmchunk.h"
-#include "chunkScan/chunkcumsum.h"
-#include "chunkScan/chunkscan.h"
-#include "chunkScan/chunkstate.h"
-#include "chunkScan/statepassing.h"
+#include "selectiveScan/CudaType.h"
+#include "selectiveScan/bmmchunk.h"
+#include "selectiveScan/chunkcumsum.h"
+#include "selectiveScan/chunkscan.h"
+#include "selectiveScan/chunkstate.h"
+#include "selectiveScan/statepassing.h"
 
 namespace tensorrt_llm
 {
@@ -336,7 +338,7 @@ void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream)
 }
 
 template <typename input_t, typename weight_t>
-void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
+void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper* driver)
 {
     int B = params.batch;
     int L = params.max_seqlen;
@@ -346,92 +348,93 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream)
     int N = params.dstate;
     int Q = params.chunk_size;
 
+    int numTokens = params.num_tokens;
+
     bool dtsp = params.delta_softplus;
 
-    if constexpr (std::is_same_v<input_t, half>)
+    bool hopper = tensorrt_llm::common::getSMVersion() >= 90;
+
+    CudaType tp, wt;
+
+    if (std::is_same_v<input_t, half>)
+        tp = CT_FP16;
+    else if (std::is_same_v<input_t, __nv_bfloat16>)
+        tp = CT_BF16;
+    else
+        return;
+
+    if (std::is_same_v<weight_t, float>)
+        wt = CT_FP32;
+    else if (std::is_same_v<weight_t, input_t>)
+        wt = tp;
+    else
+        return;
+
+    dim3 bds[5], tds[5];
+    int shms[5], useTmas[5];
+    CUtensorMap descs_host[8];
+
+    ChunkCumsumKernelFunc chunk_cumsum
+        = getChunkCumsumKernel(B, L, H, P, G, N, Q, numTokens, &bds[0], &tds[0], &shms[0], tp, wt);
+    ChunkStateKernelFunc chunk_state = getChunkStateKernel(
+        B, L, H, P, G, N, Q, numTokens, hopper, driver, &bds[1], &tds[1], &shms[1], &useTmas[1], &descs_host[0], tp);
+    StatePassingKernelFunc state_passing
+        = getStatePassingKernel(B, L, H, P, G, N, Q, numTokens, &bds[2], &tds[2], &shms[2], tp);
+    BmmChunkKernelFunc bmm_chunk = getBmmChunkKernel(
+        B, L, H, P, G, N, Q, numTokens, hopper, driver, &bds[3], &tds[3], &shms[3], &useTmas[3], &descs_host[2], tp);
+    ChunkScanKernelFunc chunk_scan = getChunkScanKernel(B, L, H, P, G, N, Q, numTokens, hopper, driver, &bds[4],
+        &tds[4], &shms[4], &useTmas[4], &descs_host[4], tp, wt);
+
+    void* mxY = params.out_ptr;
+    void* mxOs = params.Os_ptr;
+    void* mxFs = params.x_ptr;
+    void* mxSt = params.St_ptr;
+    void* mxdc = params.dc_ptr;
+    void* mxdA = params.dA_ptr;
+    void const* mxdt = params.delta_ptr;
+    void const* mxdb = params.delta_bias_ptr;
+    void const* mxA = params.A_ptr;
+    void* mxCB = params.CB_ptr;
+    void const* mxD = params.D_ptr;
+    void const* mxXBC = params.u_ptr;
+    void const* mxZ = params.z_ptr;
+
+    if (useTmas[1] || useTmas[3] || useTmas[4])
     {
-        dim3 bds[5], tds[5];
-        int shms[5];
+        // chunk_state
+        *(void**) &descs_host[0] = (input_t*) mxXBC + H * P; // B
+        *(void**) &descs_host[1] = (input_t*) mxXBC;         // X
+        // bmm_chunk
+        *(void**) &descs_host[2] = (input_t*) mxXBC + H * P + G * N; // C
+        *(void**) &descs_host[3] = (input_t*) mxXBC + H * P;         // B
+        // chunk_scan
+        *(void**) &descs_host[4] = (input_t*) mxXBC + H * P + G * N; // C
+        *(void**) &descs_host[5] = (input_t*) mxOs;
+        *(void**) &descs_host[6] = (input_t*) mxCB;
+        *(void**) &descs_host[7] = (input_t*) mxXBC; // X
 
-        ChunkCumsumKernelFuncFp16 chunk_cumsum = getChunkCumsumKernelFp16(B, L, H, Q, dtsp, &bds[0], &tds[0], &shms[0]);
-        ChunkStateKernelFuncFp16 chunk_state = getChunkStateKernelFp16(B, L, H, P, G, N, Q, &bds[1], &tds[1], &shms[1]);
-        StatePassingKernelFuncFp16 state_passing
-            = getStatePassingKernelFp16(B, L, H, P, N, Q, &bds[2], &tds[2], &shms[2]);
-        BmmChunkKernelFuncFp16 bmm_chunk = getBmmChunkKernelFp16(B, L, G, N, Q, &bds[3], &tds[3], &shms[3]);
-        ChunkScanKernelFuncFp16 chunk_scan = getChunkScanKernelFp16(B, L, H, P, G, N, Q, &bds[4], &tds[4], &shms[4]);
-
-        half* mxY = (half*) params.out_ptr;
-        half* mxOs = (half*) params.Os_ptr;
-        half* mxFs = (half*) params.x_ptr;
-        float* mxSt = (float*) params.St_ptr;
-        float* mxdc = (float*) params.dc_ptr;
-        float* mxdA = (float*) params.dA_ptr;
-        half const* mxdt = (half const*) params.delta_ptr;
-        float const* mxdb = (float const*) params.delta_bias_ptr;
-        float const* mxA = (float const*) params.A_ptr;
-        half* mxCB = (half*) params.CB_ptr;
-        float const* mxD = (float const*) params.D_ptr;
-        half const* mxXBC = (half const*) params.u_ptr;
-        half const* mxZ = (half const*) params.z_ptr;
-
-        auto rp = params.remove_padding;
-        auto ltip = params.last_token_ids_ptr;
-        auto ssmp = params.slot_mapping_ptr;
-
-        cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
-        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, P, G, N, mxdc, mxdA, mxdt, mxdb, mxA, mxZ, rp, ltip);
-        cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
-        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxXBC, rp, ltip);
-        cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
-        state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
-        cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
-        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, H, P, G, N, mxCB, mxXBC, rp, ltip);
-        cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
-        chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
-            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxD, mxXBC, mxZ, rp, ltip);
+        cudaMemcpy(params.desc_ptr, descs_host, sizeof(CUtensorMap) * 8, cudaMemcpyHostToDevice);
     }
-    else if constexpr (std::is_same_v<input_t, __nv_bfloat16>)
-    {
-        dim3 bds[5], tds[5];
-        int shms[5];
 
-        ChunkCumsumKernelFuncBf16 chunk_cumsum = getChunkCumsumKernelBf16(B, L, H, Q, dtsp, &bds[0], &tds[0], &shms[0]);
-        ChunkStateKernelFuncBf16 chunk_state = getChunkStateKernelBf16(B, L, H, P, G, N, Q, &bds[1], &tds[1], &shms[1]);
-        StatePassingKernelFuncBf16 state_passing
-            = getStatePassingKernelBf16(B, L, H, P, N, Q, &bds[2], &tds[2], &shms[2]);
-        BmmChunkKernelFuncBf16 bmm_chunk = getBmmChunkKernelBf16(B, L, G, N, Q, &bds[3], &tds[3], &shms[3]);
-        ChunkScanKernelFuncBf16 chunk_scan = getChunkScanKernelBf16(B, L, H, P, G, N, Q, &bds[4], &tds[4], &shms[4]);
+    CUtensorMap* descs = (CUtensorMap*) params.desc_ptr;
 
-        __nv_bfloat16* mxY = (__nv_bfloat16*) params.out_ptr;
-        __nv_bfloat16* mxOs = (__nv_bfloat16*) params.Os_ptr;
-        __nv_bfloat16* mxFs = (__nv_bfloat16*) params.x_ptr;
-        float* mxSt = (float*) params.St_ptr;
-        float* mxdc = (float*) params.dc_ptr;
-        float* mxdA = (float*) params.dA_ptr;
-        __nv_bfloat16 const* mxdt = (__nv_bfloat16 const*) params.delta_ptr;
-        float const* mxdb = (float const*) params.delta_bias_ptr;
-        float const* mxA = (float const*) params.A_ptr;
-        __nv_bfloat16* mxCB = (__nv_bfloat16*) params.CB_ptr;
-        float const* mxD = (float const*) params.D_ptr;
-        __nv_bfloat16 const* mxXBC = (__nv_bfloat16 const*) params.u_ptr;
-        __nv_bfloat16 const* mxZ = (__nv_bfloat16 const*) params.z_ptr;
+    auto rp = params.remove_padding;
+    auto ltip = params.last_token_ids_ptr;
+    auto ssmp = params.slot_mapping_ptr;
 
-        auto rp = params.remove_padding;
-        auto ltip = params.last_token_ids_ptr;
-        auto ssmp = params.slot_mapping_ptr;
-
-        cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
-        chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(B, L, H, P, G, N, mxdc, mxdA, mxdt, mxdb, mxA, mxZ, rp, ltip);
-        cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
-        chunk_state<<<bds[1], tds[1], shms[1], stream>>>(B, L, H, P, G, N, mxSt, mxdc, mxdA, mxXBC, rp, ltip);
-        cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
-        state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
-        cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
-        bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, H, P, G, N, mxCB, mxXBC, rp, ltip);
-        cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
-        chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
-            B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxD, mxXBC, mxZ, rp, ltip);
-    }
+    cudaFuncSetAttribute(chunk_cumsum, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[0]);
+    chunk_cumsum<<<bds[0], tds[0], shms[0], stream>>>(
+        B, L, H, P, G, N, mxdc, mxdA, mxdt, mxdb, mxA, mxZ, rp, ltip, dtsp);
+    cudaFuncSetAttribute(chunk_state, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[1]);
+    chunk_state<<<bds[1], tds[1], shms[1], stream>>>(
+        B, L, H, P, G, N, mxSt, mxdc, mxdA, (useTmas[1] ? &descs[0] : mxXBC), rp, ltip);
+    cudaFuncSetAttribute(state_passing, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[2]);
+    state_passing<<<bds[2], tds[2], shms[2], stream>>>(B, L, H, P, G, N, mxOs, mxFs, mxSt, mxdA, rp, ltip, ssmp);
+    cudaFuncSetAttribute(bmm_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[3]);
+    bmm_chunk<<<bds[3], tds[3], shms[3], stream>>>(B, L, H, P, G, N, mxCB, (useTmas[3] ? &descs[2] : mxXBC), rp, ltip);
+    cudaFuncSetAttribute(chunk_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, shms[4]);
+    chunk_scan<<<bds[4], tds[4], shms[4], stream>>>(
+        B, L, H, P, G, N, mxY, mxOs, mxdc, mxdA, mxCB, mxD, (useTmas[4] ? &descs[4] : mxXBC), mxZ, rp, ltip);
 }
 
 #define INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(input_t, weight_t)                                                        \
@@ -445,7 +448,8 @@ INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE(__nv_bfloat16, float);
 #undef INSTANTIATE_SELECTIVE_SCAN_DATA_TYPE
 
 #define INSTANTIATE_CHUNK_SCAN_DATA_TYPE(input_t, weight_t)                                                            \
-    template void invokeChunkScan<input_t, weight_t>(SSMParamsBase & params, cudaStream_t stream);
+    template void invokeChunkScan<input_t, weight_t>(                                                                  \
+        SSMParamsBase & params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper * driver);
 
 INSTANTIATE_CHUNK_SCAN_DATA_TYPE(float, float);
 INSTANTIATE_CHUNK_SCAN_DATA_TYPE(half, float);

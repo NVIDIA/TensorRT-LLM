@@ -840,9 +840,12 @@ class TestFunctional(unittest.TestCase):
             perf_knob_tensor_size = 16
             generation_host_runtime_perf_knobs = torch.tensor(
                 [-1] * perf_knob_tensor_size, dtype=torch.int64, device='cpu')
+
             if enable_multi_block_mmha:
+                generation_host_runtime_perf_knobs[0] = 1  # multi_block_mode
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 generation_host_runtime_perf_knobs[
-                    0] = 1  # enable multi_block_mode
+                    1] = 1  # enable_context_fmha_fp32_acc
 
             local_shape_dict = {
                 'input': (total_num_tokens, hidden_size),

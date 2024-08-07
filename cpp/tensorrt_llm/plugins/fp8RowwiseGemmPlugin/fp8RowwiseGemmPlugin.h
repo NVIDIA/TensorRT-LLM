@@ -16,7 +16,7 @@
  */
 #pragma once
 
-#include "tensorrt_llm/kernels/cutlass_kernels/fbgemm_gpu/fp8_rowwise_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>

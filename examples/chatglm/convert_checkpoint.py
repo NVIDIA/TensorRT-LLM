@@ -27,7 +27,7 @@ def parse_arguments():
     parser.add_argument(
         '--chatglm_version',
         default=None,
-        choices=[None, 'glm', 'chatglm', 'chatglm2', 'chatglm3'],
+        choices=[None, 'glm', 'chatglm', 'chatglm2', 'chatglm3', 'glm-4'],
         help=
         "By default the script will try to infer the chatglm_version from model_dir. "
         "Or users may overwrite chatglm_version by explicitly passing the version."
@@ -149,11 +149,13 @@ def load_chatglm_config(model_dir: str,
 
     if chatglm_version is None:
         print("Inferring chatglm version from path...")
-        for v in ['chatglm3', 'chatglm2', 'chatglm', 'glm']:
+        for v in ['glm-4', 'chatglm3', 'chatglm2', 'chatglm', 'glm']:
             if v in config._name_or_path:
                 chatglm_version = v
                 break
-    assert chatglm_version in ['glm', 'chatglm', 'chatglm2', 'chatglm3']
+    assert chatglm_version in [
+        'glm', 'chatglm', 'chatglm2', 'chatglm3', 'glm-4'
+    ]
     print(f"Chatglm version: {chatglm_version}")
     if chatglm_version == 'glm':
         config.num_kv_heads = config.num_attention_heads
@@ -710,7 +712,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
     for l in layers_range:
         if chatglm_version in ['glm', 'chatglm']:
             prefix = f'transformer.layers.{l}'
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
+        elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
             prefix = f'transformer.encoder.layers.{l}'
         tllm_prex = f'transformer.layers.{l-layers_range[0]}'
 
@@ -719,7 +721,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
             qkv_weight, qkv_bias = get_weight_and_bias(
                 model_params, f'{prefix}.attention.query_key_value', dtype)
             qkv_act_range = act_range.get(f'{prefix}.attention.query_key_value')
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
+        elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
             qkv_weight, qkv_bias = get_weight_and_bias(
                 model_params, f'{prefix}.self_attention.query_key_value', dtype)
             qkv_act_range = act_range.get(
@@ -866,7 +868,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
                                      mapping.tp_rank,
                                      dim=0)
                     weights[f'{tllm_prex}.mlp.fc.bias'] = mlp_fc_b
-            elif chatglm_version in ['chatglm2', 'chatglm3']:
+            elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
                 if mlp_fc_bias is not None:
                     mlp_fc_b = swap_and_split_mlp(mlp_fc_bias, mapping.tp_size,
                                                   mapping.tp_rank)
@@ -884,7 +886,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
                                      mapping.tp_size,
                                      mapping.tp_rank,
                                      dim=0)
-            elif chatglm_version in ['chatglm2', 'chatglm3']:
+            elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
                 mlp_fc_w = swap_and_split_mlp(mlp_fc_weight, mapping.tp_size,
                                               mapping.tp_rank)
                 if mlp_fc_bias is None:
@@ -966,7 +968,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
         elif chatglm_version == 'chatglm':
             embed_w = get_weight(model_params, 'transformer.word_embeddings',
                                  dtype)
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
+        elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
             embed_w = get_weight(model_params,
                                  'transformer.embedding.word_embeddings', dtype)
 
@@ -985,7 +987,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
             lm_head_weight = get_weight(model_params,
                                         'transformer.word_embeddings',
                                         dtype).clone()
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
+        elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
             lm_head_weight = get_weight(model_params,
                                         'transformer.output_layer', dtype)
             assert not share_embedding_table
@@ -1000,7 +1002,7 @@ def convert_hf_chatglm(hf_model: AutoModel,
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,
                                                  'transformer.final_layernorm',
                                                  dtype)
-        elif chatglm_version in ['chatglm2', 'chatglm3']:
+        elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
             ln_f_w, ln_f_b = get_weight_and_bias(
                 model_params, 'transformer.encoder.final_layernorm', dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -1031,7 +1033,7 @@ if __name__ == '__main__':
         position_embedding_type = 'learned_absolute'
     elif chatglm_version == 'chatglm':
         position_embedding_type = 'chatglm'
-    elif chatglm_version in ['chatglm2', 'chatglm3']:
+    elif chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
         position_embedding_type = 'rope_gptj'
 
     rotary_base = 10000.0

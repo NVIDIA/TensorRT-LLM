@@ -17,6 +17,8 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
       - [Run with Triton Backend](#run-with-triton-backend)
       - [Run Python runtime](#run-python-runtime)
     - [Benchmark](#benchmark)
+      - [Benchmark C++ runtime](#benchmark-c-runtime)
+      - [Benchmark Python runtime](#benchmark-python-runtime)
     - [Run BART with LoRA](#run-bart-with-lora)
     - [Reminders](#reminders)
     - [Attention Scaling Factors](#attention-scaling-factors)
@@ -97,6 +99,8 @@ We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 * When `X < Y`, both TP and PP are enabled. In such case, please make sure you have completed weight conversion step for `TP=X`.
 
 The default value of `--max_input_len` is 1024. When building DecoderModel, specify decoder input length with `--max_input_len=1` for encoder-decoder model to start generation from decoder_start_token_id of length 1. If the start token is a single token (the default behavior of T5/BART/etc.), you should set `--max_input_len` as 1; if you want the decoder-only type of generation, set `--max_input_len` above 1 to get similar behavior as HF's `decoder_forced_input_ids`.
+
+EncoderModel does not generate prompt. `--max_seq_len` should be the same as `--max_input_len`. `--max_seq_len` would be set as `--max_input_len` if not specified.
 
 DecoderModel takes `--max_encoder_input_len` and `--max_input_len` as model inputs, `--max_encoder_input_len` is set to 1024 as default since `--max_input_len` is 1024 for EncoderModel.
 
@@ -233,6 +237,12 @@ mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt
 ```
 
 ### Benchmark
+
+#### Benchmark C++ runtime
+
+The tutorial for encoder-decoder C++ runtime benchmark can be found in [`benchmarks/cpp`](../../benchmarks/cpp/README.md#2-launch-c-benchmarking-inflightv1-batching)
+
+#### Benchmark Python runtime
 
 The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
 

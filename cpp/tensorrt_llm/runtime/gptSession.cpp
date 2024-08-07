@@ -21,7 +21,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/gptDecoderBatch.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
@@ -169,7 +169,7 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(
+            mDecoders.emplace_back(std::make_shared<GptDecoderBatched>(
                 vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
         }
         else
@@ -178,7 +178,7 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
         }
         constexpr SizeType32 maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, /* fusedDecoder*/ false, logitsType, mModelConfig);
+            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -298,7 +298,7 @@ void GptSession::setup(Config const& sessionConfig)
 
     // Store this param related to decoder buffer size and kv cache manager to check against
     // the input shape with the params given in generate().
-    // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
+    // GptDecoderBatched does not resize buffers, but allows smaller batchSize and beamWidth.
     // TODO refactor batch manager to remove dependency on maxSequenceLength.
     mDecoderMaxSequenceLength = maxSequenceLength;
     mDecoderMaxAttentionWindow = maxAttentionWindow;
@@ -821,7 +821,7 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
         // TODO(micro batching) use mCommStream?
         if (beamWidth > 1)
         {
-            finalize(microBatchId);
+            finalize(microBatchId, samplingConfig);
         }
         else if (!mWorldConfig.isPipelineParallel())
         {
@@ -1143,7 +1143,7 @@ bool GptSession::shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, Size
     return nbFinished == batchSize * beamWidth;
 }
 
-void GptSession::finalize(SizeType32 microBatchId)
+void GptSession::finalize(SizeType32 microBatchId, SamplingConfig const& samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mRuntime->getBufferManager();
@@ -1161,7 +1161,7 @@ void GptSession::finalize(SizeType32 microBatchId)
         if (mWorldConfig.isLastPipelineParallelRank())
         {                                               // send ids from last to first
             auto& decoder = mDecoders.at(microBatchId); // only the last rank has the decoder
-            decoder->finalize();
+            decoder->finalize(samplingConfig);
             auto finalOutputIds = decoder->getOutputIds();
 
             auto const peer = pipelineGroup.front();
@@ -1200,7 +1200,7 @@ void GptSession::finalize(SizeType32 microBatchId)
     else
     {
         auto& decoder = mDecoders.at(microBatchId); // all ranks have the decoder
-        decoder->finalize();
+        decoder->finalize(samplingConfig);
         auto finalOutputIds = decoder->getOutputIds();
         manager.copy(*finalOutputIds, *outputIds);
         if (cumLogProbs)
