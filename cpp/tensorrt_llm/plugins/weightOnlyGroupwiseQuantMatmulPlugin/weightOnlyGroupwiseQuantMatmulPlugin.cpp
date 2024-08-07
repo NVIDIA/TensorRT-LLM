@@ -68,7 +68,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
         biasesPtr = nullptr;
     }
 
-    int const wsSize = mRunner->getWorkspaceSize(m, n, k);
+    int const wsSize = mRunner->getWorkspaceSize(m, originalN, k);
 
     mRunner->gemm(actPtr, weightPtr, inputScalesPtr, zerosPtr, biasesPtr, outputPtr, m, originalN, k, mGroupSize,
         tactic, workspacePtr, wsSize, stream);
@@ -85,7 +85,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(size_t maxM, siz
         k * originalN * sizeof(half) / mGroupSize, // zeros
         maxM * sizeof(half),                       // biases
         maxM * originalN * sizeof(half),           // C
-        mRunner->getWorkspaceSize(maxM, n, k)      // workspace
+        mRunner->getWorkspaceSize(maxM, originalN, k)      // workspace
     };
     size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
     setTmpWorkspaceSizeInBytes(bytes);
@@ -446,7 +446,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
     }
     else
     {
-        int const ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, n, k);
+        int const ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, real_n, k);
 
         int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<int32_t const*>(inputs[mWeightInputIdx]));
 
