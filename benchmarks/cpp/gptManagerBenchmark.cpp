@@ -157,6 +157,7 @@ struct BenchmarkParams
     std::optional<int> maxAttentionWindow{std::nullopt};
     std::optional<int> sinkTokenLength{std::nullopt};
     bool multiBlockMode{false};
+    bool enableContextFMHAFP32Acc{false};
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
@@ -806,6 +807,8 @@ public:
             benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
+        texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(
+            benchmarkParams.multiBlockMode, benchmarkParams.enableContextFMHAFP32Acc);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
@@ -824,7 +827,7 @@ public:
         executorConfig.setDecodingConfig(texec::DecodingConfig(
             benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
             std::nullopt, benchmarkParams.medusaChoices));
-        executorConfig.setMultiBlockMode(benchmarkParams.multiBlockMode);
+        executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
 
         if (executorModelType == texec::ModelType::kDECODER_ONLY)
         {
@@ -1429,7 +1432,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.decodingConfig = texec::DecodingConfig(
         benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
         std::nullopt, benchmarkParams.medusaChoices);
-    optionalParams.multiBlockMode = benchmarkParams.multiBlockMode;
+    optionalParams.extendedRuntimePerfKnobConfig = texec::ExtendedRuntimePerfKnobConfig(
+        benchmarkParams.multiBlockMode, benchmarkParams.enableContextFMHAFP32Acc);
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
     auto const worldConfig = WorldConfig::mpi(jsonConfig.getGpusPerNode(), jsonConfig.getTensorParallelism(),
@@ -1891,6 +1895,9 @@ int main(int argc, char* argv[])
     options.add_options()(
         "encoder_engine_dir", "Directory that store the engines of the encoder models.", cxxopts::value<std::string>());
 
+    options.add_options()("enable_context_fmha_fp32_acc", "Enable FMHA runner FP32 accumulation",
+        cxxopts::value<bool>()->default_value("false"));
+
     auto result = options.parse(argc, argv);
 
     if (result.count("help"))
@@ -2050,6 +2057,9 @@ int main(int argc, char* argv[])
 
     // Argument: multi_block_mode
     benchmarkParams.multiBlockMode = result["multi_block_mode"].as<bool>();
+
+    // Argument: enable_context_fmha_fp32_acc
+    benchmarkParams.enableContextFMHAFP32Acc = result["enable_context_fmha_fp32_acc"].as<bool>();
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

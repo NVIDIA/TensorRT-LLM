@@ -4,7 +4,7 @@
 
 ```{note}
 The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.10.0) for the most stable experience.
+We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.12.0) for the most stable experience.
 ```
 
 **Prerequisites**
@@ -30,7 +30,7 @@ We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-L
             1. Select **Add python.exe to PATH** at the start of the installation. The installation may only add the `python` command, but not the `python3` command.
             2. Navigate to the installation path `%USERPROFILE%\AppData\Local\Programs\Python\Python310` (`AppData` is a hidden folder) and copy `python.exe` to `python3.exe`.
 
-        2. Install [CUDA 12.4.1 Toolkit](https://developer.nvidia.com/cuda-12-4-1-download-archive?target_os=Windows&target_arch=x86_64). Use the Express Installation option. Installation may require a restart.
+        2. Install [CUDA 12.5.1 Toolkit](https://developer.nvidia.com/cuda-12-5-1-download-archive?target_os=Windows&target_arch=x86_64). Use the Express Installation option. Installation may require a restart.
 
 
 **Steps**
@@ -47,7 +47,7 @@ We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.10.0 --extra-index-url https://pypi.nvidia.com
+  pip install tensorrt_llm==0.12.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/cu121/torch/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.

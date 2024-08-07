@@ -3,7 +3,7 @@ from enum import Enum, auto
 import numpy as np
 import torch
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.quantization import QuantMode
 
 from ..plugin_node import PluginNode
@@ -15,6 +15,7 @@ class IdxEntry(Enum):
     QKV_TENSOR = auto()
     K_TENSOR = auto()
     V_TENSOR = auto()
+    CONTEXT_FMHA_CUSTOM_MASK = auto()
     SEQUENCE_LENGTH = auto()
     HOST_PAST_KEY_VALUE_LENGTHS = auto()
     HOST_MAX_ATTENTION_WINDOW = auto()
@@ -28,6 +29,7 @@ class IdxEntry(Enum):
     PAST_KEY_VALUE = auto()
     KV_CACHE_QUANTIZATION_SCALE = auto()
     KV_CACHE_DEQUANTIZATION_SCALE = auto()
+    ATTENTION_OUTPUT_QUANTIZATION_SCALE = auto()
     ROTARY_INV_FREQ = auto()
     ROTARY_COS_SIN = auto()
     ALIBI_SLOPES = auto()
@@ -49,6 +51,10 @@ class IdxEntryParser:
         self.num_kv_heads = plugin_info.pfc_as_list['num_kv_heads'][0]
         self.unfuse_qkv_gemm = bool(
             plugin_info.pfc_as_list['unfuse_qkv_gemm'][0])
+        self.use_fp8_context_fmha = bool(
+            plugin_info.pfc_as_list['use_fp8_context_fmha'][0])
+        self.mask_type = AttentionMaskType(
+            plugin_info.pfc_as_list['mask_type'][0])
         self.use_cache = bool(plugin_info.pfc_as_list['use_cache'][0])
         self.paged_kv_cache = bool(plugin_info.pfc_as_list['paged_kv_cache'][0])
         self.do_cross_attention = bool(
@@ -73,6 +79,8 @@ class IdxEntryParser:
             return self.unfuse_qkv_gemm
         elif entry == IdxEntry.V_TENSOR:
             return self.unfuse_qkv_gemm
+        elif entry == IdxEntry.CONTEXT_FMHA_CUSTOM_MASK:
+            return self.mask_type == AttentionMaskType.custom_mask
         elif entry == IdxEntry.SEQUENCE_LENGTH:
             return self.use_cache
         elif entry == IdxEntry.HOST_PAST_KEY_VALUE_LENGTHS:
@@ -100,6 +108,9 @@ class IdxEntryParser:
             )
         elif entry == IdxEntry.KV_CACHE_DEQUANTIZATION_SCALE:
             return self.use_cache and self.kv_cache_quant_mode.has_kv_cache_quant(
+            )
+        elif entry == IdxEntry.ATTENTION_OUTPUT_QUANTIZATION_SCALE:
+            return self.use_fp8_context_fmha and self.kv_cache_quant_mode.has_fp8_qdp(
             )
         elif entry == IdxEntry.ROTARY_INV_FREQ:
             return self.position_embedding_type.is_rope()

@@ -257,7 +257,9 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
+    context_attention_src
     decoder_attention_src
+    selective_scan_src
     fpA_intB_gemm_src
     moe_gemm_src
     fb_gemm_src

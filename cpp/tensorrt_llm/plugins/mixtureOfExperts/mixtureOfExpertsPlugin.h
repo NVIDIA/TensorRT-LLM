@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include <cassert>
 #include <set>
 #include <string>
@@ -45,21 +46,23 @@ struct GemmIDMoe
     nvinfer1::DataType dtype{};
     nvinfer1::DataType wdtype{};
     tensorrt_llm::common::QuantMode quant_mode;
+    bool determinism_mode = false;
 
     bool operator==(GemmIDMoe const& id) const
     {
         return id.gemm_idx == gemm_idx && id.num_experts == num_experts && id.moe_k == moe_k
             && id.parallelism_config == parallelism_config && id.hidden == hidden && id.inter == inter
-            && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.quant_mode == quant_mode;
+            && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.quant_mode == quant_mode
+            && id.determinism_mode == determinism_mode;
     }
 
     friend std::ostream& operator<<(std::ostream& out, GemmIDMoe const& id)
     {
         out << "gemm idx, experts, k, parallelism_config, hidden, inter, actfn, dtype, weight "
-               "type, parallelism mode="
+               "type, parallelism mode, determinism mode="
             << id.gemm_idx << "," << id.num_experts << "," << id.moe_k << "," << id.parallelism_config << ","
             << id.hidden << "," << id.inter << "," << static_cast<int>(id.actfn) << "," << static_cast<int>(id.dtype)
-            << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value();
+            << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << "," << id.determinism_mode;
         return out;
     }
 };
@@ -97,7 +100,7 @@ public:
         tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
         nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias,
         int tp_size, int tp_rank, int ep_size, int ep_rank, MOEExpertScaleNormalizationMode normalization_mode,
-        MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
+        bool force_determinism, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
 
@@ -157,6 +160,7 @@ private:
     MOEExpertScaleNormalizationMode mNormalizationMode{};
 
     GemmDims mDims{};
+    bool mUseDeterministicKernels = false;
 
     GemmIDMoe mGemmId1{};
     GemmIDMoe mGemmId2{};
@@ -164,7 +168,7 @@ private:
     MixtureOfExpertsPluginProfilerPtr mGemmProfiler;
 
     // The below are not serialised
-    const std::string mLayerName{};
+    std::string const mLayerName{};
     std::string mNamespace{};
 
     struct WorkspaceInfo

@@ -127,6 +127,13 @@ def main(args):
     if args.stop_words:
         stop_words_list = tensorrt_llm.runtime.decode_words_list(
             args.stop_words, tokenizer)
+    if model_version == 'glm-4':  # adddefault stop token ids for GLM-4
+        glm4_stop_ids = [[151329], [151336], [151338]]
+        if stop_words_list is None:
+            stop_words_list = [glm4_stop_ids] * args.batch_size
+        else:
+            for req_stop_words_list in stop_words_list:
+                req_stop_words_list.extend(glm4_stop_ids)
 
     bad_words_list = None
     if args.bad_words:
@@ -446,6 +453,8 @@ def main(args):
                 kv_cache_free_gpu_memory_fraction,
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode)
+        runner_kwargs.update(
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"

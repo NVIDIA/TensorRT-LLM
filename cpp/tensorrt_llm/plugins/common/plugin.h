@@ -147,7 +147,7 @@ public:
 };
 
 // for testing only
-void* getCommSessionHandle();
+void const* getCommSessionHandle();
 } // namespace tensorrt_llm::plugins
 
 inline bool isBuilding()

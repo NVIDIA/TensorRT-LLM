@@ -21,6 +21,7 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
 add_library(
   th_common SHARED
   dynamicDecodeOp.cpp
+  fmhaPackMaskOp.cpp
   weightOnlyQuantOp.cpp
   gatherTreeOp.cpp
   fp8Op.cpp

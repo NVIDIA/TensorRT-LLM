@@ -397,9 +397,7 @@ class Builder():
         tik = time.time()
         engine = self.trt_builder.build_serialized_network(
             network.trt_network, builder_config.trt_builder_config)
-        if engine is None:
-            logger.error('Engine building failed, please check the error log.')
-            return None
+        assert engine is not None, 'Engine building failed, please check the error log.'
 
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -717,6 +715,14 @@ def _init_max_seq_len(model_config, build_config):
                                            1.0) if rotary_type != 'su' else 1
     else:
         rotary_factor = 1
+
+    if model_config.architecture == "EncoderModel":
+        if build_config.max_seq_len is None:
+            build_config.max_seq_len = build_config.max_input_len
+            logger.info(
+                f'max_seq_len is not specified for EncoderModel, using --max_input_len.'
+            )
+        assert build_config.max_input_len == build_config.max_seq_len, f"EncoderModel should have same --max_input_len ({build_config.max_input_len}) and --max_seq_len ({build_config.max_seq_len})."
 
     if build_config.max_seq_len is None:
         # Step 1: Find the upper bound of max_seq_len

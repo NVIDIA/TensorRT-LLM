@@ -114,7 +114,9 @@ class LLaMAConfig(PretrainedConfig):
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
-        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        head_dim = getattr(
+            hf_config, "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads)
         head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = hf_config.hidden_act
         attn_bias = getattr(hf_config, 'bias', False) or getattr(

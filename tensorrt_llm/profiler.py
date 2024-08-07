@@ -223,7 +223,7 @@ def check_gpt_mem_usage(engine, kv_dtype, use_gpt_attention_plugin,
     try:
         cuda_engine = runtime.deserialize_cuda_engine(engine)
         assert cuda_engine is not None
-        activation_size = cuda_engine.device_memory_size / 1024 / 1024
+        activation_size = cuda_engine.device_memory_size_v2 / 1024 / 1024
         del cuda_engine
     except Exception:
         logger.warning(

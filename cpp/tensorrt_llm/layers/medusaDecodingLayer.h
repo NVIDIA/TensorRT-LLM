@@ -64,7 +64,7 @@ private:
     runtime::SizeType32 mRuntimeMaxTopKPerRequestPerMedusaHead{0};
 
     TensorPtr mCurandStatesDevice;
-    TensorPtr mSetupWorkspaceDevice;
+    BufferPtr mSetupWorkspaceDevice;
     BufferPtr mSamplingWorkspaceDevice;
     TensorPtr mRuntimeTopKDevice;
     TensorPtr mTargetTokensDevice;

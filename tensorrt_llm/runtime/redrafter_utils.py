@@ -316,15 +316,17 @@ def redrafter_prepare_random_tensors(session, batch_size, initialize=False):
             random_seed = torch.full([batch_size],
                                      REDRAFTER_DEFAULT_SEED,
                                      dtype=torch.int64)
-        session.saved_rng_states = []
+        session.saved_rng_states = [None] * batch_size
     for b in range(batch_size):
         if initialize:  # context phase
-            torch.manual_seed(random_seed[b].item())
+            torch.cuda.manual_seed(random_seed[b].item())
         else:  # generation phase
             assert session.saved_rng_states is not None, "Couldn't find random states."
-            torch.set_rng_state(session.saved_rng_states[b])
+            torch.cuda.set_rng_state(session.saved_rng_states[b],
+                                     session.device)
         rds, rdv = get_rand_tensors()
-        session.saved_rng_states.append(torch.get_rng_state())
+        session.saved_rng_states[b] = torch.cuda.get_rng_state(
+            device=session.device)
         rand_data_sample.append(rds)
         rand_data_validation.append(rdv)
     session.rand_data_sample = torch.concat(rand_data_sample, dim=0)

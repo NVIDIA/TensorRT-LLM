@@ -120,14 +120,14 @@ class Session(object):
 
     @property
     def context_mem_size(self) -> int:
-        return self.engine.device_memory_size
+        return self.engine.device_memory_size_v2
 
     def _print_engine_info(self):
         '''print engine info for debug purpose, internal use only.
         '''
         refittable = self.engine.refittable
         num_layers = self.engine.num_layers
-        device_memory_size = self.engine.device_memory_size
+        device_memory_size = self.engine.device_memory_size_v2
         name = self.engine.name
         nb_profiles = self.engine.num_optimization_profiles
         logger.info(
@@ -210,13 +210,12 @@ class Session(object):
 
         self._context = None
 
-        min = self.engine.minimum_weight_streaming_budget
+        min = 0
         max = self.engine.streamable_weights_size
-        budget = int(min + gpu_weights_percent * (max - min))
+        budget = int(gpu_weights_percent * max)
 
-        budget_config = budget if gpu_weights_percent != 1 else 0
-        self.engine.weight_streaming_budget = budget_config
-        assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
+        self.engine.weight_streaming_budget_v2 = budget
+        assert self.engine.weight_streaming_budget_v2 == budget, "Failed to set weight streaming budget!"
         logger.info(
             f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
         )

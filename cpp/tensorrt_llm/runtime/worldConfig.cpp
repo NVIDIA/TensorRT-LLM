@@ -123,7 +123,7 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
                 "Detect%s, please provide the full device list instead of limiting to single device, "
                 "otherwise allreduce performance may be sub-optimal "
                 "since custom allreduce kernel relies on P2P access to peer devices.",
-                envStr);
+                envStr.c_str());
         }
         gpusPerNode = 1;
     }

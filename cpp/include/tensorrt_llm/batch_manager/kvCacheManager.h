@@ -553,8 +553,15 @@ public:
 
     void addContextTokens(SizeType32 seqSlotIdx, SizeType32 numTokens);
 
+    /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     void addToken(SizeType32 seqSlotIdx);
 
+    /// @brief Add new request to the KV cache manager.
+    /// @param inputLength Input length for which KV cache need to be allocated.
+    /// @param beamWidth Beam width for which KV cache need to be allocated.
+    /// @param llmRequest Optional request to use for KV cache lookup.
+    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
+    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     void addSequence(SizeType32 seqSlotIdx, SizeType32 inputLength, SizeType32 beamWidth,
         std::shared_ptr<LlmRequest> const& llmRequest = nullptr);
 
@@ -603,6 +610,11 @@ public:
     {
         return mCacheType == CacheType::kCROSS;
     }
+
+    [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
+
+    [[nodiscard]] static SizeType32 getMaxAttentionWindowUpperBound(SizeType32 blocksInPrimaryPool,
+        SizeType32 tokensPerBlock, SizeType32 maxBeamWidth, SizeType32 sinkTokenLen, bool useOneMoreBlock);
 
 private:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 seqSlotIdx,

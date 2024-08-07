@@ -43,6 +43,7 @@ SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dtRank, int nH
     , mPagedState(pagedState)
     , mZEnabled(zEnabled)
     , mIsMamba2(isMamba2)
+    , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
 {
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (!mIsMamba2), "Pre SM 80 GPUs do not support Mamba2");
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
@@ -53,6 +54,7 @@ SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dtRank, int nH
 
 // Parameterized constructor
 SelectiveScanPlugin::SelectiveScanPlugin(void const* data, size_t length)
+    : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mDim);
@@ -137,7 +139,7 @@ size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
     if (!mIsMamba2)
         return 0;
 
-    int const NUM_BUFFERS = 5;
+    int const NUM_BUFFERS = 6;
     size_t workspaces[NUM_BUFFERS];
 
     if (mRemovePadding)
@@ -151,11 +153,12 @@ size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         int Q = mChunkSize;
         int BxC = (BxL + Q - 1) / Q + B;
 
-        workspaces[0] = BxC * H * N * P * 2; // g_mxOs_
-        workspaces[1] = BxC * H * N * P * 4; // g_mxSt_ in float
-        workspaces[2] = BxC * H * Q * 4;     // g_mxdc_ in float
-        workspaces[3] = BxC * H * Q * 4;     // g_mxdA_ in float
-        workspaces[4] = BxC * G * Q * Q * 2; // g_mxCB_
+        workspaces[0] = long(BxC) * H * N * P * 2; // g_mxOs_
+        workspaces[1] = long(BxC) * H * N * P * 4; // g_mxSt_ in float
+        workspaces[2] = long(BxC) * H * Q * 4;     // g_mxdc_ in float
+        workspaces[3] = long(BxC) * H * Q * 4;     // g_mxdA_ in float
+        workspaces[4] = long(BxC) * G * Q * Q * 2; // g_mxCB_
+        workspaces[5] = 1024;                      // TMA descs
     }
     else
     {
@@ -168,21 +171,22 @@ size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         int Q = mChunkSize;
         int C = (L + Q - 1) / Q;
 
-        workspaces[0] = B * C * H * N * P * 2; // g_mxOs_
-        workspaces[1] = B * C * H * N * P * 4; // g_mxSt_ in float
-        workspaces[2] = B * C * H * Q * 4;     // g_mxdc_ in float
-        workspaces[3] = B * C * H * Q * 4;     // g_mxdA_ in float
-        workspaces[4] = B * C * G * Q * Q * 2; // g_mxCB_
+        workspaces[0] = long(B * C) * H * N * P * 2; // g_mxOs_
+        workspaces[1] = long(B * C) * H * N * P * 4; // g_mxSt_ in float
+        workspaces[2] = long(B * C) * H * Q * 4;     // g_mxdc_ in float
+        workspaces[3] = long(B * C) * H * Q * 4;     // g_mxdA_ in float
+        workspaces[4] = long(B * C) * G * Q * Q * 2; // g_mxCB_
+        workspaces[5] = 1024;                        // TMA descs
     }
 
     return calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
 
 void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch, const size_t dim,
-    const size_t maxSeqLen, const size_t dstate, const size_t dtRank, const size_t nHeads, const size_t nGroups,
-    const size_t chunkSize, void* statePtr, void const* x, void const* delta, void const* deltaBias, void const* A,
-    void const* BC, void const* D, void const* z, void const* osPtr, void const* stPtr, void const* dcPtr,
-    void const* dAPtr, void const* cbPtr, int const* lastTokenIds, int const* slotMapping, void* out,
+    const size_t maxSeqLen, const size_t numTokens, const size_t dstate, const size_t dtRank, const size_t nHeads,
+    const size_t nGroups, const size_t chunkSize, void* statePtr, void const* x, void const* delta,
+    void const* deltaBias, void const* A, void const* BC, void const* D, void const* z, void* osPtr, void* stPtr,
+    void* dcPtr, void* dAPtr, void* cbPtr, void* descPtr, int const* lastTokenIds, int const* slotMapping, void* out,
     bool deltaSoftplus, bool removePadding)
 {
     // Reset the parameters
@@ -191,6 +195,7 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.batch = batch;
     params.dim = dim;
     params.max_seqlen = maxSeqLen;
+    params.num_tokens = numTokens;
     params.dstate = dstate;
     params.dt_rank = dtRank;
     params.nheads = nHeads;
@@ -211,11 +216,12 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.out_ptr = out;
     params.x_ptr = statePtr;
     params.z_ptr = const_cast<void*>(z);
-    params.Os_ptr = const_cast<void*>(osPtr);
-    params.St_ptr = const_cast<void*>(stPtr);
-    params.dc_ptr = const_cast<void*>(dcPtr);
-    params.dA_ptr = const_cast<void*>(dAPtr);
-    params.CB_ptr = const_cast<void*>(cbPtr);
+    params.Os_ptr = osPtr;
+    params.St_ptr = stPtr;
+    params.dc_ptr = dcPtr;
+    params.dA_ptr = dAPtr;
+    params.CB_ptr = cbPtr;
+    params.desc_ptr = descPtr;
     params.last_token_ids_ptr = lastTokenIds;
     params.slot_mapping_ptr = slotMapping;
 }
@@ -276,6 +282,7 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     float* mxdc = nullptr;
     float* mxdA = nullptr;
     T* mxCB = nullptr;
+    void* descs = nullptr;
 
     if (!mIsMamba2 || reqTypes[0] == RequestType::kGENERATION) /* no workspace needed */
         ;
@@ -290,11 +297,12 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         int Q = mChunkSize;
         int BxC = (BxL + Q - 1) / Q + B;
 
-        mxOs = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, BxC * H * N * P * 2));
-        mxSt = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, BxC * H * N * P * 4));
-        mxdc = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, BxC * H * Q * 4));
-        mxdA = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, BxC * H * Q * 4));
-        mxCB = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, BxC * G * Q * Q * 2));
+        mxOs = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * N * P * 2));
+        mxSt = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * N * P * 4));
+        mxdc = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * Q * 4));
+        mxdA = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * Q * 4));
+        mxCB = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * G * Q * Q * 2));
+        descs = nextWorkspacePtr(workspace_byte_ptr, offset, 1024);
     }
     else
     {
@@ -307,23 +315,28 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         int Q = mChunkSize;
         int C = (L + Q - 1) / Q;
 
-        mxOs = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, B * C * H * N * P * 2));
-        mxSt = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, B * C * H * N * P * 4));
-        mxdc = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, B * C * H * Q * 4));
-        mxdA = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, B * C * H * Q * 4));
-        mxCB = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, B * C * G * Q * Q * 2));
+        mxOs = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * N * P * 2));
+        mxSt = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * N * P * 4));
+        mxdc = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * Q * 4));
+        mxdA = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * Q * 4));
+        mxCB = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * G * Q * Q * 2));
+        descs = nextWorkspacePtr(workspace_byte_ptr, offset, 1024);
     }
 
-    setSSMParams(ssm_params, batch_size, mDim, max_seq_len, mDState, mDtRank, mNHeads, mNGroups, mChunkSize, statePtr,
-        inputs[getInputTensorIdx()], inputs[getDeltaIdx()], inputs[getDeltaBiasIdx()], inputs[getAIdx()],
-        inputs[getBCIdx()], inputs[getDIdx()], z, mxOs, mxSt, mxdc, mxdA, mxCB,
+    int numTokens = inputDesc[getInputTensorIdx()].dims.d[0];
+    if (!mRemovePadding)
+        numTokens *= inputDesc[getInputTensorIdx()].dims.d[1];
+
+    setSSMParams(ssm_params, batch_size, mDim, max_seq_len, numTokens, mDState, mDtRank, mNHeads, mNGroups, mChunkSize,
+        statePtr, inputs[getInputTensorIdx()], inputs[getDeltaIdx()], inputs[getDeltaBiasIdx()], inputs[getAIdx()],
+        inputs[getBCIdx()], inputs[getDIdx()], z, mxOs, mxSt, mxdc, mxdA, mxCB, descs,
         static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, outputs[0], mDeltaSoftplus, mRemovePadding);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {
         if (mIsMamba2)
         {
-            invokeChunkScan<T, float>(ssm_params, stream);
+            invokeChunkScan<T, float>(ssm_params, stream, mDriver.get());
         }
         else
         {

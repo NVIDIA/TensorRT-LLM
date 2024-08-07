@@ -154,8 +154,8 @@ def llm_end2end_tp2_cases():
     }, )
 
 
-@skip_single_gpu
 @parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
+@skip_single_gpu
 def test_llm_end2end_tp2(llm_additional_options):
     model_path = get_model_path(default_model_name)
 

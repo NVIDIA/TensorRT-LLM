@@ -259,10 +259,24 @@ public:
     static MpiComm const& world();
 
     //! \brief Corresponds to `world()` by default, but can be overridden per process.
-    static MpiComm& session();
+    static MpiComm const& session()
+    {
+        return mutableSession();
+    }
 
     //! \brief Returns the MPI local communicator.
-    static MpiComm& localSession();
+    static MpiComm const& localSession()
+    {
+        return mutableLocalSession();
+    }
+
+    static MpiComm const& setSession(MpiComm comm)
+    {
+        auto& session = mutableSession();
+        session = std::move(comm);
+        refreshLocalSession();
+        return session;
+    }
 
     [[nodiscard]] MpiComm split(int color, int key) const;
 
@@ -381,9 +395,19 @@ public:
     }
 
 private:
+    //! \brief Corresponds to `world()` by default, but can be overridden per process.
+    static MpiComm& mutableSession();
+
+    //! \brief Returns the MPI local communicator.
+    static MpiComm& mutableLocalSession();
+
+    static void refreshLocalSession();
+
     MPI_Comm mComm;
     bool mFreeComm;
 };
+
+std::vector<int> getWorldRanks(MpiComm const& comm);
 
 void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
 

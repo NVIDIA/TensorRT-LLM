@@ -74,16 +74,15 @@ void Fp8RowwiseGemmPluginProfiler::runTactic(int m, int n, int k, Fp8RowwiseGemm
     int8_t* wsBytePointer = reinterpret_cast<int8_t*>(workspace);
     void* aTmp = reinterpret_cast<void*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, m * k * bpeIn));
     void* bTmp = reinterpret_cast<void*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, n * k * bpeIn));
-    // void* cTmp = reinterpret_cast<void*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, m * n * bpeOut));
+    // void* cTmp = reinterpret_cast<void*>(nextWorkspacePtr(wsBytePointer, wsByteOffset,  n * bpeOut));
     void* dTmp = reinterpret_cast<void*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, m * n * bpeOut));
     float* scaleD0Tmp = reinterpret_cast<float*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, m * sizeof(float)));
     float* scaleD1Tmp = reinterpret_cast<float*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, n * sizeof(float)));
-    float* scaleOutTmp = reinterpret_cast<float*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, m * sizeof(float)));
     char* workspaceTmp = reinterpret_cast<char*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, wsSizeRunner));
 
     // Run profiling
-    mRunner->gemm(dTmp, aTmp, bTmp, nullptr, mQuantMode, m, n, k, scaleD0Tmp, scaleD1Tmp, scaleOutTmp, tactic,
-        workspaceTmp, wsSizeRunner, stream);
+    mRunner->gemm(dTmp, aTmp, bTmp, nullptr, mQuantMode, m, n, k, scaleD0Tmp, scaleD1Tmp, tactic, workspaceTmp,
+        wsSizeRunner, stream);
     sync_check_cuda_error();
 }
 
@@ -98,7 +97,7 @@ void Fp8RowwiseGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t 
     std::vector<size_t> workspaces = {
         maxM * k * getBytePerElement(nvinfer1::DataType::kFP8), // A
         n * k * getBytePerElement(nvinfer1::DataType::kFP8),    // B
-        // maxM * n * getBytePerElement(mType),          // C_bias
+        // n * getBytePerElement(mType),          // C_bias
         maxM * n * getBytePerElement(mType),  // D
         maxM * sizeof(float),                 // alphaRow
         n * sizeof(float),                    // alphaCol
@@ -278,8 +277,8 @@ int Fp8RowwiseGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     auto const bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
     TLLM_CHECK_WITH_INFO(bestTactic, "No valid GEMM tactic");
     mGemmRunner->gemm(outputs[0], inputs[0], inputs[1], nullptr, mQuantMode, m, n, k,
-        reinterpret_cast<float const*>(inputs[2]), reinterpret_cast<float const*>(inputs[3]),
-        reinterpret_cast<float const*>(inputs[2]), *bestTactic, reinterpret_cast<char*>(workspace), wsSize, stream);
+        reinterpret_cast<float const*>(inputs[2]), reinterpret_cast<float const*>(inputs[3]), *bestTactic,
+        reinterpret_cast<char*>(workspace), wsSize, stream);
     sync_check_cuda_error();
 
     return 0;
@@ -347,8 +346,6 @@ void Fp8RowwiseGemmPlugin::configGemm()
 {
     mPluginProfiler->profileTactics(mGemmRunner, mType, mDims, mGemmId);
 }
-
-///////////////
 
 Fp8RowwiseGemmPluginCreator::Fp8RowwiseGemmPluginCreator()
 {

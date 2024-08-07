@@ -19,20 +19,32 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
+#include <array>
 #include <cuda_runtime_api.h>
 #include <optional>
 #include <vector>
 
-#include <cutlass/gemm/group_array_problem_shape.hpp>
+#include "cute/tensor.hpp"
+#include "cutlass/gemm/gemm.h"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/layout/layout.h"
 
 namespace tensorrt_llm
 {
+template <class T>
+constexpr auto transpose_stride(T const& t)
+{
+    return cute::prepend(cute::prepend(cute::take<2, cute::rank_v<T>>(t), cute::get<0>(t)), cute::get<1>(t));
+}
 
 struct HopperGroupedGemmInput
 {
+    template <class T>
+    using TransposeStride = decltype(transpose_stride<T>(T{}));
     template <class Tag>
     using TransposeLayoutTag = std::conditional_t<std::is_same_v<Tag, cutlass::layout::RowMajor>,
         cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
+
     static_assert(std::is_same_v<cutlass::layout::RowMajor, TransposeLayoutTag<cutlass::layout::ColumnMajor>>);
     static_assert(std::is_same_v<cutlass::layout::ColumnMajor, TransposeLayoutTag<cutlass::layout::RowMajor>>);
 
@@ -41,20 +53,17 @@ struct HopperGroupedGemmInput
     using LayoutA = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for A matrix operand
     using LayoutB = TransposeLayoutTag<cutlass::layout::ColumnMajor>; // Layout type for B matrix operand
     using LayoutC = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for C matrix operand
-    using LayoutD = TransposeLayoutTag<cutlass::layout::RowMajor>;    // Layout type for D matrix operand
 
     using StrideA
         = std::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutA*>>; // Use B because they will be swapped
     using StrideB
         = std::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutB*>>; // Use A because they will be swapped
     using StrideC = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutC*>>;
-    using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
 
     template <class T>
     constexpr static bool IsFP8_v = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
 
-    // Although the user may be using half or bfloat for the unquantized FP8 type,
-    // we just pick one so we don't need to double our template count to distinguish the cases
+    // Currently this should always just be T
     template <class T>
     using OutputTypeAdaptor_t = std::conditional_t<IsFP8_v<T>, nv_bfloat16, T>;
 
@@ -63,74 +72,77 @@ struct HopperGroupedGemmInput
     ProblemShape shape_info{};
     StrideA* stride_a = nullptr;
     StrideB* stride_b = nullptr;
-    StrideC* stride_c = nullptr;
-    StrideD* stride_d = nullptr;
 
     void const** ptr_a = nullptr;
     void const** ptr_b = nullptr;
+
+    // C is currently the same in both epilogues
+    StrideC* stride_c = nullptr;
     void const** ptr_c = nullptr;
-    void** ptr_d = nullptr;
+
+    struct DefaultEpilogue
+    {
+        using LayoutD = TransposeLayoutTag<cutlass::layout::RowMajor>; // Layout type for D matrix operand
+        using StrideD = std::remove_pointer_t<cutlass::detail::TagToStrideC_t<LayoutD*>>;
+
+        StrideD* stride_d = nullptr;
+        void** ptr_d = nullptr;
+    };
+
+    struct FusedFinalizeEpilogue
+    {
+        using StrideFinalOutput = DefaultEpilogue::StrideD;
+        using StrideBias = TransposeStride<cute::Stride<cute::_0, cute::_1, int>>;
+        using StrideRouterScales = TransposeStride<cute::Stride<cute::_1, cute::_0>>;
+
+        void* ptr_final_output = nullptr;
+        StrideFinalOutput stride_final_output{};
+
+        void const* ptr_bias = nullptr;
+        StrideBias stride_bias{};
+
+        float const* ptr_router_scales = nullptr;
+        StrideRouterScales stride_router_scales{};
+
+        int64_t const* ptr_expert_first_token_offset = nullptr;
+        int const* ptr_source_token_index = nullptr;
+
+        size_t num_rows_in_final_output = 0;
+    };
+
+    DefaultEpilogue default_epilogue;
+    FusedFinalizeEpilogue fused_finalize_epilogue;
+
+    enum class EpilogueFusion
+    {
+        NONE,
+        ACTIVATION,
+        GATED_ACTIVATION,
+        FINALIZE
+    };
+    EpilogueFusion fusion = EpilogueFusion::NONE;
 
     float const** alpha_scale_ptr_array = nullptr;
 
     uint8_t* gemm_workspace = nullptr;
     size_t gemm_workspace_size = 0;
 
-    static auto workspaceBuffers(int num_experts)
-    {
-        size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
-        size_t stride_a_size = sizeof(StrideA) * num_experts;
-        size_t stride_b_size = sizeof(StrideB) * num_experts;
-        size_t stride_c_size = sizeof(StrideC) * num_experts;
-        size_t stride_d_size = sizeof(StrideD) * num_experts;
+    static std::array<size_t, 10> workspaceBuffers(int num_experts);
 
-        size_t ptr_buf_size = sizeof(void*) * num_experts;
-        size_t scale_buf_size = sizeof(float**) * num_experts;
+    static size_t workspaceSize(int num_experts);
 
-        return std::array{problem_shape_size, stride_a_size, stride_b_size, stride_c_size, stride_d_size, ptr_buf_size,
-            ptr_buf_size, ptr_buf_size, ptr_buf_size, scale_buf_size};
-    }
-
-    static size_t workspaceSize(int num_experts)
-    {
-        auto buffers = workspaceBuffers(num_experts);
-        return tensorrt_llm::common::calculateTotalWorkspaceSize(buffers.data(), buffers.size());
-    }
-
-    void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size)
-    {
-        auto buffers = workspaceBuffers(num_experts);
-        std::array<int8_t*, 10> pointers{};
-        TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(), "Mismatching workspace size and number of buffers");
-        for (int i = 0; i < buffers.size(); i++)
-        {
-            pointers[i] = start_ptr;
-            start_ptr = tensorrt_llm::common::nextWorkspacePtr(start_ptr, buffers[i]);
-        }
-
-        shape_info.num_groups = num_experts;
-        shape_info.problem_shapes = reinterpret_cast<ProblemShape::UnderlyingProblemShape*>(pointers[0]);
-        shape_info.host_problem_shapes = nullptr;
-        stride_a = reinterpret_cast<StrideA*>(pointers[1]);
-        stride_b = reinterpret_cast<StrideB*>(pointers[2]);
-        stride_c = reinterpret_cast<StrideC*>(pointers[3]);
-        stride_d = reinterpret_cast<StrideD*>(pointers[4]);
-
-        ptr_a = reinterpret_cast<void const**>(pointers[5]);
-        ptr_b = reinterpret_cast<void const**>(pointers[6]);
-        ptr_c = reinterpret_cast<void const**>(pointers[7]);
-        ptr_d = reinterpret_cast<void**>(pointers[8]);
-
-        alpha_scale_ptr_array = reinterpret_cast<float const**>(pointers[9]);
-
-        this->gemm_workspace = reinterpret_cast<uint8_t*>(gemm_workspace);
-        this->gemm_workspace_size = gemm_workspace_size;
-    }
+    void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size);
 
     bool isValid() const
     {
         return stride_a != nullptr && ptr_a != nullptr;
     }
+
+    void setFinalizeFusionParams(void* final_output, float const* router_scales,
+        int64_t const* expert_first_token_offset, int const* source_token_index, void const* bias, int hidden_size,
+        int num_output_tokens);
+
+    std::string toString() const;
 };
 
 // Note update moe.py to match
@@ -150,26 +162,32 @@ constexpr bool isGatedActivation(ActivationType activation_type)
     return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu;
 }
 
-template <typename T, /*The type used for activations/scales/compute*/
-    typename WeightType /* The type for the MoE weights */>
+template <typename T,                   /*The type used for activations/scales/compute*/
+    typename WeightType,                /* The type for the MoE weights */
+    typename OutputType,                /* The output type for the GEMM */
+    typename ScaleBiasType = OutputType /* The type for the scales/bias */
+    >
 class MoeGemmRunner
 {
 public:
     MoeGemmRunner();
 
-    using HopperGemmOutputType = typename HopperGroupedGemmInput::OutputTypeAdaptor_t<T>;
-    static constexpr bool use_fp8 = std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value;
+#if defined(ENABLE_FP8)
+    static constexpr bool use_fp8 = std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+#else
+    static constexpr bool use_fp8 = false;
+#endif
 
-    void moeGemmBiasAct(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales,
-        HopperGemmOutputType const* biases, HopperGemmOutputType* C, int64_t const* total_rows_before_expert,
+    void moeGemmBiasAct(T const* A, WeightType const* B, ScaleBiasType const* weight_scales,
+        ScaleBiasType const* biases, void* C, int64_t const* total_tokens_including_expert,
         HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         ActivationType activation_type, bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
         cutlass_extensions::CutlassGemmConfig chosen_conf);
 
-    void moeGemm(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales, HopperGemmOutputType* C,
-        int64_t const* total_rows_before_expert, HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n,
-        int64_t gemm_k, int num_experts, bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
-        cutlass_extensions::CutlassGemmConfig chosen_conf);
+    void moeGemm(T const* A, WeightType const* B, ScaleBiasType const* weight_scales, void* C,
+        int64_t const* total_tokens_including_expert, HopperGroupedGemmInput layout_info, int64_t total_rows,
+        int64_t gemm_n, int64_t gemm_k, int num_experts, bool use_fused_moe, float const** alpha_scale_ptr_array,
+        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
     static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
@@ -188,18 +206,17 @@ public:
 
 private:
     template <typename EpilogueTag>
-    void dispatchToArch(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales,
-        HopperGemmOutputType const* biases, HopperGemmOutputType* C, int64_t const* total_rows_before_expert,
+    void dispatchToArch(T const* A, WeightType const* B, ScaleBiasType const* weight_scales,
+        ScaleBiasType const* biases, void* C, int64_t const* total_tokens_including_expert,
         HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe, float const** alpha_scale_ptr_array,
         cudaStream_t stream, int* occupancy = nullptr);
 
     template <typename EpilogueTag>
-    void runGemm(T const* A, WeightType const* B, HopperGemmOutputType const* weight_scales,
-        HopperGemmOutputType const* biases, HopperGemmOutputType* C, int64_t const* total_rows_before_expert,
-        HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
-        bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
-        cutlass_extensions::CutlassGemmConfig chosen_conf);
+    void runGemm(T const* A, WeightType const* B, ScaleBiasType const* weight_scales, ScaleBiasType const* biases,
+        void* C, int64_t const* total_tokens_including_expert, HopperGroupedGemmInput layout_info, int64_t total_rows,
+        int64_t gemm_n, int64_t gemm_k, int num_experts, bool use_fused_moe, float const** alpha_scale_ptr_array,
+        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
 
 private:
     int sm_{};

@@ -23,6 +23,7 @@ from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .dit.model import DiT
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
+from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
@@ -53,6 +54,7 @@ __all__ = [
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
+    'FalconConfig',
     'FalconForCausalLM',
     'FalconModel',
     'GPTConfig',

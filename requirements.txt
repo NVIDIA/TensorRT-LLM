@@ -22,7 +22,7 @@ tensorrt~=10.2.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-05.html#rel-24-05 uses 2.4.0a0.
 torch>=2.3.0a0,<=2.4.0a0
 nvidia-modelopt~=0.15.0
-transformers>=4.38.2
+transformers>=4.38.2,<=4.42.4
 pillow==10.3.0
 wheel
 optimum

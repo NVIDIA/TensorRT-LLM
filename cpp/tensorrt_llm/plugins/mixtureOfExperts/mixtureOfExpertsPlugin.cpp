@@ -40,7 +40,8 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k,
     int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
     nvinfer1::DataType weight_type, nvinfer1::DataType output_type, QuantMode quant_mode, bool use_finished,
     bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
-    MOEExpertScaleNormalizationMode normalization_mode, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr)
+    MOEExpertScaleNormalizationMode normalization_mode, bool force_determinism,
+    MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr)
     : mNumExperts(number_of_experts)
     , mK(top_k)
     , mExpertHiddenSize(expert_hidden_size)
@@ -54,6 +55,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k,
     , mUseBias(use_bias)
     , mParallelismConfig(MOEParallelismConfig{tp_size, tp_rank, ep_size, ep_rank})
     , mNormalizationMode(normalization_mode)
+    , mUseDeterministicKernels(force_determinism)
     , mGemmProfiler(std::move(gemm_profiler_ptr))
 {
     init();
@@ -77,6 +79,7 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mDims(other.mDims)
     , mGemmId1(other.mGemmId1)
     , mGemmId2(other.mGemmId2)
+    , mUseDeterministicKernels(other.mUseDeterministicKernels)
     , mGemmProfiler(other.mGemmProfiler)
     , mLayerName(other.mLayerName)
     , mNamespace(other.mNamespace)
@@ -89,8 +92,8 @@ size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
     return sizeof(mNumExperts) + sizeof(mK) + sizeof(mExpertHiddenSize) + sizeof(mExpertInterSize)
         + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType)
         + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mParallelismConfig)
-        + sizeof(mNormalizationMode) + sizeof(mDims) + mGemmProfiler->getSerializationSize(mGemmId1)
-        + mGemmProfiler->getSerializationSize(mGemmId2);
+        + sizeof(mNormalizationMode) + sizeof(mDims) + sizeof(mUseDeterministicKernels)
+        + mGemmProfiler->getSerializationSize(mGemmId1) + mGemmProfiler->getSerializationSize(mGemmId2);
 }
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
@@ -115,7 +118,9 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
     read(d, mParallelismConfig);
     read(d, mNormalizationMode);
     read(d, mDims);
+    read(d, mUseDeterministicKernels);
 
+    // Call init before deserialising the profiler to initialize mGemmId
     init();
     mGemmProfiler->deserialize(d, mDims, mGemmId1);
     mGemmProfiler->deserialize(d, mDims, mGemmId2);
@@ -145,6 +150,7 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mParallelismConfig);
     write(d, mNormalizationMode);
     write(d, mDims);
+    write(d, mUseDeterministicKernels);
 
     mGemmProfiler->serialize(d, mGemmId1);
     mGemmProfiler->serialize(d, mGemmId2);
@@ -200,14 +206,17 @@ void MixtureOfExpertsPlugin::init()
         switch (mOutputType)
         {
         case nvinfer1::DataType::kFP8:
-            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3>>();
+            // TODO We need an atomic FP8 reduction for the finalize fusions
+            TLLM_THROW("Outputting FP8 directly is not currently supported");
+            // mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3>>();
             break;
         case nvinfer1::DataType::kHALF:
-            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half>>();
+            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, half, half>>();
             break;
 #ifdef ENABLE_BF16
         case nvinfer1::DataType::kBF16:
-            mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>>();
+            mMOERunner
+                = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>>();
             break;
 #endif
         default: TLLM_THROW("Invalid output type specified for FP8");
@@ -222,10 +231,12 @@ void MixtureOfExpertsPlugin::init()
             static_cast<int>(mType), static_cast<int>(mWeightType));
     }
 
+    mMOERunner->use_deterministic_hopper_reduce_ = mK > 2 && mUseDeterministicKernels;
+
     mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode};
+        mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
     mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode};
+        mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
     mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mK);
 }
 
@@ -260,15 +271,19 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     {
         auto normalized_weight_type
             = mWeightType == nvinfer1::DataType::kINT4 ? nvinfer1::DataType::kINT8 : mWeightType;
-        return (inOut[pos].type == normalized_weight_type);
+        return inOut[pos].type == normalized_weight_type;
     }
     else if (pos == getFinishedTensorIndex() && hasFinishedTensor())
     {
-        return (inOut[pos].type == DataType::kBOOL);
+        return inOut[pos].type == DataType::kBOOL;
     }
     else if (pos == getRoutingTensorIndex())
     {
-        return (inOut[pos].type == DataType::kFLOAT);
+        return inOut[pos].type == DataType::kFLOAT;
+    }
+    else if (pos == getExpertBias1Index() || pos == getExpertBias2Index())
+    {
+        return inOut[pos].type == mOutputType;
     }
     else if (pos == nbInputs + getOutputTensorIndex())
     {
@@ -277,6 +292,11 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     else if (hasExpertFp8QuantScales() && getExpertFP8Dequant1Index() <= pos && pos <= getExpertFP8QuantFinalIndex())
     {
         return inOut[pos].type == DataType::kFLOAT;
+    }
+    else if (hasExpertIntQuantScales() && getExpertIntQuantScale1Index() <= pos
+        && pos <= getExpertIntQuantScale2Index())
+    {
+        return inOut[pos].type == mOutputType;
     }
     else
     {
@@ -582,6 +602,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mEPSize{};
     int mEPRank{};
     int mNormalizationMode{};
+    int mRequiresDeterminism{0};
 
     // Read configurations from each fields
     struct MapPair
@@ -611,6 +632,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"use_finished", std::ref(mUseFinished), true},
         MapPair{"use_bias", std::ref(mUseBias), true},
         MapPair{"output_type_id", std::ref(mOutputType), true},
+        MapPair{"force_determinism", std::ref(mRequiresDeterminism), true},
     };
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -647,7 +669,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
             static_cast<tensorrt_llm::ActivationType>(mActivationType), static_cast<nvinfer1::DataType>(mType),
             static_cast<nvinfer1::DataType>(mWeightType), static_cast<nvinfer1::DataType>(mOutputType),
             QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank, mEPSize, mEPRank,
-            static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), gemmProfiler);
+            static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), mRequiresDeterminism != 0, gemmProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }
@@ -726,7 +748,7 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     }
     init_backend = true;
     auto& plugin = *mRunner;
-    backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mNumExperts,
-        plugin.mK, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mActivationType, plugin.hasBias(),
-        plugin.getParallelismConfig());
+    backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
+        plugin.mNumExperts, plugin.mK, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mActivationType,
+        plugin.hasBias(), plugin.getParallelismConfig());
 }

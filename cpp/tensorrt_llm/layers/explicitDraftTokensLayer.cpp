@@ -101,7 +101,8 @@ void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
         else
         {
             TLLM_CHECK_WITH_INFO(setupParams->randomSeed->size() == batchSize, "Random seed vector size mismatch.");
-            mBufferManager->copy(setupParams->randomSeed.value().data(), *mRandomSeedsDevice);
+            TensorPtr randomSeedsDeviceSlice = ITensor::slice(mRandomSeedsDevice, 0, batchSize);
+            mBufferManager->copy(setupParams->randomSeed.value().data(), *randomSeedsDeviceSlice, MemoryType::kCPU);
             invokeCurandBatchInitialize(
                 curandStatesDevicePtr, batchSlotsPtr, batchSize, randomSeedDevicePtr, getStream());
             sync_check_cuda_error();

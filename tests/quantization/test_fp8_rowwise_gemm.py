@@ -39,10 +39,9 @@ class TestFp8RowwiseGemm(unittest.TestCase):
 
     def _fp8_rowwise_gemm(self, m, n, k, dtype, per_token_scaling,
                           per_channel_scaling):
-        # Init operands for multiplication in int32
         shape1 = (m, k)
         mat1 = (1 * torch.randn(shape1, device="cuda")).to(
-            dtype=torch.float8_e4m3fn)  # randn
+            dtype=torch.float8_e4m3fn)
         shape2 = (n, k)
         mat2 = (1 * torch.randn(shape2, device="cuda")).to(
             dtype=torch.float8_e4m3fn)
@@ -65,7 +64,7 @@ class TestFp8RowwiseGemm(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         # Create empty network
         network = builder.create_network()
-        # Allow SQ plugin of dtype type
+        # Allow fp8_rowwise_gemm_plugin of dtype type
         network.plugin_config.fp8_rowwise_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for mat1
@@ -86,7 +85,7 @@ class TestFp8RowwiseGemm(unittest.TestCase):
                 name='scale_b',
                 shape=scale_b_torch.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
-            # Get output tensor for SQ gemm
+            # Get output tensor for fp8_rowwise_gemm gemm
             output = fp8_rowwise_gemm(x, y, scale_a, scale_b, per_token_scaling,
                                       per_channel_scaling)
             output.mark_output('output', dtype)
@@ -97,14 +96,12 @@ class TestFp8RowwiseGemm(unittest.TestCase):
                 fp8=True,
                 fp16=(dtype == "float16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
-        print("Debug engine: ", engine, engine.serialize())
         assert engine is not None, "Failed to build engine"
-        # exit()
 
+        # Create TensorRT-LLM session
         session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine.serialize())
 
-        ### trt session
         inputs = {
             'x': mat1,
             'y': mat2,

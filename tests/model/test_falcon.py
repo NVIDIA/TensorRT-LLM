@@ -24,6 +24,7 @@ from transformers import FalconConfig, FalconForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.models.falcon.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
@@ -31,9 +32,6 @@ from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import unittest_name_func
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.falcon.convert_checkpoint import convert_hf_falcon  # isort:skip
 
 
 class TestFalcon(unittest.TestCase):
@@ -93,33 +91,17 @@ class TestFalcon(unittest.TestCase):
                            dtype: str, batch_size: int, beam_width: int,
                            input_len: int, output_len: int,
                            tensor_parallel: int, rank: int):
-        config = {
-            'architecture': 'FalconForCausalLM',
-            'dtype': dtype,
-            'num_hidden_layers': hf_config.num_hidden_layers,
-            'num_attention_heads': hf_config.num_attention_heads,
-            'num_key_value_heads': hf_config.num_kv_heads,
-            'hidden_size': hf_config.hidden_size,
-            'vocab_size': hf_config.vocab_size,
-            'position_embedding_type':
-            'alibi_with_scale' if hf_config.alibi else 'rope_gpt_neox',
-            'max_position_embeddings': input_len + output_len,
-            'hidden_act': 'gelu',
-            'mapping': {
+        hf_config.max_position_embeddings = (input_len + output_len)
+        config = tensorrt_llm.models.FalconConfig.from_hugging_face(
+            hf_config,
+            dtype=dtype,
+            mapping={
                 'world_size': tensor_parallel,
-                'tp_size': tensor_parallel
-            },
-            'bias': hf_config.bias,
-            'parallel_attention': hf_config.parallel_attn,
-            'new_decoder_architecture': hf_config.new_decoder_architecture,
-        }
-        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
-        config.set_rank(rank)
-        weights = convert_hf_falcon(hf_model,
-                                    hf_config,
-                                    config.mapping,
-                                    dtype=dtype)
+                'tp_size': tensor_parallel,
+                'rank': rank,
+            })
         trtllm_model = tensorrt_llm.models.FalconForCausalLM(config)
+        weights = load_weights_from_hf_model(hf_model, config)
         trtllm_model.load(weights)
 
         with net_guard(network):

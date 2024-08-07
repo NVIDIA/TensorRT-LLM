@@ -686,7 +686,7 @@ if __name__ == '__main__':
         'num_attention_heads': hf_config.num_attention_heads,
         'hidden_size': hf_config.hidden_size,
         'vocab_size': hf_config.vocab_size,
-        'position_embedding_type': 'learned_absolute',
+        'position_embedding_type': 'rope_gpt_neox',
         'max_position_embeddings': hf_config.max_position_embeddings,
         'rotary_emb_base': hf_config.rotary_emb_base,
         'rotary_pct': hf_config.rotary_pct,

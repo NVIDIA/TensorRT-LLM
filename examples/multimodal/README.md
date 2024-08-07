@@ -188,7 +188,6 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu \
     --gemm_plugin bfloat16 \
     --gpt_attention_plugin bfloat16 \
-    --context_fmha_fp32_acc enable \
     --remove_input_padding disable \
     --max_batch_size 48 \
     --max_input_len 2048 \
@@ -215,7 +214,8 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --top_p 0.4 \
     --top_k 1 \
     --temperature 0.2 \
-    --repetition_penalty 1.2
+    --repetition_penalty 1.2 \
+    --enable_context_fmha_fp32_acc
     ```
 
 ## Deplot

@@ -140,7 +140,7 @@ TensorRT-LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. With this feature,
 sequences in context phase can be processed together with sequences in
 generation phase. The purpose of that technique is to better interleave
-requests to reduce latency as well as make better use the of the GPUs.
+requests to reduce latency as well as make better use of the GPUs.
 For efficiency reasons (1), the support for inflight batching ***requires the
 input tensors to be packed (no padding)***.
 

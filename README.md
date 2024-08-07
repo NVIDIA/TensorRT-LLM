@@ -17,14 +17,18 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/07/30] Introducing🍊 @SliceXAI ELM Turbo 🤖 train ELM once ⚡ #TensorRT #LLM optimize ☁️ deploy anywhere
+[➡️ link](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms)
+<div align="center">
+<img src="docs/source/media/picture-07-30-2024.png" width="70%">
+<div align="left">
+
 * [2024/07/23] 👀 @AIatMeta Llama 3.1 405B trained on 16K NVIDIA H100s - inference is #TensorRT #LLM optimized ⚡
 🦙 400 tok/s - per node
 🦙 37 tok/s - per user
 🦙 1 node inference
-➡️ [link](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms)
-<div align="center">
-<img src="docs/source/media/picture-07-23-2024.png" width="45%">
-<div align="left">
+[➡️ link](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms)
+
 
 * [2024/07/09] Checklist to maximize multi-language performance of @meta #Llama3 with #TensorRT #LLM inference:
 ✅ MultiLingual
@@ -88,9 +92,9 @@ for integration with the
 a production-quality system to serve LLMs.  Models built with TensorRT-LLM can
 be executed on a wide range of configurations going from a single GPU to
 multiple nodes with multiple GPUs (using
-[Tensor Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#tensor-parallelism)
+[Tensor Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#tensor-parallelism)
 and/or
-[Pipeline Parallelism](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/nlp/nemo_megatron/parallelisms.html#pipeline-parallelism)).
+[Pipeline Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#pipeline-parallelism)).
 
 The TensorRT-LLM Python API architecture looks similar to the
 [PyTorch](https://pytorch.org) API. It provides a

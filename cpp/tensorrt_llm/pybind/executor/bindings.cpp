@@ -438,8 +438,28 @@ void InitBindings(pybind11::module_& m)
             &tle::DecodingConfig::setLookaheadDecoding)
         .def_property("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices);
 
-    auto executorConfigGetState = [&peftCacheConfigGetstate, &kvCacheConfigGetstate, &schedulerConfigGetstate,
-                                      &parallelConfigGetstate](tle::ExecutorConfig const& self)
+    auto extendedRuntimePerfKnobConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 2)
+        {
+            throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
+        }
+        return tle::ExtendedRuntimePerfKnobConfig(state[0].cast<bool>(), state[1].cast<bool>());
+    };
+    auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
+    { return py::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc()); };
+    py::class_<tle::ExtendedRuntimePerfKnobConfig>(m, "ExtendedRuntimePerfKnobConfig")
+        .def(py::init<bool, bool>(), py::arg("multi_block_mode") = false,
+            py::arg("enable_context_fmha_fp32_acc") = false)
+        .def_property("multi_block_mode", &tle::ExtendedRuntimePerfKnobConfig::getMultiBlockMode,
+            &tle::ExtendedRuntimePerfKnobConfig::setMultiBlockMode)
+        .def_property("enable_context_fmha_fp32_acc", &tle::ExtendedRuntimePerfKnobConfig::getEnableContextFMHAFP32Acc,
+            &tle::ExtendedRuntimePerfKnobConfig::setEnableContextFMHAFP32Acc)
+        .def(py::pickle(extendedRuntimePerfKnobConfigGetstate, extendedRuntimePerfKnobConfigSetstate));
+
+    auto executorConfigGetState
+        = [&peftCacheConfigGetstate, &kvCacheConfigGetstate, &schedulerConfigGetstate, &parallelConfigGetstate,
+              &extendedRuntimePerfKnobConfigGetstate](tle::ExecutorConfig const& self)
     {
         py::object peftCacheConfigState = py::none();
 
@@ -449,6 +469,8 @@ void InitBindings(pybind11::module_& m)
         }
         auto kvCacheConfigState = kvCacheConfigGetstate(self.getKvCacheConfig());
         auto schedulerConfigState = schedulerConfigGetstate(self.getSchedulerConfig());
+        auto extendedRuntimePerfKnobConfigState
+            = extendedRuntimePerfKnobConfigGetstate(self.getExtendedRuntimePerfKnobConfig());
         py::object parallelConfigState = py::none();
         if (self.getParallelConfig().has_value())
         {
@@ -460,10 +482,10 @@ void InitBindings(pybind11::module_& m)
             self.getRequestStatsMaxIterations(), self.getBatchingType(), self.getMaxBatchSize(), self.getMaxNumTokens(),
             parallelConfigState, peftCacheConfigState, self.getLogitsPostProcessorMap(),
             self.getLogitsPostProcessorBatched(), self.getDecodingConfig(), self.getGpuWeightsPercent(),
-            self.getMaxQueueSize(), self.getMultiBlockMode());
+            self.getMaxQueueSize(), extendedRuntimePerfKnobConfigState);
     };
     auto executorConfigSetState = [&kvCacheConfigSetstate, &peftCacheConfigSetstate, &schedulerConfigSetstate,
-                                      &parallelConfigSetstate](py::tuple state)
+                                      &parallelConfigSetstate, &extendedRuntimePerfKnobConfigSetstate](py::tuple state)
     {
         if (state.size() != 18)
         {
@@ -471,6 +493,7 @@ void InitBindings(pybind11::module_& m)
         }
         auto kvCacheConfig = kvCacheConfigSetstate(state[2].cast<py::tuple>());
         auto schedulerConfig = schedulerConfigSetstate(state[1].cast<py::tuple>());
+        auto extendedRuntimePerfKnobConfig = extendedRuntimePerfKnobConfigSetstate(state[17].cast<py::tuple>());
 
         std::optional<tle::PeftCacheConfig> peftCacheConfig;
         if (state[11].cast<py::object>() != py::none())
@@ -490,14 +513,15 @@ void InitBindings(pybind11::module_& m)
             state[12].cast<std::optional<tle::LogitsPostProcessorMap>>(),
             state[13].cast<std::optional<tle::LogitsPostProcessorBatched>>(),
             state[14].cast<std::optional<tle::DecodingConfig>>(), state[15].cast<float>(),
-            state[16].cast<std::optional<SizeType32>>(), state[17].cast<bool>());
+            state[16].cast<std::optional<SizeType32>>(), extendedRuntimePerfKnobConfig);
     };
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
         .def(py::init<SizeType32, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType32,
                  SizeType32, tle::BatchingType, std::optional<SizeType32>, std::optional<SizeType32>,
                  std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
                  std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
-                 std::optional<tle::DecodingConfig>, float, std::optional<SizeType32>, bool>(),
+                 std::optional<tle::DecodingConfig>, float, std::optional<SizeType32>,
+                 tle::ExtendedRuntimePerfKnobConfig const&>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -509,7 +533,9 @@ void InitBindings(pybind11::module_& m)
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
             py::arg("logits_post_processor_map") = py::none(), py::arg("logits_post_processor_batched") = py::none(),
             py::arg("decoding_config") = py::none(), py::arg("gpu_weights_percent") = 1.0,
-            py::arg("max_queue_size") = py::none(), py::arg("multi_block_mode") = false)
+            py::arg("max_queue_size") = py::none(),
+            py::arg_v("extended_runtime_perf_knob_config", tle::ExtendedRuntimePerfKnobConfig(),
+                "ExtendedRuntimePerfKnobConfig()"))
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -538,8 +564,8 @@ void InitBindings(pybind11::module_& m)
         .def_property("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
         .def_property("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
-        .def_property(
-            "multi_block_mode", &tle::ExecutorConfig::getMultiBlockMode, &tle::ExecutorConfig::setMultiBlockMode)
+        .def_property("extended_runtime_perf_knob_config", &tle::ExecutorConfig::getExtendedRuntimePerfKnobConfig,
+            &tle::ExecutorConfig::setExtendedRuntimePerfKnobConfig)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 
     tensorrt_llm::pybind::executor::Executor::initBindings(m);

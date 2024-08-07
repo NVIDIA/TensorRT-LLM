@@ -177,11 +177,15 @@ def _moe_plugin(moe_config,
         np.array(moe_config.normalization_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    p_force_determinism = trt.PluginField(
+        "force_determinism", np.array([int(False)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         p_num_experts, p_top_k, p_expert_hidden_size, p_expert_inter_size,
         p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
         p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
-        p_ep_size, p_ep_rank, p_normalization_mode
+        p_ep_size, p_ep_rank, p_normalization_mode, p_force_determinism
     ])
 
     # Create the plugin with our constant inputs to the constructor

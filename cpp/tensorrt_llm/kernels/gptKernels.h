@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -32,13 +33,17 @@ enum class AttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL = 1,
+    // Only attend to the previous tokens in a fixed-length window.
+    SLIDING_WINDOW_CAUSAL = 2,
     // See ChatGLM-6B mask.
-    BIDIRECTIONAL = 2,
+    BIDIRECTIONAL = 3,
     // See GLM-10B mask.
     // TODO: merge this mask into BIDIRECTIONAL
-    BIDIRECTIONALGLM = 3,
+    BIDIRECTIONALGLM = 4,
     // For Phi-3-small model
-    BLOCKSPARSE = 4,
+    BLOCKSPARSE = 5,
+    // The custom mask input.
+    CUSTOM_MASK = 6,
 };
 
 enum class PositionEmbeddingType : int8_t
@@ -97,6 +102,8 @@ struct BuildDecoderInfoParams
     int* seqKVOffsets;
     // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
     int* paddingOffsets;
+    // The offsets to the 1st row in each sequence of packed mask buffer. Shape: [batchSize+1].
+    int* packedMaskRowOffsets;
 
     // The mask to mark invalid tokens in Attention - that's not used by the plugins as it can be
     // computed on-the-fly. When it's not needed, simply use nullptr.

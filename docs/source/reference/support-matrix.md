@@ -67,7 +67,7 @@ The following table shows the supported software for TensorRT-LLM.
         - [FairSeq NMT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
         - [Falcon](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/falcon)
         - [Flan-T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec) (4)
-        - [Gemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma)
+        - [Gemma/Gemma2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma)
         - [GPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
         - [GPT-J](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj)
         - [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)

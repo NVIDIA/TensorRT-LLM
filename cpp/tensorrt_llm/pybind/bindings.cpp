@@ -429,7 +429,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             [](size_t color, size_t rank)
             {
                 auto& world = tensorrt_llm::mpi::MpiComm::world();
-                auto& session = tensorrt_llm::mpi::MpiComm::session();
-                session = world.split(color, rank);
+                tensorrt_llm::mpi::MpiComm::setSession(world.split(color, rank));
             });
 }

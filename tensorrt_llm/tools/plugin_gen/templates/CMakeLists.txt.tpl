@@ -58,6 +58,7 @@ message(STATUS "Found nvinfer library: ${TRT_LIB_PATH}")
 add_library(
   ${TARGET_NAME} SHARED
   ${CMAKE_SOURCE_DIR}/tritonPlugins.cpp
+  ${CMAKE_SOURCE_DIR}/plugin_common.cpp
 {% for plugin in plugin_names %}
   ${CMAKE_SOURCE_DIR}/[[ plugin ]]/_generate_trt_plugin/plugin.cpp
 {% endfor %}

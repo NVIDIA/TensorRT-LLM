@@ -366,8 +366,16 @@ def chunk_state_ref(B, x, dt, dA_cumsum):
     x = rearrange(x, "b (c l) h p -> b c l h p", l=chunk_size)
     B = rearrange(B, "b (c l) ... -> b c l ...", l=chunk_size)
     decay_states = torch.exp((dA_cumsum[:, :, :, -1:] - dA_cumsum))
-    return torch.einsum("bclhn,bhcl,bhcl,bclhp->bchpn", B.to(x.dtype),
-                        decay_states.to(x.dtype), dt.to(x.dtype), x)
+    res = torch.zeros([batch, nchunks, nheads, headdim, dstate],
+                      device=x.device,
+                      dtype=x.dtype)
+    decay_states_dt = decay_states.to(x.dtype) * dt.to(x.dtype)
+    # to save memory
+    for i in range(chunk_size):
+        res += torch.einsum("bchn,bhc,bchp->bchpn", B[:, :,
+                                                      i, :, :].to(x.dtype),
+                            decay_states_dt[:, :, :, i], x[:, :, i, :, :])
+    return res
 
 
 def state_passing_ref(states, dA_chunk_cumsum, initial_states=None):
@@ -436,9 +444,11 @@ def chunk_scan_ref(B, C, x, dt, dA_cumsum, prev_states, D=None, z=None):
                       rearrange(C, "b (c l) h n -> b c l h n", c=nchunks),
                       rearrange(B, "b (c s) h n -> b c s h n", c=nchunks))
     # (batch, nheads, nchunks, chunksize, chunksize)
-    dt_segment_sum = dA_cumsum[:, :, :, :, None] - dA_cumsum[:, :, :, None, :]
-    decay = torch.exp(dt_segment_sum)
+    decay = torch.exp(
+        (dA_cumsum[:, :, :, :, None] - dA_cumsum[:, :, :, None, :]))
     scores_decay = CB * rearrange(decay, "b h c l s -> b c h l s")
+    # to save memory
+    del CB, decay
     causal_mask = torch.tril(torch.ones(chunk_size,
                                         chunk_size,
                                         device=x.device,

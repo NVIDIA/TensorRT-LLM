@@ -37,8 +37,7 @@ public:
     //! Setup the decoder before calling `forward()`
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype,
-        ModelConfig const& modelConfig) override;
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(
@@ -49,7 +48,7 @@ public:
     void forwardSync() override;
 
     //! @brief Gather final results for all requests.
-    void finalize() const override;
+    void finalize(SamplingConfig const& samplingConfig) const override;
 
     //! @param step index within tokens generated in one step
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token

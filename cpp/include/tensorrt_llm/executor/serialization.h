@@ -87,6 +87,11 @@ public:
     static void serialize(SchedulerConfig const& schedulerConfig, std::ostream& os);
     static size_t serializedSize(SchedulerConfig const& schedulerConfig);
 
+    // ExtendedRuntimePerfKnobConfig
+    static ExtendedRuntimePerfKnobConfig deserializeExtendedRuntimePerfKnobConfig(std::istream& is);
+    static void serialize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::ostream& os);
+    static size_t serializedSize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
+
     // ParallelConfig
     static ParallelConfig deserializeParallelConfig(std::istream& is);
     static void serialize(ParallelConfig const& parallelConfig, std::ostream& os);

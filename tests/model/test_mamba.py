@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 from parameterized import parameterized
-from transformers import AutoModelForCausalLM, MambaConfig
+from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -156,6 +156,8 @@ class TestMamba(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_mamba(self, gemm_plugin, mamba_conv1d_plugin, dtype,
                    remove_padding):
+        from transformers import MambaConfig
+
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -360,6 +362,7 @@ class TestMamba(unittest.TestCase):
     ],
                           name_func=unittest_name_func)
     def test_loaders(self, path, load_mode):
+        from transformers import MambaConfig
         model_root = llm_models_root()
         if model_root is None:
             pytest.skip('Skipping since real weights are unavailable.')

@@ -139,16 +139,15 @@ void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsP
         utils::insertTensorSlices(inputTensors, weightsPtrsFieldName, weightPtrsModSlice, firstLayerId);
         utils::insertTensorSlices(inputTensors, lowRankFieldName, adapterSizesModSlice, firstLayerId);
 
-        TLLM_LOG_DEBUG("weightPtrsModSlice shape %s", weightPtrsModSlice->getShape());
-        TLLM_LOG_DEBUG("adapterSizesModSlice shape %s", adapterSizesModSlice->getShape());
+        TLLM_LOG_DEBUG("weightPtrsModSlice shape %s", ITensor::toString(weightPtrsModSlice->getShape()).c_str());
+        TLLM_LOG_DEBUG("adapterSizesModSlice shape %s", ITensor::toString(adapterSizesModSlice->getShape()).c_str());
         TLLM_LOG_DEBUG("lora fields");
         for (auto i : inputTensors)
         {
             auto name = i.first;
             if (name.find("lora") != std::string::npos)
             {
-                TLLM_LOG_DEBUG("%s %s", name, i.second->getShape());
-                TLLM_LOG_DEBUG("%s", i.second->toString(i.second->getShape()));
+                TLLM_LOG_DEBUG("%s %s", name.c_str(), ITensor::toString(i.second->getShape()).c_str());
             }
         }
     }

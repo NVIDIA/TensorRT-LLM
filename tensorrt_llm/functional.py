@@ -682,9 +682,11 @@ class PositionEmbeddingType(IntEnum):
 class AttentionMaskType(IntEnum):
     padding = 0
     causal = 1
-    bidirectional = 2
-    bidirectionalglm = 3  # TODO: merge this mask into bidirectional
-    blocksparse = 4
+    sliding_window_causal = 2
+    bidirectional = 3
+    bidirectionalglm = 4  # TODO: merge this mask into bidirectional
+    blocksparse = 5
+    custom_mask = 6
 
 
 class LayerNormType(IntEnum):
@@ -4474,6 +4476,7 @@ def gpt_attention(
     *,
     qkv: Tensor,
     past_key_value: Tensor,
+    context_fmha_custom_mask: Optional[Tensor] = None,
     sequence_length: Tensor,
     host_past_key_value_lengths: Optional[Tensor],
     host_max_attention_window_sizes: Tensor,
@@ -4555,6 +4558,10 @@ def gpt_attention(
             in contiguous mode and
             [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
             in paged mode. See KV Cache in docs/gpt_attention.md,
+
+        context_fmha_custom_mask: Tensor (On GPU)
+            The tensor that stores the packed custom mask for fmha.
+            Its shape is [num_tokens, max_kv_seqlen / 32].
 
         sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
@@ -4667,9 +4674,11 @@ def gpt_attention(
             The type of mask:
                 * tensorrt_llm.layers.AttentionMaskType.padding for BERT,
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
+                * tensorrt_llm.layers.AttentionMaskType.sliding_window_causal for GPT,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectionalglm for GLM-10B,
                 * tensorrt_llm.layers.AttentionMaskType.blocksparse for Phi-3-small,
+                * tensorrt_llm.layers.AttentionMaskType.custom_mask for any models.
 
         block_sparse_block_size: int
             Block size in block sparse attention
@@ -4872,6 +4881,9 @@ def gpt_attention(
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
+    # reset mask_type to custom_mask.
+    if context_fmha_custom_mask is not None:
+        mask_type = AttentionMaskType.custom_mask
     mask_type = trt.PluginField("mask_type", np.array([int(mask_type)],
                                                       np.int32),
                                 trt.PluginFieldType.INT32)
@@ -4970,6 +4982,8 @@ def gpt_attention(
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
     assert attn_plug
     plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
+    if context_fmha_custom_mask is not None:
+        plug_inputs += [context_fmha_custom_mask]
     if use_cache:
         plug_inputs += [
             sequence_length,

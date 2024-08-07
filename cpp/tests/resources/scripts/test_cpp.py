@@ -416,13 +416,20 @@ def prepare_model_tests(model_name: str,
     if "enc_dec" in model_name:
         generate_expected_output += model_cache_arg
     if only_multi_gpu_arg and model_name != 'enc_dec':
-        generate_expected_output = [
-            "mpirun", "-n", "4", "--allow-run-as-root", "--timeout", "600"
-        ] + generate_expected_output
-    run_command(generate_expected_output,
-                cwd=root_dir,
-                env=model_env,
-                timeout=600)
+        for world_size in (2, 4):
+            generate_command = [
+                "mpirun", "-n",
+                str(world_size), "--allow-run-as-root", "--timeout", "600"
+            ] + generate_expected_output
+            run_command(generate_command,
+                        cwd=root_dir,
+                        env=model_env,
+                        timeout=600)
+    else:
+        run_command(generate_expected_output,
+                    cwd=root_dir,
+                    env=model_env,
+                    timeout=600)
 
 
 def build_tests(build_dir: _pl.Path):
@@ -557,7 +564,7 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         nranks=4,
         local_commands=[
             "executor/executorTest",
-            "--gtest_filter=*LlamaExecutorTest*LeaderMode*"
+            "--gtest_filter=*LlamaExecutorTest*LeaderMode*:*LlamaMultiExecutorTest*LeaderMode*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)

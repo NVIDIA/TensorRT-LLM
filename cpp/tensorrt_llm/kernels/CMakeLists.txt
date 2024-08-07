@@ -18,12 +18,16 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-# Exclude files in the cutlass_kernels and decoderMaskedMultiheadAttention
-# folder
+# Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
+# selectiveScan folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "selectiveScan/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
 
 function(filter_cuda_archs ARCH SOURCES_VAR)
   if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
@@ -52,12 +56,6 @@ function(filter_cuda_archs ARCH SOURCES_VAR)
   endif()
 endfunction()
 
-filter_cuda_archs("70" SRC_CPP)
-filter_cuda_archs("80" SRC_CPP)
-filter_cuda_archs("86" SRC_CPP)
-filter_cuda_archs("89" SRC_CPP)
-filter_cuda_archs("90" SRC_CPP)
-
 if(ENABLE_MULTI_DEVICE EQUAL 0)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
 endif()
@@ -67,4 +65,6 @@ set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_subdirectory(cutlass_kernels)
+add_subdirectory(contextFusedMultiHeadAttention)
 add_subdirectory(decoderMaskedMultiheadAttention)
+add_subdirectory(selectiveScan)
