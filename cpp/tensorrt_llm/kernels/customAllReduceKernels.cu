@@ -666,7 +666,7 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
             if constexpr (PUSH_MODE)
             {
                 vals[ii].packed
-                    = *reinterpret_cast<int4 const*>(&buffers[params.local_rank][ii * params.elts_total + iter_offset]);
+                    = *reinterpret_cast<int4 const*>(&local_shared_buffer[ii * params.elts_total + iter_offset]);
             }
             else
             {
