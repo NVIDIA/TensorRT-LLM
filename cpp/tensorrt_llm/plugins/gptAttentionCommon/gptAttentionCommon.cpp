@@ -483,7 +483,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 90, "FP8 FMHA cannot be enabled on Pre-Hopper Arch.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90, "FP8 FMHA cannot be enabled except on Ada or Hopper Arch.");
     }
 
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
@@ -717,20 +717,23 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     KVBlockArray::DataType* hostKvCacheBlockOffsets = nullptr;
-    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+    if (useKVCache())
     {
-        kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
-            params.cyclic_attention_window_size, params.sink_token_length, params.host_primary_pool_pointer,
-            params.host_secondary_pool_pointer, params.block_offsets);
-        hostKvCacheBlockOffsets = params.host_block_offsets;
-    }
-    else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
-    {
-        using BufferDataType = typename KVCacheBuffer::DataType;
-        kv_cache_buffer = KVLinearBuffer(params.batch_size,
-            isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
-            params.cyclic_attention_window_size, params.sink_token_length, false,
-            reinterpret_cast<BufferDataType*>(params.key_value_cache));
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        {
+            kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
+                sizePerToken, params.cyclic_attention_window_size, params.sink_token_length,
+                params.host_primary_pool_pointer, params.host_secondary_pool_pointer, params.block_offsets);
+            hostKvCacheBlockOffsets = params.host_block_offsets;
+        }
+        else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
+        {
+            using BufferDataType = typename KVCacheBuffer::DataType;
+            kv_cache_buffer = KVLinearBuffer(params.batch_size,
+                isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
+                params.cyclic_attention_window_size, params.sink_token_length, false,
+                reinterpret_cast<BufferDataType*>(params.key_value_cache));
+        }
     }
 
     auto const quant_option = tc::QuantMode::fromDescription();
@@ -1449,7 +1452,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
 
     // Apply position embedding to the keys in the K cache
     KVLinearBuffer shift_k_cache_buffer;
-    if (mPosShiftEnabled && !isCrossAttention())
+    if (useKVCache() && mPosShiftEnabled && !isCrossAttention())
     {
         shift_k_cache_buffer
             = KVLinearBuffer(batch_beam, params.max_attention_window, sizePerToken, params.cyclic_attention_window_size,

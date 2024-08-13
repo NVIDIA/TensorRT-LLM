@@ -235,15 +235,18 @@ the `sliding window_size`.
 This feature helps to reduce the memory footprint of the kv cache when
 dealing with very long sequences.
 
+The feature, which allows different `max_attention_window_size` values
+for each layer, is also supported. To utilize this feature, simply provide an
+`int32 torch.Tensor` or `list` to the `GenerationSession.setup` when using python
+runtime session, or provide a vector to the `KvCacheConfig` when using cpp runtime.
+If the number of the provided elements is less than the number of layers, the provided
+tensor/list/vector will be repeated multiple times to the number of layers and then be
+saved as a new tensor. This tensor will serve as the buffer for `max_attention_window_size`,
+setting unique values for each layer. However, it’s important to note that the
+memory allocation for the kv cache still relies on the buffer’s maximum value.
+
 _Note that the cyclic kv cache feature doesn't work with beam searching currently as
 the context kv cache are shared across beams.
-
-_The experimental feature, which allows different `max_attention_window_size` values
-for each layer, is also supported. To utilize this feature, simply provide an
-`int32 torch.Tensor` with a shape of `[num_layers]` to the `GenerationSession.setup`.
-This tensor will serve as the buffer for `max_attention_window_size`,
-setting unique values for each layer. However, it’s important to note that the
-memory allocation for the kv cache still relies on the buffer’s maximum value._
 
 ## StreamingLLM
 

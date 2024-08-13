@@ -20,6 +20,7 @@ import tensorrt as trt
 import torch
 
 import tensorrt_llm
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import Engine
 from tensorrt_llm.runtime import (ChatGLMGenerationSession, GenerationSession,
                                   SamplingConfig)
@@ -77,6 +78,13 @@ class GPTBenchmark(BaseBenchmark):
             if hasattr(self, item):
                 rnn_configs_kwargs[item] = getattr(self, item)
 
+        kv_cache_type = KVCacheType.CONTINUOUS
+        if hasattr(self, 'kv_cache_type'):
+            kv_cache_type = self.kv_cache_type
+        else:
+            if hasattr(self, 'paged_kv_cache'):
+                kv_cache_type = KVCacheType.PAGED if self.paged_kv_cache == True else KVCacheType.CONTINUOUS
+
         model_config = tensorrt_llm.runtime.ModelConfig(
             max_batch_size=self.max_batch_size,
             max_beam_width=self.num_beams,
@@ -86,8 +94,7 @@ class GPTBenchmark(BaseBenchmark):
             num_kv_heads=ceil(self.num_kv_heads / self.world_size),
             hidden_size=self.hidden_size // self.world_size,
             gpt_attention_plugin=self.use_gpt_attention_plugin,
-            paged_kv_cache=self.paged_kv_cache if hasattr(
-                self, 'paged_kv_cache') else False,
+            kv_cache_type=kv_cache_type,
             paged_state=self.paged_state
             if hasattr(self, 'paged_state') else False,
             dtype=self.dtype,

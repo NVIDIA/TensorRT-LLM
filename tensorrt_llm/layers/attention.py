@@ -35,7 +35,7 @@ from ..module import Module
 from ..parameter import Parameter
 from ..quantization import QuantMode
 from ..quantization.functional import dequantize, quantize
-from .linear import ColumnLinear, QKVColumnLinear, RowLinear
+from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 
@@ -201,9 +201,10 @@ class AttentionParams(object):
                 return False
         return True
 
-    def is_valid(self, gpt_attention_plugin, remove_input_padding):
+    def is_valid(self, gpt_attention_plugin, remove_input_padding,
+                 use_kv_cache):
         if gpt_attention_plugin:
-            if self.sequence_length is None:
+            if use_kv_cache and self.sequence_length is None:
                 return False
             if self.context_lengths is None:
                 return False
@@ -346,7 +347,8 @@ class Attention(Module):
                  skip_cross_qkv=False,
                  max_attn_value=0.0,
                  block_sparse_params=None,
-                 use_implicit_relative_attention=False):
+                 use_implicit_relative_attention=False,
+                 reorder=False):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -438,7 +440,7 @@ class Attention(Module):
 
         # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
         # example: d_model != num_heads * head_size in Flan-T5/ByT5/Gemma
-        self.qkv = QKVColumnLinear(
+        self.qkv = ColumnLinear(
             hidden_size,
             tp_size * self.num_attention_heads * self.attention_head_size +
             (2 * tp_size * self.num_attention_kv_heads *
@@ -777,9 +779,11 @@ class Attention(Module):
 
         assert attention_params is None or attention_params.is_valid(
             default_net().plugin_config.gpt_attention_plugin,
-            default_net().plugin_config.remove_input_padding)
-        assert kv_cache_params is None or kv_cache_params.is_valid(
-            default_net().plugin_config.gpt_attention_plugin)
+            default_net().plugin_config.remove_input_padding, use_cache)
+
+        if use_cache:
+            assert kv_cache_params is None or kv_cache_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin)
 
         past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
         )
@@ -1065,9 +1069,13 @@ class Attention(Module):
                 if self.rotary_embedding_dim is not None:
                     # When shape(hidden_states, 1) > 1(Context phase), the embedding start from 0,
                     # otherwise (Generation phase) move start to position
-                    start = where(
-                        shape(hidden_states, 1) > 1, 0,
-                        shape(past_key_value, 3))
+                    if not use_cache:
+                        # Only context phase is involved when kv cache is disabled.
+                        start = 0
+                    else:
+                        start = where(
+                            shape(hidden_states, 1) > 1, 0,
+                            shape(past_key_value, 3))
                     size = where(
                         shape(hidden_states, 1) > 1, shape(hidden_states, 1), 1)
                     sincos = slice(embed_positions, concat([0, start, 0]),
@@ -1593,7 +1601,7 @@ class CogVLMAttention(Attention):
         self.vision_length = vision_length
         self.vision_start = vision_start
 
-        self.vis_qkv = QKVColumnLinear(
+        self.vis_qkv = ColumnLinear(
             hidden_size,
             tp_size * self.num_attention_heads * self.attention_head_size +
             (2 * tp_size * self.num_attention_kv_heads *
@@ -1641,7 +1649,7 @@ class CogVLMAttention(Attention):
 
         assert attention_params is None or attention_params.is_valid(
             default_net().plugin_config.gpt_attention_plugin,
-            default_net().plugin_config.remove_input_padding)
+            default_net().plugin_config.remove_input_padding, use_cache)
         assert kv_cache_params is None or kv_cache_params.is_valid(
             default_net().plugin_config.gpt_attention_plugin)
 

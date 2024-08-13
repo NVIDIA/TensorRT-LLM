@@ -132,6 +132,7 @@ class Network(object):
 
         from .graph_rewriting import FLayerInfoMemo
         self.flayer_memo = FLayerInfoMemo()  # holds the functional metadata
+        self._parameter_tensors = {}  # holds the parameter tensors
 
     def _init(self, trt_network):
         self._trt_network = trt_network
@@ -164,6 +165,17 @@ class Network(object):
                 np.copyto(weights, values, casting='no')
             else:
                 Parameter.xavier_init(weights)
+
+    @property
+    def parameter_tensors(self):
+        return self._parameter_tensors
+
+    def get_parameter_tensor(self, param):
+        return self.parameter_tensors.get(param, None)
+
+    def set_parameter_tensor(self, param, tensor):
+        assert param not in self.parameter_tensors
+        self.parameter_tensors[param] = tensor
 
     @property
     def dtype(self) -> trt.DataType:

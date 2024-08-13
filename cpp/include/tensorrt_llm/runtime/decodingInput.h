@@ -35,7 +35,7 @@ public:
     using TensorPtr = ITensor::SharedPtr;
 
     DecodingInput(SizeType32 maxLength, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 batchSize,
-        TensorPtr logits, TensorPtr endIds)
+        TensorPtr logits, TensorPtr endIds, TensorConstPtr batchSlots)
         : step{maxLength}
         , maxLength{maxLength}
         , maxAttentionWindow{maxAttentionWindow}
@@ -45,6 +45,7 @@ public:
         , maxBadWordsLen{0}
         , logits{std::move(logits)}
         , endIds{std::move(endIds)}
+        , batchSlots{std::move(batchSlots)}
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->logits), "Invalid logits tensor");
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->endIds), "Invalid endIds tensor");
@@ -75,6 +76,9 @@ public:
 
     TensorConstPtr endIds; //!<  [batchSize * beamWidth], on gpu
 
+    TensorConstPtr
+        batchSlots; //!<  [batchSize], address map of the linear batch id to to the seq slots, int32_t, pinned
+
     // optional parameters
     TensorConstPtr finished;      //!<  [batchSize, beamWidth], finished states at current iteration.
                                   //!<  If true for some request, the decoding step of it is skipped, on gpu
@@ -89,8 +93,6 @@ public:
     TensorConstPtr stopWordsPtrs;          //!<  [batchSize][2, stopWordsLength], on gpu
     TensorConstPtr stopWordsLens;          //!<  [batchSize], on gpu
     TensorConstPtr noRepeatNgramSize;      //!<  [batchSize], on gpu
-    TensorConstPtr
-        batchSlots; //!<  [batchSize], optional, address map of the linear batch id to to the seq slots, int32_t, pinned
 
     // parameters for beam search
     TensorPtr cacheIndirection; //!<  [batchSize, beamWidth, maxSeqLen] - the k/v cache index for beam search, on gpu

@@ -12,20 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
-import os
 from typing import Optional, Union
 
-import safetensors
 from transformers import AutoModelForCausalLM
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor
-from ...layers import (MLP, Attention, AttentionMaskType, Embedding, LayerNorm,
-                       ParallelLMHead)
+from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, LayerNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ...quantization import QuantAlgo
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, QuantConfig)
 from .config import PhiConfig
@@ -146,6 +142,7 @@ class PhiModel(Module):
 
 
 class PhiForCausalLM(DecoderModelForCausalLM):
+    config_class = PhiConfig
 
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
@@ -153,13 +150,13 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        lm_head = ParallelLMHead(config.hidden_size,
-                                 vocab_size_padded,
-                                 bias=True,
-                                 dtype=config.dtype,
-                                 tp_group=config.mapping.tp_group,
-                                 tp_size=config.mapping.tp_size,
-                                 gather_output=True)
+        lm_head = ColumnLinear(config.hidden_size,
+                               vocab_size_padded,
+                               bias=True,
+                               dtype=config.dtype,
+                               tp_group=config.mapping.tp_group,
+                               tp_size=config.mapping.tp_size,
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)
 
@@ -202,61 +199,3 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         model = cls(config)
         model.load(weights)
         return model
-
-    @classmethod
-    def quantize(
-        cls,
-        hf_model_dir: str,
-        output_dir: str,
-        dtype: str = 'auto',
-        mapping: Optional[Mapping] = None,
-        quant_config: Optional[QuantConfig] = None,
-        *,
-        device: str = 'cuda',
-        calib_dataset: str = 'cnn_dailymail',
-        calib_batches: int = 512,
-        calib_batch_size: int = 1,
-        calib_max_seq_length: int = 512,
-        random_seed: int = 1234,
-        tokenizer_max_seq_length: int = 2048,
-        **kwargs,
-    ):
-        DEFAULT_MODELOPT_FLOW = [
-            QuantAlgo.W4A16_AWQ,
-            QuantAlgo.FP8,
-            QuantAlgo.W8A8_SQ_PER_CHANNEL,
-        ]
-        NATIVE_QUANT_FLOW = [QuantAlgo.W4A16, QuantAlgo.W8A16, None]
-
-        config = PhiConfig.from_hugging_face(hf_model_dir,
-                                             dtype=dtype,
-                                             mapping=mapping,
-                                             quant_config=quant_config,
-                                             **kwargs)
-
-        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
-            super().quantize(hf_model_dir,
-                             output_dir,
-                             dtype=config.dtype,
-                             mapping=config.mapping,
-                             quant_config=config.quantization,
-                             device=device,
-                             calib_dataset=calib_dataset,
-                             calib_batches=calib_batches,
-                             calib_batch_size=calib_batch_size,
-                             calib_max_seq_length=calib_max_seq_length,
-                             random_seed=random_seed,
-                             tokenizer_max_seq_length=tokenizer_max_seq_length)
-        else:
-            assert quant_config.quant_algo in NATIVE_QUANT_FLOW, f"Internal error: shall call Modelopt for this quantization {quant_config}"
-
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
-
-            for rank in range(mapping.world_size):
-                weights = load_weights_from_hf_model(hf_model, config)
-                config = copy.deepcopy(config)
-                config.set_rank(rank)
-                safetensors.torch.save_file(
-                    weights, os.path.join(output_dir,
-                                          f'rank{rank}.safetensors'))

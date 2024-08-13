@@ -111,6 +111,7 @@ __global__ void getPackedMask(SizeType32 const* __restrict__ cumGenerationLength
 
     auto const maxGenerationLength = maxGenerationLengths[0];
     auto const numPackedMasks = divUp(maxDraftTokens + 1, 32);
+
     auto const outputStartId = batchSlots ? (batchSlots[batchIdx] * (maxDraftTokens + 1))
                                           : ((batchIdx == 0) ? 0 : cumGenerationLengths[batchIdx - 1]);
     auto* outputPtr = packedMask + (outputStartId + tokenIdx) * numPackedMasks;
@@ -198,7 +199,7 @@ template <typename T>
 __global__ void fillContextBuffers(FillContextExplicitDraftTokensParams<T> params)
 {
     auto const bid = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[bid] : bid;
+    auto const batchSlot = params.batchSlots[bid];
 
     if (threadIdx.x == 0)
     {
@@ -223,11 +224,55 @@ template void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<half
 
 namespace
 {
+// params.skipVerification == true must be similar to fillContextBuffers
+// params.skipVerification == false must be similar to extractExplicitDraftTokens
+template <typename T>
+__global__ void fillRandData(FillRandDataExplicitDraftTokensParams<T> const params)
+{
+    if (threadIdx.x == 0)
+    {
+        auto const bid = static_cast<SizeType32>(blockIdx.x);
+        auto const batchSlot = params.batchSlots ? params.batchSlots[bid] : bid;
+
+        auto curandState = params.curandState[batchSlot];
+
+        // Generate new random data for sampling.
+        params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(&curandState));
+
+        if (!params.skipVerification)
+        {
+            for (auto idx = 0; idx < params.numPaths * params.draftLength; idx++)
+            {
+                // Generate new random data for token verification.
+                auto const offset = flat_index2(batchSlot, idx, params.numPaths * params.draftLength);
+                params.randDataVerification[offset] = static_cast<T>(curand_uniform(&curandState));
+            }
+        }
+
+        params.curandState[batchSlot] = curandState;
+    }
+}
+} // namespace
+
+template <typename T>
+void invokeFillRandData(FillRandDataExplicitDraftTokensParams<T> const& params, cudaStream_t stream)
+{
+    params.checkParams();
+
+    SizeType32 constexpr BLOCK_SIZE = 32;
+    fillRandData<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
+}
+
+template void invokeFillRandData(FillRandDataExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
+template void invokeFillRandData(FillRandDataExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+
+namespace
+{
 template <typename T>
 __global__ void extractExplicitDraftTokens(ExtractExplicitDraftTokensParams<T> params)
 {
     auto const bid = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[bid] : bid;
+    auto const batchSlot = params.batchSlots[bid];
 
     // Get accepted path len.
     // This tensor comes directly from engine and has linear batch index.
@@ -325,14 +370,16 @@ __global__ void extractExplicitDraftTokens(ExtractExplicitDraftTokensParams<T> p
         // Set number of tokens passed to the engine per request for the next iteration.
         params.outputGenerationLengths[batchSlot] = numNextDraftTokens;
 
+        auto curandState = params.curandState[batchSlot];
         // Generate new random data for sampling.
-        params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
+        params.randDataSample[batchSlot] = static_cast<T>(curand_uniform(&curandState));
         for (auto idx = 0; idx < params.numPaths * (params.maxPathLength - 1); idx++)
         {
             // Generate new random data for token verification.
             auto const offset = flat_index2(batchSlot, idx, params.numPaths * (params.maxPathLength - 1));
-            params.randDataVerification[offset] = static_cast<T>(curand_uniform(params.curandState + batchSlot));
+            params.randDataVerification[offset] = static_cast<T>(curand_uniform(&curandState));
         }
+        params.curandState[batchSlot] = curandState;
 
         // Increase seqLen by accepted len.
         params.sequenceLengths[batchSlot] = curSeqLen + bestPathLength;
@@ -435,7 +482,7 @@ template <typename T>
 __global__ void packGenerationLengths(PackExplicitDraftTokensParams<T> params)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = params.batchSlots[batchIdx];
 
     auto const isGenerationRequest = batchIdx >= params.numContextRequests;
     auto const genIdx = batchIdx - params.numContextRequests;
@@ -463,7 +510,7 @@ template <typename T>
 __global__ void packExplicitDraftTokens(PackExplicitDraftTokensParams<T> params)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = params.batchSlots ? params.batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = params.batchSlots[batchIdx];
 
     auto const isGenerationRequest = batchIdx >= params.numContextRequests;
     auto const genIdx = batchIdx - params.numContextRequests;

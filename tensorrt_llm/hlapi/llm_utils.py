@@ -558,9 +558,10 @@ class LlmArgs:
             raise ValueError(
                 "KvCacheConfig.max_attention_window should be set for streaming LLM."
             )
-        if self.kv_cache_config.max_attention_window <= 0:
+        if any(i <= 0 for i in self.kv_cache_config.max_attention_window):
             raise ValueError(
-                "KvCacheConfig.max_attention_window should be greater than 0.")
+                "Elements in KvCacheConfig.max_attention_window should be greater than 0."
+            )
 
         if self.kv_cache_config.sink_token_length is None:
             raise ValueError(
@@ -721,7 +722,6 @@ class _ModelRuntimeContext:
     It could be a runtime cache in MPI nodes.
     '''
     engine_buffer: Optional[trt.IHostMemory] = None
-    tokenizer: Optional[TokenizerBase] = None
     # engine_config is only used for saving the engine to disk
     engine_config: Optional[Union[dict, EngineConfig]] = None
     mapping: Optional[Mapping] = None
@@ -748,11 +748,9 @@ class ModelLoader:
 
     def __init__(self,
                  llm_args: LlmArgs,
-                 tokenizer: Optional[TokenizerBase],
                  workspace: Optional[str | tempfile.TemporaryDirectory] = None,
                  llm_build_stats: Optional["LlmBuildStats"] = None):
         self.llm_args = llm_args
-        self.tokenizer = tokenizer
         self._workspace = workspace or tempfile.TemporaryDirectory()
         self.llm_build_stats = llm_build_stats or LlmBuildStats()
 
@@ -920,7 +918,6 @@ class ModelLoader:
         assert engine_dir
 
         runtime_context = _ModelRuntimeContext(
-            tokenizer=self.tokenizer,
             engine_buffer=self._engine_buffer,
             engine_config=config,
             mapping=self.mapping,
@@ -1028,10 +1025,7 @@ class ModelLoader:
             raise NotImplementedError(
                 f"Unsupported model architecture in HLAPI: {architecture}")
 
-        use_weight_only = self.llm_args.quant_config.quant_algo in (
-            QuantAlgo.W4A16, QuantAlgo.W8A16)
-        if self.llm_args.quant_config.quant_mode.has_any_quant(
-        ) and not use_weight_only:
+        if self.llm_args.quant_config.requires_calibration:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1089,6 +1083,7 @@ class ModelLoader:
     def _build_engine(self):
 
         self.build_config.update(auto_parallel_config=self.auto_parallel_config)
+        self.build_config.update_kv_cache_type(self._model_info.architecture)
         if self.auto_parallel_config.enabled:
             self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
@@ -1301,27 +1296,23 @@ class CachedModelLoader:
 
         def build_task():
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
+                model_loader_kwargs = {
+                    'llm_args': self.llm_args,
+                    'workspace': self.workspace.name,
+                    'llm_build_stats': self.llm_build_stats,
+                }
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
-                        llm_args=self.llm_args,
-                        tokenizer=self.llm_args.
-                        tokenizer,  # TODO[chunweiy]: Use llm_args directly
-                        dtype=self.llm_args.dtype,
-                        engine_dir=self.get_engine_dir())
+                        engine_dir=self.get_engine_dir(),
+                        **model_loader_kwargs)
                     self.llm_build_stats.build_steps_info = build_infos[0]
 
                 else:  # single-gpu
-
-                    with ModelLoader(self.llm_args,
-                                     tokenizer=self.llm_args.tokenizer,
-                                     workspace=self.workspace.name,
-                                     llm_build_stats=self.llm_build_stats
-                                     ) as model_loader:
-
+                    with ModelLoader(**model_loader_kwargs) as model_loader:
                         model_loader(self.get_engine_dir())
 
                 release_gc()
@@ -1339,17 +1330,16 @@ class CachedModelLoader:
     @staticmethod
     def _node_build_task(
         llm_args: LlmArgs,
-        tokenizer: Optional[TokenizerBase] = None,
-        dtype: str = 'auto',
+        workspace: Optional[str | tempfile.TemporaryDirectory] = None,
+        llm_build_stats: Optional['LlmBuildStats'] = None,
         engine_dir: Optional[Path] = None,
     ):
         if MPINodeState.is_initialized():
             raise RuntimeError("The MPI node is already initialized.")
 
-        with ModelLoader(
-                llm_args,
-                tokenizer=tokenizer,
-        ) as model_loader:
+        with ModelLoader(llm_args,
+                         workspace=workspace,
+                         llm_build_stats=llm_build_stats) as model_loader:
             model_loader(engine_dir=engine_dir)
             return model_loader.llm_build_stats.build_steps_info
 

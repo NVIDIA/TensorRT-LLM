@@ -111,15 +111,13 @@ template <typename T>
 std::shared_ptr<SamplingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
-    auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, step, ite, mBatchSize);
+    auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
 
     decodeInputTensors->logits = mLogitsDevice;
 
     decodeInputTensors->inputLengths = mContextLengthDevice;
 
     decodeInputTensors->finished = mFinishedDevice;
-
-    decodeInputTensors->batchSlots = mBatchSlots;
 
     decodeInputTensors->probsComputed = mComputeProbs;
 

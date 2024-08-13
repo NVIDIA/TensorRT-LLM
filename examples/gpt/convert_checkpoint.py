@@ -197,11 +197,9 @@ def convert_and_save_hf(args):
     quant_config = args_to_quant_config(args)
 
     if args.smoothquant is not None or args.int8_kv_cache:
-        mapping = Mapping(
-            world_size=world_size,
-            rank=-1,  #intentinoally make -1 to avoid mistake
-            tp_size=args.tp_size,
-            pp_size=args.pp_size)
+        mapping = Mapping(world_size=world_size,
+                          tp_size=args.tp_size,
+                          pp_size=args.pp_size)
         GPTForCausalLM.quantize(
             args.model_dir,
             args.output_dir,

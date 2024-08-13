@@ -111,9 +111,11 @@ class MambaModel(Module):
         if config.vocab_size % config.pad_vocab_size_multiple != 0:
             config.vocab_size += config.pad_vocab_size_multiple - (
                 config.vocab_size % config.pad_vocab_size_multiple)
-        self.vocab_embedding = Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.dtype)
+        self.vocab_embedding = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.dtype,
+            share_embedding_table=config.share_embedding_table)
         self.layers = ModuleList(
             [MambaLayer(config, i) for i in range(n_layer)])
         if config.rms_norm:
@@ -264,7 +266,10 @@ class MambaForCausalLM(PretrainedModel):
 
         # basic inputs
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
-            True, use_gemm_plugin, remove_input_padding, paged_state)
+            use_gemm_plugin=use_gemm_plugin,
+            use_mamba_conv1d_plugin=use_mamba_conv1d_plugin,
+            remove_input_padding=remove_input_padding,
+            paged_state=paged_state)
 
         num_profiles, ranges = GenerationMixin.get_profiles_ranges(
             max_batch_size=max_batch_size,

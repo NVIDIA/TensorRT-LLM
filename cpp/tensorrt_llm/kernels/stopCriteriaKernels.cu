@@ -36,7 +36,7 @@ __global__ void stopWordsCriterion(TokenIdType const** outputIds, SizeType32 con
     auto const id = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     auto const batchIdx = blockIdx.y / beamWidth;
     auto const beamIdx = blockIdx.y % beamWidth;
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots[batchIdx];
     auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
     auto const newTokens = numNewTokens ? numNewTokens[batchSlot] : 1;
 
@@ -136,7 +136,7 @@ __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum
 {
     SizeType32 threadFinishedCount = 0;
     auto const batchIdx = blockIdx.x;
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots[batchIdx];
 
     for (auto beamIdx = static_cast<SizeType32>(threadIdx.x); beamIdx < beamWidth;
          beamIdx += static_cast<SizeType32>(blockDim.x))
@@ -204,7 +204,7 @@ __global__ void explicitEOSCriterion(TokenIdType const** outputIds, TokenIdType 
         return;
     }
 
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots[batchIdx];
     if (finished[batchSlot].isFinished())
     {
         return;

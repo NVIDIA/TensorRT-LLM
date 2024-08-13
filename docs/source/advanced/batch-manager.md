@@ -17,6 +17,9 @@ how it returns completed requests to the user.
 
 ## The Batch Manager API
 
+*The batch manager API is deprecated in favor of the {ref}`executor`.
+ It will be removed in a future release of TensorRT-LLM.*
+
 A software component (called the client in the text that follows) can interact
 with the batch manager using two mandatory, and several optional callbacks. Their signatures are defined
 in the [`callbacks.h`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/batch_manager/callbacks.h) file.

@@ -13,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from tensorrt_llm.models.gemma.convert import (QuantizeModifiers, Weights,
+                                               load_gemma_weights_from_hf_model,
+                                               non_modelopt_quantize_if_needed)
+from tensorrt_llm.quantization.mode import (MODELOPT_FLOW_QUANTIZATIONS,
+                                            QuantAlgo)
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, cast, recv, send
@@ -23,13 +29,17 @@ from ...layers import (Attention, AttentionMaskType, AttentionParams,
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig, QuantConfig)
-from .weight import load_from_hf_gemma
+                              QuantConfig, save_checkpoint, save_config)
+from .config import GemmaConfig
+
+if TYPE_CHECKING:
+
+    from .config import HfConfigOrDir
 
 
 class GemmaDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -40,13 +50,17 @@ class GemmaDecoderLayer(Module):
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         local_layer_idx = layer_idx - layers_range[0]
+
         q_scaling = 1.0
-        if hasattr(config, "query_pre_attn_scalar"):
-            q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
-                config.head_size)
-        max_attn_value = 0.0 if not hasattr(
-            config, "attn_logit_softcapping"
-        ) or config.attn_logit_softcapping is None else config.attn_logit_softcapping
+        max_attn_value = 0.0
+
+        gemma2_config = config.gemma2_config()
+        if gemma2_config:
+            q_scaling = math.sqrt(
+                gemma2_config.query_pre_attn_scalar) / math.sqrt(
+                    config.head_size)
+            max_attn_value = config.attn_logit_softcapping or 0.0
+
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -135,7 +149,7 @@ class GemmaDecoderLayer(Module):
 
 class GemmaModel(Module):
 
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: GemmaConfig) -> None:
         super().__init__()
 
         self.mapping = config.mapping
@@ -198,10 +212,9 @@ class GemmaModel(Module):
 
 
 class GemmaForCausalLM(DecoderModelForCausalLM):
+    config_class = GemmaConfig
 
-    def __init__(self, config: PretrainedConfig):
-
-        self.check_config(config)
+    def __init__(self, config: GemmaConfig):
         transformer = GemmaModel(config)
 
         vocab_size_padded = pad_vocab_size(config.vocab_size,
@@ -238,92 +251,98 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
 
         super().__init__(config, transformer, lm_head)
 
-    @classmethod
-    def from_hugging_face(cls,
-                          hf_model_dir,
-                          dtype='float16',
-                          mapping: Optional[Mapping] = None,
-                          **kwargs):
+    @staticmethod
+    def _load_gemma_weights_from_hf(hf_model_dir: "HfConfigOrDir",
+                                    trt_llm_config: GemmaConfig, *,
+                                    load_model_on_cpu: bool) -> Weights:
         import transformers
-        from transformers import GemmaConfig
-
-        from ...models.modeling_utils import PretrainedConfig
-        cfg = GemmaConfig.from_pretrained(hf_model_dir)
-
-        num_kv_heads = cfg.num_key_value_heads if hasattr(cfg, "num_key_value_heads") \
-            else cfg.num_attention_heads
-        quantization = kwargs.get('quantization', QuantConfig())
-        if mapping is None:
-            mapping = Mapping()
-
-        cfg.mapping = mapping
-        cfg.dtype = dtype
-        cfg.norm_epsilon = cfg.rms_norm_eps
-
-        config = {
-            'architecture': cfg.architectures[0],
-            'dtype': cfg.dtype,
-            'logits_dtype': 'float32',
-            'num_hidden_layers': cfg.num_hidden_layers,
-            'num_attention_heads': cfg.num_attention_heads,
-            'head_size': cfg.head_dim,
-            'hidden_size': cfg.hidden_size,
-            'intermediate_size': cfg.intermediate_size,
-            'num_key_value_heads': num_kv_heads,
-            'vocab_size': cfg.vocab_size,
-            'position_embedding_type': 'rope_gpt_neox',
-            'max_position_embeddings': cfg.max_position_embeddings,
-            'hidden_act': cfg.hidden_act,
-            'rotary_base': getattr(cfg, 'rotary_base', 10000.0),
-            'rotary_scaling': getattr(cfg, 'rotary_scaling', None),
-            'norm_epsilon': cfg.rms_norm_eps,
-            'quantization': quantization.to_dict(),
-            'mapping': {
-                'world_size': mapping.world_size,
-                'tp_size': mapping.world_size,
-            },
-            'use_parallel_embedding': kwargs.get("use_parallel_embedding",
-                                                 False),
-            'embedding_sharding_dim': kwargs.get("embedding_sharding_dim", 0),
-            'use_fused_mlp': kwargs.get("use_fused_mlp", False),
-        }
-
-        assert not quantization.quant_mode.has_any_quant()
-
-        tllm_llama = GemmaForCausalLM(PretrainedConfig.from_dict(config))
-
-        hf_model = transformers.GemmaForCausalLM
-        hf_llama = hf_model.from_pretrained(
+        hf_gemma = transformers.GemmaForCausalLM.from_pretrained(
             hf_model_dir,
-            device_map={
-                "model": "cpu",
-                "lm_head": "cpu",
-                "embed_tokens": "cpu",
-                "layers": "cpu",
-                "norm": "cpu",
-            },  # Load to CPU memory
+            device_map="cpu" if load_model_on_cpu else "auto",
             torch_dtype='auto',
         )
+        weights = load_gemma_weights_from_hf_model(hf_gemma, trt_llm_config)
+        del hf_gemma
+        return weights
 
-        weights = load_from_hf_gemma(
-            tllm_llama,
-            hf_llama,
-            mapping=mapping,
-            dtype=dtype,
-            # TODO: these shall be outside from_hugging_face too.
-            use_gemm_woq_plugin=kwargs.get("use_gemm_woq_plugin", False),
-        )
-        del hf_llama
-        tllm_llama.load(weights)
-        return tllm_llama
+    @classmethod
+    def from_hugging_face(cls,
+                          hf_model_dir: "HfConfigOrDir",
+                          dtype='float16',
+                          mapping: Optional[Mapping] = None,
+                          quant_config: Optional[QuantConfig] = None,
+                          load_model_on_cpu: bool = True,
+                          **kwargs):
+        config = GemmaConfig.from_hugging_face(hf_config_or_dir=hf_model_dir,
+                                               dtype=dtype,
+                                               mapping=mapping,
+                                               quant_config=quant_config,
+                                               **kwargs)
+        model = GemmaForCausalLM(config)
+        weights = cls._load_gemma_weights_from_hf(
+            hf_model_dir, config, load_model_on_cpu=load_model_on_cpu)
+        model.load(weights)
+        return model
 
-    def check_config(self, config):
-        config.set_if_not_exist("share_embedding_table", True)
-        config.set_if_not_exist('use_parallel_embedding', False)
-        config.set_if_not_exist('embedding_sharding_dim', 0)
-        config.set_if_not_exist('mlp_bias', False)
-        config.set_if_not_exist('attn_bias', False)
-        config.set_if_not_exist('rotary_base', 10000.0)
-        config.set_if_not_exist('rotary_scaling', None)
-        config.set_if_not_exist('use_fused_mlp', False)
-        config.set_if_not_exist('inter_layernorms', False)
+    NATIVE_QUANT_FLOW = {
+        QuantAlgo.W8A16, QuantAlgo.W4A16,
+        QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
+        QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN,
+        QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN,
+        QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN
+    }
+
+    @classmethod
+    def assert_valid_quant_algo(cls, quant_algo: Optional[QuantAlgo]):
+        allowed_quant_values = {
+            None
+        } | cls.NATIVE_QUANT_FLOW | MODELOPT_FLOW_QUANTIZATIONS
+        assert quant_algo in allowed_quant_values, f"{quant_algo} isn't in the allowed `QuantAlgo` values for this model: {allowed_quant_values}"
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'float16',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        gemma_config_kwargs: Dict[str, Any] = None,
+        **quantize_kwargs: Dict[str, Any],
+    ):
+        config = GemmaConfig.from_hugging_face(hf_model_dir,
+                                               dtype=dtype,
+                                               mapping=mapping,
+                                               quantization=quant_config,
+                                               **(gemma_config_kwargs or {}))
+
+        quant_algo = config.quantization.quant_algo
+        if quant_algo is None and config.quantization.kv_cache_quant_algo is None:
+            raise ValueError(
+                "There is no point in calling `quantize()` if both `quant_algo` and `kv_cache_quant_algo` are `None`"
+            )
+        elif quant_algo in cls.MODELOPT_FLOW_QUANTIZATIONS:
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=config.dtype,
+                             mapping=config.mapping,
+                             quant_config=config.quantization**quantize_kwargs)
+        elif quant_algo in cls.NATIVE_QUANT_FLOW:
+            save_config(config, output_dir=output_dir, log=True)
+            for config in config.for_each_rank():
+                hf_weights = cls._load_gemma_weights_from_hf(
+                    hf_model_dir, config)
+                ranked_weights = non_modelopt_quantize_if_needed(
+                    hf_weights,
+                    model_dir=hf_model_dir,
+                    quantize_modifiers=QuantizeModifiers(),
+                    trt_llm_config=config)
+                save_checkpoint(
+                    output_dir=output_dir,
+                    weights=ranked_weights,
+                    rank=config.mapping.rank,
+                )
+                del hf_weights
+        else:
+            cls.assert_valid_quant_algo(quant_algo)

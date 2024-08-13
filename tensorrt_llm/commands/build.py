@@ -26,6 +26,7 @@ import torch
 
 from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraManager
@@ -115,6 +116,20 @@ def parse_arguments():
         default=0,
         help=
         'Setting to a value > 0 enables support for prompt tuning or multimodal input.'
+    )
+    parser.add_argument(
+        '--kv_cache_type',
+        default=argparse.SUPPRESS,
+        type=KVCacheType,
+        help=
+        'Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed.'
+    )
+    parser.add_argument(
+        '--paged_kv_cache',
+        type=str,
+        default=argparse.SUPPRESS,
+        help=
+        'Deprecated. Set this option to enable is equvilient to `--kv_cache_type paged` for transformer based models.'
     )
     parser.add_argument(
         '--use_fused_mlp',
@@ -242,6 +257,13 @@ def parse_arguments():
         action='store_true',
         help=
         'Specify whether offloading weights to CPU and streaming loading at runtime.',
+    )
+    parser.add_argument(
+        '--fast_build',
+        default=False,
+        action='store_true',
+        help=
+        'Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization.',
     )
 
     plugin_config_parser = parser.add_argument_group("plugin_config")
@@ -409,7 +431,15 @@ def main():
 
     workers = min(torch.cuda.device_count(), args.workers)
 
+    if hasattr(args, 'paged_kv_cache'):
+        logger.warning(
+            'Option --paged_kv_cache is deprecated, use --kv_cache_type=paged/disabled instead.'
+        )
+
     plugin_config = PluginConfig.from_arguments(args)
+
+    if args.fast_build:
+        plugin_config.manage_weights = True
 
     kwargs = {
         'logits_dtype': args.logits_dtype,
@@ -488,6 +518,9 @@ def main():
                 'weight_streaming': args.weight_streaming,
             },
             plugin_config=plugin_config)
+
+        if hasattr(args, 'kv_cache_type'):
+            build_config.update_from_dict({'kv_cache_type': args.kv_cache_type})
     else:
         build_config = BuildConfig.from_json_file(args.build_config,
                                                   plugin_config=plugin_config)

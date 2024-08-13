@@ -206,6 +206,9 @@ void tileCpuBufferReplaceImpl(ITensor::SharedPtr& tensor, SizeType32 beamWidth)
     {
     case MemoryType::kCPU: tiledTensor = std::shared_ptr(BufferManager::cpu(shape, tensor->getDataType())); break;
     case MemoryType::kPINNED: tiledTensor = std::shared_ptr(BufferManager::pinned(shape, tensor->getDataType())); break;
+    case MemoryType::kPINNEDPOOL:
+        tiledTensor = std::shared_ptr(BufferManager::pinnedPool(shape, tensor->getDataType()));
+        break;
     default: TLLM_THROW("Tensor is not using CPU memory."); break;
     }
     auto const src = bufferCast<T>(*tensor);

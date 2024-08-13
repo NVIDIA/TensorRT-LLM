@@ -259,6 +259,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm90 = (mSM == kSM_90);
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
+    bool const isSm89 = (mSM == kSM_89);
 
     // Sliding_window_causal mask.
     if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize
@@ -303,7 +304,12 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if (mLaunchParams.flash_attention && runnerParams.kvSeqLen <= 64)
+        if (isSm89 && mFixedParams.dataType == DATA_TYPE_E4M3)
+        {
+            // so far Ada QMMA only supports non-tiled kernels.
+            mLaunchParams.granular_tiling = false;
+        }
+        else if (mLaunchParams.flash_attention && runnerParams.kvSeqLen <= 64)
         {
             // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
             // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels

@@ -23,6 +23,7 @@
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 using namespace tensorrt_llm::runtime;
@@ -86,9 +87,10 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
     setupParams->penaltyParams = std::make_shared<tl::PenaltySetupParams>();
     setupParams->decodingParams = std::make_shared<tl::SamplingSetupParams>();
 
-    ddLayer.setup(batchSize, beamWidth, nullptr, setupParams);
+    auto batchSlots = getDefaultBatchSlots(batchSize, *manager);
+    ddLayer.setup(batchSize, beamWidth, batchSlots, setupParams);
 
-    auto forwardParams = std::make_shared<tl::SamplingInputs>(gpuEndIds, step, ite, localBatchSize);
+    auto forwardParams = std::make_shared<tl::SamplingInputs>(gpuEndIds, batchSlots, step, ite, localBatchSize);
     auto logitsShape
         = ITensor::makeShape({signedBatchSize, static_cast<int64_t>(beamWidth), static_cast<int64_t>(vocabSizePadded)});
     forwardParams->logits = manager->gpu(logitsShape, nvinfer1::DataType::kFLOAT);

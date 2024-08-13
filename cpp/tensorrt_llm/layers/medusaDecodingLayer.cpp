@@ -116,7 +116,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, B
     auto initCurandStates = [this](std::optional<std::vector<uint64_t>>& randomSeed, SizeType32 batchSize,
                                 BufferConstPtr batchSlots, TensorPtr statesDevice)
     {
-        auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+        auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
         auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*statesDevice));
         if (randomSeed)
         {
@@ -279,7 +279,7 @@ void MedusaDecodingLayer<T>::samplePrimeHeadTokens(
     auto const batchSize = inputs.logits.value()->getDimension<0>();
 
     auto logits = bufferCast<T>(*inputs.logits.value());
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs.batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     auto sequenceLengths = bufferCastOrNull<SizeType32>(outputs.sequenceLength);
     auto tokensPerStepDevice = bufferCast<SizeType32>(*inputs.curTokensPerStep.value());
 
@@ -322,7 +322,7 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(
     auto endIds = bufferCast<TokenIdType>(*inputs.endIds);
     auto paths = bufferCast<SizeType32>(*inputs.paths);
 
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs.batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     auto sequenceLengths = bufferCastOrNull<SizeType32>(outputs.sequenceLength);
     auto numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
     auto curTokensPerStepDevice = bufferCast<SizeType32>(*inputs.curTokensPerStep.value());
@@ -377,7 +377,7 @@ void MedusaDecodingLayer<T>::sampleNewDraftTokens(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputs.logits.value()->getDimension<0>();
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs.batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     auto sequenceLengths = bufferCastOrNull<SizeType32>(outputs.sequenceLength);
 
     TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots must be provided for MedusaDecoding");
@@ -436,7 +436,7 @@ void MedusaDecodingLayer<T>::scatterNewDraftTokens(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputs.logits.value()->getDimension<0>();
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs.batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
 
     TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots must be provided for MedusaDecoding");
 
@@ -462,7 +462,7 @@ void MedusaDecodingLayer<T>::packAcceptedPaths(
 
     auto const batchSize = inputs.logits.value()->getDimension<0>();
     auto paths = bufferCast<SizeType32>(*inputs.paths);
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs.batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     auto numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
     auto numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
     auto pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);

@@ -40,7 +40,7 @@ __global__ void setupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, Size
     auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
+        auto const batchSlot = batchSlots[bi];
         auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
         auto p = topPsSize > 1 ? topPs[batchSlot] : topP;
         if (k == 0 && p == 0.0f)
@@ -133,7 +133,7 @@ void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Buf
     auto const topK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
     auto const topP = (runtimeTopPSize == 0) ? DefaultDecodingParams::getTopP() : runtimeTopP.front();
 
-    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
     auto setupWorkspaceDevicePtr = reinterpret_cast<SizeType32*>(mSetupWorkspaceDevice->data());
     auto runtimeTopPDevicePtr = bufferCast<float>(*mRuntimeTopPDevice);
     auto runtimeTopKDevicePtr = bufferCast<SizeType32>(*mRuntimeTopKDevice);
@@ -197,14 +197,14 @@ void TopKSamplingLayer<T>::forwardAsync(
 
     auto logits = bufferCastOrNull<T>(inputs->logits);
     auto endIds = bufferCastOrNull<TokenIdType>(inputs->endIds);
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs->batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs->batchSlots);
     auto curandStatesDevice = inputs->curandStates;
     auto samplingWorkspaceDevice = inputs->samplingWorkspace;
     auto const probsComputed = inputs->probsComputed;
 
     std::vector<int32_t> batchSlotsVec(batchSize);
     std::iota(batchSlotsVec.begin(), batchSlotsVec.end(), 0);
-    auto batchSlotsHost = inputs->batchSlots ? bufferCastOrNull<int>(inputs->batchSlots) : batchSlotsVec.data();
+    auto batchSlotsHost = bufferCast<SizeType32>(*inputs->batchSlots);
     auto skipDecodeHostPtr = bufferCastOrNull<bool>(mSkipDecodeHost);
     auto const skip = allOfBatchSlots(batchSlotsHost, skipDecodeHostPtr, batchSize, true);
     if (skip)

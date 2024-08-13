@@ -95,7 +95,7 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferC
     // [batchSize] random seeds, initializing the random table by different
     // random seeds respectively. If no random seed, initialize the random table
     // of all sentences by 0 directly.
-    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
     if (setupParams->randomSeed)
     {
         auto curandStateDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
@@ -156,7 +156,7 @@ void SamplingLayer<T>::forwardAsync(
 
     auto logits = bufferCast<T>(*inputs->logits.value());
     auto endIds = bufferCast<TokenIdType>(*inputs->endIds);
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs->batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs->batchSlots);
 
     FinishedState const* finishedInput = (inputs->finished)
         ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*inputs->finished.value()))

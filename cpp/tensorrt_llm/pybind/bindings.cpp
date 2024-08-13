@@ -68,23 +68,23 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     auto kvCacheConfigGetState = [](tbk::KvCacheConfig const& config)
     {
-        return py::make_tuple(config.maxTokens, config.maxAttentionWindow, config.sinkTokenLength,
+        return py::make_tuple(config.maxTokens, config.maxAttentionWindowVec, config.sinkTokenLength,
             config.freeGpuMemoryFraction, config.enableBlockReuse, config.useUvm);
     };
     auto kvCacheConfigSetState = [](py::tuple t)
     {
-        return tbk::KvCacheConfig(t[0].cast<std::optional<SizeType32>>(), t[1].cast<std::optional<SizeType32>>(),
-            t[2].cast<std::optional<SizeType32>>(), t[3].cast<std::optional<float>>(), t[4].cast<bool>(),
-            t[5].cast<bool>());
+        return tbk::KvCacheConfig(t[0].cast<std::optional<SizeType32>>(),
+            t[1].cast<std::optional<std::vector<SizeType32>>>(), t[2].cast<std::optional<SizeType32>>(),
+            t[3].cast<std::optional<float>>(), t[4].cast<bool>(), t[5].cast<bool>());
     };
     py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<std::optional<SizeType32>, std::optional<SizeType32>, std::optional<SizeType32>,
+        .def(py::init<std::optional<SizeType32>, std::optional<std::vector<SizeType32>>, std::optional<SizeType32>,
                  std::optional<float>, bool>(),
             py::arg("max_tokens") = py::none(), py::arg("max_attention_window") = py::none(),
             py::arg("sink_token_length") = py::none(), py::arg("free_gpu_memory_fraction") = py::none(),
             py::arg("enable_block_reuse") = false)
         .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
-        .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindow)
+        .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindowVec)
         .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
         .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction)
         .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse)
@@ -129,6 +129,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("CHATGLM", tr::ModelConfig::ModelVariant::kChatGlm)
         .value("MAMBA", tr::ModelConfig::ModelVariant::kMamba)
         .value("RECURRENTGEMMA", tr::ModelConfig::ModelVariant::kRecurrentGemma);
+
+    py::enum_<tr::ModelConfig::KVCacheType>(m, "KVCacheType")
+        .value("CONTINUOUS", tr::ModelConfig::KVCacheType::kCONTINUOUS)
+        .value("PAGED", tr::ModelConfig::KVCacheType::kPAGED)
+        .value("DISABLED", tr::ModelConfig::KVCacheType::kDISABLED)
+        .def(py::init(&tr::ModelConfig::KVCacheTypeFromString));
 
     py::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
@@ -190,8 +196,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::overload_cast<bool>(&tr::ModelConfig::useGptAttentionPlugin))
         .def_property("use_packed_input", py::overload_cast<>(&tr::ModelConfig::usePackedInput, py::const_),
             py::overload_cast<bool>(&tr::ModelConfig::usePackedInput))
-        .def_property("use_paged_kv_cache", py::overload_cast<>(&tr::ModelConfig::usePagedKvCache, py::const_),
-            py::overload_cast<bool>(&tr::ModelConfig::usePagedKvCache))
+        .def_property("kv_cache_type", py::overload_cast<>(&tr::ModelConfig::getKVCacheType, py::const_),
+            py::overload_cast<tr::ModelConfig::KVCacheType>(&tr::ModelConfig::setKVCacheType))
         .def_property("tokens_per_block", &tr::ModelConfig::getTokensPerBlock, &tr::ModelConfig::setTokensPerBlock)
         .def_property("quant_mode", &tr::ModelConfig::getQuantMode, &tr::ModelConfig::setQuantMode)
         .def_property_readonly("supports_inflight_batching", &tr::ModelConfig::supportsInflightBatching)

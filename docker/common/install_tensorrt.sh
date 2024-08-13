@@ -2,18 +2,18 @@
 
 set -ex
 
-TRT_VER="10.2.0.19"
+TRT_VER="10.3.0.26"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-05.html#rel-24-05
-CUDA_VER="12.4" # 12.4.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-07.html#rel-24-07
+CUDA_VER="12.5" # 12.5.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
-# PyTorch 2.3.x can compile with cuDNN v9.
-CUDNN_VER="9.1.0.70-1"
-NCCL_VER="2.21.5-1+cuda12.4"
-CUBLAS_VER="12.4.5.8-1"
+# PyTorch 2.x can compile with cuDNN v9.
+CUDNN_VER="9.2.1.18-1"
+NCCL_VER="2.22.3-1+cuda12.5"
+CUBLAS_VER="12.5.3.2-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
-# https://docs.nvidia.com/cuda/archive/12.4.1/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.4.127-1"
+# https://docs.nvidia.com/cuda/archive/12.5.1/cuda-toolkit-release-notes/index.html
+NVRTC_VER="12.5.82-1"
 
 for i in "$@"; do
     case $i in
@@ -69,9 +69,16 @@ install_centos_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
     yum -y update
     yum -y install epel-release
-    yum remove -y libnccl* && yum -y install libnccl-${NCCL_VER} libnccl-devel-${NCCL_VER}
-    yum remove -y libcublas* && yum -y install libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER} libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}
+    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libnccl-${NCCL_VER}.x86_64.rpm
+    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libnccl-devel-${NCCL_VER}.x86_64.rpm
+    yum remove -y libnccl* && yum -y localinstall libnccl-${NCCL_VER}.x86_64.rpm libnccl-devel-${NCCL_VER}.x86_64.rpm
+    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${NVRTC_VER}.noarch.rpm
+    yum remove -y cuda-toolkit* && yum -y localinstall cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${NVRTC_VER}.noarch.rpm
+    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm
+    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm
+    yum remove -y libcublas* && yum -y localinstall libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm
     yum clean all
+    nvcc --version
 }
 
 install_tensorrt() {
@@ -86,7 +93,7 @@ install_tensorrt() {
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
         if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu22_04" && OS2="Ubuntu-22.04" && OS="ubuntu-22.04"; else OS1="Linux" && OS2="Linux" && OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.2.0/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.3.0/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/

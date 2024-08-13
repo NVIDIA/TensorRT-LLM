@@ -486,18 +486,16 @@ std::shared_ptr<DecodingInputs> DynamicDecodeLayerTest<T>::createInputTensors(Si
     std::shared_ptr<DecodingInputs> forwardParams;
     if (mDecodingMode.isTopKorTopP())
     {
-        forwardParams = std::make_shared<SamplingInputs>(mEndIdsDevice, step, ite, mBatchSize);
+        forwardParams = std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
     }
     else if (mDecodingMode.isMedusa())
     {
-        forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSize);
+        forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSlots, mBatchSize);
     }
 
     forwardParams->embeddingBias = mEmbeddingBiasDevice;
 
     forwardParams->finished = mFinishedDevice;
-
-    forwardParams->batchSlots = mBatchSlots;
 
     if (mUseLogitsVec)
     {

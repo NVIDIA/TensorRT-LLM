@@ -23,12 +23,17 @@ from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
+    'BaiChuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',
     'GLMModel': 'THUDM/glm-10b',
     'ChatGLMModel': 'THUDM/chatglm3-6b',
     'ChatGLMForCausalLM': 'THUDM/chatglm3-6b',
+    'RWForCausalLM': 'tiiuae/falcon-rw-1b',
     'FalconForCausalLM': 'tiiuae/falcon-rw-1b',
-    'GPTForCausalLM': 'gpt2-medium',
+    'GPT2LMHeadModel': 'gpt2',
+    'GPT2LMHeadCustomModel': 'gpt2',
+    'Starcoder2ForCausalLM': 'bigcode/starcoder2-3b',
+    'GPTForCausalLM': 'gpt2',
     'GPTJForCausalLM': 'EleutherAI/gpt-j-6b',
     'GPTNeoXForCausalLM': 'EleutherAI/gpt-neox-20b',
     'InternLMForCausalLM': 'internlm/internlm-chat-7b',
@@ -173,7 +178,7 @@ def add_common_args(parser):
     parser.add_argument('--random_seed', type=int, default=0)
     parser.add_argument('--early_stopping',
                         type=int,
-                        help='Use early stopping if num_beams > 1'
+                        help='Use early stopping if num_beams > 1, '
                         '1 for early-stopping, 0 for non-early-stopping'
                         'other values for stopping by length',
                         default=1)
@@ -213,6 +218,7 @@ def add_common_args(parser):
         '--max_attention_window_size',
         type=int,
         default=None,
+        nargs="+",
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )

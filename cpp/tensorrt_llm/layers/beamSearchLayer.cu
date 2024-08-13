@@ -64,16 +64,14 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
     auto constexpr fltMin = std::numeric_limits<float>::lowest();
     auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
 
-    auto batchSlotsHost = batchSlots ? batchSlots : getDefaultBatchSlots(batchSize, *mBufferManager);
-
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
     fillBuffers(setupParams->beamSearchDiversityRate, DefaultDecodingParams::getBeamSearchDiversity(),
-        mDiversityRateHost, mDiversityRateDevice, batchSlotsHost, std::make_pair(-fltEpsilon, fltMax),
-        "diversity rate");
+        mDiversityRateHost, mDiversityRateDevice, batchSlots, std::make_pair(-fltEpsilon, fltMax), "diversity rate");
     fillBuffers(setupParams->lengthPenalty, DefaultDecodingParams::getLengthPenalty(), mLengthPenaltyHost,
-        mLengthPenaltyDevice, batchSlotsHost, std::make_pair(fltMin, fltMax), "length penalty");
+        mLengthPenaltyDevice, batchSlots, std::make_pair(fltMin, fltMax), "length penalty");
     fillBuffers(setupParams->earlyStopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
-        mEarlyStoppingDevice, batchSlotsHost, std::make_pair(0, std::numeric_limits<int>::max()), "early stopping");
+        mEarlyStoppingDevice, batchSlots, std::make_pair(-fltEpsilon, std::numeric_limits<int>::max()),
+        "early stopping");
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -86,7 +84,7 @@ __global__ void updateCacheIndirectionKernel(
     int const nBM{bh.nBeamWidth};
     int const nMSL{bh.nMaxSeqLen};
     int const indexBatch = blockIdx.y;
-    int const batchSlot = bh.batchSlots ? bh.batchSlots[indexBatch] : indexBatch;
+    int const batchSlot = bh.batchSlots[indexBatch];
     int const indexBeam = blockIdx.z;
     int const indexBatchBeam = batchSlot * nBM + indexBeam;
     int const lastStep{bh.sequenceLengths[indexBatchBeam] - 1}; // the sequenceLengths is updated, need to minus 1
@@ -143,7 +141,7 @@ void BeamSearchLayer<T>::forwardAsync(
     bh.batchDones = op->beamHypotheses->batchDones;
     bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIdsPtr->getDimension<0>());
     bh.nBatchSize = ip->localBatchSize;
-    bh.batchSlots = bufferCastOrNull<SizeType32>(ip->batchSlots);
+    bh.batchSlots = bufferCast<SizeType32>(*ip->batchSlots);
     bh.nBeamWidth = op->outputIds->getDimension<1>();
     bh.nMaxSeqLen = op->outputIds->getDimension<2>();
     bh.nVocabSize = mDecoderDomain.getVocabSizePadded();

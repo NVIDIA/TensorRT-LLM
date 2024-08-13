@@ -155,8 +155,6 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferCo
         allocateWorkspace();
     }
 
-    auto defaultBatchSlots = batchSlots ? batchSlots : getDefaultBatchSlots(batchSize, *mBufferManager);
-
     // Setup penalties.
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
 
@@ -181,31 +179,28 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferCo
     if (mUseTemperature)
     {
         fillBuffers(penaltyParams->temperature, DefaultDecodingParams::getTemperature(), mTemperature,
-            mTemperatureDevice, defaultBatchSlots, getLimitsPenalty(DecodingPenaltyType::Temperature),
-            "temperature penalty");
+            mTemperatureDevice, batchSlots, getLimitsPenalty(DecodingPenaltyType::Temperature), "temperature penalty");
     }
     if (mUseRepetitionPenalty)
     {
         fillBuffers(penaltyParams->repetitionPenalty, DefaultDecodingParams::getRepetitionPenalty(), mRepetitionPenalty,
-            mRepetitionPenaltyDevice, defaultBatchSlots, getLimitsPenalty(DecodingPenaltyType::Repetition),
+            mRepetitionPenaltyDevice, batchSlots, getLimitsPenalty(DecodingPenaltyType::Repetition),
             "repetition penalty");
     }
     if (mUsePresencePenalty)
     {
         fillBuffers(penaltyParams->presencePenalty, DefaultDecodingParams::getPresencePenalty(), mPresencePenalty,
-            mPresencePenaltyDevice, defaultBatchSlots, getLimitsPenalty(DecodingPenaltyType::Presence),
-            "presence penalty");
+            mPresencePenaltyDevice, batchSlots, getLimitsPenalty(DecodingPenaltyType::Presence), "presence penalty");
     }
     if (mUseFrequencyPenalty)
     {
         fillBuffers(penaltyParams->frequencyPenalty, DefaultDecodingParams::getFrequencyPenalty(), mFrequencyPenalty,
-            mFrequencyPenaltyDevice, defaultBatchSlots, getLimitsPenalty(DecodingPenaltyType::Frequency),
-            "frequency penalty");
+            mFrequencyPenaltyDevice, batchSlots, getLimitsPenalty(DecodingPenaltyType::Frequency), "frequency penalty");
     }
     if (mUseMinLength)
     {
         fillBuffers(penaltyParams->minLength, DefaultDecodingParams::getMinLength(), mMinLength, mMinLengthDevice,
-            defaultBatchSlots, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
+            batchSlots, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -222,7 +217,7 @@ void PenaltyLayer<T>::forwardAsync(
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
-    auto batchSlots = bufferCastOrNull<SizeType32>(params->batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*params->batchSlots);
 
     if (!mLogitsPtrsHost->data())
     {
@@ -256,9 +251,7 @@ void PenaltyLayer<T>::forwardAsync(
 
     auto inputLengths = bufferCastOrNull<SizeType32>(params->inputLengths);
     auto embeddingBias = bufferCastOrNull<T>(params->embeddingBias);
-    auto batchSlotsHost = params->batchSlots ? params->batchSlots.value()
-                                             : getDefaultBatchSlots(localDecoderDomain.getBatchSize(), *mBufferManager);
-    auto batchSlotsHostPtr = bufferCast<SizeType32>(*batchSlotsHost);
+    auto batchSlotsHostPtr = bufferCast<SizeType32>(*params->batchSlots);
 #define GET_PENALTIES(capital_name, type)                                                                              \
     (mUse##capital_name                                                                                                \
         && !allOfBatchSlots(batchSlotsHostPtr, bufferCast<type>(*m##capital_name), localDecoderDomain.getBatchSize(),  \

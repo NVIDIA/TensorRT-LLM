@@ -44,7 +44,7 @@ static __global__ void setTopPRuntimeArgs(SizeType32 batchSize, SizeType32 topK,
     auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     for (SizeType32 bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
+        auto const batchSlot = batchSlots[bi];
         auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
         auto const p = topPsSize > 1 ? topPs[batchSlot] : topP;
         if (k == 0 && p == 0.0f)
@@ -241,20 +241,8 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     auto const skipHostDecodeDeviceSlice = ITensor::slice(mSkipDecodeDevice, 0, mDecoderDomain.getBatchSize());
     auto skipDecodeHostSlice = ITensor::slice(mSkipDecodeHost, 0, mDecoderDomain.getBatchSize());
     mBufferManager->copy(*skipHostDecodeDeviceSlice, *skipDecodeHostSlice);
-    std::vector<float> runtimeTopPs(mDecoderDomain.getBatchSize());
-    auto const runtimeTopPDeviceSlice = ITensor::slice(mRuntimeTopPDevice, 0, mDecoderDomain.getBatchSize());
-    mBufferManager->copy(*runtimeTopPDeviceSlice, runtimeTopPs.data(), runtime::MemoryType::kCPU);
-    {
-        auto maxTopP = 0.f;
-        for (SizeType32 bi = 0; bi < batchSize; ++bi)
-        {
-            auto const bid = batchSlotsPtr ? batchSlotsPtr[bi] : bi;
-            maxTopP = std::max(maxTopP, runtimeTopPs[bid]);
-        }
-        mRuntimeMaxTopP = std::max(mRuntimeMaxTopP, maxTopP);
-    }
 
-    if (mIsAirTopP == true)
+    if (mIsAirTopP)
     {
         auto smCnt = mDeviceProp.multiProcessorCount;
         if (smCnt <= 0)
@@ -282,10 +270,8 @@ void TopPSamplingLayer<T>::forwardAsync(
 
     auto const batchSize = inputs->logits.value()->getDimension<0>();
 
-    auto batchSlotsHost
-        = inputs->batchSlots ? inputs->batchSlots.value() : getDefaultBatchSlots(batchSize, *mBufferManager);
     auto skipDecodeHostPtr = bufferCastOrNull<bool>(mSkipDecodeHost);
-    auto const skip = allOfBatchSlots(bufferCastOrNull<SizeType32>(batchSlotsHost), skipDecodeHostPtr, batchSize, true);
+    auto const skip = allOfBatchSlots(bufferCast<SizeType32>(*inputs->batchSlots), skipDecodeHostPtr, batchSize, true);
     if (skip)
     {
         return;
@@ -294,7 +280,7 @@ void TopPSamplingLayer<T>::forwardAsync(
     // Probabilities must be already computed instead of logits
     auto probs = bufferCastOrNull<T>(inputs->logits);
     auto endIds = bufferCastOrNull<TokenIdType>(inputs->endIds);
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs->batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs->batchSlots);
     auto curandStatesDevice = inputs->curandStates;
     auto samplingWorkspaceDevice = inputs->samplingWorkspace;
 

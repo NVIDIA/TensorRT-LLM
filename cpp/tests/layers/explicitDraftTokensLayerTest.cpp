@@ -18,9 +18,16 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
+#include "tensorrt_llm/runtime/tllmLogger.h"
+
+#include <NvInferRuntimeBase.h>
+
 #include <algorithm>
+#include <cstdint>
 #include <random>
 
 namespace tensorrt_llm::tests::layers
@@ -869,12 +876,12 @@ void ExplicitDraftTokensLayerTest<T>::setup()
     mStream->synchronize();
 
     mBestPathLengths = mBufferManager->copyFrom(mNetwork.getBestPathLengths(),
-        ITensor::makeShape({mSamplingParams.getBatchSize()}), runtime::MemoryType::kPINNED);
+        ITensor::makeShape({mSamplingParams.getBatchSize()}), runtime::MemoryType::kPINNEDPOOL);
     mBestPathIndices = mBufferManager->copyFrom(mNetwork.getBestPathIndices(),
-        ITensor::makeShape({mSamplingParams.getBatchSize()}), runtime::MemoryType::kPINNED);
+        ITensor::makeShape({mSamplingParams.getBatchSize()}), runtime::MemoryType::kPINNEDPOOL);
     mPackedPosIds = mBufferManager->copyFrom(mNetwork.getNextPackedPosId(),
         ITensor::makeShape({mSamplingParams.getMaxDecodingTokens() * mSamplingParams.getBatchSize()}),
-        runtime::MemoryType::kPINNED);
+        runtime::MemoryType::kPINNEDPOOL);
 
     auto const nextDraftTokens = mNetwork.getNextDraftTokens();
     auto const lastDraftTokens = mNetwork.getLastDraftTokens();
@@ -939,9 +946,8 @@ void ExplicitDraftTokensLayerTest<T>::setup()
 template <typename T>
 std::shared_ptr<ExplicitDraftTokensInputs> ExplicitDraftTokensLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<ExplicitDraftTokensInputs>(mEndIds, mSamplingParams.getBatchSize());
-
-    forwardParams->batchSlots = mBatchSlots;
+    auto forwardParams
+        = std::make_shared<ExplicitDraftTokensInputs>(mEndIds, mBatchSlots, mSamplingParams.getBatchSize());
 
     forwardParams->seqSlots = mBatchSlots;
 
@@ -1531,6 +1537,86 @@ TYPED_TEST(ExplicitDraftTokensLayerTest, SimpleTestB4DifferentSequences)
     params.setBatchSize(4);
 
     this->runTest(prompt, predictions, nextDraftLetters, lastDraftLetters, params);
+}
+
+template <typename T>
+class FillRandDataTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
+{
+protected:
+    static auto constexpr mDataType{TRTDataType<T>::value};
+
+    FillRandDataTest() {}
+
+    void SetUp() override
+    {
+        mLogger = std::make_shared<TllmLogger>();
+        mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+        mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
+    }
+
+    void TearDown() override {}
+
+    void runTest(
+        SizeType32 batchSize, SizeType32 numPaths, SizeType32 draftLength, bool skipVerification, uint64_t randomSeed)
+    {
+        SizeType32* batchSlotsPtr{nullptr};
+
+        auto curandState = mBufferManager->gpu(ITensor::makeShape({batchSize, 48}), nvinfer1::DataType::kUINT8);
+        auto* curandStatePtr = reinterpret_cast<curandState_t*>(bufferCast<uint8_t>(*curandState));
+
+        tk::invokeCurandInitialize(curandStatePtr, batchSlotsPtr, batchSize, randomSeed, mStream->get());
+        mStream->synchronize();
+
+        tksd::FillRandDataExplicitDraftTokensParams<T> params;
+        params.batchSize = batchSize;
+        params.numPaths = numPaths;
+        params.draftLength = draftLength;
+        params.skipVerification = skipVerification;
+
+        auto randDataSample = mBufferManager->gpu(ITensor::makeShape({batchSize}), mDataType);
+        auto randDataValidation
+            = mBufferManager->gpu(ITensor::makeShape({batchSize, numPaths, draftLength}), mDataType);
+
+        params.randDataSample = bufferCast<T>(*randDataSample);
+        params.randDataVerification = bufferCast<T>(*randDataValidation);
+        params.curandState = curandStatePtr;
+        params.batchSlots = batchSlotsPtr;
+
+        tksd::invokeFillRandData(params, mStream->get());
+        mStream->synchronize();
+
+        auto randDataSampleHost = mBufferManager->copyFrom(*randDataSample, MemoryType::kCPU);
+        auto randDataSampleHostPtr = bufferCast<T>(*randDataSampleHost);
+        EXPECT_GE(randDataSampleHostPtr[0], T(0));
+        EXPECT_LE(randDataSampleHostPtr[0], T(1));
+
+        auto randDataValidationHost = mBufferManager->copyFrom(*randDataValidation, MemoryType::kCPU);
+        auto randDataValidationHostRange = BufferRange<T>(*randDataValidationHost);
+        for (auto i = 0; i < randDataValidationHostRange.size(); ++i)
+        {
+            EXPECT_GE(randDataValidationHostRange[i], T(0)) << "index " << i;
+            EXPECT_LE(randDataValidationHostRange[i], T(1)) << "index " << i;
+        }
+    }
+
+private:
+    std::shared_ptr<nvinfer1::ILogger> mLogger;
+    std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
+    std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
+};
+
+TYPED_TEST_SUITE(FillRandDataTest, FloatAndHalfTypes);
+
+TYPED_TEST(FillRandDataTest, SimpleTest)
+{
+    SizeType32 constexpr batchSize{2};
+    SizeType32 constexpr numPaths{3};
+    SizeType32 constexpr draftLength{4};
+    bool constexpr skipVerification{false};
+
+    uint64_t randomSeed{0};
+
+    this->runTest(batchSize, numPaths, draftLength, skipVerification, randomSeed);
 }
 
 } // namespace tensorrt_llm::tests::layers

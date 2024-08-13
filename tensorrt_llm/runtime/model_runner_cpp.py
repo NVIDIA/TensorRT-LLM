@@ -19,10 +19,10 @@ from typing import List, Optional, Union
 
 import torch
 
-import tensorrt_llm.bindings.executor as trtllm
-
 from .. import profiler
-from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
+from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
+                        WorldConfig)
+from ..bindings import executor as trtllm
 from ..logger import logger
 from ..mapping import Mapping
 from .generation import LogitsProcessor, SamplingConfig, StoppingCriteria
@@ -47,7 +47,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
     def __init__(self, executor: trtllm.Executor, max_batch_size: int,
                  max_input_len: int, max_seq_len: int, max_beam_width: int,
-                 model_config: ModelConfig, world_config: WorldConfig) -> None:
+                 model_config: ModelConfig, world_config: WorldConfig,
+                 use_kv_cache: bool) -> None:
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
@@ -61,6 +62,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                tp_size=world_config.tensor_parallelism,
                                pp_size=world_config.pipeline_parallelism)
         self.world_config = world_config
+        self.use_kv_cache = use_kv_cache
 
     @classmethod
     def from_dir(
@@ -73,7 +75,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         max_input_len: Optional[int] = None,
         max_output_len: Optional[int] = None,
         max_beam_width: Optional[int] = None,
-        max_attention_window_size: Optional[int] = None,
+        max_attention_window_size: Optional[list[int]] = None,
         sink_token_length: Optional[int] = None,
         kv_cache_free_gpu_memory_fraction: Optional[float] = None,
         medusa_choices: list[list[int]] | None = None,
@@ -113,7 +115,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The runtime beam width limit. If max_beam_width is not None, it should not
                 be larger than the engine's max_beam_width; otherwise, the engine's max_beam_width
                 will be used.
-            max_attention_window_size (int):
+            max_attention_window_size (List[int]):
                 The attention window size that controls the sliding window attention / cyclic kv cache behavior.
             sink_token_length (int) :
                 The sink token length, default=0.
@@ -154,6 +156,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
             decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
             decoder_model_config = decoder_json_config.model_config
+            use_kv_cache = decoder_model_config.kv_cache_type != KVCacheType.DISABLED
+
+            if not use_kv_cache:
+                assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
             tp_size = decoder_json_config.tensor_parallelism
             pp_size = decoder_json_config.pipeline_parallelism
@@ -192,11 +198,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                        max_seq_len=max_input_len + max_output_len,
                        max_beam_width=max_beam_width,
                        model_config=decoder_model_config,
-                       world_config=world_config)
+                       world_config=world_config,
+                       use_kv_cache=use_kv_cache)
 
         config_path = Path(engine_dir) / "config.json"
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
+        use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
+
+        if not use_kv_cache:
+            assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
         # Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor
         # by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and
@@ -266,7 +277,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                    max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    model_config=model_config,
-                   world_config=world_config)
+                   world_config=world_config,
+                   use_kv_cache=use_kv_cache)
 
     def _check_inputs(self, batch_input_ids: List[List[int]],
                       sampling_config: trtllm.SamplingConfig, max_new_tokens):
@@ -404,6 +416,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if logits_processor is not None:
             raise RuntimeError(
                 "Logits processor is not supported in C++ session.")
+
+        if not self.use_kv_cache and max_new_tokens > 1:
+            raise RuntimeError(
+                'Disabled KV cache is intended for context phase only now.')
 
         # If we are in a multi-gpu scenario, only rank 0 continues
         if not self.session.can_enqueue_requests():

@@ -409,14 +409,14 @@ class KvCacheConfig
 {
 public:
     explicit KvCacheConfig(bool enableBlockReuse = false, std::optional<SizeType32> const& maxTokens = std::nullopt,
-        std::optional<SizeType32> const& maxAttentionWindow = std::nullopt,
+        std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
-    [[nodiscard]] std::optional<SizeType32> getMaxAttentionWindow() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> getMaxAttentionWindowVec() const;
     [[nodiscard]] std::optional<SizeType32> getSinkTokenLength() const;
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
@@ -424,7 +424,7 @@ public:
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setMaxTokens(SizeType32 maxTokens);
-    void setMaxAttentionWindow(SizeType32 maxAttentionWindow);
+    void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
     void setHostCacheSize(size_t hostCacheSize);
@@ -442,8 +442,10 @@ private:
     std::optional<SizeType32> mMaxTokens;
 
     /// @brief Size of the attention window for each sequence. Only the last mMaxAttentionWindow tokens of each sequence
-    /// will be stored in the KV cache.
-    std::optional<SizeType32> mMaxAttentionWindow;
+    /// will be stored in the KV cache. Different layers may have different max attention window sizes.
+    /// If the number of elements in mMaxAttentionWindowVec is less than the number of layers, mMaxAttentionWindowVec
+    /// will be repeated multiple times to the number of layers.
+    std::optional<std::vector<SizeType32>> mMaxAttentionWindowVec;
 
     /// @brief Number of sink tokens (tokens to always keep in attention window)
     std::optional<SizeType32> mSinkTokenLength;
@@ -699,8 +701,8 @@ public:
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorMap> logitsPostProcessorMap = std::nullopt,
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt,
-        std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1,
-        std::optional<SizeType32> maxQueueSize = std::nullopt,
+        bool replicateLogitsPostProcessor = true, std::optional<DecodingConfig> decodingConfig = std::nullopt,
+        float gpuWeightsPercent = 1, std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig());
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
@@ -717,6 +719,7 @@ public:
     [[nodiscard]] std::optional<PeftCacheConfig> getPeftCacheConfig() const;
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getLogitsPostProcessorMap() const;
     [[nodiscard]] std::optional<LogitsPostProcessorBatched> getLogitsPostProcessorBatched() const;
+    [[nodiscard]] bool getReplicateLogitsPostProcessor() const;
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
     [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
@@ -736,6 +739,7 @@ public:
     void setPeftCacheConfig(PeftCacheConfig const& peftCacheConfig);
     void setLogitsPostProcessorMap(LogitsPostProcessorMap const& logitsPostProcessorMap);
     void setLogitsPostProcessorBatched(LogitsPostProcessorBatched const& logitsPostProcessorBatched);
+    void setReplicateLogitsPostProcessor(bool const replicateLogitsPostProcessor);
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
     void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
@@ -779,6 +783,8 @@ private:
     std::optional<PeftCacheConfig> mPeftCacheConfig;
     std::optional<LogitsPostProcessorMap> mLogitsPostProcessorMap;
     std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
+    /// @brief If set to true, logits post processor will run on all TP ranks in last PP rank
+    bool mReplicateLogitsPostProcessor;
 
     /// @brief Decoding configuration.
     std::optional<DecodingConfig> mDecodingConfig;

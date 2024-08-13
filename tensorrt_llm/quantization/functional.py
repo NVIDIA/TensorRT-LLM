@@ -16,6 +16,7 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 import tensorrt as trt
+import torch
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
@@ -585,3 +586,72 @@ def quantize_tensor(x, scale):
 
         quantized = _create_tensor(layer.get_output(0), layer)
     return quantized
+
+
+def symmetric_quantize_last_axis_of_batched_matrix(weight, quant_mode):
+    amax = weight.abs().max(dim=0)[0].to(weight.dtype)
+    if quant_mode == torch.int8:
+        scale = amax / 128.
+        qweight = torch.clamp((weight / scale).round(), -128, 127).char()
+        qweight = qweight.T.reshape(weight.shape)
+    else:
+        scale = amax / 8.
+        qweight = torch.clamp((weight / scale).round(), -8, 7).char()
+        qweight[qweight < 0] += 16
+        qweight = qweight.T.view(torch.uint8)
+        qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+        qweight = qweight.reshape(weight.shape[0], weight.shape[1] // 2)
+    return qweight, scale
+
+
+def preprocess_weights_for_mixed_gemm(weight, quant_mode):
+    original_shape = weight.shape
+    if quant_mode == torch.int8:
+        return weight.T.reshape(original_shape)
+    else:
+        weight = weight.view(torch.uint8)
+        weight_quint4x2 = torch.zeros(original_shape[0],
+                                      original_shape[1] * 2).char()
+        weight_quint4x2[:, ::2] = weight // 16
+        weight_quint4x2[:, 1::2] = weight % 16
+        weight_quint4x2 = weight_quint4x2.T
+        weight_quint4x2 = weight_quint4x2[:, ::2] + weight_quint4x2[:,
+                                                                    1::2] * 16
+        row_idx = [
+            i + (1 if i % 2 == 0 else -1)
+            for i in range(weight_quint4x2.shape[0])
+        ]
+        weight_quint4x2 = weight_quint4x2[row_idx, :]
+        return weight_quint4x2.reshape(original_shape[0],
+                                       original_shape[1] // 2)
+
+
+def change_qkv_leading_dim(w, num_heads):
+    if w.dim() == 1:
+        w = w.reshape(num_heads, 3, -1)
+        w = w.transpose(0, 1).reshape(-1)
+    else:
+        shape = w.shape
+        head_dim = shape[1] // (3 * num_heads)
+        w = w.reshape(-1, num_heads, 3, head_dim)
+        w = w.transpose(1, 2).reshape(shape[0], -1)
+    return w
+
+
+def postprocess_weight_only(tllm_key, weights, quant_mode):
+    if weights.dim() > 2:
+        v = weights.transpose(-1, -2)
+    else:
+        v = weights.t()
+
+    if "weight" in tllm_key:
+        processed_torch_weights, torch_weight_scales = \
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                v.contiguous(), torch.int8 if quant_mode == 1 else torch.quint4x2)
+        return {
+            tllm_key: processed_torch_weights,
+            tllm_key.replace("weight", "per_channel_scale"):
+            torch_weight_scales,
+        }
+    else:
+        return {tllm_key: weights}  # Bias

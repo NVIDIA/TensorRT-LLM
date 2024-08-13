@@ -56,7 +56,7 @@ void StopCriteriaLayer<T>::forwardAsync(
 
     auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
     auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
-    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(inputs->batchSlots);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*inputs->batchSlots);
 
     TLLM_CHECK_WITH_INFO(inputs->stopCriteriaInputs, "stopCriteriaInputs for forward is not set");
 

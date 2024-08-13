@@ -169,6 +169,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
             for (int i = 0; i < 8; i += 4)
             {
+                // dc & dA should be set to zero out of seq length, but this is done to
+                // dc by chunkcumsum, so no need here.
                 *(int4*) (s_mxdc + get(thread(iStep)) + i) = *(int4*) (g_mxdc + get(hStart * Q + thread(iStep)) + i);
                 *(int4*) (s_mxdA + get(thread(iStep)) + i) = *(int4*) (g_mxdA + get(hStart * Q + thread(iStep)) + i);
             }
@@ -228,6 +230,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
                     int kStart = (iK - pipeS_) * cn<tileK_>;
 
+                    // dc & dA should be set to zero out of seq length, but this is done to
+                    // dc by chunkcumsum, so no need here.
                     tmp2.x *= expf(s_mxdA[Q_ - 1] - s_mxdA[kStart + get(thread(iStep) / cn<tileM_>)])
                         * s_mxdc[kStart + get(thread(iStep) / cn<tileM_>)];
                     tmp2.y *= expf(s_mxdA[Q_ - 1] - s_mxdA[kStart + get(thread(iStep) / cn<tileM_>)])
@@ -500,6 +504,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
             for (int i = 0; i < 8; i += 4)
             {
+                // dc & dA should be set to zero out of seq length, but this is done to
+                // dc by chunkcumsum, so no need here.
                 *(int4*) (s_mxdc + get(thread(iStep)) + i) = *(int4*) (g_mxdc + get(hStart * Q + thread(iStep)) + i);
                 *(int4*) (s_mxdA + get(thread(iStep)) + i) = *(int4*) (g_mxdA + get(hStart * Q + thread(iStep)) + i);
             }
@@ -567,15 +573,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
                     int kStart = (iK - pipeS_) * cn<tileK_>;
 
+                    // dc & dA should be set to zero out of seq length, but this is done to
+                    // dc by chunkcumsum, so no need here.
                     tmp2.x *= expf(s_mxdA[Q_ - 1] - s_mxdA[kStart + get(thread(iStep) / cn<tileM_>)])
                         * s_mxdc[kStart + get(thread(iStep) / cn<tileM_>)];
                     tmp2.y *= expf(s_mxdA[Q_ - 1] - s_mxdA[kStart + get(thread(iStep) / cn<tileM_>)])
                         * s_mxdc[kStart + get(thread(iStep) / cn<tileM_>)];
-
-                    if (get(L - blockIdx_y * Q) <= kStart + get(thread(iStep) / cn<tileM_>))
-                        tmp2.x = 0;
-                    if (get(L - blockIdx_y * Q) <= kStart + get(thread(iStep) / cn<tileM_>))
-                        tmp2.y = 0;
 
                     if (std::is_same_v<Tp_, half>)
                         *(half2*) &tmpL[i] = __float22half2_rn(tmp2);

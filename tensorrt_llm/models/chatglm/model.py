@@ -13,20 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional, Union
+
+import torch
+from transformers import AutoModel
+
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, concat, shape
 from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, KeyValueCacheParams, LayerNorm,
                        RmsNorm)
+from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+                              QuantConfig, check_share_embedding)
+from .config import GLM_ARCH1_VERSIONS, GLM_ARCH2_VERSIONS, ChatGLMConfig
+from .convert import load_weights_from_hf_model
 
 
 class ChatGLMDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: ChatGLMConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -47,7 +55,7 @@ class ChatGLMDecoderLayer(Module):
             attention_mask_type = AttentionMaskType.bidirectionalglm
         elif config.chatglm_version == 'chatglm':
             attention_mask_type = AttentionMaskType.bidirectional
-        elif config.chatglm_version in ['chatglm2', 'chatglm3', 'glm-4']:
+        elif config.chatglm_version in GLM_ARCH2_VERSIONS:
             attention_mask_type = AttentionMaskType.causal
 
         self.input_layernorm = norm_cls(
@@ -163,14 +171,16 @@ class ChatGLMDecoderLayer(Module):
 
 class ChatGLMModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: ChatGLMConfig):
         super().__init__()
         self.chatglm_version = config.chatglm_version
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
 
-        self.vocab_embedding = Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.dtype)
+        self.vocab_embedding = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.dtype,
+            share_embedding_table=config.share_embedding_table)
 
         if config.chatglm_version == 'glm':
             self.position_embedding = Embedding(
@@ -248,9 +258,9 @@ class ChatGLMModel(Module):
 
 
 class ChatGLMForCausalLM(DecoderModelForCausalLM):
+    config_class = ChatGLMConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: ChatGLMConfig):
         transformer = ChatGLMModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -264,20 +274,95 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
                                gather_output=True)
         super().__init__(config, transformer, lm_head)
 
-    def check_config(self, config: PretrainedConfig):
-        config.set_if_not_exist('chatglm_version', 'chatglm3')
-        config.set_if_not_exist('add_bias_linear', False)
-        config.set_if_not_exist('add_qkv_bias', True)
-        config.set_if_not_exist('apply_query_key_layer_scaling', False)
-        config.set_if_not_exist('apply_residual_connection_post_layernorm',
-                                False)
-        config.set_if_not_exist('rmsnorm', True)
-        config.set_if_not_exist('rope_ratio', 1.0)
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a LLaMAForCausalLM object from give parameters
+        '''
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+
+        config = ChatGLMConfig.from_hugging_face(hf_model_or_dir,
+                                                 dtype=dtype,
+                                                 mapping=mapping,
+                                                 quant_config=quant_config,
+                                                 **kwargs)
+        if config.chatglm_version == 'glm':
+            device_map = 'cuda' if not load_model_on_cpu else 'cpu'
+        else:
+            device_map = 'auto' if not load_model_on_cpu else 'cpu'
+        hf_model = AutoModel.from_pretrained(
+            hf_model_or_dir,
+            trust_remote_code=True,
+            torch_dtype='auto' if config.chatglm_version != 'glm' else getattr(
+                torch, config.dtype),
+            device_map=device_map)
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
+        **kwargs,
+    ):
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
+                             device=device,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
+            from . import convert
+
+            config = ChatGLMConfig.from_hugging_face(hf_model_dir,
+                                                     dtype=dtype,
+                                                     mapping=mapping,
+                                                     quant_config=quant_config,
+                                                     **kwargs)
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             calib_dataset=calib_dataset,
+                             device=device)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
 
     def prepare_inputs(self, *args, **kwargs):
         """See `PretrainedModel.prepare_inputs` for the detailed parameter list.
         """
-        if self.transformer.chatglm_version in ['chatglm', 'glm']:
+        if self.transformer.chatglm_version in GLM_ARCH1_VERSIONS:
             position_encoding_2d = True
         else:
             position_encoding_2d = False

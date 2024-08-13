@@ -58,8 +58,6 @@ def test_plugin_config(dtype):
     with pytest.raises(Exception):
         plugin_config.nccl_plugin = 123
     with pytest.raises(Exception):
-        plugin_config.paged_kv_cache = 1024
-    with pytest.raises(Exception):
         plugin_config.a_new_xxx_plugin = 'float16'
 
     config_dict = plugin_config.to_dict()

@@ -161,6 +161,11 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                         tmp2.x = tmp2.x > 32.f ? tmp2.x : log1p(expf(tmp2.x));
                         tmp2.y = tmp2.y > 32.f ? tmp2.y : log1p(expf(tmp2.y));
                     }
+                    else
+                    {
+                        tmp2.x = tmp2.x > 0.f ? tmp2.x : 0.f;
+                        tmp2.y = tmp2.y > 0.f ? tmp2.y : 0.f;
+                    }
 
                     s_mxdc[get((thread(iStep) * cn<8> + Rn<UNROLL, 8>{i}) % cn<tileH_> * Q
                         + (thread(iStep) * cn<8> + Rn<UNROLL, 8>{i}) / cn<tileH_>)]
@@ -174,9 +179,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
             {
 #pragma unroll
                 for (int i = 0; i < 8; i++)
+                {
+                    // Set dc to zero out of seq length, a must for chunkstate & chunkscan.
                     s_mxdc[get((thread(iStep) * cn<8> + Rn<UNROLL, 8>{i}) % cn<tileH_> * Q
                         + (thread(iStep) * cn<8> + Rn<UNROLL, 8>{i}) / cn<tileH_>)]
                         = 0.f;
+                }
             }
         }
 

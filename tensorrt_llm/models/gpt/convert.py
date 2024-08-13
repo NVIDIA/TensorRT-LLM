@@ -994,10 +994,11 @@ def quantize(hf_model_dir: str,
              config: GPTConfig,
              device: str = 'cuda',
              calib_dataset: str = 'cnn_dailymail'):
+    os.makedirs(output_dir, exist_ok=True)
     config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
-    assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
+    assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq

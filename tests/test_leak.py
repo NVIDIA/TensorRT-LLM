@@ -37,6 +37,7 @@ def create_optimize_network():
     model = create_model()
     network = builder.create_network()
     network.plugin_config.gpt_attention_plugin = 'float16'
+    network.plugin_config.paged_kv_cache = True
     profiler.print_memory_usage('Before creating Network')
     with tllm.net_guard(network):
         # Forward
