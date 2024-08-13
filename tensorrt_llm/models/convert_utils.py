@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+import fnmatch
 from typing import Dict, Optional, Union
 
 import torch
@@ -73,11 +74,14 @@ def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
     if quant_algo not in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         return weights
     if exclude_modules is None:
-        exclude_modules = ['shared_expert_gate.weight']
+        exclude_modules = ['*shared_expert_gate.weight']
     for name in list(weights):
-        if any([_name in name for _name in exclude_modules]):
-            continue
-        if any([_name in name for _name in quant_weights
+        is_excluded = False
+        for exclude_module in exclude_modules:
+            if fnmatch.fnmatchcase(name, exclude_module):
+                is_excluded = True
+                break
+        if not is_excluded and any([_name in name for _name in quant_weights
                 ]) and weights[name].dtype != torch.int8:
             quant_weight, quant_scale = weight_only_quantize(
                 weight=weights[name], quant_algo=quant_algo, plugin=plugin)
