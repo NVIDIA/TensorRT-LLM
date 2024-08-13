@@ -166,6 +166,7 @@ BufferManager::IBufferPtr BufferManager::allocate(
     case MemoryType::kGPU: return gpu(size, type);
     case MemoryType::kPINNED: return pinned(size, type);
     case MemoryType::kUVM: return managed(size, type);
+    case MemoryType::kPINNEDPOOL: return pinnedPool(size, type);
     }
 
     TLLM_THROW("Unknown memory type");
@@ -180,6 +181,7 @@ BufferManager::ITensorPtr BufferManager::allocate(
     case MemoryType::kGPU: return gpu(dims, type);
     case MemoryType::kPINNED: return pinned(dims, type);
     case MemoryType::kUVM: return managed(dims, type);
+    case MemoryType::kPINNEDPOOL: return pinnedPool(dims, type);
     }
 
     TLLM_THROW("Unknown memory type");

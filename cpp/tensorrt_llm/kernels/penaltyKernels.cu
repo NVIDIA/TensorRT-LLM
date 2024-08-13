@@ -50,7 +50,7 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const beamIdx = static_cast<SizeType32>(blockIdx.y);
     auto const stepIdx = static_cast<SizeType32>(blockIdx.z);
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     auto const batchBeamStepIdx = (batchIdx * beamWidth + beamIdx) * maxTokensPerStep + stepIdx;
     auto const batchSlotBeamIdx = batchSlot * beamWidth + beamIdx;
     auto const inputLen = inputLengths == nullptr ? SizeType32{0} : inputLengths[batchSlotBeamIdx];
@@ -149,7 +149,7 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
     // Apply bias and penalties
     auto const inLogitsPtr = inputLogits[batchIdx] + (beamIdx * maxTokensPerStep + stepIdx) * vocabSizePadded;
     auto outLogitsPtr = outputLogits + batchBeamStepIdx * vocabSizePadded;
-    const T MASK_VAL = (std::is_same<T, half>::value) ? -HALF_FLT_MAX : -FLT_MAX;
+    T const MASK_VAL = (std::is_same<T, half>::value) ? -HALF_FLT_MAX : -FLT_MAX;
     for (auto index = static_cast<SizeType32>(threadIdx.x); index < vocabSizePadded;
          index += static_cast<SizeType32>(blockDim.x))
     {

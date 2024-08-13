@@ -115,6 +115,7 @@ public:
         std::optional<SizeType32> genMicroBatchSize = std::nullopt;
         std::optional<executor::DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
+        std::optional<std::filesystem::path> enginePath;
     };
 
     //! @brief Optional profiler class to profile the generation phase of an inference request
@@ -178,10 +179,7 @@ public:
     }
 
     GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-        std::string const& engineFile, LoggerPtr logger = nullptr)
-        : GptSession(sessionConfig, modelConfig, worldConfig, RawEngine(engineFile), std::move(logger))
-    {
-    }
+        std::string const& engineFile, LoggerPtr logger = nullptr);
 
     [[nodiscard]] nvinfer1::ILogger& getLogger() const;
 
@@ -291,6 +289,8 @@ private:
 
     TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
+    bool shouldUseKVCacheManager() const;
+
     class CudaGraphExecutor
     {
     public:
@@ -369,6 +369,7 @@ private:
     std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
     SizeType32 mDecoderMaxSequenceLength{};
+    std::vector<SizeType32> mDecoderMaxAttentionWindowVec{};
     SizeType32 mDecoderMaxAttentionWindow{};
     SizeType32 mDecoderSinkTokenLength{};
 

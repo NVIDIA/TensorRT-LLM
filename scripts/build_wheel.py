@@ -56,6 +56,15 @@ def get_build_dir(build_dir, build_type):
     return build_dir
 
 
+def clear_folder(folder_path):
+    for item in os.listdir(folder_path):
+        item_path = os.path.join(folder_path, item)
+        if os.path.isdir(item_path):
+            rmtree(item_path)
+        else:
+            os.remove(item_path)
+
+
 def main(*,
          build_type: str = "Release",
          build_dir: Path = None,
@@ -152,7 +161,7 @@ def main(*,
     first_build = not build_dir.exists()
 
     if clean and build_dir.exists():
-        rmtree(build_dir)
+        clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
     if use_ccache:
@@ -196,8 +205,8 @@ def main(*,
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     if lib_dir.exists():
-        rmtree(lib_dir)
-    lib_dir.mkdir(parents=True)
+        clear_folder(lib_dir)
+    lib_dir.mkdir(parents=True, exist_ok=True)
     if on_windows:
         copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
              lib_dir / "tensorrt_llm.dll")
@@ -230,8 +239,8 @@ def main(*,
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
-        rmtree(bin_dir)
-    bin_dir.mkdir(parents=True)
+        clear_folder(bin_dir)
+    bin_dir.mkdir(parents=True, exist_ok=True)
 
     if not on_windows:
         copy(build_dir / "tensorrt_llm/executor_worker/executorWorker",

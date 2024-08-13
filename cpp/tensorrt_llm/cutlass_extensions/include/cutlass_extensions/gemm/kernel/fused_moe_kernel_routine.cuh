@@ -41,6 +41,7 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         int const M = gemm_m;
         int const N1 = params.gemm_n;
         int const K1 = params.gemm_k;
+        bool const bias_is_broadcast = params.bias_is_broadcast;
 
         int const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
         typename KT::ElementInput const* ptr_input_ = params.ptr_input + row_jump * K1;
@@ -48,10 +49,13 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
             = params.ptr_fc1 + (2 * problem_index + 1) * N1 * K1; // TODO: we only focus on gated activation..
         typename KT::ElementWeight const* ptr_fc1_
             = params.ptr_fc1 + 2 * problem_index * N1 * K1;       // TODO: we only focus on gated activation..
-        typename KT::ElementInput const* ptr_bias_
-            = (params.ptr_bias == nullptr) ? nullptr : params.ptr_bias + 2 * problem_index * N1;
-        typename KT::ElementInput const* ptr_bias_gate_
-            = (params.ptr_bias == nullptr) ? nullptr : params.ptr_bias + (2 * problem_index + 1) * N1;
+        typename KT::ElementInput const* ptr_bias_ = (params.ptr_bias == nullptr)
+            ? nullptr
+            : (bias_is_broadcast ? params.ptr_bias + 2 * problem_index * N1 : params.ptr_bias + 2 * row_jump * N1);
+        typename KT::ElementInput const* ptr_bias_gate_ = (params.ptr_bias == nullptr)
+            ? nullptr
+            : (bias_is_broadcast ? params.ptr_bias + (2 * problem_index + 1) * N1
+                                 : params.ptr_bias + (2 * row_jump + 1) * N1);
         typename KT::ElementOutput* ptr_output_ = params.ptr_output + row_jump * N1;
 
         cute::Tensor mInput_mk
@@ -68,11 +72,13 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
 
         cute::Tensor mBias_mn = cute::make_tensor(
             cute::make_gmem_ptr(static_cast<typename KT::ElementInput const*>(ptr_bias_)), cute::make_shape(M, N1),
-            cute::make_stride(cute::Int<0>{}, cute::_1{})); // trick: bias shape is [1, N], but we use [M, N].
+            cute::make_stride(bias_is_broadcast ? cute::Int<0>{} : N1 * 2,
+                cute::_1{})); // trick: bias shape is [1, N], but we use [M, N].
 
         cute::Tensor mBias_gate_mn = cute::make_tensor(
             cute::make_gmem_ptr(static_cast<typename KT::ElementInput const*>(ptr_bias_gate_)), cute::make_shape(M, N1),
-            cute::make_stride(cute::Int<0>{}, cute::_1{})); // trick: bias shape is [1, N], but we use [M, N].
+            cute::make_stride(bias_is_broadcast ? cute::Int<0>{} : N1 * 2,
+                cute::_1{})); // trick: bias shape is [1, N], but we use [M, N].
 
         cute::Tensor mOutput_mn
             = cute::make_tensor(cute::make_gmem_ptr(static_cast<typename KT::ElementInput*>(ptr_output_)),
@@ -104,6 +110,7 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         extern __shared__ char smem_[];
         typename KT::SharedStorage& shared_storage = *reinterpret_cast<typename KT::SharedStorage*>(smem_);
         int const thread_idx = threadIdx.x;
+        bool const bias_is_broadcast = params.bias_is_broadcast;
         // gmem tensor partition ..
         auto [gInput_mk, gfc1_gate_nk, gfc1_nk, gBias_mn, gBias_gate_mn, gOutput_mn]
             = gmem_tensor_init(problem_index, gemm_m, params);
@@ -320,8 +327,8 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         // (2) add bias if it has..
         if (params.ptr_bias != nullptr)
         {
-            cute::Tensor gBias = gBias_mn(cute::_, cute::_, 0, block_n_idx); // bias only have one row..
-            cute::Tensor gBias_gate = gBias_gate_mn(cute::_, cute::_, 0, block_n_idx);
+            cute::Tensor gBias = gBias_mn(cute::_, cute::_, bias_is_broadcast ? 0 : block_m_idx, block_n_idx);
+            cute::Tensor gBias_gate = gBias_gate_mn(cute::_, cute::_, bias_is_broadcast ? 0 : block_m_idx, block_n_idx);
             cute::Tensor tOgBias = thr_mma.partition_C(gBias);
             cute::Tensor tOgBiasg = thr_mma.partition_C(gBias_gate);
             for (int i = 0; i < cute::size(accum); i++)
@@ -403,12 +410,14 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         int const M = gemm_m;
         int const N1 = params.gemm_n;
         int const K1 = params.gemm_k;
+        bool const bias_is_broadcast = params.bias_is_broadcast;
 
         int const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
         typename KT::ElementInput const* ptr_input_ = params.ptr_input + row_jump * K1;
         typename KT::ElementWeight const* ptr_fc1_ = params.ptr_fc1 + problem_index * N1 * K1;
-        typename KT::ElementInput const* ptr_bias_
-            = (params.ptr_bias == nullptr) ? nullptr : params.ptr_bias + problem_index * N1;
+        typename KT::ElementInput const* ptr_bias_ = (params.ptr_bias == nullptr)
+            ? nullptr
+            : (bias_is_broadcast ? params.ptr_bias + problem_index * N1 : params.ptr_bias + row_jump * N1);
         typename KT::ElementOutput* ptr_output_ = params.ptr_output + row_jump * N1;
 
         cute::Tensor mInput_mk
@@ -421,7 +430,8 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
 
         cute::Tensor mBias_mn = cute::make_tensor(
             cute::make_gmem_ptr(static_cast<typename KT::ElementInput const*>(ptr_bias_)), cute::make_shape(M, N1),
-            cute::make_stride(cute::Int<0>{}, cute::_1{})); // trick: bias shape is [1, N], but we use [M, N].
+            cute::make_stride(bias_is_broadcast ? cute::Int<0>{} : N1,
+                cute::_1{})); // trick: bias shape is [1, N], but we use [M, N].
 
         cute::Tensor mOutput_mn
             = cute::make_tensor(cute::make_gmem_ptr(static_cast<typename KT::ElementInput*>(ptr_output_)),
@@ -448,6 +458,7 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         extern __shared__ char smem_[];
         typename KT::SharedStorage& shared_storage = *reinterpret_cast<typename KT::SharedStorage*>(smem_);
         int const thread_idx = threadIdx.x;
+        bool const bias_is_broadcast = params.bias_is_broadcast;
         // gmem tensor partition ..
         auto [gInput_mk, gfc1_nk, gBias_mn, gOutput_mn] = gmem_tensor_init(problem_index, gemm_m, params);
         int const residue_m = gemm_m - block_m_idx * cute::size<0>(gInput_mk);
@@ -632,7 +643,7 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         // (2) add bias if it has..
         if (params.ptr_bias != nullptr)
         {
-            cute::Tensor gBias = gBias_mn(cute::_, cute::_, 0, block_n_idx); // bias only have one row..
+            cute::Tensor gBias = gBias_mn(cute::_, cute::_, bias_is_broadcast ? 0 : block_m_idx, block_n_idx);
             cute::Tensor tOgBias = thr_mma.partition_C(gBias);
             for (int i = 0; i < cute::size(accum); i++)
             {

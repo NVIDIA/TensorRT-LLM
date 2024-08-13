@@ -628,7 +628,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
 
     bool allEqual{true};
     BufferManager::ITensorPtr reference_qkv_buf
-        = this->mBufferManager->copyFrom(*(this->attention_input_buf), tensorrt_llm::runtime::MemoryType::kPINNED);
+        = this->mBufferManager->copyFrom(*(this->attention_input_buf), tensorrt_llm::runtime::MemoryType::kPINNEDPOOL);
     fpType* reference_qkv = bufferCast<fpType>(*reference_qkv_buf);
 
     for (SizeType32 iAssert = 0; iAssert < this->qkv_size; iAssert++)

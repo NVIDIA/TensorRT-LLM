@@ -67,6 +67,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 class KVCacheBlock;
+class KVCacheManager;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
@@ -288,8 +289,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
-        GenerationRequest& sequence, SizeType32 inputLength, std::shared_ptr<LlmRequest> const& llmRequest);
+    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+        std::shared_ptr<LlmRequest> const& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
@@ -389,6 +390,10 @@ public:
     //! \details Does nothing of block is already in primary memory.
     void onboardBlock(BlockPtr offloadBlock);
 
+    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
+    //! \details Only full blocks are considered.
+    VecTokens findNewContextBlock(VecTokens const& inputTokens) const;
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -405,7 +410,8 @@ private:
     //! \param blockedTokens Tokens of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::list<VecTokens> const& blockedTokens, GenerationRequest& sequence);
+    SizeType32 loadOrAllocateBlocks(
+        std::list<VecTokens> const& blockedTokens, SizeType32 numContextBlocks, GenerationRequest& sequence);
 
     //! \brief Find best primary block to free.
     //! \details The best primary block to free is the primary block that appears first in the queue and have no primary
@@ -460,6 +466,9 @@ private:
     std::size_t mAllocTotalBlocks, mAllocNewBlocks, mReusedBlocks;
     // KV cache type (self or cross)
     CacheType mCacheType;
+
+private:
+    friend class KVCacheManager;
 };
 
 class KVCacheManager
@@ -610,6 +619,14 @@ public:
     {
         return mCacheType == CacheType::kCROSS;
     }
+
+    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
+    //! \details Only full blocks are considered.
+    VecTokens findNewContextBlock(VecTokens const& inputTokens) const;
+
+    //! \brief Store full context blocks contributed by llmRequest.
+    //! \details These blocks become reusable from next step.
+    void storeContextBlocks(SizeType32 seqSlotIdx, std::shared_ptr<LlmRequest> const& llmRequest);
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

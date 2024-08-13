@@ -18,6 +18,7 @@ from typing import List
 
 import tensorrt as trt
 
+from ..bindings import KVCacheType
 from ..functional import Tensor
 from ..layers import SpecDecodingParams
 from ..mapping import Mapping
@@ -27,14 +28,28 @@ from ..plugin import current_all_reduce_helper
 class GenerationMixin:
 
     @staticmethod
-    def has_ctx_gen_opt_profiles(use_gpt_attention_plugin: bool,
-                                 use_gemm_plugin: bool,
-                                 remove_input_padding: bool,
-                                 paged_kv_cache: bool) -> bool:
+    def has_ctx_gen_opt_profiles(
+            use_gpt_attention_plugin: bool = False,
+            use_gemm_plugin: bool = False,
+            use_mamba_conv1d_plugin: bool = False,
+            remove_input_padding: bool = False,
+            paged_state: bool = False,
+            kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS) -> bool:
         res = False
+
         if not use_gpt_attention_plugin or not use_gemm_plugin:
-            use_in_flight_batching = use_gpt_attention_plugin and remove_input_padding and paged_kv_cache
+            use_in_flight_batching = False
+            # Refer to modelConfig.h: supportsInflightBatching(), this should be consistent its implementation.
+            # We skip check transformer or rnn arch for simplification.
+            if remove_input_padding and use_gpt_attention_plugin:
+                use_in_flight_batching = kv_cache_type in [
+                    KVCacheType.PAGED, KVCacheType.DISABLED
+                ]
+            elif remove_input_padding and use_mamba_conv1d_plugin:
+                use_in_flight_batching = paged_state == True
+
             res = not use_in_flight_batching
+
         return res
 
     @staticmethod
@@ -66,17 +81,17 @@ class GenerationMixin:
 
     @staticmethod
     def get_profiles_ranges(
-        *,
-        max_batch_size,
-        max_beam_width,
-        max_input_len,
-        max_num_tokens,
-        max_draft_len,
-        opt_batch_size,
-        opt_num_tokens,
-        enable_ctx_gen_opt_profiles,
-        multiple_profiles,
-    ):
+            *,
+            max_batch_size,
+            max_beam_width,
+            max_input_len,
+            max_num_tokens,
+            max_draft_len,
+            opt_batch_size,
+            opt_num_tokens,
+            enable_ctx_gen_opt_profiles,
+            multiple_profiles,
+            kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS):
         default_range = GenerationMixin.default_range
         if opt_batch_size:
             bb_range_cxt = [1, opt_batch_size, max_batch_size]
@@ -112,6 +127,19 @@ class GenerationMixin:
             num_tokens_range_gen = default_range(
                 max_batch_size * max(tokens_per_engine_step, max_beam_width))
             num_tokens_range = [num_tokens_range_ctx, num_tokens_range_gen]
+
+            # Only keep context range when kv cache is disabled.
+            if kv_cache_type == KVCacheType.DISABLED:
+                num_profiles = 1
+                bb_range = [bb_range[0]]
+                bbd_range = [bbd_range[0]]
+                inlen_range = [inlen_range[0]]
+                position_ids_inlen_range = [position_ids_inlen_range[0]]
+                num_tokens_range_ctx = [num_tokens_range_ctx[0]]
+                # Draft tokens cannot be combined with beam search
+                num_tokens_range_gen = [num_tokens_range_gen[0]]
+                num_tokens_range = [num_tokens_range[0]]
+
         else:
             if multiple_profiles:
                 num_tokens_range = GenerationMixin.split_num_tokens_range(
@@ -148,14 +176,13 @@ class GenerationMixin:
                                  head_size,
                                  num_layers,
                                  kv_dtype,
+                                 kv_cache_type: KVCacheType,
                                  num_profiles=1,
                                  enable_ctx_gen_opt_profiles=False,
                                  remove_input_padding=False,
                                  use_gpt_attention_plugin=False,
-                                 paged_kv_cache=False,
                                  tokens_per_block=64,
                                  mapping=Mapping(),
-                                 use_cache=True,
                                  streamingllm=False,
                                  attn_layer_idx=None,
                                  opt_batch_size=None):
@@ -178,7 +205,7 @@ class GenerationMixin:
         _mask_len_ctx = default_range(max_input_len)
         _kv_cache_range_ctx = [0, 0, 0]
         _kv_cache_range_gen = default_range(max_seq_len, -1)
-        if not paged_kv_cache:
+        if kv_cache_type == KVCacheType.DISABLED:
             _kv_cache_range = default_range(max_seq_len)
         else:
             kv_max_seq_len = max_seq_len
@@ -191,13 +218,23 @@ class GenerationMixin:
             _kv_cache_range = default_range(kv_max_seq_len)
 
         if enable_ctx_gen_opt_profiles:
-            assert num_profiles == 2
-            bb_range = [bb_range_cxt, bb_range_gen]
-            mask_len_range = [_mask_len_ctx, _max_len_range]
-            if use_gpt_attention_plugin:
-                kv_cache_range = [_kv_cache_range, _kv_cache_range]
+            if kv_cache_type != KVCacheType.DISABLED:
+                assert num_profiles == 2
+                bb_range = [bb_range_cxt, bb_range_gen]
+                mask_len_range = [_mask_len_ctx, _max_len_range]
+                if use_gpt_attention_plugin:
+                    kv_cache_range = [_kv_cache_range, _kv_cache_range]
+                else:
+                    kv_cache_range = [_kv_cache_range_ctx, _kv_cache_range_gen]
             else:
-                kv_cache_range = [_kv_cache_range_ctx, _kv_cache_range_gen]
+                assert num_profiles == 1
+                bb_range = [bb_range_cxt]
+                mask_len_range = [_mask_len_ctx]
+                if use_gpt_attention_plugin:
+                    kv_cache_range = [_kv_cache_range]
+                else:
+                    kv_cache_range = [_kv_cache_range_ctx]
+
         else:
             bb_range = [bb_range_gen] * num_profiles
             mask_len_range = [_max_len_range] * num_profiles
@@ -215,8 +252,11 @@ class GenerationMixin:
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
         host_kv_cache_pool_pointers = None
-        if use_cache:
-            if not paged_kv_cache:
+        if kv_cache_type == KVCacheType.DISABLED:
+            for i in layers_range:
+                past_key_value.append(None)
+        else:
+            if kv_cache_type != KVCacheType.PAGED:
                 for i in layers_range:
                     kv_dim_range = OrderedDict([
                         ('batch_size_beam_width', bb_range),
@@ -281,6 +321,7 @@ class GenerationMixin:
                 for i in layers_range:
                     past_key_value.append(None)
 
+        assert len(past_key_value) == len(layers_range)
         sequence_length = None
         context_lengths = None
         host_context_lengths = None
@@ -293,7 +334,7 @@ class GenerationMixin:
         runtime_perf_knobs = None
 
         if use_gpt_attention_plugin:
-            if use_cache:
+            if kv_cache_type != KVCacheType.DISABLED:
                 sequence_length = Tensor(
                     name='sequence_length',
                     dtype=trt.int32,
@@ -308,7 +349,7 @@ class GenerationMixin:
                 shape=[-1],
                 dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
             )
-            if use_cache:
+            if kv_cache_type != KVCacheType.DISABLED:
                 host_past_key_value_lengths = Tensor(
                     name='host_past_key_value_lengths',
                     dtype=trt.int32,
@@ -364,7 +405,7 @@ class GenerationMixin:
                                                 ('scalar', [1] * num_profiles)
                                             ]))
 
-        if use_cache:
+        if kv_cache_type != KVCacheType.DISABLED:
             cache_indirection = Tensor(
                 name='cache_indirection',
                 dtype=trt.int32,
@@ -406,10 +447,10 @@ class GenerationMixin:
             head_size,
             num_layers,
             kv_dtype,
+            kv_cache_type: KVCacheType,
             remove_input_padding=False,
             use_gpt_attention_plugin=False,
             use_gemm_plugin=False,
-            paged_kv_cache=False,
             tokens_per_block=64,
             gather_context_logits=False,
             gather_generation_logits=False,
@@ -429,8 +470,10 @@ class GenerationMixin:
             opt_batch_size=None):
 
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
-            use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
-            paged_kv_cache)
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
+            remove_input_padding=remove_input_padding,
+            kv_cache_type=kv_cache_type)
 
         num_profiles, ranges = GenerationMixin.get_profiles_ranges(
             max_batch_size=max_batch_size,
@@ -441,7 +484,8 @@ class GenerationMixin:
             opt_batch_size=opt_batch_size,
             opt_num_tokens=opt_num_tokens,
             enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
-            multiple_profiles=multiple_profiles)
+            multiple_profiles=multiple_profiles,
+            kv_cache_type=kv_cache_type)
         bb_range = ranges['bb_range']
         bbd_range = ranges['bbd_range']
         inlen_range = ranges['inlen_range']
@@ -725,7 +769,7 @@ class GenerationMixin:
             enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
-            paged_kv_cache=paged_kv_cache,
+            kv_cache_type=kv_cache_type,
             tokens_per_block=tokens_per_block,
             mapping=mapping,
             streamingllm=streamingllm,

@@ -73,13 +73,13 @@ public:
 
     using ElementC = typename ThreadEpilogueOp::ElementC;
     using StrideC = StrideC_;
-    using UnderlyingStrideC = cute::remove_pointer_t<StrideC>;
+    using InternalStrideC = cute::remove_pointer_t<StrideC>;
     using ElementD = ElementD_;
     using StrideD = StrideD_;
-    using UnderlyingStrideD = cute::remove_pointer_t<StrideD>;
+    using InternalStrideD = cute::remove_pointer_t<StrideD>;
 
-    static_assert(!is_same_v<UnderlyingStrideC, StrideC>, "Stride C must be a pointer");
-    static_assert(is_same_v<UnderlyingStrideD, StrideD>, "Stride D must not be a pointer");
+    static_assert(!is_same_v<InternalStrideC, StrideC>, "Stride C must be a pointer");
+    static_assert(is_same_v<InternalStrideD, StrideD>, "Stride D must not be a pointer");
 
     using CopyAtomR2S = Copy_Atom<CopyOpR2S, ElementAccumulator>;
     using CopyAtomS2R = Copy_Atom<CopyOpS2R, ElementAccumulator>;
@@ -154,7 +154,7 @@ public:
                 auto problem_shape_MNKL = append<4>(problem_shape.get_host_problem_shape(i), 1);
                 auto [M, N, K, L] = problem_shape_MNKL;
                 implementable = implementable
-                    && cutlass::detail::check_alignment<AlignmentD>(cute::make_shape(M, N, L), UnderlyingStrideD{});
+                    && cutlass::detail::check_alignment<AlignmentD>(cute::make_shape(M, N, L), InternalStrideD{});
             }
         }
 
@@ -241,7 +241,7 @@ public:
 
         // Represent the full output tensor
         ElementC const* ptr_C = epilogue_op.is_source_needed() ? params.ptr_C[l_coord] : nullptr;
-        auto dC = epilogue_op.is_source_needed() ? params.dC[l_coord] : UnderlyingStrideC{};
+        auto dC = epilogue_op.is_source_needed() ? params.dC[l_coord] : InternalStrideC{};
         Tensor mC_mnl = make_tensor(make_gmem_ptr(ptr_C), make_shape(M, N, mock_L), dC);        // (m,n,l)
         Tensor mD_mnl = make_gather_tensor(
             make_gmem_ptr(params.ptr_D), make_shape(M, N, mock_L), params.dD, get_scatter_idx); // (m,n,l)
@@ -506,7 +506,37 @@ struct EpilogueMoeFusedFinalizeBuilder
     using CopyAtomS2R = DefaultCopy;
     using CopyAtomR2G = decltype(detail::get_vectorized_atomic_add_op<ElementD, EpiTileN>());
 
-    using CollectiveOp = detail::Sm90TmaWarpSpecializedAdapter<
+    template <class EpilogueOp>
+    struct Sm90TmaWarpSpecializedAdapterWithSmemStorage : detail::Sm90TmaWarpSpecializedAdapter<EpilogueOp>
+    {
+        // We need to override this one using declaration because otherwise we double up on the smem
+        using TensorMapStorage = typename EpilogueOp::TensorMapStorage;
+
+        using Base = detail::Sm90TmaWarpSpecializedAdapter<EpilogueOp>;
+
+        CUTLASS_HOST_DEVICE
+        Sm90TmaWarpSpecializedAdapterWithSmemStorage(
+            typename EpilogueOp::Params const& params, [[maybe_unused]] typename Base::TensorStorage& shared_tensors)
+            : Base(params)
+        {
+        }
+
+        // These functions depend on the type of TensorMapStorage
+        template <bool IsLoad>
+        CUTLASS_DEVICE void tensormaps_perform_update([[maybe_unused]] TensorMapStorage& shared_tensormap,
+            [[maybe_unused]] typename EpilogueOp::Params const& params,
+            [[maybe_unused]] cute::TmaDescriptor const* tensormap, [[maybe_unused]] int32_t next_batch)
+        {
+        }
+
+        template <bool IsLoad>
+        CUTLASS_DEVICE void tensormaps_cp_fence_release([[maybe_unused]] TensorMapStorage& shared_tensormap,
+            [[maybe_unused]] cute::TmaDescriptor const* tensormap, [[maybe_unused]] uint32_t lane_predicate)
+        {
+        }
+    };
+
+    using CollectiveOp = Sm90TmaWarpSpecializedAdapterWithSmemStorage<
         EpilogueMoeFusedFinalize<StrideC, ElementD, StrideD, ThreadEpilogueOp, ElementBias, StrideBias, ElementScale,
             StrideScale, EpilogueTile, SmemLayoutAtomD, CopyAtomR2S, CopyAtomS2R, CopyAtomR2G>>;
 };

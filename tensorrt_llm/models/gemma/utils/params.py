@@ -22,13 +22,12 @@ open sourcing.
 import functools
 from typing import Any
 
-import orbax.checkpoint
-
 Params = dict[str, Any]
 
 
 @functools.cache
 def load_params(path: str) -> Params:
+    import orbax.checkpoint
     """Loads parameters from a checkpoint path."""
     checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     params = checkpointer.restore(path)

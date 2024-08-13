@@ -120,11 +120,17 @@ public:
     //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
     //! ids without padding for request `batchIdx`, on gpu
-    [[nodiscard]] virtual TensorPtr getOutputIds(SizeType32 batchIdx) const = 0;
+    [[nodiscard]] virtual TensorPtr getIds(SizeType32 batchIdx) const = 0;
+
+    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], only used for beam search in
+    //! GptDecoderBatched It contains gathered token ids without padding, on gpu
+    [[nodiscard]] virtual TensorPtr getGatheredIds(SizeType32 batchIdx) const = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
-    [[nodiscard]] virtual CudaEvent finalize(SizeType32 batchIdx, SamplingConfig const& samplingConfig) const = 0;
+    [[nodiscard]] virtual CudaEvent finalize(
+        SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const
+        = 0;
 
     //! @returns [batchSize (actual)], marks finished requests (per batch)
     [[nodiscard]] virtual std::vector<bool> getFinished() const = 0;

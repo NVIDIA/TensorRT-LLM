@@ -284,7 +284,7 @@ def main(args):
     if args.stop_words:
         stop_words_list = tensorrt_llm.runtime.decode_words_list(
             args.stop_words, tokenizer)
-    if model_version == 'glm-4':  # add default stop token ids for GLM-4
+    if model_version == 'glm4':  # add default stop token ids for GLM-4
         glm4_stop_ids = [[151329], [151336], [151338]]
         if stop_words_list is None:
             stop_words_list = [glm4_stop_ids] * len(batch_input_ids)
@@ -349,6 +349,7 @@ def main(args):
         debug_mode=args.debug_mode,
         lora_ckpt_source=args.lora_ckpt_source,
         gpu_weights_percent=args.gpu_weights_percent,
+        max_output_len=args.max_output_len,
     )
     if not args.use_py_session:
         runner_kwargs.update(is_enc_dec=is_enc_dec)
@@ -362,7 +363,6 @@ def main(args):
             max_batch_size=len(batch_input_ids),
             max_input_len=max(
                 encoder_input_lengths if is_enc_dec else input_lengths),
-            max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,

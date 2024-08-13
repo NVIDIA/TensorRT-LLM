@@ -1166,15 +1166,13 @@ def quantize(hf_model_dir: str,
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
-    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
-
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config.to_dict(), f, indent=4)
+    os.makedirs(output_dir, exist_ok=True)
+    config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
-    assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
-    quant_config = config.quantization
+    assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
+    quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == "INT8"
 

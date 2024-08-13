@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import datetime
+import math
 import secrets
 import threading
 import time
@@ -480,9 +481,28 @@ class ExecutorBindingsWorker(GenerationExecutor):
             for response in self.engine.await_responses(
                     timeout=datetime.timedelta(milliseconds=100)):
                 req_id = response.request_id
+
+                # If the req_id is not returned from enqueue_request in the main thread, wait.
+                # TODO[chunweiy]: use a pending list instead.
+                sleep_interval = 0.01
+                repeat_for_wait = math.ceil(
+                    2 /
+                    sleep_interval)  # We will wait for 2s for a single req_id
+
+                if req_id not in self._results:
+                    for i in range(repeat_for_wait):
+                        time.sleep(sleep_interval)
+                        if req_id in self._results:
+                            break
+                    else:
+                        if req_id not in self._results:
+                            raise RuntimeError(
+                                f"Request ID {req_id} not found in the results queue."
+                            )
+
+                queue = self.return_queue(req_id)
                 if response.has_error():
-                    self.return_queue(req_id).put(
-                        (req_id, None, None, response.error_msg))
+                    queue.put((req_id, None, None, response.error_msg))
                 else:
                     tensors = (
                         response.result.output_token_ids,
@@ -491,9 +511,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
                         response.result.log_probs,
                         response.result.cum_log_probs,
                     )
-                    self.return_queue(req_id).put(
-                        (response.request_id, tensors, response.result.is_final,
-                         None))
+                    queue.put((response.request_id, tensors,
+                               response.result.is_final, None))
                     if response.result.is_final:
                         self._pending.remove(req_id)
 

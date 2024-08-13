@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+import weakref
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -27,6 +28,7 @@ from ._utils import (copy_torch_to_numpy, np_dtype_to_trt, str_dtype_to_trt,
                      torch_to_numpy, trt_dtype_to_np, trt_dtype_to_torch)
 from .functional import Tensor, constant
 from .logger import logger
+from .network import Network
 
 
 class Parameter:
@@ -36,7 +38,8 @@ class Parameter:
                  value: Optional[Union[np.ndarray, torch.Tensor]] = None,
                  shape: Sequence[int] = None,
                  dtype: Union[str, trt.DataType] = None,
-                 is_buffer: bool = False):
+                 is_buffer: bool = False,
+                 prefer_managed=False):
         if dtype is None:
             logger.warning(
                 f'Parameter dtype is None, using default dtype: {self._DEFAULT_DTYPE}, it is recommended to always specify dtype explicitly'
@@ -55,6 +58,9 @@ class Parameter:
             self._shape = value.shape
             self._value = self._regularize_value(value)
         self.is_buffer = is_buffer
+        self._prefer_managed = prefer_managed
+        self._tensor: Tensor = None
+        self._network: weakref.ref = None
 
     @property
     def shape(self):
@@ -65,18 +71,78 @@ class Parameter:
         return self._dtype
 
     @property
-    def value(self) -> Tensor:
+    def name(self):
+        return self._name
+
+    # need_transpose is WAR for bug 4641821
+    def _create_managed_tensor(self, network, need_transpose=False) -> Tensor:
+        num = len(network._inputs)
+        name = f"managed_constant_{num}"
+        self._name = name
+        shape = self._shape
+        if need_transpose:
+            assert len(shape) == 2
+            shape = list(reversed(shape))
+
+        if self._value is None or (isinstance(self._value, np.ndarray)
+                                   and not self._value.flags['C_CONTIGUOUS']):
+            network._register_unfilled_weights(
+                # use updated self._shape here
+                name,
+                np.empty(self._shape, trt_dtype_to_np(self._dtype)),
+                self._value)
+        return Tensor(name=name, dtype=self._dtype, shape=shape)
+
+    def get_managed_tensor(self,
+                           network: Network,
+                           need_transpose=False) -> Tensor:
+        if self._network is None or self._network() != network:
+            self._network = weakref.ref(network)
+            self._tensor = network.get_parameter_tensor(self)
+            if self._tensor is None:
+                self._tensor = self._create_managed_tensor(
+                    network, need_transpose)
+                network.set_parameter_tensor(self, self._tensor)
+        return self._tensor
+
+    def _create_constant_tensor(self) -> Tensor:
         if (self._value is not None and isinstance(self._value, np.ndarray)
                 and self._value.flags['C_CONTIGUOUS']):
-            self._value = constant(self._value)
+            return constant(self._value)
+
         elif self._value is None or isinstance(self._value, np.ndarray):
-            dtype = trt_dtype_to_np(self.dtype)
-            ndarray = np.empty(self.shape, dtype)
-            value = self._value
-            self._value = constant(ndarray)
-            default_net()._register_unfilled_weights(self._value.producer.name,
-                                                     ndarray, value)
-        return self._value
+            shape = self._shape
+            dtype = trt_dtype_to_np(self._dtype)
+            ndarray = np.empty(shape, dtype)
+            tensor = constant(ndarray)
+            default_net()._register_unfilled_weights(tensor.producer.name,
+                                                     ndarray, self._value)
+            return tensor
+
+    def get_constant_tensor(self, network: Network) -> Tensor:
+        if self._network is None or self._network() != network:
+            self._network = weakref.ref(network)
+            self._tensor = network.get_parameter_tensor(self)
+            if self._tensor is None:
+                self._tensor = self._create_constant_tensor()
+                self._name = self._tensor.producer.name
+                network.set_parameter_tensor(self, self._tensor)
+        return self._tensor
+
+    def get_tensor(self, network) -> Tensor:
+        if self.is_managed(network):
+            return self.get_managed_tensor(network)
+        else:
+            return self.get_constant_tensor(network)
+
+    def is_managed(self, network):
+        if network is None:
+            network = default_net()
+        return self._prefer_managed and network.plugin_config.manage_weights
+
+    @property
+    def value(self) -> Tensor:
+        return self.get_tensor(default_net())
 
     @classmethod
     def xavier_init(cls, weights: np.ndarray):
@@ -149,10 +215,22 @@ class Parameter:
 
         self.value = v
 
-    def _get_weights(self) -> trt.Weights:
-        if isinstance(self._value, Tensor):
-            self._value.producer.__class__ = trt.IConstantLayer
-            return self._value.producer.weights
+    def set_name(self, name: str, network):
+        self._name = name
+        if self.is_managed(network):
+            self._get_weights(network).name = name
+            return True
+        else:
+            return network.trt_network.set_weights_name(
+                self._get_weights(network), name)
+
+    def _get_weights(self, network) -> trt.Weights | Tensor | None:
+        tensor = network.get_parameter_tensor(self)
+        if self.is_managed(network):
+            return tensor
+        elif tensor is not None:
+            tensor.producer.__class__ = trt.IConstantLayer
+            return tensor.producer.weights
         else:
             return None
 

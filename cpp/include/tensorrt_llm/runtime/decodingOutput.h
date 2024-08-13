@@ -59,8 +59,9 @@ public:
 
     static float constexpr kNegativeInfinity = -1e20f;
 
-    explicit DecodingOutput(TensorPtr ids)
+    explicit DecodingOutput(TensorPtr ids, TensorPtr gatheredIds)
         : ids{std::move(ids)}
+        , gatheredIds{std::move(gatheredIds)}
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->ids), "Invalid ids tensor");
     }
@@ -68,6 +69,11 @@ public:
     // mandatory parameters
     TensorPtr ids;                       // [BS, BM, MSL], contains previously generated token ids for all
                                          // steps before DecodingInput.step
+
+    TensorPtr gatheredIds;               // [BS, BM, MSL], these are the tokens computed during the gatherTree step
+                                         // When doing beam search and streaming, this second set of tokens is needed
+                                         // due to the beam search kernels assuming ungathered tokens (stored in `ids`).
+
     TensorPtr newTokensSteps;            // [maxTokensPerStep, BS, BM] new tokens at each generated token of
                                          // maxTokensPerStep
     TensorPtr newTokens;                 // [BS, BM] usually a view of newTokensSteps for the current token

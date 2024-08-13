@@ -151,6 +151,7 @@ enum class MemoryType
 {
     kCPU,
     kCPU_PINNED,
+    kCPU_PINNEDPOOL,
     kGPU,
     kUVM,
     kUNKNOWN

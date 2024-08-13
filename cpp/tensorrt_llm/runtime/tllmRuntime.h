@@ -24,6 +24,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -118,6 +120,7 @@ public:
     bool hasLayerProfiler(SizeType32 contextId) const;
     std::string getLayerProfileInfo() const;
     void reportToProfiler(SizeType32 contextId);
+    void loadManagedWeights(std::string const& weightsPath);
 
 private:
     BufferManager::CudaStreamPtr mStream;
@@ -130,5 +133,7 @@ private:
     std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
     std::unique_ptr<LayerProfiler> mLayerProfiler;
     bool mUseShapeInference;
+    TensorMap mManagedWeightsMap{};
+    std::set<SizeType32> mSetWeights;
 };
 } // namespace tensorrt_llm::runtime

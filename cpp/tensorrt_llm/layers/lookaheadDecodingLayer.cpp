@@ -138,7 +138,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
     }
 
     auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
-    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
     if (setupParams->randomSeed)
     {
         auto& randomSeed = setupParams->randomSeed.value();
@@ -181,7 +181,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(
     TLLM_CHECK(inputs->logits);
 
     mBufferManager->copy(
-        bufferCast<SizeType32>(*inputs->batchSlots.value()), *mCpuAlgo->mBatchSlots, runtime::MemoryType::kGPU);
+        bufferCast<SizeType32>(*inputs->batchSlots), *mCpuAlgo->mBatchSlots, runtime::MemoryType::kGPU);
     mBufferManager->copy(bufferCast<SizeType32>(*inputs->curTokensPerStep.value()), *mCpuAlgo->mTokensPerStep,
         runtime::MemoryType::kGPU);
     mBufferManager->copy(bufferCast<TokenIdType>(*inputs->endIds), *mCpuAlgo->mEndIds, runtime::MemoryType::kGPU);
@@ -196,7 +196,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(
     params.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     params.maxSeqLen = mDecoderDomain.getMaxDecodingTokens();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.batchSlots = bufferCast<SizeType32>(*inputs->batchSlots.value());
+    params.batchSlots = bufferCast<SizeType32>(*inputs->batchSlots);
     TLLM_LOG_DEBUG("batchSize = %d", batchSize);
     params.logProbs = bufferCastOrNull<T>(inputs->logits);
     params.outputIds = bufferCast<TokenIdType>(*mTargetTokensDevice);

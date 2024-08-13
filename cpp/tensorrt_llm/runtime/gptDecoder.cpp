@@ -45,6 +45,7 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
     , mMaxBatchSize(maxBatchSize)
     , mDecodingMode{mode}
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
         maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
@@ -53,11 +54,12 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
                                        static_cast<SizeType32>(maxBatchSize), static_cast<SizeType32>(maxBeamWidth)}),
         nvFloatType);
     mManager->setZero(*mLogProbsTiled);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize,
-    std::optional<TensorConstPtr> const& batchSlots, std::optional<DecodingOutput> const& output)
+void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
+    std::optional<DecodingOutput> const& output)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -65,6 +67,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
 
     TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Sampling config is invalid");
+    TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots are mandatory to set up the decoder.");
 
     auto penaltyParams = std::make_shared<tl::PenaltySetupParams>();
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
@@ -135,7 +138,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
-    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots.value_or(nullptr), setupParams);
+    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots, setupParams);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -251,19 +254,21 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input
 {
     auto constexpr ite = 0;
 
+    TLLM_CHECK_WITH_INFO(input.batchSlots != nullptr, "Batch slots are mandatory to call the decoder.");
     std::shared_ptr<tl::DecodingInputs> forwardParams;
     if (decodingMode.isTopKorTopP())
     {
-        forwardParams = std::make_shared<tl::SamplingInputs>(input.endIds, input.step, ite, input.batchSize);
+        forwardParams
+            = std::make_shared<tl::SamplingInputs>(input.endIds, input.batchSlots, input.step, ite, input.batchSize);
     }
     else if (decodingMode.isBeamSearch())
     {
-        forwardParams = std::make_shared<tl::DecodingInputs>(
-            input.endIds, input.step, ite, input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
+        forwardParams = std::make_shared<tl::DecodingInputs>(input.endIds, input.batchSlots, input.step, ite,
+            input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
     }
     else if (decodingMode.isMedusa())
     {
-        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(input.endIds, input.batchSize);
+        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(input.endIds, input.batchSlots, input.batchSize);
     }
     else if (decodingMode.isLookahead())
     {
@@ -271,7 +276,8 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input
     }
     else if (decodingMode.isExplicitDraftTokens())
     {
-        forwardParams = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSize);
+        forwardParams
+            = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSlots, input.batchSize);
     }
 
     // No logits for explicit draft tokens
@@ -316,11 +322,6 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input
     if (input.finished)
     {
         forwardParams->finished = input.finished;
-    }
-
-    if (input.batchSlots)
-    {
-        forwardParams->batchSlots = input.batchSlots;
     }
 
     // Medusa
@@ -534,11 +535,11 @@ void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& inp
 
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 template <typename T>
-void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& decodingOutput,
-    DecodingInput const& decodingInput, BufferManager const& manager,
-    std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig)
+void GptDecoder<T>::gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
+    BufferManager const& manager, std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto& finalOutputIds = *decodingOutput.gatheredIds;
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
     auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
     auto const batchSize = finalOutputIdsShape.d[0];
@@ -559,6 +560,7 @@ void GptDecoder<T>::gatherTree(ITensor& finalOutputIds, DecodingOutput const& de
 
     auto const& stream = manager.getStream().get();
 
+    // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
     tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();

@@ -59,6 +59,7 @@
         "max_num_tokens": 2048,
         "opt_num_tokens": null,
         "max_prompt_embedding_table_size": 0,
+        "kv_cache_type": "PAGED",
         "gather_context_logits": false,
         "gather_generation_logits": false,
         "strongly_typed": true,

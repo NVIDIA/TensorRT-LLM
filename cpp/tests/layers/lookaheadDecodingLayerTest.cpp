@@ -624,10 +624,9 @@ void LookaheadDecodingLayerTest::decodeForward(void)
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
     PRINT_VALUES(mBatchSlots);
 
-    auto inputParams = std::make_shared<LookaheadDecodingInputs>(mEndIds);
+    auto inputParams = std::make_shared<LookaheadDecodingInputs>(mEndIds, mBatchSlots);
     inputParams->localBatchSize = batchSize;
     inputParams->logits = ITensor::slice(mProbs, 0, batchSize);
-    inputParams->batchSlots = mBatchSlots;
     inputParams->finished = mFinished; // TODO(liweim) ask finished protocol
     inputParams->curTokensPerStep = mTokensPerStep;
 

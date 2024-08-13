@@ -45,7 +45,6 @@ public:
 protected:
     TensorPtr mRuntimeTopKDevice;
     TensorPtr mRuntimeTopPDevice;
-    float mRuntimeMaxTopP{0.f};
     TensorPtr mInitialTopPDevice;
     TensorPtr mTopPDecayDevice;
     TensorPtr mTopPMinDevice;
@@ -55,7 +54,7 @@ protected:
     TensorPtr mSkipDecodeDevice;
     TensorPtr mSkipDecodeHost;
     runtime::SizeType32 mAirTopPBlockNum{0};
-    runtime::SizeType32 mWorkspaceSize{0};
+    size_t mWorkspaceSize{0};
 
     cudaDeviceProp mDeviceProp;
     bool mIsDeterministic{true};

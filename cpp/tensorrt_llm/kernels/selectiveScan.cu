@@ -413,7 +413,8 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::c
         *(void**) &descs_host[6] = (input_t*) mxCB;
         *(void**) &descs_host[7] = (input_t*) mxXBC; // X
 
-        cudaMemcpy(params.desc_ptr, descs_host, sizeof(CUtensorMap) * 8, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(params.desc_ptr, descs_host, sizeof(CUtensorMap) * 8, cudaMemcpyHostToDevice, stream);
+        cudaStreamSynchronize(stream); // to assure cudaMemcpyAsync is finished
     }
 
     CUtensorMap* descs = (CUtensorMap*) params.desc_ptr;

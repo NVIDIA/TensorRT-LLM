@@ -46,7 +46,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 |   chatglm3_6b    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
 | chatglm3_6b_base |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
 | chatglm3_6b_32k  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
-|     glm_10b      |   Y   |   Y   |   Y   |       |       |       |   Y   |       |   Y   |       |           |       |
+|     glm_10b      |   Y   |   Y   |   Y   |       |   Y   |   Y   |   Y   |       |   Y   |   Y   |     Y     |   Y   |
 |     glm_4_9b     |   Y   |   Y   |   Y   |       |       |       |   Y   |       |       |   Y   |           |       |
 |  glm_4_9b_chat   |   Y   |   Y   |   Y   |       |       |       |   Y   |       |       |   Y   |           |       |
 

@@ -20,6 +20,7 @@
 
 #include <NvInferRuntime.h>
 #include <filesystem>
+#include <optional>
 
 namespace tensorrt_llm::runtime
 {
@@ -60,8 +61,18 @@ public:
 
     [[nodiscard]] std::filesystem::path getPath() const
     {
-        TLLM_CHECK(mType == FilePath);
+        TLLM_CHECK(mEnginePath.has_value());
+        return mEnginePath.value();
+    }
+
+    [[nodiscard]] std::optional<std::filesystem::path> getPathOpt() const
+    {
         return mEnginePath;
+    }
+
+    void setPath(std::filesystem::path enginePath)
+    {
+        mEnginePath = std::move(enginePath);
     }
 
     [[nodiscard]] void const* getAddress() const
@@ -84,7 +95,7 @@ public:
 
 private:
     Type mType;
-    std::filesystem::path mEnginePath;
+    std::optional<std::filesystem::path> mEnginePath;
 
     struct
     {

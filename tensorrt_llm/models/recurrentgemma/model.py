@@ -27,7 +27,8 @@ from ...layers import (Attention, AttentionMaskType, AttentionParams,
 from ...module import Module, ModuleList
 from ...plugin import current_all_reduce_helper
 from ..generation_mixin import GenerationMixin
-from ..modeling_utils import PretrainedConfig, PretrainedModel
+from ..modeling_utils import (PretrainedConfig, PretrainedModel,
+                              get_kv_cache_type_from_legacy)
 
 
 class ResidualLayer(Module):
@@ -148,9 +149,11 @@ class RecurrentGemmaModel(Module):
         self.lru_width = config.rnn_hidden_size
         n_layer = config.num_hidden_layers
 
-        self.vocab_embedding = Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.dtype)
+        self.vocab_embedding = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.dtype,
+            share_embedding_table=config.share_embedding_table)
         self.layers = ModuleList(
             [ResidualLayer(config, layer_idx=i) for i in range(n_layer)])
 
@@ -440,11 +443,14 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
 
         self.gather_context_logits = gather_context_logits
         mapping = self.config.mapping
+        kv_cache_type = get_kv_cache_type_from_legacy(use_cache, paged_kv_cache)
 
         # basic inputs
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
-            use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
-            paged_kv_cache)
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
+            remove_input_padding=remove_input_padding,
+            kv_cache_type=kv_cache_type)
         num_profiles, ranges = GenerationMixin.get_profiles_ranges(
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -454,7 +460,8 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             opt_batch_size=opt_batch_size,
             opt_num_tokens=opt_num_tokens,
             enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
-            multiple_profiles=multiple_profiles)
+            multiple_profiles=multiple_profiles,
+            kv_cache_type=kv_cache_type)
 
         if remove_input_padding:
             assert use_mamba_conv1d_plugin, "mamba_conv1d_plugin is needed to support remove_input_padding"
@@ -512,7 +519,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
-            paged_kv_cache=paged_kv_cache,
+            kv_cache_type=kv_cache_type,
             tokens_per_block=tokens_per_block,
             mapping=mapping,
             streamingllm=streamingllm,

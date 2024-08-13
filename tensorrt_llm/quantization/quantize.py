@@ -93,6 +93,7 @@ def weight_only_quantize(model, quant_config: QuantConfig):
         if isinstance(module, ColumnLinear):
             module_name = name.rsplit('.', 1)[-1]
             init_params["transb"] = module_name == "lm_head"
+        init_params["tp_rank"] = model.config.mapping.tp_rank
 
     model = quantize_layers(
         model,
@@ -117,6 +118,7 @@ def weight_only_groupwise_quantize(model, quant_config: QuantConfig):
         init_params["zero"] = quant_config.has_zero_point
         init_params[
             "use_w4a8_awq"] = quant_config.quant_algo == QuantAlgo.W4A8_AWQ
+        init_params["tp_rank"] = model.config.mapping.tp_rank
 
     model = quantize_layers(
         model,

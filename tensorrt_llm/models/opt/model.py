@@ -112,9 +112,11 @@ class OPTModel(Module):
         super().__init__()
         self.do_layer_norm_before = config.do_layer_norm_before
 
-        self.vocab_embedding = Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.dtype)
+        self.vocab_embedding = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.dtype,
+            share_embedding_table=config.share_embedding_table)
         self.position_embedding = Embedding(config.max_position_embeddings,
                                             config.hidden_size,
                                             dtype=config.dtype)

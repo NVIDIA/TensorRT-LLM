@@ -52,6 +52,7 @@ class BloomDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
+            reorder=True,
             quant_mode=config.quant_mode)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -107,9 +108,11 @@ class BloomModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.vocab_embedding = Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         dtype=config.dtype)
+        self.vocab_embedding = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.dtype,
+            share_embedding_table=config.share_embedding_table)
         self.ln_embed = LayerNorm(normalized_shape=config.hidden_size,
                                   dtype=config.dtype)
         self.layers = DecoderLayerList(BloomDecoderLayer, config)

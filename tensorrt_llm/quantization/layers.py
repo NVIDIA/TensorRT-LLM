@@ -17,9 +17,11 @@ from typing import Optional
 
 import numpy as np
 import tensorrt as trt
+import torch
+import torch.nn.functional as F
 
 from .._common import default_net, precision
-from .._utils import fp32_array, is_same_dtype
+from .._utils import fp32_array, is_same_dtype, str_dtype_to_torch
 from ..functional import (ACT2FN, AllReduceFusionOp, AllReduceFusionParams,
                           AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, allgather, allreduce, cast,
@@ -31,7 +33,8 @@ from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
 from ..parameter import Parameter
-from .functional import (dequantize, fp8_rowwise_gemm, fp8_rowwise_rms_norm,
+from .functional import (change_qkv_leading_dim, dequantize, fp8_rowwise_gemm,
+                         fp8_rowwise_rms_norm, postprocess_weight_only,
                          quantize, quantize_fp8_per_token, quantize_per_token,
                          quantize_tensor, smooth_quant_gemm,
                          smooth_quant_layer_norm, smooth_quant_rms_norm,
@@ -530,17 +533,19 @@ class Fp8RowwiseRowLinear(RowLinear):
 class WeightOnlyQuantLinear(Linear):
 
     def __init__(
-            self,
-            in_features,
-            out_features,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            gather_output=True,
-            quant_mode=QuantMode.use_weight_only(),
-            transa=False,
-            transb=False,
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        tp_rank=0,
+        gather_output=True,
+        quant_mode=QuantMode.use_weight_only(),
+        transa=False,
+        transb=False,
+        is_qkv=False,
     ):
         super().__init__(in_features,
                          out_features,
@@ -548,7 +553,8 @@ class WeightOnlyQuantLinear(Linear):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         gather_output=gather_output)
+                         gather_output=gather_output,
+                         is_qkv=is_qkv)
         if quant_mode.is_int8_weight_only():
             self.weight_only_quant_mode = 1
             quant_type_size_in_bits = 8
@@ -566,6 +572,7 @@ class WeightOnlyQuantLinear(Linear):
 
         self.transa = transa
         self.transb = transb
+        self.tp_rank = tp_rank
 
     def forward(self, x, lora_runtime_params=None):
         # ootb has not supported int4 yet.
@@ -593,6 +600,20 @@ class WeightOnlyQuantLinear(Linear):
 
         return x
 
+    def postprocess(self,
+                    tllm_key,
+                    weights,
+                    using_head_as_leading_dim=False,
+                    num_heads=-1):
+        if "per_channel_scale" in tllm_key:
+            return {}
+        weights = super().postprocess(tllm_key, weights,
+                                      using_head_as_leading_dim,
+                                      num_heads)[tllm_key]
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        return postprocess_weight_only(tllm_key, weights,
+                                       self.weight_only_quant_mode)
+
 
 WeightOnlyQuantColumnLinear = WeightOnlyQuantLinear
 
@@ -607,6 +628,7 @@ class WeightOnlyQuantRowLinear(RowLinear):
             dtype=None,
             tp_group=None,
             tp_size=1,
+            tp_rank=0,
             quant_mode=QuantMode.use_weight_only(),
     ):
         super().__init__(in_features,
@@ -626,6 +648,7 @@ class WeightOnlyQuantRowLinear(RowLinear):
                                 dtype="int8")
         self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                            dtype=dtype)
+        self.tp_rank = tp_rank
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         hidden_state = x
@@ -657,6 +680,13 @@ class WeightOnlyQuantRowLinear(RowLinear):
             x = x + self.bias.value
 
         return x
+
+    def postprocess(self, tllm_key, weights):
+        if "per_channel_scale" in tllm_key:
+            return {}
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        return postprocess_weight_only(tllm_key, weights,
+                                       self.weight_only_quant_mode)
 
 
 class WeightOnlyQuantEmbedding(Embedding):
@@ -707,6 +737,30 @@ class WeightOnlyQuantEmbedding(Embedding):
         return result
 
 
+def unpack_int32_into_int8(w_packed):
+    # Unpack inputs packed in int32/float32 into uint4 and store them in int8 format
+    w_packed_int4x2 = w_packed.contiguous().view(torch.uint8)
+    w_unpacked = torch.zeros(w_packed_int4x2.shape[0],
+                             w_packed_int4x2.shape[1] * 2,
+                             dtype=torch.int8)
+    w_unpacked[:, ::2] = w_packed_int4x2 % 16
+    w_unpacked[:, 1::2] = w_packed_int4x2 // 16
+    return w_unpacked.contiguous()
+
+
+def pad_like(w, target_shape, value=0):
+    if w.shape == target_shape:
+        return w
+    else:
+        if w.dim() == 1:
+            return F.pad(w, (0, max(0, target_shape[-1] - w.shape[-1])),
+                         value=value)
+        else:
+            return F.pad(w, (0, max(0, target_shape[-1] - w.shape[-1]), 0,
+                             max(0, target_shape[-2] - w.shape[-2])),
+                         value=value)
+
+
 class WeightOnlyGroupwiseQuantLinear(Linear):
 
     def __init__(
@@ -720,9 +774,19 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         gather_output=True,
         use_w4a8_awq=False,
+        is_qkv=False,
     ):
+        multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
+        self.is_padded = False
+        if in_features % multiple > 0:
+            in_features = math.ceil(in_features / multiple) * multiple
+            self.is_padded = True
+        if out_features % multiple > 0:
+            out_features = math.ceil(out_features / multiple) * multiple
+            self.is_padded = True
 
         super().__init__(in_features,
                          out_features,
@@ -730,7 +794,8 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         gather_output=gather_output)
+                         gather_output=gather_output,
+                         is_qkv=is_qkv)
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
@@ -746,6 +811,10 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
+        self.transposed_weight = True
+        self.tp_rank = tp_rank
+        if self.is_padded:
+            self.tp_dim = -1
 
         if pre_quant_scale:
             self.prequant_scaling_factor = Parameter(shape=(1,
@@ -763,6 +832,16 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
             self.alpha = Parameter(shape=(1, ), dtype="float32")
         else:
             self.register_parameter('alpha', None)
+
+        if pre_quant_scale:
+            self.tllm_to_externel_key_dict = {
+                "weight":
+                ["weight", "weight_scaling_factor", "prequant_scaling_factor"]
+            }  # AWQ
+        else:
+            self.tllm_to_externel_key_dict = {
+                "weight": ["qweight", "qzeros", "scales"]
+            }  # GPTQ
 
     def forward(self, x, lora_runtime_params=None):
         pre_quant_scale = self.prequant_scaling_factor.value if self.prequant_scaling_factor else None
@@ -787,6 +866,74 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
 
         return x
 
+    def postprocess(self,
+                    tllm_key,
+                    weights,
+                    using_head_as_leading_dim=False,
+                    num_heads=-1):
+        if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
+            return {}
+        if self.is_qkv and type(weights) is list and len(weights) > 3:
+            weights = [
+                torch.cat(weights[i::len(weights) // 3], dim=1)
+                for i in range(len(weights) // 3)
+            ]
+
+        if tllm_key.endswith("bias"):
+            if self.is_padded:
+                weights = torch.split(weights, self.out_features,
+                                      0)[self.tp_rank]
+                weights = pad_like(weights, self.bias.shape)
+            if using_head_as_leading_dim:
+                weights = change_qkv_leading_dim(weights, num_heads)
+            return weights
+        elif tllm_key.endswith("weight"):
+            qweight_int32, qzeros_int32, scales_fp16 = weights
+            qweight_unpacked_int8 = unpack_int32_into_int8(
+                qweight_int32.T).T.contiguous() - 8
+            qweight = qweight_unpacked_int8
+            qweight[qweight < 0] += 16
+            qweight = qweight.view(torch.uint8)
+            if using_head_as_leading_dim:
+                qweight = change_qkv_leading_dim(qweight, num_heads)
+                scales_fp16 = change_qkv_leading_dim(scales_fp16, num_heads)
+            if self.is_padded:
+                qweight = torch.split(qweight, self.out_features,
+                                      1)[self.tp_rank]
+                qweight = pad_like(qweight,
+                                   (self.in_features, self.out_features))
+            qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+            qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
+                qweight.contiguous(), torch.quint4x2,
+                torch.float16).view(str_dtype_to_torch(self.dtype))
+            # zeros = zeros * scales
+            qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
+            if using_head_as_leading_dim:
+                qzeros_unpacked_int32 = change_qkv_leading_dim(
+                    qzeros_unpacked_int32, num_heads)
+            if self.is_padded:
+                scales_fp16 = torch.split(scales_fp16,
+                                          self.weights_scaling_factor.shape[1],
+                                          1)[self.tp_rank]
+                qzeros_unpacked_int32 = torch.split(
+                    qzeros_unpacked_int32, self.weights_scaling_factor.shape[1],
+                    1)[self.tp_rank]
+                scales_fp16 = pad_like(scales_fp16,
+                                       self.weights_scaling_factor.shape, 1)
+                qzeros_unpacked_int32 = pad_like(qzeros_unpacked_int32,
+                                                 self.zero.shape)
+            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 7) * scales_fp16
+            zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
+                str_dtype_to_torch(self.dtype))
+
+            results = {
+                tllm_key: qweight,
+                tllm_key.replace("weight", "weights_scaling_factor"):
+                scales_fp16,
+                tllm_key.replace("weight", "zero"): zeros_x_scales_fp16,
+            }
+            return results
+
 
 WeightOnlyGroupwiseQuantColumnLinear = WeightOnlyGroupwiseQuantLinear
 
@@ -804,8 +951,25 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
         use_w4a8_awq=False,
     ):
+        multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
+        self.is_padded = False
+        if in_features % multiple > 0:
+            in_features = math.ceil(in_features / multiple) * multiple
+            self.is_padded = True
+        if out_features % multiple > 0:
+            out_features = math.ceil(out_features / multiple) * multiple
+            self.is_padded = True
+        multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
+        self.is_padded = False
+        if in_features % multiple > 0:
+            in_features = math.ceil(in_features / multiple) * multiple
+            self.is_padded = True
+        if out_features % multiple > 0:
+            out_features = math.ceil(out_features / multiple) * multiple
+            self.is_padded = True
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -827,6 +991,14 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
+        self.transposed_weight = True
+        self.tp_rank = tp_rank
+        if self.is_padded:
+            self.tp_dim = -1
+        self.transposed_weight = True
+        self.tp_rank = tp_rank
+        if self.is_padded:
+            self.tp_dim = -1
 
         if pre_quant_scale:
             self.prequant_scaling_factor = Parameter(shape=(1,
@@ -844,6 +1016,16 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
             self.alpha = Parameter(shape=(1, ), dtype="float32")
         else:
             self.register_parameter('alpha', None)
+
+        if pre_quant_scale:
+            self.tllm_to_externel_key_dict = {
+                "weight":
+                ["weight", "weight_scaling_factor", "prequant_scaling_factor"]
+            }  # AWQ
+        else:
+            self.tllm_to_externel_key_dict = {
+                "weight": ["qweight", "qzeros", "scales"]
+            }  # GPTQ
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         pre_quant_scale = self.prequant_scaling_factor.value if self.prequant_scaling_factor else None
@@ -868,6 +1050,56 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
                           reduce_fusion_params=reduce_fusion_params)
 
         return x
+
+    def postprocess(self, tllm_key, weights):
+        if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
+            return {}
+        if tllm_key.endswith("bias"):
+            if self.is_padded:
+                weights = pad_like(weights, self.bias.shape)
+            if self.tp_size > 1:
+                weights /= self.tp_size
+            return weights
+        elif tllm_key.endswith("weight"):
+            qweight_int32, qzeros_int32, scales_fp16 = weights
+            qweight_unpacked_int8 = unpack_int32_into_int8(
+                qweight_int32.T).T.contiguous() - 8
+            qweight = qweight_unpacked_int8
+            qweight[qweight < 0] += 16
+            qweight = qweight.view(torch.uint8)
+            if self.is_padded:
+                qweight = torch.split(qweight, self.in_features,
+                                      0)[self.tp_rank]
+                qweight = pad_like(qweight,
+                                   (self.in_features, self.out_features))
+            qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+            qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
+                qweight.contiguous(), torch.quint4x2,
+                torch.float16).view(str_dtype_to_torch(self.dtype))
+            # zeros = zeros * scales
+            qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
+            if self.is_padded:
+                scales_fp16 = torch.split(scales_fp16,
+                                          self.weights_scaling_factor.shape[0],
+                                          0)[self.tp_rank]
+                qzeros_unpacked_int32 = torch.split(
+                    qzeros_unpacked_int32, self.weights_scaling_factor.shape[0],
+                    0)[self.tp_rank]
+                scales_fp16 = pad_like(scales_fp16,
+                                       self.weights_scaling_factor.shape, 1)
+                qzeros_unpacked_int32 = pad_like(qzeros_unpacked_int32,
+                                                 self.zero.shape)
+            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 7) * scales_fp16
+            zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
+                str_dtype_to_torch(self.dtype))
+
+            results = {
+                tllm_key: qweight,
+                tllm_key.replace("weight", "weights_scaling_factor"):
+                scales_fp16,
+                tllm_key.replace("weight", "zero"): zeros_x_scales_fp16,
+            }
+            return results
 
 
 class SmoothQuantMLP(Module):
@@ -982,12 +1214,12 @@ class Int8SmoothQuantRowLinear(RowLinear):
                                self.weights_scaling_factor.value.dtype)
 
         w_deq_out = cast(w_deq_out, self.dtype)
-        return self.multiply_reduce(dequantized_out,
-                                    w_deq_out,
-                                    gemm_plugin=None,
-                                    reduce_fusion_params=reduce_fusion_params,
-                                    lora_runtime_params=lora_runtime_params,
-                                    lora_hidden_state=lora_hidden_state)
+        return self.multiply_collect(dequantized_out,
+                                     w_deq_out,
+                                     gemm_plugin=None,
+                                     reduce_fusion_params=reduce_fusion_params,
+                                     lora_runtime_params=lora_runtime_params,
+                                     lora_hidden_state=lora_hidden_state)
 
 
 class Int8SmoothQuantLinear(Linear):
@@ -1042,37 +1274,44 @@ class Int8SmoothQuantLinear(Linear):
                                self.weights_scaling_factor.value.dtype)
         w_deq_out = cast(w_deq_out, self.dtype)
 
-        return self.multiply_gather(dequantized_out,
-                                    w_deq_out,
-                                    gemm_plugin=None,
-                                    lora_runtime_params=lora_runtime_params,
-                                    lora_hidden_state=lora_hidden_state)
+        return self.multiply_collect(dequantized_out,
+                                     w_deq_out,
+                                     gemm_plugin=None,
+                                     lora_runtime_params=lora_runtime_params,
+                                     lora_hidden_state=lora_hidden_state)
 
 
 class FP8Linear(Linear):
 
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        bias=True,
-        dtype=None,
-        tp_group=None,
-        tp_size=1,
-        gather_output=True,
-    ):
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 gather_output=True,
+                 prefer_managed_weight=True,
+                 is_qkv=False):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         gather_output=gather_output)
+                         gather_output=gather_output,
+                         prefer_managed_weight=prefer_managed_weight,
+                         is_qkv=is_qkv)
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype='fp8')
+                                dtype='fp8',
+                                prefer_managed=self.prefer_managed_weight)
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
+        self.tllm_to_externel_key_dict = {
+            "activation_scaling_factor": "input_quantizer._amax",
+            "weights_scaling_factor": "weight_quantizer._amax",
+        }
 
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None or default_net(
@@ -1098,6 +1337,7 @@ class FP8Linear(Linear):
 
         weights_scaling_factor = cast(self.weights_scaling_factor.value,
                                       self.dtype)
+
         if self.weight.value.dtype != trt.fp8:
             w_quant_out = quantize(self.weight.value, weights_scaling_factor,
                                    'fp8')
@@ -1106,26 +1346,39 @@ class FP8Linear(Linear):
 
         gemm_plugin = default_net().plugin_config.gemm_plugin
         if gemm_plugin == 'fp8':
-            ret = self.multiply_gather(quantized_out,
-                                       w_quant_out,
-                                       gemm_plugin=gemm_plugin,
-                                       use_fp8=True,
-                                       alpha=alpha,
-                                       lora_runtime_params=lora_runtime_params,
-                                       lora_hidden_state=lora_hidden_state)
+            return self.multiply_collect(
+                quantized_out,
+                w_quant_out,
+                gemm_plugin=gemm_plugin,
+                use_fp8=True,
+                alpha=alpha,
+                lora_runtime_params=lora_runtime_params,
+                lora_hidden_state=lora_hidden_state)
         else:
             dequantized_out = dequantize(quantized_out,
                                          activation_scaling_factor, -1,
                                          self.dtype)
             w_deq_out = dequantize(w_quant_out, weights_scaling_factor, -1,
                                    self.dtype)
-            ret = self.multiply_gather(dequantized_out,
-                                       w_deq_out,
-                                       gemm_plugin=None,
-                                       use_fp8=True,
-                                       lora_runtime_params=lora_runtime_params,
-                                       lora_hidden_state=lora_hidden_state)
-        return ret
+            return self.multiply_collect(
+                dequantized_out,
+                w_deq_out,
+                gemm_plugin=None,
+                use_fp8=True,
+                lora_runtime_params=lora_runtime_params,
+                lora_hidden_state=lora_hidden_state)
+
+    def postprocess(self, tllm_key, weights):
+        # TODO: add FP8 modelopt format support
+        if self.is_qkv:
+            if tllm_key.endswith("scaling_factor"):
+                return 448.0 / max(weights).unsqueeze(0)
+            else:
+                return super().postprocess(tllm_key, weights)
+        if tllm_key.endswith("scaling_factor"):
+            return 448.0 / weights.unsqueeze(0)
+        else:
+            return weights
 
 
 class FP8RowLinear(RowLinear):
@@ -1136,18 +1389,27 @@ class FP8RowLinear(RowLinear):
                  bias=True,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 prefer_managed_weight=True):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size)
-        self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype='fp8')
+                         tp_size=tp_size,
+                         prefer_managed_weight=prefer_managed_weight)
+        self.weight = Parameter(
+            shape=(self.out_features, self.in_features),
+            dtype="fp8",
+            prefer_managed=self.prefer_managed_weight,
+        )
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
+        self.tllm_to_externel_key_dict = {
+            "activation_scaling_factor": "input_quantizer._amax",
+            "weights_scaling_factor": "weight_quantizer._amax",
+        }
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         assert lora_runtime_params is None or default_net(
@@ -1176,7 +1438,7 @@ class FP8RowLinear(RowLinear):
 
         gemm_plugin = default_net().plugin_config.gemm_plugin
         if gemm_plugin == 'fp8':
-            ret = self.multiply_reduce(
+            ret = self.multiply_collect(
                 quantized_out,
                 w_quant_out,
                 gemm_plugin=gemm_plugin,
@@ -1191,7 +1453,7 @@ class FP8RowLinear(RowLinear):
                                          self.dtype)
             w_deq_out = dequantize(w_quant_out, weights_scaling_factor, -1,
                                    self.dtype)
-            ret = self.multiply_reduce(
+            ret = self.multiply_collect(
                 dequantized_out,
                 w_deq_out,
                 gemm_plugin=None,
@@ -1200,6 +1462,13 @@ class FP8RowLinear(RowLinear):
                 lora_hidden_state=lora_hidden_state,
                 reduce_fusion_params=reduce_fusion_params)
         return ret
+
+    def postprocess(self, tllm_key, weights):
+        # TODO: add FP8 modelopt format support
+        if tllm_key.endswith("scaling_factor"):
+            return 448.0 / weights.unsqueeze(0)
+        else:
+            return weights
 
 
 class Fp8RowwiseMLP(Module):
@@ -1452,11 +1721,12 @@ class SmoothQuantAttention(Module):
         self.rotary_embedding_dim = 0
 
         if rotary_embedding_scaling is not None:
+            rotary_scaling_type = rotary_embedding_scaling.get(
+                "type", rotary_embedding_scaling.get("rope_type"))
             self.rotary_embedding_scale_type = RotaryScalingType.from_string(
-                rotary_embedding_scaling["type"])
+                rotary_scaling_type)
             self.rotary_embedding_scale = rotary_embedding_scaling.get(
                 "factor", 1.0)
-            assert self.rotary_embedding_scale > 1.0
 
         if self.position_embedding_type.is_rope():
             self.rotary_embedding_dim = int(self.attention_head_size *
@@ -1551,9 +1821,10 @@ class SmoothQuantAttention(Module):
 
             assert attention_params.is_valid(
                 default_net().plugin_config.gpt_attention_plugin,
-                default_net().plugin_config.remove_input_padding)
-            assert kv_cache_params.is_valid(
-                default_net().plugin_config.gpt_attention_plugin)
+                default_net().plugin_config.remove_input_padding, use_cache)
+            if use_cache:
+                assert kv_cache_params.is_valid(
+                    default_net().plugin_config.gpt_attention_plugin)
             assert self.attention_mask_type == AttentionMaskType.causal, \
                 'Plugin only support masked MHA.'
             if self.kv_cache_scaling_factor is not None:
@@ -1607,6 +1878,7 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
                 host_context_lengths=attention_params.host_context_lengths,
+                use_cache=use_cache,
                 spec_decoding_generation_lengths=spec_decoding_params.
                 spec_decoding_generation_lengths,
                 spec_decoding_position_offsets=spec_decoding_params.

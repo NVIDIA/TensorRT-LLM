@@ -34,7 +34,7 @@ MemoryType IBuffer::memoryType(void const* data)
     TLLM_CUDA_CHECK(::cudaPointerGetAttributes(&attributes, data));
     switch (attributes.type)
     {
-    case cudaMemoryTypeHost: return MemoryType::kPINNED;
+    case cudaMemoryTypeHost: return MemoryType::kPINNEDPOOL;
     case cudaMemoryTypeDevice: return MemoryType::kGPU;
     case cudaMemoryTypeManaged: return MemoryType::kUVM;
     case cudaMemoryTypeUnregistered: return MemoryType::kCPU;
@@ -60,6 +60,10 @@ IBuffer::UniquePtr IBuffer::wrap(void* data, nvinfer1::DataType type, std::size_
     case MemoryType::kPINNED:
         result.reset(new GenericBuffer<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
+        break;
+    case MemoryType::kPINNEDPOOL:
+        result.reset(new GenericBuffer<PinnedPoolBorrowingAllocator>( // NOLINT(modernize-make-unique)
+            capacity, type, PinnedPoolBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)
@@ -106,6 +110,7 @@ char const* IBuffer::getMemoryTypeName() const
     switch (getMemoryType())
     {
     case MemoryType::kPINNED: return MemoryTypeString<MemoryType::kPINNED>::value;
+    case MemoryType::kPINNEDPOOL: return MemoryTypeString<MemoryType::kPINNEDPOOL>::value;
     case MemoryType::kCPU: return MemoryTypeString<MemoryType::kCPU>::value;
     case MemoryType::kGPU: return MemoryTypeString<MemoryType::kGPU>::value;
     case MemoryType::kUVM: return MemoryTypeString<MemoryType::kUVM>::value;

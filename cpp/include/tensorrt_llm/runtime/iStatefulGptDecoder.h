@@ -101,7 +101,10 @@ public:
     virtual void finalize(SamplingConfig const& samplingConfig) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
-    [[nodiscard]] virtual TensorPtr getOutputIds() const = 0;
+    [[nodiscard]] virtual TensorPtr getIds() const = 0;
+
+    //! @returns [batchSize, beamWidth, maxSequenceLength] token ids after gatherTree
+    [[nodiscard]] virtual TensorPtr getGatheredIds() const = 0;
 
     //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
     [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;

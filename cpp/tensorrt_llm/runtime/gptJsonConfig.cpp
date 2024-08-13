@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -191,6 +192,16 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     auto const computeGenerationLogits = parseJsonFieldOr(builderConfig, "gather_generation_logits", false);
     auto const speculativeDecodingModeOpt
         = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(builderConfig, "speculative_decoding_mode");
+    auto const kvCacheTypeStr = parseJsonFieldOr<std::string>(builderConfig, "kv_cache_type", "continuous");
+    auto const kvCacheType = ModelConfig::KVCacheTypeFromString(kvCacheTypeStr);
+
+    auto it = builderConfig.find("kv_cache_type");
+    if (it == builderConfig.end())
+    {
+        TLLM_LOG_ERROR(
+            "Missing kv_cache_type field in builder_config, you need to rebuild engine. Default to continuous kv "
+            "cache.");
+    }
 
     modelConfig.setMaxBatchSize(maxBatchSize);
     modelConfig.setMaxBeamWidth(maxBeamWidth);
@@ -203,6 +214,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.setSpeculativeDecodingMode(speculativeDecodingModeOpt.has_value()
             ? SpeculativeDecodingMode(speculativeDecodingModeOpt.value())
             : SpeculativeDecodingMode::None());
+    modelConfig.setKVCacheType(kvCacheType);
 }
 
 void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
@@ -217,6 +229,9 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
     auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
+    auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
+        ? ModelConfig::ManageWeightsType::kEnabled
+        : ModelConfig::ManageWeightsType::kDisabled;
 
     TLLM_CHECK_WITH_INFO(
         !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
@@ -224,12 +239,16 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
     modelConfig.usePackedInput(removeInputPadding);
-    modelConfig.usePagedKvCache(pagedKvCache);
     modelConfig.usePagedState(pagedState);
+    if (pagedKvCache)
+    {
+        modelConfig.setKVCacheType(ModelConfig::KVCacheType::kPAGED);
+    }
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
+    modelConfig.setManageWeightsType(manageWeightsType);
 }
 
 void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,

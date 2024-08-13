@@ -306,7 +306,7 @@ void InitBindings(pybind11::module_& m)
 
     auto kvCacheConfigGetstate = [](tle::KvCacheConfig const& self)
     {
-        return py::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindow(),
+        return py::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks());
     };
@@ -317,11 +317,11 @@ void InitBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid state!");
         }
         return tle::KvCacheConfig(state[0].cast<bool>(), state[1].cast<std::optional<SizeType32>>(),
-            state[2].cast<std::optional<SizeType32>>(), state[3].cast<std::optional<SizeType32>>(),
+            state[2].cast<std::optional<std::vector<SizeType32>>>(), state[3].cast<std::optional<SizeType32>>(),
             state[4].cast<std::optional<float>>(), state[5].cast<std::optional<size_t>>(), state[6].cast<bool>());
     };
     py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
-        .def(py::init<bool, std::optional<SizeType32> const&, std::optional<SizeType32> const&,
+        .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool>(),
             py::arg("enable_block_reuse") = false, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
@@ -330,8 +330,8 @@ void InitBindings(pybind11::module_& m)
         .def_property(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
-        .def_property("max_attention_window", &tle::KvCacheConfig::getMaxAttentionWindow,
-            &tle::KvCacheConfig::setMaxAttentionWindow)
+        .def_property("max_attention_window", &tle::KvCacheConfig::getMaxAttentionWindowVec,
+            &tle::KvCacheConfig::setMaxAttentionWindowVec)
         .def_property(
             "sink_token_length", &tle::KvCacheConfig::getSinkTokenLength, &tle::KvCacheConfig::setSinkTokenLength)
         .def_property("free_gpu_memory_fraction", &tle::KvCacheConfig::getFreeGpuMemoryFraction,
@@ -481,19 +481,19 @@ void InitBindings(pybind11::module_& m)
             self.getEnableChunkedContext(), self.getNormalizeLogProbs(), self.getIterStatsMaxIterations(),
             self.getRequestStatsMaxIterations(), self.getBatchingType(), self.getMaxBatchSize(), self.getMaxNumTokens(),
             parallelConfigState, peftCacheConfigState, self.getLogitsPostProcessorMap(),
-            self.getLogitsPostProcessorBatched(), self.getDecodingConfig(), self.getGpuWeightsPercent(),
-            self.getMaxQueueSize(), extendedRuntimePerfKnobConfigState);
+            self.getLogitsPostProcessorBatched(), self.getReplicateLogitsPostProcessor(), self.getDecodingConfig(),
+            self.getGpuWeightsPercent(), self.getMaxQueueSize(), extendedRuntimePerfKnobConfigState);
     };
     auto executorConfigSetState = [&kvCacheConfigSetstate, &peftCacheConfigSetstate, &schedulerConfigSetstate,
                                       &parallelConfigSetstate, &extendedRuntimePerfKnobConfigSetstate](py::tuple state)
     {
-        if (state.size() != 18)
+        if (state.size() != 19)
         {
             throw std::runtime_error("Invalid state!");
         }
         auto kvCacheConfig = kvCacheConfigSetstate(state[2].cast<py::tuple>());
         auto schedulerConfig = schedulerConfigSetstate(state[1].cast<py::tuple>());
-        auto extendedRuntimePerfKnobConfig = extendedRuntimePerfKnobConfigSetstate(state[17].cast<py::tuple>());
+        auto extendedRuntimePerfKnobConfig = extendedRuntimePerfKnobConfigSetstate(state[18].cast<py::tuple>());
 
         std::optional<tle::PeftCacheConfig> peftCacheConfig;
         if (state[11].cast<py::object>() != py::none())
@@ -511,15 +511,15 @@ void InitBindings(pybind11::module_& m)
             state[7].cast<tle::BatchingType>(), state[8].cast<std::optional<SizeType32>>(),
             state[9].cast<std::optional<SizeType32>>(), parallelConfig, peftCacheConfig,
             state[12].cast<std::optional<tle::LogitsPostProcessorMap>>(),
-            state[13].cast<std::optional<tle::LogitsPostProcessorBatched>>(),
-            state[14].cast<std::optional<tle::DecodingConfig>>(), state[15].cast<float>(),
-            state[16].cast<std::optional<SizeType32>>(), extendedRuntimePerfKnobConfig);
+            state[13].cast<std::optional<tle::LogitsPostProcessorBatched>>(), state[14].cast<bool>(),
+            state[15].cast<std::optional<tle::DecodingConfig>>(), state[16].cast<float>(),
+            state[17].cast<std::optional<SizeType32>>(), extendedRuntimePerfKnobConfig);
     };
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
         .def(py::init<SizeType32, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType32,
                  SizeType32, tle::BatchingType, std::optional<SizeType32>, std::optional<SizeType32>,
                  std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
-                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>,
+                 std::optional<tle::LogitsPostProcessorMap>, std::optional<tle::LogitsPostProcessorBatched>, bool,
                  std::optional<tle::DecodingConfig>, float, std::optional<SizeType32>,
                  tle::ExtendedRuntimePerfKnobConfig const&>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
@@ -532,8 +532,8 @@ void InitBindings(pybind11::module_& m)
             py::arg("parallel_config") = py::none(),
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
             py::arg("logits_post_processor_map") = py::none(), py::arg("logits_post_processor_batched") = py::none(),
-            py::arg("decoding_config") = py::none(), py::arg("gpu_weights_percent") = 1.0,
-            py::arg("max_queue_size") = py::none(),
+            py::arg("replicate_logits_post_processor") = true, py::arg("decoding_config") = py::none(),
+            py::arg("gpu_weights_percent") = 1.0, py::arg("max_queue_size") = py::none(),
             py::arg_v("extended_runtime_perf_knob_config", tle::ExtendedRuntimePerfKnobConfig(),
                 "ExtendedRuntimePerfKnobConfig()"))
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
@@ -559,6 +559,8 @@ void InitBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setLogitsPostProcessorMap)
         .def_property("logits_post_processor_batched", &tle::ExecutorConfig::getLogitsPostProcessorBatched,
             &tle::ExecutorConfig::setLogitsPostProcessorBatched)
+        .def_property("replicate_logits_post_processor", &tle::ExecutorConfig::getReplicateLogitsPostProcessor,
+            &tle::ExecutorConfig::setReplicateLogitsPostProcessor)
         .def_property(
             "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig)
         .def_property("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,

@@ -20,8 +20,11 @@
 #include "NvInferPlugin.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
+#include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cassert>
 #include <set>
@@ -94,14 +97,19 @@ class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 public:
     using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
     using MOEExpertScaleNormalizationMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode;
+    using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
+    using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
 
     MixtureOfExpertsPlugin() = delete;
-    MixtureOfExpertsPlugin(int number_of_experts, int top_k, int expert_hidden_size, int expert_inter_size,
-        tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
-        nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias,
-        int tp_size, int tp_rank, int ep_size, int ep_rank, MOEExpertScaleNormalizationMode normalization_mode,
-        bool force_determinism, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
-    MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
+    MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int top_k, int expert_hidden_size,
+        int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
+        nvinfer1::DataType weight_type, nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode,
+        bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
+        MOEExpertScaleNormalizationMode normalization_mode, bool force_determinism,
+        MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
+        LoraPluginProfilerPtr lora_profiler, int max_low_rank);
+    MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
+        LoraPluginProfilerPtr lora_profiler);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
 
     void init();
@@ -167,6 +175,28 @@ private:
 
     MixtureOfExpertsPluginProfilerPtr mGemmProfiler;
 
+    // lora related
+    bool mUseLora{};
+    nvinfer1::DataType mLoraType{};
+    int mMaxLowRank{};
+    bool mRemoveInputPadding{};
+
+    LoraImplPtr mLoraImpl1;
+    LoraImplPtr mLoraImpl2;
+
+    GemmIdCublas mLoraGemmId1{};
+    GemmIdCublas mLoraGemmId2{};
+    LoraPluginProfilerPtr mLoraProfiler;
+
+    std::vector<void const*> mLoraExpandFC1WeightPtrs{};
+    std::vector<void const*> mLoraExpandFC2WeightPtrs{};
+    std::vector<void const*> mLoraExpandGatedWeightPtrs{};
+    std::vector<int32_t> mLoraExpandFC1Ranks{};
+    std::vector<int32_t> mLoraExpandFC2Ranks{};
+    std::vector<int32_t> mLoraExpandGatedRanks{};
+
+    cudaEvent_t mMemcpyEvent;
+
     // The below are not serialised
     std::string const mLayerName{};
     std::string mNamespace{};
@@ -178,15 +208,26 @@ private:
         void* fc2_output{};
         void* src_to_dest_map{};
         void* selected_experts{};
+        void* lora_workspace{};
         size_t size{};
     };
 
     int64_t getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
-    WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens) const;
+    WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
     kernels::QuantParams getQuantParams(
         void const* scale_1, void const* scale_2, void const* scale_3 = nullptr, void const* scale_4 = nullptr) const;
+
+    int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
+    kernels::LoraParams getLoraParams(
+        nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace);
+
+    enum class RequestType : int32_t
+    {
+        kCONTEXT = 0,
+        kGENERATION = 1
+    };
 
     using IndexType = std::int32_t;
 
@@ -237,6 +278,16 @@ private:
         return hasExpertFp8QuantScales() && mOutputType == nvinfer1::DataType::kFP8;
     }
 
+    bool hasLora() const
+    {
+        return mUseLora;
+    }
+
+    bool hasGatedLoraWeightsAndRanks() const
+    {
+        return mUseLora && isGatedActivation(mActivationType);
+    }
+
     IndexType getExpertBias1Index() const
     {
         return getExpertWeights2Index() + hasBias();
@@ -282,9 +333,49 @@ private:
         return getExpertFP8Dequant2Index() + hasExpertFp8FinalQuantScales();
     }
 
+    IndexType getLoraFC1WeightPtrsIndex() const
+    {
+        return getExpertFP8QuantFinalIndex() + hasLora();
+    }
+
+    IndexType getLoraFC1RanksIndex() const
+    {
+        return getLoraFC1WeightPtrsIndex() + hasLora();
+    }
+
+    IndexType getLoraFC2WeightPtrsIndex() const
+    {
+        return getLoraFC1RanksIndex() + hasLora();
+    }
+
+    IndexType getLoraFC2RanksIndex() const
+    {
+        return getLoraFC2WeightPtrsIndex() + hasLora();
+    }
+
+    IndexType getLoraGatedWeightPtrsIndex() const
+    {
+        return getLoraFC2RanksIndex() + hasGatedLoraWeightsAndRanks();
+    }
+
+    IndexType getLoraGatedRanksIndex() const
+    {
+        return getLoraGatedWeightPtrsIndex() + hasGatedLoraWeightsAndRanks();
+    }
+
+    IndexType getHostRequestTypeIndex() const
+    {
+        return getLoraGatedRanksIndex() + hasLora();
+    }
+
+    IndexType getHostContextLengthIndex() const
+    {
+        return getHostRequestTypeIndex() + (mRemoveInputPadding && hasLora());
+    }
+
     IndexType getNbInputs() const
     {
-        return getExpertFP8QuantFinalIndex() + 1;
+        return getHostContextLengthIndex() + 1;
     }
 
     // Outputs
@@ -386,6 +477,7 @@ public:
 
 private:
     GemmPluginProfilerManager<MixtureOfExpertsGemmProfiler> moePluginProfiler;
+    GemmPluginProfilerManager<CublasLtGemmPluginProfiler> loraPluginProfileManager;
     static nvinfer1::PluginFieldCollection mFC;
     static std::vector<nvinfer1::PluginField> mPluginAttributes;
     std::string mNamespace;

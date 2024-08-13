@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -92,14 +93,17 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
     auto& dInput = mJointDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds));
+    auto batchSlots = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
+    dInput
+        = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(batchSlots));
 
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
     auto& dOutput = mJointDecodingOutput;
     auto outputIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput = std::make_unique<DecodingOutput>(std::move(outputIds));
+    auto gatheredOutputIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dOutput = std::make_unique<DecodingOutput>(std::move(outputIds), std::move(gatheredOutputIds));
 
     dOutput->newTokensSteps = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
@@ -107,12 +111,12 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
         = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mDraftProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     mTargetProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    mBatchSlotsSetup = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
-    mBatchSlotsDecoder = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
-    mBatchSlotsAcceptTokens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
-    mBatchSlotsAcceptLogits = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    mBatchSlotsSetup = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
+    mBatchSlotsDecoder = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
+    mBatchSlotsAcceptTokens = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
+    mBatchSlotsAcceptLogits = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
     // use batchSize many entries instead of the usual 1
-    dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
+    dOutput->finishedSum = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
     mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
     // we don't need dOutput->lengths because lengths are passed from outside
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
@@ -123,13 +127,19 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
     mCurandStates = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT8);
     mDraftTokenIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     mDraftLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
-    mTargetLogitsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<float*>::value);
+    mTargetLogitsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<float*>::value);
 
-    dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
-    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
-    dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
-    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
+    dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
+    dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
+    dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
     dInput->embeddingBias = mBufferManager.emptyTensor(MemoryType::kGPU, dtype);
+
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, device);
+    mNumSMs = deviceProp.multiProcessorCount;
 
     if (!mSpeculativeDecodingMode.isNone())
     {
@@ -229,6 +239,7 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     dInput.badWordsLists.resize(maxBatchSize);
 
     const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeXmaxBeamWidth);
+    const_cast<ITensor&>(*dInput.batchSlots).reshape(maxBatchSizeShape);
     auto& sequenceLimitLength = const_cast<ITensor&>(*dInput.sequenceLimitLength);
     sequenceLimitLength.reshape(maxBatchSizeShape);
     kernels::invokeFill(sequenceLimitLength, mMaxSequenceLength, *mRuntimeStream);
@@ -240,6 +251,20 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
 
     auto& dOutput = *mJointDecodingOutput;
     dOutput.ids->reshape(jointOutputIdsShape);
+
+    if (maxBeamWidth > 1)
+    {
+        dOutput.gatheredIds->reshape(jointOutputIdsShape);
+
+        mOutputBeamHypotheses = std::make_shared<DecodingOutput::BeamHypotheses>();
+        mOutputBeamHypotheses->empty(mBufferManager);
+        mOutputBeamHypotheses->reshape(1, maxBeamWidth, mMaxSequenceLength);
+        mCumLogProbsTmp = mBufferManager.gpu(ITensor::makeShape({1, maxBeamWidth}), nvinfer1::DataType::kFLOAT);
+    }
+    else
+    {
+        dOutput.gatheredIds = dOutput.ids;
+    }
 
     mBufferManager.setZero(*dOutput.newTokensSteps);
     mFinishedSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
@@ -608,14 +633,15 @@ void GptDecoderBatched::newRequestDraftTokensExternal(
 
     auto const curandStatesView = ITensor::slice(mCurandStates, batchIdx, 1);
     auto curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*curandStatesView));
+    auto batchSlotsPtr = bufferCast<SizeType32>(*ITensor::slice(mBatchSlotsSetup, 0, localBatchSize));
     if (samplingConfig.randomSeed.has_value())
     {
         tk::invokeCurandInitialize(
-            curandState, nullptr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
+            curandState, batchSlotsPtr, localBatchSize, samplingConfig.randomSeed.value()[0], stream->get());
     }
     else
     {
-        tk::invokeCurandInitialize(curandState, nullptr, localBatchSize, 0, stream->get());
+        tk::invokeCurandInitialize(curandState, batchSlotsPtr, localBatchSize, 0, stream->get());
     }
     auto numDraftTokensView = ITensor::slice(mNumDraftTokens, batchIdx, 1);
     kernels::invokeFill(*numDraftTokensView, numDraftTokens, *stream);
@@ -999,7 +1025,8 @@ void GptDecoderBatched::forwardSync(
 }
 
 // TODO call this at the end of forward if mFinished[i] changes from false to true?
-CudaEvent GptDecoderBatched::postProcessRequest(SizeType32 batchSlot, SamplingConfig const& samplingConfig) const
+CudaEvent GptDecoderBatched::postProcessRequest(
+    SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -1023,7 +1050,8 @@ CudaEvent GptDecoderBatched::postProcessRequest(SizeType32 batchSlot, SamplingCo
     slice(dInput.endIds, dJointInput.endIds);
     slice(dInput.lengths, dJointInput.lengths);
 
-    DecodingOutput dOutput{ITensor::slice(dJointOutput.ids, batchSlot, 1)};
+    DecodingOutput dOutput{
+        ITensor::slice(dJointOutput.ids, batchSlot, 1), ITensor::slice(dJointOutput.gatheredIds, batchSlot, 1)};
     dOutput.beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
     slice(dOutput.parentIds, dJointOutput.parentIds);
     slice(dOutput.cumLogProbs, dJointOutput.cumLogProbs);
@@ -1037,11 +1065,18 @@ CudaEvent GptDecoderBatched::postProcessRequest(SizeType32 batchSlot, SamplingCo
     dOutput.newTokens->squeeze(0);
     dOutput.newTokens = ITensor::slice(dOutput.newTokens, batchSlot, 1);
 
-    // TODO can we do this inplace?
-    auto& outputIds = dOutput.ids;
-    auto finalOutputIds = manager.gpu(outputIds->getShape(), outputIds->getDataType());
-    decoder.gatherTree(*finalOutputIds, dOutput, dInput, manager, samplingConfig);
-    manager.copy(*finalOutputIds, *outputIds);
+    if (streaming)
+    {
+        // in case of streaming we shouldn't overwrite the data in beamHypotheses, since the beam search kernels expect
+        // ungathered data but the kernels in gatherTree write in-place.
+        // Thus, we need to make a copy of the beamHypotheses
+        tensorrt_llm::kernels::invokeCopyBeamHypotheses(
+            dOutput.beamHypotheses, *mOutputBeamHypotheses, *dOutput.cumLogProbs, *mCumLogProbsTmp, *stream, mNumSMs);
+        dOutput.beamHypotheses = *mOutputBeamHypotheses;
+        dOutput.cumLogProbs = mCumLogProbsTmp;
+    }
+
+    decoder.gatherTree(dOutput, dInput, manager, samplingConfig);
 
     CudaEvent event{};
     stream->record(event);
@@ -1187,17 +1222,17 @@ void GptDecoderBatched::finalize(SamplingConfig const& samplingConfig) const
     auto batchSlots = bufferCast<SizeType32>(*mBatchSlotsSetup);
     for (SizeType32 batchIdx = 0; batchIdx < mActualBatchSize; ++batchIdx)
     {
-        auto slot = batchSlots ? batchSlots[batchIdx] : batchIdx;
+        auto slot = batchSlots[batchIdx];
         auto requestSamplingConfig = extractSamplingConfig(samplingConfig, slot);
-        auto event = postProcessRequest(slot, requestSamplingConfig);
+        auto event = postProcessRequest(slot, requestSamplingConfig, /*streaming*/ false);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-CudaEvent GptDecoderBatched::finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig) const
+CudaEvent GptDecoderBatched::finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto event = postProcessRequest(batchSlot, samplingConfig);
+    auto event = postProcessRequest(batchSlot, samplingConfig, streaming);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return event;
 }

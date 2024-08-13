@@ -1,6 +1,15 @@
 import torch
 
-from ..._utils import str_dtype_to_torch
+from ..._utils import pad_vocab_size, str_dtype_to_torch
+
+
+def split(v, tp_size, idx, dim=0):
+    if tp_size == 1:
+        return v
+    if len(v.shape) == 1:
+        return torch.chunk(v, tp_size)[idx].contiguous()
+    else:
+        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
 
 def load_weights_from_hf_model(hf_model, config):
@@ -31,6 +40,7 @@ def load_weights_from_hf_model(hf_model, config):
     # merge qkv weights
     qkv_keys = ["q_proj", "k_proj", "v_proj"]
 
+    scales = {}
     for key in hf_state_dict.keys():
         if 'self_attn.q_proj.weight' in key:
             prefix = key.split('self_attn')[0].replace("model.layers.",
@@ -39,29 +49,75 @@ def load_weights_from_hf_model(hf_model, config):
             # [(num_heads x q)|(num_heads x k)|(num_heads x v), hidden_size]
             qkv_weights = []
             qkv_bias = []
-            for k in qkv_keys:
-                qkv_weights.append(weights.pop(f"{prefix}attention.{k}.weight"))
-                qkv_bias.append(weights.pop(f"{prefix}attention.{k}.bias"))
 
-            weights[f"{prefix}attention.qkv.weight"] = torch.cat(qkv_weights,
-                                                                 dim=0)
+            for k in qkv_keys:
+                split_w = split(weights.pop(f"{prefix}attention.{k}.weight"),
+                                config.mapping.tp_size, config.mapping.tp_rank)
+
+                qkv_weights.append(split_w)
+                split_b = split(weights.pop(f"{prefix}attention.{k}.bias"),
+                                config.mapping.tp_size, config.mapping.tp_rank)
+                qkv_bias.append(split_b)
+            v = torch.cat(qkv_weights, dim=0)
+            if is_weight_only:
+                processed_torch_weights, torch_weight_scales = \
+                    torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                        v.t().contiguous().cpu(), plugin_weight_only_quant_type)
+                weights[
+                    f"{prefix}attention.qkv.weight"] = processed_torch_weights
+                scales[
+                    f"{prefix}attention.qkv.per_channel_scale"] = torch_weight_scales
+            else:
+                weights[f"{prefix}attention.qkv.weight"] = v
             weights[f"{prefix}attention.qkv.bias"] = torch.cat(qkv_bias, dim=0)
-    if is_weight_only:
-        kw_list = [
-            'attention.dense.weight', 'attention.qkv.weight', 'mlp.fc.weight',
-            'mlp.proj.weight'
-        ]
-        for key in [
-                weight_name for kw in kw_list for weight_name in weights
-                if kw in weight_name
-        ]:
-            v = weights[key].t().contiguous().cpu()
-            processed_torch_weights, torch_weight_scales = \
-                torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                    v, plugin_weight_only_quant_type)
-            weights[key] = processed_torch_weights
-            weights[key.replace('.weight',
-                                '.per_channel_scale')] = torch_weight_scales
+
+    tp_rank = config.mapping.tp_rank
+    for weight_name in weights:
+        loaded_weight = weights[weight_name]
+        if "attention.dense.weight" in weight_name or "mlp.proj.weight" in weight_name:  # RowLinear
+            v = split(loaded_weight,
+                      config.mapping.tp_size,
+                      config.mapping.tp_rank,
+                      dim=1)
+            if is_weight_only:
+                processed_torch_weights, torch_weight_scales = \
+                    torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                        v.t().contiguous().cpu(), plugin_weight_only_quant_type)
+                weights[weight_name] = processed_torch_weights
+                scales[weight_name.replace(
+                    '.weight', '.per_channel_scale')] = torch_weight_scales
+            else:
+                weights[weight_name] = v
+        elif "mlp.fc." in weight_name:
+
+            v = split(loaded_weight, config.mapping.tp_size,
+                      config.mapping.tp_rank)
+            if is_weight_only and "mlp.fc.weight" in weight_name:
+                processed_torch_weights, torch_weight_scales = \
+                    torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                        v.t().contiguous().cpu(), plugin_weight_only_quant_type)
+                weights[weight_name] = processed_torch_weights
+                scales[weight_name.replace(
+                    '.weight', '.per_channel_scale')] = torch_weight_scales
+            else:
+                weights[weight_name] = v
+        elif "lm_head." in weight_name:
+            output_dim = 0
+            shard_size = loaded_weight.shape[output_dim]
+            tp_rank * shard_size
+            vocab_size = loaded_weight.shape[output_dim]
+
+            if shard_size % config.mapping.tp_size != 0:
+                pad_width = pad_vocab_size(vocab_size,
+                                           config.mapping.tp_size) - vocab_size
+                loaded_weight = torch.nn.functional.pad(loaded_weight,
+                                                        (0, 0, 0, pad_width),
+                                                        'constant',
+                                                        value=0)
+            weights[weight_name] = split(loaded_weight, config.mapping.tp_size,
+                                         config.mapping.tp_rank)
+
+    weights.update(scales)
 
     return weights
 

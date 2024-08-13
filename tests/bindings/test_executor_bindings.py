@@ -871,14 +871,14 @@ def test_kv_cache_config():
 
     config.enable_block_reuse = True
     config.max_tokens = 1
-    config.max_attention_window = 2
+    config.max_attention_window = [2]
     config.sink_token_length = 3
     config.free_gpu_memory_fraction = 0.5
     config.host_cache_size = 4
     config.onboard_blocks = False
     assert config.enable_block_reuse == True
     assert config.max_tokens == 1
-    assert config.max_attention_window == 2
+    assert config.max_attention_window == [2]
     assert config.sink_token_length == 3
     assert config.free_gpu_memory_fraction == 0.5
     assert config.host_cache_size == 4
@@ -887,7 +887,7 @@ def test_kv_cache_config():
     kwargs = {
         "enable_block_reuse": True,
         "max_tokens": 3,
-        "max_attention_window": 10,
+        "max_attention_window": [10],
         "sink_token_length": 2,
         "free_gpu_memory_fraction": 0.5,
         "host_cache_size": 1024,
@@ -988,6 +988,7 @@ def test_executor_config():
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
     assert config.logits_post_processor_map is None
     assert config.logits_post_processor_batched is None
+    assert config.replicate_logits_post_processor == True
     assert config.decoding_config is None
 
     kwargs = {
@@ -1014,6 +1015,8 @@ def test_executor_config():
         "peft_cache_config":
         trtllm.PeftCacheConfig(10),
         "logits_post_processor_map": {},
+        "replicate_logits_post_processor":
+        False,
         "decoding_config":
         trtllm.DecodingConfig(trtllm.DecodingMode.TopKTopP()),
     }

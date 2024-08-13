@@ -28,11 +28,12 @@ public:
     GenerationConfig() = default;
 
     explicit GenerationConfig(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxInputLength,
-        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSeqLength,
-        SizeType32 inputLengthSum = SizeType32(0))
+        std::vector<SizeType32> maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength,
+        SizeType32 maxSeqLength, SizeType32 inputLengthSum = SizeType32(0))
         : batchSize{batchSize}
         , beamWidth{beamWidth}
         , maxInputLength{maxInputLength}
+        , maxAttentionWindowVec{maxAttentionWindowVec}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
         , maxSeqLength{maxSeqLength}
@@ -43,13 +44,15 @@ public:
     SizeType32 batchSize{};
     SizeType32 beamWidth{};
     SizeType32 maxInputLength{};
+    std::vector<SizeType32> maxAttentionWindowVec{};
     SizeType32 maxAttentionWindow{};
     SizeType32 sinkTokenLength{};
     SizeType32 maxSeqLength{};
     SizeType32 inputLengthSum{}; // Initialized only if inputPacked is set to true in fromInput.
 
     static GenerationConfig fromInput(ITensor const& inputIds, ITensor& inputLengths, bool inputPacked,
-        SizeType32 beamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength);
+        SizeType32 beamWidth, std::vector<SizeType32> maxAttentionWindowVec, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength);
 };
 
 } // namespace tensorrt_llm::runtime

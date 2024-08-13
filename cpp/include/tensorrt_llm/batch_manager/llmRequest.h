@@ -162,7 +162,7 @@ public:
         , mDecodingIter(0)
         , mPriority(req.getPriority())
     {
-        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnAllGeneratedTokens == false)
+        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && !mReturnAllGeneratedTokens)
         {
             TLLM_LOG_WARNING(
                 "Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. "
@@ -405,7 +405,7 @@ public:
         }
     }
 
-    /// @brief Sets the generated tokens for all beams. Erases all previous generated tokens.
+    /// @brief Sets the generated tokens for all beams after gatherTree. Erases all previous generated tokens.
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {

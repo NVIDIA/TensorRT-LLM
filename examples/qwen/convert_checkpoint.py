@@ -219,7 +219,6 @@ def convert_and_save_hf(args):
     if args.smoothquant is not None or args.int8_kv_cache:
         mapping = Mapping(
             world_size=world_size,
-            rank=-1,  #intentinoally make -1 to avoid mistake
             tp_size=args.tp_size,
             pp_size=args.pp_size,
             moe_tp_size=args.moe_tp_size,

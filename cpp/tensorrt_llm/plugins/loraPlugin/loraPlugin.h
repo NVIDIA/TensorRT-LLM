@@ -16,25 +16,23 @@
  */
 #ifndef TRT_LORA_PLUGIN_H
 #define TRT_LORA_PLUGIN_H
-#include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include <cassert>
-#include <set>
 #include <string>
 #include <vector>
 
 namespace tensorrt_llm::plugins
 {
 
-using CublasGemmWrapper = tensorrt_llm::common::CublasMMWrapper;
-using CublasGemmWrapperPtr = std::shared_ptr<CublasGemmWrapper>;
-
 class LoraPlugin : public BasePlugin
 {
 public:
     using PluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
+    using ImplPtr = std::shared_ptr<kernels::LoraImpl>;
+    using Config = cublasLtMatmulHeuristicResult_t;
 
     LoraPlugin() = delete;
 
@@ -74,9 +72,8 @@ public:
     void destroy() noexcept override;
 
 private:
+    int64_t getNumTokens(nvinfer1::PluginTensorDesc const* input_tensors) const;
     void init();
-    void configGemm();
-    void setGemmConfig();
 
     using IndexType = std::int32_t;
 
@@ -115,26 +112,25 @@ private:
 private:
     const std::string mLayerName;
 
-    int mInHiddenSize;
     std::vector<int> mOutHiddenSizes;
     int mTransA;
     int mTransB;
     nvinfer1::DataType mType;
     bool mRemoveInputPadding;
     int mMaxNumTokens;
-    int mMaxLowRank;
     int mNumLoraModules;
+    int mInHiddenSize;
+    int mMaxLowRank;
     int mWeightIndex;
-    int const mSplitKSlices = 16;
 
-    // @fixme: seems this is shared across multiple clones.
-    // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
-    CublasGemmWrapperPtr mCublasWrapper;
+    std::vector<void const*> mExpandLoraWeightPtrs{};
+    std::vector<int32_t> mExpandLoraRanks{};
 
     GemmDims mDims{};
     GemmIdCublas mGemmId{};
 
     PluginProfilerPtr mPluginProfiler;
+    ImplPtr mLoraImpl;
 };
 
 class LoraPluginCreator : public BaseCreator

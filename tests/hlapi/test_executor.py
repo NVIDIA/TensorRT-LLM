@@ -1,8 +1,7 @@
 import asyncio
 import json
 import os as _os
-import sys as _sys
-import unittest
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,12 +14,18 @@ from tensorrt_llm.executor import (GenerationExecutor, GenerationRequest,
 from tensorrt_llm.hlapi import LLM, BuildConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
 
-_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
-from utils.cpp_paths import *  # noqa
+sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+import tempfile
+
 from utils.llm_data import llm_models_root
 from utils.util import similar
 
 WORLD_SIZE = mpi_world_size()
+
+
+@pytest.fixture(scope="module")
+def engine_path():
+    return Path(tempfile.tempdir) / "llm_engine"
 
 
 @pytest.fixture(scope="module")
@@ -103,6 +108,7 @@ def test_sync_generation(llama_7b_path: Path):
             sampling_params=[sampling_params0, sampling_params1])
         for result, expected in zip(results,
                                     (expected_output, expected_long_output)):
+            print(f"result: {result}")
             assert tokenizer.decode(result.outputs[0].token_ids) == expected
 
         # Iterate the partial results when streaming
@@ -111,6 +117,7 @@ def test_sync_generation(llama_7b_path: Path):
                                          streaming=True)
         for partial_result in future:
             partial_text = tokenizer.decode(partial_result.outputs[0].token_ids)
+            print(f"partial_text: {partial_text}")
             assert expected_output.startswith(partial_text)
 
         # Iterate the partial results when streaming
@@ -122,6 +129,7 @@ def test_sync_generation(llama_7b_path: Path):
             for partial_result in future:
                 partial_text = tokenizer.decode(
                     partial_result.outputs[0].token_ids)
+                print(f"partial_text: {partial_text}")
                 assert expected_long_output.startswith(partial_text)
 
         # Low-level api with .submit
@@ -193,7 +201,3 @@ def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     stats = executor.get_stats()
     assert json.loads(stats)["iter"] == 1
     executor.shutdown()
-
-
-if __name__ == "__main__":
-    unittest.main()

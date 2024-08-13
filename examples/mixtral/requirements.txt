@@ -1,4 +1,4 @@
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.12.0.dev2024080600
+tensorrt_llm==0.13.0.dev2024081300
 transformers==4.38.2
 accelerate==0.25.0

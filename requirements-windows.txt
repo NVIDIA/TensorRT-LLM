@@ -16,7 +16,7 @@ h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.2.0
+tensorrt~=10.3.0
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch==2.4.0+cu121

@@ -25,7 +25,7 @@ import torch
 
 from .. import profiler
 from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
-from ..bindings import MpiComm
+from ..bindings import KVCacheType, MpiComm
 from ..bindings.executor import Executor
 from ..builder import Engine, get_engine_version
 from ..logger import logger
@@ -86,6 +86,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     dtype = builder_config['precision']
     tp_size = builder_config['tensor_parallel']
     pp_size = builder_config.get('pipeline_parallel', 1)
+    kv_cache_type = KVCacheType(builder_config.get('kv_cache_type'))
     world_size = tp_size * pp_size
     assert world_size == mpi_world_size(), \
         f'Engine world size ({tp_size} * {pp_size}) != Runtime world size ({mpi_world_size()})'
@@ -139,7 +140,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
     mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
     remove_input_padding = plugin_config['remove_input_padding']
-    paged_kv_cache = plugin_config['paged_kv_cache']
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     lora_plugin = plugin_config.get('lora_plugin')
@@ -157,7 +157,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         mamba_conv1d_plugin=mamba_conv1d_plugin,
         remove_input_padding=remove_input_padding,
         model_name=model_name,
-        paged_kv_cache=paged_kv_cache,
+        kv_cache_type=kv_cache_type,
         paged_state=paged_state,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
@@ -398,6 +398,7 @@ class ModelRunner(ModelRunnerMixin):
                  max_input_len: int,
                  max_seq_len: int,
                  max_beam_width: int,
+                 kv_cache_type: KVCacheType,
                  lora_manager: Optional[LoraManager] = None) -> None:
         """
         Create a ModelRunner instance.
@@ -423,12 +424,14 @@ class ModelRunner(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
+        self.kv_cache_type = kv_cache_type
         self.enable_context_fmha_fp32_acc = False
 
     @classmethod
     def from_engine(
             cls,
             engine: Engine,
+            max_output_len: Optional[int] = None,
             lora_dir: Optional[List[str]] = None,
             rank: int = 0,
             debug_mode: bool = False,
@@ -457,6 +460,11 @@ class ModelRunner(ModelRunnerMixin):
             if hasattr(pretrained_config, item):
                 rnn_configs_kwargs[item] = getattr(pretrained_config, item)
 
+        if not hasattr(build_config, 'kv_cache_type'):
+            logger.Warning(
+                'Build config doesn\'t have kv_cache_type, you might need to rebuild your enigne.'
+            )
+
         model_config = ModelConfig(
             max_batch_size=build_config.max_batch_size,
             max_beam_width=build_config.max_beam_width,
@@ -472,7 +480,6 @@ class ModelRunner(ModelRunnerMixin):
                 build_config.plugin_config.mamba_conv1d_plugin),
             remove_input_padding=build_config.plugin_config.
             remove_input_padding,
-            paged_kv_cache=build_config.plugin_config.paged_kv_cache,
             paged_state=build_config.plugin_config.paged_state,
             tokens_per_block=build_config.plugin_config.tokens_per_block,
             quant_mode=pretrained_config.quant_mode,
@@ -496,7 +503,12 @@ class ModelRunner(ModelRunnerMixin):
             redrafter_draft_len_per_beam=pretrained_config.
             redrafter_draft_len_per_beam if hasattr(
                 pretrained_config, 'redrafter_draft_len_per_beam') else 0,
-        )
+            kv_cache_type=getattr(build_config, 'kv_cache_type',
+                                  KVCacheType.CONTINUOUS))
+
+        if model_config.kv_cache_type == KVCacheType.DISABLED:
+            assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
+
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
         max_seq_len = build_config.max_seq_len
@@ -542,6 +554,7 @@ class ModelRunner(ModelRunnerMixin):
                      max_input_len=max_input_len,
                      max_seq_len=max_seq_len,
                      max_beam_width=max_beam_width,
+                     kv_cache_type=model_config.kv_cache_type,
                      lora_manager=lora_manager)
         runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
         return runner
@@ -550,6 +563,7 @@ class ModelRunner(ModelRunnerMixin):
     def from_dir(
             cls,
             engine_dir: str,
+            max_output_len: Optional[int] = None,
             lora_dir: Optional[List[str]] = None,
             rank: int = 0,
             debug_mode: bool = False,
@@ -565,6 +579,8 @@ class ModelRunner(ModelRunnerMixin):
         Args:
             engine_dir (str):
                 The directory that contains the serialized engine files and config files.
+            max_output_len (Optional[int]):
+                max_output_len, this arg might be available only when loading time, generate will still to check when disable_kv_cache is enabled.
             lora_dir (Optional[List[str]]):
                 The directories that contain LoRA weights.
             rank (int):
@@ -645,6 +661,7 @@ class ModelRunner(ModelRunnerMixin):
                          max_input_len=max_input_len,
                          max_seq_len=max_input_len + max_output_len,
                          max_beam_width=max_beam_width,
+                         kv_cache_type=KVCacheType.CONTINUOUS,
                          lora_manager=lora_manager)
             runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
             return runner
@@ -658,16 +675,11 @@ class ModelRunner(ModelRunnerMixin):
                         f"{engine_dir}/{dir}" for dir in config_lora_dir
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
-            runner = ModelRunner.from_engine(
-                engine,
-                lora_dir,
-                rank,
-                debug_mode,
-                lora_ckpt_source,
-                medusa_choices,
-                stream,
-                gpu_weights_percent,
-                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
+
+            runner = ModelRunner.from_engine(engine, max_output_len, lora_dir,
+                                             rank, debug_mode, lora_ckpt_source,
+                                             medusa_choices, stream,
+                                             gpu_weights_percent)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -803,6 +815,10 @@ class ModelRunner(ModelRunnerMixin):
         if sampling_config.stop_words_list is not None:
             sampling_config.stop_words_list = to_word_list_format(
                 sampling_config.stop_words_list)
+
+        if not self.kv_cache_type and sampling_config.max_new_tokens > 1:
+            raise RuntimeError(
+                'Disabled KV cache is intended for context phase only now.')
 
         self.session.setup(
             batch_size=batch_size,

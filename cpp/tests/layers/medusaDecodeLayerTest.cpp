@@ -261,15 +261,13 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
 template <typename T>
 std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSize);
+    auto forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSlots, mBatchSize);
 
     auto batchSlots = BufferRange<SizeType32>(*mBatchSlots);
 
     forwardParams->logits = mTargetLogitsDevice;
 
     forwardParams->finished = mFinishedDevice;
-
-    forwardParams->batchSlots = mBatchSlots;
 
     forwardParams->paths = mPathsDevice;
 

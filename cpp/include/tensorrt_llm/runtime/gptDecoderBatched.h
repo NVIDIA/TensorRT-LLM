@@ -79,24 +79,52 @@ public:
 
     //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token ids without
-    //! padding for request `batchIdx`, on gpu
-    [[nodiscard]] TensorPtr getOutputIds(SizeType32 batchIdx) const override
+    //! padding for request `batchIdx`, on gpu. In case of beam search, contains the ungathered data.
+    [[nodiscard]] TensorPtr getIds(SizeType32 batchIdx) const override
     {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         auto tensor = ITensor::slice(mJointDecodingOutput->ids, batchIdx, 1);
         tensor->squeeze(0);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
         return tensor;
     }
 
     //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
-    //! ids without padding, on gpu
-    [[nodiscard]] TensorPtr getOutputIds() const override
+    //! ids without padding, on gpu. In case of beam search, contains the ungathered data.
+    [[nodiscard]] TensorPtr getIds() const override
     {
-        return ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        auto tensor = ITensor::slice(mJointDecodingOutput->ids, 0, mActualBatchSize);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return tensor;
+    }
+
+    //! @param batchIdx index of the batch
+    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], only used for beam search. It contains
+    //! gathered token ids without padding for request `batchIdx`, on gpu.
+    [[nodiscard]] TensorPtr getGatheredIds(SizeType32 batchIdx) const override
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, batchIdx, 1);
+        tensor->squeeze(0);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return tensor;
+    }
+
+    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], only used for beam search. It contains
+    //! gathered token ids without padding, on gpu
+    [[nodiscard]] TensorPtr getGatheredIds() const override
+    {
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+        auto tensor = ITensor::slice(mJointDecodingOutput->gatheredIds, 0, mActualBatchSize);
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return tensor;
     }
 
     //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
-    [[nodiscard]] CudaEvent finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig) const override;
+    [[nodiscard]] CudaEvent finalize(
+        SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const override;
 
     //! @brief Gather final beam search results for all requests.
     void finalize(SamplingConfig const& samplingConfig) const override;
@@ -202,7 +230,8 @@ public:
 
 private:
     //! @brief Gather final beam search results for request `batchIdx`.
-    [[nodiscard]] CudaEvent postProcessRequest(SizeType32 batchIdx, SamplingConfig const& samplingConfig) const;
+    [[nodiscard]] CudaEvent postProcessRequest(
+        SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const;
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`.
     void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
@@ -299,5 +328,11 @@ private:
 
     SpeculativeDecodingMode mSpeculativeDecodingMode;
     executor::DecodingMode mDecodingMode{executor::DecodingMode::Auto()};
+
+    // temporary buffers for the beam search + streaming case
+    std::shared_ptr<DecodingOutput::BeamHypotheses> mOutputBeamHypotheses{nullptr};
+    // will store a slice of DecodingOutput::cumLogProbs
+    DecodingOutput::TensorPtr mCumLogProbsTmp;
+    SizeType32 mNumSMs;
 };
 } // namespace tensorrt_llm::runtime
