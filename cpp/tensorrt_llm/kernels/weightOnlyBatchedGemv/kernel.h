@@ -109,6 +109,7 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
 
         scales_iterator.load(iter);
         zeros_iterator.load(iter);
+        __pipeline_wait_prior(0);
         act_scale_iterator.load(vec_act_scale, iter);
 #pragma unroll
         for (int i = 0; i < CtaN; ++i)
