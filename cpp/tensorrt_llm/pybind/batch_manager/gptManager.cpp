@@ -75,7 +75,7 @@ tb::GetInferenceRequestsCallback callbackAdapter(GetInferenceRequestsCallback co
         std::list<InferenceRequest> pythonResults = callback(max_sequences);
         std::list<std::shared_ptr<tb::InferenceRequest>> cppResults{};
 
-        for (const auto& ir : pythonResults)
+        for (auto const& ir : pythonResults)
         {
             cppResults.push_back(ir.toTrtLlm());
         }
@@ -89,7 +89,7 @@ tb::SendResponseCallback callbackAdapter(SendResponseCallback const& callback)
     return [callback](uint64_t id, std::list<tb::NamedTensor> const& cppTensors, bool isOk, std::string const& errMsg)
     {
         std::list<NamedTensor> pythonList{};
-        for (const auto& cppNamedTensor : cppTensors)
+        for (auto const& cppNamedTensor : cppTensors)
         {
             pythonList.emplace_back(cppNamedTensor);
         }
@@ -100,9 +100,19 @@ tb::SendResponseCallback callbackAdapter(SendResponseCallback const& callback)
 void GptManager::initBindings(py::module_& m)
 {
     py::class_<GptManager>(m, "GptManager")
-        .def(py::init<std::filesystem::path const&, tb::TrtGptModelType, GetInferenceRequestsCallback,
-                 SendResponseCallback, tb::PollStopSignalCallback, tb::ReturnBatchManagerStatsCallback,
-                 tb::TrtGptModelOptionalParams const&, std::optional<uint64_t>>(),
+        .def(py::init(
+                 [](std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType,
+                     GetInferenceRequestsCallback const& getInferenceRequestsCb,
+                     SendResponseCallback const& sendResponseCb, tb::PollStopSignalCallback const& pollStopSignalCb,
+                     tb::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb,
+                     tb::TrtGptModelOptionalParams const& optionalParams, std::optional<uint64_t> terminateReqId)
+                 {
+                     PyErr_WarnEx(
+                         PyExc_DeprecationWarning, "GptManager is deprecated use the executor API instead.", 1);
+
+                     return GptManager(trtEnginePath, modelType, getInferenceRequestsCb, sendResponseCb,
+                         pollStopSignalCb, returnBatchManagerStatsCb, optionalParams, terminateReqId);
+                 }),
             py::arg("trt_engine_path"), py::arg("model_type"), py::arg("get_inference_requests_cb"),
             py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
             py::arg("return_batch_manager_stats_cb") = nullptr,

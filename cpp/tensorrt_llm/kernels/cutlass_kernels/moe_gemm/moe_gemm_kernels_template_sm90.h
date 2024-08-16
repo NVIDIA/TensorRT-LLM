@@ -63,8 +63,10 @@
 
 namespace tensorrt_llm
 {
+using EpilogueFusion = HopperGroupedGemmInput::EpilogueFusion;
 
-template <typename T, typename WeightType, typename EpilogueTag, typename TileShape, typename ClusterShape>
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename TileShape, typename ClusterShape>
 void dispatchMoeGemmSelectBiasSM90(HopperGroupedGemmInput hopper_input, int num_experts, int multi_processor_count,
     cudaStream_t stream, int* occupancy, size_t* workspace_size)
 {
@@ -82,8 +84,8 @@ void dispatchMoeGemmSelectBiasSM90(HopperGroupedGemmInput hopper_input, int num_
     //                                           WeightType,
     //                                               cutlass::arch::Sm90, EpilogueTag, false>;
     // TODO(dastokes) Re-enable bias when CUTLASS supports it
-    auto func = kernels::cutlass_kernels::sm90_generic_moe_gemm_kernelLauncher<T, WeightType, EpilogueTag, TileShape,
-        ClusterShape, false>;
+    auto func = kernels::cutlass_kernels::sm90_generic_moe_gemm_kernelLauncher<T, WeightType, OutputType, EpilogueTag,
+        FUSION, TileShape, ClusterShape, false>;
     func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
 }
 
@@ -130,7 +132,8 @@ constexpr bool are_tile_shapes_supported()
     }
 }
 
-template <typename T, typename WeightType, typename EpilogueTag, typename TileShape>
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename TileShape>
 void dispatchMoeGemmSelectClusterShapeSM90(HopperGroupedGemmInput hopper_input, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream, int* occupancy,
     size_t* workspace_size)
@@ -144,7 +147,7 @@ void dispatchMoeGemmSelectClusterShapeSM90(HopperGroupedGemmInput hopper_input, 
         using ClusterShape = Shape<_##M, _##N, _##K>;                                                                  \
         if constexpr (are_tile_shapes_supported<TileShape, ClusterShape>())                                            \
         {                                                                                                              \
-            dispatchMoeGemmSelectBiasSM90<T, WeightType, EpilogueTag, TileShape, ClusterShape>(                        \
+            dispatchMoeGemmSelectBiasSM90<T, WeightType, OutputType, EpilogueTag, FUSION, TileShape, ClusterShape>(    \
                 hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);                  \
             break;                                                                                                     \
         }                                                                                                              \
@@ -165,7 +168,7 @@ void dispatchMoeGemmSelectClusterShapeSM90(HopperGroupedGemmInput hopper_input, 
     }
 } // namespace tensorrt_llm
 
-template <typename T, typename WeightType, typename EpilogueTag>
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION>
 void dispatchMoeGemmSelectTileShapeSM90(HopperGroupedGemmInput hopper_input, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream, int* occupancy,
     size_t* workspace_size)
@@ -180,7 +183,7 @@ void dispatchMoeGemmSelectTileShapeSM90(HopperGroupedGemmInput hopper_input, int
         constexpr int KtileBytes = K / sizeof(T);                                                                      \
         using KTileDim = Int<KtileBytes>;                                                                              \
         using TileShape = Shape<_##M, _##N, KTileDim>;                                                                 \
-        dispatchMoeGemmSelectClusterShapeSM90<T, WeightType, EpilogueTag, TileShape>(                                  \
+        dispatchMoeGemmSelectClusterShapeSM90<T, WeightType, OutputType, EpilogueTag, FUSION, TileShape>(              \
             hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);         \
         break;                                                                                                         \
     }
@@ -201,13 +204,13 @@ void dispatchMoeGemmSelectTileShapeSM90(HopperGroupedGemmInput hopper_input, int
     }
 }
 
-template <typename T, typename WeightType>
+template <typename T, typename WeightType, typename OutputType, EpilogueFusion FUSION>
 size_t calcMaxWorkspaceSizeSM90(
     int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count)
 {
     size_t count;
     // Most of the values are ignored for WS size calculation. We reuse the function to reduce the template bloat
-    dispatchMoeGemmSelectTileShapeSM90<T, WeightType, cutlass_extensions::EpilogueOpDefault>(
+    dispatchMoeGemmSelectTileShapeSM90<T, WeightType, OutputType, cutlass_extensions::EpilogueOpDefault, FUSION>(
         HopperGroupedGemmInput{}, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
     return count;
 }

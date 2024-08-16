@@ -25,7 +25,7 @@ For example, each rank typically uses just 1/8 of the model weights when using 8
 
 TensorRT can optimize the memory usage by reusing memory for different tensors based on live analysis and tensor size. To avoid out of memory errors at runtime and to reduce the runtime cost of switching optimization profiles and changing shapes, **TensorRT pre-computes the activation tensors memory requirement at build time**. The memory requirement is computed based on an optimized TensorRT graph, one profile’s memory usage is computed by using the max tensor shape, and the memory requirement of one engine is computed by the maximum size between different profiles. There are external and internal factors that can affect the activation size returned by TensorRT, such as the network structure, kernel fusion, operation scheduling, etc.
 
-Once the TensorRT engine is built, the activation memory size of that engine **cannot be changed**, and can be queried by the API `trt.ICudaEngine.device_memory_size`.
+Once the TensorRT engine is built, the activation memory size of that engine **cannot be changed**, and can be queried by the API `trt.ICudaEngine.device_memory_size_v2`.
 
 Practically, for a given model, specified precision and parallelization strategy, one can tune the activation memory usage by adjusting the max batch size, max input length, max beam width, max number of tokens, padding removal on/off flag, context FMHA on/off flag.
 Here some explanations on how these values affect the memory:

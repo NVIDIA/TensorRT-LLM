@@ -16,13 +16,16 @@
 #include "tllmRuntime.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/common/safetensors.h"
 #include "tllmLogger.h"
 
 #include <limits>
 #include <type_traits>
 
 using namespace tensorrt_llm::runtime;
+using TensorMap = StringPtrMap<ITensor>;
 
 namespace
 {
@@ -91,12 +94,11 @@ void setWeightStreaming(nvinfer1::ICudaEngine& engine, float const gpuWeightsPer
 {
     if (gpuWeightsPercent < 1)
     {
-        int64_t min = engine.getMinimumWeightStreamingBudget();
-        int64_t max = engine.getStreamableWeightsSize();
-        int64_t budget = min + gpuWeightsPercent * (max - min);
+        int64_t streamableSize = engine.getStreamableWeightsSize();
+        int64_t budget = gpuWeightsPercent * streamableSize;
         TLLM_LOG_INFO("Set gpu weights percent to %f, which is %lld bytes. Valid range: %lld bytes - %lld bytes.",
-            gpuWeightsPercent, budget, min, max);
-        engine.setWeightStreamingBudget(budget);
+            gpuWeightsPercent, budget, 0, streamableSize);
+        engine.setWeightStreamingBudgetV2(budget);
     }
 }
 } // namespace
@@ -131,7 +133,7 @@ TllmRuntime::TllmRuntime(
 
     setWeightStreaming(getEngine(), gpuWeightsPercent);
 
-    auto const devMemorySize = mEngine->getDeviceMemorySize();
+    auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
 
     // Print context memory size for CI/CD to track.
@@ -155,7 +157,7 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
         }
     }
     auto& context = *mContexts.back();
-    context.setDeviceMemory(mEngineBuffer->data());
+    context.setDeviceMemoryV2(mEngineBuffer->data(), static_cast<int64_t>(mEngineBuffer->getCapacity()));
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
     // If nvtx verbosity is DETAILED, print an info about potential perf overhead.
     if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
@@ -189,17 +191,23 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
     {
-        auto const name = mEngine->getIOTensorName(i);
+        char const* name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
         {
             auto pos = tensorMap.find(name);
-            if (pos == tensorMap.end())
+            auto posWeight = mManagedWeightsMap.find(name);
+            if (pos == tensorMap.end() && posWeight == mManagedWeightsMap.end())
             {
                 auto expectedShape = mEngine->getTensorShape(name);
                 TLLM_THROW(
                     "Input tensor '%s' not found; expected shape: %s", name, ITensor::toString(expectedShape).c_str());
             }
-            auto const& tensor = pos->second;
+            if (posWeight != mManagedWeightsMap.end() && mSetWeights.count(contextIndex) > 0)
+            {
+                continue; // This input tensor is a managed weight, and we have already set it in a previous call.
+            }
+
+            auto const& tensor = pos == tensorMap.end() ? posWeight->second : pos->second;
             auto const tensorDtype = tensor->getDataType();
             auto const engineDtype = mEngine->getTensorDataType(name);
             // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
@@ -237,6 +245,7 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
         }
     }
 
+    mSetWeights.insert(contextIndex);
     if (mUseShapeInference)
     {
         NVTX3_SCOPED_RANGE(infer_shapes);
@@ -334,4 +343,23 @@ std::string TllmRuntime::getLayerProfileInfo() const
 void TllmRuntime::reportToProfiler(SizeType32 contextId)
 {
     mContexts[contextId]->reportToProfiler();
+}
+
+void TllmRuntime::loadManagedWeights(std::string const& weightsPath)
+{
+    auto& engine = getEngine();
+    auto& manager = getBufferManager();
+
+    std::shared_ptr<common::safetensors::ISafeTensor> managed_weights
+        = common::safetensors::ISafeTensor::open(weightsPath.c_str());
+    for (auto const& name : managed_weights->keys())
+    {
+        TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
+        auto const weight = managed_weights->getTensor(name.c_str());
+        TLLM_CHECK(weight->dtype() == engine.getTensorDataType(name.c_str()));
+        auto weightsDevice
+            = std::shared_ptr<ITensor>{manager.allocate(MemoryType::kGPU, weight->trtDims(), weight->dtype())};
+        manager.copy(weight->data(), *weightsDevice, MemoryType::kCPU);
+        mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
+    }
 }

@@ -72,25 +72,23 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_tokens)
+size_t DecoderXQARunner::getWorkspaceSize(int max_num_tokens)
 {
     // buffer for RoPE / output quantization.
-    constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
-    size_t workspace_size = kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens;
+    constexpr size_t kXQA_OUT_ELEM_SIZE = 2;                                             // fp16 or bf16.
+    size_t workspace_size = kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens; // medusa
     if (mMultiBlockMode)
     {
         int workspaces[4];
-        int const max_num_request = max_batch_beam_size;
-        uint32_t const nbSeq = mNumKVHeads * max_num_request;
-        uint32_t const nbSubSeq = xqaMaxNbCtaPerKVHeadFactor() * nbSeq;
+        uint32_t const nbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
+        uint32_t const nbSeq = nbSubSeq / 2;
         int group_size = mNumHeads / mNumKVHeads;
-        workspaces[0] = sizeof(uint32_t) * nbSeq;
-        workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq;
-        workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq;
+        workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
+        workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
+        workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum
         int32_t const multi_block_workspace_alignment
-            = roundUp<int32_t>(sizeof(__half) * kMaxBeamWidth * group_size * mHeadSize, 128);
-        workspaces[3] = multi_block_workspace_alignment * xqaMaxNbCtaPerKVHeadFactor() * mNumKVHeads
-            * divUp(max_batch_beam_size, kMaxBeamWidth);
+            = roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mHeadSize, 128);
+        workspaces[3] = multi_block_workspace_alignment * nbSubSeq;
         workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
             + roundUp(workspaces[0], multi_block_workspace_alignment)
             + roundUp(workspaces[1], multi_block_workspace_alignment)

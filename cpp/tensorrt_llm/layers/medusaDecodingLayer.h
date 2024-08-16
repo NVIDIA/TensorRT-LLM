@@ -59,12 +59,12 @@ private:
 private:
     using Base::mDecoderDomain;
 
-    runtime::SizeType32 mWorkspaceSize{0};
+    size_t mWorkspaceSize{0};
     runtime::SizeType32 mRuntimeMaxTopK{0};
     runtime::SizeType32 mRuntimeMaxTopKPerRequestPerMedusaHead{0};
 
     TensorPtr mCurandStatesDevice;
-    TensorPtr mSetupWorkspaceDevice;
+    BufferPtr mSetupWorkspaceDevice;
     BufferPtr mSamplingWorkspaceDevice;
     TensorPtr mRuntimeTopKDevice;
     TensorPtr mTargetTokensDevice;

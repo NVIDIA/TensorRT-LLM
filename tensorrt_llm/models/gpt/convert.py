@@ -994,10 +994,11 @@ def quantize(hf_model_dir: str,
              config: GPTConfig,
              device: str = 'cuda',
              calib_dataset: str = 'cnn_dailymail'):
+    os.makedirs(output_dir, exist_ok=True)
     config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
-    assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
+    assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq
@@ -1406,18 +1407,22 @@ def load_weights_from_nemo(nemo_ckpt_dir: str, config: GPTConfig, **kwargs):
         if tp_idx == 0 and pp_idx == 0:
             if has_position_embedding:
                 val = model[
-                    "model.language_model.embedding.position_embeddings.weight"]
+                    "model.language_model.embedding.position_embeddings.weight"].detach(
+                    ).cpu()
                 model_level_weights[
                     "transformer.position_embedding.weight"].append(val)
         if pp_idx == 0:
             val = model.get(
-                "state_dict",
-                model)["model.language_model.embedding.word_embeddings.weight"]
+                "state_dict", model
+            )["model.language_model.embedding.word_embeddings.weight"].detach(
+            ).cpu()
             model_level_weights["transformer.vocab_embedding.weight"].append(
                 val)
         if has_lm_head and pp_idx == training_pp_size - 1:
-            val = model.get("state_dict",
-                            model)["model.language_model.output_layer.weight"]
+            val = model.get(
+                "state_dict",
+                model)["model.language_model.output_layer.weight"].detach().cpu(
+                )
             model_level_weights["lm_head.weight"].append(val)
 
     weights = {}
@@ -1430,7 +1435,7 @@ def load_weights_from_nemo(nemo_ckpt_dir: str, config: GPTConfig, **kwargs):
                                         handle_model_level_weights,
                                         layer_rename_config)
         for name in list(models[0].keys()):
-            params = [model[name] for model in models]
+            params = [model[name].detach().cpu() for model in models]
             if transpose_weights and params[0].ndim == 2:
                 params = [p.T for p in params]
             if "layernorm.weight" in name and apply_layernorm_1p:

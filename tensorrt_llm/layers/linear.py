@@ -12,15 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from abc import ABCMeta, abstractmethod
 from typing import Optional
 
 import numpy as np
 import tensorrt as trt
 import torch
-import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
-from .._utils import pad_vocab_size, set_obj_attrs, str_dtype_to_trt
+from .._utils import set_obj_attrs, str_dtype_to_torch, str_dtype_to_trt
 from ..functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
                           _add_plugin_info, _create_tensor, allgather,
                           allreduce, cast, matmul)
@@ -83,7 +83,7 @@ def _gemm_plugin(input: Tensor,
             type is the gemm_plugin type set in the plugin_config.
     '''
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
-        'Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        "Gemm", "1", TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
 
     if use_fp8:
@@ -129,59 +129,97 @@ def _gemm_plugin(input: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
-class Linear(Module):
+class LinearBase(Module, metaclass=ABCMeta):
 
-    def __init__(self,
-                 in_features,
-                 out_features,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 gather_output=True,
-                 share_weight=None,
-                 strict_dtype=False,
-                 pad_lda=0):
+    def __init__(
+        self,
+        local_in_features,
+        local_out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        share_weight=None,
+        strict_dtype=False,
+        pad_lda=0,
+        prefer_managed_weight=True,
+    ):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features // tp_size
+        self.in_features = local_in_features
+        self.out_features = local_out_features
         self.dtype = dtype
         self.pad_lda = pad_lda
+        self.prefer_managed_weight = prefer_managed_weight
 
         self.share_weight = share_weight
         if not share_weight:
-            self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                    dtype=dtype)
-            set_obj_attrs(self.weight, {
-                "weight_loader": self.weight_loader,
-            })
+            self.weight = Parameter(
+                shape=(self.out_features, self.in_features),
+                dtype=dtype,
+                prefer_managed=self.prefer_managed_weight,
+            )
+            set_obj_attrs(
+                self.weight,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
         else:
             self.weight = share_weight
 
         self.tp_size = tp_size
         self.tp_group = tp_group
-        self.gather_output = gather_output
         self.strict_dtype = self.dtype if strict_dtype else None
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
-            set_obj_attrs(self.bias, {
-                "weight_loader": self.weight_loader,
-            })
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None
 
-    def multiply_gather(self,
-                        x,
-                        weight,
-                        gemm_plugin: Optional[str] = None,
-                        use_fp8: bool = False,
-                        alpha: Optional[np.ndarray] = None,
-                        lora_runtime_params: Optional[LoraRuntimeParams] = None,
-                        lora_hidden_state: Optional[Tensor] = None):
+    def weight_loader(self, mapping: Mapping, param: Parameter,
+                      loaded_weight: torch.Tensor) -> None:
+        tp_rank = mapping.tp_rank
+        shard_size = param._shape[self.tp_split_dim()]
+        start_idx = tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(self.tp_split_dim(), start_idx,
+                                             shard_size)
+
+        param.value = loaded_weight
+
+    @classmethod
+    @abstractmethod
+    def tp_split_dim(cls) -> int:
+        pass
+
+    def weight_is_kn(self):  # WAR for bug 4641821
+        return (default_net().plugin_config.manage_weights
+                and self.prefer_managed_weight
+                and self.weight.dtype == trt.DataType.HALF)
+
+    def get_weight(self) -> Tensor:
+        if default_net(
+        ).plugin_config.manage_weights and self.prefer_managed_weight:
+            use_gemm_plugin = default_net(
+            ).plugin_config.gemm_plugin is not None
+            return self.weight.get_managed_tensor(
+                network=default_net(),
+                need_transpose=self.weight_is_kn() and not use_gemm_plugin)
+        else:
+            return self.weight.get_constant_tensor(network=default_net())
+
+    def multiply_and_lora(
+        self,
+        x,
+        weight,
+        gemm_plugin: Optional[str] = None,
+        use_fp8: bool = False,
+        alpha: Optional[np.ndarray] = None,
+        lora_runtime_params: Optional[LoraRuntimeParams] = None,
+        lora_hidden_state: Optional[Tensor] = None,
+    ):
         hidden_state = x
         if gemm_plugin:
             if gemm_plugin == 'fp8':
@@ -197,13 +235,102 @@ class Linear(Module):
                              alpha=alpha,
                              strict_dtype=strict_dtype)
         else:
-            x = matmul(x, weight, transb=True)
+            x = matmul(x, weight, transb=not self.weight_is_kn())
 
         if default_net(
         ).plugin_config.lora_plugin and lora_runtime_params is not None:
-            x = x + self.lora(hidden_state if lora_hidden_state is None else
-                              lora_hidden_state,
-                              lora_runtime_params=lora_runtime_params)
+            x = x + self.lora(
+                hidden_state
+                if lora_hidden_state is None else lora_hidden_state,
+                lora_runtime_params=lora_runtime_params,
+            )
+        return x
+
+    @abstractmethod
+    def collect_and_bias(self, x: Tensor) -> Tensor:
+        pass
+
+    def multiply_collect(
+            self,
+            x,
+            weight,
+            gemm_plugin: Optional[str] = None,
+            use_fp8: bool = False,
+            alpha: Optional[np.ndarray] = None,
+            lora_runtime_params: Optional[LoraRuntimeParams] = None,
+            lora_hidden_state: Optional[Tensor] = None,
+            **kwargs):
+        x = self.multiply_and_lora(
+            x,
+            weight,
+            gemm_plugin=gemm_plugin,
+            use_fp8=use_fp8,
+            alpha=alpha,
+            lora_runtime_params=lora_runtime_params,
+            lora_hidden_state=lora_hidden_state,
+        )
+        return self.collect_and_bias(x, **kwargs)
+
+    def forward(self,
+                x,
+                lora_runtime_params: Optional[LoraRuntimeParams] = None,
+                lora_hidden_state: Optional[Tensor] = None,
+                **kwargs) -> Tensor:
+        return self.multiply_collect(
+            x,
+            self.get_weight(),
+            gemm_plugin=default_net().plugin_config.gemm_plugin,
+            use_fp8=False,
+            lora_runtime_params=lora_runtime_params,
+            lora_hidden_state=lora_hidden_state,
+            **kwargs)
+
+
+class Linear(LinearBase):
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        gather_output=True,
+        share_weight=None,
+        strict_dtype=False,
+        pad_lda=0,
+        prefer_managed_weight=True,
+        is_qkv=True,
+    ):
+        super().__init__(
+            local_in_features=in_features,
+            local_out_features=out_features // tp_size,
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            share_weight=share_weight,
+            strict_dtype=strict_dtype,
+            pad_lda=pad_lda,
+            prefer_managed_weight=prefer_managed_weight,
+        )
+        self.gather_output = gather_output
+        self.is_qkv = is_qkv
+        self.tp_dim = 0
+        if bias:
+            set_obj_attrs(
+                self.bias,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
+
+    @classmethod
+    def tp_split_dim(cls) -> int:
+        return 0
+
+    def collect_and_bias(self, x, **kwargs):
 
         if self.bias is not None:
             bias = cast(self.bias.value, x.dtype)
@@ -215,146 +342,71 @@ class Linear(Module):
 
         return x
 
-    def forward(self,
-                x,
-                lora_runtime_params: Optional[LoraRuntimeParams] = None,
-                lora_hidden_state: Optional[Tensor] = None):
-        return self.multiply_gather(
-            x,
-            self.weight.value,
-            gemm_plugin=default_net().plugin_config.gemm_plugin,
-            lora_runtime_params=lora_runtime_params,
-            lora_hidden_state=lora_hidden_state)
-
-    def weight_loader(self, mapping: Mapping, param: Parameter,
-                      loaded_weight: torch.Tensor):
-        tp_rank = mapping.tp_rank
-        output_dim = 0
-        shard_size = param._shape[output_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-        param.value = loaded_weight
+    def postprocess(self,
+                    tllm_key,
+                    weights,
+                    using_head_as_leading_dim=False,
+                    num_heads=-1):
+        if self.is_qkv:
+            if isinstance(weights, list):
+                weights = torch.cat(weights)
+            if using_head_as_leading_dim:
+                # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]
+                head_dim = self.out_features // (3 * num_heads)
+                w = weights.reshape(num_heads, 3, head_dim, -1)
+                w = w.transpose(0, 1)
+                if w.shape[-1] > 1:
+                    weights = w.reshape(-1, self.in_features)  # Weight
+                else:
+                    weights = w.reshape(-1)  # Bias
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        return {tllm_key: weights}
 
 
 ColumnLinear = Linear
 
 
-class QKVColumnLinear(ColumnLinear):
+class RowLinear(LinearBase):
 
-    def weight_loader(self, mapping: Mapping, param: Parameter,
-                      loaded_weight: torch.Tensor):
-        tp_rank = mapping.tp_rank
-        output_dim = 0
-        shard_size = param._shape[output_dim] // 3
-        start_idx = tp_rank * shard_size
-        # reshape for qkv_weights
-        assert loaded_weight.shape[output_dim] % 3 == 0
-        loaded_weight = loaded_weight.reshape(
-            3, loaded_weight.shape[output_dim] // 3, -1)
-        loaded_weight = loaded_weight.narrow(output_dim + 1, start_idx,
-                                             shard_size)
-        loaded_weight = loaded_weight.reshape(
-            loaded_weight.shape[output_dim + 1] * 3, -1)
-        # for bias
-        if len(param._shape) == 1:
-            loaded_weight.squeeze_(-1)
-        param.value = loaded_weight
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        strict_dtype: bool = False,
+        pad_lda=0,
+        prefer_managed_weight=True,
+    ):
+        super().__init__(
+            local_in_features=in_features // tp_size,
+            local_out_features=out_features,
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            strict_dtype=strict_dtype,
+            pad_lda=pad_lda,
+            prefer_managed_weight=prefer_managed_weight,
+        )
 
+        self.tp_dim = 1
 
-class ParallelLMHead(ColumnLinear):
+    @classmethod
+    def tp_split_dim(cls) -> int:
+        return 1
 
-    def weight_loader(self, mapping: Mapping, param: Parameter,
-                      loaded_weight: torch.Tensor):
-        tp_rank = mapping.tp_rank
-        output_dim = 0
-        shard_size = param._shape[output_dim]
-        start_idx = tp_rank * shard_size
-        # vocab padding for TP
-        vocab_size = loaded_weight.shape[output_dim]
-        pad_width = pad_vocab_size(vocab_size, self.tp_size) - vocab_size
-        if pad_width > 0:
-            loaded_weight = F.pad(loaded_weight, (0, 0, 0, pad_width),
-                                  mode="constant",
-                                  value=0)
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        param.value = loaded_weight
-
-
-class RowLinear(Module):
-
-    def __init__(self,
-                 in_features,
-                 out_features,
-                 bias=True,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1,
-                 strict_dtype: bool = False,
-                 pad_lda=0):
-        super().__init__()
-        self.in_features = in_features // tp_size
-        self.out_features = out_features
-        self.dtype = dtype
-        self.pad_lda = pad_lda
-
-        self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=dtype)
-        set_obj_attrs(self.weight, {
-            "weight_loader": self.weight_loader,
-        })
-
-        if bias:
-            self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
-        else:
-            self.register_parameter('bias', None)
-
-        # see optimize_model's add_lora for LoRA initialization
-        self.lora = None
-
-        self.tp_group = tp_group
-        self.tp_size = tp_size
-        self.strict_dtype = self.dtype if strict_dtype else None
-
-    def multiply_reduce(
-            self,
-            x,
-            weight,
-            gemm_plugin: Optional[str] = None,
-            use_fp8: bool = False,
-            alpha: Optional[np.ndarray] = None,
-            lora_runtime_params: Optional[LoraRuntimeParams] = None,
-            lora_hidden_state: Optional[Tensor] = None,
-            reduce_fusion_params: Optional[AllReduceFusionParams] = None):
-        hidden_state = x
-        if gemm_plugin:
-            if gemm_plugin == 'fp8':
-                strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
-                    self.dtype, str) else self.dtype
-            else:
-                strict_dtype = self.strict_dtype
-            x = _gemm_plugin(x,
-                             weight,
-                             transb=True,
-                             pad_lda=self.pad_lda,
-                             use_fp8=use_fp8,
-                             alpha=alpha,
-                             strict_dtype=strict_dtype)
-        else:
-            x = matmul(x, weight, transb=True)
-
-        if default_net(
-        ).plugin_config.lora_plugin and lora_runtime_params is not None:
-            x = x + self.lora(hidden_state if lora_hidden_state is None else
-                              lora_hidden_state,
-                              lora_runtime_params=lora_runtime_params)
-
+    def collect_and_bias(self, x, **kwargs):
+        reduce_fusion_params: Optional[AllReduceFusionParams] = kwargs.get(
+            "reduce_fusion_params", None)
         if self.tp_size > 1 and self.tp_group is not None:
             need_bias = self.bias is not None
-            fuse_bias_into_all_reduce = need_bias and (
-                reduce_fusion_params
-                is not None) and (reduce_fusion_params.fusion_op
-                                  == AllReduceFusionOp.RESIDUAL_RMS_NORM)
+            fuse_bias_into_all_reduce = (
+                need_bias and (reduce_fusion_params is not None)
+                and (reduce_fusion_params.fusion_op
+                     == AllReduceFusionOp.RESIDUAL_RMS_NORM))
             if fuse_bias_into_all_reduce:
                 reduce_fusion_params.bias = self.bias.value
             x = allreduce(x,
@@ -370,25 +422,3 @@ class RowLinear(Module):
             x = x + bias
 
         return x
-
-    def forward(self,
-                x,
-                lora_runtime_params: Optional[LoraRuntimeParams] = None,
-                lora_hidden_state: Optional[Tensor] = None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
-        return self.multiply_reduce(
-            x,
-            self.weight.value,
-            gemm_plugin=default_net().plugin_config.gemm_plugin,
-            lora_runtime_params=lora_runtime_params,
-            lora_hidden_state=lora_hidden_state,
-            reduce_fusion_params=reduce_fusion_params)
-
-    def weight_loader(self, mapping: Mapping, param: Parameter,
-                      loaded_weight: torch.Tensor):
-        tp_rank = mapping.tp_rank
-        input_dim = 1
-        shard_size = param._shape[input_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
-        param.value = loaded_weight

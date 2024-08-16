@@ -18,5 +18,5 @@
 
 namespace tensorrt_llm
 {
-template class MoeGemmRunner<half, half>;
+template class MoeGemmRunner<half, half, half>;
 }

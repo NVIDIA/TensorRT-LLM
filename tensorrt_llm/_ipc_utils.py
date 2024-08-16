@@ -22,6 +22,7 @@ from cuda import cudart
 from cuda.cudart import cudaError_t
 
 from ._utils import mpi_comm
+from .logger import logger
 from .mapping import Mapping
 
 
@@ -32,14 +33,15 @@ def _raise_if_error(error: cudaError_t):
 
 @contextmanager
 def peer_access(mapping: Mapping):
-    set_peer_access(mapping, True)
+    is_p2p_supported = set_peer_access(mapping, True)
+    assert is_p2p_supported, "P2P access not supported"
     try:
         yield
     finally:
         set_peer_access(mapping, False)
 
 
-def set_peer_access(mapping: Mapping, enabled: bool = True):
+def set_peer_access(mapping: Mapping, enabled: bool = True) -> bool:
     src_node = mapping.local_rank
     for rank in mapping.tp_group:
         dest_node = mapping.get_local_rank(rank)
@@ -51,8 +53,9 @@ def set_peer_access(mapping: Mapping, enabled: bool = True):
         _raise_if_error(error)
 
         if result == 0:
-            raise RuntimeError(
-                f"Can't enable access between nodes {src_node} and {dest_node}")
+            logger.info(
+                f"Cannot access peer device from {src_node} to {dest_node}")
+            return False
 
         if enabled:
             cudart.cudaDeviceEnablePeerAccess(dest_node, 0)
@@ -65,6 +68,7 @@ def set_peer_access(mapping: Mapping, enabled: bool = True):
                 cudaError_t.cudaErrorPeerAccessNotEnabled
         ]:
             raise RuntimeError(error)
+    return True
 
 
 class IpcMemory():
@@ -73,9 +77,9 @@ class IpcMemory():
     # (Max all reduce blocks + 1) * sizeof(int)
     IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
 
-    def __init__(self, mapping: Mapping, size: int):
+    def __init__(self, mapping: Mapping, size: int, open_ipc: bool = True):
         self.mapping = mapping
-        self.open_ipc = mapping.tp_size <= mapping.gpus_per_node
+        self.open_ipc = open_ipc and mapping.tp_size <= mapping.gpus_per_node
         if self.open_ipc:
             self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(
                 self.mapping, size, True)

@@ -36,6 +36,7 @@
 #include "cutlass/tensor_ref.h"
 
 #include "cutlass_extensions/compute_occupancy.h"
+#include "cutlass_extensions/epilogue/collective/epilogue_moe_finalize.hpp"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
 #include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
@@ -63,9 +64,11 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
+using EpilogueFusion = HopperGroupedGemmInput::EpilogueFusion;
 
 // Hopper helper class for defining all the cutlass helper types
-template <typename T, typename WeightType, typename EpilogueTag, typename TileShape, typename ClusterShape, bool BIAS>
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, typename TileShape,
+    typename ClusterShape, bool BIAS, EpilogueFusion FUSION>
 struct HopperGroupedGemmInfo
 {
     using Arch = cutlass::arch::Sm90;
@@ -111,15 +114,18 @@ struct HopperGroupedGemmInfo
     using ElementA = ElementType;
     using ElementB = CutlassWeightType;
 
-    template <class Element>
-    using CutlassOutputTypeAdaptor_t = typename TllmToCutlassTypeAdapter<
-        HopperGroupedGemmInput::OutputTypeAdaptor_t<typename CutlassToTllmTypeAdapter<Element>::type>>::type;
-    using ElementD = CutlassOutputTypeAdaptor_t<ElementType>;
+    using ElementD = typename TllmToCutlassTypeAdapter<HopperGroupedGemmInput::OutputTypeAdaptor_t<OutputType>>::type;
+    using ElementFinalOutput = typename TllmToCutlassTypeAdapter<OutputType>::type;
 
-    using ElementC = std::conditional_t<BIAS, ElementType, void>;
-    using ElementCNoVoid = std::conditional_t<BIAS, ElementType, ElementD>;
+    // using ElementC = std::conditional_t<BIAS, ElementType, void>;
+    // using ElementCNoVoid = std::conditional_t<BIAS, ElementType, ElementD>;
+    using ElementC = void;
+    using ElementCNoVoid = ElementD;
 
     using ElementAccumulator = float;
+
+    using ElementBias = ElementFinalOutput;
+    using ElementRouterScales = float;
 
     // A matrix configuration - this is transposed and swapped with B
     using LayoutA = HopperGroupedGemmInput::LayoutA;
@@ -135,13 +141,15 @@ struct HopperGroupedGemmInfo
 
     // C matrix configuration
     using LayoutC = HopperGroupedGemmInput::LayoutC; // Layout type for C matrix operand
+    using StrideC = HopperGroupedGemmInput::StrideC;
     // Note we use ElementType here deliberately, so we don't break when BIAS is disabled
     constexpr static int AlignmentC
         = 128 / cutlass::sizeof_bits<ElementType>::value; // Memory access granularity/alignment of C matrix in units
                                                           // of elements (up to 16 bytes)
 
     // D matrix configuration
-    using LayoutD = HopperGroupedGemmInput::LayoutD;
+    using LayoutD = HopperGroupedGemmInput::DefaultEpilogue::LayoutD;
+    using StrideD = HopperGroupedGemmInput::DefaultEpilogue::StrideD;
     constexpr static int AlignmentD
         = 128 / cutlass::sizeof_bits<ElementD>::value; // Memory access granularity/alignment of D matrix
                                                        // in units of elements (up to 16 bytes)
@@ -160,14 +168,29 @@ struct HopperGroupedGemmInfo
     //        >;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized;
 
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder< //
-        Arch, cutlass::arch::OpClassTensorOp,                                             //
-        TileShape, ClusterShape,                                                          //
-        cutlass::epilogue::collective::EpilogueTileAuto,                                  //
-        ElementAccumulator, ElementAccumulator,                                           //
-        ElementC, LayoutC*, AlignmentC,                                                   //
-        ElementD, LayoutD*, AlignmentD,                                                   //
+    // Epilogue For Default Finalize
+    using CollectiveEpilogueDefault = typename cutlass::epilogue::collective::CollectiveBuilder< //
+        Arch, cutlass::arch::OpClassTensorOp,                                                    //
+        TileShape, ClusterShape,                                                                 //
+        cutlass::epilogue::collective::EpilogueTileAuto,                                         //
+        ElementAccumulator, ElementAccumulator,                                                  //
+        ElementC, LayoutC*, AlignmentC,                                                          //
+        ElementD, LayoutD*, AlignmentD,                                                          //
         EpilogueSchedule>::CollectiveOp;
+
+    // Epilogue For Fused Finalize
+    using CollectiveEpilogueFinalize = typename cutlass::epilogue::collective::EpilogueMoeFusedFinalizeBuilder< //
+        TileShape,                                                                                              //
+        ElementCNoVoid, StrideC*,                                                                               //
+        ElementFinalOutput, HopperGroupedGemmInput::FusedFinalizeEpilogue::StrideFinalOutput,                   //
+        ElementAccumulator,                                                                                     //
+        ElementAccumulator,                                                                                     //
+        ElementBias, HopperGroupedGemmInput::FusedFinalizeEpilogue::StrideBias,                                 //
+        ElementRouterScales, HopperGroupedGemmInput::FusedFinalizeEpilogue::StrideRouterScales                  //
+        >::CollectiveOp;
+
+    using CollectiveEpilogue
+        = std::conditional_t<FUSION == EpilogueFusion::FINALIZE, CollectiveEpilogueFinalize, CollectiveEpilogueDefault>;
 
     using StageCountAutoCarveout = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
         sizeof(typename CollectiveEpilogue::SharedStorage))>;
@@ -191,7 +214,8 @@ struct HopperGroupedGemmInfo
 };
 
 // Hopper specialised version
-template <typename T, typename WeightType, typename EpilogueTag, typename TileShape, typename ClusterShape, bool BIAS>
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    typename TileShape, typename ClusterShape, bool BIAS>
 void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, int num_experts,
     int const multi_processor_count, cudaStream_t stream, int* kernel_occupancy, size_t* workspace_size)
 {
@@ -199,7 +223,8 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
     using namespace cute;
     if constexpr (!should_filter_sm90_gemm_problem_shape_v<TileShape, ClusterShape, T>)
     {
-        using GemmInfo = HopperGroupedGemmInfo<T, WeightType, EpilogueTag, TileShape, ClusterShape, BIAS>;
+        using GemmInfo
+            = HopperGroupedGemmInfo<T, WeightType, OutputType, EpilogueTag, TileShape, ClusterShape, BIAS, FUSION>;
 
         using ElementAccumulator = typename GemmInfo::ElementAccumulator;
         using ElementA = typename GemmInfo::ElementA;
@@ -242,10 +267,8 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
         using MainloopArguments = typename CollectiveMainloop::Arguments;
         TLLM_CHECK(hopper_input.stride_a);
         TLLM_CHECK(hopper_input.stride_b);
-        TLLM_CHECK(hopper_input.stride_d);
         TLLM_CHECK(hopper_input.ptr_a);
         TLLM_CHECK(hopper_input.ptr_b);
-        TLLM_CHECK(hopper_input.ptr_d);
 
         MainloopArguments const mainloop_params = {reinterpret_cast<ElementB const**>(hopper_input.ptr_b),
             hopper_input.stride_b, reinterpret_cast<ElementA const**>(hopper_input.ptr_a), hopper_input.stride_a};
@@ -255,9 +278,38 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
         epilogue_scalars.alpha_ptr_array = hopper_input.alpha_scale_ptr_array;
         using EpilogueArguments = typename CollectiveEpilogue::Arguments;
         // TODO(dastokes) ptr_c casts to ElementCNoVoid** because there is a workaround in CUTLASS
-        EpilogueArguments const epilogue_params
-            = {epilogue_scalars, reinterpret_cast<ElementCNoVoid const**>(hopper_input.ptr_c), hopper_input.stride_c,
-                reinterpret_cast<ElementD**>(hopper_input.ptr_d), hopper_input.stride_d};
+        auto make_epi_args = [&]()
+        {
+            if constexpr (FUSION == EpilogueFusion::NONE)
+            {
+                auto epi_params = hopper_input.default_epilogue;
+                return EpilogueArguments{epilogue_scalars, reinterpret_cast<ElementCNoVoid const**>(hopper_input.ptr_c),
+                    hopper_input.stride_c, reinterpret_cast<ElementD**>(epi_params.ptr_d), epi_params.stride_d};
+            }
+            else if constexpr (FUSION == EpilogueFusion::FINALIZE)
+            {
+                // Parameters for fused finalize
+                auto epi_params = hopper_input.fused_finalize_epilogue;
+                return EpilogueArguments{
+                    epilogue_scalars, // Parameters to underlying epilogue
+                    reinterpret_cast<ElementCNoVoid const**>(hopper_input.ptr_c), hopper_input.stride_c, // C params
+                    reinterpret_cast<typename GemmInfo::ElementFinalOutput*>(epi_params.ptr_final_output),
+                    epi_params.stride_final_output,                                // D (output) params
+                    reinterpret_cast<typename GemmInfo::ElementBias const*>(epi_params.ptr_bias),
+                    epi_params.stride_bias,                                        // Bias params
+                    epi_params.ptr_router_scales, epi_params.stride_router_scales, // Router scales
+                    epi_params.ptr_expert_first_token_offset, // Offset of this expert's token in the router scales
+                    epi_params.ptr_source_token_index,        // Index of the source token to sum into
+                    epi_params.num_rows_in_final_output       // Number of tokens in the output buffer
+                };
+            }
+            else
+            {
+                static_assert(
+                    sizeof(EpilogueArguments) == 0, "Unimplemented fusion provided to SM90+ MoE gemm launcher");
+            }
+        };
+        EpilogueArguments const epilogue_params = make_epi_args();
 
         typename GemmKernel::TileScheduler::Arguments scheduler_args{
             1, GemmKernel::TileScheduler::RasterOrderOptions::AlongN};
@@ -275,12 +327,12 @@ void sm90_generic_moe_gemm_kernelLauncher(HopperGroupedGemmInput hopper_input, i
 
         auto init_status = gemm.initialize(args, hopper_input.gemm_workspace);
         TLLM_CHECK_WITH_INFO(init_status == cutlass::Status::kSuccess,
-            "Failed to initialize cutlass variable batched gemm. Error: "
+            "Failed to initialize cutlass SM90 grouped gemm. Error: "
                 + std::string(cutlassGetStatusString(init_status)));
 
         auto run_status = gemm.run(stream);
         TLLM_CHECK_WITH_INFO(run_status == cutlass::Status::kSuccess,
-            "Failed to run cutlass variable batched gemm. Error: " + std::string(cutlassGetStatusString(run_status)));
+            "Failed to run cutlass SM90 grouped gemm. Error: " + std::string(cutlassGetStatusString(run_status)));
         sync_check_cuda_error();
     }
     else

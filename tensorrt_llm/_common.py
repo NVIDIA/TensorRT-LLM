@@ -19,6 +19,7 @@ import platform
 import time
 from functools import wraps
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -27,6 +28,11 @@ import torch
 import tensorrt as trt
 
 # isort: on
+
+if TYPE_CHECKING:
+    from .network import Network
+else:
+    Network = None
 
 from ._utils import str_dtype_to_trt
 from .bindings import MpiComm
@@ -73,7 +79,7 @@ def _init(log_level: object = None) -> None:
     logger.info('TensorRT-LLM inited.')
 
 
-def default_net():
+def default_net() -> Network:
     assert net, "Use builder to create network first, and use `set_network` or `net_guard` to set it to default"
     return net
 
@@ -182,12 +188,9 @@ class _BuildingFlag:
 
     def __enter__(self):
         os.environ['IS_BUILDING'] = '1'
-        os.environ[
-            '__LUNOWUD'] = '-cask_fusion:fp8=off'  # will be removed in future releases
 
     def __exit__(self, type, value, tb):
         del os.environ['IS_BUILDING']
-        del os.environ['__LUNOWUD']
 
 
 def _is_building(f):

@@ -69,8 +69,8 @@ file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
 
 # Get the sources for FP8 Rowwise GEMM launchers
 file(GLOB_RECURSE FBGEMM_CU_INSTANTIATIONS
-     ${INSTANTIATION_GENERATION_DIR}/fbgemm_gpu/*.cu)
-file(GLOB_RECURSE FBGEMM_SRC_CU fbgemm_gpu/*.cu)
+     ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm/*.cu)
+file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
 
 # Get the sources for all the remaining sources
 file(GLOB_RECURSE SRC_CPP *.cpp)
@@ -78,7 +78,7 @@ file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fbgemm_gpu/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(REMOVE_ITEM ALL_SRCS
      "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 

@@ -57,6 +57,12 @@ def serialize_engine(engine, path):
     logger.info(f'Engine serialized. Total time: {t}')
 
 
+def get_last_path_component(path):
+    normalized_path = os.path.normpath(path)
+    last_component = os.path.basename(normalized_path)
+    return last_component
+
+
 class BaseBenchmark(object):
 
     def __init__(self, engine_dir, model_name, dtype, rank, world_size):
@@ -144,7 +150,7 @@ class BaseBenchmark(object):
 
     def get_report_dict(self, benchmark_profiler=None):
         report_fields = [
-            "model_name",
+            "engine_dir",
             "world_size",
             "num_heads",
             "num_kv_heads",
@@ -165,7 +171,7 @@ class BaseBenchmark(object):
             "compute_cap",
         ]
         report_dict = OrderedDict.fromkeys(report_fields)
-        report_dict["model_name"] = self.model_name
+        report_dict["engine_dir"] = get_last_path_component(self.engine_dir)
         report_dict["world_size"] = self.world_size
         report_dict["precision"] = self.dtype
         report_dict["quantization"] = str(self.quant_mode)
@@ -174,7 +180,8 @@ class BaseBenchmark(object):
 
     def get_csv_filename(self):
         if len(self.csv_filename) == 0:
-            self.csv_filename = get_csv_filename(self.model_name,
+            self.csv_filename = get_csv_filename(get_last_path_component(
+                self.engine_dir),
                                                  self.dtype,
                                                  self.world_size,
                                                  fp8linear=int(self.enable_fp8))

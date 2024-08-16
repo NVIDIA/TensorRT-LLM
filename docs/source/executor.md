@@ -17,7 +17,7 @@ The `Executor` class is responsible for receiving requests from the client, and 
 
 #### Logits Post-Processor (optional)
 
-Users can alter the logits produced the network, by providing a map of named callbacks of the form:
+Users can alter the logits produced by the network, by providing a map of named callbacks of the form:
 
 ```
 std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
@@ -42,6 +42,10 @@ post-processor as `Request::kBatchedPostProcessorName`.
 
 Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
 
+In a multi-GPU run, callback is invoked on all tensor parallel ranks (in last pipeline rank) by default.
+For correct execution, user should replicate client-side state accessed by callback on all tensor parallel ranks.
+If replication is expensive or infeasible, use `ExecutorConfig::setReplicateLogitsPostProcessor(false)` to invoke callback only on first tensor parallel rank.
+
 ### The Request Class
 
 The `Request` class is used to define properties of the request, such as the input token ids and the maximum number of tokens to generate. The `streaming` parameter can be used to indicate if the request should generate a response for each new generated tokens (`streaming = true`) or only after all tokens have been generated (`streaming = false`). Other mandatory parameters of the request include the sampling configuration (defined by the `SamplingConfig` class) which contains parameters controlling the decoding process and the output configuration (defined by the `OutputConfig` class) which controls what information should be included in the `Result` for a particular response.
@@ -55,6 +59,17 @@ The `awaitResponses` method of the `Executor` class returns a vector of response
 ### The Result Class
 
 The `Result` class holds the result for a given request. It contains a Boolean parameter called `isFinal` that indicates if this is the last `Result` that will be returned for the given request id. It also contains the generated tokens. If the request is configured with `streaming = false`, the `isFinal` Boolean will be set to `true` and all generated tokens will be included in the `outputTokenIds`. If `streaming = true` is used, a `Result` will only include 1 token and the `isFinal` flag will be set to `true` for the last result associated with this request.
+
+### Sending Requests with Different Beam Widths
+
+The executor can process requests with different beam widths if the following conditions are met:
+
+- The model was built with a `max_beam_width > 1`.
+- The executor is configured with a `maxBeamWidth > 1` (the configured `maxBeamWidth` must be less than or equal to the model's `max_beam_width`).
+- The requested beam widths are less than or equal to the configured `maxBeamWidth`.
+- For requests with two different beam widths, `x` and `y`, requests with beam width `y` are not enqueued until all responses for requests with beam width `x` have been awaited.
+
+The request queue of the executor must be empty to allow it to reconfigure itself for a new beam width. This reconfiguration will happen automatically when requests with a new beam width are enqueued. If requests with different beam widths are enqueued at the same time, the executor will encounter an error and terminate all requests prematurely.
 
 ## C++ Executor API Example
 

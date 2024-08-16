@@ -49,7 +49,7 @@ __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdT
     SizeType32 maxNumHeads, SizeType32 maxDecodingTokens)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     auto const inputLength = sequenceLengths[batchSlot];
     auto const endId = endIds[batchSlot];
     auto const numTokensPerStep = curTokensPerStep[batchSlot];
@@ -205,7 +205,7 @@ __global__ void scatterMedusaDraftTokens(TokenIdType* treeDraftIds, TokenIdType 
     SizeType32 maxDecodingTokens)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     auto const tokensPerStep = tokensPerStepData[batchSlot];
     auto const maxDecodingDraftTokens = maxDecodingTokens - 1;
     for (auto index = static_cast<SizeType32>(threadIdx.x); index < tokensPerStep - 1;

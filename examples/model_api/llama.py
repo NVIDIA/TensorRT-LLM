@@ -11,14 +11,6 @@ from tensorrt_llm.hlapi import SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 
 
-def read_input():
-    while (True):
-        input_text = input("< ")
-        if input_text in ("q", "quit"):
-            break
-        yield input_text
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Llama single model example")
     parser.add_argument(
@@ -64,11 +56,13 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
     executor = GenerationExecutor.create(args.engine_dir)
-    sampling_params = SamplingParams(max_new_tokens=20)
-    for inp in read_input():
-        output = executor.generate(tokenizer.encode(inp),
-                                   sampling_params=sampling_params)
-        print(f"> {tokenizer.decode(output.outputs[0].token_ids)}")
+    sampling_params = SamplingParams(max_new_tokens=5)
+
+    input_str = "What should you say when someone gives you a gift? You should say:"
+    output = executor.generate(tokenizer.encode(input_str),
+                               sampling_params=sampling_params)
+    output_str = tokenizer.decode(output.outputs[0].token_ids)
+    print(f"{input_str} {output_str}")
 
 
 if __name__ == "__main__":

@@ -154,9 +154,10 @@ struct BenchmarkParams
     std::optional<SizeType32> maxBatchSize{std::nullopt};
     std::optional<SizeType32> maxNumTokens{std::nullopt};
     int randomSeed = 430;
-    std::optional<int> maxAttentionWindow{std::nullopt};
+    std::optional<std::vector<int>> maxAttentionWindowVec{std::nullopt};
     std::optional<int> sinkTokenLength{std::nullopt};
     bool multiBlockMode{false};
+    bool enableContextFMHAFP32Acc{false};
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
@@ -802,10 +803,12 @@ public:
 
         texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy);
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
-            benchmarkParams.maxAttentionWindow, benchmarkParams.sinkTokenLength, benchmarkParams.freeGpuMemoryFraction,
-            benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
+            benchmarkParams.maxAttentionWindowVec, benchmarkParams.sinkTokenLength,
+            benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
+        texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(
+            benchmarkParams.multiBlockMode, benchmarkParams.enableContextFMHAFP32Acc);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
@@ -824,7 +827,7 @@ public:
         executorConfig.setDecodingConfig(texec::DecodingConfig(
             benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
             std::nullopt, benchmarkParams.medusaChoices));
-        executorConfig.setMultiBlockMode(benchmarkParams.multiBlockMode);
+        executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
 
         if (executorModelType == texec::ModelType::kDECODER_ONLY)
         {
@@ -1348,7 +1351,7 @@ std::shared_ptr<InferenceRequest> makeRequest(std::uint64_t reqId, Sample const&
     if (sample.taskId >= 0)
     {
         uint64_t taskId = static_cast<uint64_t>(sample.taskId);
-        request->setLoraTaskId(bufferManager.copyFrom(&taskId, ITensor::makeShape({1}), MemoryType::kPINNED));
+        request->setLoraTaskId(bufferManager.copyFrom(&taskId, ITensor::makeShape({1}), MemoryType::kPINNEDPOOL));
     }
     if (loraWeights)
     {
@@ -1403,9 +1406,9 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     {
         optionalParams.kvCacheConfig.freeGpuMemoryFraction = benchmarkParams.freeGpuMemoryFraction;
     }
-    if (benchmarkParams.maxAttentionWindow)
+    if (benchmarkParams.maxAttentionWindowVec)
     {
-        optionalParams.kvCacheConfig.maxAttentionWindow = benchmarkParams.maxAttentionWindow;
+        optionalParams.kvCacheConfig.maxAttentionWindowVec = benchmarkParams.maxAttentionWindowVec;
     }
     if (benchmarkParams.sinkTokenLength)
     {
@@ -1429,7 +1432,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     optionalParams.decodingConfig = texec::DecodingConfig(
         benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa() : texec::DecodingMode::Auto(),
         std::nullopt, benchmarkParams.medusaChoices);
-    optionalParams.multiBlockMode = benchmarkParams.multiBlockMode;
+    optionalParams.extendedRuntimePerfKnobConfig = texec::ExtendedRuntimePerfKnobConfig(
+        benchmarkParams.multiBlockMode, benchmarkParams.enableContextFMHAFP32Acc);
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
     auto const worldConfig = WorldConfig::mpi(jsonConfig.getGpusPerNode(), jsonConfig.getTensorParallelism(),
@@ -1438,7 +1442,7 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
     BufferManager bufferManager{std::make_shared<CudaStream>()}; // the stream is not used
 
     ITensor::SharedPtr beamWidthTensor{
-        bufferManager.copyFrom(&beamWidth, ITensor::makeShape({1}), MemoryType::kPINNED)};
+        bufferManager.copyFrom(&beamWidth, ITensor::makeShape({1}), MemoryType::kPINNEDPOOL)};
 
     // Load dataset
     auto const samples = parseWorkloadJson(datasetPath, maxNumSamples, maxPromptLen);
@@ -1451,16 +1455,16 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
         waitSleep, staticEmulatedBatchSize, batchTimeout, logIterationData, excludeInputInOutput);
 
     ITensor::SharedPtr eosIdTensor{
-        eosId ? bufferManager.copyFrom(&eosId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
+        eosId ? bufferManager.copyFrom(&eosId.value(), ITensor::makeShape({1}), MemoryType::kPINNEDPOOL) : nullptr};
     ITensor::SharedPtr padIdTensor{
-        padId ? bufferManager.copyFrom(&padId.value(), ITensor::makeShape({1}), MemoryType::kPINNED) : nullptr};
+        padId ? bufferManager.copyFrom(&padId.value(), ITensor::makeShape({1}), MemoryType::kPINNEDPOOL) : nullptr};
 
     ITensor::SharedPtr returnContextLogitsFlagTensor{returnContextLogits
-            ? bufferManager.copyFrom(&returnContextLogits, ITensor::makeShape({1}), MemoryType::kPINNED)
+            ? bufferManager.copyFrom(&returnContextLogits, ITensor::makeShape({1}), MemoryType::kPINNEDPOOL)
             : nullptr};
 
     ITensor::SharedPtr returnGenerationLogitsFlagTensor{returnGenerationLogits
-            ? bufferManager.copyFrom(&returnGenerationLogits, ITensor::makeShape({1}), MemoryType::kPINNED)
+            ? bufferManager.copyFrom(&returnGenerationLogits, ITensor::makeShape({1}), MemoryType::kPINNEDPOOL)
             : nullptr};
 
     if (worldConfig.getRank() == 0)
@@ -1812,7 +1816,8 @@ int main(int argc, char* argv[])
         "eos_id", "Specify the end-of-sequence token id.", cxxopts::value<TokenIdType>()->default_value("-1"));
     options.add_options()("pad_id", "Specify the padding token id.", cxxopts::value<TokenIdType>());
     options.add_options()("max_tokens_in_paged_kvcache", "Max tokens in paged K-V Cache.", cxxopts::value<int>());
-    options.add_options()("max_attention_window", "Max KV cache length per sequence", cxxopts::value<int>());
+    options.add_options()(
+        "max_attention_window", "Max KV cache length per sequence", cxxopts::value<std::vector<int>>());
     options.add_options()("sink_token_len", "Sink token length in kv cache per sequence.", cxxopts::value<int>());
     options.add_options()(
         "random_seed", "integer random seed for exponential time delays.", cxxopts::value<int>()->default_value("420"));
@@ -1891,6 +1896,9 @@ int main(int argc, char* argv[])
     options.add_options()(
         "encoder_engine_dir", "Directory that store the engines of the encoder models.", cxxopts::value<std::string>());
 
+    options.add_options()("enable_context_fmha_fp32_acc", "Enable FMHA runner FP32 accumulation",
+        cxxopts::value<bool>()->default_value("false"));
+
     auto result = options.parse(argc, argv);
 
     if (result.count("help"))
@@ -1954,7 +1962,7 @@ int main(int argc, char* argv[])
     // Argument: Max KV cache length
     if (result.count("max_attention_window"))
     {
-        benchmarkParams.maxAttentionWindow = result["max_attention_window"].as<int>();
+        benchmarkParams.maxAttentionWindowVec = result["max_attention_window"].as<std::vector<int>>();
     }
 
     // Argument: Sink token length
@@ -2050,6 +2058,9 @@ int main(int argc, char* argv[])
 
     // Argument: multi_block_mode
     benchmarkParams.multiBlockMode = result["multi_block_mode"].as<bool>();
+
+    // Argument: enable_context_fmha_fp32_acc
+    benchmarkParams.enableContextFMHAFP32Acc = result["enable_context_fmha_fp32_acc"].as<bool>();
 
     std::optional<TokenIdType> padId;
     // Argument: Padding token id

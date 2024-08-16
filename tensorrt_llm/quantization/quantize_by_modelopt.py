@@ -127,11 +127,12 @@ MODEL_NAME_PATTERN_MAP = {
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
+    "GLM": "glm",
 }
 
 
 def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
-    print(f"Initializing tokenizer from {ckpt_path}")
+    logger.info(f"Initializing tokenizer from {ckpt_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         ckpt_path,
         model_max_length=max_seq_length,
@@ -164,7 +165,7 @@ def _get_vila_model(model_dir):
 
 
 def get_model(ckpt_path, dtype="fp16", device="cuda"):
-    print(f"Initializing model from {ckpt_path}")
+    logger.info(f"Initializing model from {ckpt_path}")
     if dtype == "bf16" or dtype == "bfloat16":
         dtype = torch.bfloat16
     elif dtype == "fp16" or dtype == "float16":
@@ -182,6 +183,12 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         model_cls = LlavaForConditionalGeneration
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
+    elif hf_config.model_type == "glm":
+        from transformers import AutoModelForSeq2SeqLM
+        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
+                                                      device_map="cuda",
+                                                      torch_dtype=dtype,
+                                                      trust_remote_code=True)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
@@ -194,7 +201,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
 
     model_dtype = next(model.parameters()).dtype
     if dtype != model_dtype:
-        print(
+        logger.info(
             f"[TensorRT-LLM][WARNING] The manually set model data type is {dtype}, "
             f"but the data type of the HuggingFace model is {model_dtype}.")
 
@@ -213,7 +220,7 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          batch_size=1,
                          calib_size=512,
                          block_size=512):
-    print("Loading calibration dataset")
+    logger.info("Loading calibration dataset")
     if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
             "json",
@@ -224,7 +231,7 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         dataset = dataset["article"][:calib_size]
     elif os.path.isdir(dataset_name_or_dir):
-        print(
+        logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
@@ -257,17 +264,18 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
             return
         """Adjusts weights and scaling factors based on selected algorithms."""
         for idx, data in enumerate(calib_dataloader):
-            print(f"Calibrating batch {idx}")
+            logger.debug(f"Calibrating batch {idx}")
             # model might be mapped to different device because the device_map is auto
             data = data.to(model.device)
             model(data)
 
-    print("Starting quantization...")
+    logger.info("Starting quantization...")
     start_time = time.time()
     atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     end_time = time.time()
-    print("Quantization done. Total time used: {:.2f} s.".format(end_time -
-                                                                 start_time))
+    logger.info(
+        "Quantization done. Total time used: {:.2f} s.".format(end_time -
+                                                               start_time))
 
     return model
 
@@ -336,7 +344,7 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
         json.dump(base_model_config, f, indent=4)
 
     torch.cuda.empty_cache()
-    print("Combine medusa heads' weight, done.")
+    logger.info("Combine medusa heads' weight, done.")
 
 
 def quantize_and_export(*,
@@ -394,15 +402,15 @@ def quantize_and_export(*,
 
     if qformat in ["full_prec", "int8_wo", "int4_wo"
                    ] and kv_cache_dtype is None:
-        print(f"No quantization applied, export {dtype} model")
+        logger.info(f"No quantization applied, export {dtype} model")
     else:
         if "awq" in qformat:
             if calib_size > 32:
-                print(
+                logger.info(
                     f"AWQ calibration could take longer with calib_size = {calib_size}, Using"
                     " calib_size=32 instead")
                 calib_size = 32
-            print(
+            logger.info(
                 "\nAWQ calibration could take longer than other calibration methods. Please"
                 " increase the batch size to speed up the calibration process. Batch size can be"
                 " set by adding the argument --batch_size <batch_size> to the command line.\n"
@@ -439,7 +447,7 @@ def quantize_and_export(*,
 
     with torch.inference_mode():
         if model_type is None:
-            print(
+            logger.info(
                 f"Unknown model type {type(model).__name__}. Continue exporting..."
             )
             model_type = f"unknown:{type(model).__name__}"
@@ -549,7 +557,7 @@ def quantize_and_export(*,
                                   max_draft_len, medusa_hidden_act,
                                   medusa_model_dir, quant_medusa_head)
         end_time = time.time()
-        print(
+        logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
                 export_path, end_time - start_time))
 
@@ -668,7 +676,7 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         text_column = "article"
     elif os.path.isdir(dataset_name_or_dir):
-        print(
+        logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )

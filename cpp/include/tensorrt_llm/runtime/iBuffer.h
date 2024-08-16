@@ -46,7 +46,8 @@ enum class MemoryType : std::int32_t
     kGPU = 0,
     kCPU = 1,
     kPINNED = 2,
-    kUVM = 3
+    kUVM = 3,
+    kPINNEDPOOL = 4
 };
 
 template <MemoryType T>
@@ -76,6 +77,12 @@ template <>
 struct MemoryTypeString<MemoryType::kUVM>
 {
     static auto constexpr value = "UVM";
+};
+
+template <>
+struct MemoryTypeString<MemoryType::kPINNEDPOOL>
+{
+    static auto constexpr value = "PINNEDPOOL";
 };
 
 //! \brief For converting a TensorRT data type to a C++ data type.

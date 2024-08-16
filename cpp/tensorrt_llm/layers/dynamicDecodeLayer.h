@@ -59,11 +59,11 @@ private:
 
     void prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> const& outputs, BufferConstPtr batchSlots,
         runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen);
-    static void prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<DecodingInputs> const& params, TensorPtr const idsPtrsHost, BufferConstPtr batchSlots,
-        runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize, runtime::SizeType32 beamWidth,
-        runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep, runtime::SizeType32 cyclicStep,
-        bool outputLogProbs, cudaStream_t stream);
+    void prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<DecodingInputs> const& params, TensorPtr outputIdsPtrsHost, TensorPtr parentIdsPtrsHost,
+        BufferConstPtr batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
+        runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep,
+        runtime::SizeType32 cyclicStep, bool outputLogProbs, cudaStream_t stream);
 
 private:
     using Base::mDecoderDomain;
@@ -73,7 +73,10 @@ private:
     executor::DecodingMode mDecodingMode;
 
     TensorPtr mZeroParentIdsDevice;
-    TensorPtr mIdsPtrHost;
+    TensorPtr mOutputIdsPtrHost;
+    TensorPtr mParentIdsPtrHost;
+    TensorPtr mOutputIdsPtrDevice;
+    TensorPtr mParentIdsPtrDevice;
 
     bool mHasDiffRuntimeArgs{false};
 

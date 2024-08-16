@@ -40,7 +40,7 @@ class TrtGptModel;
 
 /* Responsible for shepherding requests through to completion
    using TRT Backend. */
-class GptManager
+class [[deprecated("Use the executor API instead.")]] GptManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;

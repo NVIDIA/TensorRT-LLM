@@ -80,7 +80,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* 
     SizeType32 constexpr MAX_K = 1;
     auto const threadId = static_cast<SizeType32>(threadIdx.x);
     auto const batchId = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchId] : batchId;
+    auto const batchSlot = batchSlots[batchId];
 
     // Skip decoding kernel if configured
     if ((skipDecode != nullptr && skipDecode[batchSlot])
@@ -216,9 +216,9 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
 
     auto const tid = static_cast<SizeType32>(threadIdx.x);
     auto const batchId = static_cast<SizeType32>(blockIdx.x);
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchId] : batchId;
+    auto const batchSlot = batchSlots[batchId];
     // Skip kernel if this sampling method is not chosen
-    const FinishedState finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
+    FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
     if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
         return;
@@ -391,7 +391,7 @@ __global__ void computeToppDecay(float* runtimeTopP, float const* runtimeInitial
     SizeType32 const* batchSlots)
 {
     auto const idx = static_cast<SizeType32>(blockDim.x * blockIdx.x + threadIdx.x);
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[idx] : idx;
+    auto const batchSlot = batchSlots[idx];
     auto const currentStep{sequenceLengths[batchSlot]};
     if (outputIds[batchSlot][currentStep] == topPResetIds[batchSlot])
     {

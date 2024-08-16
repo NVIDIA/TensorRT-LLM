@@ -28,6 +28,7 @@ from tensorrt_llm import Tensor, str_dtype_to_trt
 from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_trt
 from tensorrt_llm.functional import gpt_attention
 from tensorrt_llm.models.generation_mixin import GenerationMixin
+from tensorrt_llm.models.modeling_utils import get_kv_cache_type_from_legacy
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -66,6 +67,9 @@ class TestPluginNoCache(unittest.TestCase):
         net.plugin_config.gpt_attention_plugin = dtype
         net.plugin_config.set_context_fmha(context_fmha_type)
         net.plugin_config.remove_input_padding = remove_input_padding
+        kv_cache_type = get_kv_cache_type_from_legacy(
+            use_cache, net.plugin_config.paged_kv_cache)
+
         with tensorrt_llm.net_guard(net):
             inputs = GenerationMixin().prepare_attention_inputs(
                 max_batch_size=max_batch_size,
@@ -79,7 +83,7 @@ class TestPluginNoCache(unittest.TestCase):
                 remove_input_padding=remove_input_padding,
                 use_gpt_attention_plugin=True,
                 enable_ctx_gen_opt_profiles=False,
-                use_cache=use_cache,
+                kv_cache_type=kv_cache_type,
             )
 
             if remove_input_padding:

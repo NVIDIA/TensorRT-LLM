@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 from pathlib import Path
 
 import run
@@ -22,10 +23,17 @@ from build_engines_utils import init_model_spec_module
 init_model_spec_module()
 
 import os
+import shutil
 
 import model_spec
 
 import tensorrt_llm.bindings as _tb
+
+
+def get_model_data_dir():
+    resources_dir = Path(__file__).parent.resolve().parent
+    data_dir = resources_dir / 'data'
+    return data_dir / 'gpt2'
 
 
 def generate_output(engine: str,
@@ -46,7 +54,7 @@ def generate_output(engine: str,
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / input_name
-    model_data_dir = data_dir / model
+    model_data_dir = get_model_data_dir()
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'
     else:
@@ -76,6 +84,10 @@ def generate_output(engine: str,
         str(output_logits_npy), '--use_py_session'
     ]
 
+    # Generate context_fmha_fp32_acc enabled results for GptExecutorTest.GenerationLogitsEarlyStop
+    if model_spec_obj.get_enable_context_fmha_fp32_acc():
+        args_list.extend(["--enable_context_fmha_fp32_acc"])
+
     assert not os.path.exists(results_file) and not os.path.exists(results_csv)
 
     if output_cum_log_probs:
@@ -91,15 +103,14 @@ def generate_output(engine: str,
         ])
 
     args = run.parse_arguments(args_list)
-    print(args_list)
     run.main(args)
 
 
 def generate_outputs(num_beams):
-    print('Generating GPT2 FP32 outputs')
     input_name = 'input_tokens.npy'
     input_name_long = 'input_tokens_long.npy'
 
+    print('Generating GPT2 FP32 outputs')
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.FLOAT)
     model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
     if num_beams == 1:
@@ -133,6 +144,15 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj)
     model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
     model_spec_obj.gather_logits()
+    generate_output(engine=model_spec_obj.get_model_path(),
+                    num_beams=num_beams,
+                    input_name=input_name,
+                    model_spec_obj=model_spec_obj,
+                    output_logits=True,
+                    output_log_probs=True,
+                    output_cum_log_probs=True)
+    # GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime
+    model_spec_obj.enable_context_fmha_fp32_acc()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,
@@ -183,5 +203,15 @@ def generate_outputs(num_beams):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--clean',
+                        action='store_true',
+                        default=False,
+                        help='Clean target folders before building engines')
+    args = parser.parse_args()
+    if args.clean:
+        model_data_dir = get_model_data_dir()
+        print(f'Cleaning target folder {model_data_dir}')
+        shutil.rmtree(model_data_dir, ignore_errors=True)
     generate_outputs(num_beams=1)
     generate_outputs(num_beams=2)

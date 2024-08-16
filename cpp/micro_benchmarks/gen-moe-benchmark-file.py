@@ -65,7 +65,8 @@ act_fn = 3
 norm_mode = 1
 dtype_string = make_dtype_string()  # All dtypes
 routing_string = make_routing_string(
-    name="balanced")  # Use the default uniform distribution
+    name="uniform",
+    is_distribution=True)  # Use the default uniform random distribution
 tactic_id1 = '"auto"'
 tactic_id2 = '"auto"'
 

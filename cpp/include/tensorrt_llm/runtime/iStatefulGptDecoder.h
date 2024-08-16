@@ -76,7 +76,7 @@ public:
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
@@ -98,10 +98,13 @@ public:
     }
 
     //! @brief Gather final beam search results for all requests.
-    virtual void finalize() const = 0;
+    virtual void finalize(SamplingConfig const& samplingConfig) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
-    [[nodiscard]] virtual TensorPtr getOutputIds() const = 0;
+    [[nodiscard]] virtual TensorPtr getIds() const = 0;
+
+    //! @returns [batchSize, beamWidth, maxSequenceLength] token ids after gatherTree
+    [[nodiscard]] virtual TensorPtr getGatheredIds() const = 0;
 
     //! @returns [batchSize, maxBeamWidth], cumulative log probabilities (per beam), on gpu
     [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;

@@ -186,7 +186,7 @@ void verifyModelConfig(ModelConfig const& modelConfig, ModelSpec const& modelSpe
 {
     ASSERT_EQ(modelSpec.mUseGptAttentionPlugin, modelConfig.useGptAttentionPlugin());
     ASSERT_EQ(modelSpec.mUsePackedInput, modelConfig.usePackedInput());
-    ASSERT_EQ(modelSpec.mUsePagedKvCache, modelConfig.usePagedKvCache());
+    ASSERT_EQ(modelSpec.mKVCacheType == KVCacheType::kPAGED, modelConfig.isPagedKVCache());
     ASSERT_EQ(modelSpec.mDataType, modelConfig.getDataType());
 }
 

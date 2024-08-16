@@ -28,6 +28,28 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// compute groups for warp-specialized kernels on Hopper
+static constexpr int NUM_COMPUTE_GROUPS = 2;
+
+// Make sure the packed mask input is padded to 128 x 256 tile size in order to
+// match all Ampere/Hopper kernels.
+static constexpr int FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT = 128;
+static constexpr int FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT = 256;
+// The packed mask's MMA tile size is 64 x 64.
+static constexpr int FLASH_ATTEN_PACKED_MASK_MMA_M = 64;
+static constexpr int FLASH_ATTEN_PACKED_MASK_MMA_N = 64;
+// The flash attention always uses 4x1 warp layout.
+static constexpr int FLASH_ATTEN_WARPS_M = 4;
+static constexpr int FLASH_ATTEN_WARPS_N = 1;
+// The number of threads per warp group.
+static constexpr int NUM_THREADS_PER_WARP_GROUP = FLASH_ATTEN_WARPS_M * FLASH_ATTEN_WARPS_N * 32;
+// The number of core mmas_n in one uint32_t packed mask.
+static constexpr int NUM_CORE_MMAS_N = FLASH_ATTEN_PACKED_MASK_MMA_N / 8;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class ContextFMHAType
 {
     DISABLED,
@@ -38,11 +60,156 @@ enum class ContextFMHAType
 
 enum class ContextAttentionMaskType
 {
-    PADDING,
+    // Mask the padded tokens.
+    PADDING = 0,
+    // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL,
-    SLIDING_WINDOW_CAUSAL
+    // Causal mask + mask the beginning tokens based on sliding_window_size
+    // Only pay attention to [max(0, q_i - sliding_window_size), q_i]
+    SLIDING_WINDOW_CAUSAL,
+    // The custom mask input.
+    CUSTOM_MASK
 };
 
+enum class AttentionInputLayout
+{
+    // QKV are packed into [B, S, 3, H, D] layout.
+    PACKED_QKV = 0,
+    // Q has contiguous [B, S, H, D] layout, while KV has contiguous [B, 2, H, S, D] layout.
+    Q_CONTIGUOUS_KV,
+    // Q has contiguous [B, S, H, D] layout, while paged KV has [B, 2, Max_blocks_per_seq] layout
+    // that contains paged block indices. The indices indicate the block offset to the pool ptr in
+    // global memory
+    Q_PAGED_KV
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct MHARunnerFixedParams
+{
+    // The FMHA data type.
+    Data_type dataType;
+    // Do we use fp32 accumulation ?
+    // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
+    // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
+    bool forceFp32Acc;
+    // The attention mask type.
+    ContextAttentionMaskType attentionMaskType;
+    // The attention input layout.
+    AttentionInputLayout attentionInputLayout;
+    // Are the sequences in the batch padded ?
+    bool isSPadded;
+    // The number of Q heads.
+    int numQHeads;
+    // The number of Kv Heads.
+    int numKvHeads;
+    // The head size.
+    int headSize;
+    // The scaling applied to bmm1_scale.
+    float qScaling;
+    // The tanh scale after bmm1 (used in Grok models).
+    float qkTanhScale;
+    // Do we apply alibi ?
+    bool hasAlibi;
+    // Scale the alibi bias or not ?
+    bool scaleAlibi;
+    // The tensor parallel size (alibi).
+    int tpSize = 1;
+    // The tensor parallel rank (alibi).
+    int tpRank = 0;
+
+    // Convert to string for debug.
+    std::string convertToStrOutput()
+    {
+        // Data type.
+        std::string output = "data_type = ";
+        switch (dataType)
+        {
+        case DATA_TYPE_FP16: output += forceFp32Acc ? "fp16_fp32" : "fp16"; break;
+        case DATA_TYPE_BF16: output += "bf16"; break;
+        case DATA_TYPE_E4M3: output += "e4m3"; break;
+        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        }
+        // Head size.
+        output += ", head_size = " + std::to_string(headSize);
+        // Attention mask type.
+        output += ", attention_mask_type = ";
+        switch (attentionMaskType)
+        {
+        case ContextAttentionMaskType::PADDING: output += "padding"; break;
+        case ContextAttentionMaskType::CAUSAL: output += "causal"; break;
+        case ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL: output += "sliding_window_causal"; break;
+        case ContextAttentionMaskType::CUSTOM_MASK: output += "custom_mask"; break;
+        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        }
+        // Attention mask type.
+        output += ", attention_input_layout = ";
+        switch (attentionInputLayout)
+        {
+        case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
+        case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
+        case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
+        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        }
+        // Alibi.
+        output += ", alibi = ";
+        output += (hasAlibi ? "true" : "false");
+        // QK tanh scale.
+        output += ", qk_tanh_scale = ";
+        output += (qkTanhScale != 0.f ? "true" : "false");
+
+        return output;
+    }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct MHARunnerParams
+{
+    // The batch size.
+    int b;
+    // The max q sequence length.
+    int qSeqLen;
+    // The max kv sequence length.
+    int kvSeqLen;
+    // The sliding window size.
+    int slidingWindowSize;
+    // The total number of Q sequence lengths in the batch.
+    int totalQSeqLen;
+    // The total number of KV sequence lengths in the batch.
+    int totalKvSeqLen;
+
+    // Buffers.
+    // The packed QKV buffer ptr.
+    void const* qkvPtr;
+    // The Q buffer ptr.
+    void const* qPtr;
+    // The contiguous Kv buffer ptr;
+    void const* kvPtr;
+    // The paged kv cache array.
+    KVBlockArray pagedKvCache;
+    // The output buffer ptr.
+    void* outputPtr;
+    // The packed mask ptr.
+    void const* packedMaskPtr;
+    // The cumulative Q sequence lengths.
+    void const* cuQSeqLenPtr;
+    // The cumulative KV sequence lengths.
+    void const* cuKvSeqLenPtr;
+    // The cumulative packed mask rows.
+    void const* cuMaskRowsPtr;
+    // The dynamic scheduler tile counter.
+    void* tileCounterPtr;
+    // The bmm1 scale device ptr.
+    uint32_t const* scaleBmm1Ptr;
+    // The bmm2 scale device ptr.
+    float const* scaleBmm2Ptr;
+    // The cuda stream.
+    cudaStream_t stream;
+    bool forceFp32Acc = false;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 struct AlibiParams
 {
     constexpr static int round_down_to_power_two(int x)
@@ -81,10 +248,18 @@ struct AlibiParams
     int sequence_pos_offset = 0;
 };
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct Fused_multihead_attention_params_v2
 {
     // The QKV matrices.
     void const* qkv_ptr;
+    // The separate Q matrice.
+    void const* q_ptr;
+    // The separate KV matrice.
+    void const* kv_ptr;
+    // The separate paged kv cache.
+    KVBlockArrayForContextFMHA paged_kv_cache;
     // The mask to implement drop-out.
     void const* packed_mask_ptr;
     // The O matrix (output).
@@ -92,29 +267,49 @@ struct Fused_multihead_attention_params_v2
 
     // The stride between rows of the Q, K and V matrices.
     int64_t qkv_stride_in_bytes;
+    // The stride between rows of the separate Q matrice.
+    int64_t q_stride_in_bytes;
+    // The stride between rows of the separate KV matrice.
+    int64_t kv_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
     int64_t o_stride_in_bytes;
 
+    // tma descriptors on device.
+    // Either q in packed qkv [B, S, 3, H, D] of separate q layout [B, S, H, D].
+    cudaTmaDesc tma_desc_q;
+    // Tma descriptors for packed/contiguous/paged kv cache.
+    // Kv in packed qkv layout: [B, S, 3, H, D]
+    // Contiguous kv layout: [B, 2, H, S, D].
+    // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
+    cudaTmaDesc tma_desc_kv;
+    // Tma descriptor for o
+    cudaTmaDesc tma_desc_o;
+
+    // Tma load of paged kv cache.
+    int blocks_per_tma_load;
+    int blocks_per_tma_load_log2;
+
     // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
-    int b, h, s, d;
+    int b, h, h_kv, h_q_per_kv, s, d;
+    // Sliding Window Attention
+    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
+    int sliding_window_size = INT_MAX;
     // The scaling factors for the kernel.
-    uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+    uint32_t scale_bmm1, tanh_scale_bmm1, scale_softmax, scale_bmm2;
 
     // The scaling factors in the device memory.
     uint32_t const* scale_bmm1_d;
     uint32_t const* scale_bmm2_d;
 
-    // Do we use trick to avoid I2F/F2I in the INT8 kernel.
-    bool enable_i2f_trick;
-
-    // array of length b+1 holding prefix sum of actual sequence lengths
-    int const* cu_seqlens;
-
-    // use C/32 Format.
-    bool interleaved = false;
-    bool use_int8_scale_max = false;
+    // array of length b+1 holding prefix sum of actual q sequence lengths.
+    int const* cu_q_seqlens;
+    // array of length b+1 holding prefix sum of actual kv sequence lengths.
+    int const* cu_kv_seqlens;
+    // array of length b+1 holding prefix sum of actual mask sequence lengths.
+    // it might not be the same as cu_q_seqlens as the mask seqlens will be padded.
+    int const* cu_mask_rows;
 
     // If the kernel is using alibi or not
     bool has_alibi = false;
@@ -126,187 +321,21 @@ struct Fused_multihead_attention_params_v2
     uint32_t num_tiles_per_head;
     bool use_balanced_scheduling;
 
-    // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
-    int h_kv;
-    int h_q_per_kv;
-
-    // Sliding Window Attention
-    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
-    int sliding_window_size = INT_MAX;
-
     // is input/output padded
     bool is_s_padded = false;
-
-    // tma descriptors
-    cudaTmaDesc tma_desc_q;
-    cudaTmaDesc tma_desc_k;
-    cudaTmaDesc tma_desc_v;
-    cudaTmaDesc tma_desc_o;
-
-    void clear()
-    {
-        qkv_ptr = nullptr;
-        packed_mask_ptr = nullptr;
-        o_ptr = nullptr;
-
-        qkv_stride_in_bytes = 0;
-        packed_mask_stride_in_bytes = 0;
-        o_stride_in_bytes = 0;
-
-        b = 0;
-        h = 0;
-        s = 0;
-        d = 0;
-        // The scaling factors for the kernel.
-        scale_bmm1 = 0;
-        scale_softmax = 0;
-        scale_bmm2 = 0;
-
-        scale_bmm1_d = nullptr;
-        scale_bmm2_d = nullptr;
-
-        enable_i2f_trick = false;
-
-        cu_seqlens = nullptr;
-        interleaved = false;
-        use_int8_scale_max = false;
-
-        h_kv = 0;
-        h_q_per_kv = 1;
-        sliding_window_size = INT_MAX;
-        is_s_padded = false;
-
-        has_alibi = false;
-        alibi_params = AlibiParams{};
-    }
 };
 
-struct Fused_multihead_attention_paged_kv_params_v2
-{
-    // The Q matrices.
-    void const* q_ptr;
-    // Paged KV Cache buffer.
-    KVBlockArrayForContextFMHA paged_kv_cache;
-    // The O matrix (output).
-    void* o_ptr;
-    // The packed mask for random mask.
-    void const* packed_mask_ptr;
-
-    // The stride between rows of the Q matrices.
-    int64_t q_stride_in_bytes;
-    // The stride between rows of the paged KV matrices.
-    int64_t kv_stride_in_bytes;
-    // The stride between rows of O.
-    int64_t o_stride_in_bytes;
-    // The stride between matrices of packed mask.
-    int64_t packed_mask_stride_in_bytes;
-
-    // The dimensions.
-    int b, h, s, d;
-    // The scaling factors for the kernel.
-    uint32_t scale_bmm1, scale_softmax, scale_bmm2;
-    // The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA).
-    uint32_t const* scale_bmm1_d;
-    uint32_t const* scale_bmm2_d;
-
-    // M tile id counter for dynamic scheduling
-    uint32_t* tile_id_counter_ptr;
-    uint32_t num_tiles;
-    uint32_t num_tiles_per_head;
-    bool use_balanced_scheduling;
-
-    // Do we use Niall's trick to avoid I2F/F2I in the INT8 kernel.
-    // See https://confluence.nvidia.com/pages/viewpage.action?pageId=302779721 for details.
-    bool enable_i2f_trick;
-
-    // true: for int8, instead of doing max reduce, use max value encoded in scale factor
-    bool use_int8_scale_max = false;
-
-    // If the kernel is using alibi or not
-    bool has_alibi = false;
-    AlibiParams alibi_params;
-
-    // array of length b+1 holding prefix sum of actual kv sequence lengths.
-    int const* cu_seqlens;
-    // Chunked attention (only handles one tile of Q).
-    int const* cu_q_seqlens;
-
-    // q with shape [B, S, H, D] in const cache.
-    cudaTmaDesc tma_desc_q;
-    // Tma descriptors for paged kv cache.
-    cudaTmaDesc tma_desc_paged_kv;
-    // Tma descriptors for o
-    cudaTmaDesc tma_desc_o;
-
-    // Paged KV load.
-    int blocks_per_tma_load;
-    int blocks_per_tma_load_log2;
-
-    // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
-    int h_kv;
-    int h_q_per_kv;
-
-    // Sliding Window Attention
-    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
-    int sliding_window_size = INT_MAX;
-
-    // is input/output padded
-    bool is_s_padded = false;
-
-    void clear()
-    {
-        q_ptr = nullptr;
-        o_ptr = nullptr;
-        packed_mask_ptr = nullptr;
-
-        q_stride_in_bytes = 0;
-        kv_stride_in_bytes = 0;
-        o_stride_in_bytes = 0;
-        packed_mask_stride_in_bytes = 0;
-
-        b = 0;
-        h = 0;
-        s = 0;
-        d = 0;
-        // The scaling factors for the kernel.
-        scale_bmm1 = 0;
-        scale_softmax = 0;
-        scale_bmm2 = 0;
-
-        scale_bmm1_d = nullptr;
-        scale_bmm2_d = nullptr;
-
-        tile_id_counter_ptr = nullptr;
-        num_tiles = 1;
-        num_tiles_per_head = 1;
-        use_balanced_scheduling = false;
-
-        enable_i2f_trick = false;
-
-        cu_seqlens = nullptr;
-        cu_q_seqlens = nullptr;
-        use_int8_scale_max = false;
-
-        blocks_per_tma_load = 1;
-        blocks_per_tma_load_log2 = 0;
-
-        h_kv = 0;
-        h_q_per_kv = 0;
-        sliding_window_size = INT_MAX;
-        is_s_padded = false;
-
-        has_alibi = false;
-        alibi_params = AlibiParams{};
-    }
-};
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // flags to control kernel choice
 struct Launch_params
 {
     // seq_length to select the kernel
     int kernel_s = 0;
-    // kv_seq_length to set launch strategies.
-    int kernel_kv_s = 0;
+    // total q sequence length (considering the paddings).
+    int total_q_seqlen = 0;
+    // total kv sequence length.
+    int total_kv_seqlen = 0;
     // padded head size (new power of 2) for tma descriptors.
     int padded_d = 0;
     // flags to control small batch kernel choice
@@ -320,14 +349,6 @@ struct Launch_params
     bool interleaved = false;
     // by default TMA is not used.
     bool use_tma = false;
-    // host seqlens to set tma descriptors
-    int* seqlens = nullptr;
-    // number of paged kv blocks for context sequence.
-    int blocks_per_context_sequence = 0;
-    // device ptr on the host for paged kv cache.
-    void* paged_kv_pool_ptr = nullptr;
-    // offsets on the host for paged kv cache.
-    int32_t const* paged_kv_block_offsets = nullptr;
     // if flash attention is used (only FP16)
     bool flash_attention = false;
     // if warp_specialized kernels are used (only SM90 HGMMA + TMA)
@@ -336,15 +357,15 @@ struct Launch_params
     bool granular_tiling = false;
     // dynamic tile scheduling.
     bool dynamic_scheduler = false;
-    // mask type: padding, causal, sliding_window_causal
+    // mask type: padding, causal, sliding_window_causal, custom_mask.
     ContextAttentionMaskType attention_mask_type = ContextAttentionMaskType::PADDING;
+    // input layout: packed_qkv, q_contiguous_kv, q_paged_kv.
+    AttentionInputLayout attention_input_layout = AttentionInputLayout::PACKED_QKV;
     // use specialized kernels without alibi support.
     bool useKernelWithoutAlibi = false;
     // enable exp2 optimization (which helps improve performance).
     // note that this is not compatible with alibi bias due to the accuracy issues.
     bool useBase2ExpTrick = false;
-    // use paged_kv_fmha kernels.
-    bool paged_kv_input = false;
     // enable scale + tanh for qk products.
     bool enableQKTanhScale = false;
     // harward properties to determine how to launch blocks
@@ -352,26 +373,6 @@ struct Launch_params
     int device_l2_cache_size = 0;
     // total device memory (used by TMA loading of paged kv cache).
     size_t total_device_memory = 0;
-
-    void set_default_kernel_selection_params()
-    {
-        kernel_s = 0;
-        kernel_kv_s = 0;
-        padded_d = 0;
-        force_unroll = false;
-        use_tma = false;
-        flash_attention = false;
-        warp_specialization = false;
-        granular_tiling = false;
-        dynamic_scheduler = false;
-        attention_mask_type = (attention_mask_type == ContextAttentionMaskType::PADDING)
-            ? ContextAttentionMaskType::PADDING
-            : ContextAttentionMaskType::CAUSAL;
-        useKernelWithoutAlibi = false;
-        useBase2ExpTrick = false;
-        paged_kv_input = false;
-        enableQKTanhScale = false;
-    }
 };
 
 } // namespace kernels

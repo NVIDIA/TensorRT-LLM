@@ -95,6 +95,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Context FMHA custom mask buffer.
+        uint32_t const* fmha_custom_mask;
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq;
         // Rotary cos sin cache buffer to avoid re-computing.
@@ -132,6 +134,7 @@ protected:
         int32_t cross_qkv_length = 0;
         int32_t const* encoder_input_lengths = nullptr;
         int32_t num_encoder_tokens = 0;
+        int64_t const* runtime_perf_knobs = nullptr;
 
         std::string enqueueContextParamsToString() const
         {
@@ -141,6 +144,7 @@ protected:
 
             ss << "attention_input: " << attention_input << std::endl;
             ss << "qkv_bias: " << qkv_bias << std::endl;
+            ss << "fmha_custom_mask: " << fmha_custom_mask << std::endl;
             ss << "rotary_inv_freq: " << rotary_inv_freq << std::endl;
             ss << "rotary_cos_sin: " << rotary_cos_sin << std::endl;
             ss << "input_seq_length: " << input_seq_length << std::endl;
@@ -284,6 +288,11 @@ protected:
         return mUseKVCache;
     }
 
+    bool useCustomMask() const
+    {
+        return mMaskType == tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK;
+    }
+
     void reserveSemaphoreArray(int32_t size);
 
     void debugCheckSemaphores(cudaStream_t stream);
@@ -348,7 +357,7 @@ protected:
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     std::shared_ptr<CUDADriverWrapper> mDriver;
-    UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
+    UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;

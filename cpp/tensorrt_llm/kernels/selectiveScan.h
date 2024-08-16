@@ -31,6 +31,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm
@@ -42,6 +43,7 @@ struct SSMParamsBase
 {
     int batch, dim, dstate, dt_rank, nheads, ngroups, chunk_size;
     int max_seqlen; // only valid for padded input.
+    int num_tokens;
     bool remove_padding;
     bool delta_softplus;
     bool is_mamab2;
@@ -62,6 +64,7 @@ struct SSMParamsBase
     void* __restrict__ dc_ptr;
     void* __restrict__ dA_ptr;
     void* __restrict__ CB_ptr;
+    void* __restrict__ desc_ptr;
     int const* __restrict__ last_token_ids_ptr;
     int const* __restrict__ slot_mapping_ptr;
 };
@@ -72,7 +75,7 @@ template <typename input_t, typename weight_t>
 void invokeSelectiveScan(SSMParamsBase& params, cudaStream_t stream);
 
 template <typename input_t, typename weight_t>
-void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream);
+void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::common::CUDADriverWrapper* driver);
 
 template <typename input_t, typename weight_t>
 void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream);

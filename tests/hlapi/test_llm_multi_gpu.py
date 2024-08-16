@@ -154,8 +154,8 @@ def llm_end2end_tp2_cases():
     }, )
 
 
-@skip_single_gpu
 @parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
+@skip_single_gpu
 def test_llm_end2end_tp2(llm_additional_options):
     model_path = get_model_path(default_model_name)
 
@@ -202,7 +202,3 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-hlapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
     subprocess.run(command, shell=True, check=True,
                    env=os.environ)  # nosec B603
-
-
-if __name__ == '__main__':
-    test_llm_pp2()

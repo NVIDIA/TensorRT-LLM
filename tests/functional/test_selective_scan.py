@@ -263,11 +263,16 @@ class TestFunctional(unittest.TestCase):
                                    present_state_cpu.numpy(),
                                    atol=dtype_atol[dtype])
 
-    @parameterized.expand(list(
-        product([2048], [64], [1, 4], ['context', 'generation'],
-                ['float32', 'float16', 'bfloat16'], [3], [16], [True, False],
-                [True, False])),
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        list(
+            product([2048], [64], [1, 4], ['context', 'generation'],
+                    ['float32', 'float16', 'bfloat16'], [3], [16],
+                    [True, False], [True, False])) +
+        # long sequence tests to cover the int overflow issue
+        list(
+            product([5120], [64], [1], ['context'], ['float16'], [2], [131072],
+                    [True, False], [True, False])),
+        name_func=unittest_name_func)
     def test_selective_scan_v2(self, dim, headdim, ngroups, req_type, dtype,
                                batch_size, max_seq_len, has_z, remove_padding):
 
@@ -278,16 +283,28 @@ class TestFunctional(unittest.TestCase):
                 "Mamba2 chunk scan kernel only support float16 and bfloat16")
         if getSMVersion() < 80:
             pytest.skip("Mamba2 is not supported in pre-Ampere architecture")
+        if max_seq_len >= 128 * 1024:
+            total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
+            if total_gpu_mem <= 68 * 1024**3:
+                pytest.skip(
+                    "The long sequence test needs at least 68GB memory, skipping"
+                )
 
         # configs
         device = "cuda"
         seq_len = max_seq_len if req_type == 'context' else 1
+        long_context = max_seq_len >= 128 * 1024
         dstate = 128
         chunk_size = 256
         nheads = dim // headdim
         delta_softplus = True
         mean = 0.0
-        std_dev = 0.5 if dtype == "float32" else 0.1
+        if long_context:
+            std_dev = 0.05
+        elif dtype == "float32":
+            std_dev = 0.5
+        else:
+            std_dev = 0.1
 
         # test data
         torch.random.manual_seed(0)
@@ -295,6 +312,7 @@ class TestFunctional(unittest.TestCase):
             last_token_ids = torch.randint(1,
                                            seq_len + 1, (batch_size, ),
                                            dtype=torch.int32)
+            last_token_ids[0] = seq_len
             host_context_lengths = last_token_ids.detach().clone().cpu()
             last_token_ids = torch.cumsum(last_token_ids,
                                           dim=0,
@@ -496,6 +514,36 @@ class TestFunctional(unittest.TestCase):
                                              "b l h p -> b l (h p)")
                     out_ref[start:end, ] = part_out_ref.squeeze(0)
                     state_ref[i, ] = part_state_ref.squeeze(0)
+            elif long_context:
+                # to save memory
+                for i in range(batch_size):
+                    x_reshaped = rearrange(x_ref[i:i + 1, ],
+                                           "b l (h p) -> b l h p",
+                                           p=headdim)
+                    B_ref_reshaped = rearrange(B_ref[i:i + 1, ],
+                                               "b l (g n) -> b l g n",
+                                               g=ngroups)
+                    C_ref_reshaped = rearrange(C_ref[i:i + 1, ],
+                                               "b l (g n) -> b l g n",
+                                               g=ngroups)
+                    z_ref_reshaped = rearrange(z_ref[i:i + 1, ],
+                                               "b l (h p) -> b l h p",
+                                               p=headdim) if has_z else None
+                    part_out_ref, part_state_ref = ssd_chunk_scan_combined_ref(
+                        x_reshaped,
+                        dt_ref[i:i + 1, ],
+                        A_ref,
+                        B_ref_reshaped,
+                        C_ref_reshaped,
+                        chunk_size,
+                        D=D_ref,
+                        z=z_ref_reshaped,
+                        dt_bias=dt_bias_ref,
+                        dt_softplus=delta_softplus)
+                    part_out_ref = rearrange(part_out_ref,
+                                             "b l h p -> b l (h p)")
+                    out_ref[i, ] = part_out_ref.squeeze(0)
+                    state_ref[i, ] = part_state_ref.squeeze(0)
             else:
                 x_reshaped = rearrange(x_ref, "b l (h p) -> b l h p", p=headdim)
                 B_ref_reshaped = rearrange(B_ref,
@@ -545,7 +593,10 @@ class TestFunctional(unittest.TestCase):
                                                  dt_softplus=delta_softplus)
             out_ref = rearrange(out_ref, "b h p -> b (h p)").unsqueeze(1)
 
-        dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
+        if long_context:
+            dtype_atol = {"float16": 2e-2, "bfloat16": 1e-1}
+        else:
+            dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
 
         output_cpu = outputs['output'].to(torch.float32).cpu()
         present_state_cpu = outputs['present_state'].to(torch.float32).cpu()

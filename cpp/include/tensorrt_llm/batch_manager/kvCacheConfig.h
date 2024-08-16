@@ -38,12 +38,12 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit KvCacheConfig(std::optional<SizeType32> maxTokens = std::nullopt,
-        std::optional<SizeType32> maxAttentionWindow = std::nullopt,
+        std::optional<std::vector<SizeType32>> maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> sinkTokenLength = std::nullopt,
         std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = false, bool useUvm = false,
         std::optional<size_t> hostCacheSize = std::nullopt, bool onboardBlocks = true)
         : maxTokens{maxTokens}
-        , maxAttentionWindow{maxAttentionWindow}
+        , maxAttentionWindowVec{maxAttentionWindowVec}
         , sinkTokenLength{sinkTokenLength}
         , freeGpuMemoryFraction{freeGpuMemoryFraction}
         , enableBlockReuse(enableBlockReuse)
@@ -54,7 +54,7 @@ public:
     }
 
     explicit KvCacheConfig(executor::KvCacheConfig const& kvCacheConfig)
-        : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindow(),
+        : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindowVec(),
             kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
             kvCacheConfig.getEnableBlockReuse(), false, kvCacheConfig.getHostCacheSize(),
             kvCacheConfig.getOnboardBlocks())
@@ -63,7 +63,7 @@ public:
 
     bool operator==(KvCacheConfig const& other) const
     {
-        return maxTokens == other.maxTokens && maxAttentionWindow == other.maxAttentionWindow
+        return maxTokens == other.maxTokens && maxAttentionWindowVec == other.maxAttentionWindowVec
             && sinkTokenLength == other.sinkTokenLength && freeGpuMemoryFraction == other.freeGpuMemoryFraction
             && enableBlockReuse == other.enableBlockReuse && useUvm == other.useUvm
             && hostCacheSize == other.hostCacheSize && onboardBlocks == other.onboardBlocks;
@@ -72,7 +72,7 @@ public:
     friend std::ostream& operator<<(std::ostream& os, KvCacheConfig const& self);
 
     std::optional<SizeType32> maxTokens;
-    std::optional<SizeType32> maxAttentionWindow;
+    std::optional<std::vector<SizeType32>> maxAttentionWindowVec;
     std::optional<SizeType32> sinkTokenLength;
     std::optional<float> freeGpuMemoryFraction;
     bool enableBlockReuse;

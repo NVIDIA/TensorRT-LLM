@@ -44,7 +44,7 @@ static __global__ void setTopPRuntimeArgs(SizeType32 batchSize, SizeType32 topK,
     auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     for (SizeType32 bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[bi] : bi;
+        auto const batchSlot = batchSlots[bi];
         auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
         auto const p = topPsSize > 1 ? topPs[batchSlot] : topP;
         if (k == 0 && p == 0.0f)
@@ -94,22 +94,22 @@ void TopPSamplingLayer<T>::allocateBuffer(SizeType32 batchSize)
         mWorkspaceSize = getAirTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded(), mIsDeterministic);
     }
 
-    mRuntimeTopKDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<SizeType32>::value);
-    mRuntimeTopPDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mInitialTopPDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mTopPDecayDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mTopPMinDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value);
-    mTopPResetIdsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<TokenIdType>::value);
-    mSkipDecodeDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<bool>::value);
-    mSkipDecodeHost = mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), TRTDataType<bool>::value);
+    auto const batchSizeShape = ITensor::makeShape({batchSize});
+    mRuntimeTopKDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
+    mRuntimeTopPDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mInitialTopPDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mTopPDecayDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mTopPMinDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mTopPResetIdsDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<TokenIdType>::value);
+    mSkipDecodeDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<bool>::value);
+    mSkipDecodeHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<bool>::value);
     auto skipDecodeHostRange = BufferRange<bool>(*mSkipDecodeHost);
     std::fill(skipDecodeHostRange.begin(), skipDecodeHostRange.end(), true);
 
     auto workspaceSize = std::max({mRuntimeTopKDevice->getSizeInBytes(), mRuntimeTopPDevice->getSizeInBytes(),
         mInitialTopPDevice->getSizeInBytes(), mTopPDecayDevice->getSizeInBytes(), mTopPMinDevice->getSizeInBytes(),
         mTopPResetIdsDevice->getSizeInBytes(), mSkipDecodeDevice->getSizeInBytes()});
-    mSetupWorkspaceDevice
-        = mBufferManager->gpu(ITensor::makeShape({static_cast<int64_t>(workspaceSize)}), TRTDataType<int8_t>::value);
+    mSetupWorkspaceDevice = mBufferManager->gpu(workspaceSize);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -189,23 +189,23 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     auto const topK = runtimeTopK.at(0);
     auto const topP = runtimeTopP.at(0);
 
-    auto setupWorkspaceDevicePtr = reinterpret_cast<SizeType32*>(bufferCastOrNull<int8_t>(mSetupWorkspaceDevice));
+    auto setupWorkspaceDevicePtr = reinterpret_cast<SizeType32*>(mSetupWorkspaceDevice->data());
     auto setupWorkspaceDeviceAsFloatPtr = reinterpret_cast<float*>(setupWorkspaceDevicePtr);
     auto runtimeTopKDevicePtr = bufferCastOrNull<SizeType32>(mRuntimeTopKDevice);
     if (runtimeTopKSize > 1)
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopK.size()) == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
-        mBufferManager->copy(runtimeTopK.data(), *mSetupWorkspaceDevice, runtime::MemoryType::kCPU);
+        copyToWorkspace(*mBufferManager, runtimeTopK, mSetupWorkspaceDevice);
         invokeScatterDecodingParams(
             setupWorkspaceDevicePtr, runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
     }
-    auto runtimeTopPDevicePtr = bufferCastOrNull<float>(mRuntimeTopPDevice);
+    auto runtimeTopPDevicePtr = bufferCast<float>(*mRuntimeTopPDevice);
     if (runtimeTopPSize > 1)
     {
         TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(runtimeTopP.size()) == batchSize,
             fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopP.size(), batchSize));
-        mBufferManager->copy(runtimeTopP.data(), *mSetupWorkspaceDevice, runtime::MemoryType::kCPU);
+        copyToWorkspace(*mBufferManager, runtimeTopP, mSetupWorkspaceDevice);
         invokeScatterDecodingParams(
             setupWorkspaceDeviceAsFloatPtr, runtimeTopPDevicePtr, batchSlotsPtr, batchSize, getStream());
     }
@@ -241,20 +241,8 @@ void TopPSamplingLayer<T>::setup(SizeType32 const batchSize, SizeType32 const be
     auto const skipHostDecodeDeviceSlice = ITensor::slice(mSkipDecodeDevice, 0, mDecoderDomain.getBatchSize());
     auto skipDecodeHostSlice = ITensor::slice(mSkipDecodeHost, 0, mDecoderDomain.getBatchSize());
     mBufferManager->copy(*skipHostDecodeDeviceSlice, *skipDecodeHostSlice);
-    std::vector<float> runtimeTopPs(mDecoderDomain.getBatchSize());
-    auto const runtimeTopPDeviceSlice = ITensor::slice(mRuntimeTopPDevice, 0, mDecoderDomain.getBatchSize());
-    mBufferManager->copy(*runtimeTopPDeviceSlice, runtimeTopPs.data(), runtime::MemoryType::kCPU);
-    {
-        auto maxTopP = 0.f;
-        for (SizeType32 bi = 0; bi < batchSize; ++bi)
-        {
-            auto const bid = batchSlotsPtr ? batchSlotsPtr[bi] : bi;
-            maxTopP = std::max(maxTopP, runtimeTopPs[bid]);
-        }
-        mRuntimeMaxTopP = std::max(mRuntimeMaxTopP, maxTopP);
-    }
 
-    if (mIsAirTopP == true)
+    if (mIsAirTopP)
     {
         auto smCnt = mDeviceProp.multiProcessorCount;
         if (smCnt <= 0)
@@ -282,10 +270,8 @@ void TopPSamplingLayer<T>::forwardAsync(
 
     auto const batchSize = inputs->logits.value()->getDimension<0>();
 
-    auto batchSlotsHost
-        = inputs->batchSlots ? inputs->batchSlots.value() : getDefaultBatchSlots(batchSize, *mBufferManager);
     auto skipDecodeHostPtr = bufferCastOrNull<bool>(mSkipDecodeHost);
-    auto const skip = allOfBatchSlots(bufferCastOrNull<SizeType32>(batchSlotsHost), skipDecodeHostPtr, batchSize, true);
+    auto const skip = allOfBatchSlots(bufferCast<SizeType32>(*inputs->batchSlots), skipDecodeHostPtr, batchSize, true);
     if (skip)
     {
         return;
@@ -294,7 +280,7 @@ void TopPSamplingLayer<T>::forwardAsync(
     // Probabilities must be already computed instead of logits
     auto probs = bufferCastOrNull<T>(inputs->logits);
     auto endIds = bufferCastOrNull<TokenIdType>(inputs->endIds);
-    auto batchSlots = bufferCastOrNull<SizeType32>(inputs->batchSlots);
+    auto batchSlots = bufferCast<SizeType32>(*inputs->batchSlots);
     auto curandStatesDevice = inputs->curandStates;
     auto samplingWorkspaceDevice = inputs->samplingWorkspace;
 

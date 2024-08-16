@@ -7,6 +7,7 @@ import time
 import typing
 from pathlib import Path
 
+# isort: off
 import flax
 import numpy as np
 import orbax
@@ -14,6 +15,7 @@ import safetensors.torch
 import torch
 from recurrentgemma import jax as recurrentgemma_jax
 from transformers import AutoConfig, AutoModelForCausalLM
+#isort: on
 
 import tensorrt_llm
 from tensorrt_llm import logger

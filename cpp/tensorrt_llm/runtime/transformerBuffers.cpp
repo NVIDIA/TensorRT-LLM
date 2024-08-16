@@ -57,25 +57,19 @@ TransformerBuffers::TransformerBuffers(
     }
 
     nvinfer1::DataType kvDtype;
-    if (modelConfig.usePagedKvCache())
+
+    if (modelConfig.isPagedKVCache())
     {
         kvDtype = modelConfig.getKvDataType();
-    }
-    else
-    {
-        kvDtype = modelConfig.getQuantMode().hasFp8KvCache()
-            ? nvinfer1::DataType::kFP8
-            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstAttentionLayerId)).c_str());
-    }
-
-    if (modelConfig.usePagedKvCache())
-    {
         auto const kvCacheBlockOffsetsType = engine.getTensorDataType("kv_cache_block_offsets");
         kvCacheBlockOffsetsHost = manager.emptyTensor(MemoryType::kCPU, kvCacheBlockOffsetsType);
         kvCacheBlockOffsetsDevice = manager.emptyTensor(MemoryType::kGPU, kvCacheBlockOffsetsType);
     }
     else
     {
+        kvDtype = modelConfig.getQuantMode().hasFp8KvCache()
+            ? nvinfer1::DataType::kFP8
+            : engine.getTensorDataType(("present_key_value_" + std::to_string(firstAttentionLayerId)).c_str());
         presentKeysVals = utils::createBufferVector(runtime, localNbLayers, MemoryType::kGPU, kvDtype);
     }
 
@@ -110,7 +104,7 @@ void TransformerBuffers::reshape(
         {batchSize, 2, modelConfig.getNbKvHeads(), maxAttentionWindow, modelConfig.getSizePerHead()});
     auto const kvCacheShape
         = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(), maxInputLength, modelConfig.getSizePerHead()});
-    if (modelConfig.usePagedKvCache())
+    if (modelConfig.isPagedKVCache())
     {
         auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
         if (cacheBlockOffsetsShape.nbDims > 0)
@@ -173,7 +167,7 @@ TransformerBuffers TransformerBuffers::sliceTo(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TransformerBuffers buffers;
     auto const generationBatchSize = generationConfig.batchSize;
-    if (modelConfig.usePagedKvCache())
+    if (modelConfig.isPagedKVCache())
     {
         auto const& realCacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
         auto const maxBlocksPerSeq = realCacheBlockOffsetsShape.d[2];
@@ -281,6 +275,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
 
     // get local number of layers.
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
+    auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -292,7 +287,12 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
         std::fill_n(RequestTypesPtr, batchSize, 0);
 
         auto maxAttentionWindowsPtr = bufferCast<SizeType32>(*maxAttentionWindows);
-        std::fill_n(maxAttentionWindowsPtr, localNbLayers, generationConfig.maxAttentionWindow);
+        auto const attentionWindowLength = generationConfig.maxAttentionWindowVec.size();
+        for (SizeType32 i = 0; i < localNbLayers; ++i)
+        {
+            maxAttentionWindowsPtr[i]
+                = generationConfig.maxAttentionWindowVec[(firstLayerId + i) % attentionWindowLength];
+        }
 
         bufferCast<SizeType32>(*sinkTokenLengths)[0] = generationConfig.sinkTokenLength;
 
@@ -384,7 +384,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
         hiddenStates->reshape(hiddenStatesShape);
     }
 
-    if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
+    if (modelConfig.useGptAttentionPlugin() && modelConfig.isPagedKVCache())
     {
         auto constexpr contextBeamWidth = 1;
         kvCacheManager->getBlockOffsetsOfBatch(
@@ -482,7 +482,7 @@ void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& man
         utils::tileBufferReplace(attentionMask, beamWidth, manager);
     }
 
-    if (!modelConfig.usePagedKvCache())
+    if (!modelConfig.isPagedKVCache())
     {
         for (auto& buffer : presentKeysVals)
             utils::tileBufferReplace(buffer, beamWidth, manager);
@@ -526,7 +526,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
         tile(runtimeBuffers, manager, modelConfig, worldConfig);
     }
 
-    if (modelConfig.useGptAttentionPlugin() && modelConfig.usePagedKvCache())
+    if (modelConfig.useGptAttentionPlugin() && modelConfig.isPagedKVCache())
     {
         auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
         cacheBlockOffsetsShape.d[0] = batchSize * beamWidth;
@@ -644,7 +644,7 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
         hiddenStates->reshape(hiddenStatesShape);
     }
 
-    if (modelConfig.usePagedKvCache())
+    if (modelConfig.isPagedKVCache())
     {
         for (auto batchIdx = firstBatchSlotIdx; batchIdx < firstBatchSlotIdx + batchSize; ++batchIdx)
         {
@@ -715,7 +715,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         {
             inputBuffers.insert_or_assign("host_context_lengths", contextLengthsHost);
         }
-        if (modelConfig.usePagedKvCache())
+        if (modelConfig.isPagedKVCache())
         {
             inputBuffers.insert_or_assign("kv_cache_block_offsets", kvCacheBlockOffsetsDevice);
             inputBuffers.insert_or_assign("host_kv_cache_block_offsets", kvCacheBlockOffsetsHost);

@@ -83,7 +83,7 @@ public:
      */
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
 
-    size_t getWorkspaceSize(int max_batch_beam_size, int max_num_tokens);
+    size_t getWorkspaceSize(int max_num_tokens);
 
     void prepare(XQAParams const& xqa_params)
     {

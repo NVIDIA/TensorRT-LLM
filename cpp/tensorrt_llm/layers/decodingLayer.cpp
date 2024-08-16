@@ -211,7 +211,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         // sentences once.
         TensorPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
-        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, step, ite, localBatchSize);
+        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, params->batchSlots, step, ite, localBatchSize);
 
         decodeInputs->finished = params->finished;
 
@@ -222,8 +222,6 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
             auto& inputLengths = params->inputLengths.value();
             decodeInputs->inputLengths = ITensor::slice(inputLengths, 0, localBatchSize);
         }
-        decodeInputs->batchSlots = params->batchSlots;
-
         preparedInputs = decodeInputs;
         preparedOutputs = baseOutputs;
     }

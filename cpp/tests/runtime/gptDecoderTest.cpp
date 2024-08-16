@@ -103,7 +103,8 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         vocabSizePadded, maxSeqLength, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
-    decoder->setup(samplingConfig, batchSize);
+    auto batchSlots = getDefaultBatchSlots(batchSize, manager);
+    decoder->setup(samplingConfig, batchSize, batchSlots);
 
     // set up inputs
     auto logits = std::shared_ptr(
@@ -115,7 +116,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
-    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds};
+    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds, batchSlots};
 
     std::vector<std::int32_t> inputLengthsVec(batchSize * beamWidth, 0);
     inputs.lengths = manager.copyFrom(inputLengthsVec, ITensor::makeShape({batchSize * beamWidth}), MemoryType::kGPU);
@@ -136,7 +137,10 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto outputIds = std::shared_ptr(
         manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
     manager.setZero(*outputIds);
-    DecodingOutput outputs{outputIds};
+    auto gatheredOutputIds = std::shared_ptr(
+        manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
+    manager.setZero(*gatheredOutputIds);
+    DecodingOutput outputs{outputIds, gatheredOutputIds};
     auto newTokens
         = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT32));
     manager.setZero(*newTokens);

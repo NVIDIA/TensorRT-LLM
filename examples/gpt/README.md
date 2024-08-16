@@ -148,7 +148,7 @@ If the engines are built successfully, you will see output like:
 
 `trtllm-build` enables FMHA kernels by default. You may disable it by adding `--context_fmha disable`.
 
-If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
 
 Note that the FMHA kernels have to be used together with `gpt_attention_plugin` enabled.
 

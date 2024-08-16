@@ -17,7 +17,7 @@ from typing import Optional
 
 import torch
 
-from .._utils import set_obj_attrs
+from .._utils import set_obj_attrs, str_dtype_to_torch
 from ..functional import embedding, unsqueeze, where
 from ..mapping import Mapping
 from ..module import Module
@@ -44,7 +44,8 @@ class Embedding(Module):
                  tp_size: int = 1,
                  tp_group: Optional[list] = None,
                  sharding_dim: int = 0,
-                 tp_rank: Optional[int] = None):
+                 tp_rank: Optional[int] = None,
+                 share_embedding_table: bool = False):
         super().__init__()
         # num_embeddings records the total vocab size no matter using TP or not
         self.num_embeddings = num_embeddings
@@ -54,6 +55,8 @@ class Embedding(Module):
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
         self.dtype = dtype
+        self.tp_dim = sharding_dim
+        self.share_embedding_table = share_embedding_table
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,
@@ -88,6 +91,16 @@ class Embedding(Module):
                                                  shard_size)
         param.value = loaded_weight
 
+    def postprocess(self, tllm_key, weights):
+        if weights is None:
+            return {}
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        if self.share_embedding_table:
+            return {}
+        else:
+            weights = weights.clone()
+            return {tllm_key: weights}
+
 
 class PromptTuningEmbedding(Embedding):
     """
@@ -106,9 +119,10 @@ class PromptTuningEmbedding(Embedding):
                  tp_size=1,
                  tp_group=None,
                  sharding_dim=0,
-                 tp_rank=0):
+                 tp_rank=0,
+                 share_embedding_table=False):
         super().__init__(num_embeddings, embedding_dim, dtype, tp_size,
-                         tp_group, sharding_dim, tp_rank)
+                         tp_group, sharding_dim, tp_rank, share_embedding_table)
         if vocab_size is None:
             vocab_size = num_embeddings
         self.vocab_size = vocab_size

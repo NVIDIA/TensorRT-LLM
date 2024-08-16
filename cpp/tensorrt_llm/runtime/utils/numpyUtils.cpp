@@ -163,7 +163,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     dims.nbDims = shape.size();
     std::copy(shape.begin(), shape.end(), dims.d);
 
-    auto readWhere = where == MemoryType::kGPU ? MemoryType::kPINNED : where;
+    auto readWhere = where == MemoryType::kGPU ? MemoryType::kPINNEDPOOL : where;
     auto tensor = manager.allocate(readWhere, dims, type);
     auto data = tensor->data();
     auto eltSize = BufferDataType(tensor->getDataType()).getSize();
@@ -204,7 +204,7 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
 
     if (where == MemoryType::kGPU)
     {
-        auto tensorHost = manager.copyFrom(tensor, MemoryType::kPINNED);
+        auto tensorHost = manager.copyFrom(tensor, MemoryType::kPINNEDPOOL);
         manager.getStream().synchronize();
         saveNpy(manager, *tensorHost, filename);
         return;

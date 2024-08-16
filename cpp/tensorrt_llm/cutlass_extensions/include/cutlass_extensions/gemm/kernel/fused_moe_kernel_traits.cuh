@@ -31,10 +31,11 @@ struct Routine_Arguments
     ElementWeight* ptr_fc1{};
     ElementInput* ptr_bias{};
     ElementOutput* ptr_output{};
-    int64_t const* total_rows_before_expert{};
+    int64_t const* total_tokens_including_expert{};
     int gemm_n{};
     int gemm_k{};
     int num_expert{};
+    bool bias_is_broadcast{};
 };
 
 template <typename ElementInput, typename ElementWeight, typename ElementOutput>
@@ -44,10 +45,11 @@ struct Routine_Params
     ElementWeight* ptr_fc1{};
     ElementInput* ptr_bias{};
     ElementOutput* ptr_output{};
-    int64_t const* total_rows_before_expert{};
+    int64_t const* total_tokens_including_expert{};
     int gemm_n{};
     int gemm_k{};
     int num_expert{};
+    bool bias_is_broadcast{};
 };
 
 enum class Activation_Type

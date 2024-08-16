@@ -52,7 +52,7 @@ struct FillBuffers
         for (size_t bi = 0; bi < batchSize; ++bi)
         {
             auto value = defaultValue;
-            auto batchSlot = batchSlots ? runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi] : bi;
+            auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
             if (optParam)
             {
                 if (optParam->size() == 1)
@@ -132,13 +132,18 @@ inline DecoderDomain getLocalDecoderDomain(
     return DecoderDomain(batchSize, beamWidth, vocabSize);
 }
 
-inline TensorConstPtr getDefaultBatchSlots(runtime::SizeType32 batchSize, runtime::BufferManager const& bufferManager)
+/// @brief A convenience function to copy the content of a standard vector to a layer workspace.
+template <typename T>
+inline void copyToWorkspace(
+    runtime::BufferManager const& bufferManager, std::vector<T> const& src, runtime::IBuffer::SharedPtr& workspace)
 {
-    auto defaultBatchSlots = bufferManager.pinnedPool(
-        runtime::ITensor::makeShape({batchSize}), runtime::TRTDataType<runtime::SizeType32>::value);
-    auto range = runtime::BufferRange<runtime::SizeType32>(*defaultBatchSlots);
-    std::iota(range.begin(), range.end(), 0);
-    return defaultBatchSlots;
+    auto const sizeOfWorkspaceInBytes = workspace->getSizeInBytes();
+    auto const sizeOfSrcInBytes = sizeof(T) * src.size();
+    TLLM_CHECK_WITH_INFO(sizeOfSrcInBytes <= sizeOfWorkspaceInBytes,
+        "The size of the workspace (%lu bytes) is insufficient for the data (%lu bytes)", sizeOfWorkspaceInBytes,
+        sizeOfSrcInBytes);
+    runtime::IBuffer::SharedPtr workspaceSlice = runtime::IBuffer::slice(workspace, 0, sizeOfSrcInBytes);
+    bufferManager.copy(src.data(), *workspaceSlice, runtime::MemoryType::kCPU);
 }
 
 } // namespace layers

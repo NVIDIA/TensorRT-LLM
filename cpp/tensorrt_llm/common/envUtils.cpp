@@ -45,17 +45,6 @@ bool forceXQAKernels()
     return forceXQA;
 }
 
-int32_t xqaMaxNbCtaPerKVHeadFactor()
-{
-    return envXqaNbCtaPerKVHead().value_or(8);
-}
-
-std::optional<int32_t> envXqaNbCtaPerKVHead()
-{
-    static std::optional<int32_t> const ret = getIntEnv("TRTLLM_XQA_BLOCKS_PER_SEQUENCE");
-    return ret;
-}
-
 std::optional<bool> getEnvEnableXQAJIT()
 {
     static bool init = false;

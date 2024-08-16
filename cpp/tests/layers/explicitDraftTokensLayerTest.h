@@ -15,18 +15,13 @@
  */
 #pragma once
 
-#include <gtest/gtest.h>
-
-#include <memory>
-
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#include "tensorrt_llm/runtime/runtimeKernels.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
+#include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/tllmException.h"
+#include <memory>
 
 namespace tensorrt_llm::tests::layers
 {
@@ -339,6 +334,6 @@ public:
         DraftLettersVec const& nextDraftLetters, DraftLettersVec const& lastDraftLetters, SamplingParams& params);
 };
 
-typedef testing::Types<float, half> FloatAndHalfTypes;
+using FloatAndHalfTypes = testing::Types<float, half>;
 
 } // namespace tensorrt_llm::tests::layers

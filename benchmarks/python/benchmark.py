@@ -192,7 +192,6 @@ def main(args):
             raise Exception(
                 f"--gpu_weights_percent only accepts values between 0.0 and 1.0."
             )
-    args.weight_streaming = any([p != 1 for p in gpu_weights_percents])
 
     rank = tensorrt_llm.mpi_rank()
     world_size = tensorrt_llm.mpi_world_size()
@@ -225,10 +224,9 @@ def main(args):
                                     benchmark_profiler=benchmark_profiler)
     for config in benchmarker.get_config():
         try:
-            if args.weight_streaming:
-                # We pass in config instead of the gpu_weights_percent here to keep this benchmark script
-                # agnostic to the length and contents of the config.
-                benchmarker.set_weight_streaming(config)
+            # We pass in config instead of the gpu_weights_percent here to keep this benchmark script
+            # agnostic to the length and contents of the config.
+            benchmarker.set_weight_streaming(config)
             inputs = benchmarker.prepare_inputs(config)
         except torch.cuda.OutOfMemoryError as e:
             logger.error(

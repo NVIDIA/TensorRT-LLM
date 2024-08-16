@@ -290,15 +290,15 @@ std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWr
 
 inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, int multiprocessor_count)
 {
-    if (tensorrt_llm::common::envXqaNbCtaPerKVHead().has_value())
-    {
-        return tensorrt_llm::common::envXqaNbCtaPerKVHead().value();
-    }
     int multi_block_count = 1;
     int num_kv_heads = xqaParams.num_kv_heads;
     int history_length = xqaParams.timestep;
 
+    int32_t const maxNbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
+
     multi_block_count = history_length / kMinHistoryTokensPerBlock;
+    // avoid using too many blocks for one sequence, otherwise the final reduction may dominate.
+    multi_block_count = std::min(multi_block_count, static_cast<int>(std::round(std::sqrt(multi_block_count * 8.F))));
     multi_block_count = std::max(multi_block_count, 1);
     // adjust to kTargetWaveFactor, as already initialized using kMinHistoryTokensPerBlock, only need to decrease.
     double wave_count = (double) batch_size * num_kv_heads * multi_block_count / (double) multiprocessor_count;
@@ -309,10 +309,14 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     }
     multi_block_count = std::max(multi_block_count, 1);
 
-    // add limitation on upper bound.
-    multi_block_count = std::min(tensorrt_llm::common::xqaMaxNbCtaPerKVHeadFactor(), multi_block_count);
+    // Add limitation due to reserved workspace size.
+    // When batch_size is large, multi-block is useless anyway. So large workspace is not useful and we can set a hard
+    // limit for workspace size (computed from maxNbSubSeq).
+    multi_block_count = std::max(std::min(multi_block_count, maxNbSubSeq / batch_size), 1);
 
     TLLM_CHECK_WITH_INFO(multi_block_count >= 1, "MultiBlock count should be larger than 1");
+    TLLM_CHECK_WITH_INFO(
+        multi_block_count == 1 || batch_size * multi_block_count <= maxNbSubSeq, "Insufficient workspace");
     return multi_block_count;
 }
 
