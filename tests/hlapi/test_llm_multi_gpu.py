@@ -202,3 +202,7 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-hlapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
     subprocess.run(command, shell=True, check=True,
                    env=os.environ)  # nosec B603
+
+
+if __name__ == '__main__':
+    test_llm_pp2()

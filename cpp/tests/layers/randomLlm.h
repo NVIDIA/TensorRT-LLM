@@ -109,6 +109,8 @@ public:
     }
 
     // simulate forward in a LLM.
+    void forward(TensorPtr const& output, runtime::SizeType32 startId, TensorConstPtr const& input,
+        TensorConstPtr const& offsets, TensorConstPtr const mask = nullptr) const;
     void forward(TensorPtr const& output, TensorConstPtr const& input, TensorConstPtr const& position,
         TensorConstPtr const mask = nullptr) const;
     //! set inout[i] invalid if mask[i]==false;

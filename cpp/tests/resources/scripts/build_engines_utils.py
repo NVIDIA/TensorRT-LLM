@@ -65,10 +65,17 @@ def wincopy(source: str, dest: str, isdir: bool, cwd=None) -> None:
 
 
 # Helper function to locate model_spec module.
-def init_model_spec_module():
+def init_model_spec_module(force_init_trtllm_bindings=True):
     import os
 
+    # model spec depends on tensorrt_llm bindings. This will trigger initialization of bindings.
     # Rely on unique built model_spec to locate the module.
+    if force_init_trtllm_bindings:
+        import tensorrt_llm.bindings as _tb
+
+        # Ensure the KVCacheType enum is available.
+        assert _tb.KVCacheType('PAGED') is not None
+
     cpp_root_dir = _pl.Path(__file__).parent.resolve().parent.parent.parent
 
     found_locations = []

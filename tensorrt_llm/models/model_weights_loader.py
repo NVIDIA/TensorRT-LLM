@@ -9,8 +9,8 @@ import torch
 from safetensors import safe_open
 from tqdm import tqdm
 
-from tensorrt_llm.quantization.layers import (WeightOnlyQuantColumnLinear,
-                                              WeightOnlyQuantRowLinear)
+from tensorrt_llm.quantization.layers import (
+    WeightOnlyGroupwiseQuantColumnLinear, WeightOnlyGroupwiseQuantRowLinear)
 
 from .._utils import trt_dtype_to_torch
 from ..logger import logger
@@ -185,6 +185,8 @@ class ModelWeightsLoader:
                 return tensor[:]
             else:
                 width = tensor_shape[tp_dim]
+                if width == 1:
+                    return tensor[:]
                 slice_width = math.ceil(width / tp_size)
                 slice_start = tp_rank * slice_width
                 slice_end = min((tp_rank + 1) * slice_width, width)
@@ -196,7 +198,8 @@ class ModelWeightsLoader:
     def load(self,
              tllm_key: str,
              preprocess: Callable[[int], None] = None,
-             skip_tp: bool = False):
+             skip_tp: bool = False,
+             custom_postprocess_kwargs: dict = {}):
         """Load tensor from shards
 
         This function contains following steps:
@@ -226,10 +229,10 @@ class ModelWeightsLoader:
         tllm_to_externel_key_dict = sub_module.tllm_to_externel_key_dict if hasattr(
             sub_module, "tllm_to_externel_key_dict") else {}
         tp_dim = sub_module.tp_dim if hasattr(sub_module, "tp_dim") else -1
-        require_weight_transpose = (isinstance(
-            sub_module, WeightOnlyQuantColumnLinear) or isinstance(
-                sub_module,
-                WeightOnlyQuantRowLinear)) and tllm_key.endswith("weight")
+        require_weight_transpose = (
+            isinstance(sub_module, WeightOnlyGroupwiseQuantColumnLinear)
+            or isinstance(sub_module, WeightOnlyGroupwiseQuantRowLinear)
+        ) and tllm_key.endswith("weight")
         if tp_dim >= 0 and require_weight_transpose:
             tp_dim = 1 - tp_dim
         tp_size = sub_module.tp_size if hasattr(sub_module, "tp_size") else 1
@@ -260,7 +263,9 @@ class ModelWeightsLoader:
             else:
                 weight_dict = {tllm_key: v.to(trt_dtype_to_torch(param.dtype))}
         else:
-            v = sub_module.postprocess(tllm_key, v)
+            postprocess_kwargs = {"config": self.model.config}
+            postprocess_kwargs.update(custom_postprocess_kwargs)
+            v = sub_module.postprocess(tllm_key, v, **postprocess_kwargs)
             if isinstance(v, dict):
                 weight_dict = v
             else:
@@ -290,6 +295,9 @@ class ModelWeightsLoader:
                 continue
             w_shape = weights[tllm_key].shape
             if w_shape != param.shape:
+                logger.warning(
+                    f'{tllm_key} has invalid shape {w_shape}. Expected {param.shape}.'
+                )
                 pad = torch.nn.functional.pad
                 pad_dim = []
                 for dim in range(weights[tllm_key].dim()):
@@ -298,11 +306,12 @@ class ModelWeightsLoader:
                     pad_dim.append(
                         max(0, param.shape[current_dim] - w_shape[current_dim]))
                 try:
+                    logger.warning(
+                        f'{tllm_key} is going to be padded by {pad_dim}.')
                     weights[tllm_key] = pad(weights[tllm_key],
                                             tuple(pad_dim),
                                             value=0)
                     assert weights[tllm_key].shape == param.shape
-                    logger.warning(f'Parameter {tllm_key} is auto padded.')
                 except:
                     raise ValueError(
                         f'Parameter {tllm_key} has invalid shape {weights[tllm_key].shape} compared with expected shape {param.shape}. Auto padding failed.'

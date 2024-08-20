@@ -18,7 +18,6 @@
 #include "nlohmann/json.hpp"
 #include "tensorrt_llm/common/assert.h"
 #include <NvInferRuntime.h>
-#include <array>
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -153,9 +152,9 @@ public:
         {
             auto const& value = it->second;
             int64_t offset = mJsonSize + sizeof(mJsonSize);
-            return std::shared_ptr<SafeTensorArray>(new SafeTensorArray(mFs, value["dtype"], value["shape"],
+            return std::make_shared<SafeTensorArray>(mFs, value["dtype"], value["shape"],
                 static_cast<int64_t>(value["data_offsets"][0]) + offset,
-                static_cast<int64_t>(value["data_offsets"][1]) + offset));
+                static_cast<int64_t>(value["data_offsets"][1]) + offset);
         }
         TLLM_THROW("Tensor not found: " + std::string(name));
     }

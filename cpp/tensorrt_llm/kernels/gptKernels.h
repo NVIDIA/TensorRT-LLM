@@ -100,8 +100,12 @@ struct BuildDecoderInfoParams
     int* seqQOffsets;
     // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
     int* seqKVOffsets;
-    // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
+    // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
+    // [numTokens].
     int* paddingOffsets;
+    // The number of padded tokens in the corresponding padded tensor before the current token, for Encoder. Shape:
+    // [numTokens].
+    int* encoderPaddingOffsets;
     // The offsets to the 1st row in each sequence of packed mask buffer. Shape: [batchSize+1].
     int* packedMaskRowOffsets;
 
@@ -120,8 +124,10 @@ struct BuildDecoderInfoParams
 
     // The number of sequences in the batch.
     int batchSize;
-    // The maximum query length of a sequence; it includes input and output.
+    // The maximum query length of a sequence for Decoder (max_input_length), N for ctx phase, 1 for gen phase.
     int maxQSeqLength;
+    // The maximum query length of a sequence for Encoder, for cross attention (cross_qkv_length).
+    int maxEncoderQSeqLength;
     // Whether remove the input padding or not.
     bool removePadding;
     // The kv cache capacity.
@@ -164,12 +170,20 @@ struct BuildDecoderInfoParams
            << *(runtime::ITensor::wrap(
                   (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
            << std::endl;
+        if (encoderPaddingOffsets != nullptr)
+        {
+            ss << "encoderPaddingOffsets: "
+               << *(runtime::ITensor::wrap((void*) encoderPaddingOffsets, nvinfer1::DataType::kINT32,
+                      runtime::ITensor::makeShape({batchSize})))
+               << std::endl;
+        }
         ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
         ss << "seqQLengths: " << seqQLengths << std::endl;
         ss << "seqKVLengths: " << seqKVLengths << std::endl;
         ss << "fmhaTileCounter: " << fmhaTileCounter << std::endl;
         ss << "batchSize: " << batchSize << std::endl;
         ss << "maxQSeqLength: " << maxQSeqLength << std::endl;
+        ss << "maxEncoderQSeqLength: " << maxEncoderQSeqLength << std::endl;
         ss << "removePadding: " << std::boolalpha << removePadding << std::endl;
         ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
         ss << "sinkTokenLength: " << sinkTokenLength << std::endl;

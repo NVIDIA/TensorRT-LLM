@@ -261,7 +261,8 @@ class LLM:
         if self.args.decoding_config is not None:
             executor_config.decoding_config = self.args.decoding_config
         if self.args.logits_post_processor_map:
-            executor_config.logits_post_processor_map = self.args.logits_post_processor_map
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_map=self.args.logits_post_processor_map)
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_context
         executor_config.max_beam_width = self.args.build_config.max_beam_width

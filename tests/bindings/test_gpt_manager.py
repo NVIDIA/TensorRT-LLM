@@ -32,7 +32,7 @@ def get_model_spec() -> model_spec.ModelSpec:
         model_spec_obj = model_spec.ModelSpec(
             'input_tokens.npy',
             _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
-                model_spec.KVCacheType.PAGED).use_packed_input()
+                _tb.KVCacheType.PAGED).use_packed_input()
         get_model_spec.model_spec_obj = model_spec_obj
 
     return get_model_spec.model_spec_obj

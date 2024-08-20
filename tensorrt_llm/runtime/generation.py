@@ -32,7 +32,6 @@ from cuda import cudart
 
 from tensorrt_llm.runtime.redrafter_utils import *
 
-from .._ipc_utils import set_peer_access
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType
@@ -518,6 +517,7 @@ class ModelConfig:
     # ReDrafter
     redrafter_num_beams: int = 0
     redrafter_draft_len_per_beam: int = 0
+    num_kv_heads_per_layer: Optional[List[int]] = None
 
 
 @dataclass
@@ -736,10 +736,12 @@ class GenerationSession(object):
             self.first_layer:self.last_layer]
 
         self.attn_to_general_idx = {}
+        self.general_to_attn_idx = {}
         attn_layer_idx = 0
         for i in range(self.first_layer, self.last_layer):
             if self.layer_types[i] == 'attention':
                 self.attn_to_general_idx[attn_layer_idx] = i
+                self.general_to_attn_idx[i] = attn_layer_idx
                 attn_layer_idx += 1
 
         # Cyclic KV cache buffer names.
@@ -773,11 +775,10 @@ class GenerationSession(object):
                 self.mapping.pp_size, self.decoder_logits_dtype)
 
         if self.mapping.tp_size > 1:
-            is_p2p_supported = set_peer_access(self.mapping)
             self.ipc_buffers, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.mapping.tp_size), is_p2p_supported)
+                    self.mapping.tp_size))
 
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
@@ -997,8 +998,17 @@ class GenerationSession(object):
     def remove_input_padding(self):
         return self._model_config.remove_input_padding
 
-    @property
-    def num_heads_kv(self):
+    def get_num_heads_kv(self, layer_idx: Optional[int] = None) -> int:
+        if layer_idx is None or self._model_config.num_kv_heads_per_layer is None:
+            return self._model_config.num_kv_heads
+
+        if self._model_config.layer_types:
+            assert self._model_config.layer_types[
+                layer_idx] == "attention", f"Layer {layer_idx} is not an attention layer"
+
+        if self._model_config.num_kv_heads_per_layer:
+            return self._model_config.num_kv_heads_per_layer[layer_idx]
+
         return self._model_config.num_kv_heads
 
     @property
@@ -1690,7 +1700,7 @@ class GenerationSession(object):
                     num_blocks,
                     self.num_attn_layers,
                     2,
-                    self.num_heads_kv,
+                    self.get_num_heads_kv(),
                     self.tokens_per_block,
                     self.head_size,
                 )
@@ -1706,7 +1716,7 @@ class GenerationSession(object):
                         cross_num_blocks,
                         self.num_layers,
                         2,
-                        self.num_heads_kv,
+                        self.get_num_heads_kv(),
                         self.tokens_per_block,
                         self.head_size,
                     )
@@ -1714,15 +1724,15 @@ class GenerationSession(object):
                                                            dtype=kv_cache_type,
                                                            device=self.device)
             elif self.has_attn_layers:
-                cache_shape = (
-                    batch_size,
-                    2,
-                    self.num_heads_kv,
-                    self.max_attention_window_size,
-                    self.head_size,
-                )
                 for i in range(self.first_layer, self.last_layer):
                     if self.layer_types[i] == 'attention':
+                        cache_shape = (
+                            batch_size,
+                            2,
+                            self.get_num_heads_kv(self.general_to_attn_idx[i]),
+                            self.max_attention_window_size,
+                            self.head_size,
+                        )
                         self.buffer[f'present_key_value_{i}'] = torch.empty(
                             cache_shape,
                             dtype=kv_cache_type,
@@ -1732,7 +1742,7 @@ class GenerationSession(object):
                     cross_cache_shape = (
                         batch_size,
                         2,
-                        self.num_heads_kv,
+                        self.get_num_heads_kv(),
                         self.encoder_max_input_length,
                         self.head_size,
                     )
@@ -1894,7 +1904,7 @@ class GenerationSession(object):
                 if self.cross_qkv_reuse is None:
                     # see Attention's self.qkv output dim
                     cross_qkv_out_dim = self.num_heads * self.head_size + (
-                        2 * self.num_heads_kv * self.head_size)
+                        2 * self.get_num_heads_kv() * self.head_size)
                     cross_qkv_shape = encoder_output.shape[:-1] + (
                         cross_qkv_out_dim, )
                     cross_qkv_reuse = torch.empty(cross_qkv_shape,
@@ -1980,7 +1990,9 @@ class GenerationSession(object):
             for idx in range(self.first_layer, self.last_layer):
                 if not self.use_gpt_attention_plugin and self.layer_types[
                         idx] == 'attention':
-                    kv_cache_shape = (batch_size, 2, self.num_heads_kv, 0,
+                    kv_cache_shape = (batch_size, 2,
+                                      self.get_num_heads_kv(
+                                          self.general_to_attn_idx[idx]), 0,
                                       self.head_size)
                     # for empty tensor, TRT does not really use the tensor data, so any dtype is fine
                     kv_cache_buffer = torch.zeros((1, ),
@@ -1994,7 +2006,7 @@ class GenerationSession(object):
 
                     if self.cross_attention:
                         cross_kv_cache_shape = (batch_size, 2,
-                                                self.num_heads_kv, 0,
+                                                self.get_num_heads_kv(), 0,
                                                 self.head_size)
                         # for empty tensor, TRT does not really use the tensor data, so any dtype is fine
                         cross_kv_cache_buffer = torch.zeros((1, ),
@@ -2269,7 +2281,8 @@ class GenerationSession(object):
         if not self.paged_kv_cache:
             for attn_idx, layer_idx in self.attn_to_general_idx.items():
                 if not self.use_gpt_attention_plugin:
-                    next_shape = (batch_size * beam_width, 2, self.num_heads_kv,
+                    next_shape = (batch_size * beam_width, 2,
+                                  self.get_num_heads_kv(),
                                   max_context_length + step, self.head_size)
                     # We will make current layer's output KV-cache overwrite previous layers input KV-cache
                     # buffer id: ...  5,  6,  7,  8,  9, ...
@@ -2785,7 +2798,7 @@ class GenerationSession(object):
         assert self.buffer is not None
         assert self.parent_ids.shape[:2] == (batch_size, beam_width)
 
-        cache_shape = (batch_size * beam_width, 2, self.num_heads_kv,
+        cache_shape = (batch_size * beam_width, 2, self.get_num_heads_kv(),
                        max_context_length + step, self.head_size)
 
         import functools
@@ -3738,7 +3751,8 @@ class GenerationSession(object):
             self.buffer[f'host_kv_cache_pool_pointers'] = torch.tensor(
                 [self.kv_cache_pool.data_ptr(), 0], dtype=torch.int64)
 
-            block_size = self.num_heads_kv * self.tokens_per_block * self.head_size
+            block_size = self.get_num_heads_kv(
+            ) * self.tokens_per_block * self.head_size
             self.kv_cache_manager = KVCacheManager(
                 num_layers=self.num_attn_layers,
                 num_blocks=num_blocks,
@@ -3760,7 +3774,8 @@ class GenerationSession(object):
                         [self.cross_kv_cache_pool.data_ptr(), 0],
                         dtype=torch.int64)
 
-                cross_block_size = self.num_heads_kv * self.tokens_per_block * self.head_size
+                cross_block_size = self.get_num_heads_kv(
+                ) * self.tokens_per_block * self.head_size
                 self.cross_kv_cache_manager = KVCacheManager(
                     num_layers=self.num_layers,
                     num_blocks=cross_num_blocks,
@@ -3802,7 +3817,7 @@ class GenerationSession(object):
 
             if self.paged_kv_cache:
                 self.kv_cache_updater.init_paged_kv_cache(
-                    self.num_layers, self.num_heads_kv, self.head_size,
+                    self.num_layers, self.get_num_heads_kv(), self.head_size,
                     kv_cache_type, self.kv_cache_manager,
                     self.buffer[f'host_kv_cache_pool_pointers'])
             else:
@@ -3811,7 +3826,7 @@ class GenerationSession(object):
                     for i in range(self.first_layer, self.last_layer)
                 ]
                 self.kv_cache_updater.init_linear_kv_cache(
-                    self.num_layers, self.num_heads_kv, self.head_size,
+                    self.num_layers, self.get_num_heads_kv(), self.head_size,
                     kv_cache_type, past_key_value_list)
 
         stop_words_lens = None

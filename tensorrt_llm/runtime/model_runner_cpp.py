@@ -79,6 +79,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         sink_token_length: Optional[int] = None,
         kv_cache_free_gpu_memory_fraction: Optional[float] = None,
         medusa_choices: list[list[int]] | None = None,
+        lookahead_config: list[int] | None = None,
         debug_mode: bool = False,
         lora_ckpt_source: str = "hf",
         gpu_weights_percent: float = 1,
@@ -234,6 +235,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config.medusa_choices = medusa_choices
             if multi_block_mode is not None:
                 multi_block_mode = False  # Medusa doesn't support multi-block mode.
+
+        if lookahead_config is not None:
+            [w, n, g] = lookahead_config
+            decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
+                w, n, g)
 
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size

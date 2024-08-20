@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import datetime
+import json
 import math
 import secrets
 import threading
@@ -369,7 +370,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine_dir: Path,
+        engine_object_or_path: Union[Path, "Engine"],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
@@ -387,7 +388,7 @@ class GenerationExecutor(ABC):
                 f"on {world_size} ranks.")
 
         worker_kwargs = {
-            "engine_dir": engine_dir,
+            "engine_object_or_path": engine_object_or_path,
             "executor_config": executor_config,
         }
 
@@ -412,7 +413,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine_dir: Path,
+        engine_object_or_path: Union[Path, "Engine"],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
@@ -422,10 +423,17 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._pending: set = set()
         self.result_queue = None
         self.rank = mpi_rank()
-
-        self.engine = tllm.Executor(engine_dir,
-                                    tllm.ModelType.DECODER_ONLY,
-                                    executor_config=executor_config)
+        from .builder import Engine
+        if isinstance(engine_object_or_path, Engine):
+            self.engine = tllm.Executor(
+                engine_object_or_path.engine,
+                json.dumps(engine_object_or_path.config.to_dict()),
+                tllm.ModelType.DECODER_ONLY,
+                executor_config=executor_config)
+        else:
+            self.engine = tllm.Executor(engine_object_or_path,
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config)
         self.awaiter_stop_event = threading.Event()
         self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
                                                daemon=True)
@@ -678,7 +686,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
     @print_traceback_on_error
     @staticmethod
     def workers_main(
-        engine_dir: Path,
+        engine_object_or_path: Union[Path, "Engine"],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
@@ -699,7 +707,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # TODO[chunweiy]: fix the non-rank0 process failure
         init_ok = True
         try:
-            executor = ExecutorBindingsWorker(engine_dir, executor_config)
+            executor = ExecutorBindingsWorker(engine_object_or_path,
+                                              executor_config)
         except Exception as e:
             init_ok = False
             raise e

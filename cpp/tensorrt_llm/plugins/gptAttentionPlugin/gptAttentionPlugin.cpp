@@ -659,7 +659,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         if (past_key_value_cache != outputs[1])
         {
             auto shape = outputDesc[1].dims;
-            auto const size = std::accumulate(shape.d, shape.d + shape.nbDims, 1, std::multiplies<size_t>{});
+            auto const size
+                = cacheElemSize * std::accumulate(shape.d, shape.d + shape.nbDims, 1, std::multiplies<size_t>{});
             cudaMemcpyAsync(outputs[1], past_key_value_cache, size, cudaMemcpyDeviceToDevice, stream);
         }
     }

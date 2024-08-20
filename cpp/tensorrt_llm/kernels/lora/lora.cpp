@@ -26,11 +26,13 @@
 
 #include <algorithm>
 
-namespace tk = tensorrt_llm::kernels;
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
 using tensorrt_llm::kernels::LoraImpl;
 using tensorrt_llm::kernels::CublasGemmWrapperPtr;
+
+namespace tensorrt_llm::kernels
+{
 
 // TODO should reuse the function in gemmPlugin
 void _getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int& m, int& n, int& k, int& lda, int& ldb,
@@ -103,9 +105,9 @@ int64_t getLowRankWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int
     return divUp(numTokens * maxLoraModuleNum * maxLowRank * typeSize, 16) * 16;
 }
 
-int64_t getGroupedGemmParamsWorkSpaceSize(int64_t nbReq)
+int64_t getGemmParamsWorkSpaceSize(int64_t nbReq)
 {
-    return std::max(tk::getSplitkGroupedGemmParamsWorkSpaceSize(nbReq), tk::getGroupedGemmParamsWorkSpaceSize(nbReq));
+    return std::max(getSplitkGroupedGemmParamsWorkSpaceSize(nbReq), getGroupedGemmParamsWorkSpaceSize(nbReq));
 }
 
 int64_t getSplitkGroupedGemmWorkSpaceSize(
@@ -129,7 +131,7 @@ size_t LoraImpl::getWorkspaceSize(
 
     return (size_t) getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices)
         + getLowRankWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, typeSize)
-        + getGroupedGemmParamsWorkSpaceSize(numReqs * mNumLoraModules);
+        + getGemmParamsWorkSpaceSize(numReqs * mNumLoraModules);
 }
 
 void LoraImpl::setBestTactic(std::optional<Config> config)
@@ -160,7 +162,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
     setGemmConfig();
 
     int64_t GemmWorkSpaceSize = getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices);
-    int64_t groupGemmParamsWorkSpaceSize = getGroupedGemmParamsWorkSpaceSize(numReqs * mNumLoraModules);
+    int64_t groupGemmParamsWorkSpaceSize = getGemmParamsWorkSpaceSize(numReqs * mNumLoraModules);
     void* gemmWorkSpace = workspace; // [gemmWorkSpace, lowrankWorkSpace, groupGemmParamsWorkSpace]
     void* lowRankWorkSpace = static_cast<char*>(gemmWorkSpace) + GemmWorkSpaceSize;
     void* groupGemmParamsWorkSpace = static_cast<char*>(lowRankWorkSpace)
@@ -321,11 +323,11 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             TLLM_CHECK_WITH_INFO(mTransA == false && mTransB == true,
                 fmtstr("Invalid transA (%d) transB (%d). transA must be false, transB must be true", int(mTransA),
                     int(mTransB)));
-            tk::splitkGroupedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, groupGemmParamsWorkSpace,
+            splitkGroupedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, groupGemmParamsWorkSpace,
                 groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, splitkBufferOffsets, true, mType,
                 mSplitKSlices, stream);
             sync_check_cuda_error();
-            tk::groupedGemm(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, groupGemmParamsWorkSpace,
+            groupedGemm(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, groupGemmParamsWorkSpace,
                 groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, false, mType, stream);
             sync_check_cuda_error();
         }
@@ -333,3 +335,5 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
 
     return 0;
 }
+
+} // namespace tensorrt_llm::kernels

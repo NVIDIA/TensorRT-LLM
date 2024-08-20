@@ -33,13 +33,15 @@ from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
 from ..parameter import Parameter
-from .functional import (change_qkv_leading_dim, dequantize, fp8_rowwise_gemm,
-                         fp8_rowwise_rms_norm, postprocess_weight_only,
-                         quantize, quantize_fp8_per_token, quantize_per_token,
-                         quantize_tensor, smooth_quant_gemm,
-                         smooth_quant_layer_norm, smooth_quant_rms_norm,
-                         weight_only_groupwise_quant_matmul,
-                         weight_only_quant_matmul)
+
+# isort: off
+from .functional import (
+    change_qkv_leading_dim, dequantize, fp8_rowwise_gemm, fp8_rowwise_rms_norm,
+    postprocess_fp8_rowwise, postprocess_weight_only, quantize,
+    quantize_fp8_per_token, quantize_per_token, quantize_tensor,
+    smooth_quant_gemm, smooth_quant_layer_norm, smooth_quant_rms_norm,
+    weight_only_groupwise_quant_matmul, weight_only_quant_matmul)
+# isort: on
 from .mode import QuantMode
 
 
@@ -443,6 +445,7 @@ class Fp8RowwiseLinear(Linear):
                                                dtype="float32")
 
         self.quant_mode = quant_mode
+        self.tllm_to_externel_key_dict = {"weight": ["weight", "weight_scale"]}
 
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None, "lora is not supported on SmoothQuantLinear now"
@@ -460,6 +463,9 @@ class Fp8RowwiseLinear(Linear):
             x = allgather(x, self.tp_group, gather_dim=1)
 
         return x
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        return postprocess_fp8_rowwise(tllm_key, weights, **kwargs)
 
 
 Fp8RowwiseColumnLinear = Fp8RowwiseLinear
@@ -500,6 +506,7 @@ class Fp8RowwiseRowLinear(RowLinear):
                                                dtype="float32")
 
         self.quant_mode = quant_mode
+        self.tllm_to_externel_key_dict = {"weight": ["weight", "weight_scale"]}
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         assert lora_runtime_params is None, "lora is not supported on SmoothQuantRowLinear now"
@@ -528,6 +535,9 @@ class Fp8RowwiseRowLinear(RowLinear):
             x = x + self.bias.value
 
         return x
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        return postprocess_fp8_rowwise(tllm_key, weights, **kwargs)
 
 
 class WeightOnlyQuantLinear(Linear):
@@ -600,16 +610,10 @@ class WeightOnlyQuantLinear(Linear):
 
         return x
 
-    def postprocess(self,
-                    tllm_key,
-                    weights,
-                    using_head_as_leading_dim=False,
-                    num_heads=-1):
+    def postprocess(self, tllm_key, weights, **kwargs):
         if "per_channel_scale" in tllm_key:
             return {}
-        weights = super().postprocess(tllm_key, weights,
-                                      using_head_as_leading_dim,
-                                      num_heads)[tllm_key]
+        weights = super().postprocess(tllm_key, weights, **kwargs)[tllm_key]
         weights = weights.to(str_dtype_to_torch(self.dtype))
         return postprocess_weight_only(tllm_key, weights,
                                        self.weight_only_quant_mode)
@@ -681,7 +685,7 @@ class WeightOnlyQuantRowLinear(RowLinear):
 
         return x
 
-    def postprocess(self, tllm_key, weights):
+    def postprocess(self, tllm_key, weights, **kwargs):
         if "per_channel_scale" in tllm_key:
             return {}
         weights = weights.to(str_dtype_to_torch(self.dtype))
@@ -749,16 +753,17 @@ def unpack_int32_into_int8(w_packed):
 
 
 def pad_like(w, target_shape, value=0):
-    if w.shape == target_shape:
-        return w
+    if w.shape != target_shape:
+        pad_dim = []
+        for dim in range(len(target_shape)):
+            current_dim = -1 - dim
+            pad_dim.append(0)
+            pad_dim.append(
+                max(0, target_shape[current_dim] - w.shape[current_dim]))
+        res = F.pad(w, pad_dim, value=value)
+        return res
     else:
-        if w.dim() == 1:
-            return F.pad(w, (0, max(0, target_shape[-1] - w.shape[-1])),
-                         value=value)
-        else:
-            return F.pad(w, (0, max(0, target_shape[-1] - w.shape[-1]), 0,
-                             max(0, target_shape[-2] - w.shape[-2])),
-                         value=value)
+        return w
 
 
 class WeightOnlyGroupwiseQuantLinear(Linear):
@@ -811,7 +816,6 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
-        self.transposed_weight = True
         self.tp_rank = tp_rank
         if self.is_padded:
             self.tp_dim = -1
@@ -866,11 +870,11 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
 
         return x
 
-    def postprocess(self,
-                    tllm_key,
-                    weights,
-                    using_head_as_leading_dim=False,
-                    num_heads=-1):
+    def postprocess(self, tllm_key, weights, **kwargs):
+        using_head_as_leading_dim = kwargs.get("using_head_as_leading_dim",
+                                               False)
+        config = kwargs.get("config", None)
+        num_heads = config.num_heads
         if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
             return {}
         if self.is_qkv and type(weights) is list and len(weights) > 3:
@@ -921,7 +925,7 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
                 scales_fp16 = pad_like(scales_fp16,
                                        self.weights_scaling_factor.shape, 1)
                 qzeros_unpacked_int32 = pad_like(qzeros_unpacked_int32,
-                                                 self.zero.shape)
+                                                 self.zero.shape, 7)
             zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 7) * scales_fp16
             zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
                 str_dtype_to_torch(self.dtype))
@@ -962,14 +966,6 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         if out_features % multiple > 0:
             out_features = math.ceil(out_features / multiple) * multiple
             self.is_padded = True
-        multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
-        self.is_padded = False
-        if in_features % multiple > 0:
-            in_features = math.ceil(in_features / multiple) * multiple
-            self.is_padded = True
-        if out_features % multiple > 0:
-            out_features = math.ceil(out_features / multiple) * multiple
-            self.is_padded = True
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -991,11 +987,6 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
-        self.transposed_weight = True
-        self.tp_rank = tp_rank
-        if self.is_padded:
-            self.tp_dim = -1
-        self.transposed_weight = True
         self.tp_rank = tp_rank
         if self.is_padded:
             self.tp_dim = -1
@@ -1051,7 +1042,7 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
 
         return x
 
-    def postprocess(self, tllm_key, weights):
+    def postprocess(self, tllm_key, weights, **kwargs):
         if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
             return {}
         if tllm_key.endswith("bias"):
@@ -1088,7 +1079,7 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
                 scales_fp16 = pad_like(scales_fp16,
                                        self.weights_scaling_factor.shape, 1)
                 qzeros_unpacked_int32 = pad_like(qzeros_unpacked_int32,
-                                                 self.zero.shape)
+                                                 self.zero.shape, 7)
             zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 7) * scales_fp16
             zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
                 str_dtype_to_torch(self.dtype))
@@ -1368,13 +1359,13 @@ class FP8Linear(Linear):
                 lora_runtime_params=lora_runtime_params,
                 lora_hidden_state=lora_hidden_state)
 
-    def postprocess(self, tllm_key, weights):
+    def postprocess(self, tllm_key, weights, **kwargs):
         # TODO: add FP8 modelopt format support
         if self.is_qkv:
             if tllm_key.endswith("scaling_factor"):
                 return 448.0 / max(weights).unsqueeze(0)
             else:
-                return super().postprocess(tllm_key, weights)
+                return super().postprocess(tllm_key, weights, **kwargs)
         if tllm_key.endswith("scaling_factor"):
             return 448.0 / weights.unsqueeze(0)
         else:
@@ -1463,7 +1454,7 @@ class FP8RowLinear(RowLinear):
                 reduce_fusion_params=reduce_fusion_params)
         return ret
 
-    def postprocess(self, tllm_key, weights):
+    def postprocess(self, tllm_key, weights, **kwargs):
         # TODO: add FP8 modelopt format support
         if tllm_key.endswith("scaling_factor"):
             return 448.0 / weights.unsqueeze(0)

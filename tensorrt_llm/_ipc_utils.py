@@ -15,7 +15,6 @@
 import array
 import struct
 import sys
-from contextlib import contextmanager
 from typing import List, Tuple
 
 from cuda import cudart
@@ -31,17 +30,7 @@ def _raise_if_error(error: cudaError_t):
         raise RuntimeError(error)
 
 
-@contextmanager
-def peer_access(mapping: Mapping):
-    is_p2p_supported = set_peer_access(mapping, True)
-    assert is_p2p_supported, "P2P access not supported"
-    try:
-        yield
-    finally:
-        set_peer_access(mapping, False)
-
-
-def set_peer_access(mapping: Mapping, enabled: bool = True) -> bool:
+def can_access_peer(mapping: Mapping) -> bool:
     src_node = mapping.local_rank
     for rank in mapping.tp_group:
         dest_node = mapping.get_local_rank(rank)
@@ -56,18 +45,6 @@ def set_peer_access(mapping: Mapping, enabled: bool = True) -> bool:
             logger.info(
                 f"Cannot access peer device from {src_node} to {dest_node}")
             return False
-
-        if enabled:
-            cudart.cudaDeviceEnablePeerAccess(dest_node, 0)
-        else:
-            cudart.cudaDeviceDisablePeerAccess(dest_node)
-        error = cudart.cudaGetLastError()[0]
-        if error not in [
-                cudaError_t.cudaSuccess,
-                cudaError_t.cudaErrorPeerAccessAlreadyEnabled,
-                cudaError_t.cudaErrorPeerAccessNotEnabled
-        ]:
-            raise RuntimeError(error)
     return True
 
 

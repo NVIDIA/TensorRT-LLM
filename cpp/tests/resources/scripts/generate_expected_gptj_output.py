@@ -70,7 +70,7 @@ def generate_outputs(only_fp8, num_beams):
     if only_fp8 and num_beams == 1:
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FP8)
         model_spec_obj.use_gpt_plugin()
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_packed_input()
 
         print('Generating GPT-J FP8-kv-cache outputs')
@@ -81,7 +81,7 @@ def generate_outputs(only_fp8, num_beams):
         print('Generating GPT-J FP16 outputs')
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
         model_spec_obj.use_gpt_plugin()
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
                         model_spec_obj=model_spec_obj)
@@ -91,7 +91,7 @@ def generate_outputs(only_fp8, num_beams):
                         num_beams=num_beams,
                         model_spec_obj=model_spec_obj)
 
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
                         model_spec_obj=model_spec_obj)

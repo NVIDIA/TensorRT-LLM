@@ -54,6 +54,8 @@ public:
 
     void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) override;
 
+    void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) override;
+
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
 
@@ -75,6 +77,12 @@ public:
     [[nodiscard]] std::vector<bool> getFinished() const override
     {
         return {mFinished.begin(), mFinished.begin() + mActualBatchSize};
+    }
+
+    //! @returns [batchSize, beamWidth], FinishedState value, on gpu
+    [[nodiscard]] TensorPtr getFinishReasons() const override
+    {
+        return ITensor::slice(mJointDecodingOutput->finishReasons, 0, mActualBatchSize);
     }
 
     //! @param batchIdx index of the batch
@@ -241,6 +249,9 @@ private:
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(ModelConfig const& modelConfig);
+
+    //! @brief Setup buffers for lookahead decoding.
+    void setupLookahead(ModelConfig const& modelConfig);
 
     //! @brief Setups decoder internal tensors for new speculative decoding request
     void newRequestSpeculativeDecoding(

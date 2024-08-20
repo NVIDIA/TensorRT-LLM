@@ -406,6 +406,9 @@ def prepare_model_tests(model_name: str,
         python_exe,
         str(scripts_dir / f"build_{model_name}_engines.py")
     ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
+
+    if model_name in ['gpt']:
+        build_engines += ['--clean']
     run_command(build_engines, cwd=root_dir, env=model_env, timeout=1800)
 
     model_env["PYTHONPATH"] = "examples"
@@ -415,6 +418,10 @@ def prepare_model_tests(model_name: str,
     ] + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
     if "enc_dec" in model_name:
         generate_expected_output += model_cache_arg
+
+    if model_name in ['gpt']:
+        generate_expected_output += ['--clean']
+
     if only_multi_gpu_arg and model_name != 'enc_dec':
         for world_size in (2, 4):
             generate_command = [
@@ -543,6 +550,16 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     run_command(mpi_utils_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
+    # Cache transceiver tests
+    cache_trans_test = [
+        "mpirun",
+        "-n",
+        "2",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
@@ -653,7 +670,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
         if model_name == "gpt":
             input_file = 'input_tokens.npy'
             model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-            model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+            model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
             model_spec_obj.use_gpt_plugin()
             model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
             ) / "tp1-pp1-gpu"
@@ -694,7 +711,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
     if model_name == "gpt":
         input_file = 'input_tokens.npy'
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.use_packed_input()
         model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
@@ -887,7 +904,7 @@ if __name__ == "__main__":
 
     from build_engines_utils import init_model_spec_module
 
-    init_model_spec_module()
+    init_model_spec_module(force_init_trtllm_bindings=False)
 
     if test_args.run_all_models:
         test_args.run_gpt = True

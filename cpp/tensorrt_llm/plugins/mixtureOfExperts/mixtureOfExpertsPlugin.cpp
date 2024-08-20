@@ -647,6 +647,11 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace_ptr,
     cudaStream_t stream) noexcept
 {
+    if (isBuilding())
+    {
+        return 0;
+    }
+
     int64_t const num_tokens = getNumTokens(inputDesc);
     int64_t const num_reqs = getNumLoraRequests(inputDesc);
     int64_t const num_not_finished = num_tokens; // TODO Take this as an input

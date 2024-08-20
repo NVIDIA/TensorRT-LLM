@@ -655,3 +655,34 @@ def postprocess_weight_only(tllm_key, weights, quant_mode):
         }
     else:
         return {tllm_key: weights}  # Bias
+
+
+def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
+    if tllm_key.endswith("per_channel_scale"):
+        return {}
+
+    config = kwargs.get("config", None)
+    if weights[1] is not None:
+        assert weights[0].dtype == torch.float8_e4m3fn
+        scale = weights[1].to(torch.float32).reshape(-1)
+        return {
+            tllm_key: weights[0],
+            tllm_key.replace("weight", "per_channel_scale"): scale
+        }
+    else:
+        clamp_val = config.quantization.clamp_val
+        # activation range bound.
+        x = weights[0].to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+        xmax = x.abs().max(-1, keepdim=True).values
+        # minimum scaling factor.
+        torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
+        out = x / torch_weight_scales
+        torch_weight_scales = torch_weight_scales.reshape(-1)
+        out = torch.clamp(out, -448, 448)
+        processed_torch_weights = out.to(torch.float8_e4m3fn)
+        processed_torch_weights = processed_torch_weights.to(
+            torch.float8_e4m3fn)
+        return {
+            tllm_key: processed_torch_weights,
+            tllm_key.replace("weight", "per_channel_scale"): torch_weight_scales
+        }

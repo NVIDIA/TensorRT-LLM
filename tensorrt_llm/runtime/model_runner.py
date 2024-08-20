@@ -465,6 +465,22 @@ class ModelRunner(ModelRunnerMixin):
                 'Build config doesn\'t have kv_cache_type, you might need to rebuild your enigne.'
             )
 
+        # TODO(oargov): this is a hack, make it prettier!
+        if hasattr(pretrained_config, "get_layer_num_kv_heads"):
+            # each layer has a different number of kv heads
+            attention_layers = [
+                layer_idx for layer_idx, layer_type in enumerate(
+                    pretrained_config.layer_types) if layer_type == "attention"
+            ] if hasattr(pretrained_config, "layer_types") else list(
+                range(pretrained_config.num_hidden_layers))
+            num_kv_heads_per_layer = [
+                pretrained_config.get_layer_num_kv_heads(layer_idx)
+                if layer_idx in attention_layers else 0
+                for layer_idx in range(pretrained_config.num_hidden_layers)
+            ]
+        else:
+            num_kv_heads_per_layer = None
+
         model_config = ModelConfig(
             max_batch_size=build_config.max_batch_size,
             max_beam_width=build_config.max_beam_width,
@@ -498,6 +514,7 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'num_medusa_heads') else 0,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
+            num_kv_heads_per_layer=num_kv_heads_per_layer,
             redrafter_num_beams=pretrained_config.redrafter_num_beams
             if hasattr(pretrained_config, 'redrafter_num_beams') else 0,
             redrafter_draft_len_per_beam=pretrained_config.

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
@@ -100,6 +101,9 @@ public:
     //! @brief Setup buffers for ExplicitDraftTokens decoding.
     virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
 
+    //! @brief Setup buffers for Lookahead decoding.
+    virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;
+
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
@@ -134,6 +138,9 @@ public:
 
     //! @returns [batchSize (actual)], marks finished requests (per batch)
     [[nodiscard]] virtual std::vector<bool> getFinished() const = 0;
+
+    //! @returns [batchSize, beamWidth], FinishedState value, on gpu
+    [[nodiscard]] virtual TensorPtr getFinishReasons() const = 0;
 
     //! @returns [batchSize, beamWidth], cumulative log probabilities (per beam), on gpu
     [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;

@@ -16,11 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <NvInferRuntime.h>
@@ -52,7 +54,8 @@ public:
     virtual ~IGptDecoder() = default;
 
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-        std::optional<DecodingOutput> const& output = std::nullopt)
+        std::optional<DecodingOutput> const& output = std::nullopt,
+        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt)
         = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
@@ -95,7 +98,8 @@ public:
         std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-        std::optional<DecodingOutput> const& output = std::nullopt) override;
+        std::optional<DecodingOutput> const& output = std::nullopt,
+        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 

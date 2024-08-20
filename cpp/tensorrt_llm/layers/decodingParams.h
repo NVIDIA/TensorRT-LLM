@@ -198,12 +198,21 @@ public:
     std::shared_ptr<DecodingSetupParams> decodingParams;
 };
 
-class LookaheadSetupParams : public DecodingSetupParams
+struct LookaheadSetupParams : public DecodingSetupParams
 {
-public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
     std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen] on cpu
-    std::optional<std::vector<uint64_t>> randomSeed;            // [1] or [batchSize] on cpu
     std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1 or batchSize] on cpu
+
+    //! see LookaheadDecodingOutputs::generationLengths
+    TensorPtr generationLengths;
+    //! see LookaheadDecodingOutputs::positionOffsets
+    TensorPtr positionOffsets;
+    //! see LookaheadDecodingOutputs::attentionPackedMasks
+    TensorPtr attentionPackedMasks;
+    //! see LookaheadDecodingOutputs::actualGenerationLengths
+    TensorPtr actualGenerationLengths;
 };
 
 class BaseDecodingInputs
@@ -396,17 +405,11 @@ public:
 
 class LookaheadDecodingInputs : public DecodingInputs
 {
-    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
-
 public:
-    explicit LookaheadDecodingInputs(TensorPtr endIds, TensorConstPtr batchSlots)
+    explicit LookaheadDecodingInputs(TensorConstPtr endIds, TensorConstPtr batchSlots)
         : DecodingInputs{std::move(endIds), std::move(batchSlots)}
-    //, logits{logits}
     {
     }
-    // TODO(liweim) reuse base logits and curTokensPerStep.
-    // TensorConstPtr logits;        // [batchSize, maxTokensPerStep, vocabSizePadded] on gpu
-    // TensorConstPtr tokensPerStep; // [maxBatchSize] on gpu
 };
 
 class BaseDecodingOutputs
@@ -525,6 +528,33 @@ public:
     TensorPtr pathsOffsets;
     //! [maxBatchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)]
     TensorPtr packedMasks;
+};
+
+class LookaheadDecodingOutputs : public SpeculativeDecodingOutputs
+{
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+public:
+    explicit LookaheadDecodingOutputs(TensorPtr outputIds)
+        : SpeculativeDecodingOutputs{std::move(outputIds)}
+    {
+    }
+
+    //! for TLLM engine input "spec_decoding_generation_lengths", indicating how many tokens to be generated.
+    //! currently, the 1st step of generation is 1, set at `setup`, others are maxDecodingTokens, set at `forward`.
+    //! [maxBatchSize]
+    TensorPtr generationLengths;
+    //! for TLLM engine input "spec_decoding_position_offsets",
+    //! indicating each token position offset base on the last golden token = 0.
+    //! ABC<D>efgxyz--- // sequence tokens, ABCD: golden; efg, xyz: draft; ---: padding.
+    //! ***<0>123123--- // positionOffsets.
+    //! 012<3>456456--- // positionIds.
+    //! [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionOffsets;
+    //! [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionIds;
+    //! The actual decoding tokens length, for debug and for future.
+    TensorPtr actualGenerationLengths;
 };
 
 class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs

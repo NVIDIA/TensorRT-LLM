@@ -27,17 +27,18 @@ import model_spec
 import tensorrt_llm.bindings as _tb
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
+def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
+                 build_extra_args):
 
     ckpt_dir = engine_dir / 'ckpt'
 
-    covert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
-                  ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
-                      f'--output_dir={ckpt_dir}',
-                      '--dtype=float16',
-                  ] + list(args)
+    convert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
+                   ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
+                       f'--output_dir={ckpt_dir}',
+                       '--dtype=float16',
+                   ] + convert_extra_args
 
-    run_command(covert_cmd)
+    run_command(convert_cmd)
 
     build_args = [
         'trtllm-build',
@@ -52,7 +53,7 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, *args):
         '--log_level=error',
         '--paged_kv_cache=enable',
         '--remove_input_padding=enable',
-    ]
+    ] + build_extra_args
 
     run_command(build_args)
 
@@ -83,7 +84,7 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
 
     model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
     tp_pp_sizes = [(1, 1)]
@@ -97,7 +98,16 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
 
         build_engine(hf_dir,
                      engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     f'--tp_size={tp_size}', f'--pp_size={pp_size}')
+                     [f'--tp_size={tp_size}', f'--pp_size={pp_size}'], [])
+
+    ## build lookahead engine
+    model_spec_obj.use_lookahead_decoding()
+    build_engine(hf_dir,
+                 engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-gpu',
+                 [], [
+                     '--max_draft_len=39',
+                     '--speculative_decoding_mode=lookahead_decoding'
+                 ])
 
     print("Done.")
 

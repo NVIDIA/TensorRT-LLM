@@ -108,11 +108,9 @@ class BloomModel(Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            share_embedding_table=config.share_embedding_table)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
         self.ln_embed = LayerNorm(normalized_shape=config.hidden_size,
                                   dtype=config.dtype)
         self.layers = DecoderLayerList(BloomDecoderLayer, config)

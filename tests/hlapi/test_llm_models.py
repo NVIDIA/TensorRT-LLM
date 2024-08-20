@@ -174,10 +174,13 @@ def test_llm_phi_3_mini_4k():
                                         "examples/phi/requirements.txt")
     command = f"pip install -r {phi_requirement_path}"
     subprocess.run(command, shell=True, check=True, env=os.environ)
-    llm_test_harness(phi_3_mini_4k_model_path,
-                     prompts=['A B C'],
-                     references=[' D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+    phi3_mini_4k_sampling_params = SamplingParams(max_new_tokens=13)
+
+    llm_test_harness(
+        phi_3_mini_4k_model_path,
+        prompts=["I am going to Paris, what should I see?"],
+        references=["\n\nAssistant: Paris is a city rich in history,"],
+        sampling_params=phi3_mini_4k_sampling_params)
 
 
 @force_ampere
@@ -222,7 +225,7 @@ def test_llm_gemma_2b():
                      sampling_params=sampling_params)
 
 
-@force_ampere
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4800391")
 def test_llm_gemma_2b_int4weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
     llm_test_harness(gemma_2b_model_path,
@@ -232,7 +235,7 @@ def test_llm_gemma_2b_int4weight_only():
                      quant_config=quant_config)
 
 
-@force_ampere
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4800404")
 def test_llm_gemma_2_9b_it():
     llm_test_harness(gemma_2_9b_it_model_path,
                      prompts=['A B C'],
@@ -292,7 +295,7 @@ def test_llm_baichuan2_7b_int4weight_only():
                      quant_config=quant_config)
 
 
-@skip_pre_ampere
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4800424")
 def test_llm_qwen():
     llm_test_harness(qwen_model_path,
                      prompts=['A B C'],
@@ -300,7 +303,7 @@ def test_llm_qwen():
                      sampling_params=sampling_params)
 
 
-@skip_pre_ampere
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4800424")
 def test_llm_qwen1_5():
     llm_test_harness(qwen1_5_model_path,
                      prompts=['A B C'],

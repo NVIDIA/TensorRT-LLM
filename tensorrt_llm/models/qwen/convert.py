@@ -1086,7 +1086,7 @@ def convert_hf_qwen(hf_model,
     if mapping.is_last_pp_rank():
         if hf_model.config.tie_word_embeddings:
             # lm_head.weight has the same weights as embedding
-            lm_head_weights = v
+            lm_head_weights = v.clone()
         else:
             lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 

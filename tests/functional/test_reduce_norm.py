@@ -29,7 +29,6 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionOp,
                                      AllReduceFusionParams, AllReduceStrategy,
                                      allreduce)
@@ -105,66 +104,67 @@ class TestCommunicationPlugin(unittest.TestCase):
         input = self.reference_tensors[self.rank][:size].to(
             torch_dtype).reshape(token_num, hidden_size)
 
-        with peer_access(self.mapping):
-            with tllm.net_guard(net):
-                network = tllm.default_trtnet()
+        with tllm.net_guard(net):
+            network = tllm.default_trtnet()
 
-                x = Tensor(name='x',
-                           shape=input.shape,
-                           dtype=tllm.str_dtype_to_trt(dtype))
-                y = Tensor(name='y',
-                           shape=bias.shape,
-                           dtype=tllm.str_dtype_to_trt(dtype))
-                z = Tensor(name='z',
-                           shape=residual.shape,
-                           dtype=tllm.str_dtype_to_trt(dtype))
-                w = Tensor(name='w',
-                           shape=weight.shape,
-                           dtype=tllm.str_dtype_to_trt(dtype))
-                current_all_reduce_helper().set_workspace_tensor(self.mapping)
+            x = Tensor(name='x',
+                       shape=input.shape,
+                       dtype=tllm.str_dtype_to_trt(dtype))
+            y = Tensor(name='y',
+                       shape=bias.shape,
+                       dtype=tllm.str_dtype_to_trt(dtype))
+            z = Tensor(name='z',
+                       shape=residual.shape,
+                       dtype=tllm.str_dtype_to_trt(dtype))
+            w = Tensor(name='w',
+                       shape=weight.shape,
+                       dtype=tllm.str_dtype_to_trt(dtype))
+            current_all_reduce_helper().set_workspace_tensor(self.mapping)
 
-                current = x
-                current, z = allreduce(
-                    current,
-                    self.mapping.tp_group,
-                    strategy,
-                    config,
-                    reduce_fusion_params=AllReduceFusionParams(
-                        AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        bias=y,
-                        residual=z,
-                        norm_weight=w,
-                        eps=eps))
-                output = current.trt_tensor
+            current = x
+            current, z = allreduce(
+                current,
+                self.mapping.tp_group,
+                strategy,
+                config,
+                reduce_fusion_params=AllReduceFusionParams(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    bias=y,
+                    residual=z,
+                    norm_weight=w,
+                    eps=eps),
+            )
+            output = current.trt_tensor
 
-                output.name = 'output'
-                output.dtype = tllm.str_dtype_to_trt(dtype)
-                network.mark_output(output)
+            output.name = 'output'
+            output.dtype = tllm.str_dtype_to_trt(dtype)
+            network.mark_output(output)
 
-            build_engine = EngineFromNetwork(
-                (builder.trt_builder, net.trt_network),
-                config=CreateConfig(
-                    fp16=(dtype == 'float16'),
-                    bf16=(dtype == 'bfloat16'),
-                    precision_constraints='obey',
-                ))
+        build_engine = EngineFromNetwork(
+            (builder.trt_builder, net.trt_network),
+            config=CreateConfig(
+                fp16=(dtype == 'float16'),
+                bf16=(dtype == 'bfloat16'),
+                precision_constraints='obey',
+            ),
+        )
 
-            output = torch.zeros_like(input)
+        output = torch.zeros_like(input)
 
-            stream = torch.cuda.current_stream()
-            feed_dict = {
-                'x': input,
-                'y': bias,
-                'z': residual,
-                'w': weight,
-                'all_reduce_workspace': workspace
-            }
+        stream = torch.cuda.current_stream()
+        feed_dict = {
+            'x': input,
+            'y': bias,
+            'z': residual,
+            'w': weight,
+            'all_reduce_workspace': workspace
+        }
 
-            session = tllm.runtime.Session.from_engine(build_engine())
-            session.run(inputs=feed_dict,
-                        outputs={"output": output},
-                        stream=stream.cuda_stream)
-            torch.cuda.synchronize()
+        session = tllm.runtime.Session.from_engine(build_engine())
+        session.run(inputs=feed_dict,
+                    outputs={"output": output},
+                    stream=stream.cuda_stream)
+        torch.cuda.synchronize()
 
         close = torch.isclose(allreduce_ref, output, rtol=1e-2, atol=1e-3)
         if not torch.all(close):

@@ -4913,8 +4913,7 @@ def gpt_attention(
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     kv_cache_quant_mode_field = trt.PluginField(
-        "kv_cache_quant_mode",
-        np.array(np.int8(kv_cache_quant_mode), dtype=np.int32),
+        "kv_cache_quant_mode", np.array(kv_cache_quant_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
     paged_kv_cache = trt.PluginField(
         "paged_kv_cache", np.array(paged_kv_cache_flag, dtype=np.int32),
@@ -5519,7 +5518,6 @@ def lora_plugin(
     transa: bool = False,
     transb: bool = False,
     host_context_lengths: Tensor = None,  # for pad-free input mode
-    max_num_tokens: int = 0,
     max_low_rank: int = 0,
     lora_ranks: List[Tensor] = None,
     lora_weights_pointers: List[Tensor] = None,
@@ -5549,9 +5547,6 @@ def lora_plugin(
 
         host_context_lengths: cpu Tensor = None
             A host tensor that contains the lengths of the different inputs,
-
-        max_num_tokens : int
-            Maximum number of tokens, used to determine the workspace size.
 
         max_low_rank : int
             Maximum low_rank, used to determine the workspace size.
@@ -5600,9 +5595,6 @@ def lora_plugin(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
-    max_num_tokens_field = trt.PluginField(
-        "max_num_tokens", np.array(max_num_tokens, dtype=np.int32),
-        trt.PluginFieldType.INT32)
     max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
                                          trt.PluginFieldType.INT32)
@@ -5616,8 +5608,7 @@ def lora_plugin(
 
     pfc = trt.PluginFieldCollection([
         in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
-        remove_input_padding, max_num_tokens_field, max_low_rank_field,
-        weight_index_field
+        remove_input_padding, max_low_rank_field, weight_index_field
     ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 

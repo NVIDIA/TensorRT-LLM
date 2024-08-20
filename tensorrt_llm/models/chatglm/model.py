@@ -176,11 +176,9 @@ class ChatGLMModel(Module):
         self.chatglm_version = config.chatglm_version
         norm_cls = RmsNorm if config.rmsnorm else LayerNorm
 
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            share_embedding_table=config.share_embedding_table)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
 
         if config.chatglm_version == 'glm':
             self.position_embedding = Embedding(
