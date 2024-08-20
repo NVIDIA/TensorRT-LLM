@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple
 
 import tensorrt as trt
 
-from .._ipc_utils import IpcMemory
+from .._ipc_utils import IpcMemory, can_access_peer
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -171,6 +171,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _paged_state: bool = field(default=True, init=False)
     _streamingllm: bool = field(default=False, init=False)
     _manage_weights: bool = field(default=False, init=False)
+    _use_fused_mlp: bool = field(default=True, init=False)
 
     def update_from_dict(self, config: dict):
         for name in config.keys():
@@ -297,6 +298,7 @@ cli_plugin_args = [
     "paged_state",
     "streamingllm",
     "reduce_fusion",
+    "use_fused_mlp",
 ]
 
 
@@ -378,10 +380,9 @@ class CustomAllReduceHelper:
 
     @staticmethod
     def allocate_workspace(mapping: Mapping,
-                           size: int,
-                           is_p2p_supported: bool = True
-                           ) -> Tuple[List[IpcMemory], "torch.tensor"]:
+                           size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
+        is_p2p_supported = can_access_peer(mapping)
         ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
                                      is_p2p_supported)
         ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,

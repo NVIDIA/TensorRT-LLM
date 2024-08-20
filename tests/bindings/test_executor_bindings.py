@@ -516,9 +516,16 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
             assert result.context_logits is None
         if return_generation_logits:
             assert len(result.generation_logits.shape) == 3
-            assert list(result.generation_logits.shape) == [
-                beam_width, max_output_len, vocab_size_padded
-            ]
+            if streaming:
+                assert list(result.generation_logits.shape) == [
+                    max_output_len, beam_width, vocab_size_padded
+                ] or list(result.generation_logits.shape) == [
+                    1, beam_width, vocab_size_padded
+                ]
+            else:
+                assert list(result.generation_logits.shape) == [
+                    beam_width, max_output_len, vocab_size_padded
+                ]
 
     def verify_output(beam_tokens, test_data, given_input_lengths):
         for batch_id, tokens in beam_tokens.items():
@@ -608,6 +615,76 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
         i += 1
     assert i < max_wait_ms
     verify_output(tokens, test_data, given_input_lengths)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("beam_width", [1])
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_finish_reason(streaming: bool, beam_width: int, model_files,
+                       model_path):
+    if streaming and beam_width > 1:
+        pytest.skip("Test does not support streaming with beam search")
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               trtllm.ExecutorConfig(beam_width))
+    requests = [
+        # Finish due to length.
+        trtllm.Request([1, 2, 3, 4], 5, streaming,
+                       trtllm.SamplingConfig(beam_width)),
+        # Finish due to end id.
+        trtllm.Request([1, 2, 3, 4],
+                       5,
+                       streaming,
+                       trtllm.SamplingConfig(beam_width),
+                       end_id=4),
+        # Finish due to stop word.
+        trtllm.Request([1, 2, 3, 4],
+                       5,
+                       streaming,
+                       trtllm.SamplingConfig(beam_width),
+                       stop_words=[[4, 2]]),
+    ]
+    req_ids = executor.enqueue_requests(requests)
+    req_to_batch_id = {req_ids[i]: i for i in range(len(requests))}
+
+    num_finished = 0
+    i = 0
+    num_responses = 0
+    max_wait_ms = 10000
+    while num_finished < len(requests) and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(wait_time)
+        for response in responses:
+            num_responses += 1
+            assert not response.has_error(
+            ), f"Request id {response.request_id} failed with err {response.error_msg}"
+            result = response.result
+            num_finished += result.is_final
+            batch_id = req_to_batch_id[response.request_id]
+
+            # Non final results should have "NOT_FINISHED". Revise this when streaming + beam_width > 1 is enabled.
+            if not result.is_final:
+                assert all([
+                    r == trtllm.FinishReason.NOT_FINISHED
+                    for r in result.finish_reasons
+                ])
+            # Check if finish reason is correct.
+            elif batch_id == 0:
+                assert all([
+                    r == trtllm.FinishReason.LENGTH
+                    for r in result.finish_reasons
+                ])
+            elif batch_id == 1:
+                assert all([
+                    r == trtllm.FinishReason.END_ID
+                    for r in result.finish_reasons
+                ])
+            elif batch_id == 2:
+                assert all([
+                    r == trtllm.FinishReason.STOP_WORDS
+                    for r in result.finish_reasons
+                ])
+        i += 1
+    assert i < max_wait_ms
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -784,7 +861,9 @@ def test_request():
         "external_draft_tokens_config":
         trtllm.ExternalDraftTokensConfig([1, 2, 3]),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
-        "lora_config": trtllm.LoraConfig(1)
+        "lora_config": trtllm.LoraConfig(1),
+        "logits_post_processor_name": "my_logits_pp",
+        "client_id": 1234
     }
     request = trtllm.Request(**kwargs)
     for k, v in kwargs.items():
@@ -809,12 +888,16 @@ def test_result():
     result.log_probs = [[1.0, 2.0, 3.0]]
     result.context_logits = torch.ones(3, 100)
     result.generation_logits = torch.ones(1, 3, 100)
+    result.encoder_output = torch.ones(1, 1)
+    result.finish_reasons = [trtllm.FinishReason.LENGTH]
     assert result.is_final == True
     assert result.output_token_ids == [[1, 2, 3]]
     assert result.cum_log_probs == [1.0, 2.0, 3.0]
     assert result.log_probs == [[1.0, 2.0, 3.0]]
     assert (result.context_logits == torch.ones(3, 100)).all()
     assert (result.generation_logits == torch.ones(1, 3, 100)).all()
+    assert (result.encoder_output == torch.ones(1, 1)).all()
+    assert result.finish_reasons == [trtllm.FinishReason.LENGTH]
 
 
 def test_response():
@@ -973,6 +1056,24 @@ def test_speculative_decoding_config():
     assert config.medusa_choices == [[0, 0], [0, 1]]
 
 
+def test_logits_post_processor_config():
+    config = trtllm.LogitsPostProcessorConfig()
+    assert config.processor_map == None
+    assert config.processor_batched == None
+    assert config.replicate == True
+
+    kwargs = {
+        "processor_map": {
+            "test_pp": None
+        },
+        "processor_batched": None,
+        "replicate": False
+    }
+    config = trtllm.LogitsPostProcessorConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
+
+
 def test_executor_config():
     config = trtllm.ExecutorConfig()
     assert config.max_beam_width == 1
@@ -986,10 +1087,9 @@ def test_executor_config():
     assert config.batching_type == trtllm.BatchingType.INFLIGHT
     assert config.parallel_config is None
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
-    assert config.logits_post_processor_map is None
-    assert config.logits_post_processor_batched is None
-    assert config.replicate_logits_post_processor == True
+    assert config.logits_post_processor_config is None
     assert config.decoding_config is None
+    assert config.debug_config is None
 
     kwargs = {
         "max_beam_width":
@@ -1014,11 +1114,16 @@ def test_executor_config():
         trtllm.ParallelConfig(),
         "peft_cache_config":
         trtllm.PeftCacheConfig(10),
-        "logits_post_processor_map": {},
-        "replicate_logits_post_processor":
-        False,
+        "logits_post_processor_config":
+        trtllm.LogitsPostProcessorConfig(),
         "decoding_config":
         trtllm.DecodingConfig(trtllm.DecodingMode.TopKTopP()),
+        "extended_runtime_perf_knob_config":
+        trtllm.ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
+        "debug_config":
+        trtllm.DebugConfig(dump_input_tensors=True,
+                           dump_output_tensors=True,
+                           debug_tensor_names=["test"])
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1029,6 +1134,10 @@ def test_executor_config():
     assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
     assert isinstance(config.parallel_config, trtllm.ParallelConfig)
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
+    assert config.extended_runtime_perf_knob_config.multi_block_mode == True
+    assert isinstance(config.debug_config, trtllm.DebugConfig)
+    assert isinstance(config.logits_post_processor_config,
+                      trtllm.LogitsPostProcessorConfig)
 
 
 def test_parallel_config():
@@ -1103,9 +1212,8 @@ def test_logits_post_processor(model_files, model_path):
     # Create executor
     beam_width = 1
     executor_config = trtllm.ExecutorConfig(beam_width)
-    executor_config.logits_post_processor_map = {
-        "my_logits_pp": logits_post_processor
-    }
+    executor_config.logits_post_processor_config = trtllm.LogitsPostProcessorConfig(
+        {"my_logits_pp": logits_post_processor})
     executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 
@@ -1162,7 +1270,8 @@ def test_logits_post_processor_batched(model_files, model_path):
     # Create executor
     beam_width = 1
     executor_config = trtllm.ExecutorConfig(beam_width)
-    executor_config.logits_post_processor_batched = logits_post_processor_batched
+    executor_config.logits_post_processor_config = trtllm.LogitsPostProcessorConfig(
+        None, logits_post_processor_batched)
     executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 
@@ -1298,18 +1407,99 @@ def test_peft_cache_config_pickle():
     assert config.host_cache_size == config_copy.host_cache_size
 
 
+def test_decoding_config_pickle():
+    config = trtllm.DecodingConfig(
+        decoding_mode=trtllm.DecodingMode.BeamSearch())
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.decoding_mode.isBeamSearch
+    assert config.lookahead_decoding_config == config_copy.lookahead_decoding_config
+    assert config.medusa_choices == config_copy.medusa_choices
+
+
+def test_debug_config_pickle():
+    config = trtllm.DebugConfig(dump_input_tensors=True,
+                                dump_output_tensors=True,
+                                debug_tensor_names=["test"])
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.dump_input_tensors == config_copy.dump_input_tensors
+    assert config.dump_output_tensors == config_copy.dump_output_tensors
+    assert config.debug_tensor_names == config_copy.debug_tensor_names
+
+
+def test_logits_post_processor_config_pickle():
+    kwargs = {
+        "processor_map": {
+            "test_pp": None
+        },
+        "processor_batched": None,
+        "replicate": False
+    }
+    config = trtllm.LogitsPostProcessorConfig(**kwargs)
+    config_copy = pickle.loads(pickle.dumps(config))
+    for k in kwargs:
+        assert getattr(config, k) == getattr(config_copy, k)
+
+
 def test_executor_config_pickle():
     beam_width = 2
     config = trtllm.ExecutorConfig(beam_width)
-    config.scheduler_config = trtllm.SchedulerConfig()
-    config.kv_cache_config = trtllm.KvCacheConfig()
-    config.parallel_config = trtllm.ParallelConfig()
-    config.peft_cache_config = trtllm.PeftCacheConfig(1)
+
+    kwargs = {
+        "max_beam_width":
+        2,
+        "max_batch_size":
+        8,
+        "max_num_tokens":
+        128,
+        "scheduler_config":
+        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
+        "kv_cache_config":
+        trtllm.KvCacheConfig(enable_block_reuse=True),
+        "enable_chunked_context":
+        True,
+        "normalize_log_probs":
+        False,
+        "iter_stats_max_iterations":
+        100,
+        "batching_type":
+        trtllm.BatchingType.STATIC,
+        "parallel_config":
+        trtllm.ParallelConfig(),
+        "peft_cache_config":
+        trtllm.PeftCacheConfig(10),
+        "logits_post_processor_config":
+        trtllm.LogitsPostProcessorConfig(),
+        "decoding_config":
+        trtllm.DecodingConfig(trtllm.DecodingMode.TopKTopP()),
+        "extended_runtime_perf_knob_config":
+        trtllm.ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
+        "debug_config":
+        trtllm.DebugConfig(dump_input_tensors=True,
+                           dump_output_tensors=True,
+                           debug_tensor_names=["test"])
+    }
+    config = trtllm.ExecutorConfig(**kwargs)
+    for k, v in kwargs.items():
+        if "config" not in k:
+            assert getattr(config, k) == v
+
     pickle.dumps(config)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config.max_beam_width == config_copy.max_beam_width
+    assert config.max_batch_size == config_copy.max_batch_size
+    assert config.max_num_tokens == config_copy.max_num_tokens
     assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
     assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
+    assert config.enable_chunked_context == config_copy.enable_chunked_context
+    assert config.normalize_log_probs == config_copy.normalize_log_probs
+    assert config.normalize_log_probs == config_copy.normalize_log_probs
+    assert config.iter_stats_max_iterations == config_copy.iter_stats_max_iterations
+    assert config.batching_type == config_copy.batching_type
+    assert config.parallel_config.communication_type == config_copy.parallel_config.communication_type
+    assert config.peft_cache_config.num_host_module_layer == config_copy.peft_cache_config.num_host_module_layer
+    assert config_copy.decoding_config.decoding_mode.isTopKandTopP
+    assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
+    assert config.debug_config.dump_input_tensors == config_copy.debug_config.dump_input_tensors
 
 
 def test_return_full_tokens():

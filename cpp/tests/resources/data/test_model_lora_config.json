@@ -160,7 +160,6 @@
             "streamingllm": false
         },
         "use_strip_plan": false,
-        "max_encoder_input_len": 1024,
-        "use_fused_mlp": false
+        "max_encoder_input_len": 1024
     }
 }

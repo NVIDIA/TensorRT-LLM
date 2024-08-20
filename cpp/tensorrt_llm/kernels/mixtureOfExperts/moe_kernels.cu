@@ -1746,16 +1746,27 @@ T const* CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::l
     auto fc1_lora_impl = lora_params.fc1_lora_impl;
     int num_reqs = lora_params.num_reqs;
 
-    int64_t num_tokens_handled = 0;
-    T* lora_gated_out = lora_fc1_result_ + expanded_num_rows * inter_size;
+    T *lora_gated_out = nullptr, *lora_fc1_result = nullptr;
+
+    if (is_gated_activation)
+    {
+        lora_gated_out = lora_fc1_result_;
+        lora_fc1_result = lora_fc1_result_ + expanded_num_rows * inter_size;
+    }
+    else
+    {
+        lora_fc1_result = lora_fc1_result_;
+    }
+
     void* lora_workspace = lora_params.workspace;
+    int64_t num_tokens_handled = 0;
 
     // TODO: Remove the weightIndex parameter from the 'loraImpl->run' function and consolidate it into a single
     // 'groupGEMM' operation.
     for (int expert_id = 0; expert_id < num_experts_per_node; expert_id += 1)
     {
         int64_t expert_num_rows = host_expert_first_token_offset[expert_id + 1] - num_tokens_handled;
-        void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result_ + num_tokens_handled * inter_size);
+        void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result + num_tokens_handled * inter_size);
         fc1_lora_impl->run(expert_num_rows, num_reqs, permuted_data_ + num_tokens_handled * hidden_size,
             &host_permuted_fc1_lora_ranks[num_tokens_handled], &host_permuted_fc1_weight_ptrs[num_tokens_handled * 2],
             expert_id + start_expert, &tmp_lora_fc_result, lora_workspace, stream);

@@ -202,23 +202,21 @@ def build_engines(model_cache: Optional[str] = None,
     no_kv_cache_args = ['--kv_cache_type=disabled']
 
     def get_ifb_args(kv_cache_type):
-        if kv_cache_type == model_spec.KVCacheType.DISABLED:
+        if kv_cache_type == _tb.KVCacheType.DISABLED:
             return ifb_base_args + no_kv_cache_args
-        elif kv_cache_type == model_spec.KVCacheType.PAGED:
+        elif kv_cache_type == _tb.KVCacheType.PAGED:
             return ifb_base_args + paged_kv_cache_args
         else:
             assert False, f"Unsupported kv_cache_type: {kv_cache_type}"
 
     model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
     model_spec_current = model_spec_obj.__copy__()
 
-    for kv_cache_type in [
-            model_spec.KVCacheType.DISABLED, model_spec.KVCacheType.PAGED
-    ]:
+    for kv_cache_type in [_tb.KVCacheType.DISABLED, _tb.KVCacheType.PAGED]:
         model_spec_current.set_kv_cache_type(kv_cache_type)
         build_engine(
             str(fp16_ckpt_dir),
@@ -235,7 +233,7 @@ def build_engines(model_cache: Optional[str] = None,
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
         f'--max_draft_len={max_draft_tokens}',
         '--speculative_decoding_mode=draft_tokens_external',
-        *get_ifb_args(model_spec.KVCacheType.PAGED))
+        *get_ifb_args(_tb.KVCacheType.PAGED))
 
     model_spec_current = model_spec_obj.__copy__()
     model_spec_current.use_multiple_profiles()
@@ -243,8 +241,7 @@ def build_engines(model_cache: Optional[str] = None,
     build_engine(
         str(fp16_ckpt_dir),
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
-        '--multiple_profiles=enable',
-        *get_ifb_args(model_spec.KVCacheType.PAGED))
+        '--multiple_profiles=enable', *get_ifb_args(_tb.KVCacheType.PAGED))
 
     model_spec_current = model_spec_obj.__copy__()
     max_input_len = 128
@@ -253,7 +250,7 @@ def build_engines(model_cache: Optional[str] = None,
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / model_spec_current.get_model_path() /
                      tp_pp_dir),
-                 *get_ifb_args(model_spec.KVCacheType.PAGED),
+                 *get_ifb_args(_tb.KVCacheType.PAGED),
                  max_input_len=max_input_len)
 
     # Build the target model with return accepted token logits
@@ -270,8 +267,7 @@ def build_engines(model_cache: Optional[str] = None,
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
         f'--max_draft_len={max_draft_len}',
         '--speculative_decoding_mode=draft_tokens_external',
-        '--gather_generation_logits',
-        *get_ifb_args(model_spec.KVCacheType.PAGED))
+        '--gather_generation_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
 
     # We build almost the same engine twice. But this engine has gather_all_token_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
@@ -283,19 +279,7 @@ def build_engines(model_cache: Optional[str] = None,
     build_engine(
         str(fp16_ckpt_dir),
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
-        '--gather_all_token_logits',
-        *get_ifb_args(model_spec.KVCacheType.PAGED))
-
-    model_spec_current = model_spec_obj.__copy__()
-    model_spec_current.use_look_ahead_decoding()
-    max_draft_len = 64
-    model_spec_current.set_draft_tokens(max_draft_len)
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
-        f'--max_draft_len={max_draft_len}',
-        '--speculative_decoding_mode=lookahead_decoding',
-        *get_ifb_args(model_spec.KVCacheType.PAGED))
+        '--gather_all_token_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
 
     # build engine with lora enabled
     model_spec_current = model_spec_obj.__copy__()
@@ -304,7 +288,7 @@ def build_engines(model_cache: Optional[str] = None,
         str(fp16_ckpt_dir),
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_dir),
         "--lora_target_modules=attn_qkv", '--lora_plugin=float16',
-        *get_ifb_args(model_spec.KVCacheType.PAGED))
+        *get_ifb_args(_tb.KVCacheType.PAGED))
 
     if model_cache:
         llm_datasets_root = Path(model_cache) / "datasets"
@@ -326,9 +310,7 @@ def build_engines(model_cache: Optional[str] = None,
     model_spec_current.use_packed_input()
     model_spec_current.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
 
-    for kv_cache_type in [
-            model_spec.KVCacheType.DISABLED, model_spec.KVCacheType.PAGED
-    ]:
+    for kv_cache_type in [_tb.KVCacheType.DISABLED, _tb.KVCacheType.PAGED]:
         model_spec_current.set_kv_cache_type(kv_cache_type)
         build_engine(
             str(fp16_sq_ckpt_dir),

@@ -1,6 +1,5 @@
 import hashlib
 import os
-import signal
 import sys
 import tempfile
 import traceback
@@ -326,15 +325,6 @@ class ExceptionHandler(metaclass=Singleton):
 exception_handler = ExceptionHandler()
 sys.excepthook = exception_handler
 
-
-def sigint_handler(signal, frame):
-    sys.stderr.write("\nSIGINT received, quit LLM!\n")
-    sys.exit(1)
-
-
-# Register the signal handler to handle SIGINT
-# This helps to deal with user's Ctrl+C
-signal.signal(signal.SIGINT, sigint_handler)
 # Use the system temporary directory to share the cache
 temp_dir = tempfile.gettempdir()
 

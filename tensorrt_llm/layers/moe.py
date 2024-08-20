@@ -337,7 +337,7 @@ class MOEWeightWrapper(Module):
             self.register_parameter('activation_scaling_factor', None)
             self.register_parameter('weights_scaling_factor', None)
 
-    def postprocess(self, tllm_key, weights):
+    def postprocess(self, tllm_key, weights, **kwargs):
         if tllm_key.endswith("weight"):
             if isinstance(weights, torch.Tensor):
                 weights = [weights]
@@ -667,7 +667,6 @@ class MoeOOTB(MOE):
                 gate_lora_weights_pointers,
             }],
             host_context_lengths=lora_layer_params.host_context_lengths,
-            max_num_tokens=lora_layer_params.max_num_tokens,
             max_encoder_context_length=lora_layer_params.
             max_encoder_context_length,
             host_request_types=lora_layer_params.host_request_types,

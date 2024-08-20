@@ -41,9 +41,9 @@ bool verifyAcceptOffsets(TensorPtr output, TensorPtr accepted, TensorPtr accepte
     BufferRange<TokenIdType> acceptedRange(*accepted);
     BufferRange<SizeType32> offsetsRange(*acceptedOffsets);
     bool result = true;
-    for (SizeType32 i = 0; i < acceptedRange.size(); i++)
+    for (SizeType32 i = 1; i < acceptedRange.size(); i++)
     {
-        result &= outputRange[offsetsRange[i]] == acceptedRange[i];
+        result &= outputRange[offsetsRange[i - 1] + 1] == acceptedRange[i];
     }
     return result;
 }

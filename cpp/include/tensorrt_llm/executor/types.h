@@ -348,6 +348,22 @@ struct RequestStatsPerIteration
     std::vector<RequestStats> requestStats;
 };
 
+/// @brief The reason why the model stopped generating tokens for a request.
+enum class FinishReason
+{
+    /// @brief The request is not finished.
+    kNOT_FINISHED = 0,
+
+    /// @brief The request finished because the end id was generated.
+    kEND_ID = 1,
+
+    /// @brief The request finished because a stop word was generated.
+    kSTOP_WORDS = 2,
+
+    /// @brief The request finished because the maximum number of tokens was reached.
+    kLENGTH = 3,
+};
+
 /// @brief mode of the decoder
 class DecodingMode
 {

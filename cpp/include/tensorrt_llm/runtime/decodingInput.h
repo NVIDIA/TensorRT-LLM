@@ -80,7 +80,7 @@ public:
         batchSlots; //!<  [batchSize], address map of the linear batch id to to the seq slots, int32_t, pinned
 
     // optional parameters
-    TensorConstPtr finished;      //!<  [batchSize, beamWidth], finished states at current iteration.
+    TensorConstPtr finishReasons; //!<  [batchSize, beamWidth], finished states at current iteration.
                                   //!<  If true for some request, the decoding step of it is skipped, on gpu
     TensorConstPtr
         sequenceLimitLength;      //!<  [batchSize], on gpu. The maximum sequence length for each sequence in the batch.
@@ -129,9 +129,16 @@ public:
         TensorConstPtr seqSlots;              //!<  [batchSize]
     };
 
+    struct LookaheadInputs
+    {
+        TensorPtr tokensPerStep;
+    };
+
     std::optional<MedusaInputs> medusaInputs;
 
     std::optional<ExplicitDraftTokensInputs> explicitDraftTokensInputs;
+
+    std::optional<LookaheadInputs> lookaheadInputs;
 };
 
 } // namespace tensorrt_llm::runtime

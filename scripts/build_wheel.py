@@ -76,6 +76,7 @@ def main(*,
          trt_root: str = None,
          nccl_root: str = None,
          clean: bool = False,
+         configure_cmake: bool = False,
          use_ccache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -185,7 +186,7 @@ def main(*,
     source_dir = get_source_dir()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
-        if clean or first_build:
+        if clean or first_build or configure_cmake:
             build_run(
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
@@ -326,6 +327,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--cuda_architectures", "-a")
     parser.add_argument("--install", "-i", action="store_true")
     parser.add_argument("--clean", "-c", action="store_true")
+    parser.add_argument("--configure_cmake",
+                        action="store_true",
+                        help="Always configure cmake before building")
     parser.add_argument("--use_ccache",
                         "-ccache",
                         default=False,

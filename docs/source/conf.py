@@ -71,6 +71,12 @@ print('CPP_INCLUDE_DIR', CPP_INCLUDE_DIR)
 print('CPP_GEN_DIR', CPP_GEN_DIR)
 
 
+def setup(app):
+    from docs.source.generate_examples import generate_examples
+
+    generate_examples()
+
+
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):
     cpp_header_files = [
         file for file in os.listdir(header_dir) if file.endswith('.h')

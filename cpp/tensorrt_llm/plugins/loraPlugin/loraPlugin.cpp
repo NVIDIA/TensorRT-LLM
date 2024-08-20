@@ -39,7 +39,7 @@ std::vector<nvinfer1::PluginField> LoraPluginCreator::mPluginAttributes;
 
 LoraPlugin::LoraPlugin(int in_hidden_size, std::vector<int> out_hidden_sizes, int transA, int transB,
     int num_lora_modules, nvinfer1::DataType type, LoraPlugin::PluginProfilerPtr const& pluginProfiler,
-    bool remove_input_padding, int max_num_tokens, int max_low_rank, int weight_index)
+    bool remove_input_padding, int max_low_rank, int weight_index)
     : mInHiddenSize(in_hidden_size)
     , mTransA(transA)
     , mTransB(transB)
@@ -47,7 +47,6 @@ LoraPlugin::LoraPlugin(int in_hidden_size, std::vector<int> out_hidden_sizes, in
     , mType(type)
     , mPluginProfiler(pluginProfiler)
     , mRemoveInputPadding(remove_input_padding)
-    , mMaxNumTokens(max_num_tokens)
     , mMaxLowRank(max_low_rank)
     , mWeightIndex(weight_index)
 {
@@ -69,7 +68,6 @@ LoraPlugin::LoraPlugin(void const* data, size_t length, LoraPlugin::PluginProfil
     read(d, mNumLoraModules);
     read(d, mType);
     read(d, mRemoveInputPadding);
-    read(d, mMaxNumTokens);
     read(d, mMaxLowRank);
     read(d, mWeightIndex);
     mOutHiddenSizes.resize(mNumLoraModules);
@@ -212,7 +210,7 @@ size_t LoraPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, in
     int const nbReq = inputs[getLoraRanksIdx()].dims.d[0];
     auto const type = inputs[getInputTensorIdx()].type;
     auto const numTokens = getNumTokens(inputs);
-    return mLoraImpl->getWorkspaceSize(mMaxNumTokens, nbReq, type);
+    return mLoraImpl->getWorkspaceSize(numTokens, nbReq, type);
 }
 
 int64_t LoraPlugin::getNumTokens(nvinfer1::PluginTensorDesc const* input_tensors) const
@@ -232,6 +230,11 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    if (isBuilding())
+    {
+        return 0;
+    }
 
     auto const numReqs = inputDesc[getLoraRanksIdx()].dims.d[0];
     void const* input = inputs[getInputTensorIdx()];
@@ -344,8 +347,8 @@ size_t LoraPlugin::getSerializationSize() const noexcept
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     return sizeof(mInHiddenSize) + sizeof(mTransA) + sizeof(mTransB) + sizeof(mNumLoraModules) + sizeof(mType)
-        + mPluginProfiler->getSerializationSize(mGemmId) + sizeof(mRemoveInputPadding) + sizeof(mMaxNumTokens)
-        + sizeof(mMaxLowRank) + sizeof(mWeightIndex) + sizeof(int) * mNumLoraModules; // selected tactics container size
+        + mPluginProfiler->getSerializationSize(mGemmId) + sizeof(mRemoveInputPadding) + sizeof(mMaxLowRank)
+        + sizeof(mWeightIndex) + sizeof(int) * mNumLoraModules; // selected tactics container size
 }
 
 void LoraPlugin::serialize(void* buffer) const noexcept
@@ -358,7 +361,6 @@ void LoraPlugin::serialize(void* buffer) const noexcept
     write(d, mNumLoraModules);
     write(d, mType);
     write(d, mRemoveInputPadding);
-    write(d, mMaxNumTokens);
     write(d, mMaxLowRank);
     write(d, mWeightIndex);
     for (int i = 0; i < mNumLoraModules; i++)
@@ -414,7 +416,6 @@ IPluginV2* LoraPluginCreator::createPlugin(char const* name, PluginFieldCollecti
     int num_lora_modules;
     int in_hidden_size, transA, transB;
     bool remove_input_padding;
-    int max_num_tokens;
     int max_low_rank;
     int weight_index;
     // Read configurations from each fields
@@ -445,11 +446,6 @@ IPluginV2* LoraPluginCreator::createPlugin(char const* name, PluginFieldCollecti
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             remove_input_padding = static_cast<bool>(*(static_cast<int8_t const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "max_num_tokens"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            max_num_tokens = *(static_cast<int const*>(fields[i].data));
         }
         else if (!strcmp(attrName, "max_low_rank"))
         {
@@ -488,7 +484,7 @@ IPluginV2* LoraPluginCreator::createPlugin(char const* name, PluginFieldCollecti
         // FIXME enable tactic profiler
         auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false, /* skip */ true);
         auto* obj = new LoraPlugin(in_hidden_size, out_hidden_sizes, transA, transB, num_lora_modules, type,
-            pluginProfiler, remove_input_padding, max_num_tokens, max_low_rank, weight_index);
+            pluginProfiler, remove_input_padding, max_low_rank, weight_index);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

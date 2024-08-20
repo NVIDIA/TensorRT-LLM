@@ -1,6 +1,6 @@
 import functools
 import os
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 from typing import Any, Callable, List, Literal
 
@@ -10,9 +10,9 @@ VALID_MODELS = Literal["tiiuae/falcon-7b", "tiiuae/falcon-40b",
                        "tiiuae/falcon-180B", "meta-llama/Llama-2-7b-hf",
                        "meta-llama/Llama-2-13b-hf", "meta-llama/Llama-2-70b-hf",
                        "EleutherAI/gpt-j-6b", ]
-VALID_COMPUTE_DTYPES = Literal["float16", "bfloat16"]
+VALID_COMPUTE_DTYPES = Literal["auto", "float16", "bfloat16"]
 VALID_CACHE_DTYPES = Literal["float16", "float8", "int8"]
-VALID_QUANT_ALGOS = Literal["None", f"{QuantAlgo.W8A16}", f"{QuantAlgo.W4A16}",
+VALID_QUANT_ALGOS = Literal[f"{QuantAlgo.W8A16}", f"{QuantAlgo.W4A16}",
                             f"{QuantAlgo.W4A16_AWQ}", f"{QuantAlgo.W4A8_AWQ}",
                             f"{QuantAlgo.W4A16_GPTQ}", f"{QuantAlgo.FP8}",
                             f"{QuantAlgo.INT8}"]

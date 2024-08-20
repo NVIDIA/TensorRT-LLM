@@ -42,15 +42,12 @@ public:
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
         std::shared_ptr<BaseDecodingInputs> const& inputParams) override;
 
-    void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
-        std::shared_ptr<BaseDecodingInputs> const& inputParams) override;
-
     //! @returns workspace needed for this layer in bytes
     [[nodiscard]] size_t getWorkspaceSize() const noexcept;
 
 private:
-    void forwardSyncCPU(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
-        std::shared_ptr<BaseDecodingInputs> const& inputParams);
+    void forwardSyncCPU(std::shared_ptr<LookaheadDecodingOutputs> const& outputs,
+        std::shared_ptr<LookaheadDecodingInputs> const& inputs);
     void posIdsToMask(TensorPtr mask, TensorConstPtr posIds);
 
 private:
@@ -67,6 +64,7 @@ private:
         explicit CpuAlgorithmResources(DecoderDomain const& decoderDomain);
 
         std::vector<LookaheadAlgorithm> mAlgos;
+        std::vector<TensorPtr> mPrompts;
         TensorPtr mBatchSlots;
         TensorPtr mTargetTokens;
         TensorPtr mTokensPerStep;
@@ -76,16 +74,23 @@ private:
         TensorPtr mPathsOffsets;
         TensorPtr mNumNewTokens;
         TensorPtr mNumNewTokensCumSum;
+        TensorPtr mNewTokens;
 
         TensorPtr mNextDraftTokens;
         TensorPtr mNextDraftPosIds;
-        TensorPtr mPackedMasks;
         TensorPtr mSamplingMask;
         TensorPtr mNextDraftLengths;
         TensorPtr mSequenceLengths;
+        TensorPtr mGenerationLengths;
+        TensorPtr mGenerationLengthsMax;
+        TensorPtr mPackedMask;
+        TensorPtr mPositionOffsets;
+        TensorPtr mPositionIds;
     };
 
     std::optional<CpuAlgorithmResources> mCpuAlgo;
+
+    runtime::SizeType32 mGlobalSteps{0};
 };
 
 } // namespace tensorrt_llm::layers

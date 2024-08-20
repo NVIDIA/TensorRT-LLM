@@ -650,7 +650,6 @@ class PretrainedModel(Module,
                 model_inputs['lora_ranks'],
                 model_inputs['lora_weights_pointers'],
                 host_context_lengths=model_inputs['host_context_lengths'],
-                max_num_tokens=max_num_tokens,
                 host_request_types=model_inputs['host_request_types'])
         if model_inputs['spec_decoding_params'] is not None:
             result['spec_decoding_params'] = model_inputs[
@@ -823,6 +822,14 @@ def fuse_gate_mlp(
     for name, mlp, layer in model.named_modules_with_parent():
         if isinstance(mlp, GatedMLP):
             init_params = get_init_params(mlp)
+
+            hidden_act = init_params["hidden_act"]
+            if hidden_act not in ["silu", "gelu"]:
+                logger.warning(
+                    f"fuse_gate_mlp cannot be done for {name} due to unsupported activation {hidden_act}. Skipping."
+                )
+                continue
+
             init_params["inner_layernorm"] = mlp.inner_layernorm is not None
             fused_layer = FusedGatedMLP(**init_params)
 

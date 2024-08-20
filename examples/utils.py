@@ -289,6 +289,13 @@ def add_common_args(parser):
         help="Medusa choice to use, if not none, will use Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
+    parser.add_argument(
+        '--lookahead_config',
+        type=str,
+        default=None,
+        help="lookahead config to use, if not none, will use lookahead decoding."
+        "   E.g.: [5, 6, 7] for [max_window_size, max_ngram_size, max_verification_set_size]."
+    )
 
     # model arguments
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')

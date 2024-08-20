@@ -46,7 +46,7 @@ int main(int argc, char* argv[])
     auto request = tle::Request(inputTokens, maxNewTokens);
 
     // Enqueue the request
-    auto requestId = executor.enqueueRequest(std::move(request));
+    auto requestId = executor.enqueueRequest(request);
 
     // Wait for the response
     auto responses = executor.awaitResponses(requestId);

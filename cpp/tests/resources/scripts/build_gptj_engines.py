@@ -133,7 +133,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         get_ckpt_with_modelopt_quant(hf_dir, fp8_ckpt_path, model_cache)
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FP8)
         model_spec_obj.use_gpt_plugin()
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_packed_input()
         build_engine(fp8_ckpt_path,
                      engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
@@ -146,7 +146,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         print("\nBuilding fp16-plugin engine")
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
         model_spec_obj.use_gpt_plugin()
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
 
         build_engine(fp16_ckpt_path,
                      engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
@@ -163,7 +163,7 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
                      '--remove_input_padding=enable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed-paged engine")
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         build_engine(fp16_ckpt_path,
                      engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                      '--gpt_attention_plugin=float16',

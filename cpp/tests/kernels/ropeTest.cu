@@ -275,7 +275,8 @@ protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     BufferManager::ITensorPtr cu_q_seqlens_tensor{nullptr}, cu_kv_seqlens_tensor{nullptr},
-        padding_offset_tensor{nullptr}, fmha_tile_counter_ptr_tensor{nullptr}, rotary_inv_freq_buf_tensor{nullptr};
+        padding_offset_tensor{nullptr}, encoder_padding_offset_tensor{nullptr}, fmha_tile_counter_ptr_tensor{nullptr},
+        rotary_inv_freq_buf_tensor{nullptr};
     std::mt19937 gen;
     //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     // initialize params coming from GPTAttentionPluginCommon
@@ -364,9 +365,10 @@ protected:
         cu_q_seqlens_tensor = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), nvinfer1::DataType::kINT32);
         cu_kv_seqlens_tensor
             = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), nvinfer1::DataType::kINT32);
-        padding_offset_tensor = mBufferManager->pinned(
-            ITensor::makeShape({batch_size, (mCrossAttention ? cross_qkv_length : input_seq_length)}),
-            nvinfer1::DataType::kINT32);
+        padding_offset_tensor
+            = mBufferManager->pinned(ITensor::makeShape({batch_size, input_seq_length}), nvinfer1::DataType::kINT32);
+        encoder_padding_offset_tensor
+            = mBufferManager->pinned(ITensor::makeShape({batch_size, cross_qkv_length}), nvinfer1::DataType::kINT32);
         fmha_tile_counter_ptr_tensor
             = mBufferManager->pinned(ITensor::makeShape({mEnableContextFMHA ? 1 : 0}), nvinfer1::DataType::kINT32);
         rotary_inv_freq_buf_tensor = mBufferManager->pinned(
@@ -470,6 +472,7 @@ protected:
         cu_q_seqlens = bufferCast<int32_t>(*(this->cu_q_seqlens_tensor));
         int* cu_kv_seqlens = bufferCast<int32_t>(*(this->cu_kv_seqlens_tensor));
         int* padding_offset = bufferCast<int32_t>(*(this->padding_offset_tensor));
+        int* encoder_padding_offset = bufferCast<int32_t>(*(this->encoder_padding_offset_tensor));
         uint32_t* fmha_tile_counter_ptr = bufferCast<uint32_t>(*(this->fmha_tile_counter_ptr_tensor));
         rotary_inv_freq_buf = bufferCast<float>(*(this->rotary_inv_freq_buf_tensor));
 
@@ -478,12 +481,14 @@ protected:
         decoderParams.seqQOffsets = cu_q_seqlens;
         decoderParams.seqKVOffsets = cu_kv_seqlens;
         decoderParams.paddingOffsets = padding_offset;
+        decoderParams.encoderPaddingOffsets = mCrossAttention ? encoder_padding_offset : nullptr;
         decoderParams.attentionMask = mCrossAttention ? nullptr : attention_mask; // manually set for cross attn
         // Fixed sequence length offset if not removing the padding (cu_q_seqlens[ii] = ii * seq_length).
-        decoderParams.seqQLengths = mCrossAttention ? encoder_input_lengths : q_seq_lengths;
+        decoderParams.seqQLengths = q_seq_lengths;
         decoderParams.seqKVLengths = mCrossAttention ? encoder_input_lengths : kv_seq_lengths;
         decoderParams.batchSize = batch_size;
-        decoderParams.maxQSeqLength = mCrossAttention ? cross_qkv_length : input_seq_length;
+        decoderParams.maxQSeqLength = input_seq_length;
+        decoderParams.maxEncoderQSeqLength = mCrossAttention ? cross_qkv_length : 0;
         decoderParams.removePadding = mRemovePadding;
         decoderParams.attentionWindowSize = cyclic_attention_window_size;
         decoderParams.sinkTokenLength = sink_token_length;

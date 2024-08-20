@@ -19,6 +19,16 @@ cd examples/bindings
 python3 example_basic.py --model_path=../llama/tmp/7B/trt_engines/fp16/1-gpu/
 ```
 
+### Debug example
+
+This example shows how you can define which engine IO tensors should be dumped to numpy files.
+Run `example_debug.py`, passing in the directory where the TensorRT engine was generated. For example:
+
+```
+cd examples/bindings
+python3 example_debug.py --model_path=../llama/tmp/7B/trt_engines/fp16/1-gpu/
+```
+
 ### Advanced example
 
 This example shows how you can use the python bindings to generate tokens for a larger number of requests concurrently and demonstrate how tokens can be returned in a streaming fashion.

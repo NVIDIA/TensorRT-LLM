@@ -61,9 +61,12 @@ int main(int argc, char* argv[])
     // Create the executor for this engine
     tle::SizeType32 beamWidth = 1;
     auto executorConfig = tle::ExecutorConfig(beamWidth);
-    executorConfig.setLogitsPostProcessorMap(
-        std::unordered_map<std::string, tensorrt_llm::executor::LogitsPostProcessor>{
-            {logitsPostProcessorName, logitsPostProcessorFn}});
+
+    auto logitsProcConfig = tle::LogitsPostProcessorConfig();
+    logitsProcConfig.setProcessorMap(std::unordered_map<std::string, tensorrt_llm::executor::LogitsPostProcessor>{
+        {logitsPostProcessorName, logitsPostProcessorFn}});
+    executorConfig.setLogitsPostProcessorConfig(logitsProcConfig);
+
     auto trtEnginePath = argv[1];
     auto executor = tle::Executor(trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
 

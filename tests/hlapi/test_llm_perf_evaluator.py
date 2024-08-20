@@ -5,7 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from tensorrt_llm.hlapi import KvCacheConfig
+from tensorrt_llm.hlapi import BuildConfig, KvCacheConfig
 from tensorrt_llm.hlapi._perf_evaluator import (LLMPerfEvaluator,
                                                 MemoryContinuousMonitorThread)
 
@@ -50,12 +50,16 @@ def test_perf_evaluator():
         # try to set some flags
         kvcache_config = KvCacheConfig(enable_block_reuse=True)
 
+        build_config = BuildConfig()
+        build_config.plugin_config._use_paged_context_fmha = True
+
         evaluator = LLMPerfEvaluator.create(
             model=llama_model_path,
             num_samples=10,
             samples_path=samples_path,
             warmup=10,
             kv_cache_config=kvcache_config,
+            build_config=build_config,
         )
         assert evaluator
         report = evaluator.run()

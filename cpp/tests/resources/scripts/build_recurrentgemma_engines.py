@@ -114,7 +114,7 @@ def build_engines(model_cache: _tp.Optional[str] = None):
     model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
 
     print("\nBuilding fp16-plugin-packed-paged engine")
     build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,

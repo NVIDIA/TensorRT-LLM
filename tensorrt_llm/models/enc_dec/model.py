@@ -667,7 +667,6 @@ class EncoderModel(PretrainedModel):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
-                       max_num_tokens,
                        prompt_embedding_table_size: int = 0,
                        lora_target_modules: List[str] = None,
                        *args,
@@ -890,7 +889,6 @@ class EncoderModel(PretrainedModel):
             lora_params = LoraParams(
                 lora_ranks=lora_ranks,
                 lora_weights_pointers=lora_weights_pointers,
-                max_num_tokens=max_num_tokens,
                 host_request_types=host_request_types,
                 host_context_lengths=host_context_lengths,
             )
@@ -1226,7 +1224,6 @@ class DecoderModel(PretrainedModel):
                        max_beam_width,
                        max_decoder_input_len,
                        max_seq_len,
-                       max_num_tokens,
                        max_encoder_input_len,
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
@@ -1596,7 +1593,6 @@ class DecoderModel(PretrainedModel):
                 lora_ranks=lora_ranks,
                 lora_weights_pointers=lora_weights_pointers,
                 host_context_lengths=host_context_lengths,
-                max_num_tokens=max_num_tokens,
                 max_encoder_context_length=max_encoder_input_len,
                 host_request_types=host_request_types,
                 host_encoder_input_lengths=host_encoder_input_lengths,
