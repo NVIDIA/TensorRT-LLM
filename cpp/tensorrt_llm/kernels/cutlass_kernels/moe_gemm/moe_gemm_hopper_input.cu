@@ -92,7 +92,7 @@ void HopperGroupedGemmInput::setFinalizeFusionParams(void* final_output, float c
 
     fused_finalize_epilogue.stride_final_output
         = cutlass::make_cute_packed_stride(FusedFinalizeEpilogue::StrideFinalOutput{},
-            transpose_stride(cute::make_shape(num_output_tokens, hidden_size, cute::Int<1>{})));
+            transpose_stride(cute::make_shape(num_output_tokens, hidden_size, 1)));
     fused_finalize_epilogue.stride_bias
         = transpose_stride(cute::make_stride(cute::Int<0>{}, cute::Int<1>{}, hidden_size));
     fused_finalize_epilogue.stride_router_scales = {};

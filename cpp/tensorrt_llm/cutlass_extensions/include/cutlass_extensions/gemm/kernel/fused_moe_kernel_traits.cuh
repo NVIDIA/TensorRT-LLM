@@ -35,6 +35,7 @@ struct Routine_Arguments
     int gemm_n{};
     int gemm_k{};
     int num_expert{};
+    bool bias_is_broadcast{};
 };
 
 template <typename ElementInput, typename ElementWeight, typename ElementOutput>
@@ -48,6 +49,7 @@ struct Routine_Params
     int gemm_n{};
     int gemm_k{};
     int num_expert{};
+    bool bias_is_broadcast{};
 };
 
 enum class Activation_Type

@@ -55,6 +55,17 @@ inline int compute_occupancy_for_kernel()
             // configuration.
             return 0;
         }
+
+        if constexpr (enable_cutlass_3x)
+        {
+            tensorrt_llm::common::check_cuda_error(cudaFuncSetAttribute(
+                cutlass::device_kernel<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        }
+        else
+        {
+            tensorrt_llm::common::check_cuda_error(cudaFuncSetAttribute(
+                cutlass::Kernel<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        }
     }
 
     int max_active_blocks = -1;

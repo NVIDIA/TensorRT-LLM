@@ -92,7 +92,7 @@ def build_engines(model_cache: str):
 
     model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
     model_spec_obj.use_medusa()
 

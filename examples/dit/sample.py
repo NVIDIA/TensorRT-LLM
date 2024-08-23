@@ -10,7 +10,6 @@ from diffusion import DiTDiffusionPipeline
 from torchvision.utils import save_image
 
 import tensorrt_llm
-from tensorrt_llm._ipc_utils import set_peer_access
 from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
@@ -77,11 +76,10 @@ class TllmDiT(object):
         expected_tensor_names = ['latent', 'timestep', 'label', 'output']
 
         if self.mapping.tp_size > 1:
-            is_p2p_supported = set_peer_access(self.mapping)
             self.buffer, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.mapping.tp_size), is_p2p_supported)
+                    self.mapping.tp_size))
             self.inputs['all_reduce_workspace'] = self.all_reduce_workspace
             expected_tensor_names += ['all_reduce_workspace']
 

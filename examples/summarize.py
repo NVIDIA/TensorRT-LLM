@@ -29,7 +29,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, load_tokenizer,
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import mpi_broadcast, str_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.qwen.utils import make_context
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -127,7 +127,7 @@ def main(args):
     if args.stop_words:
         stop_words_list = tensorrt_llm.runtime.decode_words_list(
             args.stop_words, tokenizer)
-    if model_version == 'glm-4':  # adddefault stop token ids for GLM-4
+    if model_version == 'glm4':  # add default stop token ids for GLM-4
         glm4_stop_ids = [[151329], [151336], [151338]]
         if stop_words_list is None:
             stop_words_list = [glm4_stop_ids] * args.batch_size
@@ -140,7 +140,7 @@ def main(args):
         bad_words_list = tensorrt_llm.runtime.decode_words_list(
             args.bad_words, tokenizer)
 
-    # random_seed = 5
+    random_seed = args.random_seed
     temperature = args.temperature
     num_beams = args.num_beams
     length_penalty = args.length_penalty
@@ -148,6 +148,7 @@ def main(args):
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
+    torch.manual_seed(random_seed)
 
     output_dir = Path(args.output_dir) if args.output_dir else None
     if output_dir is not None:
@@ -347,18 +348,28 @@ def main(args):
             local_early_stopping = "never"
 
         with torch.no_grad():
+            hf_config = {}
+            if num_beams == 1:
+                hf_config.update({
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "do_sample": True,
+                })
+            else:
+                hf_config.update({
+                    "num_beams": num_beams,
+                    "num_return_sequences": num_beams,
+                    "early_stopping": local_early_stopping,
+                })
             outputs = model.generate(batch_input_ids,
                                      max_new_tokens=output_len,
-                                     top_k=top_k,
                                      temperature=temperature,
                                      eos_token_id=end_id,
                                      pad_token_id=pad_id,
-                                     num_beams=num_beams,
-                                     num_return_sequences=num_beams,
                                      length_penalty=length_penalty,
-                                     early_stopping=local_early_stopping,
                                      output_scores=True,
-                                     return_dict_in_generate=True)
+                                     return_dict_in_generate=True,
+                                     **hf_config)
             if eval_ppl and batch_size == 1:
                 # model.generate cannot return context logits?
                 # Will cause additional latency
@@ -493,11 +504,15 @@ def main(args):
                 eval_ppl=args.eval_ppl,
                 add_special_tokens=args.add_special_tokens,
                 min_input_length=args.min_input_length)
-            if output_tensorrt_llm == []:
-                data_point_idx += max_batch_size
-                ite_count += 1
-                continue
             profiler.stop('tensorrt_llm')
+
+            empty_batch = (runtime_rank == 0 and len(output_tensorrt_llm) == 0)
+            empty_batch = mpi_broadcast(empty_batch, 0)
+            if empty_batch:
+                # No valid samples in the current batch, skip this iteration
+                data_point_idx += max_batch_size
+                continue
+
             if runtime_rank == 0:
                 input_lengths = lengths_info['input_lengths']
                 seq_lengths = lengths_info['seq_lengths']
@@ -607,10 +622,14 @@ def main(args):
                 add_special_tokens=args.add_special_tokens,
                 min_input_length=args.min_input_length)
             profiler.stop('hf')
-            if output_hf == []:
+
+            # HF model runs on rank 0 only
+            empty_batch = len(output_hf) == 0
+            if empty_batch:
+                # No valid samples in the current batch, skip this iteration
                 data_point_idx += max_batch_size
-                ite_count += 1
                 continue
+
             if runtime_rank == 0:
                 seq_lengths = [len(tokens) for tokens in token_list]
                 total_output_token_count_hf += sum(seq_lengths)
@@ -648,6 +667,7 @@ def main(args):
             logger.info(
                 f'TensorRT-LLM (total latency: {profiler.elapsed_time_in_sec("tensorrt_llm")} sec)'
             )
+
             logger.info(
                 f'TensorRT-LLM (total output tokens: {total_output_token_count_trt_llm})'
             )
@@ -656,17 +676,16 @@ def main(args):
             )
             for beam_idx in range(num_beams):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
-                computed_metrics_tensorrt_llm = metric_tensorrt_llm[
-                    beam_idx].compute()
                 if args.eval_task != "eval_context_ppl":
+                    computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                        beam_idx].compute()
                     for key in computed_metrics_tensorrt_llm.keys():
                         logger.info(
                             f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
                         )
-
-                if args.check_accuracy and beam_idx == 0 and args.eval_task != "eval_context_ppl":
-                    assert computed_metrics_tensorrt_llm[
-                        'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
+                    if args.check_accuracy and beam_idx == 0:
+                        assert computed_metrics_tensorrt_llm[
+                            'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
                 if args.eval_ppl:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"

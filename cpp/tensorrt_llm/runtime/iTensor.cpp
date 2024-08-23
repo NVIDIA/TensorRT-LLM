@@ -117,6 +117,10 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
         result.reset(new GenericTensor<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             shape, capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
         break;
+    case MemoryType::kPINNEDPOOL:
+        result.reset(new GenericTensor<PinnedPoolBorrowingAllocator>( // NOLINT(modernize-make-unique)
+            shape, capacity, type, PinnedPoolBorrowingAllocator(data, capacityInBytes)));
+        break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)
             new GenericTensor<CpuBorrowingAllocator>(

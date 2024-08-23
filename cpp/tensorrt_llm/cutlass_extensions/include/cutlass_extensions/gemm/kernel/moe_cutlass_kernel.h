@@ -144,6 +144,7 @@ public:
         ElementScale* weight_scales;
         ElementC* ptr_C;
         ElementC* ptr_D;
+        bool C_is_broadcast;
 
         int64_t const* total_tokens_including_expert;
         int64_t gemm_n;
@@ -170,6 +171,7 @@ public:
             , gemm_n(0)
             , gemm_k(0)
             , host_problem_sizes(nullptr)
+            , C_is_broadcast{true}
         {
         }
 
@@ -177,8 +179,8 @@ public:
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count, int group_size, typename EpilogueOutputOp::Params output_op,
             ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales, ElementC const* ptr_C,
-            ElementC* ptr_D, int64_t const* total_tokens_including_expert, int64_t gemm_n, int64_t gemm_k,
-            GemmCoord* host_problem_sizes = nullptr)
+            bool C_is_broadcast, ElementC* ptr_D, int64_t const* total_tokens_including_expert, int64_t gemm_n,
+            int64_t gemm_k, GemmCoord* host_problem_sizes = nullptr)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)
             , group_size(group_size)
@@ -187,6 +189,7 @@ public:
             , ptr_B(const_cast<ElementB*>(ptr_B))
             , weight_scales(const_cast<ElementScale*>(weight_scales))
             , ptr_C(const_cast<ElementC*>(ptr_C))
+            , C_is_broadcast{C_is_broadcast}
             , ptr_D(ptr_D)
             , total_tokens_including_expert(total_tokens_including_expert)
             , gemm_n(gemm_n)
@@ -211,6 +214,7 @@ public:
         typename ProblemVisitor::Params problem_visitor;
         int threadblock_count;
         int group_size;
+        bool C_is_broadcast;
 
         typename EpilogueOutputOp::Params output_op;
 
@@ -231,6 +235,7 @@ public:
             , weight_scales(nullptr)
             , ptr_C(nullptr)
             , ptr_D(nullptr)
+            , C_is_broadcast(true)
         {
         }
 
@@ -246,6 +251,7 @@ public:
             , weight_scales(args.weight_scales)
             , ptr_C(args.ptr_C)
             , ptr_D(args.ptr_D)
+            , C_is_broadcast(args.C_is_broadcast)
         {
         }
 
@@ -262,6 +268,7 @@ public:
             weight_scales = args.weight_scales;
             ptr_C = args.ptr_C;
             ptr_D = args.ptr_D;
+            C_is_broadcast = args.C_is_broadcast;
         }
     };
 
@@ -446,10 +453,12 @@ public:
             // Epilogue
             //
 
-            ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C) + problem_idx * gemm_n;
+            ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C)
+                + (params.C_is_broadcast ? problem_idx : rows_to_jump) * gemm_n;
             ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
 
-            LayoutC layout_C(0);
+            // lora need to set as layout_C(gemm_n)
+            LayoutC layout_C = params.C_is_broadcast ? LayoutC(0) : LayoutC(gemm_n);
             LayoutC layout_D(gemm_n);
 
             typename Epilogue::OutputTileIterator::Params params_C(layout_C);

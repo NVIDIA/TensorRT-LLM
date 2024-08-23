@@ -53,6 +53,11 @@ public:
     static void serialize(LoraConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(LoraConfig const& config);
 
+    // ContextPhaseParams
+    [[nodiscard]] static ContextPhaseParams deserializeContextPhaseParams(std::istream& is);
+    static void serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(ContextPhaseParams const& contextPhaseParams);
+
     // Request
     [[nodiscard]] static Request deserializeRequest(std::istream& is);
     static void serialize(Request const& request, std::ostream& os);
@@ -121,6 +126,11 @@ public:
     static DecodingConfig deserializeDecodingConfig(std::istream& is);
     static void serialize(DecodingConfig const& decodingConfig, std::ostream& os);
     static size_t serializedSize(DecodingConfig const& decodingConfig);
+
+    // DebugConfig
+    static DebugConfig deserializeDebugConfig(std::istream& is);
+    static void serialize(DebugConfig const& debugConfig, std::ostream& os);
+    static size_t serializedSize(DebugConfig const& debugConfig);
 
     // ExecutorConfig
     static ExecutorConfig deserializeExecutorConfig(std::istream& is);

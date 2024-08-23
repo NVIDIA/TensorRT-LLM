@@ -20,6 +20,7 @@
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/layers/layerUtils.h"
+#include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
 #include "tensorrt_llm/layers/medusaDecodingLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
 
@@ -66,6 +67,7 @@ bool hasDiffRuntimeArgs(std::shared_ptr<tensorrt_llm::layers::DynamicDecodeSetup
 
 namespace tensorrt_llm::layers
 {
+
 template <typename T>
 DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
     std::shared_ptr<BufferManager> bufferManager)
@@ -88,8 +90,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     }
     else if (mDecodingMode.isLookahead())
     {
-        // TODO(nkorobov) add lookahead layer
-        TLLM_LOG_WARNING("Lookahead decoding is not supported yet.");
+        mDecodingLayer = std::make_unique<LookaheadDecodingLayer<T>>(mDecoderDomain, mBufferManager);
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
@@ -134,7 +135,7 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferC
     else if (mDecodingMode.isLookahead())
     {
         TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Lookahead, but beamWidth != 1 (%d != 1)", beamWidth);
-        // TODO(nkorobov) add lookahead layer
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
@@ -211,7 +212,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         // sentences once.
         TensorPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
-        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, step, ite, localBatchSize);
+        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, params->batchSlots, step, ite, localBatchSize);
 
         decodeInputs->finished = params->finished;
 
@@ -222,8 +223,6 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
             auto& inputLengths = params->inputLengths.value();
             decodeInputs->inputLengths = ITensor::slice(inputLengths, 0, localBatchSize);
         }
-        decodeInputs->batchSlots = params->batchSlots;
-
         preparedInputs = decodeInputs;
         preparedOutputs = baseOutputs;
     }
@@ -237,7 +236,8 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     }
     else if (mDecodingMode.isLookahead())
     {
-        // TODO(nkorobov) add lookahead layer
+        preparedInputs = baseInputs;
+        preparedOutputs = baseOutputs;
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {

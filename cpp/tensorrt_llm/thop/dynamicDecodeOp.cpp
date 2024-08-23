@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <c10/cuda/CUDAFunctions.h>
@@ -53,6 +54,7 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const maxBatchSize, size_t const maxB
         tr::ITensor::makeShape({static_cast<int32_t>(maxBatchSize)}), nvinfer1::DataType::kINT32);
     mDynamicDecodeLayer
         = std::make_shared<tl::DynamicDecodeLayer<T>>(tle::DecodingMode::Auto(), decodingDomain, bufferManager);
+    mBatchSlots = tr::getDefaultBatchSlots(maxBatchSize, *bufferManager);
 }
 
 namespace
@@ -167,7 +169,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
 
     setupParams->penaltyParams = penaltyParams;
     setupParams->banWordsParams = banWordsParams;
-    mDynamicDecodeLayer->setup(batch_size, beam_width, nullptr, setupParams);
+    mDynamicDecodeLayer->setup(batch_size, beam_width, tr::ITensor::slice(mBatchSlots, 0, batch_size), setupParams);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -193,15 +195,16 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     auto const isBeamSearch = mBeamWidth.value() > 1;
 
     std::shared_ptr<tl::DecodingInputs> forwardParams;
+    tr::ITensor::SharedConstPtr batchSlotsSlice = tr::ITensor::slice(mBatchSlots, 0, localBatchSize);
     if (isBeamSearch)
     {
-        forwardParams = std::make_shared<tl::DecodingInputs>(convert_tensor<int>(endId), step, static_cast<int>(ite),
-            localBatchSize, maxAttentionWindow, sinkTokenLength);
+        forwardParams = std::make_shared<tl::DecodingInputs>(convert_tensor<int>(endId), batchSlotsSlice, step,
+            static_cast<int>(ite), localBatchSize, maxAttentionWindow, sinkTokenLength);
     }
     else
     {
         forwardParams = std::make_shared<tl::SamplingInputs>(
-            convert_tensor<int>(endId), step, static_cast<int>(ite), localBatchSize);
+            convert_tensor<int>(endId), batchSlotsSlice, step, static_cast<int>(ite), localBatchSize);
     }
 
     forwardParams->logits = convert_tensor<T>(logits);

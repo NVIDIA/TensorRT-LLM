@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .enc_dec_model_runner import EncDecModelRunner
 from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LogitsProcessorList, ModelConfig,
@@ -19,6 +20,7 @@ from .generation import (ChatGLMGenerationSession, GenerationSession,
                          StoppingCriteriaList, decode_words_list)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .model_runner import ModelRunner
+from .multimodal_model_runner import MultimodalModelRunner
 from .session import Session, TensorInfo
 
 try:
@@ -47,5 +49,7 @@ __all__ = [
     'StoppingCriteria',
     'ModelRunner',
     'ModelRunnerCpp',
+    'EncDecModelRunner',
+    'MultimodalModelRunner',
     'PYTHON_BINDINGS',
 ]

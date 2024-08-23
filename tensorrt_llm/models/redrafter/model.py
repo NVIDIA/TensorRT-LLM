@@ -18,6 +18,7 @@ from collections import OrderedDict
 import tensorrt as trt
 
 from tensorrt_llm._common import default_net
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import Tensor, cast, categorical_sample
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.generation_mixin import GenerationMixin
@@ -192,8 +193,11 @@ class ReDrafterForCausalLM(LLaMAForCausalLM):
         assert inputs['spec_decoding_params'] is not None
 
         enable_two_optimization_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
-            use_gpt_attention_plugin, use_gemm_plugin, remove_input_padding,
-            paged_kv_cache)
+            use_gpt_attention_plugin=use_gpt_attention_plugin,
+            use_gemm_plugin=use_gemm_plugin,
+            remove_input_padding=remove_input_padding,
+            kv_cache_type=KVCacheType.PAGED
+            if paged_kv_cache else KVCacheType.CONTINUOUS)
         if enable_two_optimization_profiles:
             bb_range = [bb_range, bb_range]
             bb0_range = [bb0_range, bb0_range]

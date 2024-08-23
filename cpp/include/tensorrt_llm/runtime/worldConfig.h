@@ -123,6 +123,11 @@ public:
         return getPipelineParallelRank() == getPipelineParallelism() - 1;
     }
 
+    [[nodiscard]] bool constexpr isFirstTensorParallelRank() const noexcept
+    {
+        return getTensorParallelRank() == 0;
+    }
+
     [[nodiscard]] SizeType32 constexpr getLastRank() const noexcept
     {
         return getSize() - 1;

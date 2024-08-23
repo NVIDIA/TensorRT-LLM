@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
@@ -179,6 +180,8 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 //! Get cublas and cublasLt handle for current cuda context
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
+std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> getCublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
+    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace);
 
 #ifndef DEBUG
 

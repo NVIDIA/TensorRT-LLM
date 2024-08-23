@@ -298,40 +298,37 @@ def process_redrafter_outputs(session, step, batch_size, last_draft_tokens,
 def redrafter_prepare_random_tensors(session, batch_size, initialize=False):
     torch.cuda.nvtx.range_push("torch_rand")
 
-    def get_rand_tensors():
-        rds = torch.rand([1], dtype=session.dtype, device=session.device)
-        rdv = torch.rand([
-            1, session._model_config.redrafter_num_beams,
-            session._model_config.redrafter_draft_len_per_beam
-        ],
-                         dtype=session.dtype,
-                         device=session.device)
-        return rds, rdv
+    num_beams = session._model_config.redrafter_num_beams
+    draft_len = session._model_config.redrafter_draft_len_per_beam
 
-    rand_data_sample = []
-    rand_data_validation = []
+    random_seed = None
     if initialize:  # context phase
-        random_seed = session.random_seed
-        if random_seed is None:
+        if session.random_seed is not None:
+            random_seed = session.random_seed.to(session.device)
+        else:
             random_seed = torch.full([batch_size],
                                      REDRAFTER_DEFAULT_SEED,
-                                     dtype=torch.int64)
-        session.saved_rng_states = [None] * batch_size
-    for b in range(batch_size):
-        if initialize:  # context phase
-            torch.cuda.manual_seed(random_seed[b].item())
-        else:  # generation phase
-            assert session.saved_rng_states is not None, "Couldn't find random states."
-            torch.cuda.set_rng_state(session.saved_rng_states[b],
-                                     session.device)
-        rds, rdv = get_rand_tensors()
-        session.saved_rng_states[b] = torch.cuda.get_rng_state(
+                                     dtype=torch.uint64,
+                                     device=session.device)
+        session.saved_rng_states = torch.empty([batch_size, 48],
+                                               dtype=torch.uint8,
+                                               device=session.device)
+
+        session.rand_data_sample = torch.empty([batch_size],
+                                               dtype=session.dtype,
+                                               device=session.device)
+        session.rand_data_validation = torch.empty(
+            [batch_size, num_beams, draft_len],
+            dtype=session.dtype,
             device=session.device)
-        rand_data_sample.append(rds)
-        rand_data_validation.append(rdv)
-    session.rand_data_sample = torch.concat(rand_data_sample, dim=0)
-    session.rand_data_validation = torch.concat(rand_data_validation, dim=0)
-    session.buffer["rand_data_sample"] = session.rand_data_sample
-    session.buffer["rand_data_validation"] = session.rand_data_validation
+
+        session.buffer["rand_data_sample"] = session.rand_data_sample
+        session.buffer["rand_data_validation"] = session.rand_data_validation
+
+    torch.ops.tensorrt_llm.redrafter_prepare_random_tensors(
+        session.saved_rng_states, session.rand_data_sample,
+        session.rand_data_validation, random_seed, batch_size, num_beams,
+        draft_len, initialize)
+
     torch.cuda.nvtx.range_pop()
     return

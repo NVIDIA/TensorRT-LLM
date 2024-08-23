@@ -16,15 +16,18 @@ from .baichuan.model import BaichuanForCausalLM
 from .bert.model import (BertForQuestionAnswering,
                          BertForSequenceClassification, BertModel)
 from .bloom.model import BloomForCausalLM, BloomModel
+from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
+from .deci.model import DeciLMForCausalLM
 from .dit.model import DiT
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
+from .gemma.config import GEMMA2_ARCHITECTURE, GEMMA_ARCHITECTURE, GemmaConfig
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
 from .gpt.model import GPTForCausalLM, GPTModel
@@ -79,6 +82,7 @@ __all__ = [
     'Phi3Config',
     'PhiForCausalLM',
     'Phi3ForCausalLM',
+    'ChatGLMConfig',
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',
@@ -94,6 +98,7 @@ __all__ = [
     'MPTForCausalLM',
     'MPTModel',
     'SkyworkForCausalLM',
+    'GemmaConfig',
     'GemmaForCausalLM',
     'DbrxConfig',
     'DbrxForCausalLM',
@@ -128,6 +133,7 @@ MODEL_MAP = {
     'ChatGLMModel': ChatGLMForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
+    'ExaoneForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,
     'ArcticForCausalLM': LLaMAForCausalLM,
@@ -139,7 +145,8 @@ MODEL_MAP = {
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'BaiChuanForCausalLM': BaichuanForCausalLM,
     'SkyworkForCausalLM': LLaMAForCausalLM,
-    'GemmaForCausalLM': GemmaForCausalLM,
+    GEMMA_ARCHITECTURE: GemmaForCausalLM,
+    GEMMA2_ARCHITECTURE: GemmaForCausalLM,
     'QWenLMHeadModel': QWenForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
     'Qwen2ForCausalLM': QWenForCausalLM,
@@ -151,4 +158,5 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'DeciLMForCausalLM': DeciLMForCausalLM,
 }

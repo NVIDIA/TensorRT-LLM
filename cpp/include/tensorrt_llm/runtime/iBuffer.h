@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 
 #include <NvInferRuntime.h>
@@ -46,7 +47,8 @@ enum class MemoryType : std::int32_t
     kGPU = 0,
     kCPU = 1,
     kPINNED = 2,
-    kUVM = 3
+    kUVM = 3,
+    kPINNEDPOOL = 4
 };
 
 template <MemoryType T>
@@ -76,6 +78,12 @@ template <>
 struct MemoryTypeString<MemoryType::kUVM>
 {
     static auto constexpr value = "UVM";
+};
+
+template <>
+struct MemoryTypeString<MemoryType::kPINNEDPOOL>
+{
+    static auto constexpr value = "PINNEDPOOL";
 };
 
 //! \brief For converting a TensorRT data type to a C++ data type.
@@ -314,6 +322,12 @@ template <>
 struct TRTDataType<kernels::KVCacheIndex>
 {
     static constexpr auto value = TRTDataType<kernels::KVCacheIndex::UnderlyingType>::value;
+};
+
+template <>
+struct TRTDataType<kernels::FinishedState>
+{
+    static constexpr auto value = TRTDataType<kernels::FinishedState::UnderlyingType>::value;
 };
 
 template <>

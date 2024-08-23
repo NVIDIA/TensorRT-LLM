@@ -46,8 +46,7 @@ def fc_gate_lora(hidden_states, lora, lora_layer_params):
                     mlp_gate_lora_params.lora_weights_pointers[0]
                 ],
                 host_request_types=mlp_fc_lora_params.host_request_types,
-                host_context_lengths=mlp_fc_lora_params.host_context_lengths,
-                max_num_tokens=mlp_fc_lora_params.max_num_tokens)
+                host_context_lengths=mlp_fc_lora_params.host_context_lengths)
 
             mlp_fc_lora, mlp_gate_lora = lora(hidden_states, mlp_in_lora_params)
             mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],

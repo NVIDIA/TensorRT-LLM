@@ -208,14 +208,12 @@ class TestLLaMA(unittest.TestCase):
              dict()))  # GQA
         test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
                            False, 'float16', 4, 'silu', dict()))  # GQA
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'float16', 2, 'gelu', {
-                               "use_fused_mlp": True
-                           }))  # GQA
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'float16', 2, 'silu', {
-                               "use_fused_mlp": True
-                           }))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'gelu',
+             dict()))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'silu',
+             dict()))  # GQA
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
@@ -553,7 +551,6 @@ class TestLLaMA(unittest.TestCase):
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'use_fused_mlp': False,
         }
 
         config = PretrainedConfig.from_dict(config)

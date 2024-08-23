@@ -68,13 +68,19 @@ class TestMamba(unittest.TestCase):
             'conv_kernel': hf_config.conv_kernel,
             'use_bias': hf_config.use_bias,
             'mamba_version': 'Mamba1',
+            'mapping': {
+                'world_size': 1,
+                'tp_size': 1,
+                'pp_size': 1
+            },
         }
-        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         if load_mode == 'from_checkpoint':
-            weights = convert_from_hf_checkpoint(model_dir=hf_path, dtype=dtype)
+            weights = convert_from_hf_checkpoint(mamba_config=config,
+                                                 model_dir=hf_path,
+                                                 dtype=dtype)
         else:
             weights = convert_hf_mamba(hf_mamba, rank=0, dtype=dtype)
-
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         tensorrt_llm_mamba = tensorrt_llm.models.MambaForCausalLM(config)
         tensorrt_llm_mamba.load(weights)
         return tensorrt_llm_mamba

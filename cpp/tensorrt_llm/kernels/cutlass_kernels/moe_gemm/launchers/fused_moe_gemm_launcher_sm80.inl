@@ -32,8 +32,8 @@ namespace tensorrt_llm::kernels::cutlass_kernels
 template <typename ElementType_, typename CutlassWeightType_, int MaxTileM_, int TileN_, int TileK_, int Stages_,
     typename EpilogueTag>
 void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWeightType_ const* B,
-    ElementType_ const* biases, ElementType_* C, int64_t const* total_tokens_including_expert, int64_t num_rows,
-    int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream,
+    ElementType_ const* biases, bool bias_is_broadcast, ElementType_* C, int64_t const* total_tokens_including_expert,
+    int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, int multi_processor_count, cudaStream_t stream,
     int* kernel_occupancy)
 {
     constexpr auto activation_type = fused_moe::EpilogueRouting<EpilogueTag>(true);
@@ -78,7 +78,7 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
     using Arguments = typename GemmType::Arguments;
     Arguments args{{const_cast<ElementType_*>(A), const_cast<CutlassWeightType_*>(B), const_cast<ElementType_*>(biases),
                        reinterpret_cast<ElementType_*>(C), total_tokens_including_expert, static_cast<int>(gemm_n),
-                       static_cast<int>(gemm_k), num_experts},
+                       static_cast<int>(gemm_k), num_experts, bias_is_broadcast},
         num_experts, threadblock_count};
     auto params = GemmType::to_underlying_arguments(args);
     if (GemmType::kSmemSize >= (48 << 10))

@@ -52,7 +52,7 @@ struct FillBuffers
         for (size_t bi = 0; bi < batchSize; ++bi)
         {
             auto value = defaultValue;
-            auto batchSlot = batchSlots ? runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi] : bi;
+            auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
             if (optParam)
             {
                 if (optParam->size() == 1)
@@ -130,15 +130,6 @@ inline DecoderDomain getLocalDecoderDomain(
         TLLM_THROW("Can't get local Decoder domain");
     }
     return DecoderDomain(batchSize, beamWidth, vocabSize);
-}
-
-inline TensorConstPtr getDefaultBatchSlots(runtime::SizeType32 batchSize, runtime::BufferManager const& bufferManager)
-{
-    auto defaultBatchSlots = bufferManager.pinnedPool(
-        runtime::ITensor::makeShape({batchSize}), runtime::TRTDataType<runtime::SizeType32>::value);
-    auto range = runtime::BufferRange<runtime::SizeType32>(*defaultBatchSlots);
-    std::iota(range.begin(), range.end(), 0);
-    return defaultBatchSlots;
 }
 
 /// @brief A convenience function to copy the content of a standard vector to a layer workspace.

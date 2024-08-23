@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tensorView.h"
 
@@ -182,9 +183,22 @@ public:
         return (BufferLocation<float const>(mTensor))[idx];
     }
 
+    runtime::BufferManager::ITensorPtr copyToHostOptional()
+    {
+        runtime::BufferManager::ITensorPtr hostPtr{nullptr};
+        if (mTensor.getMemoryType() == runtime::MemoryType::kGPU)
+        {
+            runtime::BufferManager manager{std::make_shared<runtime::CudaStream>()};
+            hostPtr = manager.copyFrom(mTensor, runtime::MemoryType::kCPU);
+            manager.getStream().synchronize();
+        }
+        return hostPtr;
+    }
+
     std::string string(void)
     {
-        runtime::BufferRange<runtime::TokenIdType const> range(mTensor);
+        runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
+        runtime::BufferRange<runtime::TokenIdType const> range(hostPtr ? (*hostPtr) : mTensor);
         std::string result(range.size(), '\0');
         std::copy(range.begin(), range.end(), result.begin());
         return result;
@@ -195,8 +209,10 @@ public:
         using namespace tensorrt_llm::runtime;
         std::ostringstream buf;
         auto shape = mTensor.getShape();
-        runtime::BufferRange<TokenIdType const> tensorRange(mTensor);
-        buf << mName << ": " << shape;
+        runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
+        runtime::BufferRange<runtime::TokenIdType const> tensorRange(hostPtr ? (*hostPtr) : mTensor);
+
+        buf << mName << ": " << mTensor.getMemoryTypeName() << ',' << mTensor.getDataTypeName() << ',' << shape;
         auto line = [&buf](TokenIdType const* array, SizeType32 size)
         {
             buf << '[';
@@ -249,14 +265,16 @@ public:
         using namespace tensorrt_llm::runtime;
         std::ostringstream buf;
         auto shape = mTensor.getShape();
-        runtime::BufferRange<T const> tensorRange(mTensor);
-        buf << mName << ": " << shape;
+        runtime::BufferManager::ITensorPtr hostPtr = copyToHostOptional();
+        runtime::BufferRange<T const> tensorRange(hostPtr ? (*hostPtr) : mTensor);
+
+        buf << mName << ": " << mTensor.getMemoryTypeName() << ',' << mTensor.getDataTypeName() << ',' << shape;
         auto line = [&buf](T const* array, SizeType32 size)
         {
             buf << '[';
             for (SizeType32 i = 0; i < size; i++)
             {
-                buf << array[i];
+                buf << static_cast<unsigned long long>(array[i]);
                 if (i != size - 1)
                 {
                     buf << ',';

@@ -39,7 +39,7 @@ bool forwardAndSync(std::unique_ptr<IGptDecoder> const& decoder, DecodingOutput&
 
     BufferManager::ITensorPtr finishedSum;
     std::int32_t* finishedSumHost = nullptr;
-    if (input.sequenceLimitLength && output.finished)
+    if (input.sequenceLimitLength && output.finishReasons)
     {
         finishedSumHost = bufferCast<std::int32_t>(*output.finishedSum);
         for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
@@ -52,7 +52,7 @@ bool forwardAndSync(std::unique_ptr<IGptDecoder> const& decoder, DecodingOutput&
 
     if (finishedSumHost)
     {
-        auto const numToFinish = output.finished->getSize();
+        auto const numToFinish = output.finishReasons->getSize();
         TLLM_CUDA_CHECK(::cudaStreamSynchronize(stream->get()));
 
         SizeType32 finishedSum = 0;
@@ -103,7 +103,8 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         vocabSizePadded, maxSeqLength, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
-    decoder->setup(samplingConfig, batchSize);
+    auto batchSlots = getDefaultBatchSlots(batchSize, manager);
+    decoder->setup(samplingConfig, batchSize, batchSlots);
 
     // set up inputs
     auto logits = std::shared_ptr(
@@ -115,7 +116,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto endIds
         = std::shared_ptr(manager.copyFrom(endIdsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU));
 
-    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds};
+    DecodingInput inputs{maxInputLength, maxSeqLength, sinkTokenLength, batchSize, logits, endIds, batchSlots};
 
     std::vector<std::int32_t> inputLengthsVec(batchSize * beamWidth, 0);
     inputs.lengths = manager.copyFrom(inputLengthsVec, ITensor::makeShape({batchSize * beamWidth}), MemoryType::kGPU);
@@ -136,7 +137,10 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     auto outputIds = std::shared_ptr(
         manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
     manager.setZero(*outputIds);
-    DecodingOutput outputs{outputIds};
+    auto gatheredOutputIds = std::shared_ptr(
+        manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
+    manager.setZero(*gatheredOutputIds);
+    DecodingOutput outputs{outputIds, gatheredOutputIds};
     auto newTokens
         = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT32));
     manager.setZero(*newTokens);
@@ -145,10 +149,10 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     std::vector<int> sequenceLengthsVec(batchSize * beamWidth, maxInputLength);
     outputs.lengths
         = manager.copyFrom(sequenceLengthsVec, ITensor::makeShape({batchSize, beamWidth}), MemoryType::kGPU);
-    outputs.finished = manager.gpu(ITensor::makeShape({batchSize, beamWidth}),
+    outputs.finishReasons = manager.gpu(ITensor::makeShape({batchSize, beamWidth}),
         TRTDataType<tensorrt_llm::kernels::FinishedState::UnderlyingType>::value);
-    inputs.finished = ITensor::view(outputs.finished);
-    manager.setZero(*outputs.finished);
+    inputs.finishReasons = ITensor::view(outputs.finishReasons);
+    manager.setZero(*outputs.finishReasons);
     outputs.finishedSum = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
     auto finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
@@ -223,7 +227,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         {
             finishedSum += finishedSumHost[bi];
         }
-        EXPECT_EQ(finishedSum, outputs.finished->getSize());
+        EXPECT_EQ(finishedSum, outputs.finishReasons->getSize());
     }
 }
 

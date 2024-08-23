@@ -56,6 +56,15 @@ def get_build_dir(build_dir, build_type):
     return build_dir
 
 
+def clear_folder(folder_path):
+    for item in os.listdir(folder_path):
+        item_path = os.path.join(folder_path, item)
+        if os.path.isdir(item_path):
+            rmtree(item_path)
+        else:
+            os.remove(item_path)
+
+
 def main(*,
          build_type: str = "Release",
          build_dir: Path = None,
@@ -67,6 +76,7 @@ def main(*,
          trt_root: str = None,
          nccl_root: str = None,
          clean: bool = False,
+         configure_cmake: bool = False,
          use_ccache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -152,7 +162,7 @@ def main(*,
     first_build = not build_dir.exists()
 
     if clean and build_dir.exists():
-        rmtree(build_dir)
+        clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
 
     if use_ccache:
@@ -176,7 +186,7 @@ def main(*,
     source_dir = get_source_dir()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
-        if clean or first_build:
+        if clean or first_build or configure_cmake:
             build_run(
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
@@ -196,8 +206,8 @@ def main(*,
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     if lib_dir.exists():
-        rmtree(lib_dir)
-    lib_dir.mkdir(parents=True)
+        clear_folder(lib_dir)
+    lib_dir.mkdir(parents=True, exist_ok=True)
     if on_windows:
         copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
              lib_dir / "tensorrt_llm.dll")
@@ -230,8 +240,8 @@ def main(*,
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
-        rmtree(bin_dir)
-    bin_dir.mkdir(parents=True)
+        clear_folder(bin_dir)
+    bin_dir.mkdir(parents=True, exist_ok=True)
 
     if not on_windows:
         copy(build_dir / "tensorrt_llm/executor_worker/executorWorker",
@@ -317,6 +327,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--cuda_architectures", "-a")
     parser.add_argument("--install", "-i", action="store_true")
     parser.add_argument("--clean", "-c", action="store_true")
+    parser.add_argument("--configure_cmake",
+                        action="store_true",
+                        help="Always configure cmake before building")
     parser.add_argument("--use_ccache",
                         "-ccache",
                         default=False,

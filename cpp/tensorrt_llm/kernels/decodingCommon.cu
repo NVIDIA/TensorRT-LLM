@@ -28,7 +28,7 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-__global__ void curandInitialize(curandState_t* state, int const* batchSlots, int const size, const uint64_t randomSeed)
+__global__ void curandInitialize(curandState_t* state, int const* batchSlots, int const size, uint64_t const randomSeed)
 {
     int const idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size)
@@ -39,7 +39,7 @@ __global__ void curandInitialize(curandState_t* state, int const* batchSlots, in
 }
 
 void invokeCurandInitialize(
-    curandState_t* state, int const* batchSlots, const size_t batchSize, const uint64_t randomSeed, cudaStream_t stream)
+    curandState_t* state, int const* batchSlots, size_t const batchSize, uint64_t const randomSeed, cudaStream_t stream)
 {
     dim3 block(256);
     dim3 grid((int) (ceil(batchSize * 1.0 / 256)));
@@ -52,12 +52,12 @@ __global__ void curandBatchInitialize(
     SizeType32 const bid = threadIdx.x + blockIdx.x * blockDim.x;
     if (bid < size)
     {
-        auto const batchSlot = batchSlots != nullptr ? batchSlots[bid] : bid;
+        auto const batchSlot = batchSlots[bid];
         curand_init(randomSeeds[bid], 0, 0, &states[batchSlot]);
     }
 }
 
-void invokeCurandBatchInitialize(curandState_t* states, SizeType32 const* batchSlots, const size_t batchSize,
+void invokeCurandBatchInitialize(curandState_t* states, SizeType32 const* batchSlots, size_t const batchSize,
     uint64_t const* randomSeeds, cudaStream_t stream)
 {
     dim3 block(256);
@@ -72,7 +72,7 @@ __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bia
 {
     auto const batchIdx = blockIdx.x;
     auto const beamIdx = blockIdx.y;
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots[batchIdx];
     auto const batchIdxLogits = batchSlotsLogits ? batchSlot : batchIdx;
     FinishedState const finishState
         = finished != nullptr ? finished[beamIdx * maxBatchSize + batchSlot] : FinishedState::empty();
@@ -182,7 +182,7 @@ __global__ void scatterDecodingParamsKernel(T const* src, T* dst, int const* bat
     {
         return;
     }
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     dst[batchSlot] = src[batchIdx];
 }
 

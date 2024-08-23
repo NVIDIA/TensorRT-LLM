@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 from pathlib import Path
 
 import run
@@ -22,10 +23,17 @@ from build_engines_utils import init_model_spec_module
 init_model_spec_module()
 
 import os
+import shutil
 
 import model_spec
 
 import tensorrt_llm.bindings as _tb
+
+
+def get_model_data_dir():
+    resources_dir = Path(__file__).parent.resolve().parent
+    data_dir = resources_dir / 'data'
+    return data_dir / 'gpt2'
 
 
 def generate_output(engine: str,
@@ -46,7 +54,7 @@ def generate_output(engine: str,
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / input_name
-    model_data_dir = data_dir / model
+    model_data_dir = get_model_data_dir()
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'
     else:
@@ -95,7 +103,6 @@ def generate_output(engine: str,
         ])
 
     args = run.parse_arguments(args_list)
-    print(args_list)
     run.main(args)
 
 
@@ -105,7 +112,7 @@ def generate_outputs(num_beams):
 
     print('Generating GPT2 FP32 outputs')
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.FLOAT)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     if num_beams == 1:
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
@@ -119,7 +126,7 @@ def generate_outputs(num_beams):
 
     print('Generating GPT2 FP16 outputs')
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     if num_beams == 1:
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
@@ -135,7 +142,7 @@ def generate_outputs(num_beams):
                     num_beams=num_beams,
                     input_name=input_name,
                     model_spec_obj=model_spec_obj)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.gather_logits()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -156,7 +163,7 @@ def generate_outputs(num_beams):
 
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -176,7 +183,7 @@ def generate_outputs(num_beams):
     model_spec_obj = model_spec.ModelSpec(input_name_long, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name_long,
@@ -186,7 +193,7 @@ def generate_outputs(num_beams):
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.use_packed_input()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.set_quant_method(model_spec.QuantMethod.SMOOTH_QUANT)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -196,5 +203,15 @@ def generate_outputs(num_beams):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--clean',
+                        action='store_true',
+                        default=False,
+                        help='Clean target folders before building engines')
+    args = parser.parse_args()
+    if args.clean:
+        model_data_dir = get_model_data_dir()
+        print(f'Cleaning target folder {model_data_dir}')
+        shutil.rmtree(model_data_dir, ignore_errors=True)
     generate_outputs(num_beams=1)
     generate_outputs(num_beams=2)

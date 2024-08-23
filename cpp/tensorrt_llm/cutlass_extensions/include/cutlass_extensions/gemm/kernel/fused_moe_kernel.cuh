@@ -78,9 +78,10 @@ struct Fused_Moe_Kernel_sm80
 
     static Params to_underlying_arguments(Arguments const& args)
     {
-        return {{args.routine_args.ptr_input, args.routine_args.ptr_fc1, args.routine_args.ptr_bias,
-                    args.routine_args.ptr_output, args.routine_args.total_tokens_including_expert,
-                    args.routine_args.gemm_n, args.routine_args.gemm_k, args.routine_args.num_expert},
+        return {
+            {args.routine_args.ptr_input, args.routine_args.ptr_fc1, args.routine_args.ptr_bias,
+                args.routine_args.ptr_output, args.routine_args.total_tokens_including_expert, args.routine_args.gemm_n,
+                args.routine_args.gemm_k, args.routine_args.num_expert, args.routine_args.bias_is_broadcast},
             args.threadblock_count,
             {args.routine_args.total_tokens_including_expert, args.routine_args.gemm_n, args.routine_args.gemm_k,
                 args.problem_count, nullptr, 0}};
@@ -95,7 +96,7 @@ struct Fused_Moe_Kernel_sm80
         using RoutineTraits = Fused_Moe_Kernel_routine_sm80<ElementInput, ElementWeight, ElementOutput, kTileM,        \
             kTileN, kTileK, kStages, activation_type>;                                                                 \
         RoutineTraits routine{};                                                                                       \
-        const int block_m_idx = (block_m_idx_temp) *kMaxTileM / kTileM;                                                \
+        int const block_m_idx = (block_m_idx_temp) *kMaxTileM / kTileM;                                                \
         routine.run_routine(params.routine_params, problem_index, block_m_idx, block_n_idx, gemm_m);                   \
     }
         typename ProblemVisitor::SharedStorage dummy_storage{};

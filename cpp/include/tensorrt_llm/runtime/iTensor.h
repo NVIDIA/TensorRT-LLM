@@ -50,6 +50,7 @@ public:
     using SharedConstPtr = std::shared_ptr<ITensor const>;
     using Shape = nvinfer1::Dims;
     using DimType64 = std::remove_reference_t<decltype(Shape::d[0])>;
+    using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
 
     static_assert(std::is_same_v<DimType64, std::int64_t>, "This version of TRT-LLM requires TensorRT 10.0 or later.");
 

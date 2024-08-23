@@ -1065,8 +1065,10 @@ __global__ void transpose_remove_padding(T const* src, T* dst, int const batch_s
     // do remove_sequence_length_padding
     int const bid = blockIdx.x; // batch * seq_len or valid_word_num
 
-    int const src_batch_id = (bid + mask_offset[bid]) / seq_len;
-    int const src_seq_id = (bid + mask_offset[bid]) % seq_len;
+    int const mask_offset_value = (mask_offset == nullptr) ? 0 : mask_offset[bid];
+
+    int const src_batch_id = (bid + mask_offset_value) / seq_len;
+    int const src_seq_id = (bid + mask_offset_value) % seq_len;
 
     int const dst_seq_id = bid;
 
@@ -1166,7 +1168,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
     // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
-    bool const has_padding = padding_offset == nullptr;
+    bool const has_padding = padding_offset != nullptr;
     int const hidden = head_num * size_per_head; // hidden dim Q
     int const n = hidden + 2 * kv_head_num * size_per_head;
 
@@ -1175,11 +1177,11 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int const bias_id = index % n;
 
         int const token_idx = index / n;
-        int const token_padded_idx = token_idx + (has_padding ? 0 : padding_offset[token_idx]);
+        int const token_padded_idx = token_idx + (has_padding ? padding_offset[token_idx] : 0);
         int const target_batch_id = token_padded_idx / seq_len;
         int const actual_seq_len = seq_lens[target_batch_id];
         int const seq_id = token_padded_idx % seq_len;
-        bool const valid_seq = seq_id < actual_seq_len || !has_padding;
+        bool const valid_seq = seq_id < actual_seq_len || has_padding;
 
         int qkv_id;
         int head_id;
@@ -1319,12 +1321,12 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     int const token_idx = blockIdx.x;
     int const token_padding_offset = (padding_offset == nullptr || token_idx < 0) ? 0 : padding_offset[token_idx];
     int const tgt_token_idx = token_idx + token_padding_offset;
-    bool const has_padding = padding_offset == nullptr;
+    bool const has_padding = padding_offset != nullptr;
 
     int const batch_idx = tgt_token_idx / seq_len;
     int const seq_idx = tgt_token_idx % seq_len;
     int const actual_seq_len = seq_lens[batch_idx];
-    bool const valid_seq = seq_idx < actual_seq_len || !has_padding;
+    bool const valid_seq = seq_idx < actual_seq_len || has_padding;
 
     int const head_idx = blockIdx.y;
     int const tidx = threadIdx.x;

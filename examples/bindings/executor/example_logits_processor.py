@@ -179,12 +179,14 @@ if __name__ == "__main__":
 
     # Create the executor.
     executor_config = trtllm.ExecutorConfig(args.beam_width)
+    logits_proc_config = trtllm.LogitsPostProcessorConfig()
     if not args.lpp_batched:
-        executor_config.logits_post_processor_map = {
+        logits_proc_config.processor_map = {
             "my_logits_pp": logits_post_processor
         }
     else:
-        executor_config.logits_post_processor_batched = logits_post_processor_batched
+        logits_proc_config.processor_batched = logits_post_processor_batched
+    executor_config.logits_post_processor_config = logits_proc_config
     executor = trtllm.Executor(args.engine_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 

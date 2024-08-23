@@ -179,7 +179,7 @@ public:
 #endif
 
     void moeGemmBiasAct(T const* A, WeightType const* B, ScaleBiasType const* weight_scales,
-        ScaleBiasType const* biases, void* C, int64_t const* total_tokens_including_expert,
+        ScaleBiasType const* biases, bool bias_is_broadcast, void* C, int64_t const* total_tokens_including_expert,
         HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         ActivationType activation_type, bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
         cutlass_extensions::CutlassGemmConfig chosen_conf);
@@ -207,16 +207,17 @@ public:
 private:
     template <typename EpilogueTag>
     void dispatchToArch(T const* A, WeightType const* B, ScaleBiasType const* weight_scales,
-        ScaleBiasType const* biases, void* C, int64_t const* total_tokens_including_expert,
+        ScaleBiasType const* biases, bool bias_is_broadcast, void* C, int64_t const* total_tokens_including_expert,
         HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
         cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe, float const** alpha_scale_ptr_array,
         cudaStream_t stream, int* occupancy = nullptr);
 
     template <typename EpilogueTag>
     void runGemm(T const* A, WeightType const* B, ScaleBiasType const* weight_scales, ScaleBiasType const* biases,
-        void* C, int64_t const* total_tokens_including_expert, HopperGroupedGemmInput layout_info, int64_t total_rows,
-        int64_t gemm_n, int64_t gemm_k, int num_experts, bool use_fused_moe, float const** alpha_scale_ptr_array,
-        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
+        bool bias_is_broadcast, void* C, int64_t const* total_tokens_including_expert,
+        HopperGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
+        bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
+        cutlass_extensions::CutlassGemmConfig chosen_conf);
 
 private:
     int sm_{};

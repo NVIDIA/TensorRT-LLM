@@ -229,8 +229,7 @@ struct CollectiveMmaGated<MainloopSm90TmaGmmaWarpSpecialized<Stages, ClusterShap
     }
 
     template <class ProblemShape>
-    CUTLASS_HOST_DEVICE static bool can_implement(
-        ProblemShape const& problem_shape, [[maybe_unused]] Arguments const& args)
+    static bool can_implement(ProblemShape const& problem_shape, [[maybe_unused]] Arguments const& args)
     {
         constexpr int tma_alignment_bits = 128;
         auto problem_shape_MNKL = append<4>(problem_shape, 1);

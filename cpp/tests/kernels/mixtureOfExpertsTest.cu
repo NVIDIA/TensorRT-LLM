@@ -238,6 +238,7 @@ protected:
     int64_t mActiveRows{};
 
     bool mUseBias = true;
+    bool mUseLora = false;
 
     bool mIsGated = false;
     int64_t mGatedMultiplier = 1;
@@ -286,7 +287,7 @@ protected:
         size_t const weight_size = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms;
         // Workspace size
         size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
-            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, {});
+            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, {}, mUseLora);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -331,7 +332,7 @@ protected:
         }
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, parallelism_config);
+            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, parallelism_config, mUseLora);
 
         auto const stream = mStream->get();
 
@@ -772,11 +773,13 @@ protected:
                 static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
         }
 
+        LoraParams lora_params;
+
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            parallelism_config, mNormMode, stream);
+            parallelism_config, mNormMode, mUseLora, lora_params, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -1727,7 +1730,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         for (int ep : {1, 4, 8})
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, {}, false,
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, {}, false, mUseLora,
                 MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);

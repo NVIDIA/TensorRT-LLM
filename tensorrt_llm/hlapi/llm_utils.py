@@ -46,9 +46,8 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
-from ..models import MODEL_MAP
-from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
-                                     TopModelMixin)
+from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
+from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
@@ -283,6 +282,11 @@ class LlmArgs:
         # The underlying implementation might disable it if it is not supported.
         self.enable_chunked_context: bool = False
 
+        # TODO[chunweiy]: Enable this option in the future
+        # Currently we want HLAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
+        # magics.
+        self.perform_config_arbitration = False
+
         if self.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -386,6 +390,14 @@ class LlmArgs:
 
         self.build_config = self.build_config or BuildConfig()
 
+        if self.perform_config_arbitration:
+            self._perform_config_arbitration()
+
+    def _perform_config_arbitration(self):
+        '''
+        Arbitrate the configurations for the model building. The configs between different functional or performance
+        features might be confilcted, and this method will arbitrate the conflicts and raise errors if necessary.
+        '''
         self._config_arbitrator = _ConfigArbitrator()
         if self.build_config_mutable:
             if not self.build_config.max_num_tokens:
@@ -414,6 +426,8 @@ class LlmArgs:
         self._config_arbitrator(plugin_config=self.build_config.plugin_config,
                                 kv_cache_config=self.kv_cache_config,
                                 build_config=self.build_config)
+
+        self._config_arbitrator = None
 
     def _check_model_or_model_dir(self):
         if not self.model:
@@ -558,9 +572,10 @@ class LlmArgs:
             raise ValueError(
                 "KvCacheConfig.max_attention_window should be set for streaming LLM."
             )
-        if self.kv_cache_config.max_attention_window <= 0:
+        if any(i <= 0 for i in self.kv_cache_config.max_attention_window):
             raise ValueError(
-                "KvCacheConfig.max_attention_window should be greater than 0.")
+                "Elements in KvCacheConfig.max_attention_window should be greater than 0."
+            )
 
         if self.kv_cache_config.sink_token_length is None:
             raise ValueError(
@@ -597,7 +612,8 @@ class LlmArgs:
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        del state['_config_arbitrator']
+        if '_config_arbitrator' in state:
+            del state['_config_arbitrator']
         return state
 
 
@@ -721,7 +737,6 @@ class _ModelRuntimeContext:
     It could be a runtime cache in MPI nodes.
     '''
     engine_buffer: Optional[trt.IHostMemory] = None
-    tokenizer: Optional[TokenizerBase] = None
     # engine_config is only used for saving the engine to disk
     engine_config: Optional[Union[dict, EngineConfig]] = None
     mapping: Optional[Mapping] = None
@@ -748,11 +763,9 @@ class ModelLoader:
 
     def __init__(self,
                  llm_args: LlmArgs,
-                 tokenizer: Optional[TokenizerBase],
                  workspace: Optional[str | tempfile.TemporaryDirectory] = None,
                  llm_build_stats: Optional["LlmBuildStats"] = None):
         self.llm_args = llm_args
-        self.tokenizer = tokenizer
         self._workspace = workspace or tempfile.TemporaryDirectory()
         self.llm_build_stats = llm_build_stats or LlmBuildStats()
 
@@ -920,7 +933,6 @@ class ModelLoader:
         assert engine_dir
 
         runtime_context = _ModelRuntimeContext(
-            tokenizer=self.tokenizer,
             engine_buffer=self._engine_buffer,
             engine_config=config,
             mapping=self.mapping,
@@ -1015,23 +1027,8 @@ class ModelLoader:
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
-
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(
-            self._model_dir, trust_remote_code=True)
-        architecture = hf_config.architectures[0]
-
-        if architecture not in MODEL_MAP:
-            raise KeyError(f"Unsupported model architecture: {architecture}")
-        model_cls = MODEL_MAP[architecture]
-        if TopModelMixin.__name__ in model_cls.from_hugging_face.__qualname__:
-            raise NotImplementedError(
-                f"Unsupported model architecture in HLAPI: {architecture}")
-
-        use_weight_only = self.llm_args.quant_config.quant_algo in (
-            QuantAlgo.W4A16, QuantAlgo.W8A16)
-        if self.llm_args.quant_config.quant_mode.has_any_quant(
-        ) and not use_weight_only:
+        model_cls = AutoModelForCausalLM.get_trtllm_model_class(self._model_dir)
+        if self.llm_args.quant_config.requires_calibration:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1067,6 +1064,7 @@ class ModelLoader:
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
 
+        #TODO: TRTLLM-1091, change the architecture in the checkpoint to TRT-LLM one, not HF one.
         architecture = self.pretrained_config.architecture
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
@@ -1089,6 +1087,7 @@ class ModelLoader:
     def _build_engine(self):
 
         self.build_config.update(auto_parallel_config=self.auto_parallel_config)
+        self.build_config.update_kv_cache_type(self._model_info.architecture)
         if self.auto_parallel_config.enabled:
             self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
@@ -1262,16 +1261,7 @@ class CachedModelLoader:
         # The build() doesn't need the real model instance to get a updated BuildConig. What is really needed is the
         # dtype. That's why the model will be downloaded from HF if necessary to get the accurate dtype.
 
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(
-            model_dir, trust_remote_code=True)
-        architecture = hf_config.architectures[0]
-
-        if architecture not in MODEL_MAP:
-            raise KeyError(f"Unsupported model architecture: {architecture}")
-        model_cls = MODEL_MAP[architecture]
-        config_cls = model_cls.config_class
-        pretrained_config = config_cls.from_hugging_face(
+        pretrained_config = AutoConfig.from_hugging_face(
             model_dir,
             mapping=Mapping(world_size=llm_args.parallel_config.world_size,
                             tp_size=llm_args.parallel_config.tp_size,
@@ -1301,27 +1291,23 @@ class CachedModelLoader:
 
         def build_task():
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
+                model_loader_kwargs = {
+                    'llm_args': self.llm_args,
+                    'workspace': self.workspace.name,
+                    'llm_build_stats': self.llm_build_stats,
+                }
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
-                        llm_args=self.llm_args,
-                        tokenizer=self.llm_args.
-                        tokenizer,  # TODO[chunweiy]: Use llm_args directly
-                        dtype=self.llm_args.dtype,
-                        engine_dir=self.get_engine_dir())
+                        engine_dir=self.get_engine_dir(),
+                        **model_loader_kwargs)
                     self.llm_build_stats.build_steps_info = build_infos[0]
 
                 else:  # single-gpu
-
-                    with ModelLoader(self.llm_args,
-                                     tokenizer=self.llm_args.tokenizer,
-                                     workspace=self.workspace.name,
-                                     llm_build_stats=self.llm_build_stats
-                                     ) as model_loader:
-
+                    with ModelLoader(**model_loader_kwargs) as model_loader:
                         model_loader(self.get_engine_dir())
 
                 release_gc()
@@ -1339,17 +1325,16 @@ class CachedModelLoader:
     @staticmethod
     def _node_build_task(
         llm_args: LlmArgs,
-        tokenizer: Optional[TokenizerBase] = None,
-        dtype: str = 'auto',
+        workspace: Optional[str | tempfile.TemporaryDirectory] = None,
+        llm_build_stats: Optional['LlmBuildStats'] = None,
         engine_dir: Optional[Path] = None,
     ):
         if MPINodeState.is_initialized():
             raise RuntimeError("The MPI node is already initialized.")
 
-        with ModelLoader(
-                llm_args,
-                tokenizer=tokenizer,
-        ) as model_loader:
+        with ModelLoader(llm_args,
+                         workspace=workspace,
+                         llm_build_stats=llm_build_stats) as model_loader:
             model_loader(engine_dir=engine_dir)
             return model_loader.llm_build_stats.build_steps_info
 

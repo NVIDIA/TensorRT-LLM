@@ -16,9 +16,9 @@
 
 #include "explicitDraftTokensLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
@@ -30,9 +30,7 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::kernels::speculative_decoding;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 template <typename T>
@@ -86,7 +84,7 @@ void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<ExplicitDraftTokensSetupParams>(baseSetupParams);
-    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
     auto randomSeedDevicePtr = bufferCast<uint64_t>(*mRandomSeedsDevice);
     auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
 
@@ -137,7 +135,7 @@ void ExplicitDraftTokensLayer<T>::fillContextBuffers(
     params.outputTemperatures = bufferCast<T>(*setupParams.temperatures);
     params.inputTemperatures = bufferCastOrNull<float>(mTemperatureDevice);
     params.curandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
-    params.batchSlots = bufferCastOrNull<SizeType32>(batchSlots);
+    params.batchSlots = bufferCast<SizeType32>(*batchSlots);
     params.batchSize = batchSize;
 
     params.checkParams();
@@ -281,7 +279,7 @@ void ExplicitDraftTokensLayer<T>::packAcceptedPaths(
     auto numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
     auto numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
     auto pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);
-    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots.value());
+    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
     auto bestPathIndicesSlotsPtr = bufferCastOrNull<SizeType32>(mBestPathIndicesSlots);
     auto lastDraftIndicesSlotsPtr = bufferCastOrNull<SizeType32>(mLastDraftIndicesSlots);
 
@@ -301,5 +299,4 @@ void ExplicitDraftTokensLayer<T>::packAcceptedPaths(
 template class ExplicitDraftTokensLayer<float>;
 template class ExplicitDraftTokensLayer<half>;
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

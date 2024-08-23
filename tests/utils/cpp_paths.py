@@ -45,7 +45,7 @@ def engine_path(resource_path: _pl.Path) -> _pl.Path:
 def get_base_model_spec() -> model_spec.ModelSpec:
     model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
     model_spec_obj.use_gpt_plugin().set_kv_cache_type(
-        model_spec.KVCacheType.PAGED).use_packed_input()
+        _tb.KVCacheType.PAGED).use_packed_input()
     return model_spec_obj
 
 

@@ -119,6 +119,7 @@ public:
         case runtime::MemoryType::kGPU: return c10::kCUDA;
         case runtime::MemoryType::kCPU: [[fallthrough]];
         case runtime::MemoryType::kPINNED: [[fallthrough]];
+        case runtime::MemoryType::kPINNEDPOOL: [[fallthrough]];
         default: return c10::kCPU;
         }
     }

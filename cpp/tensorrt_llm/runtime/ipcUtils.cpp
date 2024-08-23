@@ -29,7 +29,7 @@ namespace tensorrt_llm::runtime
 
 namespace
 {
-bool setPeerAccess(WorldConfig const& worldConfig, bool enable)
+bool canAccessPeer(WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const srcDevice = worldConfig.getDevice();
@@ -49,20 +49,6 @@ bool setPeerAccess(WorldConfig const& worldConfig, bool enable)
             TLLM_LOG_INFO("cudaDeviceCanAccessPeer failed for device: %d peerDevice: %d", srcDevice, destDevice);
             TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
             return false;
-        }
-
-        if (enable)
-        {
-            cudaDeviceEnablePeerAccess(destDevice, 0);
-        }
-        else
-        {
-            cudaDeviceDisablePeerAccess(destDevice);
-        }
-        auto const error = cudaGetLastError();
-        if (error != cudaErrorPeerAccessAlreadyEnabled && error != cudaErrorPeerAccessNotEnabled)
-        {
-            TLLM_CUDA_CHECK(error);
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -147,7 +133,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const isP2pSupported = setPeerAccess(worldConfig, true);
+    auto const isP2pSupported = canAccessPeer(worldConfig);
 
     auto const tpSize = worldConfig.getTensorParallelism();
     auto const bufferSize = tpSize

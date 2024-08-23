@@ -13,14 +13,17 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import llama_model_path
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client():
     llm = LLM(llama_model_path)
     kv_cache_config = KvCacheConfig()
 
     app_instance = LlmServer(llm, kv_cache_config)
     client = TestClient(app_instance.app)
-    return client
+    yield client
+
+    del llm
+    del app_instance.llm
 
 
 def test_generate(client):

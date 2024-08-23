@@ -42,7 +42,7 @@ __global__ void acceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType 
 {
     for (auto batchIdx = static_cast<SizeType32>(threadIdx.x); batchIdx < batchSize; batchIdx += blockDim.x)
     {
-        auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+        auto const batchSlot = batchSlots[batchIdx];
         auto const numDraftTokens = numsDraftTokens[batchSlot];
 
         auto const contextLength = contextLengths[batchSlot];
@@ -101,7 +101,7 @@ __global__ void acceptDraftTokensByLogitsKernel(T const* draftProbs, T* targetPr
     auto const draftTokenIdx = blockIdx.y;
     auto const batchIdx = bid / beamWidth;
     auto const beamIdx = bid % beamWidth;
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     auto const batchSlotBeamWidth = batchSlot * beamWidth + beamIdx;
 
     auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
@@ -114,32 +114,40 @@ __global__ void acceptDraftTokensByLogitsKernel(T const* draftProbs, T* targetPr
     auto const logitsOffset = (batchSlot * maxDraftTokens + draftTokenIdx) * beamWidth * vocabSize;
     auto const draftProbsBatch = draftProbs + logitsOffset;
     auto const targetProbsBatch = targetProbs + logitsOffset;
+    auto const vocabSizePadded = static_cast<SizeType32>((vocabSize + blockDim.x - 1) / blockDim.x) * blockDim.x;
 
-    SizeType32 rejected = 0;
-    auto vocabSizePadded = static_cast<SizeType32>((vocabSize + blockDim.x - 1) / blockDim.x) * blockDim.x;
+    struct Candidate candidate;
+    __shared__ float threshold;
+    if (threadIdx.x == 0)
+    {
+        threshold = randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold;
+    }
+    __syncthreads();
 
     for (auto vIdx = static_cast<SizeType32>(threadIdx.x); vIdx < vocabSizePadded;
          vIdx += static_cast<SizeType32>(blockDim.x))
     {
-        if (rejected > 0)
-        {
-            break;
-        }
-
-        // FIXME(nkorobov): We compare probability distributions, but it might make sense to compare probabilities of
-        // the selected tokens based on the https://arxiv.org/pdf/2302.01318.pdf
         bool const pred = vIdx < vocabSize;
-        auto const threshold
-            = pred ? (randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold) : 0.f;
         auto const targetProb = pred ? static_cast<float>(targetProbsBatch[vIdx]) : 1.f;
         auto const draftProb = pred ? static_cast<float>(draftProbsBatch[vIdx]) : 0.f;
 
-        rejected = __syncthreads_count(targetProb < threshold * draftProb);
+        if (draftProb > candidate.maxProb)
+        {
+            candidate.maxProb = draftProb;
+            candidate.rateQP = pred ? targetProb / draftProb : 0.f;
+        }
     }
+    __syncthreads();
+
+    typedef cub::BlockReduce<Candidate, 1024> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage reduce_buffer;
+    Candidate candidate_global = BlockReduce(reduce_buffer).Reduce(candidate, reduce_op);
+    __syncthreads();
+
     if (threadIdx.x == 0)
     {
         finished[draftTokenIdx * maxBatchSize * beamWidth + batchSlotBeamWidth]
-            = rejected > 0 ? FinishedState::skipDecoding() : FinishedState::empty();
+            = candidate_global.rateQP < threshold ? FinishedState::skipDecoding() : FinishedState::empty();
     }
 }
 
@@ -151,7 +159,7 @@ __global__ void correctAcceptedStatesAndLogits(T const* draftProbs, T* targetPro
     auto const bid = blockIdx.x;
     auto const batchIdx = bid / beamWidth;
     auto const beamIdx = bid % beamWidth;
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     auto const batchSlotBeamWidth = batchSlot * beamWidth + beamIdx;
     auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
 

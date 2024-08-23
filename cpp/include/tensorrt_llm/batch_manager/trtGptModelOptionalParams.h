@@ -45,7 +45,8 @@ public:
         std::optional<SizeType32> maxNumTokens = std::nullopt,
         executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{},
         executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
-        = executor::ExtendedRuntimePerfKnobConfig{})
+        = executor::ExtendedRuntimePerfKnobConfig{},
+        std::optional<executor::DebugConfig> debugConfig = std::nullopt)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
@@ -59,6 +60,7 @@ public:
         , maxNumTokens(maxNumTokens)
         , schedulerConfig{schedulerConfig}
         , extendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
+        , debugConfig{std::move(debugConfig)}
     {
     }
 
@@ -70,17 +72,26 @@ public:
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
-            executorConfig.getExtendedRuntimePerfKnobConfig())
+            executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig())
     {
     }
 
     bool operator==(TrtGptModelOptionalParams const& other) const
     {
-        return kvCacheConfig == other.kvCacheConfig && enableTrtOverlap == other.enableTrtOverlap
-            && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
-            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig
-            && gpuWeightsPercent == other.gpuWeightsPercent
-            && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig;
+        return kvCacheConfig == other.kvCacheConfig                                 //
+            && enableTrtOverlap == other.enableTrtOverlap                           //
+            && deviceIds == other.deviceIds                                         //
+            && normalizeLogProbs == other.normalizeLogProbs                         //
+            && enableChunkedContext == other.enableChunkedContext                   //
+            && decodingConfig == other.decodingConfig                               //
+            && gpuWeightsPercent == other.gpuWeightsPercent                         //
+            && maxBeamWidth == other.maxBeamWidth                                   //
+            && maxBatchSize == other.maxBatchSize                                   //
+            && maxNumTokens == other.maxNumTokens                                   //
+            && schedulerConfig == other.schedulerConfig                             //
+            && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig //
+            && debugConfig == other.debugConfig                                     //
+            ;
     }
 
     friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
@@ -100,6 +111,7 @@ public:
     std::optional<SizeType32> maxNumTokens;
     executor::SchedulerConfig schedulerConfig;
     executor::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig;
+    std::optional<executor::DebugConfig> debugConfig;
 };
 
 } // namespace tensorrt_llm::batch_manager

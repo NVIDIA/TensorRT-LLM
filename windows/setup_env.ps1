@@ -181,10 +181,10 @@ if (-not ($skipTRT)) {
         Write-Output "Grabbing TensorRT..."
         $ProgressPreference = 'SilentlyContinue'
         New-Item -Path .\TensorRT -ItemType Directory
-        Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.2.0/zip/TensorRT-10.2.0.19.Windows.win10.cuda-12.5.zip' -OutFile .\TensorRT\trt.zip
+        Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.3.0/zip/TensorRT-10.3.0.26.Windows.win10.cuda-12.5.zip' -OutFile .\TensorRT\trt.zip
         Expand-Archive -Path .\TensorRT\trt.zip -DestinationPath .\TensorRT\
         Remove-Item -Path .\TensorRT\trt.zip -Force
-        $trtPath = Join-Path $TRT_BASE TensorRT-10.2.0.19
+        $trtPath = Join-Path $TRT_BASE TensorRT-10.3.0.26
         Write-Output "TensorRT installed at ${trtPath}"
 
         $trtSubPaths = @{

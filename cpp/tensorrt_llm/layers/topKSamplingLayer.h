@@ -44,7 +44,7 @@ public:
 
 protected:
     bool mNormalizeLogProbs{true};
-    runtime::SizeType32 mWorkspaceSize{0};
+    size_t mWorkspaceSize{0};
     runtime::SizeType32 mRuntimeMaxTopK{0};
     TensorPtr mRuntimeTopKDevice;
     TensorPtr mRuntimeTopPDevice;

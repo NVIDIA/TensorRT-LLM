@@ -22,7 +22,7 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   find_package(MPI REQUIRED)
   message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
   message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
@@ -269,7 +269,7 @@ set(TRTLLM_LINK_LIBS
     runtime_src
     ${DECODER_SHARED_TARGET})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 

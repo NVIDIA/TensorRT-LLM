@@ -32,6 +32,7 @@ import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
 
@@ -197,8 +198,9 @@ class WhisperDecoding:
             ['gpt_attention_plugin'],
             remove_input_padding=self.decoder_config['plugin_config']
             ['remove_input_padding'],
-            paged_kv_cache=self.decoder_config['plugin_config']
-            ['paged_kv_cache'],
+            kv_cache_type=KVCacheType.PAGED
+            if self.decoder_config['plugin_config']['paged_kv_cache'] == True
+            else KVCacheType.CONTINUOUS,
             has_position_embedding=self.
             decoder_config['has_position_embedding'],
             dtype=self.decoder_config['dtype'],

@@ -198,12 +198,21 @@ public:
     std::shared_ptr<DecodingSetupParams> decodingParams;
 };
 
-class LookaheadSetupParams : public DecodingSetupParams
+struct LookaheadSetupParams : public DecodingSetupParams
 {
-public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
     std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen] on cpu
-    std::optional<std::vector<uint64_t>> randomSeed;            // [1] or [batchSize] on cpu
     std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1 or batchSize] on cpu
+
+    //! see LookaheadDecodingOutputs::generationLengths
+    TensorPtr generationLengths;
+    //! see LookaheadDecodingOutputs::positionOffsets
+    TensorPtr positionOffsets;
+    //! see LookaheadDecodingOutputs::attentionPackedMasks
+    TensorPtr attentionPackedMasks;
+    //! see LookaheadDecodingOutputs::actualGenerationLengths
+    TensorPtr actualGenerationLengths;
 };
 
 class BaseDecodingInputs
@@ -256,8 +265,8 @@ public:
 class DecodingInputs : public BaseDecodingInputs
 {
 public:
-    DecodingInputs(TensorConstPtr endIds, runtime::SizeType32 step = 0, runtime::SizeType32 ite = 0,
-        runtime::SizeType32 localBatchSize = 0, runtime::SizeType32 maxAttentionWindow = 0,
+    DecodingInputs(TensorConstPtr endIds, TensorConstPtr batchSlots, runtime::SizeType32 step = 0,
+        runtime::SizeType32 ite = 0, runtime::SizeType32 localBatchSize = 0, runtime::SizeType32 maxAttentionWindow = 0,
         runtime::SizeType32 sinkTokenLength = 0)
         : BaseDecodingInputs(localBatchSize)
         , endIds{std::move(endIds)}
@@ -265,6 +274,7 @@ public:
         , ite{ite}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
+        , batchSlots{batchSlots}
     {
     }
 
@@ -286,6 +296,8 @@ public:
     std::optional<TensorPtr> logits;
     //! [forwardBatchSize][beamWidth, vocabSizePadded], on gpu
     std::optional<std::vector<TensorPtr>> logitsVec;
+    //! [forwardBatchSize], on pinned memory
+    TensorConstPtr batchSlots;
 
     // optional parameters
     //! the indices of the selected beams, mandatory for beam search, on gpu
@@ -295,8 +307,6 @@ public:
     std::optional<TensorConstPtr> embeddingBias;
     //! [maxBatchSize, maxBeamWidth], on gpu
     std::optional<TensorConstPtr> inputLengths;
-    //! [forwardBatchSize], on pinned memory
-    std::optional<TensorConstPtr> batchSlots;
     //! [maxBatchSize, maxBeamWidth]
     std::optional<TensorConstPtr> finished;
     //! [maxBatchSize], on gpu
@@ -310,9 +320,9 @@ public:
 class SamplingInputs : public DecodingInputs
 {
 public:
-    explicit SamplingInputs(
-        TensorConstPtr endIds, runtime::SizeType32 step, runtime::SizeType32 ite, runtime::SizeType32 localBatchSize)
-        : DecodingInputs{std::move(endIds), step, ite, localBatchSize}
+    explicit SamplingInputs(TensorConstPtr endIds, TensorConstPtr batchSlots, runtime::SizeType32 step,
+        runtime::SizeType32 ite, runtime::SizeType32 localBatchSize)
+        : DecodingInputs{std::move(endIds), std::move(batchSlots), step, ite, localBatchSize}
     {
     }
 
@@ -329,8 +339,8 @@ public:
 class MedusaDecodingInputs : public DecodingInputs
 {
 public:
-    explicit MedusaDecodingInputs(TensorConstPtr endIds, runtime::SizeType32 localBatchSize)
-        : DecodingInputs(std::move(endIds), 0, 0, localBatchSize)
+    explicit MedusaDecodingInputs(TensorConstPtr endIds, TensorConstPtr batchSlots, runtime::SizeType32 localBatchSize)
+        : DecodingInputs(std::move(endIds), std::move(batchSlots), 0, 0, localBatchSize)
     {
     }
 
@@ -348,8 +358,8 @@ public:
 class ExplicitDraftTokensInputs : public DecodingInputs
 {
 public:
-    explicit ExplicitDraftTokensInputs(TensorConstPtr endIds, runtime::SizeType32 batchSize)
-        : DecodingInputs(std::move(endIds), 0, 0, batchSize)
+    explicit ExplicitDraftTokensInputs(TensorConstPtr endIds, TensorConstPtr batchSlots, runtime::SizeType32 batchSize)
+        : DecodingInputs(std::move(endIds), std::move(batchSlots), 0, 0, batchSize)
     {
     }
 
@@ -395,17 +405,11 @@ public:
 
 class LookaheadDecodingInputs : public DecodingInputs
 {
-    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
-
 public:
-    explicit LookaheadDecodingInputs(TensorPtr endIds)
-        : DecodingInputs{std::move(endIds)}
-    //, logits{logits}
+    explicit LookaheadDecodingInputs(TensorConstPtr endIds, TensorConstPtr batchSlots)
+        : DecodingInputs{std::move(endIds), std::move(batchSlots)}
     {
     }
-    // TODO(liweim) reuse base logits and curTokensPerStep.
-    // TensorConstPtr logits;        // [batchSize, maxTokensPerStep, vocabSizePadded] on gpu
-    // TensorConstPtr tokensPerStep; // [maxBatchSize] on gpu
 };
 
 class BaseDecodingOutputs
@@ -524,6 +528,33 @@ public:
     TensorPtr pathsOffsets;
     //! [maxBatchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)]
     TensorPtr packedMasks;
+};
+
+class LookaheadDecodingOutputs : public SpeculativeDecodingOutputs
+{
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+public:
+    explicit LookaheadDecodingOutputs(TensorPtr outputIds)
+        : SpeculativeDecodingOutputs{std::move(outputIds)}
+    {
+    }
+
+    //! for TLLM engine input "spec_decoding_generation_lengths", indicating how many tokens to be generated.
+    //! currently, the 1st step of generation is 1, set at `setup`, others are maxDecodingTokens, set at `forward`.
+    //! [maxBatchSize]
+    TensorPtr generationLengths;
+    //! for TLLM engine input "spec_decoding_position_offsets",
+    //! indicating each token position offset base on the last golden token = 0.
+    //! ABC<D>efgxyz--- // sequence tokens, ABCD: golden; efg, xyz: draft; ---: padding.
+    //! ***<0>123123--- // positionOffsets.
+    //! 012<3>456456--- // positionIds.
+    //! [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionOffsets;
+    //! [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionIds;
+    //! The actual decoding tokens length, for debug and for future.
+    TensorPtr actualGenerationLengths;
 };
 
 class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs

@@ -36,6 +36,45 @@ namespace tensorrt_llm
 
 namespace kernels
 {
+class CopyBeamHypothesesStruct
+{
+public:
+    TokenIdType const* srcOutputIdsCBA; // [BS, BM*2, MSL]
+    TokenIdType* dstOutputIdsCBA;       // [BS, BM*2, MSL]
+    SizeType32 outputIdsNumElts;
+
+    float const* srcLogProbsCBA; // [BS, BM*2, MSL]
+    float* dstLogProbsCBA;       // [BS, BM*2, MSL]
+    SizeType32 logProbsNumElts;
+
+    SizeType32 const* srcSequenceLengthsCBA; // [BS, BM*2]
+    SizeType32* dstSequenceLengthsCBA;       // [BS, BM*2]
+    SizeType32 sequenceLengthsNumElts;
+
+    float const* srcCumLogProbsCBA; // [BS, BM*2]
+    float* dstCumLogProbsCBA;       // [BS, BM*2]
+    SizeType32 cumLogProbsCBANumElts;
+
+    float const* srcNormedScoresCBA; // [BS, BM*2]
+    float* dstNormedScoresCBA;       // [BS, BM*2]
+    SizeType32 normedScoresNumElts;
+
+    SizeType32 const* srcNumBeamsCBA; // [BS]
+    SizeType32* dstNumBeamsCBA;       // [BS]
+    SizeType32 numBeamsNumElts;
+
+    float const* srcMinNormedScoresCBA; // [BS]
+    float* dstMinNormedScoresCBA;       // [BS]
+    SizeType32 minNormedScoresNumElts;
+
+    bool const* srcBatchDones; // [BS]
+    bool* dstBatchDones;       // [BS]
+    SizeType32 batchDonesNumElts;
+
+    float const* srcCumLogProbs; // [BS, BM]
+    float* dstCumLogProbs;       // [BS, BM]
+    SizeType32 cumLogProbsNumElts;
+};
 
 __global__ void gatherTree(gatherTreeParam param)
 {
@@ -490,6 +529,101 @@ void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
     TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
 }
 
+__global__ void copyBeamHypotheses(CopyBeamHypothesesStruct copyStruct)
+{
+    auto const idx = static_cast<SizeType32>(threadIdx.x + blockIdx.x * blockDim.x);
+    auto const stride = static_cast<SizeType32>(blockDim.x * gridDim.x);
+
+    for (SizeType32 ii = idx; ii < copyStruct.outputIdsNumElts; ii += stride)
+    {
+        copyStruct.dstOutputIdsCBA[ii] = copyStruct.srcOutputIdsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.logProbsNumElts; ii += stride)
+    {
+        copyStruct.dstLogProbsCBA[ii] = copyStruct.srcLogProbsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.cumLogProbsNumElts; ii += stride)
+    {
+        copyStruct.dstCumLogProbs[ii] = copyStruct.srcCumLogProbs[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.sequenceLengthsNumElts; ii += stride)
+    {
+        copyStruct.dstSequenceLengthsCBA[ii] = copyStruct.srcSequenceLengthsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.cumLogProbsCBANumElts; ii += stride)
+    {
+        copyStruct.dstCumLogProbsCBA[ii] = copyStruct.srcCumLogProbsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.normedScoresNumElts; ii += stride)
+    {
+        copyStruct.dstNormedScoresCBA[ii] = copyStruct.srcNormedScoresCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.numBeamsNumElts; ii += stride)
+    {
+        copyStruct.dstNumBeamsCBA[ii] = copyStruct.srcNumBeamsCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.minNormedScoresNumElts; ii += stride)
+    {
+        copyStruct.dstMinNormedScoresCBA[ii] = copyStruct.srcMinNormedScoresCBA[ii];
+    }
+
+    for (SizeType32 ii = idx; ii < copyStruct.batchDonesNumElts; ii += stride)
+    {
+        copyStruct.dstBatchDones[ii] = copyStruct.srcBatchDones[ii];
+    }
+}
+
+void invokeCopyBeamHypotheses(DecodingOutput::BeamHypotheses const& src, DecodingOutput::BeamHypotheses const& dst,
+    ITensor& srcCumLogProbs, ITensor& dstCumLogProbs, runtime::CudaStream const& stream, SizeType32 numSMs)
+{
+    CopyBeamHypothesesStruct copyStruct = {};
+
+    copyStruct.srcOutputIdsCBA = bufferCast<TokenIdType>(*(src.outputIdsCBA));
+    copyStruct.dstOutputIdsCBA = bufferCast<TokenIdType>(*(dst.outputIdsCBA));
+    copyStruct.outputIdsNumElts = dst.outputIdsCBA->getSize();
+
+    copyStruct.srcLogProbsCBA = bufferCast<float>(*(src.logProbsCBA));
+    copyStruct.dstLogProbsCBA = bufferCast<float>(*(dst.logProbsCBA));
+    copyStruct.logProbsNumElts = dst.logProbsCBA->getSize();
+
+    copyStruct.srcSequenceLengthsCBA = bufferCast<SizeType32>(*(src.sequenceLengthsCBA));
+    copyStruct.dstSequenceLengthsCBA = bufferCast<SizeType32>(*(dst.sequenceLengthsCBA));
+    copyStruct.sequenceLengthsNumElts = dst.sequenceLengthsCBA->getSize();
+
+    copyStruct.srcCumLogProbsCBA = bufferCast<float>(*(src.cumLogProbsCBA));
+    copyStruct.dstCumLogProbsCBA = bufferCast<float>(*(dst.cumLogProbsCBA));
+    copyStruct.cumLogProbsCBANumElts = dst.cumLogProbsCBA->getSize();
+
+    copyStruct.srcNormedScoresCBA = bufferCast<float>(*(src.normedScoresCBA));
+    copyStruct.dstNormedScoresCBA = bufferCast<float>(*(dst.normedScoresCBA));
+    copyStruct.normedScoresNumElts = dst.normedScoresCBA->getSize();
+
+    copyStruct.srcNumBeamsCBA = bufferCast<SizeType32>(*(src.numBeamsCBA));
+    copyStruct.dstNumBeamsCBA = bufferCast<SizeType32>(*(dst.numBeamsCBA));
+    copyStruct.numBeamsNumElts = dst.numBeamsCBA->getSize();
+
+    copyStruct.srcMinNormedScoresCBA = bufferCast<float>(*(src.minNormedScoresCBA));
+    copyStruct.dstMinNormedScoresCBA = bufferCast<float>(*(dst.minNormedScoresCBA));
+    copyStruct.minNormedScoresNumElts = dst.minNormedScoresCBA->getSize();
+
+    copyStruct.srcBatchDones = bufferCast<bool>(*(src.batchDones));
+    copyStruct.dstBatchDones = bufferCast<bool>(*(dst.batchDones));
+    copyStruct.batchDonesNumElts = dst.batchDones->getSize();
+
+    copyStruct.srcCumLogProbs = bufferCast<float>(srcCumLogProbs);
+    copyStruct.dstCumLogProbs = bufferCast<float>(dstCumLogProbs);
+    copyStruct.cumLogProbsNumElts = srcCumLogProbs.getSize();
+
+    copyBeamHypotheses<<<numSMs, 256, 0, stream.get()>>>(copyStruct);
+}
+
 __global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const nMaxSeqLen)
 {
     for (int i = threadIdx.x; i < nMaxSeqLen; i += blockDim.x)
@@ -512,10 +646,9 @@ __global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* con
     for (auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
          index < batchSize * beamWidth * maxTokensPerStep; index += static_cast<SizeType32>(blockDim.x * gridDim.x))
     {
-        // batchSlots == nullptr both in Python/C++ workflow yet
         // numNewTokens == nullptr when Medusa is disabled
         auto const batchIdx{index / (beamWidth * maxTokensPerStep)};
-        auto const batchSlot{batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx};
+        auto const batchSlot{batchSlots[batchIdx]};
         auto const remainder{index % (beamWidth * maxTokensPerStep)};
         auto const beamIdx{remainder / maxTokensPerStep};
         auto const tokenIdx{remainder % maxTokensPerStep};
@@ -558,7 +691,7 @@ __global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTi
         return;
     }
 
-    auto const batchSlot = batchSlots != nullptr ? batchSlots[batchIdx] : batchIdx;
+    auto const batchSlot = batchSlots[batchIdx];
     if (pos < sequenceLengths[batchSlot])
     {
         auto const batchBeamIdx = batchSlot * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;

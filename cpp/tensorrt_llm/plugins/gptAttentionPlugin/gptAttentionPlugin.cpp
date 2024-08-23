@@ -233,24 +233,24 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    else if (mPagedKVCache
+    else if (useKVCache() && mPagedKVCache
         && (pos == getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS) || pos == getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)))
     {
         // kv cache block offsets
         return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    else if (mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)))
+    else if (useKVCache() && mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)))
     {
         // kv cache pool pointers
         return inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    else if (mKVCacheQuantMode.hasInt8KvCache()
+    else if (useKVCache() && mKVCacheQuantMode.hasInt8KvCache()
         && (!mPagedKVCache && (pos == getIdx(IdxEntry::PAST_KEY_VALUE) || pos == nbInputs + 1)))
     {
         // If use Int8 K/V cache we require I/O KV values to int8
         return (inOut[pos].type == nvinfer1::DataType::kINT8) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    else if (mKVCacheQuantMode.hasFp8KvCache()
+    else if (useKVCache() && mKVCacheQuantMode.hasFp8KvCache()
         && (!mPagedKVCache && (pos == getIdx(IdxEntry::PAST_KEY_VALUE) || pos == nbInputs + 1)))
     {
         // If use FP8 K/V cache we require I/O KV values to FP8
@@ -659,7 +659,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         if (past_key_value_cache != outputs[1])
         {
             auto shape = outputDesc[1].dims;
-            auto const size = std::accumulate(shape.d, shape.d + shape.nbDims, 1, std::multiplies<size_t>{});
+            auto const size
+                = cacheElemSize * std::accumulate(shape.d, shape.d + shape.nbDims, 1, std::multiplies<size_t>{});
             cudaMemcpyAsync(outputs[1], past_key_value_cache, size, cudaMemcpyDeviceToDevice, stream);
         }
     }
@@ -887,7 +888,7 @@ int GPTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 nvinfer1::DataType GPTAttentionPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    TLLM_CHECK(index == 0 || (!mPagedKVCache && index == 1));
+    TLLM_CHECK(index == 0 || (!mPagedKVCache && useKVCache() && index == 1));
     if (index == 0)
     {
         return mFP8ContextFMHA && mEnableContextFMHA ? nvinfer1::DataType::kFP8

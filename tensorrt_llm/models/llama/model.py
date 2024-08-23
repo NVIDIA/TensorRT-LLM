@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional, Union
 
 import transformers
@@ -22,16 +23,17 @@ from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
                            non_gated_version, recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
+from ...logger import logger
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...quantization import W8A8_SQ_PLUGIN_LIST, QuantAlgo
 from ..convert_utils import has_safetensors
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig, check_share_embedding)
 from .config import LLaMAConfig
-from .convert import (load_hf_llama, load_weights_from_hf_by_shard,
-                      load_weights_from_hf_model,
+from .convert import (load_hf_llama, load_weights_from_gptq,
+                      load_weights_from_hf_by_shard, load_weights_from_hf_model,
                       load_weights_from_hf_safetensors,
                       load_weights_from_meta_ckpt)
 
@@ -295,6 +297,16 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
 
         load_by_shard = kwargs.pop('load_by_shard', False)
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is not None:
+            if "vila" in hf_model_or_dir or "llava" in hf_model_or_dir:
+                hf_model_or_dir = load_hf_llama(hf_model_or_dir,
+                                                load_model_on_cpu)
+            elif not (load_by_shard or
+                      (has_safetensors(hf_model_or_dir)
+                       and not quant_config.quant_mode.has_any_quant())):
+                hf_model_or_dir = load_hf_llama(hf_model_or_dir,
+                                                load_model_on_cpu)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -313,21 +325,59 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                **kwargs)
         if config.remove_duplicated_kv_heads:
             config.num_key_value_heads = config.num_key_value_heads // 2
-        if use_preloading:
-            assert not load_by_shard
-            weights = load_weights_from_hf_model(hf_model, config)
-        elif load_by_shard:
-            weights = load_weights_from_hf_by_shard(hf_model_dir, config)
-        elif has_safetensors(
-                hf_model_dir) and not config.quant_mode.has_any_quant():
-            weights = load_weights_from_hf_safetensors(hf_model_dir, config)
-        else:
-            hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
-            weights = load_weights_from_hf_model(hf_model, config)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            custom_dict = {}
+            if "llava" in hf_model_or_dir:
+                custom_dict = {
+                    "transformer": "language_model.model",
+                    "lm_head": "language_model.lm_head"
+                }
+            elif "vila" in hf_model_or_dir:
+                hf_model_dir += "/llm"
+            elif "exaone" in hf_model_or_dir:
+                custom_dict = {
+                    "transformer": "transformer",
+                    "layers": "h",
+                    "vocab_embedding": "wte",
+                    "lm_head": "lm_head",
+                    "ln_f": "ln_f",
+                    "attention": "attn.attention",
+                    "dense": "out_proj",
+                    "gate": "c_fc_1",
+                    "proj": "c_proj",
+                    "fc": "c_fc_0",
+                    "input_layernorm": "ln_1",
+                    "post_layernorm": "ln_2",
+                }
+            if quant_ckpt_path is not None:
+                hf_model_dir = quant_ckpt_path
 
-        check_share_embedding(weights, config)
-        model = cls(config)
-        model.load(weights)
+            # TODO(enweiz): check whether can enable share_embedding_table according to weights
+            if config.share_embedding_table:
+                logger.warning(
+                    f"{cls.__name__} does not support share_embedding_table; setting share_embedding_table=False."
+                )
+                config.share_embedding_table = False
+            model = cls(config)
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            loader.generate_tllm_weights(model)
+        else:
+            if use_preloading:
+                assert not load_by_shard
+                weights = load_weights_from_hf_model(hf_model, config)
+            elif load_by_shard:
+                weights = load_weights_from_hf_by_shard(hf_model_dir, config)
+            elif has_safetensors(
+                    hf_model_dir) and not config.quant_mode.has_any_quant():
+                weights = load_weights_from_hf_safetensors(hf_model_dir, config)
+            elif quant_ckpt_path is not None:
+                weights = load_weights_from_gptq(quant_ckpt_path, config)
+            else:
+                hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
+                weights = load_weights_from_hf_model(hf_model, config)
+            check_share_embedding(weights, config)
+            model = cls(config)
+            model.load(weights)
         return model
 
     def default_plugin_config(self, **kwargs):
@@ -374,22 +424,13 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
-        DEFAULT_MODELOPT_FLOW = [
-            QuantAlgo.W4A16_AWQ, QuantAlgo.FP8, QuantAlgo.W8A8_SQ_PER_CHANNEL,
-            QuantAlgo.W4A8_AWQ
-        ]
-        config = LLaMAConfig.from_hugging_face(hf_model_dir,
-                                               dtype=dtype,
-                                               mapping=mapping,
-                                               quant_config=quant_config,
-                                               **kwargs)
-
-        if quant_config.quant_algo in DEFAULT_MODELOPT_FLOW:
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
-                             dtype=config.dtype,
-                             mapping=config.mapping,
-                             quant_config=config.quantization,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
                              device=device,
                              calib_dataset=calib_dataset,
                              calib_batches=calib_batches,
@@ -397,25 +438,24 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        else:
-            # non-modelopt, the legacy TRT-LLM native quantization algorithm:
-            # sq, int4/int8 weights only, int8 kv cache
-            NATIVE_QUANT_FLOW = [
-                QuantAlgo.W4A16, QuantAlgo.W8A16,
-                QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None
-            ] + W8A8_SQ_PLUGIN_LIST
-            is_valid_native_quant = (quant_config.quant_algo in NATIVE_QUANT_FLOW) and \
-                (quant_config.kv_cache_quant_algo in [QuantAlgo.INT8, None])
-            assert quant_config.quant_algo is not None or quant_config.kv_cache_quant_algo is not None, \
-                "There is no point to call the quantize function if both quant_algo and kv_cache_quant_algo is None"
-            assert is_valid_native_quant, f"Internal error: shall call Modelopt for this quantization {quant_config}"
-
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
             from . import convert
+
+            config = LLaMAConfig.from_hugging_face(hf_model_dir,
+                                                   dtype=dtype,
+                                                   mapping=mapping,
+                                                   quant_config=quant_config,
+                                                   **kwargs)
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
                              device=device,
                              calib_dataset=calib_dataset)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config)

@@ -167,12 +167,9 @@ void DynamicDecodeLayer<T>::forwardAsync(
         mRuntimeMaxSeqLen = maxSeqLen;
     }
 
-    auto batchSlotsHost = params->batchSlots ? params->batchSlots.value()
-                                             : getDefaultBatchSlots(localDecoderDomain.getBatchSize(), *mBufferManager);
-
     mCyclicStep = mCyclicStep % mRuntimeMaxSeqLen;
-    prepareIdsPtrs(
-        baseOutputs, batchSlotsHost, localDecoderDomain.getBatchSize(), localDecoderDomain.getBeamWidth(), maxSeqLen);
+    prepareIdsPtrs(baseOutputs, params->batchSlots, localDecoderDomain.getBatchSize(),
+        localDecoderDomain.getBeamWidth(), maxSeqLen);
 
     for (auto& layer : mLayers)
     {
@@ -180,7 +177,7 @@ void DynamicDecodeLayer<T>::forwardAsync(
     }
 
     // Copy nextIds and transpose logits when needed
-    prepareOutputData(baseOutputs, params, mOutputIdsPtrHost, mParentIdsPtrHost, params->batchSlots.value_or(nullptr),
+    prepareOutputData(baseOutputs, params, mOutputIdsPtrHost, mParentIdsPtrHost, params->batchSlots,
         localDecoderDomain.getBatchSize(), mDecoderDomain.getBatchSize(), localDecoderDomain.getBeamWidth(), maxSeqLen,
         mDecoderDomain.getMaxDecodingTokens(), mCyclicStep, mOutputLogProbs, getStream());
 
@@ -250,7 +247,7 @@ void DynamicDecodeLayer<T>::prepareOutputData(std::shared_ptr<BaseDecodingOutput
     auto const numNewTokens = bufferCastOrNull<SizeType32>(outputs->numNewTokens);
     auto newTokensPtr = bufferCast<TokenIdType>(*outputs->newTokens);
     auto sequenceLengthsPtr = bufferCast<SizeType32>(*outputs->sequenceLength.value());
-    auto batchSlotsPtr = bufferCastOrNull<SizeType32>(batchSlots);
+    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
 
     invokeCopyNextStepIds(newTokensPtr, outputIdsPtrDevice, sequenceLengthsPtr, numNewTokens, batchSlotsPtr, batchSize,
         maxBatchSize, beamWidth, maxSeqLen, maxTokensPerStep, stream);

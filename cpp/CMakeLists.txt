@@ -289,7 +289,7 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 find_library(RT_LIB rt)
 
 set_ifndef(ENABLE_MULTI_DEVICE 1)
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   # NCCL dependencies
   set_ifndef(NCCL_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/)
   set_ifndef(NCCL_INCLUDE_DIR /usr/include/)

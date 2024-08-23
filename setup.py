@@ -116,13 +116,17 @@ setup(
             'libs/libtensorrt_llm_nvrtc_wrapper.so',
             'libs/libdecoder_attention.so',
             'bindings.*.so',
-        ]) + ['bindings/*.pyi', 'tools/plugin_gen/templates/*'],
+        ]) + [
+            'bindings/*.pyi', 'tools/plugin_gen/templates/*',
+            'bench/build/benchmark_config.yml'
+        ],
     },
     entry_points={
         'console_scripts': [
             'trtllm-build=tensorrt_llm.commands.build:main',
             'trtllm-prune=tensorrt_llm.commands.prune:main',
             'trtllm-refit=tensorrt_llm.commands.refit:main',
+            'trtllm-bench=tensorrt_llm.commands.bench:main',
         ],
     },
     scripts=['tensorrt_llm/hlapi/trtllm-hlapi-launch'],

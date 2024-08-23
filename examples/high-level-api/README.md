@@ -2,7 +2,18 @@
 We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
 Here we show you a preview of how it works and how to use it.
 
-Note that the APIs are not stable and only support the LLaMA model. We appreciate your patience and understanding as we improve this API.
+Note that the APIs are not stable and we appreciate your patience and understanding as we improve this API.
+
+## HLAPI Supported Model
+* LLaMA (including variants Mistral, Mixtral, InternLM)
+* GPT (including variants Starcoder-1/2, Santacoder)
+* Gemma-1/2
+* Phi-1/2/3
+* ChatGLM (including variants glm-10b, chatglm, chatglm2, chatglm3, glm4)
+* QWen-1/1.5/2
+* Falcon
+* Baichuan-1/2
+* GPT-J
 
 ## Quick start
 

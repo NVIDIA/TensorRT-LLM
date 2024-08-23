@@ -37,16 +37,12 @@ CublasMMWrapper::CublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
 {
 }
 
-CublasMMWrapper::~CublasMMWrapper()
-{
-    mMutex = nullptr;
-}
+CublasMMWrapper::~CublasMMWrapper() {}
 
 CublasMMWrapper::CublasMMWrapper(CublasMMWrapper const& wrapper)
     : mCublasHandle(wrapper.mCublasHandle)
     , mCublasLtHandle(wrapper.mCublasLtHandle)
     , mStream(wrapper.mStream)
-    , mMutex(wrapper.mMutex)
 {
 }
 
@@ -135,8 +131,6 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
     half h_alpha = (half) (f_alpha);
     half h_beta = (half) (f_beta);
 
-    std::lock_guard<std::mutex> lock(*mMutex);
-
     // TODO: default cublas libs
     usingCublasLt = usingCublasLt && (mAType == CUDA_R_16F || mAType == CUDA_R_8F_E4M3);
     bool isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F;
@@ -179,8 +173,6 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
     half h_alpha = (half) f_alpha;
     half h_beta = (half) f_beta;
 
-    std::lock_guard<std::mutex> lock(*mMutex);
-
     int isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F ? 1 : 0;
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void const*>(&f_alpha);
     void const* beta = isFp16ComputeType ? reinterpret_cast<void*>(&h_beta) : reinterpret_cast<void const*>(&f_beta);
@@ -198,7 +190,6 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
     half h_alpha = (half) f_alpha;
     half h_beta = (half) f_beta;
 
-    std::lock_guard<std::mutex> lock(*mMutex);
     bool isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F ? 1 : 0;
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void const*>(&f_alpha);
     void const* beta = isFp16ComputeType ? reinterpret_cast<void*>(&h_beta) : reinterpret_cast<void const*>(&f_beta);

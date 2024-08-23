@@ -23,7 +23,6 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST, mpi_comm
 from tensorrt_llm.functional import AllReduceStrategy, allreduce
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
@@ -106,18 +105,18 @@ def allreduce_benchmark(dtype: str,
             _, start = cuda.cuEventCreate(0)
             _, stop = cuda.cuEventCreate(0)
             runtimes = []
-            with peer_access(mapping):
-                tllm.mpi_barrier()
 
-                for _ in range(10):
-                    cuda.cuEventRecord(start, stream.cuda_stream)
-                    session.run(inputs=feed_dict,
-                                outputs={"output": output},
-                                stream=stream.cuda_stream)
-                    cuda.cuEventRecord(stop, stream.cuda_stream)
-                    torch.cuda.synchronize()
-                    _, ms = cuda.cuEventElapsedTime(start, stop)
-                    runtimes.append(ms)
+            tllm.mpi_barrier()
+
+            for _ in range(10):
+                cuda.cuEventRecord(start, stream.cuda_stream)
+                session.run(inputs=feed_dict,
+                            outputs={"output": output},
+                            stream=stream.cuda_stream)
+                cuda.cuEventRecord(stop, stream.cuda_stream)
+                torch.cuda.synchronize()
+                _, ms = cuda.cuEventElapsedTime(start, stop)
+                runtimes.append(ms)
 
             median_ms = sorted(runtimes)[len(runtimes) // 2]
             assert torch.allclose(output, (input * world_size)**inner_loop)

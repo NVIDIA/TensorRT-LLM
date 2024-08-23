@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/namedTensor.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <algorithm>
@@ -165,6 +166,21 @@ public:
         mLogitsPostProcessor = cb;
     }
 
+    [[nodiscard]] std::optional<executor::LookaheadDecodingConfig> getLookaheadConfig() const
+    {
+        return mLookaheadConfig;
+    }
+
+    void setLookaheadConfig(executor::LookaheadDecodingConfig config)
+    {
+        mLookaheadConfig = config;
+    }
+
+    void clearLookaheadConfig()
+    {
+        mLookaheadConfig = std::nullopt;
+    }
+
     std::optional<LogitsPostProcessor> getLogitsPostProcessor()
     {
         return mLogitsPostProcessor;
@@ -282,6 +298,7 @@ protected:
     bool mIsStreaming;
     TensorMap mInputTensors;
     std::optional<LogitsPostProcessor> mLogitsPostProcessor;
+    std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig;
 };
 
 class InferenceRequest : public GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr, NamedTensor>

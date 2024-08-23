@@ -20,8 +20,7 @@ from .attention import (Attention, AttentionMaskType, AttentionParams,
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
-from .linear import (ColumnLinear, Linear, ParallelLMHead, QKVColumnLinear,
-                     RowLinear)
+from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
 from .moe import MOE, MoeConfig
@@ -36,8 +35,6 @@ __all__ = [
     'ColumnLinear',
     'Linear',
     'RowLinear',
-    'QKVColumnLinear',
-    'ParallelLMHead',
     'AttentionMaskType',
     'PositionEmbeddingType',
     'Attention',

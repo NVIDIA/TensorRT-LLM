@@ -483,7 +483,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 90, "FP8 FMHA cannot be enabled on Pre-Hopper Arch.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90, "FP8 FMHA cannot be enabled except on Ada or Hopper Arch.");
     }
 
     TLLM_CHECK(isRoPE() == (rotary_embedding_dim != 0));
@@ -618,9 +618,10 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
         ? max_num_tokens * size_t(local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
+    size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
-    int const NUM_BUFFERS = 15;
+    int const NUM_BUFFERS = 16;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -636,7 +637,8 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     workspaces[11] = qk_buf_float_size;
     workspaces[12] = fp8_qkv_buffer_size;
     workspaces[13] = padding_offset_size;
-    workspaces[14] = fmha_scheduler_counter;
+    workspaces[14] = encoder_padding_offset_size;
+    workspaces[15] = fmha_scheduler_counter;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     return context_workspace_size;
@@ -717,20 +719,23 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     KVBlockArray::DataType* hostKvCacheBlockOffsets = nullptr;
-    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+    if (useKVCache())
     {
-        kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
-            params.cyclic_attention_window_size, params.sink_token_length, params.host_primary_pool_pointer,
-            params.host_secondary_pool_pointer, params.block_offsets);
-        hostKvCacheBlockOffsets = params.host_block_offsets;
-    }
-    else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
-    {
-        using BufferDataType = typename KVCacheBuffer::DataType;
-        kv_cache_buffer = KVLinearBuffer(params.batch_size,
-            isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
-            params.cyclic_attention_window_size, params.sink_token_length, false,
-            reinterpret_cast<BufferDataType*>(params.key_value_cache));
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        {
+            kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
+                sizePerToken, params.cyclic_attention_window_size, params.sink_token_length,
+                params.host_primary_pool_pointer, params.host_secondary_pool_pointer, params.block_offsets);
+            hostKvCacheBlockOffsets = params.host_block_offsets;
+        }
+        else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
+        {
+            using BufferDataType = typename KVCacheBuffer::DataType;
+            kv_cache_buffer = KVLinearBuffer(params.batch_size,
+                isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
+                params.cyclic_attention_window_size, params.sink_token_length, false,
+                reinterpret_cast<BufferDataType*>(params.key_value_cache));
+        }
     }
 
     auto const quant_option = tc::QuantMode::fromDescription();
@@ -792,9 +797,10 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     size_t const fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA && !chunked_context_support
         ? params.batch_size * params.input_seq_length * (local_hidden_units_qo + 2 * local_hidden_units_kv)
         : 0;
-    size_t const padding_offset_size = mEnableContextFMHA
-        ? 0
-        : sizeof(int) * params.batch_size * (isCrossAttention() ? params.cross_qkv_length : params.input_seq_length);
+    size_t const padding_offset_size
+        = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;
+    size_t const encoder_padding_offset_size
+        = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.cross_qkv_length;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     bool const is_qk_buf_float_ = true;
@@ -820,6 +826,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     int* padding_offset = mEnableContextFMHA
         ? nullptr
         : reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, padding_offset_size));
+    int* encoder_padding_offset = (mEnableContextFMHA && !isCrossAttention())
+        ? nullptr
+        : reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, encoder_padding_offset_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
 
@@ -833,12 +842,16 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     decoder_params.seqKVOffsets = cu_kv_seqlens;
     decoder_params.packedMaskRowOffsets = cu_mask_rows;
     decoder_params.paddingOffsets = padding_offset;
+    decoder_params.encoderPaddingOffsets
+        = isCrossAttention() ? encoder_padding_offset : nullptr; // cross attention takes offsets from encoder inputs
     decoder_params.attentionMask = isCrossAttention() ? nullptr : attention_mask; // manually set for cross attn
     // Fixed sequence length offset if not removing the padding (cu_q_seqlens[i] = i * seq_length).
-    decoder_params.seqQLengths = isCrossAttention() ? params.encoder_input_lengths : params.q_seq_lengths;
+    decoder_params.seqQLengths = params.q_seq_lengths;
     decoder_params.seqKVLengths = isCrossAttention() ? params.encoder_input_lengths : params.kv_seq_lengths;
     decoder_params.batchSize = params.batch_size;
-    decoder_params.maxQSeqLength = isCrossAttention() ? params.cross_qkv_length : params.input_seq_length;
+    decoder_params.maxQSeqLength = params.input_seq_length;
+    decoder_params.maxEncoderQSeqLength
+        = isCrossAttention() ? params.cross_qkv_length : 0; // cross attention uses encoder seq length
     decoder_params.removePadding = mRemovePadding;
     decoder_params.attentionWindowSize = params.cyclic_attention_window_size;
     decoder_params.sinkTokenLength = params.sink_token_length;
@@ -1057,7 +1070,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
                 mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, stream);
             invokeAddFusedQKVBiasTranspose((T*) nullptr, k_buf_2_, v_buf_2_, const_cast<T*>(params.cross_qkv),
                 const_cast<T*>(params.qkv_bias), params.encoder_input_lengths,
-                mRemovePadding ? padding_offset : nullptr, params.batch_size, params.cross_qkv_length,
+                mRemovePadding ? encoder_padding_offset : nullptr, params.batch_size, params.cross_qkv_length,
                 params.num_encoder_tokens, mNumHeads, mNumKVHeads, getHeadSize(), mRotaryEmbeddingDim,
                 mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions,
                 position_embedding_type, (float*) nullptr, 0, stream);
@@ -1449,7 +1462,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
 
     // Apply position embedding to the keys in the K cache
     KVLinearBuffer shift_k_cache_buffer;
-    if (mPosShiftEnabled && !isCrossAttention())
+    if (useKVCache() && mPosShiftEnabled && !isCrossAttention())
     {
         shift_k_cache_buffer
             = KVLinearBuffer(batch_beam, params.max_attention_window, sizePerToken, params.cyclic_attention_window_size,

@@ -366,7 +366,7 @@ def test_generate_with_streaming_llm():
     # TODO[chunweiy]: Test with larger size when the underlying support is ready
     build_config = BuildConfig()
     build_config.plugin_config.streamingllm = True
-    kv_cache_config = KvCacheConfig(max_attention_window=64,
+    kv_cache_config = KvCacheConfig(max_attention_window=[64],
                                     sink_token_length=4)
 
     llm = LLM(model=llama_model_path,
@@ -534,15 +534,13 @@ def test_generate_with_logits_post_processor():
 
 @force_ampere
 def test_generate_block_reuse():
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                      enable_block_reuse=True),
-    )
-
-    # Check the configurations are correctly set
-    assert llm.args.build_config.plugin_config.use_paged_context_fmha is True
-    assert llm.args.build_config.plugin_config.paged_kv_cache is True
+    build_config = BuildConfig()
+    build_config.plugin_config._use_paged_context_fmha = True
+    build_config.plugin_config._paged_kv_cache = True
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                            enable_block_reuse=True),
+              build_config=build_config)
 
     sampling_params = SamplingParams(max_new_tokens=6)
 
@@ -555,3 +553,4 @@ def test_generate_block_reuse():
 
 if __name__ == '__main__':
     test_llm_loading_from_hf()
+    test_llm_generate_async()

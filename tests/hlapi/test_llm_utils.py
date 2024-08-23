@@ -137,11 +137,12 @@ def test_ConfigArbitor_multi_configs_perf_conflict():
     plugin_config = PluginConfig()
     kv_cache_config = KvCacheConfig()
 
+    old_paged_kv_cache = plugin_config.paged_kv_cache
     arb(plugin_config=plugin_config, kv_cache_config=kv_cache_config)
 
     assert plugin_config.use_paged_context_fmha == True  # perf0 is disabled
     assert kv_cache_config.enable_block_reuse == True
-    assert plugin_config.paged_kv_cache == True  # perf0 is disabled
+    assert plugin_config.paged_kv_cache == old_paged_kv_cache  # perf0 is disabled
 
 
 def test_ConfigArbitor_perf_fallback():
@@ -178,7 +179,7 @@ def test_ModelLoader():
     temp_dir = tempfile.TemporaryDirectory()
 
     def build_engine():
-        model_loader = ModelLoader(args, tokenizer=tokenizer)
+        model_loader = ModelLoader(args)
         engine_dir = model_loader(engine_dir=Path(temp_dir.name))
         assert engine_dir
         return engine_dir
@@ -188,7 +189,7 @@ def test_ModelLoader():
     args.setup()
     assert args.model_format is _ModelFormatKind.TLLM_ENGINE
     print(f'engine_dir: {args.model}')
-    model_loader = ModelLoader(args, tokenizer=tokenizer)
+    model_loader = ModelLoader(args)
     engine_dir = model_loader()
     assert engine_dir == args.model
 
@@ -199,7 +200,7 @@ def test_CachedModelLoader():
     args.enable_build_cache = True
     args.setup()
     stats = LlmBuildStats()
-    model_loader = CachedModelLoader(args, stats)
+    model_loader = CachedModelLoader(args, llm_build_stats=stats)
     engine_dir = model_loader()
     assert engine_dir
     assert engine_dir.exists() and engine_dir.is_dir()
