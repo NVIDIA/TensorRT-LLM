@@ -4,7 +4,7 @@
 
 ```{note}
 The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.10.0) for the most stable experience.
+We recommend checking out the [v0.11.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.11.0) for the most stable experience.
 ```
 
 **Prerequisites**
@@ -52,7 +52,7 @@ We recommend checking out the [v0.10.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.10.0 --extra-index-url https://pypi.nvidia.com
+  pip install tensorrt_llm==0.11.0 --extra-index-url https://pypi.nvidia.com
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.
