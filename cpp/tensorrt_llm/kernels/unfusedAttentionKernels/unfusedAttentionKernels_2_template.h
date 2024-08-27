@@ -373,7 +373,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
         {
             // The index of the token in the batch.
             int const global_token_idx = local_token_idx
-                + (variable_sequence_length ? params.cu_seq_lens[batch_idx] : batch_idx * params.max_input_seq_len);
+                + ((variable_sequence_length && params.remove_padding) ? params.cu_seq_lens[batch_idx]
+                                                                       : batch_idx * params.max_input_seq_len);
             int const cache_seq_len = params.cache_seq_lens[batch_idx];
             int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
             // Chunked attention: takes past_kv_sequence_length into consideration.
@@ -688,8 +689,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
          local_token_idx < seq_len_loop_end; local_token_idx += TOKENS_PER_BLOCK * gridDim.x)
     {
         // The index of the token in the batch.
-        int const global_token_offset
-            = variable_sequence_length ? params.cu_seq_lens[batch_idx] : batch_idx * params.max_input_seq_len;
+        int const global_token_offset = (variable_sequence_length && params.remove_padding)
+            ? params.cu_seq_lens[batch_idx]
+            : batch_idx * params.max_input_seq_len;
         int const cache_seq_len = params.cache_seq_lens[batch_idx];
         int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
         // Chunked attention: takes past_kv_sequence_length into consideration.

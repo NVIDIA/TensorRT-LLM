@@ -57,7 +57,7 @@ def main():
     else:
         print("Downloading the model:")
         model = AutoModel.from_pretrained(model_name, use_safetensors=True)
-
+    model = model.half()  # compatible with openai's checkpoint
     config = model.config
     model_dims = {
         'n_mels': config.num_mel_bins,

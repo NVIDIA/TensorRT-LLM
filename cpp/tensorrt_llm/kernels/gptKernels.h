@@ -122,14 +122,24 @@ struct BuildDecoderInfoParams
     // The fmha tile counter ptr (set to 0 before fmha).
     uint32_t* fmhaTileCounter;
 
+    // Scales for fmha only.
+    // The scale to dequant Qkv input.
+    float const* dequantScaleQkv;
+    // The scale to quant O output.
+    float const* quantScaleO;
+    // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
+    float fmhaHostBmm1Scale;
+    // The scale after fmha bmm1.
+    float* fmhaBmm1Scale;
+    // The scale after fmha bmm2.
+    float* fmhaBmm2Scale;
+
     // The number of sequences in the batch.
     int batchSize;
     // The maximum query length of a sequence for Decoder (max_input_length), N for ctx phase, 1 for gen phase.
     int maxQSeqLength;
     // The maximum query length of a sequence for Encoder, for cross attention (cross_qkv_length).
     int maxEncoderQSeqLength;
-    // Whether remove the input padding or not.
-    bool removePadding;
     // The kv cache capacity.
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
@@ -184,7 +194,6 @@ struct BuildDecoderInfoParams
         ss << "batchSize: " << batchSize << std::endl;
         ss << "maxQSeqLength: " << maxQSeqLength << std::endl;
         ss << "maxEncoderQSeqLength: " << maxEncoderQSeqLength << std::endl;
-        ss << "removePadding: " << std::boolalpha << removePadding << std::endl;
         ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
         ss << "sinkTokenLength: " << sinkTokenLength << std::endl;
         ss << "numTokens: " << numTokens << std::endl;

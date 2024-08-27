@@ -448,7 +448,7 @@ class LlmArgs:
 
     @property
     def model_dir(self) -> Path:
-        assert self.is_local_model
+        assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
         return self.model
 
     @property
@@ -1019,10 +1019,11 @@ class ModelLoader:
             # this will download only once when multiple MPI processes are running
             model_dir = download_hf_model(self.llm_args.model,
                                           revision=self.llm_args.revision)
+            print_colored(f"Downloaded model to {model_dir}\n", 'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.llm_args.model = Path(self._model_dir)  # mark as a local model
-        print_colored(f"Downloaded model to {self._model_dir}\n", 'grey')
+        assert self.llm_args.is_local_model
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
@@ -1148,7 +1149,8 @@ class ModelLoader:
                                                          truncation_side='left',
                                                          trust_remote_code=True,
                                                          use_fast=True)
-        except:
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer from {model_dir}: {e}")
             return None
 
 
@@ -1225,7 +1227,8 @@ class CachedModelLoader:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
         return (self.llm_args.enable_build_cache or _enable_build_cache) and (
-            self.llm_args.model_format is _ModelFormatKind.HF)
+            self.llm_args.model_format is _ModelFormatKind.HF
+        ) and not self.llm_args.parallel_config.auto_parallel
 
     def _get_engine_cache_stage(self) -> CachedStage:
         '''

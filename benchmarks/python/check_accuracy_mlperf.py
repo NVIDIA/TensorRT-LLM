@@ -9,6 +9,7 @@ import pandas as pd
 from transformers import AutoTokenizer, LlamaTokenizerFast
 
 nltk.download("punkt", quiet=False)
+nltk.download('punkt_tab')
 import argparse
 
 
@@ -25,10 +26,9 @@ ACCURACY_TARGETS = {
         "tokens_per_sample": 294.45 * 0.9
     },
     Model.GPT_J: {
-        "rouge1": 42.9435135,
-        "rouge2": 20.1033765,
-        "rougeL": 29.9581119,
-        # "tokens_per_sample": ??
+        "rouge1": 42.9865 * 0.99,
+        "rouge2": 20.1235 * 0.99,
+        "rougeL": 29.9881 * 0.99,
     }
 }
 
@@ -138,7 +138,6 @@ def main():
         target_texts = get_reference_df(args.dataset)
         model = Model.Llama_v2_70B
         tokenizer = LlamaTokenizerFast.from_pretrained(args.base_model)
-        relaxing_factor = 1.0
     elif args.dataset.lower().endswith(".json"):
         target_texts = get_reference_json(args.dataset)
         model = Model.GPT_J
@@ -147,7 +146,6 @@ def main():
                                                   padding_side="left",
                                                   use_fast=False)
         tokenizer.pad_token = tokenizer.eos_token
-        relaxing_factor = 0.93
     else:
         raise RuntimeError(
             "Dataset expected to be pkl (open-orca) or json (cnn-dailymail)")
@@ -169,7 +167,7 @@ def main():
     print("Targets: ", targets)
 
     for k, _ in targets.items():
-        assert targets[k] * relaxing_factor <= achieved_scores[k]
+        assert targets[k] <= achieved_scores[k]
 
 
 if __name__ == "__main__":

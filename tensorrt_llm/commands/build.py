@@ -107,9 +107,7 @@ def parse_arguments():
         help='It equals to max_batch_size*max_beam_width by default, set this '
         'value as close as possible to the actual number of tokens on your workload. '
         'Note that this argument might be removed in the future.')
-    parser.add_argument('--cp_size', type=int, default=1)
-    parser.add_argument('--tp_size', type=int, default=1)
-    parser.add_argument('--pp_size', type=int, default=1)
+
     parser.add_argument(
         '--max_prompt_embedding_table_size',
         '--max_multimodal_len',
@@ -435,10 +433,7 @@ def main():
 
     kwargs = {
         'logits_dtype': args.logits_dtype,
-        'use_fused_mlp': plugin_config.use_fused_mlp,
-        'cp_size': args.cp_size,
-        'tp_size': args.tp_size,
-        'pp_size': args.pp_size,
+        'use_fused_mlp': args.use_fused_mlp,
         'lora_dir': args.lora_dir,
         'lora_ckpt_source': args.lora_ckpt_source,
         'max_lora_rank': args.max_lora_rank,

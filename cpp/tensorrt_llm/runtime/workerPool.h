@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,16 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
+#include <cassert>
 #include <condition_variable>
-#include <exception>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
-#include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 namespace tensorrt_llm::runtime
 {
@@ -34,120 +33,53 @@ namespace tensorrt_llm::runtime
 class WorkerPool
 {
 public:
-    explicit WorkerPool(std::size_t numWorkers = 1, int device = -1)
-        : mNumWorkers(numWorkers)
-        , mShutdown(false)
-        , mDevice(device)
-    {
-        initThreads();
-    }
+    explicit WorkerPool(std::size_t numWorkers = 1, std::int32_t deviceId = -1);
 
-    ~WorkerPool()
-    {
-        shutdown();
-    }
+    WorkerPool(WorkerPool const&) = delete;
+    WorkerPool(WorkerPool&&) = delete;
+    WorkerPool& operator=(WorkerPool const&) = delete;
+    WorkerPool& operator=(WorkerPool&&) = delete;
+    ~WorkerPool();
 
-    template <typename Function, typename Return = std::invoke_result_t<std::decay_t<Function>>>
-    std::future<Return> enqueue(Function&& task)
+    template <class F>
+    auto enqueue(F&& task) -> std::future<typename std::invoke_result<F>::type>
     {
-        if (mShutdown)
+        using returnType = typename std::invoke_result<F>::type;
+        auto const taskPromise = std::make_shared<std::promise<returnType>>();
         {
-            throw std::runtime_error("WorkerPool is shutdown cannot enqueue new tasks");
+            std::lock_guard<std::mutex> lock(mQueueMutex);
+            mTasks.push(
+                [task = std::forward<F>(task), taskPromise]()
+                {
+                    try
+                    {
+                        if constexpr (std::is_void_v<returnType>)
+                        {
+                            task();
+                            taskPromise->set_value();
+                        }
+                        else
+                        {
+                            taskPromise->set_value(task());
+                        }
+                    }
+                    catch (...)
+                    {
+                        taskPromise->set_exception(std::current_exception());
+                    }
+                });
         }
-
-        auto const taskPromise = std::make_shared<std::promise<Return>>();
-        std::lock_guard<std::mutex> lock(mTasksMutex);
-        mTasks.push(
-            [task = std::forward<Function>(task), taskPromise]()
-            {
-                try
-                {
-                    if constexpr (std::is_void_v<Return>)
-                    {
-                        task();
-                        taskPromise->set_value();
-                    }
-                    else
-                    {
-                        taskPromise->set_value(task());
-                    }
-                }
-                catch (...)
-                {
-                    taskPromise->set_exception(std::current_exception());
-                }
-            });
-        mTasksCv.notify_one();
+        condition.notify_one();
         return taskPromise->get_future();
     }
 
 private:
-    static constexpr size_t kMaxNumWorkers = 128;
-    std::size_t mNumWorkers;
+    std::vector<std::thread> mWorkers;
+    std::queue<std::function<void()>> mTasks;
 
-    std::queue<std::function<void()>> mTasks{};
-    mutable std::mutex mTasksMutex;
-    std::condition_variable mTasksCv;
-
-    std::atomic<bool> mShutdown = false;
-
-    std::thread mThreads[kMaxNumWorkers];
-
-    int mDevice{-1};
-
-    void shutdown()
-    {
-        if (mShutdown)
-        {
-            return;
-        }
-        mShutdown = true;
-        mTasksCv.notify_all();
-        for (std::size_t i = 0; i < mNumWorkers; ++i)
-        {
-            mThreads[i].join();
-        }
-    }
-
-    void initThreads()
-    {
-        if (mNumWorkers > kMaxNumWorkers)
-        {
-            throw std::runtime_error(
-                "numWorker > maxNumWorkers " + std::to_string(mNumWorkers) + " > " + std::to_string(kMaxNumWorkers));
-        }
-        for (std::size_t i = 0; i < mNumWorkers; ++i)
-        {
-            mThreads[i] = std::thread(&WorkerPool::doWork, this);
-        }
-    }
-
-    void doWork()
-    {
-        if (mDevice >= 0)
-        {
-            TLLM_CUDA_CHECK(cudaSetDevice(mDevice));
-        }
-        else
-        {
-            TLLM_LOG_WARNING("WorkerPool did not set cuda device");
-        }
-        while (!mShutdown)
-        {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mTasksMutex);
-                mTasksCv.wait(lock, [this]() { return !mTasks.empty() || mShutdown; });
-                if (mTasks.empty())
-                {
-                    continue;
-                }
-                task = mTasks.front();
-                mTasks.pop();
-            }
-
-            task();
-        }
-    }
+    std::mutex mQueueMutex;
+    std::condition_variable condition;
+    bool stop{};
 };
+
 } // namespace tensorrt_llm::runtime

@@ -186,6 +186,7 @@ public:
     // Hack to init some data for the context phase in the setup.
     TensorPtr randomDataSample; // [maxBatchSize], on gpu
     TensorPtr temperatures;     // [maxBatchSize], on gpu
+    nvinfer1::DataType dtype;   // [1], on cpu
 };
 
 class DynamicDecodeSetupParams : public BaseSetupParams

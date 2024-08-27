@@ -403,6 +403,7 @@ struct BenchInfo
     float firstTokenLatency{};
     std::optional<float> avgGenT2TLatency{};
     bool firstTokenSeen{false};
+    SizeType32 decodingIter{0};
 };
 
 class Recorder
@@ -527,6 +528,7 @@ public:
                     outSeqLen -= inputSeqLen;
                 }
                 mRequestBenchInfos[requestId].outputLength = outSeqLen;
+                mRequestBenchInfos[requestId].decodingIter = response.getResult().decodingIter;
             }
             else
             {
@@ -572,6 +574,7 @@ public:
         std::vector<float> genT2TLatencies;
 
         int totalOutputTokens{0};
+        int totalDecodingIter{0};
         mNumErrorSamples = 0;
         mNumSamples = 0;
         for (auto reqInfo : mRequestBenchInfos)
@@ -580,6 +583,7 @@ public:
             {
                 reqLatencies.push_back(reqInfo.second.latency);
                 totalOutputTokens += reqInfo.second.outputLength;
+                totalDecodingIter += reqInfo.second.decodingIter;
 
                 if (mStreaming)
                 {
@@ -601,6 +605,9 @@ public:
         mTotalLatency = std::chrono::duration<float, std::milli>(mEnd - mStart).count();
         mSeqThroughput = mNumSamples / (mTotalLatency / 1000);
         mTokenThroughput = totalOutputTokens / (mTotalLatency / 1000);
+        mAcceptanceRate = totalDecodingIter
+            ? (static_cast<float>(totalOutputTokens) / static_cast<float>(totalDecodingIter))
+            : 0.0f;
 
         mAvgSeqLatency = std::accumulate(reqLatencies.begin(), reqLatencies.end(), 0.F) / reqLatencies.size();
 
@@ -648,7 +655,8 @@ public:
         printf("\n[BENCHMARK] num_samples %d\n", mNumSamples);
         printf("[BENCHMARK] total_latency(ms) %.2f\n", mTotalLatency);
         printf("[BENCHMARK] seq_throughput(seq/sec) %.2f\n", mSeqThroughput);
-        printf("[BENCHMARK] token_throughput(token/sec) %.2f\n\n", mTokenThroughput);
+        printf("[BENCHMARK] token_throughput(token/sec) %.2f\n", mTokenThroughput);
+        printf("[BENCHMARK] avg_acceptance_rate(tokens/decoding steps) %.2f\n\n", mAcceptanceRate);
 
         printf("[BENCHMARK] avg_sequence_latency(ms) %.2f\n", mAvgSeqLatency);
         printf("[BENCHMARK] max_sequence_latency(ms) %.2f\n", mMaxSeqLatency);
@@ -763,6 +771,7 @@ private:
     float mAvgGenT2TLatency{};
     float mAvgFtLatency{};
     float mTokenThroughput{};
+    float mAcceptanceRate{};
     float mP99SeqLatency{};
     float mP90SeqLatency{};
     float mP50SeqLatency{};

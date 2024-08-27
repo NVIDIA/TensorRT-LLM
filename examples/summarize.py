@@ -204,8 +204,10 @@ def main(args):
             else:
                 if 'qwen' in model_name.lower() and 'qwen2' in model_version:
                     messages = [{
-                        "role": "system",
-                        "content": "You are a helpful assistant."
+                        "role":
+                        "system",
+                        "content":
+                        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
                     }, {
                         "role": "user",
                         "content": curr_text

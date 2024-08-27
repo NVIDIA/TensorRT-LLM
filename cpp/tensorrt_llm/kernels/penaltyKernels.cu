@@ -188,6 +188,15 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
                     }
                 }
             }
+            // do clamp to prevent overflow
+            if (logit > static_cast<float>(-MASK_VAL))
+            {
+                logit = static_cast<float>(-MASK_VAL);
+            }
+            else if (logit < static_cast<float>(MASK_VAL))
+            {
+                logit = static_cast<float>(MASK_VAL);
+            }
             outLogitsPtr[index] = logit;
         }
         else

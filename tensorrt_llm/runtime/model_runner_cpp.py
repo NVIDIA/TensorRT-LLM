@@ -354,28 +354,32 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def gather_generation_logits(self) -> bool:
         return self.model_config.compute_generation_logits
 
-    def generate(self,
-                 batch_input_ids: List[torch.Tensor],
-                 *,
-                 encoder_input_ids: List[torch.Tensor] = None,
-                 sampling_config: Optional[SamplingConfig] = None,
-                 lora_uids: Optional[list] = None,
-                 streaming: bool = False,
-                 stopping_criteria: Optional[StoppingCriteria] = None,
-                 logits_processor: Optional[LogitsProcessor] = None,
-                 max_new_tokens: int = 1,
-                 end_id: int | None = None,
-                 pad_id: int | None = None,
-                 bad_words_list: list[list[int]] | None = None,
-                 stop_words_list: list[list[int]] | None = None,
-                 return_dict: bool = False,
-                 output_sequence_lengths: bool = False,
-                 output_log_probs: bool = False,
-                 output_cum_log_probs: bool = False,
-                 prompt_table: Optional[Union[str, torch.Tensor]] = None,
-                 prompt_tasks: Optional[str] = None,
-                 return_all_generated_tokens: bool = False,
-                 **kwargs) -> Union[torch.Tensor, dict]:
+    def generate(
+            self,
+            batch_input_ids: List[torch.Tensor],
+            *,
+            encoder_input_ids: List[torch.Tensor] = None,
+            encoder_input_features: List[
+                torch.Tensor] = None,  # TODO: add to doc string
+            encoder_output_lengths: List[int] = None,
+            sampling_config: Optional[SamplingConfig] = None,
+            lora_uids: Optional[list] = None,
+            streaming: bool = False,
+            stopping_criteria: Optional[StoppingCriteria] = None,
+            logits_processor: Optional[LogitsProcessor] = None,
+            max_new_tokens: int = 1,
+            end_id: int | None = None,
+            pad_id: int | None = None,
+            bad_words_list: list[list[int]] | None = None,
+            stop_words_list: list[list[int]] | None = None,
+            return_dict: bool = False,
+            output_sequence_lengths: bool = False,
+            output_log_probs: bool = False,
+            output_cum_log_probs: bool = False,
+            prompt_table: Optional[Union[str, torch.Tensor]] = None,
+            prompt_tasks: Optional[str] = None,
+            return_all_generated_tokens: bool = False,
+            **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
         The generation-controlling parameters are set in the sampling_config; it will be set to a default one if not passed.
@@ -384,6 +388,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
         Args:
             batch_input_ids (List[torch.Tensor]):
                 A list of input id tensors. Each tensor is of shape (sequence_length, ).
+            encoder_input_ids (List[torch.Tensor]):
+                A list of encoder input id tensors for encoder-decoder models (optional). Each tensor is of shape (sequence_length, ).
+            encoder_input_features: (List[torch.Tensor]):
+                A list of encoder input feature tensors for multimodal encoder-decoder models (optional). Each tensor is of shape (sequence_length, feature_dim).
+            encoder_output_lengths: (List[int]):
+                A list of encoder output lengths (optional) if encoder output has different length from encoder input (due to convolution down-sampling, etc.)
             sampling_config (SamplingConfig):
                 The sampling configuration to be used as base parametrization for the generation call.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -484,6 +494,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 input_token_ids=input_ids,
                 encoder_input_token_ids=encoder_input_ids_list[i]
                 if encoder_input_ids is not None else None,
+                encoder_output_length=encoder_output_lengths[i]
+                if encoder_output_lengths is not None else None,
+                encoder_input_features=encoder_input_features[i].contiguous()
+                if encoder_input_features is not None else None,
                 max_new_tokens=max_new_tokens,
                 pad_id=pad_id,
                 end_id=end_id,

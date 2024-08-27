@@ -126,6 +126,7 @@ of the different top-k values.
 
 - 0 (NONE) corresponds to: `scales = topk(softmax(routing values))`
 - 1 (RENORM) corresponds to: `scales = softmax(topk(routing values))`
+- 2 (SPARSE_MIXER) corresponds to: `scales = sparsemixer(routing values)`
 
 Mixtral uses `RENORM` mode, this is set as the default. To use a different mode use the `--moe_normalization_mode` flag.
 See [tensorrt_llm/layers/moe.py](../../tensorrt_llm/layers/moe.py#L56) for available values

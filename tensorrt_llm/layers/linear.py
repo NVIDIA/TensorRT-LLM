@@ -301,7 +301,7 @@ class Linear(LinearBase):
         strict_dtype=False,
         pad_lda=0,
         prefer_managed_weight=True,
-        is_qkv=True,
+        is_qkv=False,
     ):
         super().__init__(
             local_in_features=in_features,

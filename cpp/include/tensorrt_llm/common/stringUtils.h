@@ -97,7 +97,7 @@ inline std::string arr2str(T* arr, size_t size, char const* delim = kDefaultDeli
 }
 
 template <typename T>
-inline std::string vec2str(std::vector<T> vec, char const* delim = kDefaultDelimiter)
+inline std::string vec2str(std::vector<T> const& vec, char const* delim = kDefaultDelimiter)
 {
     return arr2str(vec.data(), vec.size(), delim);
 }

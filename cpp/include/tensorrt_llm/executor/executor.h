@@ -326,6 +326,9 @@ public:
     /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
     /// after every streaming step.
     /// @param priority Sets the execution priority of this request.
+    /// @param encoderInputFeatures Encoder input features for multimodal models.
+    /// @param encoderOutputLength Encoder output length if encoder input and output have different lengths (due to
+    /// convolution down-sampling, etc.)
     Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -339,7 +342,9 @@ public:
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
-        std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt);
+        std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
+        std::optional<Tensor> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderOutputLength = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -370,6 +375,8 @@ public:
     [[nodiscard]] PriorityType getPriority() const;
     [[nodiscard]] bool getReturnAllGeneratedTokens() const;
     [[nodiscard]] std::optional<ContextPhaseParams> const& getContextPhaseParams() const;
+    [[nodiscard]] std::optional<Tensor> getEncoderInputFeatures() const;
+    [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -389,6 +396,8 @@ public:
     void setPriority(PriorityType priority);
     void setReturnAllGeneratedTokens(bool returnAllGeneratedTokens);
     void setContextPhaseParams(ContextPhaseParams contextPhaseParams);
+    void setEncoderInputFeatures(Tensor encoderInputFeatures);
+    void setEncoderOutputLength(SizeType32 encoderOutputLength);
 
 private:
     friend class Serialization;
@@ -428,6 +437,9 @@ struct Result
 
     /// @brief The params of the context phase.
     std::optional<ContextPhaseParams> contextPhaseParams;
+
+    /// @brief The decoding iterations it takes.
+    SizeType32 decodingIter{0};
 };
 
 /// @brief Class that holds either an error or a result
@@ -727,42 +739,6 @@ private:
     // size in bytes to use for host cache
     std::optional<size_t> mHostCacheSize;
 };
-
-/// @brief Configuration class for the speculative decoding.
-// struct LookaheadDecodingConfig
-//{
-//     LookaheadDecodingConfig(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
-//
-//     explicit LookaheadDecodingConfig()
-//         : LookaheadDecodingConfig(1, 1, 0)
-//     {
-//     }
-//
-//     bool operator==(LookaheadDecodingConfig const& other) const;
-//     [[nodiscard]] std::tuple<SizeType32 const, SizeType32 const, SizeType32 const> get() const;
-//     [[nodiscard]] SizeType32 getWindowSize() const;
-//     [[nodiscard]] SizeType32 getNgramSize() const;
-//     [[nodiscard]] SizeType32 getVerificationSetSize() const;
-//
-//     /// @brief return <maxDecodingTokens, maxPathLen, maxDraftTokens, maxDraftPathLen>
-//     std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResource() const;
-//
-//     /// @brief return true when `this` can be executed on resources defined by `that`
-//     bool isLE(LookaheadDecodingConfig const& that) const;
-//
-//     /// @brief return true when the parameter combination is valid.
-//     static bool isLegal(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize) noexcept;
-//
-// private:
-//     friend class Serialization;
-//
-//     // Number of NGrams in lookahead branch per step.
-//     SizeType32 mWindowSize;
-//     // Number of tokens per NGram.
-//     SizeType32 mNgramSize;
-//     // Number of NGrams in verification branch per step.
-//     SizeType32 mVerificationSetSize;
-// };
 
 /// @brief Configuration class for the decoding.
 class DecodingConfig

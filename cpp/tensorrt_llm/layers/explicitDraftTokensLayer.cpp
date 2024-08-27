@@ -116,31 +116,28 @@ void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
     // Setup penalties.
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
 
+    // Set decoder dtype to WAR the lack of bf16 support in decoder.
+    if (!mDecoderDtype)
+    {
+        mDecoderDtype = setupParams->dtype;
+    }
+
     fillBuffers(setupParams->temperature, DefaultDecodingParams::getTemperature(), mTemperature, mTemperatureDevice,
         batchSlots, getLimitsPenalty(DecodingPenaltyType::Temperature), "temperature penalty");
 
-    fillContextBuffers(batchSize, batchSlots, *setupParams);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-void ExplicitDraftTokensLayer<T>::fillContextBuffers(
-    SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& setupParams)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    FillContextExplicitDraftTokensParams<T> params;
-    params.randDataSample = bufferCast<T>(*setupParams.randomDataSample);
-    params.outputTemperatures = bufferCast<T>(*setupParams.temperatures);
-    params.inputTemperatures = bufferCastOrNull<float>(mTemperatureDevice);
-    params.curandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
-    params.batchSlots = bufferCast<SizeType32>(*batchSlots);
-    params.batchSize = batchSize;
-
-    params.checkParams();
-
-    invokeFillContextBuffers(params, getStream());
+    // Dispatch context buffer fill
+    if (mDecoderDtype == nvinfer1::DataType::kFLOAT)
+    {
+        fillContextBuffers<float>(batchSize, batchSlots, *setupParams);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kHALF)
+    {
+        fillContextBuffers<half>(batchSize, batchSlots, *setupParams);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kBF16)
+    {
+        fillContextBuffers<__nv_bfloat16>(batchSize, batchSlots, *setupParams);
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -160,7 +157,18 @@ void ExplicitDraftTokensLayer<T>::forwardAsync(
     convertPackedMask(*outputs, *inputs);
 
     // Slice output ids, pos ids, next draft tokens.
-    splitInputDataToBatchSlots(*outputs, *inputs);
+    if (mDecoderDtype == nvinfer1::DataType::kFLOAT)
+    {
+        splitInputDataToBatchSlots<float>(*outputs, *inputs);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kHALF)
+    {
+        splitInputDataToBatchSlots<half>(*outputs, *inputs);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kBF16)
+    {
+        splitInputDataToBatchSlots<__nv_bfloat16>(*outputs, *inputs);
+    }
 
     // Pack accepted paths for KV cache rewind.
     packAcceptedPaths(*outputs, *inputs);
@@ -172,6 +180,96 @@ template <typename T>
 size_t ExplicitDraftTokensLayer<T>::getWorkspaceSize() const noexcept
 {
     return mWorkspaceDevice->getSizeInBytes();
+}
+
+template <typename T>
+template <typename Dtype>
+void ExplicitDraftTokensLayer<T>::fillContextBuffers(
+    SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& setupParams)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    FillContextExplicitDraftTokensParams<Dtype> params;
+    params.randDataSample = bufferCast<Dtype>(*setupParams.randomDataSample);
+    params.outputTemperatures = bufferCast<Dtype>(*setupParams.temperatures);
+    params.inputTemperatures = bufferCastOrNull<float>(mTemperatureDevice);
+    params.curandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
+    params.batchSlots = bufferCast<SizeType32>(*batchSlots);
+    params.batchSize = batchSize;
+
+    params.checkParams();
+
+    invokeFillContextBuffers(params, getStream());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+template <typename Dtype>
+void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
+    ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const batchSize = inputs.localBatchSize;
+    auto const maxSeqLen = outputs.outputIds->getDimension<-1>();
+
+    ExtractExplicitDraftTokensParams<Dtype> params;
+
+    params.outputIds = bufferCast<TokenIdType>(*outputs.outputIds);
+    params.outputPositionIdsBase = bufferCast<SizeType32>(*outputs.positionIdsBase);
+    params.outputPositionIds = bufferCast<SizeType32>(*outputs.nextDraftPosIds);
+    params.outputNextDraftTokens = bufferCast<TokenIdType>(*outputs.nextDraftTokens);
+    params.unpackedNextDraftTokens = bufferCast<TokenIdType>(*outputs.unpackedNextDraftTokens);
+    params.unpackedNextDraftIndices = bufferCast<SizeType32>(*outputs.unpackedNextDraftIndices);
+    params.acceptedLengths = bufferCast<SizeType32>(*outputs.numNewTokens.value());
+    params.nextDraftLengths = bufferCast<SizeType32>(*outputs.nextDraftLengths);
+    params.prevDraftLengths = bufferCast<SizeType32>(*outputs.prevDraftLengths);
+    params.sequenceLengths = bufferCast<SizeType32>(*outputs.sequenceLength.value());
+    params.randDataSample = bufferCast<Dtype>(*outputs.randomDataSample);
+    params.randDataVerification = bufferCast<Dtype>(*outputs.randomDataValidation);
+    params.outputDraftProbs = bufferCast<Dtype>(*outputs.nextDraftProbs);
+    params.outputTemperatures = bufferCast<Dtype>(*outputs.temperatures);
+    params.outputGenerationLengths = bufferCast<SizeType32>(*outputs.generationLengths);
+    params.outputBestPathIndices = bufferCast<SizeType32>(*mBestPathIndicesSlots);
+    params.outputLastDraftIndices = bufferCast<SizeType32>(*mLastDraftIndicesSlots);
+
+    params.batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
+    params.nextDraftTokens = bufferCast<TokenIdType>(*inputs.nextDraftTokens);
+    params.lastDraftTokens = bufferCast<TokenIdType>(*inputs.lastDraftTokens);
+    params.inputUnpackedNextDraftIndices = bufferCast<SizeType32>(*inputs.nextDraftIndices);
+    params.bestPathLengths = bufferCast<SizeType32>(*inputs.bestPathLengths);
+    params.bestPathIndices = bufferCast<SizeType32>(*inputs.bestPathIndices);
+    params.inputPositionIdsBase = bufferCast<SizeType32>(*inputs.positionIdsBase);
+    params.packedPositionIds = bufferCast<SizeType32>(*inputs.packedPosIds);
+    params.nextFlatTokens = bufferCast<TokenIdType>(*inputs.nextFlatTokens);
+    params.nextDraftProbs = bufferCast<Dtype>(*inputs.nextDraftProbs);
+    params.lastGenerationLengths = bufferCastOrNull<SizeType32>(inputs.lastGenerationLengths);
+    params.generationLengthInclusiveSum = bufferCast<SizeType32>(*mGenerationLengthInclusiveSum);
+    params.lastDraftIndices = bufferCast<SizeType32>(*inputs.lastDraftIndices);
+    params.inputTemperatures = bufferCast<float>(*mTemperatureDevice);
+    params.curandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
+    params.batchSize = batchSize;
+    params.numPaths = mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths();
+    params.maxPathLength = mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen();
+    params.maxSeqLen = maxSeqLen;
+    params.vocabSize = mDecoderDomain.getVocabSizePadded();
+    params.numContextRequests = batchSize - inputs.lastDraftTokens->getDimension<0>();
+    params.numGenerationRequests = inputs.lastDraftTokens->getDimension<0>();
+
+    params.checkParams();
+
+    // Copy max generation length
+    mBufferManager->copy(*inputs.maxGenLengthDevice, *outputs.maxGenLengthHost);
+
+    invokeExtractExplicitDraftTokens(params, getStream());
+
+    invokeCopyProbs(params, getStream());
+
+    // Copy generation lengths
+    mBufferManager->copy(*outputs.generationLengths, *outputs.generationLengthsHost);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -197,73 +295,6 @@ void ExplicitDraftTokensLayer<T>::convertPackedMask(
     invokeConvertMaskToPackedMask(batchSize, generationLengthInclusiveSumPtr, maxGenerationLengthPtr, masksDevice,
         batchSlots, mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingDraftTokens(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingTokens(), packedMasksDevice, getStream());
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
-    ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const batchSize = inputs.localBatchSize;
-    auto const maxSeqLen = outputs.outputIds->getDimension<-1>();
-
-    ExtractExplicitDraftTokensParams<T> params;
-
-    params.outputIds = bufferCast<TokenIdType>(*outputs.outputIds);
-    params.outputPositionIdsBase = bufferCast<SizeType32>(*outputs.positionIdsBase);
-    params.outputPositionIds = bufferCast<SizeType32>(*outputs.nextDraftPosIds);
-    params.outputNextDraftTokens = bufferCast<TokenIdType>(*outputs.nextDraftTokens);
-    params.unpackedNextDraftTokens = bufferCast<TokenIdType>(*outputs.unpackedNextDraftTokens);
-    params.unpackedNextDraftIndices = bufferCast<SizeType32>(*outputs.unpackedNextDraftIndices);
-    params.acceptedLengths = bufferCast<SizeType32>(*outputs.numNewTokens.value());
-    params.nextDraftLengths = bufferCast<SizeType32>(*outputs.nextDraftLengths);
-    params.prevDraftLengths = bufferCast<SizeType32>(*outputs.prevDraftLengths);
-    params.sequenceLengths = bufferCast<SizeType32>(*outputs.sequenceLength.value());
-    params.randDataSample = bufferCast<T>(*outputs.randomDataSample);
-    params.randDataVerification = bufferCast<T>(*outputs.randomDataValidation);
-    params.outputDraftProbs = bufferCast<T>(*outputs.nextDraftProbs);
-    params.outputTemperatures = bufferCast<T>(*outputs.temperatures);
-    params.outputGenerationLengths = bufferCast<SizeType32>(*outputs.generationLengths);
-    params.outputBestPathIndices = bufferCast<SizeType32>(*mBestPathIndicesSlots);
-    params.outputLastDraftIndices = bufferCast<SizeType32>(*mLastDraftIndicesSlots);
-
-    params.batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
-    params.nextDraftTokens = bufferCast<TokenIdType>(*inputs.nextDraftTokens);
-    params.lastDraftTokens = bufferCast<TokenIdType>(*inputs.lastDraftTokens);
-    params.inputUnpackedNextDraftIndices = bufferCast<SizeType32>(*inputs.nextDraftIndices);
-    params.bestPathLengths = bufferCast<SizeType32>(*inputs.bestPathLengths);
-    params.bestPathIndices = bufferCast<SizeType32>(*inputs.bestPathIndices);
-    params.inputPositionIdsBase = bufferCast<SizeType32>(*inputs.positionIdsBase);
-    params.packedPositionIds = bufferCast<SizeType32>(*inputs.packedPosIds);
-    params.nextFlatTokens = bufferCast<TokenIdType>(*inputs.nextFlatTokens);
-    params.nextDraftProbs = bufferCast<T>(*inputs.nextDraftProbs);
-    params.lastGenerationLengths = bufferCastOrNull<SizeType32>(inputs.lastGenerationLengths);
-    params.generationLengthInclusiveSum = bufferCast<SizeType32>(*mGenerationLengthInclusiveSum);
-    params.lastDraftIndices = bufferCast<SizeType32>(*inputs.lastDraftIndices);
-    params.inputTemperatures = bufferCast<float>(*mTemperatureDevice);
-    params.curandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
-    params.batchSize = batchSize;
-    params.numPaths = mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths();
-    params.maxPathLength = mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen();
-    params.maxSeqLen = maxSeqLen;
-    params.vocabSize = mDecoderDomain.getVocabSizePadded();
-    params.numContextRequests = batchSize - inputs.lastDraftTokens->getDimension<0>();
-    params.numGenerationRequests = inputs.lastDraftTokens->getDimension<0>();
-
-    params.checkParams();
-
-    // Copy max generation length
-    mBufferManager->copy(*inputs.maxGenLengthDevice, *outputs.maxGenLengthHost);
-
-    invokeExtractExplicitDraftTokens(params, getStream());
-
-    invokeCopyProbs(params, getStream());
-
-    // Copy generation lengths
-    mBufferManager->copy(*outputs.generationLengths, *outputs.generationLengthsHost);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

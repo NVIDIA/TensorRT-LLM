@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-                   add_common_args, load_tokenizer, read_decoder_start_token_id,
+                   add_common_args, load_tokenizer, prepare_enc_dec_inputs,
                    read_model_name, supports_inflight_batching,
                    throttle_generator)
 
@@ -51,6 +51,9 @@ def parse_arguments(args=None):
         help=
         'CSV or Numpy file containing tokenized input. Alternative to text input.',
         default=None)
+    parser.add_argument('--multimodal_input_file',
+                        type=str,
+                        help='Path to multimodal input file.')
     parser.add_argument('--output_csv',
                         type=str,
                         help='CSV file where the tokenized output is stored.',
@@ -98,14 +101,18 @@ def parse_input(tokenizer,
 
     batch_input_ids = []
     if input_file is None:
-        for curr_text in input_text:
-            if prompt_template is not None:
-                curr_text = prompt_template.format(input_text=curr_text)
-            input_ids = tokenizer.encode(curr_text,
-                                         add_special_tokens=add_special_tokens,
-                                         truncation=True,
-                                         max_length=max_input_length)
-            batch_input_ids.append(input_ids)
+        if 'whisper' in model_name.lower():
+            batch_input_ids.append(tokenizer.prefix_tokens)
+        else:
+            for curr_text in input_text:
+                if prompt_template is not None:
+                    curr_text = prompt_template.format(input_text=curr_text)
+                input_ids = tokenizer.encode(
+                    curr_text,
+                    add_special_tokens=add_special_tokens,
+                    truncation=True,
+                    max_length=max_input_length)
+                batch_input_ids.append(input_ids)
     else:
         if input_file.endswith('.csv'):
             with open(input_file, 'r') as csv_file:
@@ -237,18 +244,20 @@ def main(args):
     logger.set_level(args.log_level)
 
     # different handling if encoder-decoder models
-    is_enc_dec = {
+    is_enc_dec = {'encoder', 'decoder'}.issubset({
         name
         for name in os.listdir(args.engine_dir)
         if os.path.isdir(os.path.join(args.engine_dir, name))
-    } == {'encoder', 'decoder'}
+    })
     if is_enc_dec:
         logger.warning(
             "This path is an encoder-decoder model. Using different handling.")
         assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
 
     model_name, model_version = read_model_name(
-        args.engine_dir) if not is_enc_dec else ("", "")
+        args.engine_dir if not is_enc_dec else os.path.
+        join(args.engine_dir, 'encoder'))
+
     if args.tokenizer_dir is None and model_name in DEFAULT_HF_MODEL_DIRS:
         logger.warning(
             "tokenizer_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -269,6 +278,7 @@ def main(args):
     prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
         prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
+
     batch_input_ids = parse_input(tokenizer=tokenizer,
                                   input_text=args.input_text,
                                   prompt_template=prompt_template,
@@ -298,18 +308,16 @@ def main(args):
             args.bad_words, tokenizer)
 
     if is_enc_dec:
-        encoder_input_ids = batch_input_ids
-        decoder_start_token_id = read_decoder_start_token_id(
-            os.path.join(args.engine_dir, "decoder"))
-        decoder_input_ids = [
-            torch.tensor([decoder_start_token_id], dtype=torch.int32)
-            for _ in batch_input_ids
-        ]
+        encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids = prepare_enc_dec_inputs(
+            batch_input_ids, model_name, args.engine_dir,
+            args.multimodal_input_file)
 
     input_lengths = [x.size(0) for x in decoder_input_ids
                      ] if is_enc_dec else [x.size(0) for x in batch_input_ids]
-    encoder_input_lengths = [x.size(0)
-                             for x in encoder_input_ids] if is_enc_dec else None
+
+    encoder_input_lengths = [
+        x.size(0) for x in (encoder_input_features or encoder_input_ids)
+    ] if is_enc_dec else None
 
     if not args.use_py_session and not supports_inflight_batching(
             os.path.join(args.engine_dir, "decoder") if is_enc_dec else args.
@@ -387,6 +395,10 @@ def main(args):
             batch_input_ids=decoder_input_ids
             if is_enc_dec else batch_input_ids,
             encoder_input_ids=encoder_input_ids if is_enc_dec else None,
+            encoder_input_features=encoder_input_features
+            if is_enc_dec else None,
+            encoder_output_lengths=encoder_output_lengths
+            if is_enc_dec else None,
             max_new_tokens=args.max_output_len,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,
@@ -470,7 +482,7 @@ def main(args):
                          output_cum_log_probs_npy=args.output_cum_log_probs_npy,
                          output_log_probs_npy=args.output_log_probs_npy)
 
-    if args.run_profiling:
+    if args.run_profiling:  # support profiling
         ite = 10
         # warmup
         for _ in range(ite):

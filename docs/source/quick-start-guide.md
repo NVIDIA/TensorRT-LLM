@@ -129,30 +129,13 @@ curl -X POST localhost:8000/v2/models/ensemble/generate -d \
 We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
 Here we show you a preview of how it works and how to use it.
 
-Note that the APIs are not stable and only support the few models. We appreciate your patience and understanding as we improve this API.
+Note that the APIs are not stable and only support the [few models](https://nvidia.github.io/TensorRT-LLM/high-level-api-examples/introduction.html#hlapi-supported-model). We appreciate your patience and understanding as we improve this API.
 
 Here is a simple example to show how to use the HLAPI with TinyLlama.
-```python
-from tensorrt_llm import LLM, SamplingParams
-
-llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
-]
-
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-
-outputs = llm.generate(prompts, sampling_params)
-
-# Print the outputs.
-for output in outputs:
-    prompt = output.prompt
-    generated_text = output.outputs[0].text
-    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+```{eval-rst}
+.. literalinclude:: ../../examples/high-level-api/quickstart_example.py
+    :language: python
+    :linenos:
 ```
 
 ## Next Steps

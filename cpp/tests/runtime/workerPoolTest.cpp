@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/workerPool.h"
 
 #include <gtest/gtest.h>
+#include <random>
 
 namespace tensorrt_llm::runtime
 {
@@ -26,13 +27,13 @@ TEST(WorkerPool, basic)
     WorkerPool pool(2);
 
     auto fn = []() { return 12345; };
-    auto resultFuture = pool.enqueue<std::function<int()>, int>(std::move(fn));
+    auto resultFuture = pool.enqueue(fn);
 
     auto fn2 = []() { return 12.345f; };
-    auto f2 = pool.enqueue<std::function<float()>, float>(std::move(fn2));
+    auto f2 = pool.enqueue(fn2);
 
     auto fn3 = []() { return 40.78f; };
-    auto f3 = pool.enqueue<std::function<float()>, float>(std::move(fn3));
+    auto f3 = pool.enqueue(fn3);
 
     auto r1 = resultFuture.get();
     auto r2 = f2.get();
@@ -68,4 +69,46 @@ TEST(WorkerPool, voidReturn)
     EXPECT_EQ(returnVal2, 10002);
     EXPECT_EQ(returnVal3, 10003);
 }
+
+class WorkerPoolTest : public ::testing::TestWithParam<std::tuple<int, int>>
+{
+protected:
+    void SetUp() override
+    {
+        mNumTasks = std::get<0>(GetParam());
+        mNumWorkers = std::get<1>(GetParam());
+        pool = std::make_unique<WorkerPool>(mNumWorkers);
+    }
+
+    int mNumTasks;
+    int mNumWorkers;
+    std::unique_ptr<WorkerPool> pool;
+};
+
+TEST_P(WorkerPoolTest, ScheduleTasks)
+{
+    std::vector<std::future<void>> futures;
+    std::random_device randomDevice;
+    std::mt19937 generator(randomDevice());
+    std::uniform_int_distribution<> distribution(1, 5);
+
+    for (int i = 0; i < mNumTasks; ++i)
+    {
+        futures.push_back(
+            pool->enqueue([&]() { std::this_thread::sleep_for(std::chrono::milliseconds(distribution(generator))); }));
+    }
+
+    for (auto& f : futures)
+    {
+        f.get();
+    }
+
+    // This is a smoke test to try and catch threading and synchronization issues by stress testing. No assertion.
+}
+
+INSTANTIATE_TEST_SUITE_P(WorkerPoolTests, WorkerPoolTest,
+    ::testing::Combine(::testing::Values(1, 2, 4, 8, 16, 32, 64, 128), // Range for number of tasks
+        ::testing::Values(1, 2, 4, 8, 16, 32, 64, 128)                 // Range for number of workers
+        ));
+
 } // namespace tensorrt_llm::runtime

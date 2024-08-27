@@ -310,7 +310,7 @@ private:
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<T>> mExplicitDraftTokensLayer;
+    std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<typename T::LayerType>> mExplicitDraftTokensLayer;
 
     ExplicitDraftTokensDummyNetwork mNetwork;
 
@@ -334,6 +334,17 @@ public:
         DraftLettersVec const& nextDraftLetters, DraftLettersVec const& lastDraftLetters, SamplingParams& params);
 };
 
-using FloatAndHalfTypes = testing::Types<float, half>;
+template <typename T, typename U>
+struct TypePair
+{
+    using LayerType = T;
+    using DataType = U;
+};
+
+#ifdef ENABLE_BF16
+using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>, TypePair<half, __nv_bfloat16>>;
+#else
+using TestTypes = testing::Types<TypePair<float, float>, TypePair<half, half>>;
+#endif // ENABLE_BF16
 
 } // namespace tensorrt_llm::tests::layers

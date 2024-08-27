@@ -1,3 +1,5 @@
+import logging
+import math
 from pathlib import Path
 
 
@@ -18,15 +20,21 @@ def generate_examples():
 
     # Source paths
     script_dir = root_dir / "examples/high-level-api"
-    script_paths = sorted(script_dir.glob("*.py"))
+    script_paths = sorted(
+        script_dir.glob("*.py"),
+        # The autoPP example should be at the end since it is a preview example
+        key=lambda x: math.inf if 'llm_auto_parallel' in x.stem else 0)
 
     # Destination paths
     doc_dir = root_dir / "docs/source/high-level-api-examples"
     doc_paths = [doc_dir / f"{path.stem}.rst" for path in script_paths]
 
+    black_list = {'__init__.py', 'quickstart_example.py'}
+
     # Generate the example docs for each example script
     for script_path, doc_path in zip(script_paths, doc_paths):
-        if script_path.name == '__init__.py':
+        if script_path.name in black_list:
+            logging.warning(f"Skipping HLAPI file: {script_path.name}")
             continue
         script_url = f"https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/high-level-api/{script_path.name}"
 

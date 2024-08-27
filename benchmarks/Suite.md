@@ -13,6 +13,9 @@ TensorRT-LLM provides a packaged benchmarking utility that is accessible via the
 - [`meta-llama/Meta-Llama-3-8B`](https://huggingface.co/meta-llama/Meta-Llama-3-8B)
 - [`meta-llama/Meta-Llama-3-70B`](https://huggingface.co/meta-llama/Meta-Llama-3-70B)
 - [`EleutherAI/gpt-j-6b`](https://huggingface.co/EleutherAI/gpt-j-6b)
+- [`mistralai/Mistral-7B-v0.1`](https://huggingface.co/mistralai/Mistral-7B-v0.1)
+- [`mistralai/Mixtral-8x7B-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
+
 
 #### Support Quantization Modes
 
@@ -43,20 +46,20 @@ For this quick start guide, we will focus on running a short max throughput benc
 of 128:128. In order to run the benchmark from start to finish simply run the following commands:
 
 ```shell
-python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1400 > /tmp/synthetic_128_128.txt
+python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000 > /tmp/synthetic_128_128.txt
 trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
-trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine-path /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
 ```
 
 And that's it! Once the benchmark completes, a summary will be printed with summary metrics.
 
-```
+```shell
 ===========================================================
 = ENGINE DETAILS
 ===========================================================
 Model:                  meta-llama/Llama-2-7b-hf
 Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-TensorRT-LLM Version:   0.12.0.dev2024073000
+TensorRT-LLM Version:   0.12.0
 Dtype:                  float16
 KV Cache Dtype:         FP8
 Quantization:           FP8
@@ -135,7 +138,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 128/128 for [Llama-2-7b](https://huggingface.co/meta-llama/Llama-2-7b), simply run:
 
 ```shell
-benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > $PATH_TO_DATASET
+benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
 ```
 
 You can pipe the above command to a file to reuse the same dataset, or simply pipe its output to the
@@ -148,16 +151,78 @@ build a pre-configured engine for one of the supported ISL:OSL combinations, you
 using the dataset you generated with `prepare_dataset.py` to build an FP8 quantized engine:
 
 ```shell
-trtllm-bench --model $HF_MODEL_NAME build --dataset $PATH_TO_DATASET --quantization FP8
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
 ```
 
-or manually set a max sequence length thatL you plan to run with specifically:
+or manually set a max sequence length that you plan to run with specifically:
 
 ```shell
-trtllm-bench --model $HF_MODEL_NAME build --max_seq_len $MAX_SEQ_LEN --quantization FP8
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --max_seq_len 256 --quantization FP8
 ```
 
-The engine in this case will be written to the `/tmp/$HF_MODEL_NAME/tp_1_pp_1/` directory.
+Looking a little closer, the `build` sub-command
+will perform a lookup and build an engine using those reference settings. The
+look up table directly corresponds to the performance table found in our
+[Performance Overview](../docs/source/performance/perf-overview.md#throughput-measurements). The
+output of the `build` sub-command looks similar to the snippet below (for `meta-llama/Llama-2-7b-hf`):
+
+```shell
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
+[TensorRT-LLM] TensorRT-LLM version: 0.12.0
+[08/12/2024-19:13:06] [TRT-LLM] [I] Found dataset.
+[08/12/2024-19:13:07] [TRT-LLM] [I]
+===========================================================
+= DATASET DETAILS
+===========================================================
+Max Input Sequence Length:      128
+Max Output Sequence Length:     128
+Max Sequence Length:    256
+Number of Sequences:    3000
+===========================================================
+
+
+[08/12/2024-19:13:07] [TRT-LLM] [I] Set multiple_profiles to True.
+[08/12/2024-19:13:07] [TRT-LLM] [I] Set use_paged_context_fmha to True.
+[08/12/2024-19:13:07] [TRT-LLM] [I] Set use_fp8_context_fmha to True.
+[08/12/2024-19:13:07] [TRT-LLM] [I]
+===========================================================
+= ENGINE BUILD INFO
+===========================================================
+Model Name:             meta-llama/Llama-2-7b-hf
+Workspace Directory:    /tmp
+Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+
+===========================================================
+= ENGINE CONFIGURATION DETAILS
+===========================================================
+Max Sequence Length:            256
+Max Batch Size:                 4096
+Max Num Tokens:                 8192
+Quantization:                   FP8
+===========================================================
+
+Loading Model: [1/3]    Downloading HF model
+Downloaded model to /data/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9
+Time: 0.115s
+Loading Model: [2/3]    Loading HF model to memory
+current rank: 0, tp rank: 0, pp rank: 0
+Time: 60.786s
+Loading Model: [3/3]    Building TRT-LLM engine
+Time: 163.331s
+Loading model done.
+Total latency: 224.232s
+[TensorRT-LLM][INFO] Engine version 0.12.0 found in the config file, assuming engine(s) built by new builder API.
+
+<snip verbose logging>
+
+[08/12/2024-19:17:09] [TRT-LLM] [I]
+
+===========================================================
+ENGINE SAVED: /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+===========================================================
+```
+
+The engine in this case will be written to `/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1` (the end of the log).
 
 ### Running a Max Throughput Benchmark
 
@@ -175,111 +240,49 @@ list of logits. Otherwise, tokenize the `prompt` with as specified by `--model $
 3. Submit the dataset to the TensorRT-LLM `Executor` API at as fast of a rate as possible (offline mode).
 4. Wait for all requests to return, compute statistics, then report out results.
 
-To run the benchmarker, run the following with the engine and dataset generated above:
+To run the benchmarker, run the following with the [engine](#building-a-benchmark-engine) and
+[dataset](#preparing-a-dataset) generated above:
 
-```
-trtllm-bench --model $HF_MODEL_NAME throughput --dataset $PATH_TO_DATASET --engine_dir /tmp/$HF_MODEL_NAME/tp_1_pp_1/
-```
+```shell
+trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+[TensorRT-LLM] TensorRT-LLM version: 0.12.0
+[08/12/2024-19:36:48] [TRT-LLM] [I] Preparing to run throughput benchmark...
+[08/12/2024-19:36:49] [TRT-LLM] [I] Setting up benchmarker and infrastructure.
+[08/12/2024-19:36:49] [TRT-LLM] [I] Ready to start benchmark.
+[08/12/2024-19:36:49] [TRT-LLM] [I] Initializing Executor.
+[TensorRT-LLM][INFO] Engine version 0.12.0 found in the config file, assuming engine(s) built by new builder API.
 
-When the benchmark runs, you will see output similar to the following:
+<snip verbose logging>
 
-```
-Preparing to run throughput benchmark...
-Setting up benchmarker and infrastructure.
-Initializing Throughput Benchmark. [rate=%d req/s]
-Ready to start benchmark.
-Initializing Executor.
-[TensorRT-LLM][INFO] Engine version 0.12.0.dev2024073000 found in the config file, assuming engine(s) built by new builder API.
-[TensorRT-LLM][INFO] Initializing MPI with thread mode 3
-[TensorRT-LLM][INFO] Initialized MPI
-[TensorRT-LLM][INFO] Engine version 0.12.0.dev2024073000 found in the config file, assuming engine(s) built by new builder API.
-[TensorRT-LLM][INFO] MPI size: 1, MPI local size: 1, rank: 0
-[TensorRT-LLM][INFO] Rank 0 is using GPU 0
-[TensorRT-LLM][INFO] TRTGptModel maxNumSequences: 4096
-[TensorRT-LLM][INFO] TRTGptModel maxBatchSize: 4096
-[TensorRT-LLM][INFO] TRTGptModel maxBeamWidth: 1
-[TensorRT-LLM][INFO] TRTGptModel maxSequenceLen: 4098
-[TensorRT-LLM][INFO] TRTGptModel maxDraftLen: 0
-[TensorRT-LLM][INFO] TRTGptModel mMaxAttentionWindowSize: 4098
-[TensorRT-LLM][INFO] TRTGptModel enableTrtOverlap: 0
-[TensorRT-LLM][INFO] TRTGptModel normalizeLogProbs: 1
-[TensorRT-LLM][INFO] TRTGptModel maxNumTokens: 8192
-[TensorRT-LLM][INFO] TRTGptModel maxInputLen: 4097  = maxSequenceLen - 1 since chunked context is enabled
-[TensorRT-LLM][INFO] Capacity Scheduler Policy: GUARANTEED_NO_EVICT
-[TensorRT-LLM][INFO] Context Chunking Scheduler Policy: FIRST_COME_FIRST_SERVED
-[TensorRT-LLM][INFO] Loaded engine size: 6214 MiB
-[TensorRT-LLM][INFO] [MemUsageChange] Allocated 928.77 MiB for execution context memory.
-[TensorRT-LLM][INFO] [MS] Running engine with multi stream info
-[TensorRT-LLM][INFO] [MS] Number of aux streams is 1
-[TensorRT-LLM][INFO] [MS] Number of total worker streams is 2
-[TensorRT-LLM][INFO] [MS] The main stream provided by execute/enqueue calls is the first worker stream
-[TensorRT-LLM][INFO] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +0, now: CPU 0, GPU 6166 (MiB)
-[TensorRT-LLM][INFO] [MS] Running engine with multi stream info
-[TensorRT-LLM][INFO] [MS] Number of aux streams is 1
-[TensorRT-LLM][INFO] [MS] Number of total worker streams is 2
-[TensorRT-LLM][INFO] [MS] The main stream provided by execute/enqueue calls is the first worker stream
-[TensorRT-LLM][INFO] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +0, now: CPU 0, GPU 6166 (MiB)
-[TensorRT-LLM][INFO] Switching optimization profile from: 0 to 1. Please ensure there are no enqueued operations pending in this context prior to switching profiles
-[TensorRT-LLM][INFO] [MS] Running engine with multi stream info
-[TensorRT-LLM][INFO] [MS] Number of aux streams is 1
-[TensorRT-LLM][INFO] [MS] Number of total worker streams is 2
-[TensorRT-LLM][INFO] [MS] The main stream provided by execute/enqueue calls is the first worker stream
-[TensorRT-LLM][INFO] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +0, now: CPU 0, GPU 6166 (MiB)
-[TensorRT-LLM][INFO] Switching optimization profile from: 0 to 2. Please ensure there are no enqueued operations pending in this context prior to switching profiles
-[TensorRT-LLM][INFO] [MS] Running engine with multi stream info
-[TensorRT-LLM][INFO] [MS] Number of aux streams is 1
-[TensorRT-LLM][INFO] [MS] Number of total worker streams is 2
-[TensorRT-LLM][INFO] [MS] The main stream provided by execute/enqueue calls is the first worker stream
-[TensorRT-LLM][INFO] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +0, now: CPU 0, GPU 6166 (MiB)
-[TensorRT-LLM][INFO] Switching optimization profile from: 0 to 3. Please ensure there are no enqueued operations pending in this context prior to switching profiles
-[TensorRT-LLM][INFO] [MS] Running engine with multi stream info
-[TensorRT-LLM][INFO] [MS] Number of aux streams is 1
-[TensorRT-LLM][INFO] [MS] Number of total worker streams is 2
-[TensorRT-LLM][INFO] [MS] The main stream provided by execute/enqueue calls is the first worker stream
-[TensorRT-LLM][INFO] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +0, now: CPU 0, GPU 6166 (MiB)
-[TensorRT-LLM][INFO] Switching optimization profile from: 0 to 4. Please ensure there are no enqueued operations pending in this context prior to switching profiles
-[TensorRT-LLM][INFO] [MS] Running engine with multi stream info
-[TensorRT-LLM][INFO] [MS] Number of aux streams is 1
-[TensorRT-LLM][INFO] [MS] Number of total worker streams is 2
-[TensorRT-LLM][INFO] [MS] The main stream provided by execute/enqueue calls is the first worker stream
-[TensorRT-LLM][INFO] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +0, now: CPU 0, GPU 6166 (MiB)
-[TensorRT-LLM][INFO] Switching optimization profile from: 0 to 5. Please ensure there are no enqueued operations pending in this context prior to switching profiles
-[TensorRT-LLM][INFO] [MemUsageChange] Allocated 1.14 GB GPU memory for runtime buffers.
-[TensorRT-LLM][INFO] [MemUsageChange] Allocated 4.35 GB GPU memory for decoder.
-[TensorRT-LLM][INFO] Memory usage when calculating max tokens in paged kv cache: total: 79.10 GiB, available: 63.62 GiB
-[TensorRT-LLM][INFO] Number of blocks in KV cache primary pool: 4607
-[TensorRT-LLM][INFO] Number of blocks in KV cache secondary pool: 0, onboard blocks to primary memory before reuse: true
-[TensorRT-LLM][INFO] Max KV cache pages per sequence: 65
-[TensorRT-LLM][INFO] Number of tokens per block: 64.
-[TensorRT-LLM][INFO] [MemUsageChange] Allocated 62.99 GiB for max tokens in paged KV cache (294848).
 [TensorRT-LLM][INFO] Executor instance created by worker
-Starting response daemon...Executor started.
-
-Request serving started.
-Starting statistics collection.
-Collecting live stats...
-Benchmark started.
-Request serving stopped.
-Collecting last stats...
-Ending statistics collection.
-Stop received.
-Stopping response parsing.
-Collecting last responses before shutdown.
-Completed request parsing.
-Parsing stopped.
-Request generator successfully joined.
-Statistics process successfully joined.
+[08/12/2024-19:36:58] [TRT-LLM] [I] Starting response daemon...
+[08/12/2024-19:36:58] [TRT-LLM] [I] Executor started.
+[08/12/2024-19:36:58] [TRT-LLM] [I] Request serving started.
+[08/12/2024-19:36:58] [TRT-LLM] [I] Starting statistics collection.
+[08/12/2024-19:36:58] [TRT-LLM] [I] Benchmark started.
+[08/12/2024-19:36:58] [TRT-LLM] [I] Collecting live stats...
+[08/12/2024-19:36:59] [TRT-LLM] [I] Request serving stopped.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Collecting last stats...
+[08/12/2024-19:37:19] [TRT-LLM] [I] Ending statistics collection.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Stop received.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Stopping response parsing.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Collecting last responses before shutdown.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Completed request parsing.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Parsing stopped.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Request generator successfully joined.
+[08/12/2024-19:37:19] [TRT-LLM] [I] Statistics process successfully joined.
+[08/12/2024-19:37:19] [TRT-LLM] [I]
 ===========================================================
 = ENGINE DETAILS
 ===========================================================
 Model:                  meta-llama/Llama-2-7b-hf
 Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-TensorRT-LLM Version:   0.12.0.dev2024073000
+TensorRT-LLM Version:   0.12.0
 Dtype:                  float16
 KV Cache Dtype:         FP8
 Quantization:           FP8
-Max Input Length:       2048
-Max Sequence Length:    4098
+Max Input Length:       256
+Max Sequence Length:    256
 
 ===========================================================
 = WORLD + RUNTIME INFORMATION
@@ -289,28 +292,36 @@ PP Size:                1
 Max Runtime Batch Size: 4096
 Max Runtime Tokens:     8192
 Scheduling Policy:      Guaranteed No Evict
-KV Memory Percentage:   99.0%
-Issue Rate (req/sec):   3.680275266452667e+18
+KV Memory Percentage:   90.0%
+Issue Rate (req/sec):   2.0827970096792666e+19
 ===========================================================
 = STATISTICS
 ===========================================================
 Number of requests:             3000
 Average Input Length (tokens):  128.0
 Average Output Length (tokens): 128.0
-Token Throughput (tokens/sec):  23405.927228471104
-Request Throughput (req/sec):   182.8588064724305
-Total Latency (seconds):        16.406100739
+Token Throughput (tokens/sec):  18886.813971319196
+Request Throughput (req/sec):   147.55323415093122
+Total Latency (seconds):        20.331645167
 ===========================================================
 
-Benchmark Shutdown called!
-Shutting down ExecutorServer.
 [TensorRT-LLM][INFO] Orchestrator sendReq thread exiting
 [TensorRT-LLM][INFO] Orchestrator recv thread exiting
-Executor shutdown.
 [TensorRT-LLM][INFO] Leader sendThread exiting
 [TensorRT-LLM][INFO] Leader recvReq thread exiting
+[TensorRT-LLM][INFO] Refreshed the MPI local session
 ```
 
-> [!WARNING] Some statistics are not reported.
-> There are some statistics that are not reported in the summary (typically as 0.0). These statistics
-> are not available currently.
+## Summary
+
+In summary, the general process for reproducing a benchmark point is as follows:
+
+- Prepare a dataset: `python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH`
+- Build engine: `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH`
+- Benchmark engine: trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR`
+
+where,
+- `$HF_MODEL` is the Huggingface name of a model.
+- `$NUM_REQUESTS` is the number of requests to generate.
+- `$DATASET_PATH` is the path where the dataset was written when preparing the dataset.
+- `$ENGINE_DIR` the engine directory as printed by `trtllm-bench build`.

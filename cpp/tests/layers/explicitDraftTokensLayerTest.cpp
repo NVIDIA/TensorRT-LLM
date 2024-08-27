@@ -641,15 +641,16 @@ void ExplicitDraftTokensLayerTest<T>::SetUp()
 template <typename T>
 void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
 {
-    auto const dataType = TRTDataType<T>::value;
+    using DataType = typename T::DataType;
+    auto const dataType = TRTDataType<DataType>::value;
 
     auto speculativeDecodingModule = std::make_shared<SpeculativeDecodingModule>(mSamplingParams.getMaxDraftPathLen(),
         mSamplingParams.getMaxDecodingDraftTokens(), mSamplingParams.getMaxNumPaths());
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(mSamplingParams.getMaxBatchSize(), 1,
         mSamplingParams.getVocabSize(), mSamplingParams.getVocabSize(), speculativeDecodingModule);
 
-    mExplicitDraftTokensLayer
-        = std::make_shared<tensorrt_llm::layers::ExplicitDraftTokensLayer<T>>(decodingDomain, mBufferManager);
+    mExplicitDraftTokensLayer = std::make_shared<tensorrt_llm::layers::ExplicitDraftTokensLayer<typename T::LayerType>>(
+        decodingDomain, mBufferManager);
 
     // outputs
     mOutputIds = BufferManager::pinnedPool(
@@ -828,6 +829,7 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
 template <typename T>
 void ExplicitDraftTokensLayerTest<T>::setup()
 {
+    using DataType = typename T::DataType;
     // outputs
     trk::invokeFill(*mOutputIds, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mSeqLengths, SizeType32{0}, *mStream);
@@ -835,19 +837,20 @@ void ExplicitDraftTokensLayerTest<T>::setup()
     trk::invokeFill(*mAcceptedLengthCumSum, SizeType32{-1}, *mStream);
     trk::invokeFill(*mOutputNextDraftTokens, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mOutputPositionIdsBase, SizeType32{0}, *mStream);
-    trk::invokeFill(*mRandomDataSample, T{0}, *mStream);
-    trk::invokeFill(*mRandomDataValidation, T{0}, *mStream);
+    trk::invokeFill(*mRandomDataSample, DataType{0}, *mStream);
+    trk::invokeFill(*mRandomDataValidation, DataType{0}, *mStream);
     trk::invokeFill(*mPackedMasks, SizeType32{0}, *mStream);
     trk::invokeFill(*mNextPosIds, SizeType32{0}, *mStream);
     trk::invokeFill(*mOutputUnpackedNextDraftTokens, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mOutputUnpackedNextDraftIndices, SizeType32{0}, *mStream);
     trk::invokeFill(*mEndIds, TokenIdType{-1}, *mStream);
 
-    auto inDraftProbs = BufferRange<T>(*mNextDraftProbs);
+    auto inDraftProbs = BufferRange<DataType>(*mNextDraftProbs);
 
     std::mt19937 gen(42);
     std::uniform_real_distribution<float> distr(0.0, 1.0);
-    std::generate(inDraftProbs.begin(), inDraftProbs.end(), [&gen, &distr]() { return static_cast<T>(distr(gen)); });
+    std::generate(
+        inDraftProbs.begin(), inDraftProbs.end(), [&gen, &distr]() { return static_cast<DataType>(distr(gen)); });
 
     auto batchSlotsPtr = bufferCast<SizeType32>(*mBatchSlots);
     for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
@@ -870,6 +873,7 @@ void ExplicitDraftTokensLayerTest<T>::setup()
     setupParams->temperature = mTemperatures;
     setupParams->randomDataSample = mRandomDataSample;
     setupParams->temperatures = mOutputTemperatures;
+    setupParams->dtype = TRTDataType<DataType>::value;
 
     mExplicitDraftTokensLayer->setup(mSamplingParams.getBatchSize(), 1, mBatchSlots, setupParams);
 
@@ -1045,20 +1049,22 @@ std::vector<int32_t> boolArrayToBitmask(BufferRange<bool>::iterator boolIterator
 template <typename T>
 void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
 {
+    using DataType = typename T::DataType;
     auto const batchSlots = BufferRange<SizeType32>(*mBatchSlots);
 
     // Check generated random data
     {
-        auto const randomDataSample = BufferRange<T>(*mRandomDataSample);
-        auto const randomDataValidation = BufferRange<T>(*mRandomDataValidation);
+        auto const randomDataSample = BufferRange<DataType>(*mRandomDataSample);
+        auto const randomDataValidation = BufferRange<DataType>(*mRandomDataValidation);
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
         {
             auto const batchSlot = batchSlots[bi];
             // Check that all fields are filled with non zero data
-            EXPECT_NE(randomDataSample[batchSlot], T{0}) << " bi: " << bi;
+            EXPECT_NE(randomDataSample[batchSlot], DataType{0}) << " bi: " << bi;
             auto const stride = mSamplingParams.getMaxNumPaths() * mSamplingParams.getMaxDraftPathLen();
             EXPECT_FALSE(std::any_of(randomDataValidation.begin() + batchSlot * stride,
-                randomDataValidation.begin() + (batchSlot + 1) * stride, [](T val) { return val == T{0}; }))
+                randomDataValidation.begin() + (batchSlot + 1) * stride,
+                [](DataType val) { return val == DataType{0}; }))
                 << " bi: " << bi;
         }
     }
@@ -1211,8 +1217,8 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
 
     // Check draft probs
     {
-        auto const outDraftProbs = BufferRange<T>(*mOutputDraftProbs);
-        auto const inDraftProbs = BufferRange<T>(*mNextDraftProbs);
+        auto const outDraftProbs = BufferRange<DataType>(*mOutputDraftProbs);
+        auto const inDraftProbs = BufferRange<DataType>(*mNextDraftProbs);
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
         {
             auto const batchSlot = batchSlots[bi];
@@ -1239,7 +1245,8 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
         {
             auto const batchSlot = batchSlots[bi];
-            EXPECT_EQ(BufferRange<T>(*mOutputTemperatures)[batchSlot], static_cast<T>(1.f / mTemperatures[bi]))
+            EXPECT_EQ(
+                BufferRange<DataType>(*mOutputTemperatures)[batchSlot], static_cast<DataType>(1.f / mTemperatures[bi]))
                 << " bi: " << bi;
         }
     }
@@ -1248,7 +1255,8 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
 template <typename T>
 void ExplicitDraftTokensLayerTest<T>::packData()
 {
-    tksd::PackExplicitDraftTokensParams<T> params;
+    using DataType = typename T::DataType;
+    tksd::PackExplicitDraftTokensParams<DataType> params;
     params.batchSlots = bufferCast<SizeType32>(*mBatchSlots);
     params.cumSumGenerationLengths = bufferCast<SizeType32>(*mCumSumGenerationLengths);
     params.maxGenerationLength = bufferCast<SizeType32>(*mMaxGenerationLength);
@@ -1259,11 +1267,11 @@ void ExplicitDraftTokensLayerTest<T>::packData()
     params.outputGenerationLengths = bufferCast<SizeType32>(*mPackedGenerationLengths);
     params.inputGenerationLengths = bufferCast<SizeType32>(*mSpecDecodingGenerationLengths);
 
-    params.outputRandomDataSample = bufferCast<T>(*mPackedRandomDataSample);
-    params.inputRandomDataSample = bufferCast<T>(*mRandomDataSample);
+    params.outputRandomDataSample = bufferCast<DataType>(*mPackedRandomDataSample);
+    params.inputRandomDataSample = bufferCast<DataType>(*mRandomDataSample);
 
-    params.outputRandomDataValidation = bufferCast<T>(*mPackedRandomDataVerification);
-    params.inputRandomDataValidation = bufferCast<T>(*mRandomDataValidation);
+    params.outputRandomDataValidation = bufferCast<DataType>(*mPackedRandomDataVerification);
+    params.inputRandomDataValidation = bufferCast<DataType>(*mRandomDataValidation);
 
     params.outputNextDraftTokens = bufferCast<TokenIdType>(*mPackedNextDraftTokens);
     params.inputNextDraftTokens = bufferCast<TokenIdType>(*mOutputUnpackedNextDraftTokens);
@@ -1278,11 +1286,11 @@ void ExplicitDraftTokensLayerTest<T>::packData()
     params.outputPositionOffsets = bufferCast<SizeType32>(*mPackedPositionOffsets);
     params.outputPositionIds = bufferCast<SizeType32>(*mPackedPackedPosIds);
 
-    params.outputDraftProbs = bufferCast<T>(*mPackedDraftProbs);
-    params.inputDraftProbs = bufferCast<T>(*mOutputDraftProbs);
+    params.outputDraftProbs = bufferCast<DataType>(*mPackedDraftProbs);
+    params.inputDraftProbs = bufferCast<DataType>(*mOutputDraftProbs);
 
-    params.outputTemperatures = bufferCast<T>(*mPackedTemperatures);
-    params.inputTemperatures = bufferCast<T>(*mOutputTemperatures);
+    params.outputTemperatures = bufferCast<DataType>(*mPackedTemperatures);
+    params.inputTemperatures = bufferCast<DataType>(*mOutputTemperatures);
 
     params.batchSize = mSamplingParams.getBatchSize();
     params.numPaths = mSamplingParams.getMaxNumPaths();
@@ -1313,6 +1321,7 @@ void ExplicitDraftTokensLayerTest<T>::packData()
 template <typename T>
 void ExplicitDraftTokensLayerTest<T>::checkPackResult()
 {
+    using DataType = typename T::DataType;
     auto const batchSlots = BufferRange<SizeType32>(*mBatchSlots);
     auto const maxGenLength = mNetwork.getMaxNextGenerationLength();
     auto const numPackedMasks = static_cast<SizeType32>(divUp(mSamplingParams.getMaxDecodingTokens(), 32));
@@ -1325,22 +1334,24 @@ void ExplicitDraftTokensLayerTest<T>::checkPackResult()
         EXPECT_EQ(BufferRange<SizeType32>(*mPackedGenerationLengths)[bi],
             BufferRange<SizeType32>(*mSpecDecodingGenerationLengths)[batchSlot])
             << "bi: " << bi;
-        EXPECT_EQ(BufferRange<T>(*mPackedRandomDataSample)[bi], BufferRange<T>(*mRandomDataSample)[batchSlot])
+        EXPECT_EQ(
+            BufferRange<DataType>(*mPackedRandomDataSample)[bi], BufferRange<DataType>(*mRandomDataSample)[batchSlot])
             << "bi: " << bi;
-        EXPECT_EQ(BufferRange<T>(*mPackedTemperatures)[bi], BufferRange<T>(*mOutputTemperatures)[batchSlot])
+        EXPECT_EQ(
+            BufferRange<DataType>(*mPackedTemperatures)[bi], BufferRange<DataType>(*mOutputTemperatures)[batchSlot])
             << "bi: " << bi;
 
         for (SizeType32 pi = 0; pi < mSamplingParams.getMaxNumPaths(); ++pi)
         {
             for (SizeType32 ti = 0; ti < mSamplingParams.getMaxDraftPathLen(); ++ti)
             {
-                EXPECT_EQ(bufferCast<T>(*ITensor::at(mPackedRandomDataVerification, {bi, pi, ti}))[0],
-                    bufferCast<T>(*ITensor::at(mRandomDataValidation, {batchSlot, pi, ti}))[0])
+                EXPECT_EQ(bufferCast<DataType>(*ITensor::at(mPackedRandomDataVerification, {bi, pi, ti}))[0],
+                    bufferCast<DataType>(*ITensor::at(mRandomDataValidation, {batchSlot, pi, ti}))[0])
                     << "bi: " << bi << " pi: " << pi << " ti: " << ti;
                 for (SizeType32 vi = 0; vi < mSamplingParams.getVocabSize(); ++vi)
                 {
-                    EXPECT_EQ(bufferCast<T>(*ITensor::at(mPackedDraftProbs, {bi, pi, ti, vi}))[0],
-                        bufferCast<T>(*ITensor::at(mOutputDraftProbs, {batchSlot, pi, ti, vi}))[0])
+                    EXPECT_EQ(bufferCast<DataType>(*ITensor::at(mPackedDraftProbs, {bi, pi, ti, vi}))[0],
+                        bufferCast<DataType>(*ITensor::at(mOutputDraftProbs, {batchSlot, pi, ti, vi}))[0])
                         << "bi: " << bi << " pi: " << pi << " ti: " << ti << " vi: " << vi;
                 }
             }
@@ -1408,10 +1419,13 @@ void ExplicitDraftTokensLayerTest<T>::runTest(std::vector<std::string> const& pr
     checkPackResult();
 }
 
-template class ExplicitDraftTokensLayerTest<float>;
-template class ExplicitDraftTokensLayerTest<half>;
+template class ExplicitDraftTokensLayerTest<TypePair<float, float>>;
+template class ExplicitDraftTokensLayerTest<TypePair<half, half>>;
+#ifdef ENABLE_BF16
+template class ExplicitDraftTokensLayerTest<TypePair<half, __nv_bfloat16>>;
+#endif // ENABLE_BF16
 
-TYPED_TEST_SUITE(ExplicitDraftTokensLayerTest, FloatAndHalfTypes);
+TYPED_TEST_SUITE(ExplicitDraftTokensLayerTest, TestTypes);
 
 TYPED_TEST(ExplicitDraftTokensLayerTest, SimpleTestBS1)
 {
@@ -1556,15 +1570,25 @@ protected:
 
     void TearDown() override {}
 
-    void runTest(
-        SizeType32 batchSize, SizeType32 numPaths, SizeType32 draftLength, bool skipVerification, uint64_t randomSeed)
+    void runTest(SizeType32 batchSize, SizeType32 numPaths, SizeType32 draftLength, bool skipVerification,
+        uint64_t randomSeed, bool batchInit)
     {
         SizeType32* batchSlotsPtr{nullptr};
 
         auto curandState = mBufferManager->gpu(ITensor::makeShape({batchSize, 48}), nvinfer1::DataType::kUINT8);
         auto* curandStatePtr = reinterpret_cast<curandState_t*>(bufferCast<uint8_t>(*curandState));
 
-        tk::invokeCurandInitialize(curandStatePtr, batchSlotsPtr, batchSize, randomSeed, mStream->get());
+        if (batchInit)
+        {
+            auto randomSeeds = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT64);
+            trk::invokeFill(*randomSeeds, static_cast<int64_t>(randomSeed), *mStream);
+            auto* randomSeedsPtr = bufferCast<uint64_t>(*randomSeeds);
+            tk::invokeCurandBatchInitialize(curandStatePtr, batchSlotsPtr, batchSize, randomSeedsPtr, mStream->get());
+        }
+        else
+        {
+            tk::invokeCurandInitialize(curandStatePtr, batchSlotsPtr, batchSize, randomSeed, mStream->get());
+        }
         mStream->synchronize();
 
         tksd::FillRandDataExplicitDraftTokensParams<T> params;
@@ -1605,7 +1629,12 @@ private:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
 };
 
+#ifdef ENABLE_BF16
+using FloatHalfBfloatTypes = testing::Types<float, half, __nv_bfloat16>;
+TYPED_TEST_SUITE(FillRandDataTest, FloatHalfBfloatTypes);
+#else
 TYPED_TEST_SUITE(FillRandDataTest, FloatAndHalfTypes);
+#endif
 
 TYPED_TEST(FillRandDataTest, SimpleTest)
 {
@@ -1616,7 +1645,19 @@ TYPED_TEST(FillRandDataTest, SimpleTest)
 
     uint64_t randomSeed{0};
 
-    this->runTest(batchSize, numPaths, draftLength, skipVerification, randomSeed);
+    this->runTest(batchSize, numPaths, draftLength, skipVerification, randomSeed, false);
+}
+
+TYPED_TEST(FillRandDataTest, BatchInit)
+{
+    SizeType32 constexpr batchSize{3};
+    SizeType32 constexpr numPaths{2};
+    SizeType32 constexpr draftLength{5};
+    bool constexpr skipVerification{false};
+
+    uint64_t randomSeed{42};
+
+    this->runTest(batchSize, numPaths, draftLength, skipVerification, randomSeed, true);
 }
 
 } // namespace tensorrt_llm::tests::layers

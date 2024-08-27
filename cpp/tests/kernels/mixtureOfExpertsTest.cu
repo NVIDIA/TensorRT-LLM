@@ -246,6 +246,8 @@ protected:
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
+    float mSparseMixerEpsilon = 0.2f;
+
     // Default this to true. This only matters for K>2, and so by doing this we will test the fused and unfused paths
     bool mUseDeterminsiticHopperReduce = true;
 
@@ -287,7 +289,7 @@ protected:
         size_t const weight_size = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms;
         // Workspace size
         size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
-            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, {}, mUseLora);
+            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, mNormMode, {}, mUseLora);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -332,7 +334,7 @@ protected:
         }
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, parallelism_config, mUseLora);
+            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, parallelism_config, mUseLora);
 
         auto const stream = mStream->get();
 
@@ -779,7 +781,7 @@ protected:
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            parallelism_config, mNormMode, mUseLora, lora_params, stream);
+            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -805,7 +807,7 @@ protected:
             {
                 if (entry >= num_experts_per_node * tp_rank && entry < num_experts_per_node * (tp_rank + 1))
                     return entry;
-                return (int) mNumExperts;
+                return (int) mNumExperts + entry;
             });
         return result;
     }
@@ -953,9 +955,9 @@ protected:
                 return res;
             });
 
-        for (int64_t token = 0; token < mTotalTokens; token++)
+        for (int64_t token = 0; token < softmax.size(); token += mNumExperts)
         {
-            auto start = softmax.begin() + token * mNumExperts;
+            auto start = softmax.begin() + token;
             auto end = start + mNumExperts;
             auto sum = std::accumulate(start, end, 0.f);
             std::transform(start, end, start, [=](auto in) { return in / sum; });
@@ -966,7 +968,7 @@ protected:
 
     void renormScales(float* probs, int const* experts)
     {
-        if (mNormMode == MOEExpertScaleNormalizationMode::NONE)
+        if (mNormMode != MOEExpertScaleNormalizationMode::RENORMALIZE)
             return;
         float sum = 0;
         for (int k_idx = 0; k_idx < mK; k_idx++)
@@ -980,12 +982,49 @@ protected:
         }
     }
 
+    float sparseMixer(std::vector<float> logits, int token_idx, int k_idx, int expected_expert)
+    {
+        EXPECT_LE(mK, 2);
+        EXPECT_LT(k_idx, mK);
+        EXPECT_LT(token_idx * mNumExperts, logits.size());
+        EXPECT_LE((token_idx + 1) * mNumExperts, logits.size());
+
+        auto start_it = logits.begin() + token_idx * mNumExperts;
+        auto end_it = logits.begin() + (token_idx + 1) * mNumExperts;
+
+        // Mask old maxes and get the kth largest
+        auto max_it = end_it;
+        for (int i = 0; i <= k_idx; i++)
+        {
+            max_it = std::max_element(start_it, end_it);
+            if (i != k_idx)
+            {
+                EXPECT_NE(max_it, end_it);
+                *max_it = -INFINITY;
+            }
+        }
+
+        EXPECT_EQ((max_it - start_it), expected_expert)
+            << "Expected token " << token_idx << " k_idx " << k_idx << " to select expert " << expected_expert;
+
+        std::vector<float> masked;
+        std::transform(start_it, end_it, std::back_inserter(masked),
+            [this, max_it](auto val)
+            {
+                float mask_value = (*max_it - val) / max(abs(val), *max_it);
+                return (mask_value > 2 * mSparseMixerEpsilon) ? -INFINITY : val;
+            });
+        auto output_probs = softmax(masked);
+        return output_probs[expected_expert];
+    }
+
     void compareSoftmax(std::vector<int> const& expected_experts, std::vector<float> const& expected_probs,
         std::vector<float> scale_probs = {})
     {
         if (scale_probs.empty())
             scale_probs = getDataFromDevice(mScaleProbs, mTotalTokens * mK);
         auto softmax_probs = softmax(expected_probs);
+
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
@@ -995,8 +1034,13 @@ protected:
                 int selected_expert = expected_experts[token_id * mK + k_idx];
                 if (selected_expert < mNumExperts) // Ignore 'finished' values
                 {
-                    ASSERT_NEAR(softmax_probs[token_id * mNumExperts + selected_expert],
-                        scale_probs[token_id * mK + k_idx], getTolerance())
+                    float expected_value = softmax_probs[token_id * mNumExperts + selected_expert];
+                    if (mNormMode == tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+                    {
+                        expected_value = sparseMixer(expected_probs, token_id, k_idx, selected_expert);
+                    }
+
+                    ASSERT_NEAR(expected_value, scale_probs[token_id * mK + k_idx], getTolerance())
                         << "Scales mismatched for token: " << token_id << " k: " << k_idx
                         << " selected_expert: " << selected_expert;
                 }
@@ -1022,9 +1066,16 @@ protected:
                 for (int k_idx = 0; k_idx < mK; k_idx++)
                 {
                     int selected_expert = expected_experts[token_id * mK + k_idx];
+
+                    float scale_value = softmax_probs[token_id * mNumExperts + selected_expert];
+                    if (mNormMode == tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+                    {
+                        scale_value = sparseMixer(expected_probs, token_id, k_idx, selected_expert);
+                    }
+
                     sum += float(calcMLPValWithFinalBias(
                                static_cast<float>(input_data[token_id * mHiddenSize + hidden_id]), selected_expert))
-                        * softmax_probs[token_id * mNumExperts + selected_expert];
+                        * scale_value;
                 }
 
                 ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
@@ -1170,6 +1221,13 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteRenormalization)
     this->BasicPermuteTest(3);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, PermuteSparseMixer)
+{
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+}
+
 TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 {
     this->mActType = tensorrt_llm::ActivationType::Geglu;
@@ -1228,7 +1286,7 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
     std::vector<int> map(expected_experts.size());
     auto getInterleavedIndex = [this](int i) { return (i % mK) * mTotalTokens + i / mK; };
     int map_idx = 0;
-    for (int expert = 0; expert <= mNumExperts; expert++)
+    for (int expert = 0; expert < mNumExperts * 2; expert++)
     {
         for (int i = 0; i < map.size(); i++)
         {
@@ -1293,7 +1351,7 @@ void MixtureOfExpertsTest<TypeParam_>::ExpertParallelTest(int k)
             // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
             int const start_expert = i * (mNumExperts / parallelism);
             std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
-                [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
+                [&](int val) { return val >= mNumExperts ? val : val + start_expert; });
             auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, parallelism, i);
             ASSERT_EQ(selected_expert, masked_expected_experts);
 
@@ -1332,6 +1390,13 @@ TYPED_TEST(MixtureOfExpertsTest, ExpertParallelNoBias)
 TYPED_TEST(MixtureOfExpertsTest, ExpertParallelRenorm)
 {
     this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
+    this->ExpertParallelTest();
+    this->ExpertParallelTest(2);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelSparseMixer)
+{
+    this->mNormMode = MOEExpertScaleNormalizationMode::SPARSE_MIXER;
     this->ExpertParallelTest();
     this->ExpertParallelTest(2);
 }
@@ -1451,6 +1516,13 @@ TYPED_TEST(MixtureOfExpertsTest, TensorParallelRenorm)
     this->TensorParallelTest(3);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, TensorParallelSparseMixer)
+{
+    this->mNormMode = MOEExpertScaleNormalizationMode::SPARSE_MIXER;
+    this->TensorParallelTest();
+    this->TensorParallelTest(2);
+}
+
 TYPED_TEST(MixtureOfExpertsTest, TensorParallelGeglu)
 {
     this->mActType = tensorrt_llm::ActivationType::Geglu;
@@ -1523,7 +1595,7 @@ void MixtureOfExpertsTest<TypeParam_>::MixedParallelTest(int k)
                 // Note the index is [0,num_experts_per_node), so we offset the experts by the start for this node
                 int const start_expert = j * (mNumExperts / ep_parallelism);
                 std::transform(selected_expert.begin(), selected_expert.end(), selected_expert.begin(),
-                    [&](int val) { return val == mNumExperts ? mNumExperts : val + start_expert; });
+                    [&](int val) { return val >= mNumExperts ? val : val + start_expert; });
                 auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_parallelism, j);
                 ASSERT_EQ(selected_expert, masked_expected_experts);
 
@@ -1563,6 +1635,13 @@ TYPED_TEST(MixtureOfExpertsTest, MixedParallelNoBias)
 TYPED_TEST(MixtureOfExpertsTest, MixedParallelRenorm)
 {
     this->mNormMode = MOEExpertScaleNormalizationMode::RENORMALIZE;
+    this->MixedParallelTest();
+    this->MixedParallelTest(2);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, MixedParallelSparseMixer)
+{
+    this->mNormMode = MOEExpertScaleNormalizationMode::SPARSE_MIXER;
     this->MixedParallelTest();
     this->MixedParallelTest(2);
 }
@@ -1824,4 +1903,33 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
             }
         }
     }
+}
+
+using MixtureOfExpertsUnitTests = MixtureOfExpertsTest<WeightParams<half, half>>;
+
+TEST_F(MixtureOfExpertsUnitTests, SparseMixerReferenceTest)
+{
+    // Test the sparse mixer reference implementation is doing the correct thing
+    // This makes sure we are testing the correct behaviour
+    this->mNumExperts = 4;
+    this->mK = 2;
+    auto res = this->sparseMixer({1.0f, 1.0f, -INFINITY, -INFINITY}, 0, 0, 0);
+    ASSERT_FLOAT_EQ(res, 0.5f);
+    res = this->sparseMixer({1.0f, 1.0f, -INFINITY, -INFINITY}, 0, 1, 1);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+
+    res = this->sparseMixer({2.0f, 0.0f, -INFINITY, -INFINITY}, 0, 0, 0);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+    res = this->sparseMixer({2.0f, 0.0f, -INFINITY, -INFINITY}, 0, 1, 1);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+
+    res = this->sparseMixer({0.0f, 2.0f, -INFINITY, -INFINITY}, 0, 0, 1);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+    res = this->sparseMixer({0.0f, 2.0f, -INFINITY, -INFINITY}, 0, 1, 0);
+    ASSERT_FLOAT_EQ(res, 1.0f);
+
+    res = this->sparseMixer({1.0f, 1.0f, 1.0f, -INFINITY}, 0, 0, 0);
+    ASSERT_FLOAT_EQ(res, 1.f / 3.f);
+    res = this->sparseMixer({1.0f, 1.0f, 1.0f, -INFINITY}, 0, 1, 1);
+    ASSERT_FLOAT_EQ(res, 0.5f);
 }
