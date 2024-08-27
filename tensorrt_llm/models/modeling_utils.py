@@ -126,7 +126,7 @@ class QuantConfig:
                 QuantAlgo.W8A8_SQ_PER_CHANNEL, QuantAlgo.W4A8_AWQ
         ]:
             return True
-        elif self.quant_algo is None and self.kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST:
+        elif self.quant_algo is None and self.kv_cache_quant_algo == QuantAlgo.FP8:
             return True
         else:
             return False

@@ -133,6 +133,9 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         explicitDraftTokensParams->temperature = mSamplingConfig.temperature;
         explicitDraftTokensParams->randomDataSample = output->explicitDraftTokensBuffers->randomDataSample;
         explicitDraftTokensParams->temperatures = output->explicitDraftTokensBuffers->temperatures;
+        TLLM_CHECK(requestsOpt);
+        // Ignore the dtype from all other requests assuming that it is the same for all.
+        explicitDraftTokensParams->dtype = requestsOpt.value()[0].dtype;
 
         setupParams->decodingParams = explicitDraftTokensParams;
     }

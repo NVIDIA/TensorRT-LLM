@@ -105,7 +105,7 @@ public:
         int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
         nvinfer1::DataType weight_type, nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode,
         bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
-        MOEExpertScaleNormalizationMode normalization_mode, bool force_determinism,
+        MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
         MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
         LoraPluginProfilerPtr lora_profiler, int max_low_rank);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
@@ -166,6 +166,7 @@ private:
     bool mUseBias{};
     MOEParallelismConfig mParallelismConfig{};
     MOEExpertScaleNormalizationMode mNormalizationMode{};
+    float mSparseMixerEpsilon = false;
 
     GemmDims mDims{};
     bool mUseDeterministicKernels = false;

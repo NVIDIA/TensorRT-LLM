@@ -23,6 +23,9 @@
 #else
 #include "3rdparty/cub/cub.cuh"
 #endif
+#if ENABLE_BF16
+#include <cuda_bf16.h>
+#endif // ENABLE_BF16
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
@@ -221,6 +224,10 @@ void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<T> const& par
 
 template void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeFillContextBuffers(FillContextExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeFillContextBuffers(
+    FillContextExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -265,6 +272,10 @@ void invokeFillRandData(FillRandDataExplicitDraftTokensParams<T> const& params, 
 
 template void invokeFillRandData(FillRandDataExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeFillRandData(FillRandDataExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeFillRandData(
+    FillRandDataExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -404,6 +415,10 @@ template void invokeExtractExplicitDraftTokens(
     ExtractExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeExtractExplicitDraftTokens(
     ExtractExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeExtractExplicitDraftTokens(
+    ExtractExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -475,6 +490,9 @@ void invokeCopyProbs(ExtractExplicitDraftTokensParams<T> const& params, cudaStre
 
 template void invokeCopyProbs(ExtractExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeCopyProbs(ExtractExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeCopyProbs(ExtractExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -503,6 +521,10 @@ void invokePackGenerationLengths(PackExplicitDraftTokensParams<T> const& params,
 
 template void invokePackGenerationLengths(PackExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokePackGenerationLengths(PackExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokePackGenerationLengths(
+    PackExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 namespace
 {
@@ -591,6 +613,10 @@ void invokePackExplicitDraftTokens(PackExplicitDraftTokensParams<T> const& param
 
 template void invokePackExplicitDraftTokens(PackExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokePackExplicitDraftTokens(PackExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokePackExplicitDraftTokens(
+    PackExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
 
 template <typename T>
 void invokeCopyProbs(PackExplicitDraftTokensParams<T> const& params, cudaStream_t stream)
@@ -606,4 +632,8 @@ void invokeCopyProbs(PackExplicitDraftTokensParams<T> const& params, cudaStream_
 
 template void invokeCopyProbs(PackExplicitDraftTokensParams<float> const& params, cudaStream_t stream);
 template void invokeCopyProbs(PackExplicitDraftTokensParams<half> const& params, cudaStream_t stream);
+#if ENABLE_BF16
+template void invokeCopyProbs(PackExplicitDraftTokensParams<__nv_bfloat16> const& params, cudaStream_t stream);
+#endif // ENABLE_BF16
+
 } // namespace tensorrt_llm::kernels::speculative_decoding

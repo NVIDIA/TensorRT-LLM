@@ -83,7 +83,9 @@ public:
         bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
         std::optional<RequestIdType> clientId = std::nullopt,
-        executor::PriorityType priority = executor::Request::kDefaultPriority)
+        executor::PriorityType priority = executor::Request::kDefaultPriority,
+        std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderOutputLength = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -123,8 +125,10 @@ public:
         , mDecodingIter(0)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.beamWidth)
+        , mEncoderInputFeatures(std::move(encoderInputFeatures))
+        , mEncoderOutputLength(encoderOutputLength)
     {
-        if (mEncoderTokens.has_value())
+        if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
             mState = REQUEST_STATE_ENCODER_INIT;
         }
@@ -170,6 +174,7 @@ public:
         , mPriority(req.getPriority())
         , mFinishReasons(mSamplingConfig.beamWidth)
         , mContextPhaseParams(req.getContextPhaseParams())
+        , mEncoderOutputLength(req.getEncoderOutputLength())
     {
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && !mReturnAllGeneratedTokens)
         {
@@ -189,10 +194,14 @@ public:
                 "since logits are not. Disabling returnGenerationLogits.");
             mReturnGenerationLogits = false;
         }
-        if (req.getEncoderInputTokenIds())
+
+        if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
         {
             mState = REQUEST_STATE_ENCODER_INIT;
-            mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
+            if (req.getEncoderInputTokenIds().has_value())
+            {
+                mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
+            }
         }
         if (req.getEmbeddingBias())
         {
@@ -254,14 +263,24 @@ public:
             // NOTE: Draft acceptance threshold is stored in mSamplingConfig
         }
 
+        auto const& encoderInputFeatures = req.getEncoderInputFeatures();
+        if (encoderInputFeatures.has_value())
+        {
+            mEncoderInputFeatures = executor::detail::toITensor(encoderInputFeatures.value());
+        }
+        else
+        {
+            mEncoderInputFeatures = std::nullopt;
+        }
+
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt)
     {
-        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderLen() > maxEncoderInputLen.value()),
-            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderLen(),
+        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
+            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
             maxEncoderInputLen.value());
 
         if (mPromptLen > maxInputLen)
@@ -383,12 +402,36 @@ public:
         return mEncoderTokens;
     }
 
-    /// @brief Get the number of input tokens to encoder
-    /// @return The number of encoder input tokens.
-    [[nodiscard]] SizeType32 getEncoderLen() const
+    /// @brief Get length of encoder input (could be tokens or features length)
+    /// @return An integer.
+    [[nodiscard]] SizeType32 getEncoderInputLen() const
     {
-        TLLM_CHECK_WITH_INFO(getEncoderTokens().has_value(), "Encoder tokens are not given");
-        return getEncoderTokens().value()->size();
+        if (mEncoderInputFeatures.has_value())
+        {
+            return getEncoderInputFeatures()->getShape().d[0];
+        }
+        else if (getEncoderTokens().has_value())
+        {
+            return getEncoderTokens().value()->size();
+        }
+        else
+        {
+            TLLM_THROW("GenericLlmRequest::getEncoderInputLen - Do not have encoder length!");
+        }
+    }
+
+    /// @brief Get length of encoder output. Fall back to encoder input length if not present
+    /// @return An integer.
+    [[nodiscard]] SizeType32 getEncoderOutputLen() const
+    {
+        if (mEncoderOutputLength.has_value())
+        {
+            return mEncoderOutputLength.value();
+        }
+        else
+        {
+            return getEncoderInputLen();
+        }
     }
 
     /// @brief Get the draft tokens
@@ -513,7 +556,8 @@ public:
         }
 
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
-        mState = mEncoderTokens.has_value() ? REQUEST_STATE_ENCODER_INIT : REQUEST_STATE_CONTEXT_INIT;
+        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? REQUEST_STATE_ENCODER_INIT
+                                                                     : REQUEST_STATE_CONTEXT_INIT;
         mContextCurrentPosition = 0;
         mContextChunkSize = std::nullopt;
         mSeqSlot.reset();
@@ -716,6 +760,11 @@ public:
         return mEncoderOutputHost;
     }
 
+    [[nodiscard]] TensorPtr const getEncoderInputFeatures() const
+    {
+        return mEncoderInputFeatures.value_or(nullptr);
+    }
+
     void setEncoderOutputHost(TensorPtr encoderOutputHost)
     {
         mEncoderOutputHost = std::move(encoderOutputHost);
@@ -724,7 +773,7 @@ public:
     void allocEncoderOutputHost(SizeType32 encoderHiddenSize, nvinfer1::DataType dataType)
     {
         mEncoderOutputHost = runtime::BufferManager::pinned(
-            runtime::ITensor::makeShape({getEncoderLen(), encoderHiddenSize}), dataType);
+            runtime::ITensor::makeShape({getEncoderOutputLen(), encoderHiddenSize}), dataType);
     }
 
     [[nodiscard]] TensorPtr const& getEncoderOutput() const noexcept
@@ -1091,6 +1140,7 @@ public:
                 }
 
                 result.finishReasons = mFinishReasons;
+                result.decodingIter = mDecodingIter;
 
                 // Update position of last sent response
                 setMaxSentTokenLen(maxNbTokens);
@@ -1195,6 +1245,11 @@ protected:
     executor::PriorityType mPriority;
     std::vector<executor::FinishReason> mFinishReasons;
     std::optional<executor::ContextPhaseParams> mContextPhaseParams;
+
+    std::optional<TensorPtr> mEncoderInputFeatures; // Input features of encoder for multimodal models
+    std::optional<SizeType32>
+        mEncoderOutputLength; // For some models like Whisper, encoder output shape cannot be inferred from encoder
+                              // input shape due to downsampling. Thus this is needed for setting buffer sizes correctly
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)

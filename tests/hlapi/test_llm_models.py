@@ -295,20 +295,25 @@ def test_llm_baichuan2_7b_int4weight_only():
                      quant_config=quant_config)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4800424")
+@skip_pre_ampere
 def test_llm_qwen():
+    qwen_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
+                                         "examples/qwen/requirements.txt")
+    command = f"pip install -r {qwen_requirement_path}"
+    subprocess.run(command, shell=True, check=True, env=os.environ)
     llm_test_harness(qwen_model_path,
                      prompts=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4800424")
+@skip_pre_ampere
 def test_llm_qwen1_5():
+    qwen1_5_sampling_params = SamplingParams(max_new_tokens=10)
     llm_test_harness(qwen1_5_model_path,
-                     prompts=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     prompts=['1+1='],
+                     references=['2'],
+                     sampling_params=qwen1_5_sampling_params)
 
 
 @skip_pre_ampere

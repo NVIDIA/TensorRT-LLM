@@ -489,7 +489,6 @@ protected:
         decoderParams.batchSize = batch_size;
         decoderParams.maxQSeqLength = input_seq_length;
         decoderParams.maxEncoderQSeqLength = mCrossAttention ? cross_qkv_length : 0;
-        decoderParams.removePadding = mRemovePadding;
         decoderParams.attentionWindowSize = cyclic_attention_window_size;
         decoderParams.sinkTokenLength = sink_token_length;
         decoderParams.numTokens = num_tokens;
@@ -541,6 +540,7 @@ protected:
         preprocessingParams.cyclic_kv_cache_len = cyclic_attention_window_size;
         preprocessingParams.sink_token_len = sink_token_length;
         preprocessingParams.token_num = num_tokens;
+        preprocessingParams.remove_padding = mRemovePadding;
         preprocessingParams.head_num = mNumHeads;
         preprocessingParams.kv_head_num = mNumKVHeads;
         preprocessingParams.qheads_per_kv_head = mNumHeads / mNumKVHeads;

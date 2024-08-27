@@ -58,10 +58,12 @@ class MoeConfig:
     class ExpertScaleNormalizationMode(IntEnum):
         NONE = 0
         RENORMALIZE = 1
+        SPARSE_MIXER = 2
 
     num_experts: int = 0
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
+    sparse_mixer_epsilon: float = 0.01
     tp_mode: int = 0
 
     def validate(self) -> "MoeConfig":
@@ -185,6 +187,11 @@ def _moe_plugin(moe_config,
         np.array(moe_config.normalization_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    p_sparse_mixer_epsilon = trt.PluginField(
+        "sparse_mixer_epsilon",
+        np.array(moe_config.sparse_mixer_epsilon, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
+
     p_force_determinism = trt.PluginField(
         "force_determinism", np.array([int(False)], dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -208,7 +215,7 @@ def _moe_plugin(moe_config,
         p_expert_inter_size, p_activation_type, p_type_id, p_weight_type_id,
         p_output_type_id, p_quant_mode, p_use_finished, p_use_bias, p_tp_size,
         p_tp_rank, p_ep_size, p_ep_rank, p_normalization_mode,
-        p_force_determinism, p_use_lora
+        p_sparse_mixer_epsilon, p_force_determinism, p_use_lora
     ]
 
     if use_lora:

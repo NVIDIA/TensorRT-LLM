@@ -395,17 +395,20 @@ def prepare_model_tests(model_name: str,
 
     model_env = {**_os.environ, "PYTHONPATH": f"examples/{model_name}"}
     enc_dec_model_name_arg = []
+    beams_arg = []
     if model_name in ('bart', 't5'):
         enc_dec_model_name_arg = [
             '--hf_repo_name',
             'facebook/bart-large-cnn' if model_name == 'bart' else 't5-small'
         ]
+        if model_name == 't5' and (not only_multi_gpu_arg):
+            beams_arg = ['--beams', '1,2']
         model_name = 'enc_dec'
 
     build_engines = [
         python_exe,
         str(scripts_dir / f"build_{model_name}_engines.py")
-    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
+    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg + beams_arg
 
     if model_name in ['gpt']:
         build_engines += ['--clean']
@@ -418,6 +421,7 @@ def prepare_model_tests(model_name: str,
     ] + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
     if "enc_dec" in model_name:
         generate_expected_output += model_cache_arg
+        generate_expected_output += beams_arg
 
     if model_name in ['gpt']:
         generate_expected_output += ['--clean']
@@ -512,6 +516,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         included_tests.append("BartBasicTest")
     if run_t5:
         included_tests.append("T5BasicTest")
+        included_tests.append("T5Beam2Test")
     if run_redrafter:
         included_tests.append("ExplicitDraftTokens")
 

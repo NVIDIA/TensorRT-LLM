@@ -47,6 +47,7 @@ set(SRCS
     tllmRuntime.cpp
     tllmLogger.cpp
     transformerBuffers.cpp
+    workerPool.cpp
     worldConfig.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)

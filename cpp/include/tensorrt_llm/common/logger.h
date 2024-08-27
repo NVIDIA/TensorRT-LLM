@@ -80,7 +80,7 @@ public:
 
     void log(std::exception const& ex, Level level = Level::ERROR);
 
-    Level getLevel()
+    Level getLevel() const
     {
         return level_;
     }
@@ -89,6 +89,11 @@ public:
     {
         level_ = level;
         log(INFO, "Set logger level to %s", getLevelName(level));
+    }
+
+    bool isEnabled(Level const level) const
+    {
+        return level_ <= level;
     }
 
 private:
@@ -131,7 +136,7 @@ private:
 template <typename... Args>
 void Logger::log(Logger::Level level, char const* format, Args const&... args)
 {
-    if (level_ <= level)
+    if (isEnabled(level))
     {
         auto const fmt = getPrefix(level) + format;
         auto& out = level_ < WARNING ? std::cout : std::cerr;
@@ -150,7 +155,7 @@ void Logger::log(Logger::Level level, char const* format, Args const&... args)
 template <typename... Args>
 void Logger::log(Logger::Level const level, int const rank, char const* format, Args const&... args)
 {
-    if (level_ <= level)
+    if (isEnabled(level))
     {
         auto const fmt = getPrefix(level, rank) + format;
         auto& out = level_ < WARNING ? std::cout : std::cerr;
@@ -166,7 +171,16 @@ void Logger::log(Logger::Level const level, int const rank, char const* format, 
     }
 }
 
-#define TLLM_LOG(level, ...) tensorrt_llm::common::Logger::getLogger()->log(level, __VA_ARGS__)
+#define TLLM_LOG(level, ...)                                                                                           \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        auto* const logger = tensorrt_llm::common::Logger::getLogger();                                                \
+        if (logger->isEnabled(level))                                                                                  \
+        {                                                                                                              \
+            logger->log(level, __VA_ARGS__);                                                                           \
+        }                                                                                                              \
+    } while (0)
+
 #define TLLM_LOG_TRACE(...) TLLM_LOG(tensorrt_llm::common::Logger::TRACE, __VA_ARGS__)
 #define TLLM_LOG_DEBUG(...) TLLM_LOG(tensorrt_llm::common::Logger::DEBUG, __VA_ARGS__)
 #define TLLM_LOG_INFO(...) TLLM_LOG(tensorrt_llm::common::Logger::INFO, __VA_ARGS__)

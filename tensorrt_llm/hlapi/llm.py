@@ -2,8 +2,9 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, List, Optional, Sequence, Union
 
+from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from .. import bindings as tllm
@@ -50,6 +51,9 @@ class RequestOutput(GenerationResult):
         return [
             'request_id', 'prompt', 'prompt_token_ids', 'outputs', 'finished'
         ]
+
+
+PromptInputs = Union[str, List[int]]
 
 
 class LLM:
@@ -121,6 +125,8 @@ class LLM:
         self.llm_build_stats = LlmBuildStats()
 
         self._build_model()
+        self._tokenizer = self._try_load_tokenizer()
+
         exception_handler.register(self)
 
     @property
@@ -129,37 +135,42 @@ class LLM:
 
     def generate(
         self,
-        prompts: Union[str, Iterable[str], List[int], Iterable[List[int]]],
+        inputs: Union[PromptInputs, Sequence[PromptInputs]],
         sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None
+                                        List[SamplingParams]]] = None,
+        use_tqdm: bool = True,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         ''' Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            prompts: The prompt text or token ids; could be either single prompt or batched prompts.
+            inputs: The prompt text or token ids; could be either single prompt or batched prompts.
             sampling_params: The sampling params for the generation, a default one will be used if not provided.
+            use_tqdm: Whether to use tqdm to display the progress bar.
         '''
-        if isinstance(prompts, str) or isinstance(prompts[0], str):
-            unbatched = isinstance(prompts, str)
+        if isinstance(inputs, str) or isinstance(inputs[0], str):
+            unbatched = isinstance(inputs, str)
         else:
-            unbatched = isinstance(prompts[0], int)
+            unbatched = isinstance(inputs[0], int)
 
         if unbatched:
-            prompts = [prompts]
+            inputs = [inputs]
 
         futures = []
-        for i, prompt in enumerate(prompts):
+        for i, request_inputs in enumerate(inputs):
             if isinstance(sampling_params, list):
                 sp = sampling_params[i]
             else:
                 sp = sampling_params
-            future = self.generate_async(prompt,
+            future = self.generate_async(request_inputs,
                                          sampling_params=sp,
                                          streaming=False)
             futures.append(future)
 
-        for future in futures:
+        for future in tqdm(futures,
+                           desc="Processed requests",
+                           dynamic_ncols=True,
+                           disable=not use_tqdm):
             future.result()
 
         if unbatched:
@@ -169,7 +180,7 @@ class LLM:
 
     def generate_async(
         self,
-        prompt: Union[str, List[int]],
+        inputs: PromptInputs,
         sampling_params: Optional[SamplingParams] = None,
         streaming: bool = False,
     ) -> RequestOutput:
@@ -177,18 +188,19 @@ class LLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            prompt: The prompt text or token ids; must be single prompt.
+            inputs: The prompt text or token ids; must be single prompt.
             sampling_params: The sampling params for the generation, a default one will be used if not provided.
             streaming: Whether to use the streaming mode for the generation.
         '''
-        if isinstance(prompt, str):
-            prompt_token_ids = self._prepare_prompt_token_ids(prompt)
-        elif isinstance(prompt, list) and isinstance(prompt[0], int):
-            prompt_token_ids = prompt
+        if isinstance(inputs, str):
+            prompt_token_ids = self._prepare_prompt_token_ids(inputs)
+            prompt = inputs
+        elif isinstance(inputs, list) and isinstance(inputs[0], int):
+            prompt_token_ids = inputs
             prompt = None
         else:
             raise TypeError(
-                f"The prompt must be type str or list of int, but got {type(prompt)}"
+                f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
         sampling_params = self._prepare_sampling_params(sampling_params)
@@ -249,6 +261,9 @@ class LLM:
                                          workspace=self.workspace,
                                          llm_build_stats=self.llm_build_stats)
         self._engine_dir = model_loader()
+        # update the model_dir to a local dir for the runtime, such as tokenizer loading.
+        self.args.model = self._engine_dir
+        assert self.args.is_local_model
 
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
@@ -275,22 +290,22 @@ class LLM:
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size))
 
-    @property
-    def tokenizer(self) -> TokenizerBase:
+    def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
             return None
+
         if self.args.tokenizer is not None:
+            assert isinstance(self.args.tokenizer, TokenizerBase)
             return self.args.tokenizer
+
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
-        try:
-            self.args.tokenizer = ModelLoader.load_hf_tokenizer(
-                self.args.model_dir)
-        except:
-            pass
+        return ModelLoader.load_hf_tokenizer(self.args.model_dir)
 
-        return self.args.tokenizer
+    @property
+    def tokenizer(self) -> Optional[TokenizerBase]:
+        return self._tokenizer
 
     def save(self, engine_dir: str):
         ''' Save the built engine to the given path. '''

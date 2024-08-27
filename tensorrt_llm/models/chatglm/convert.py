@@ -510,20 +510,6 @@ def get_tllm_linear_sq_weight(vals,
     return results
 
 
-def smooth_quant(hf_model: AutoModel, tokenizer: AutoTokenizer, dataset,
-                 smoothquant: float):
-    act_range = {}
-    # smoother for query_key_value.dense and mlp.proj
-    model_smoother = {}
-    act_range = capture_activation_range(hf_model,
-                                         tokenizer,
-                                         dataset,
-                                         num_samples=64)
-    if smoothquant is not None:
-        smooth_chatglm_model(hf_model, act_range, smoothquant, model_smoother)
-    return act_range, model_smoother
-
-
 def load_weights_from_hf_model(hf_model: AutoModel,
                                config: ChatGLMConfig,
                                act_range: Optional[dict] = None,
@@ -884,9 +870,6 @@ def quantize(hf_model_dir: str,
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
-    if use_smooth_quant:
-        assert quant_config.smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
-
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     if config.chatglm_version == 'glm':
@@ -907,8 +890,15 @@ def quantize(hf_model_dir: str,
         trust_remote_code=True,
     )
     dataset = load_calib_dataset(calib_dataset)
-    act_range, smoother = smooth_quant(hf_model, tokenizer, dataset,
-                                       quant_config.smoothquant_val)
+
+    act_range = capture_activation_range(hf_model,
+                                         tokenizer,
+                                         dataset,
+                                         num_samples=64)
+    smoother = {}
+    if use_smooth_quant:
+        smooth_chatglm_model(hf_model, act_range, quant_config.smoothquant_val,
+                             smoother)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank

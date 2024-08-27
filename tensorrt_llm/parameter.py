@@ -172,9 +172,7 @@ class Parameter:
             # value ~ U[-v_range, v_range]
             value = value * v_range
 
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            copy_torch_to_numpy(value, weights)
+        copy_torch_to_numpy(value, weights)
 
     def is_inited(self) -> bool:
         return self._value is not None

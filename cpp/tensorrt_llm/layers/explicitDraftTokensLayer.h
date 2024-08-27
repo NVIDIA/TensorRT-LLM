@@ -48,14 +48,16 @@ public:
 private:
     void allocateBuffer();
 
-    void fillContextBuffers(
-        SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& params);
-
     void convertPackedMask(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
-    void splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
-
     void packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
+
+    template <typename Dtype>
+    void fillContextBuffers(
+        SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& setupParams);
+
+    template <typename Dtype>
+    void splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
 private:
     using Base::mDecoderDomain;
@@ -76,6 +78,8 @@ private:
     TensorPtr mLastDraftIndicesSlots;
 
     TensorPtr mTemperature;
+
+    std::optional<nvinfer1::DataType> mDecoderDtype{std::nullopt};
 };
 
 } // namespace tensorrt_llm::layers

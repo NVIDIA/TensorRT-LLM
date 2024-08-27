@@ -132,8 +132,8 @@ __launch_bounds__(TPB) __global__
 
 template <int TPB>
 __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax, bool const* finished, float* output,
-    int* indices, int* source_rows, int const num_experts, int const k, int const start_expert, int const end_expert,
-    MOEExpertScaleNormalizationMode renorm_mode)
+    int* indices, int* source_rows, int const num_experts, int const k, int const startk, int const endk,
+    int const start_expert, int const end_expert, MOEExpertScaleNormalizationMode norm_mode)
 {
 
     using cub_kvp = cub::KeyValuePair<int, float>;
@@ -149,7 +149,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
     float renorm_value = 0.0f;
     bool const row_is_active = finished ? !finished[block_row] : true;
     int64_t const thread_read_offset = blockIdx.x * num_experts;
-    for (int k_idx = 0; k_idx < k; ++k_idx)
+    for (int k_idx = startk; k_idx < endk; ++k_idx)
     {
         thread_kvp.key = 0;
         thread_kvp.value = -1.f; // This is OK because inputs are probabilities
@@ -161,7 +161,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
             inp_kvp.key = expert;
             inp_kvp.value = inputs_after_softmax[idx];
 
-            for (int prior_k = 0; prior_k < k_idx; ++prior_k)
+            for (int prior_k = startk; prior_k < k_idx; ++prior_k)
             {
                 int const prior_winning_expert = indices[k * block_row + prior_k];
 
@@ -184,11 +184,11 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
 
             int64_t const idx = k * block_row + k_idx;
             output[idx] = result_kvp.value;
-            indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
+            indices[idx] = should_process_row ? (expert - start_expert) : (num_experts + expert);
             assert(indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
 
-            if (renorm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
+            if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
             {
                 renorm_value += result_kvp.value;
             }
@@ -196,8 +196,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
         __syncthreads();
     }
 
-    if (renorm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE && threadIdx.x == 0 && renorm_value != 0.f)
+    if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE && threadIdx.x == 0 && renorm_value != 0.f)
     {
+        assert(startk == 0 && endk == k);
         renorm_value = 1 / renorm_value;
         for (int k_idx = 0; k_idx < k; k_idx++)
         {
@@ -223,8 +224,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
 
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(float const* input, bool const* finished,
-    float* output, int64_t const num_rows, int* indices, int* source_rows, int const k, int const start_expert,
-    int const end_expert, MOEExpertScaleNormalizationMode renorm_mode)
+    float* output, int64_t const num_rows, int* indices, int* source_rows, int const k, int const startk,
+    int const endk, int const start_expert, int const end_expert, MOEExpertScaleNormalizationMode norm_mode)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
     static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
@@ -349,7 +350,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(fl
 
     float renorm_value = 0.0f;
 
-    for (int k_idx = 0; k_idx < k; ++k_idx)
+    for (int k_idx = startk; k_idx < endk; ++k_idx)
     {
         // First, each thread does the local argmax
         float max_val = row_chunk[0];
@@ -400,18 +401,18 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(fl
             // single) thread per row of the input/output matrices.
             int64_t const idx = k * thread_row + k_idx;
             output[idx] = max_val;
-            indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
+            indices[idx] = should_process_row ? (expert - start_expert) : (NUM_EXPERTS + expert);
             source_rows[idx] = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
-            if (renorm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
+            if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE)
             {
                 renorm_value += max_val;
             }
         }
 
         // Finally, we clear the value in the thread with the current max if there is another iteration to run.
-        if (k_idx + 1 < k)
+        if (k_idx + 1 < endk)
         {
             int const ldg_group_for_expert = expert / COLS_PER_GROUP_LDG;
             int const thread_to_clear_in_group = (expert / ELTS_PER_LDG) % THREADS_PER_ROW;
@@ -426,8 +427,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(fl
         }
     }
 
-    if (renorm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE && thread_group_idx == 0 && renorm_value != 0.f)
+    if (norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE && thread_group_idx == 0 && renorm_value != 0.f)
     {
+        assert(startk == 0 && endk == k);
         renorm_value = 1 / renorm_value;
         for (int k_idx = 0; k_idx < k; k_idx++)
         {
@@ -454,8 +456,8 @@ struct TopkConstants
 
 template <int EXPERTS, int WARPS_PER_TB>
 void topkGatingSoftmaxLauncherHelper(float const* input, bool const* finished, float* output, int* indices,
-    int* source_row, int64_t const num_rows, int const k, int const start_expert, int const end_expert,
-    MOEExpertScaleNormalizationMode renorm_mode, cudaStream_t stream)
+    int* source_row, int64_t const num_rows, int const k, int const startk, int const endk, int const start_expert,
+    int const end_expert, MOEExpertScaleNormalizationMode norm_mode, cudaStream_t stream)
 {
     static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
@@ -468,13 +470,12 @@ void topkGatingSoftmaxLauncherHelper(float const* input, bool const* finished, f
 
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
-        input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, renorm_mode);
+        input, finished, output, num_rows, indices, source_row, k, startk, endk, start_expert, end_expert, norm_mode);
 }
 
-void topkGatingSoftmaxKernelLauncher(float const* input, bool const* finished, float* output,
-    float* softmax_temp_output, int* indices, int* source_row, int64_t const num_rows, int const num_experts,
-    int const k, int const start_expert, int const end_expert, MOEExpertScaleNormalizationMode renorm_mode,
-    cudaStream_t stream)
+void topkGatingSoftmaxKernelLauncher(float const* input, float* output, float* softmax_temp_output, int* indices,
+    int* source_row, int64_t const num_rows, int const num_experts, int const k, int const startk, int const endk,
+    int const start_expert, int const end_expert, MOEExpertScaleNormalizationMode norm_mode, cudaStream_t stream)
 {
     static constexpr int WARPS_PER_TB = 4;
 
@@ -482,66 +483,140 @@ void topkGatingSoftmaxKernelLauncher(float const* input, bool const* finished, f
     {
     case 1:
     {
-        topkGatingSoftmaxLauncherHelper<1, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<1, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 2:
     {
-        topkGatingSoftmaxLauncherHelper<2, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<2, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 4:
     {
-        topkGatingSoftmaxLauncherHelper<4, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<4, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 8:
     {
-        topkGatingSoftmaxLauncherHelper<8, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<8, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 16:
     {
-        topkGatingSoftmaxLauncherHelper<16, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<16, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 32:
     {
-        topkGatingSoftmaxLauncherHelper<32, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<32, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 64:
     {
-        topkGatingSoftmaxLauncherHelper<64, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<64, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 128:
     {
-        topkGatingSoftmaxLauncherHelper<128, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<128, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     case 256:
     {
-        topkGatingSoftmaxLauncherHelper<256, WARPS_PER_TB>(
-            input, finished, output, indices, source_row, num_rows, k, start_expert, end_expert, renorm_mode, stream);
+        topkGatingSoftmaxLauncherHelper<256, WARPS_PER_TB>(input, nullptr, output, indices, source_row, num_rows, k,
+            startk, endk, start_expert, end_expert, norm_mode, stream);
         break;
     }
     default:
     {
         static constexpr int TPB = 256;
         TLLM_CHECK(softmax_temp_output != nullptr);
-        moeSoftmax<TPB><<<num_rows, TPB, 0, stream>>>(input, finished, softmax_temp_output, num_experts);
-        moeTopK<TPB><<<num_rows, TPB, 0, stream>>>(softmax_temp_output, finished, output, indices, source_row,
-            num_experts, k, start_expert, end_expert, renorm_mode);
+        moeSoftmax<TPB><<<num_rows, TPB, 0, stream>>>(input, nullptr, softmax_temp_output, num_experts);
+        moeTopK<TPB><<<num_rows, TPB, 0, stream>>>(softmax_temp_output, nullptr, output, indices, source_row,
+            num_experts, k, startk, endk, start_expert, end_expert, norm_mode);
     }
+    }
+}
+
+__global__ void sparseMixerMask(float const* input, float* output, int const* indices, int k_idx, int k, int num_tokens,
+    int num_experts, int start_expert, float epsilon)
+{
+    int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token_idx >= num_tokens)
+    {
+        return;
+    }
+
+    // Mask out the largest value selected in the previous iteration
+    int last_selected = (k_idx > 0) ? indices[k * token_idx + (k_idx - 1)] : INT_MIN;
+    // Adjust the selected index to correct for the expert parallel transformation
+    last_selected = last_selected >= num_experts ? last_selected - num_experts : last_selected + start_expert;
+
+    // Find the max value in the current row
+    float max_val = -INFINITY;
+    for (int i = 0; i < num_experts; ++i)
+    {
+        if (i != last_selected)
+        {
+            float const val = input[token_idx * num_experts + i];
+            max_val = max(val, max_val);
+        }
+    }
+
+    // Mask out any values that fail the condition '(max - value) / std::max(abs(value), max) > 2 * epsilon'
+    for (int i = 0; i < num_experts; ++i)
+    {
+        float val = input[token_idx * num_experts + i];
+        float mask = (max_val - val) / max(abs(val), max_val);
+        bool mask_value = (mask > 2 * epsilon) || i == last_selected;
+        output[token_idx * num_experts + i] = mask_value ? -INFINITY : val;
+    }
+}
+
+void sparseMixerTopkSoftmax(float const* input, float* output, float* mixer_temp_output, float* softmax_temp_output,
+    int* indices, int* source_row, int64_t const num_rows, int const num_experts, int const k, int const start_expert,
+    int const end_expert, float epsilon, cudaStream_t stream)
+{
+    // TODO we need to update the sparseMixerMask() function to mask all previous experts instead of just the most
+    //  recent one.
+    TLLM_CHECK_WITH_INFO(k <= 2, "Current sparse mixer only supports k <= 2");
+
+    // Each thread handles one token
+    constexpr int threads_per_block = 256;
+    int num_blocks = ceilDiv(num_rows, threads_per_block);
+    for (int k_idx = 0; k_idx < k; ++k_idx)
+    {
+        // Run softmax and topk in serial for each selection, recalculating the mask for each step
+        sparseMixerMask<<<num_blocks, threads_per_block, 0, stream>>>(
+            input, mixer_temp_output, indices, k_idx, k, num_rows, num_experts, start_expert, epsilon);
+
+        topkGatingSoftmaxKernelLauncher(mixer_temp_output, output, softmax_temp_output, indices, source_row, num_rows,
+            num_experts, k, k_idx, k_idx + 1, start_expert, end_expert, MOEExpertScaleNormalizationMode::NONE, stream);
+    }
+}
+
+void selectExpertsForTokens(float const* input, float* output, float* mixer_temp_output, float* softmax_temp_output,
+    int* indices, int* source_row, int64_t const num_rows, int const num_experts, int const k, int const start_expert,
+    int const end_expert, float mixer_epsilon, MOEExpertScaleNormalizationMode norm_mode, cudaStream_t stream)
+{
+    if (norm_mode == MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+    {
+        TLLM_CHECK_WITH_INFO(mixer_temp_output, "Sparse mixer output is null when running sparse mixer");
+        sparseMixerTopkSoftmax(input, output, mixer_temp_output, softmax_temp_output, indices, source_row, num_rows,
+            num_experts, k, start_expert, end_expert, mixer_epsilon, stream);
+    }
+    else
+    {
+        topkGatingSoftmaxKernelLauncher(input, output, softmax_temp_output, indices, source_row, num_rows, num_experts,
+            k, 0, k, start_expert, end_expert, norm_mode, stream);
     }
 }
 
@@ -552,21 +627,28 @@ CubKeyValueSorter::CubKeyValueSorter()
 {
 }
 
+int CubKeyValueSorter::expertsToBits(int num_experts)
+{
+    // Max value we represent is V = num_experts + (num_experts - 1) = 2 * num_experts - 1
+    // The maximum number of bits is therefore floor(log2(V)) + 1
+    return static_cast<int>(log2(2 * num_experts - 1)) + 1;
+}
+
 CubKeyValueSorter::CubKeyValueSorter(int const num_experts)
     : num_experts_(num_experts)
-    , num_bits_((int) log2(num_experts) + 1)
+    , num_bits_(expertsToBits(num_experts))
 {
 }
 
 void CubKeyValueSorter::updateNumExperts(int const num_experts)
 {
     num_experts_ = num_experts;
-    num_bits_ = (int) log2(num_experts) + 1;
+    num_bits_ = expertsToBits(num_experts);
 }
 
 size_t CubKeyValueSorter::getWorkspaceSize(size_t const num_key_value_pairs, int const num_experts)
 {
-    int num_bits = static_cast<int>(log2(num_experts)) + 1;
+    int num_bits = expertsToBits(num_experts);
     size_t required_storage = 0;
     int* null_int = nullptr;
     cub::DeviceRadixSort::SortPairs(
@@ -1282,7 +1364,8 @@ void loraReorder(T* output, T const* lora_result, int64_t const* num_valid_token
 template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
 std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::getWorkspaceBufferSizes(
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts,
-    int const num_experts_per_node, int const k, ActivationType activation_type, bool use_lora) const
+    int const num_experts_per_node, int const k, ActivationType activation_type,
+    MOEExpertScaleNormalizationMode norm_mode, bool use_lora) const
 {
     size_t const num_moe_inputs = k * num_rows;
     size_t const permuted_elems = num_moe_inputs * hidden_size;
@@ -1299,12 +1382,18 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
         // We need to have separate memory for these as we can no longer alias the output buffer for reuse
         glu_inter_elems = interbuf_elems;
     }
-    size_t num_softmax_outs = 0;
 
     bool using_hopper = moe_gemm_runner_.supportsHopperSpecialisation();
 
     size_t const gemm_output_dtype = sizeof(UnfusedGemmOutputType);
 
+    size_t sparse_mixer_outs = 0;
+    if (norm_mode == MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+    {
+        sparse_mixer_outs = num_rows * num_experts;
+    }
+
+    size_t num_softmax_outs = 0;
     bool const is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     if (!is_pow_2 || num_experts > 256)
     {
@@ -1316,6 +1405,7 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
     size_t const permuted_experts_size = num_moe_inputs * sizeof(int);
     size_t const permuted_data_size = permuted_elems * sizeof(T);
     size_t const expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t);
+    size_t const sparse_mixer_out_size = sparse_mixer_outs * sizeof(float);
     size_t const softmax_out_size = num_softmax_outs * sizeof(float);
     size_t const permuted_scales_size = mayHaveFinalizeFused() ? num_moe_inputs * sizeof(float) : 0;
     size_t const glu_inter_size = glu_inter_elems * gemm_output_dtype; // May be an intermediate type for quantization
@@ -1359,6 +1449,7 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
         permuted_rows_size,                         //
         permuted_experts_size,                      //
         expert_first_token_offset_size,             //
+        sparse_mixer_out_size,                      //
         softmax_out_size,                           //
         permuted_scales_size,                       //
         sorter_size,                                //
@@ -1377,12 +1468,13 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
 template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
 size_t CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::getWorkspaceSize(int64_t const num_rows,
     int64_t const hidden_size, int64_t const inter_size, int const num_experts, int const k,
-    ActivationType activation_type, MOEParallelismConfig parallelism_config, bool use_lora) const
+    ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, MOEParallelismConfig parallelism_config,
+    bool use_lora) const
 {
     int const ep_size = parallelism_config.ep_size;
     TLLM_CHECK_WITH_INFO(num_experts % ep_size == 0, "Number of experts must be a multiple of ep size");
     auto workspace = getWorkspaceBufferSizes(
-        num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type, use_lora);
+        num_rows, hidden_size, inter_size, num_experts, num_experts / ep_size, k, activation_type, norm_mode, use_lora);
     auto ws_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspace.data(), workspace.size());
     TLLM_LOG_DEBUG("Mixture Of Experts Plugin requires workspace of %2f MiB", ws_size / 1024.f / 1024.f);
     return ws_size;
@@ -1391,11 +1483,12 @@ size_t CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::get
 template <class T, class WeightType, class OutputType, class ScaleBiasType, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::configureWsPtrs(char* ws_ptr,
     int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size, int const num_experts,
-    int const num_experts_per_node, int const k, ActivationType activation_type, bool use_lora)
+    int const num_experts_per_node, int const k, ActivationType activation_type,
+    MOEExpertScaleNormalizationMode norm_mode, bool use_lora)
 
 {
     auto ws_sizes = getWorkspaceBufferSizes(
-        num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k, activation_type, use_lora);
+        num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k, activation_type, norm_mode, use_lora);
 
     std::vector<int8_t*> ws_sliced{(int8_t*) ws_ptr};
     for (auto size : ws_sizes)
@@ -1410,20 +1503,26 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::confi
 
     expert_first_token_offset_ = (int64_t*) ws_sliced[3];
 
+    sparse_mixer_out_ = nullptr;
+    if (norm_mode == MOEExpertScaleNormalizationMode::SPARSE_MIXER)
+    {
+        sparse_mixer_out_ = (float*) ws_sliced[4];
+    }
+
     softmax_out_ = nullptr;
     bool const is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     if (!is_pow_2 || num_experts > 256)
     {
-        softmax_out_ = (float*) ws_sliced[4];
+        softmax_out_ = (float*) ws_sliced[5];
     }
 
     bool const gemm2_using_hopper = moe_gemm_runner_.isHopperSpecialised(*gemm2_config_);
-    permuted_scales_ = (gemm2_using_hopper && mayHaveFinalizeFused()) ? (float*) ws_sliced[5] : nullptr;
+    permuted_scales_ = (gemm2_using_hopper && mayHaveFinalizeFused()) ? (float*) ws_sliced[6] : nullptr;
 
-    sorter_ws_ = (char*) ws_sliced[6];
+    sorter_ws_ = (char*) ws_sliced[7];
 
     // Always same index, but overlapped with either fc1_result_ or fc2_result_
-    permuted_data_ = (T*) ws_sliced[7];
+    permuted_data_ = (T*) ws_sliced[8];
 
     bool const is_gated_activation = isGatedActivation(activation_type);
     bool const gemm1_using_fused_moe
@@ -1434,20 +1533,20 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::confi
     bool const non_hopper_has_glu = !gemm1_using_fused_moe && is_gated_activation;
     bool const has_glu_inter_result = hopper_has_glu || non_hopper_has_glu || use_fp8;
     // Always same index, ignored if not needed
-    glu_inter_result_ = has_glu_inter_result ? (T*) ws_sliced[8] : nullptr;
+    glu_inter_result_ = has_glu_inter_result ? (T*) ws_sliced[9] : nullptr;
 
     // fc1 and fc2 alias one of the above pointers, but it depends on if actfn is fused/unfused which is overlapped
     // NOTE: It is important to get the order of these correct as the wrong order will cause the buffer to be used as an
     // input and output for the same gemm, which will cause corruption
-    fc1_result_ = has_glu_inter_result ? (T*) ws_sliced[7] : (T*) ws_sliced[8];
-    fc2_result_ = has_glu_inter_result ? (T*) ws_sliced[8] : (T*) ws_sliced[7];
+    fc1_result_ = has_glu_inter_result ? (T*) ws_sliced[8] : (T*) ws_sliced[9];
+    fc2_result_ = has_glu_inter_result ? (T*) ws_sliced[9] : (T*) ws_sliced[8];
 
-    alpha_scale_ptr_array_ = reinterpret_cast<float const**>(ws_sliced[9]);
+    alpha_scale_ptr_array_ = reinterpret_cast<float const**>(ws_sliced[10]);
 
     hopper_grouped_gemm_input_ = {};
     if (moe_gemm_runner_.supportsHopperSpecialisation())
     {
-        hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[10], num_experts_per_node, ws_sliced[11], ws_sizes[11]);
+        hopper_grouped_gemm_input_.configureWorkspace(ws_sliced[11], num_experts_per_node, ws_sliced[12], ws_sizes[12]);
     }
 
     lora_fc1_result_ = {};
@@ -1456,9 +1555,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::confi
 
     if (use_lora)
     {
-        lora_fc1_result_ = (T*) ws_sliced[12];
-        lora_add_bias_ = (T*) ws_sliced[13];
-        lora_fc2_result_ = (T*) ws_sliced[14];
+        lora_fc1_result_ = (T*) ws_sliced[13];
+        lora_add_bias_ = (T*) ws_sliced[14];
+        lora_fc2_result_ = (T*) ws_sliced[15];
     }
 }
 
@@ -1834,7 +1933,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
     QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
     int const num_experts, int const k, char* workspace_ptr, void* final_output_void, bool const* finished,
     int64_t const active_rows, void* token_topk_final_scales_void, int* expanded_source_row_to_expanded_dest_row,
-    int* expert_for_source_row, MOEParallelismConfig parallelism_config,
+    int* expert_for_source_row, float sparse_mixer_epsilon, MOEParallelismConfig parallelism_config,
     MOEExpertScaleNormalizationMode normalization_mode, bool use_lora, LoraParams& lora_params, cudaStream_t stream)
 {
     static constexpr bool int_scales_required
@@ -1931,14 +2030,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType, Enable>::runMo
     int const num_experts_per_node = num_experts / parallelism_config.ep_size;
 
     configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts, num_experts_per_node, k,
-        fc1_activation_type, use_lora);
+        fc1_activation_type, normalization_mode, use_lora);
 
     int const start_expert = num_experts_per_node * parallelism_config.ep_rank;
     int const end_expert = start_expert + num_experts_per_node;
 
-    topkGatingSoftmaxKernelLauncher(gating_output, finished, token_topk_unpermuted_scales, softmax_out_,
-        expert_for_source_row, source_rows_, num_rows, num_experts, k, start_expert, end_expert, normalization_mode,
-        stream);
+    selectExpertsForTokens(gating_output, token_topk_unpermuted_scales, sparse_mixer_out_, softmax_out_,
+        expert_for_source_row, source_rows_, num_rows, num_experts, k, start_expert, end_expert, sparse_mixer_epsilon,
+        normalization_mode, stream);
 
     sync_check_cuda_error();
 

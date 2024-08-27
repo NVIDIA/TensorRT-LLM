@@ -271,7 +271,6 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     params.batchSize = batch_size;
     params.maxQSeqLength = input_seq_len;
     params.numTokens = num_tokens;
-    params.removePadding = mRemovePadding;
     params.attentionMaskType = AttentionMaskType::PADDING;
     params.fmhaTileCounter = fmha_tile_counter_ptr;
     invokeBuildDecoderInfo(params, stream);

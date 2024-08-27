@@ -1856,6 +1856,7 @@ class WhisperEncoder(PretrainedModel):
                             stride=2,
                             padding=1,
                             dtype=self._conv_dtype)
+        self.downsample_factor = 2
 
         self.positional_embedding = Parameter(shape=(config.n_audio_ctx,
                                                      config.hidden_size),
@@ -1899,7 +1900,7 @@ class WhisperEncoder(PretrainedModel):
             slice(input=self.positional_embedding.value,
                   starts=[0, 0],
                   sizes=[
-                      self.max_audio_feature_seq_len // 2,
+                      self.max_audio_feature_seq_len // self.downsample_factor,
                       self.positional_embedding.shape[1]
                   ],
                   strides=[1, 1]), x.dtype)
@@ -1907,6 +1908,7 @@ class WhisperEncoder(PretrainedModel):
             #B,T,D -> BxT,D
             x = x.view([-1, self.config.hidden_size])
         hidden_states = x
+        input_lengths = input_lengths // self.downsample_factor
         for encoder_layer in self.encoder_layers:
             hidden_states = encoder_layer(hidden_states,
                                           input_lengths=input_lengths)

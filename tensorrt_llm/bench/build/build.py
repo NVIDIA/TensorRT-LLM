@@ -191,7 +191,7 @@ def build_command(
             create_dataset_from_stream(tokenizer, stream=stream)
         # The max sequence length option for build is the sum of max osl + isl.
         max_seq_len = metadata.max_sequence_length
-        logger.info(metadata.get_summary_for_logger.info())
+        logger.info(metadata.get_summary_for_print())
 
     # We have a specified ISL:OSL combination.
     elif max_seq_len is None:

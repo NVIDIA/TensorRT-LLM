@@ -1369,23 +1369,6 @@ def load_weights_from_hf_model(hf_model,
     return weights
 
 
-def smooth_quant(model,
-                 tokenizer,
-                 dataset,
-                 smoothquant: Optional[float] = None):
-    assert model is not None
-    act_range = {}
-    llama_qkv_para = {}
-    # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    llama_smoother = {}
-
-    act_range = capture_activation_range(model, tokenizer, dataset)
-    if smoothquant is not None:
-        smooth_llama_model(model, act_range, smoothquant, llama_qkv_para,
-                           llama_smoother)
-    return act_range, llama_qkv_para, llama_smoother
-
-
 def quantize(hf_model_dir: str,
              output_dir: str,
              config: LLaMAConfig,
@@ -1405,9 +1388,6 @@ def quantize(hf_model_dir: str,
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
-    if use_smooth_quant:
-        assert quant_config.smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
-
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
@@ -1427,8 +1407,11 @@ def quantize(hf_model_dir: str,
 
     dataset = load_calib_dataset(calib_dataset)
 
-    act_range, qkv_para, smoother = smooth_quant(hf_model, tokenizer, dataset,
-                                                 quant_config.smoothquant_val)
+    act_range = capture_activation_range(hf_model, tokenizer, dataset)
+    qkv_para, smoother = {}, {}
+    if use_smooth_quant:
+        smooth_llama_model(hf_model, act_range, quant_config.smoothquant_val,
+                           qkv_para, smoother)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank

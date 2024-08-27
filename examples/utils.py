@@ -13,11 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
+import subprocess
+import sys
+from os.path import abspath, dirname
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
+import torch
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings import GptJsonConfig
 from tensorrt_llm.builder import get_engine_version
 
@@ -113,17 +119,24 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                    model_version: Optional[str] = None,
                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
-        use_fast = True
-        if tokenizer_type is not None and tokenizer_type == "llama":
-            use_fast = False
-        # Should set both padding_side and truncation_side to be 'left'
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
-                                                  legacy=False,
-                                                  padding_side='left',
-                                                  truncation_side='left',
-                                                  trust_remote_code=True,
-                                                  tokenizer_type=tokenizer_type,
-                                                  use_fast=use_fast)
+        if 'whisper' in model_name.lower():
+            tokenizer = AutoTokenizer.from_pretrained('openai/whisper-large-v3',
+                                                      language='english',
+                                                      task='transcribe',
+                                                      predict_timestamps=False)
+        else:
+            use_fast = True
+            if tokenizer_type is not None and tokenizer_type == "llama":
+                use_fast = False
+            # Should set both padding_side and truncation_side to be 'left'
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir,
+                legacy=False,
+                padding_side='left',
+                truncation_side='left',
+                trust_remote_code=True,
+                tokenizer_type=tokenizer_type,
+                use_fast=use_fast)
     elif model_name == 'GemmaForCausalLM' or model_name == 'RecurrentGemmaForCausalLM':
         from transformers import GemmaTokenizer
 
@@ -159,6 +172,51 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
         end_id = tokenizer.eos_token_id
 
     return tokenizer, pad_id, end_id
+
+
+def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
+                           engine_dir: str,
+                           multimodal_input_file: Optional[str]):
+    encoder_input_features = None
+    encoder_input_ids = None
+    if 'whisper' in model_name.lower():
+        tllm_path = dirname(dirname(abspath(__file__)))
+        sys.path.insert(0, tllm_path)
+
+        from examples.whisper.whisper_utils import \
+            log_mel_spectrogram  # cannot directly import whisper due to name collision
+
+        config_path = os.path.join(engine_dir, 'encoder', 'config.json')
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        n_mels = config['pretrained_config']['n_mels']
+        dtype = config['pretrained_config']['dtype']
+
+        # download mel filters file
+        subprocess.run([
+            "wget", f"--directory-prefix={engine_dir}",
+            "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
+        ],
+                       check=True)
+
+        mel, total_duration = log_mel_spectrogram(multimodal_input_file,
+                                                  n_mels,
+                                                  return_duration=True,
+                                                  mel_filters_dir=engine_dir)
+        mel = mel.type(str_dtype_to_torch(dtype))  # [featureDim, seqLen]
+        decoder_input_ids = batch_input_ids
+        encoder_input_features = [torch.einsum('DL->LD', mel)]
+        encoder_output_lengths = [encoder_input_features[0].shape[0] // 2]
+    else:
+        encoder_input_ids = batch_input_ids
+        decoder_start_token_id = read_decoder_start_token_id(
+            os.path.join(engine_dir, "decoder"))
+        decoder_input_ids = [
+            torch.tensor([decoder_start_token_id], dtype=torch.int32)
+            for _ in batch_input_ids
+        ]
+        encoder_output_lengths = None
+    return encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids
 
 
 def add_common_args(parser):
