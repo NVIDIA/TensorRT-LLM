@@ -301,65 +301,66 @@ public:
         }
     }
 
+    __device__ __forceinline__ void copy_to_shmem(int iter)
+    {
+        if constexpr (Enable)
+        {
+            // Do nothing
+        }
+    }
+
 private:
     T* addr_;
     int step_;
     int stride_;
 };
 
-template <bool Enable, int Continuous, typename T>
+template <bool Enable, typename TVec, int Strided, int Continuous, typename T>
 class SHMemIterator
 {
 public:
     __device__ __forceinline__  SHMemIterator(T* g_addr, int g_offset, T* sh_addr, int sh_offset,
-    int step, int stride, int sz_size)
+    int g_step, int sh_step, int stride)
         : g_addr_(Enable ? (g_addr + g_offset) : nullptr)
         , sh_addr_(Enable ? sh_addr : nullptr)
         , sh_offset_(sh_offset)
-        , step_(step)
+        , g_step_(g_step)
+        , sh_step_(sh_step)
         , stride_(stride)
-        , sz_size_(sz_size)
     {
 
     }
 
-    __device__ __forceinline__ void load(int iter)
+    __device__ __forceinline__ void copy_to_shmem(int iter)
     {
         if constexpr (Enable)
         {
-          const int loadunit = 128 / sizeof(T);
-          int chunks = Continuous / sz_size_;
-          int i = (threadIdx.x % sz_size_) * chunks;
-          // __pipeline_memcpy_async is implemented as a synced version in sm < 80
-          while (chunks >= loadunit) {
-            __pipeline_memcpy_async(sh_addr_ + i, g_addr_ + iter * step_ + i,
-                                    sizeof(T) * loadunit, 0);
-            chunks -= loadunit;
-            i += loadunit;
-          }
-          if (chunks > 0) {
-            __pipeline_memcpy_async(sh_addr_ + i, g_addr_ + iter * step_ + i,
-                                    sizeof(T) * chunks, 0);
-          }
-          __pipeline_commit();
+#pragma unroll
+            for (int i = threadIdx.x % Strided; i < Continuous; i += Strided) {
+                __pipeline_memcpy_async(
+                    reinterpret_cast<TVec*>(sh_addr_ + iter * sh_step_) + i,
+                    reinterpret_cast<TVec*>(g_addr_ + iter * g_step_) + i,
+                    sizeof(TVec)
+                );                    
+            }
+            __pipeline_commit();
         }
     }
 
-    __device__ __forceinline__ T* iter(int ii = 0)
+    __device__ __forceinline__ void load(void* dst, int iter, int ii = 0)
     {
         if constexpr (Enable) {
-            return &sh_addr_[ii * stride_ + sh_offset_];
+            reinterpret_cast<T*>(dst)[0] = sh_addr_[iter * sh_step_ + ii * stride_ + sh_offset_];
         }
-        return nullptr;
     }
 
 private:
     T* g_addr_;
-    int step_;
+    int g_step_;
+    int sh_step_;
     T* sh_addr_;
     int sh_offset_;
     int stride_;
-    int sz_size_;
 };
 
 } // namespace weight_only
