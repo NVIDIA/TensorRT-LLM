@@ -22,7 +22,7 @@ Users can alter the logits produced by the network, by providing a map of named 
 ```
 std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
 ```
-to the `ExecutorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
+to an instance of `LogitsPostProcessorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
 
 The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits.
 
@@ -37,14 +37,14 @@ We also provide a batched version that allows altering logits of multiple reques
 std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&, std::vector<std::optional<IdType>> const&)>
 ```
 
-A single batched callback can be specified in `ExecutorConfig`. Each request can opt to apply this callback by specifying the name of the logits
+A single batched callback can be specified in `LogitsPostProcessorConfig`. Each request can opt to apply this callback by specifying the name of the logits
 post-processor as `Request::kBatchedPostProcessorName`.
 
 Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
 
 In a multi-GPU run, callback is invoked on all tensor parallel ranks (in last pipeline rank) by default.
 For correct execution, user should replicate client-side state accessed by callback on all tensor parallel ranks.
-If replication is expensive or infeasible, use `ExecutorConfig::setReplicateLogitsPostProcessor(false)` to invoke callback only on first tensor parallel rank.
+If replication is expensive or infeasible, use `LogitsPostProcessorConfig::setReplicate(false)` to invoke callback only on first tensor parallel rank.
 
 ### The Request Class
 

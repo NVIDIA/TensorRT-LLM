@@ -84,7 +84,6 @@ class TestMistral(unittest.TestCase):
                     "top_k": 0,
                     "normalization_mode": 1,
                 },
-                'use_fused_mlp': False,
             }
 
             # Initialize model
@@ -505,7 +504,6 @@ class TestMistral(unittest.TestCase):
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'use_fused_mlp': False,
         }
 
         config = PretrainedConfig.from_dict(config)

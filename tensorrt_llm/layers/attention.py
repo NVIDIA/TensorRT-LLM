@@ -449,7 +449,8 @@ class Attention(Module):
             dtype=dtype,
             tp_group=tp_group,
             tp_size=tp_size,
-            gather_output=False)
+            gather_output=False,
+            is_qkv=True)
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.attention_head_size,
                                hidden_size,
@@ -528,7 +529,7 @@ class Attention(Module):
 
                 original_max_position_embeddings = config.original_max_position_embeddings
 
-                if config.architecture == "Phi3SmallForCausalLM":
+                if config.architecture == "Phi3SmallForCausalLM" or config.architecture == "PhiMoEForCausalLM":
                     rope_scaling_short_mscale = config.longrope_short_mscale
                     rope_scaling_long_mscale = config.longrope_long_mscale
                 embed_positions_short_factors, embed_positions_long_factors, \
@@ -728,7 +729,6 @@ class Attention(Module):
                     ],
                     host_request_types=q_lora_params.host_request_types,
                     host_context_lengths=q_lora_params.host_context_lengths,
-                    max_num_tokens=q_lora_params.max_num_tokens,
                     max_encoder_context_length=q_lora_params.
                     max_encoder_context_length,
                     host_encoder_input_lengths=q_lora_params.
@@ -1412,7 +1412,8 @@ class BertAttention(Module):
                                 dtype=dtype,
                                 tp_group=tp_group,
                                 tp_size=tp_size,
-                                gather_output=False)
+                                gather_output=False,
+                                is_qkv=True)
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.attention_head_size,
                                hidden_size,
@@ -1470,8 +1471,7 @@ class BertAttention(Module):
                         v_lora_params.lora_weights_pointers[0],
                     ],
                     host_request_types=q_lora_params.host_request_types,
-                    host_context_lengths=q_lora_params.host_context_lengths,
-                    max_num_tokens=q_lora_params.max_num_tokens)
+                    host_context_lengths=q_lora_params.host_context_lengths)
 
                 q_lora, k_lora, v_lora = self.qkv_lora(hidden_states,
                                                        qkv_lora_params)
@@ -1610,7 +1610,8 @@ class CogVLMAttention(Attention):
             dtype=dtype,
             tp_group=tp_group,
             tp_size=tp_size,
-            gather_output=False)
+            gather_output=False,
+            is_qkv=True)
         self.vis_dense = RowLinear(tp_size * self.num_attention_heads *
                                    self.attention_head_size,
                                    hidden_size,

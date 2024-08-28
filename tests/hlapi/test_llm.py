@@ -534,15 +534,13 @@ def test_generate_with_logits_post_processor():
 
 @force_ampere
 def test_generate_block_reuse():
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                      enable_block_reuse=True),
-    )
-
-    # Check the configurations are correctly set
-    assert llm.args.build_config.plugin_config.use_paged_context_fmha is True
-    assert llm.args.build_config.plugin_config.paged_kv_cache is True
+    build_config = BuildConfig()
+    build_config.plugin_config._use_paged_context_fmha = True
+    build_config.plugin_config._paged_kv_cache = True
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                            enable_block_reuse=True),
+              build_config=build_config)
 
     sampling_params = SamplingParams(max_new_tokens=6)
 

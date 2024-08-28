@@ -32,6 +32,11 @@ We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-L
 
         2. Install [CUDA 12.5.1 Toolkit](https://developer.nvidia.com/cuda-12-5-1-download-archive?target_os=Windows&target_arch=x86_64). Use the Express Installation option. Installation may require a restart.
 
+  3. If using conda environment, run the following command before installing TensorRT-LLM.
+     ```bash
+     conda install -c conda-forge pyarrow
+     ```
+
 
 **Steps**
 
@@ -58,3 +63,11 @@ We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-L
 
 2. Build the model.
 3. Deploy the model.
+
+**Known Issue**
+
+1. `OSError: exception: access violation reading 0x0000000000000000` during `import tensorrt_llm` or `trtllm-build`.
+
+This may be caused by an outdated Microsoft Visual C++ Redistributable Version. Please install
+[the latest MSVC](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version)
+and retry. Check the system path to make sure the latest version installed in `System32` is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package `pyarrow` might contain an outdated MSCV DLL).

@@ -21,6 +21,10 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#if ENABLE_BF16
+#include <cuda_bf16.h>
+#endif // ENABLE_BF16
+
 #include <c10/core/Device.h>
 #include <c10/core/DeviceType.h>
 
@@ -135,6 +139,23 @@ void prepareRandomTensors(th::Tensor& curandState, // [maxBatchSize, 48], uint8_
         tksd::invokeFillRandData(params, stream);
     }
     break;
+#ifdef ENABLE_BF16
+    case at::ScalarType::BFloat16:
+    {
+        tksd::FillRandDataExplicitDraftTokensParams<__nv_bfloat16> params;
+        params.batchSize = static_cast<tr::SizeType32>(batchSize);
+        params.numPaths = static_cast<tr::SizeType32>(numPaths);
+        params.draftLength = static_cast<tr::SizeType32>(draftLength);
+        params.randDataSample = get_ptr<__nv_bfloat16>(randDataSample);
+        params.randDataVerification = get_ptr<__nv_bfloat16>(randDataValidation);
+        params.curandState = get_ptr<curandState_t>(curandState);
+        params.batchSlots = nullptr;
+        params.skipVerification = initialize;
+
+        tksd::invokeFillRandData(params, stream);
+    }
+    break;
+#endif // ENABLE_BF16
     default: throw std::runtime_error("Unsupported tensor type.");
     }
     sync_check_cuda_error();

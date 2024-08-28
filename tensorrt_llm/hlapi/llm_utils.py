@@ -46,9 +46,8 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
-from ..models import MODEL_MAP
-from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
-                                     TopModelMixin)
+from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
+from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
@@ -283,6 +282,11 @@ class LlmArgs:
         # The underlying implementation might disable it if it is not supported.
         self.enable_chunked_context: bool = False
 
+        # TODO[chunweiy]: Enable this option in the future
+        # Currently we want HLAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
+        # magics.
+        self.perform_config_arbitration = False
+
         if self.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -386,6 +390,14 @@ class LlmArgs:
 
         self.build_config = self.build_config or BuildConfig()
 
+        if self.perform_config_arbitration:
+            self._perform_config_arbitration()
+
+    def _perform_config_arbitration(self):
+        '''
+        Arbitrate the configurations for the model building. The configs between different functional or performance
+        features might be confilcted, and this method will arbitrate the conflicts and raise errors if necessary.
+        '''
         self._config_arbitrator = _ConfigArbitrator()
         if self.build_config_mutable:
             if not self.build_config.max_num_tokens:
@@ -415,6 +427,8 @@ class LlmArgs:
                                 kv_cache_config=self.kv_cache_config,
                                 build_config=self.build_config)
 
+        self._config_arbitrator = None
+
     def _check_model_or_model_dir(self):
         if not self.model:
             raise ValueError("model should be provided.")
@@ -434,7 +448,7 @@ class LlmArgs:
 
     @property
     def model_dir(self) -> Path:
-        assert self.is_local_model
+        assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
         return self.model
 
     @property
@@ -598,7 +612,8 @@ class LlmArgs:
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        del state['_config_arbitrator']
+        if '_config_arbitrator' in state:
+            del state['_config_arbitrator']
         return state
 
 
@@ -1004,27 +1019,16 @@ class ModelLoader:
             # this will download only once when multiple MPI processes are running
             model_dir = download_hf_model(self.llm_args.model,
                                           revision=self.llm_args.revision)
+            print_colored(f"Downloaded model to {model_dir}\n", 'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.llm_args.model = Path(self._model_dir)  # mark as a local model
-        print_colored(f"Downloaded model to {self._model_dir}\n", 'grey')
+        assert self.llm_args.is_local_model
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
-
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(
-            self._model_dir, trust_remote_code=True)
-        architecture = hf_config.architectures[0]
-
-        if architecture not in MODEL_MAP:
-            raise KeyError(f"Unsupported model architecture: {architecture}")
-        model_cls = MODEL_MAP[architecture]
-        if TopModelMixin.__name__ in model_cls.from_hugging_face.__qualname__:
-            raise NotImplementedError(
-                f"Unsupported model architecture in HLAPI: {architecture}")
-
+        model_cls = AutoModelForCausalLM.get_trtllm_model_class(self._model_dir)
         if self.llm_args.quant_config.requires_calibration:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
@@ -1061,6 +1065,7 @@ class ModelLoader:
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
 
+        #TODO: TRTLLM-1091, change the architecture in the checkpoint to TRT-LLM one, not HF one.
         architecture = self.pretrained_config.architecture
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
@@ -1144,7 +1149,8 @@ class ModelLoader:
                                                          truncation_side='left',
                                                          trust_remote_code=True,
                                                          use_fast=True)
-        except:
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer from {model_dir}: {e}")
             return None
 
 
@@ -1221,7 +1227,8 @@ class CachedModelLoader:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
         return (self.llm_args.enable_build_cache or _enable_build_cache) and (
-            self.llm_args.model_format is _ModelFormatKind.HF)
+            self.llm_args.model_format is _ModelFormatKind.HF
+        ) and not self.llm_args.parallel_config.auto_parallel
 
     def _get_engine_cache_stage(self) -> CachedStage:
         '''
@@ -1257,16 +1264,7 @@ class CachedModelLoader:
         # The build() doesn't need the real model instance to get a updated BuildConig. What is really needed is the
         # dtype. That's why the model will be downloaded from HF if necessary to get the accurate dtype.
 
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(
-            model_dir, trust_remote_code=True)
-        architecture = hf_config.architectures[0]
-
-        if architecture not in MODEL_MAP:
-            raise KeyError(f"Unsupported model architecture: {architecture}")
-        model_cls = MODEL_MAP[architecture]
-        config_cls = model_cls.config_class
-        pretrained_config = config_cls.from_hugging_face(
+        pretrained_config = AutoConfig.from_hugging_face(
             model_dir,
             mapping=Mapping(world_size=llm_args.parallel_config.world_size,
                             tp_size=llm_args.parallel_config.tp_size,

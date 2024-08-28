@@ -23,7 +23,7 @@ class Arguments:
     tp: int = 1
     pp: int = 1
 
-    beams: int = 1
+    beams: str = '1'
     gpus_per_node: int = 4
     debug: bool = False
 
@@ -31,6 +31,14 @@ class Arguments:
     gemm: bool = True
 
     max_new_tokens: int = 64
+
+    @property
+    def beams_tuple(self):
+        return eval(f'tuple([{self.beams}])')
+
+    @property
+    def max_beam(self):
+        return max(self.beams_tuple)
 
     @property
     def ckpt(self):
@@ -130,7 +138,7 @@ class Build(RunCMDMixin):
             f'--paged_kv_cache disable',
             f'--moe_plugin disable',
             f'--enable_xqa disable',
-            f'--max_beam_width {args.beams}',
+            f'--max_beam_width {args.max_beam}',
             f'--max_batch_size 8',
             f'--max_input_len 512',
             f'--gemm_plugin {args.dtype}',
@@ -146,7 +154,7 @@ class Build(RunCMDMixin):
             f'--paged_kv_cache enable',
             f'--moe_plugin disable',
             f'--enable_xqa disable',
-            f'--max_beam_width {args.beams}',
+            f'--max_beam_width {args.max_beam}',
             f'--max_batch_size 8',
             f'--max_seq_len 201',
             f'--max_encoder_input_len 512',

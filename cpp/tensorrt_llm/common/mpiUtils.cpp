@@ -234,12 +234,14 @@ void MpiComm::bcast(runtime::IBuffer& buf, int root) const
 
 std::shared_ptr<MpiRequest> MpiComm::sendAsync(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Isend with size %d", size);
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Isend(buffer, size, getMpiDtype(dtype), dest, tag, mComm, &r->mRequest));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif
+    TLLM_LOG_DEBUG("end MPI_Isend with size %d", size);
     return r;
 }
 
@@ -250,11 +252,13 @@ std::shared_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int 
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Send with size %d", size);
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG("end MPI_Send with size %d", size);
 }
 
 void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
@@ -264,12 +268,14 @@ void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
 
 MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Recv with size %d", size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Recv(buffer, size, getMpiDtype(dtype), source, tag, mComm, &status));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG("end MPI_Recv with size %d", size);
     return status;
 }
 

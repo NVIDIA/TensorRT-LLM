@@ -108,8 +108,7 @@ public:
 
     [[nodiscard]] bool constexpr needsDecoderPrologue() const
     {
-        // Potentially lookahead should require it too.
-        return anyBitSet(kExplicitDraftTokens);
+        return anyBitSet(kExplicitDraftTokens | kLookaheadDecoding);
     }
 
     using UnderlyingType = std::uint8_t;

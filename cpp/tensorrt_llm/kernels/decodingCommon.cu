@@ -52,7 +52,7 @@ __global__ void curandBatchInitialize(
     SizeType32 const bid = threadIdx.x + blockIdx.x * blockDim.x;
     if (bid < size)
     {
-        auto const batchSlot = batchSlots[bid];
+        auto const batchSlot = batchSlots != nullptr ? batchSlots[bid] : bid;
         curand_init(randomSeeds[bid], 0, 0, &states[batchSlot]);
     }
 }

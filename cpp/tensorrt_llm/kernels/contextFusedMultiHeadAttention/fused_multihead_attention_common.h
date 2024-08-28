@@ -200,9 +200,9 @@ struct MHARunnerParams
     void const* cuMaskRowsPtr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
-    // The bmm1 scale device ptr.
-    uint32_t const* scaleBmm1Ptr;
-    // The bmm2 scale device ptr.
+    // The bmm1 scale device ptr (only used by fp8 kernels).
+    float const* scaleBmm1Ptr;
+    // The bmm2 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm2Ptr;
     // The cuda stream.
     cudaStream_t stream;

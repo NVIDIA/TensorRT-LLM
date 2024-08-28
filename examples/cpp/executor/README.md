@@ -33,6 +33,16 @@ From the `examples/cpp/executor/build` folder, you can get run the `executorExam
 ```
 where `<path_to_engine_dir>` is the path to the directly containing the TensorRT engine files.
 
+### executorExampleDebug
+
+This example shows how you can define which engine IO tensors should be dumped to numpy files.
+From the `examples/cpp/executor/build` folder, you can get run the `executorExampleDebug` example with:
+
+```
+./executorExampleDebug <path_to_engine_dir>
+```
+where `<path_to_engine_dir>` is the path to the directly containing the TensorRT engine files.
+
 ### executorExampleAdvanced
 
 From the `examples/cpp/executor/build` folder, you can also run the `executorExampleAdvanced` example. To get the full list of supported input arguments, type

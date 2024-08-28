@@ -20,7 +20,6 @@
 #include "iBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/safetensors.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
@@ -386,7 +385,7 @@ void GptSession::setup(Config const& sessionConfig)
     if (mModelConfig.getManageWeightsType() != ModelConfig::ManageWeightsType::kDisabled)
     {
         TLLM_CHECK_WITH_INFO(sessionConfig.enginePath.has_value(), "Engine path is not set.");
-        auto weightPath = sessionConfig.enginePath.value().parent_path()
+        auto weightPath = sessionConfig.enginePath->parent_path()
             / ("rank" + std::to_string(mWorldConfig.getLocalRank()) + "_managed_weights.safetensors");
         mRuntime->loadManagedWeights(weightPath.string());
     }

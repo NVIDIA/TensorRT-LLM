@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/types.h"
 #include <cstdint>
 #include <curand_kernel.h>
 
@@ -62,7 +63,7 @@ public:
         mState |= kFinishedEos;
     }
 
-    __host__ __device__ bool constexpr isFinishedEOS()
+    __host__ __device__ bool constexpr isFinishedEOS() const
     {
         return anyBitSet(kFinishedEos);
     }
@@ -72,7 +73,7 @@ public:
         mState |= kFinishedStopWords;
     }
 
-    __host__ __device__ bool constexpr isFinishedStopWords()
+    __host__ __device__ bool constexpr isFinishedStopWords() const
     {
         return anyBitSet(kFinishedStopWords);
     }
@@ -82,7 +83,7 @@ public:
         mState |= kFinishedMaxLength;
     }
 
-    __host__ __device__ bool constexpr isFinishedMaxLength()
+    __host__ __device__ bool constexpr isFinishedMaxLength() const
     {
         return anyBitSet(kFinishedMaxLength);
     }
@@ -105,6 +106,23 @@ public:
     __host__ __device__ bool constexpr isSkipDecoding() const
     {
         return anyBitSet(kSkipDecoding);
+    }
+
+    executor::FinishReason toFinishReason() const
+    {
+        if (isFinishedEOS())
+        {
+            return executor::FinishReason::kEND_ID;
+        }
+        if (isFinishedStopWords())
+        {
+            return executor::FinishReason::kSTOP_WORDS;
+        }
+        if (isFinishedMaxLength())
+        {
+            return executor::FinishReason::kLENGTH;
+        }
+        return executor::FinishReason::kNOT_FINISHED;
     }
 
     using UnderlyingType = uint8_t;

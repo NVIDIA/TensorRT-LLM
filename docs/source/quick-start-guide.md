@@ -125,6 +125,19 @@ curl -X POST localhost:8000/v2/models/ensemble/generate -d \
 }'
 ```
 
+## High Level API
+We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
+Here we show you a preview of how it works and how to use it.
+
+Note that the APIs are not stable and only support the [few models](https://nvidia.github.io/TensorRT-LLM/high-level-api-examples/introduction.html#hlapi-supported-model). We appreciate your patience and understanding as we improve this API.
+
+Here is a simple example to show how to use the HLAPI with TinyLlama.
+```{eval-rst}
+.. literalinclude:: ../../examples/high-level-api/quickstart_example.py
+    :language: python
+    :linenos:
+```
+
 ## Next Steps
 
 In this Quick Start Guide, you:

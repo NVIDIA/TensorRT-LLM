@@ -68,7 +68,7 @@ def generate_outputs():
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_max_output_length(max_output_len)
     model_spec_obj.use_packed_input()
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_medusa()
 
     generate_output(engine=model_spec_obj.get_model_path(),

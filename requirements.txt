@@ -28,3 +28,6 @@ optimum
 evaluate
 janus
 mpmath>=1.3.0
+click
+click_option_group
+aenum
