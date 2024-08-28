@@ -320,30 +320,62 @@ class SHMemIterator
 {
 public:
     __device__ __forceinline__  SHMemIterator(T* g_addr, int g_offset, T* sh_addr, int sh_offset,
-    int g_step, int sh_step, int stride)
+    int g_step, int sh_step, int stride, int sh_iter)
         : g_addr_(Enable ? (g_addr + g_offset) : nullptr)
         , sh_addr_(Enable ? sh_addr : nullptr)
         , sh_offset_(sh_offset)
         , g_step_(g_step)
         , sh_step_(sh_step)
         , stride_(stride)
+        , sh_iter_(sh_iter)
     {
 
     }
 
-    __device__ __forceinline__ void copy_to_shmem(int iter)
+    __device__ __forceinline__ void copy_to_shmem()
+    // __pipeline_memcpy_async will use synced version in sm < 80
     {
         if constexpr (Enable)
         {
+            if constexpr (Continuous < sizeof(TVec) / sizeof(T))
+            {   // Uncommon slow case
+                int const c = Continuous * sizeof(T);
+                static_assert(c % 4 == 0);
+                int const s = threadIdx.x % Strided;
 #pragma unroll
-            for (int i = threadIdx.x % Strided; i < Continuous; i += Strided) {
-                __pipeline_memcpy_async(
-                    reinterpret_cast<TVec*>(sh_addr_ + iter * sh_step_) + i,
-                    reinterpret_cast<TVec*>(g_addr_ + iter * g_step_) + i,
-                    sizeof(TVec)
-                );                    
+                for (int iter = 0; iter < sh_iter_; iter += Strided)
+                {
+                    if (s < sh_iter_)
+                    {
+                        __pipeline_memcpy_async(
+                            sh_addr_ + (iter + s) * sh_step_,
+                            g_addr_ + (iter + s) * g_step_,
+                            c
+                        );
+                        __pipeline_commit();
+                    }
+                }
             }
-            __pipeline_commit();
+            else
+            {
+                int const c = Continuous * sizeof(T) / sizeof(TVec);
+                int const s = (threadIdx.x % Strided) / c;
+                int const i = threadIdx.x % c;
+#pragma unroll
+                for (int iter = 0; iter < sh_iter_; iter += Strided / c)
+                {
+                    if (s < sh_iter_)
+                    {
+                        __pipeline_memcpy_async(
+                            reinterpret_cast<TVec*>(sh_addr_ + (iter + s) * sh_step_) + i,
+                            reinterpret_cast<TVec*>(g_addr_  + (iter + s) * g_step_ ) + i,
+                            sizeof(TVec)
+                        );
+                        __pipeline_commit();
+                    }
+                }
+            }
+            __pipeline_wait_prior(0);
         }
     }
 
@@ -361,6 +393,7 @@ private:
     T* sh_addr_;
     int sh_offset_;
     int stride_;
+    int sh_iter_;
 };
 
 } // namespace weight_only

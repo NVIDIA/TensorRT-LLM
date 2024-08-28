@@ -86,16 +86,16 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     GMemIterator<Mandatory, AccessTypeW, CtaN, Details::kAccessNumW, uint8_t> weight_iterator(weight,
         (interleaved_offset_n * interleaved_k + tid * StepK) / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW);
-    SHMemIterator<Mandatory, AccessTypeA, near_sz_group, sz_per_iter * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> scales_iterator(
+    SHMemIterator<Mandatory, AccessTypeA, near_sz_group, sz_per_iter, TypeA> scales_iterator(
         scales, offset_k_group * n + blk_offset_n, vec_scale, thr_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
         (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
-        Details::kInterleave);
-    SHMemIterator<EnableZero, AccessTypeA, near_sz_group, sz_per_iter * sizeof(TypeA) / sizeof(AccessTypeA), TypeA> zeros_iterator(
+        Details::kInterleave, sh_k_iter);
+    SHMemIterator<EnableZero, AccessTypeA, near_sz_group, sz_per_iter, TypeA> zeros_iterator(
         zeros, offset_k_group * n + blk_offset_n, vec_zero, thr_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
         (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
-        Details::kInterleave);
+        Details::kInterleave, sh_k_iter);
 
     out += offset_m * n + tile_id_n * CtaN * Details::kInterleave;
     if constexpr (EnableBias)
@@ -106,13 +106,8 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     TypeA tile_acc[CtaM * CtaN];
     fill<CtaM * CtaN>(tile_acc, static_cast<TypeA>(0.f));
 
-#pragma unroll
-    for (int iter = 0; iter < sh_k_iter; ++iter)
-    {
-        scales_iterator.copy_to_shmem(iter);
-        zeros_iterator.copy_to_shmem(iter);
-    }
-    __pipeline_wait_prior(0);
+    scales_iterator.copy_to_shmem();
+    zeros_iterator.copy_to_shmem();
 
     for (int idx_k = tid * StepK, iter = 0; idx_k < interleaved_k; idx_k += CtaK, ++iter)
     {
