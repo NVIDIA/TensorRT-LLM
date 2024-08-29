@@ -94,4 +94,16 @@ void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, 
     runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize, runtime::SizeType32 vocabSizePadded,
     runtime::SizeType32 maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
 
+struct Candidate // Hold probability maximum and rate of target / dfraft, used in `acceptDraftTokensByLogits`
+{
+    float maxProb{0.f};
+    float rateQP{0.f};
+};
+
+__device__ __forceinline__ Candidate reduce_op(Candidate const& a, Candidate const& b)
+{
+    // Max-reduce operator of Candidate
+    return (a.maxProb > b.maxProb) ? a : b;
+}
+
 } // namespace tensorrt_llm::kernels::speculative_decoding

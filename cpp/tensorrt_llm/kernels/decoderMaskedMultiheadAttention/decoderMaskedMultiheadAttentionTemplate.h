@@ -1307,7 +1307,6 @@ template <
 __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) masked_multihead_attention_kernel(
     Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer, KCacheBuffer pastKCache)
 {
-
     using Tk = typename kernel_type_t<T>::Type;
     // Use 8bit cache.
     static constexpr bool ENABLE_8BITS_K_CACHE = sizeof(TKcache) == 1;
@@ -1518,6 +1517,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     convert_from_float(&k_scale_quant_orig, k_scale_quant_orig_f);
     convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_KV_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     // Up to QK_VECS_PER_Dh_MAX threads load Q and K + the bias values for the current timestep.
     // Trigger the loads from the Q and K buffers.
     Qk_vec_k q, k, q_bias, k_bias;
@@ -1530,6 +1533,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     zero(k_wo_pos);
     float rotary_embedding_base = params.rotary_embedding_base;
     float rotary_embedding_scale = params.rotary_embedding_scale;
+    // Need to recompute the inv freq if it is dynamic scaling.
+    float const* rotary_embedding_inv_freq_cache = params.rotary_embedding_scale_type != RotaryScalingType::kDYNAMIC
+        ? params.rotary_embedding_inv_freq_cache
+        : nullptr;
     if (is_valid_qk_vec)
     {
         mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale,
@@ -1643,12 +1650,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (HANDLE_KV)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, 0, nullptr, current_pos_idx);
+                rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache);
         }
         else
         {
             apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale,
-                0, nullptr, current_pos_idx);
+                current_pos_idx, rotary_embedding_inv_freq_cache);
         }
         break;
     }
@@ -1691,18 +1698,16 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, rotary_embedding_m_scale,
-                    params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
-                    params.rotary_cogvlm_vision_length);
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
 
                 mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
             }
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, rotary_embedding_m_scale,
-                    params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
-                    params.rotary_cogvlm_vision_length);
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
             }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
         }
@@ -2850,6 +2855,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         }
     }
 #endif // ENABLE_MULTI_BLOCK_OPTION
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 } // namespace mmha

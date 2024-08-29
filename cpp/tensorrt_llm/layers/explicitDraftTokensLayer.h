@@ -34,23 +34,22 @@ public:
     using Base = BaseLayer;
     using PathsVec = std::vector<std::vector<std::vector<runtime::SizeType32>>>;
 
-    ExplicitDraftTokensLayer(DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    ExplicitDraftTokensLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~ExplicitDraftTokensLayer() override;
-
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
+
 private:
     void allocateBuffer();
-    void freeBuffer();
 
     void fillContextBuffers(
-        SizeType32 batchSize, SizeType32 const* batchSlots, ExplicitDraftTokensSetupParams const& params);
+        SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& params);
 
     void convertPackedMask(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
@@ -59,29 +58,24 @@ private:
     void packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
 private:
-    using Base::mStream;
-    using Base::mAllocator;
-    using Base::mWorkspaceSize;
-
     using Base::mDecoderDomain;
 
     SizeType32 mNumPaths;
     SizeType32 mMaxPathLength;
 
-    size_t mWorkspaceSizeInBytes{0};
     size_t mScanWorkspaceSizeInBytes{0};
     size_t mReduceWorkspaceSizeInBytes{0};
 
-    uint64_t* mRandomSeedsDevice{nullptr};
-    curandState_t* mCurandStatesDevice{nullptr};
-    void* mWorkspaceDevice{nullptr};
-    SizeType32* mGenerationLengthInclusiveSum{nullptr};
-    SizeType32* mMaxGenerationLength{nullptr};
-    float* mTemperatureDevice{nullptr};
-    SizeType32* mBestPathIndicesSlots{nullptr};
-    SizeType32* mLastDraftIndicesSlots{nullptr};
+    TensorPtr mRandomSeedsDevice;
+    TensorPtr mCurandStatesDevice;
+    BufferPtr mWorkspaceDevice;
+    TensorPtr mGenerationLengthInclusiveSum;
+    TensorPtr mMaxGenerationLength;
+    TensorPtr mTemperatureDevice;
+    TensorPtr mBestPathIndicesSlots;
+    TensorPtr mLastDraftIndicesSlots;
 
-    std::vector<float> mTemperature;
+    TensorPtr mTemperature;
 };
 
 } // namespace tensorrt_llm::layers

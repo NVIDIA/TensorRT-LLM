@@ -47,7 +47,15 @@ static std::unique_ptr<BufferManager> bufferManager;
 static int deviceCount;
 static char* workloadFile = nullptr;
 
-constexpr bool VERBOSE = false;
+enum VERBOSE_LEVEL
+{
+    SILENT = 0,
+    ERROR = 1,
+    INFO = 2,
+    VERBOSE = 3
+};
+
+constexpr int LOG_LEVEL = ERROR;
 
 namespace
 {
@@ -288,7 +296,7 @@ public:
         if (FP8)
             return nvinfer1::DataType::kFP8;
         if (INT_QUANT && INT4)
-            return nvinfer1::DataType::kUINT8; // Hack to distinguish int4, use unsigned
+            return nvinfer1::DataType::kINT4; // Hack to distinguish int4, use unsigned
         if (INT_QUANT)
             return nvinfer1::DataType::kINT8;
         if (std::is_same_v<DataType, float>)
@@ -299,15 +307,49 @@ public:
         if (std::is_same_v<DataType, nv_bfloat16>)
             return nvinfer1::DataType::kBF16;
 #endif
-        return nvinfer1::DataType::kBOOL;
+        TLLM_THROW("Unrecognised format");
     };
+
+    template <class T>
+    constexpr static auto typeToDtypeID()
+    {
+        if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+        {
+            return nvinfer1::DataType::kFP8;
+        }
+        else if constexpr (std::is_same_v<T, uint8_t>)
+        {
+            return nvinfer1::DataType::kINT8;
+        }
+        else if constexpr (std::is_same_v<T, cutlass::uint4b_t>)
+        {
+            return nvinfer1::DataType::kINT4;
+        }
+        else if constexpr (std::is_same_v<T, nv_bfloat16>)
+        {
+            return nvinfer1::DataType::kBF16;
+        }
+        else if constexpr (std::is_same_v<T, half>)
+        {
+            return nvinfer1::DataType::kHALF;
+        }
+        else if constexpr (std::is_same_v<T, float>)
+        {
+            return nvinfer1::DataType::kFLOAT;
+        }
+        else
+        {
+            // sizeof(T) to make the static assert dependent on the template
+            static_assert(sizeof(T) == 0, "Unrecognised data type");
+        }
+    }
 
     static bool shouldSkip()
     {
 #ifndef ENABLE_FP8
         static_assert(!FP8, "FP8 Tests enabled on unsupported CUDA version");
 #endif
-        bool should_skip_unsupported_fp8 = getSMVersion() < 90 && FP8;
+        bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
         return should_skip_unsupported_fp8;
     }
 
@@ -379,6 +421,8 @@ public:
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
     QuantParams mQuantParams{};
+    bool mUseLora = false;
+    LoraParams mLoraParams{};
 
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mSelectedConfig = std::nullopt;
 
@@ -409,8 +453,8 @@ public:
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        size_t workspace_size
-            = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {});
+        size_t workspace_size = mMoERunner.getWorkspaceSize(
+            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {}, mUseLora);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -481,35 +525,71 @@ public:
 
     // An imprecise benchmark pass for picking the best tactic.
     // Runs for 3 iterations or 1 second and picks the best option
-    int pickBestTactic(MOEParallelismConfig parallelism_config)
+    int pickBestTactic(MOEParallelismConfig parallelism_config, GemmProfilerBackend::GemmToProfile gemm_to_profile)
     {
-        NVTX3_SCOPED_RANGE(WarmUpRun);
         auto tactics = mMoERunner.getTactics();
+        ::nvtx3::scoped_range nvtx(tensorrt_llm::common::nvtx::nextColor(),
+            "Tactic Profiling GEMM " + std::to_string(static_cast<int>(gemm_to_profile)));
+
+        GemmProfilerBackend profiler;
+        profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
+            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mActType, mUseBias, mUseLora,
+            parallelism_config);
+        auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
+        auto workspace = bufferManager->gpu(workspace_size);
+
+        profiler.prepare(mTotalTokens, static_cast<char*>(workspace->data()), streamPtr->get());
 
         float best_time = INFINITY;
         int best_idx = -1;
         for (int tidx = 0; tidx < tactics.size(); tidx++)
         {
+            ::nvtx3::scoped_range nvtx(
+                tensorrt_llm::common::nvtx::nextColor(), "Tactic Profiling Tactic Index: " + std::to_string(tidx));
             try
             {
                 // Set the tactic
                 auto const& t = tactics[tidx];
-                mMoERunner.setTactic(t);
 
-                // Warm-Up run
-                benchmarkLoop(parallelism_config);
+                {
+                    ::nvtx3::scoped_range nvtx(tensorrt_llm::common::nvtx::nextColor(), "Tactic Profiling Warm-Up");
+                    // Warm-Up run
+                    profiler.runProfiler(mTotalTokens, t, static_cast<char*>(workspace->data()), streamPtr->get());
+                    check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
+                }
 
+                // Profile all samples or for 1 sec
+                int const max_iters = profiler.NUM_ROUTING_SAMPLES;
                 float const max_time_ms = 1000.f;
-                int const max_iters = 3;
+
                 float time = 0.f;
                 int iter = 0;
                 while (iter < max_iters && time < max_time_ms)
                 {
-                    time += benchmarkLoop(parallelism_config);
+                    {
+                        ::nvtx3::scoped_range nvtx(tensorrt_llm::common::nvtx::nextColor(),
+                            "Tactic Profiling Iteration " + std::to_string(iter));
+
+                        check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
+                        profiler.runProfiler(mTotalTokens, t, static_cast<char*>(workspace->data()), streamPtr->get());
+                        check_cuda_error(cudaEventRecord(mEndEvent, streamPtr->get()));
+                        check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
+                    }
+
+                    float ms;
+                    check_cuda_error(cudaEventElapsedTime(&ms, mStartEvent, mEndEvent));
+                    time += ms;
+
                     iter++;
                 }
                 // Get average time per iteration
                 time /= static_cast<float>(iter);
+
+                if (LOG_LEVEL >= VERBOSE)
+                {
+                    std::cout << "Tactic " << tidx << " for GEMM" << (int) gemm_to_profile << ":\n"
+                              << t.toString() << "\ntook: " << time << "ms\n";
+                }
 
                 // Update the best
                 if (time < best_time)
@@ -521,7 +601,7 @@ public:
             catch (std::exception const& e)
             {
                 // Sync to tidy up
-                if (VERBOSE)
+                if (LOG_LEVEL >= ERROR)
                     std::cout << "Tactic failed to run with: " << e.what() << std::endl;
                 check_cuda_error(cudaDeviceSynchronize());
                 // skip invalid tactic
@@ -529,30 +609,30 @@ public:
             }
         }
 
-        // Check if all tactics failed
-        if (best_idx < 0)
-            return -1;
-
-        auto const& best_tactic = tactics[best_idx];
-        mMoERunner.setTactic(best_tactic);
         return best_idx;
     }
 
-    int setTactic(int tactic_idx, MOEParallelismConfig parallelism_config)
+    std::pair<int, int> setTactic(int tactic_idx1, int tactic_idx2, MOEParallelismConfig parallelism_config)
     {
-        if (tactic_idx == -1)
+        auto tactics = mMoERunner.getTactics();
+        for (auto& t_ptr : {&tactic_idx1, &tactic_idx2})
         {
-            return pickBestTactic(parallelism_config);
+            auto& t = *t_ptr;
+            if (t == -1)
+            {
+                t = pickBestTactic(parallelism_config,
+                    t_ptr == &tactic_idx1 ? GemmProfilerBackend::GemmToProfile::GEMM_1
+                                          : GemmProfilerBackend::GemmToProfile::GEMM_2);
+            }
+
+            if (t < 0 || t >= tactics.size())
+            {
+                return {-1, -1};
+            }
         }
 
-        auto tactics = mMoERunner.getTactics();
-        if (tactic_idx < 0 || tactic_idx >= tactics.size())
-        {
-            return -1;
-        }
-        auto selected_tactic = tactics[tactic_idx];
-        mMoERunner.setTactic(selected_tactic);
-        return tactic_idx;
+        mMoERunner.setTactic(tactics[tactic_idx1], tactics[tactic_idx2]);
+        return {tactic_idx1, tactic_idx2};
     }
 
     void runMoEPermute(MOEParallelismConfig parallelism_config)
@@ -561,7 +641,7 @@ public:
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, mExpertWeight1, mExpertBias1, mActType, mExpertWeight2,
             mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace,
             mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, parallelism_config,
-            mNormMode, stream);
+            mNormMode, mUseLora, mLoraParams, stream);
     }
 
     void runBenchmark(benchmark::State& state);
@@ -582,8 +662,9 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     mUseBias = state.range(8);
     mActType = static_cast<tensorrt_llm::ActivationType>(state.range(9));
     mNormMode = static_cast<MOEExpertScaleNormalizationMode>(state.range(10));
-    int tactic_idx = state.range(11);
-    int const routing_config = state.range(12);
+    int tactic_idx1 = state.range(11);
+    int tactic_idx2 = state.range(12);
+    int const routing_config = state.range(13);
 
     state.counters["num_experts"] = num_experts;
     state.counters["top_k"] = top_k;
@@ -602,7 +683,7 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     std::stringstream ss;
     ss << "Experts,K,Hidden,Inter,TP,EP,Rank,Tokens,Bias,Actfn,Norm Mode,Tactic,Routing=";
     for (auto v : {num_experts, top_k, hidden_size, inter_size, tp_size, ep_size, world_rank, num_tokens,
-             (int) mUseBias, (int) mActType, (int) mNormMode, tactic_idx})
+             (int) mUseBias, (int) mActType, (int) mNormMode, tactic_idx1, tactic_idx2})
     {
         ss << v << ",";
     }
@@ -615,19 +696,22 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     initBuffersPermute(num_tokens, hidden_size, inter_size, num_experts, top_k, routing_config, parallelism_config);
 
     // Parse the tactic, does checks for "auto" mode and out of range
-    tactic_idx = setTactic(tactic_idx, parallelism_config);
-    if (tactic_idx < 0)
+    std::tie(tactic_idx1, tactic_idx2) = setTactic(tactic_idx1, tactic_idx2, parallelism_config);
+    if (tactic_idx1 < 0 || tactic_idx2 < 0)
     {
         state.SkipWithMessage("Out of range tactic");
         return;
     }
-    if (VERBOSE)
+    if (LOG_LEVEL >= INFO)
     {
         auto tactics = mMoERunner.getTactics();
-        std::cout << "Selected " << tactic_idx << "/" << tactics.size() << "\n"
-                  << tactics[tactic_idx].toString() << std::endl;
+        std::cout << "Selected tactic #1: " << tactic_idx1 << "/" << tactics.size() << "\n"
+                  << tactics[tactic_idx1].toString() << std::endl;
+        std::cout << "Selected tactic #2: " << tactic_idx2 << "/" << tactics.size() << "\n"
+                  << tactics[tactic_idx2].toString() << std::endl;
     }
-    state.counters["tactic_idx"] = tactic_idx;
+    state.counters["tactic_idx1"] = tactic_idx1;
+    state.counters["tactic_idx2"] = tactic_idx2;
 
     {
         NVTX3_SCOPED_RANGE(BenchmarkRun);

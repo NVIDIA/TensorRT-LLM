@@ -55,6 +55,10 @@ if __name__ == '__main__':
     config_path = os.path.join(args.engine_dir, 'config.json')
     with open(config_path, 'r') as f:
         config = json.load(f)
+
+    assert config["plugin_config"]["remove_input_padding"] == False, \
+        "Please refer to run_remove_input_padding.py for running BERT models with remove_input_padding enabled"
+
     dtype = config['builder_config']['precision']
     world_size = config['builder_config']['tensor_parallel']
     assert world_size == tensorrt_llm.mpi_world_size(), \

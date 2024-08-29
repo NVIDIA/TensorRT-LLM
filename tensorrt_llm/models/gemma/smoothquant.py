@@ -1,23 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import functools
 import math
 import time
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import Cache, LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       LlamaDecoderLayer,
                                                       apply_rotary_pos_emb,
                                                       repeat_kv)
 from transformers.pytorch_utils import Conv1D
 
-from tensorrt_llm._utils import torch_to_numpy
+from tensorrt_llm._utils import pad_vocab_size, torch_to_numpy
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.gemma.weight import dup_kv_weight
+
+if TYPE_CHECKING:
+    from transformers import AutoModelForCausalLM, Cache
+
+    # transformers included  ⬆️ `Cache` in https://github.com/huggingface/transformers/commit/633215ba58fe5114d8c8d32e415a04600e010701 - transformers 4.33, which is installed in the tests, is before this.
 
 
 def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
@@ -151,7 +172,7 @@ def smooth_gemm(gemm_weights,
                 act_scales,
                 layernorm_weights=None,
                 layernorm_bias=None,
-                alpha=0.5,
+                alpha: Optional[float] = 0.5,
                 weight_scales=None):
     if not isinstance(gemm_weights, list):
         gemm_weights = [gemm_weights]
@@ -244,7 +265,7 @@ def smooth_gemm_fc1_gate(fc1_weights,
                          act_scales,
                          layernorm_weights=None,
                          layernorm_bias=None,
-                         alpha=0.5,
+                         alpha: Optional[float] = 0.5,
                          weight_scales=None):
     gemm_weights = []
     if not isinstance(fc1_weights, list):
@@ -278,7 +299,8 @@ def smooth_gemm_fc1_gate(fc1_weights,
 
 
 @torch.no_grad()
-def smooth_model(model, scales, alpha, qkv_para, smoother_dict):
+def smooth_model(model, scales, alpha: Optional[float], qkv_para,
+                 smoother_dict):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         if not isinstance(module, LlamaDecoderLayer):
@@ -595,7 +617,7 @@ class LlamaAttentionExtend(LlamaAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: "Optional[Cache]" = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -765,21 +787,14 @@ def create_model_from_config(trt_llm_config, weights):
     return model
 
 
-def convert_hf_model(hf_model,
-                     mapping,
-                     vocab_size=32000,
-                     dtype='float32',
-                     use_parallel_embedding=False,
-                     sharding_dim=0,
-                     use_weight_only=False,
-                     plugin_weight_only_quant_type=torch.int8,
-                     use_smooth_quant=False,
-                     per_channel=False,
-                     per_token=False,
-                     int8_kv_cache=False,
-                     act_range=[],
-                     qkv_para=[],
-                     smoother=[]):
+def convert_hf_model(*, hf_model: "AutoModelForCausalLM", mapping: Mapping,
+                     vocab_size: int, dtype: str, use_parallel_embedding: bool,
+                     sharding_dim: int, use_weight_only: bool,
+                     plugin_weight_only_quant_type: torch.dtype,
+                     use_smooth_quant: bool, per_channel: bool, per_token: bool,
+                     int8_kv_cache: bool,
+                     act_range: "defaultdict[Any, dict[str, None]]",
+                     qkv_para: Dict, smoother: Dict):
 
     weights = {}
     tik = time.time()

@@ -1,6 +1,6 @@
 # Executor API examples
 
-This directory contains two examples that demonstrate how to use the `Executor` API. The first example defined in `executorExampleBasic.cpp` shows how you can generate output tokens for a single prompt in only a few lines of code. The second example defined in `executorExampleAdvanced.cpp` supports more options such as providing an arbitrary number of input requests with arbitrary tokens per request and running in streaming mode.
+This directory contains three examples that demonstrate how to use the `Executor` API. The first example defined in `executorExampleBasic.cpp` shows how you can generate output tokens for a single prompt in only a few lines of code. The second example defined in `executorExampleAdvanced.cpp` supports more options such as providing an arbitrary number of input requests with arbitrary tokens per request and running in streaming mode. The third example defined in `executorExampleLogitsProcessor.cpp` shows how to use `LogitsPostProcessor` to control output tokens.
 
 ## Building the examples
 

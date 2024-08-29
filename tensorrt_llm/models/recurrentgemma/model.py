@@ -250,6 +250,10 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
         self.gather_context_logits = False
         self.logits_soft_cap = config.logits_soft_cap
 
+        # Create constant attention parameters to be reused by all layers.
+        Attention.create_attention_const_params(self, config)
+        self.position_embedding_type = config.position_embedding_type
+
         if isinstance(logits_dtype, str):
             self._logits_dtype = str_dtype_to_trt(logits_dtype)
         else:
@@ -279,6 +283,11 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 last_token_ids_for_logits=None,
                 host_context_lengths=None,
                 slot_mapping=None):
+
+        # fill attention params.
+        attention_params = Attention.fill_attention_params(
+            self, attention_params)
+
         hidden_states, present_kvs, present_convs, present_rnns = self.transformer(
             input_ids, use_cache, attention_mask, kv_cache_params,
             attention_params, conv_states, rnn_states, host_request_types,
@@ -428,8 +437,6 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
         streamingllm = default_net().plugin_config.streamingllm
         use_mamba_conv1d_plugin = default_net(
         ).plugin_config.mamba_conv1d_plugin
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
 
         self.gather_context_logits = gather_context_logits
         mapping = self.config.mapping
@@ -482,7 +489,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                                       ('position_ids_inlen_range',
                                        ranges['position_ids_inlen_range']),
                                   ]))
-        if use_custom_all_reduce and mapping.tp_size > 1:
+        if mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
                 mapping, num_profiles)
 
@@ -554,7 +561,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
 
         if use_gpt_attention_plugin and remove_input_padding:
             host_context_lengths = attention_inputs['host_context_lengths']
-        elif use_mamba_conv1d_plugin and remove_input_padding:
+        elif remove_input_padding:
             host_context_lengths = Tensor(
                 name='host_context_lengths',
                 dtype=trt.int32,
@@ -597,7 +604,9 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 context_lengths=attention_inputs['context_lengths'],
                 host_context_lengths=attention_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
-                host_request_types=attention_inputs['host_request_types']),
+                host_request_types=attention_inputs['host_request_types'],
+                host_runtime_perf_knobs=attention_inputs[
+                    'host_runtime_perf_knobs']),
             'conv_states':
             recurrent_inputs['conv_states'],
             'rnn_states':

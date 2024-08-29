@@ -158,14 +158,14 @@ cluster_infos = {
         memory_budget_per_device=32,
         math_throughput=MathThroughput(float32=112),
     ),
-    "V100-SMX-16GB":
+    "V100-SXM-16GB":
     ClusterInfo(
         intra_node_bw_per_device=150,
         memory_bw=900,
         memory_budget_per_device=16,
         math_throughput=MathThroughput(float32=125),
     ),
-    "V100-SMX-32GB":
+    "V100-SXM-32GB":
     ClusterInfo(
         intra_node_bw_per_device=150,
         memory_bw=900,

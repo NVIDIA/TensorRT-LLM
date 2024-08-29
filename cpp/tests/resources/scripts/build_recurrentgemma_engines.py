@@ -21,7 +21,12 @@ import platform as _pf
 import sys as _sys
 import typing as _tp
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
 def build_engine(weight_dir: _pl.Path, ckpt_dir: _pl.Path, engine_dir: _pl.Path,
@@ -105,10 +110,15 @@ def build_engines(model_cache: _tp.Optional[str] = None):
     run_command([python_exe, "-m", "pip", "install", "transformers>=4.40.0"],
                 env=_os.environ,
                 timeout=300)
+    input_file = 'input_tokens.npy'
+    model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.use_packed_input()
+    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
 
     print("\nBuilding fp16-plugin-packed-paged engine")
-    build_engine(hf_dir, ckpt_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
-                 engine_dir / 'fp16-plugin-packed-paged' / tp_pp_dir,
+    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
                  '--remove_input_padding=enable', '--paged_state=enable')
 
     # Restore transformers version

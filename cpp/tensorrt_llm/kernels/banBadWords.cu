@@ -27,7 +27,7 @@ namespace kernels
 
 template <typename T>
 __global__ void ban_bad_words(T* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slots, SizeType32 beam_width, TokenIdType const** bad_words_ptrs,
+    SizeType32 const* batch_slots, SizeType32 beam_width, TokenIdType const* const* bad_words_ptrs,
     SizeType32 const* bad_words_lens, SizeType32 vocab_size_padded, SizeType32 const* sequence_lengths,
     SizeType32 max_seq_len)
 {
@@ -99,7 +99,7 @@ __global__ void ban_bad_words(T* logits, TokenIdType const** output_ids_ptr, Siz
 
 template <typename T>
 void invokeBanBadWords(T* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const** bad_words,
+    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const* const* bad_words,
     SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len, SizeType32 vocab_size_padded,
     SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream)
 {
@@ -115,17 +115,17 @@ void invokeBanBadWords(T* logits, TokenIdType const** output_ids_ptr, SizeType32
 }
 
 template void invokeBanBadWords(half* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const** bad_words,
+    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const* const* bad_words,
     SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len, SizeType32 vocab_size_padded,
     SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeBanBadWords(__nv_bfloat16* logits, TokenIdType const** output_ids_ptr,
     SizeType32 const** parent_ids_ptr, SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width,
-    TokenIdType const** bad_words, SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len,
+    TokenIdType const* const* bad_words, SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len,
     SizeType32 vocab_size_padded, SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 #endif
 template void invokeBanBadWords(float* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,
-    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const** bad_words,
+    SizeType32 const* batch_slot, SizeType32 batch_size, SizeType32 beam_width, TokenIdType const* const* bad_words,
     SizeType32 const* bad_words_lens, SizeType32 max_bad_words_len, SizeType32 vocab_size_padded,
     SizeType32 const* sequence_lengths, SizeType32 max_seq_len, cudaStream_t stream);
 

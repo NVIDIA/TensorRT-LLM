@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -45,11 +46,12 @@ class SpeculativeDecodingModule;
 class IGptDecoder
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor>;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
 
     virtual ~IGptDecoder() = default;
 
-    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots = nullptr,
+    virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt)
         = 0;
 
@@ -92,7 +94,7 @@ public:
         size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
         std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
-    void setup(SamplingConfig const& samplingConfig, size_t batchSize, SizeType32 const* batchSlots = nullptr,
+    void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
@@ -109,7 +111,7 @@ public:
     }
 
 private:
-    BufferManager mManager;
+    std::shared_ptr<BufferManager> mManager;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
 
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
@@ -138,6 +140,18 @@ inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode c
         TLLM_THROW("Unsupported decoder data type: %d. Use either kFLOAT or kHALF.", static_cast<int>(dtype));
         return nullptr;
     }
+}
+
+/// @brief Helper function to produce batch slots [0, 1, ..., batchSize - 1] for paths that do not explicitly provide
+/// batch slots to the decoder.
+inline runtime::ITensor::SharedConstPtr getDefaultBatchSlots(
+    runtime::SizeType32 batchSize, runtime::BufferManager const& bufferManager)
+{
+    auto defaultBatchSlots = bufferManager.pinnedPool(
+        runtime::ITensor::makeShape({batchSize}), runtime::TRTDataType<runtime::SizeType32>::value);
+    auto range = runtime::BufferRange<runtime::SizeType32>(*defaultBatchSlots);
+    std::iota(range.begin(), range.end(), 0);
+    return defaultBatchSlots;
 }
 } // namespace runtime
 } // namespace tensorrt_llm

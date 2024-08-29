@@ -4,8 +4,8 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-05.html#rel-24-05
-TORCH_VERSION="2.3.1"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-07.html#rel-24-07
+TORCH_VERSION="2.4.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {

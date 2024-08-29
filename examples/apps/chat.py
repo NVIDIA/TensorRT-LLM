@@ -82,6 +82,7 @@ def main(model: str, tokenizer: str, tp_size: int):
     sampling_params.top_p = 0.95
 
     llm = LLM(model,
+              tokenizer,
               build_config=build_config,
               kv_cache_config=kv_cache_config,
               tensor_parallel_size=tp_size)

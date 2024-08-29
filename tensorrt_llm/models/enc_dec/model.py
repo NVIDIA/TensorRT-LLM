@@ -25,7 +25,7 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
-                                     transpose)
+                                     slice, transpose)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
@@ -667,6 +667,7 @@ class EncoderModel(PretrainedModel):
     def prepare_inputs(self,
                        max_batch_size,
                        max_input_len,
+                       max_num_tokens,
                        prompt_embedding_table_size: int = 0,
                        lora_target_modules: List[str] = None,
                        *args,
@@ -689,8 +690,6 @@ class EncoderModel(PretrainedModel):
 
         input_ids, position_ids, token_type_ids, hidden_states = None, None, None, None
         remove_input_padding = default_net().plugin_config.remove_input_padding
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
         use_lora_plugin = default_net().plugin_config.lora_plugin
 
         attention_mask = None
@@ -772,8 +771,9 @@ class EncoderModel(PretrainedModel):
                     ]),
                 )
 
-        if use_custom_all_reduce and self.mapping.tp_size > 1:
-            current_all_reduce_helper().set_workspace_tensor(self.mapping, 1)
+        # if self.mapping.tp_size > 1:
+        #     current_all_reduce_helper().set_workspace_tensor(self.mapping, 1)
+        # FIXME(TRTLLM-996): Support custom allreduce for encoder models on C++ runtime
 
         input_lengths = Tensor(
             name="input_lengths",
@@ -890,7 +890,7 @@ class EncoderModel(PretrainedModel):
             lora_params = LoraParams(
                 lora_ranks=lora_ranks,
                 lora_weights_pointers=lora_weights_pointers,
-                max_context_length=max_input_len,
+                max_num_tokens=max_num_tokens,
                 host_request_types=host_request_types,
                 host_context_lengths=host_context_lengths,
             )
@@ -1226,6 +1226,7 @@ class DecoderModel(PretrainedModel):
                        max_beam_width,
                        max_decoder_input_len,
                        max_seq_len,
+                       max_num_tokens,
                        max_encoder_input_len,
                        gather_context_logits: bool = False,
                        gather_generation_logits: bool = False,
@@ -1287,6 +1288,7 @@ class DecoderModel(PretrainedModel):
         past_key_value = []
         sequence_length = None
         host_past_key_value_lengths = None
+        runtime_perf_knobs = None
         attention_mask = None
         cross_attention_mask = None
         use_gpt_attention_plugin = default_net(
@@ -1294,8 +1296,6 @@ class DecoderModel(PretrainedModel):
         remove_input_padding = default_net().plugin_config.remove_input_padding
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
         tokens_per_block = default_net().plugin_config.tokens_per_block
-        use_custom_all_reduce = default_net(
-        ).plugin_config.use_custom_all_reduce
         use_lora_plugin = default_net().plugin_config.lora_plugin
 
         input_ids, position_ids, token_type_ids, hidden_states = None, None, None, None
@@ -1448,6 +1448,12 @@ class DecoderModel(PretrainedModel):
                                             ('batch_size_beam_width',
                                              [bb_range])
                                         ]))
+            runtime_perf_knobs = Tensor(name='host_runtime_perf_knobs',
+                                        dtype=trt.int64,
+                                        shape=[16],
+                                        dim_range=OrderedDict([
+                                            ('perf_knob_size', [16])
+                                        ]))
 
         last_token_ids = None
         if self.mapping.is_last_pp_rank() and not gather_context_logits:
@@ -1492,7 +1498,7 @@ class DecoderModel(PretrainedModel):
             ]),
         )
 
-        if use_custom_all_reduce and self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(self.mapping, 1)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
@@ -1590,7 +1596,7 @@ class DecoderModel(PretrainedModel):
                 lora_ranks=lora_ranks,
                 lora_weights_pointers=lora_weights_pointers,
                 host_context_lengths=host_context_lengths,
-                max_context_length=max_decoder_input_len,
+                max_num_tokens=max_num_tokens,
                 max_encoder_context_length=max_encoder_input_len,
                 host_request_types=host_request_types,
                 host_encoder_input_lengths=host_encoder_input_lengths,
@@ -1750,7 +1756,7 @@ class DecoderModel(PretrainedModel):
                 host_request_types=host_request_types,
                 encoder_input_lengths=encoder_input_lengths,
                 encoder_max_input_length=encoder_max_input_length,
-            )
+                host_runtime_perf_knobs=runtime_perf_knobs)
 
         cross_kv_cache_gen = Tensor(name='cross_kv_cache_gen',
                                     dtype=trt.bool,
@@ -1837,18 +1843,23 @@ class WhisperEncoder(PretrainedModel):
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self._dtype = self.config.dtype
-
+        # Encoder conv needs to run in fp32 on Volta/Turing
+        major, minor = torch.cuda.get_device_capability()
+        if major >= 8:
+            self._conv_dtype = self._dtype
+        else:
+            self._conv_dtype = "float32"
         self.conv1 = Conv1d(config.n_mels,
                             config.hidden_size,
                             kernel_size=3,
                             padding=1,
-                            dtype=self._dtype)
+                            dtype=self._conv_dtype)
         self.conv2 = Conv1d(config.hidden_size,
                             config.hidden_size,
                             kernel_size=3,
                             stride=2,
                             padding=1,
-                            dtype=self._dtype)
+                            dtype=self._conv_dtype)
 
         self.positional_embedding = Parameter(shape=(config.n_audio_ctx,
                                                      config.hidden_size),
@@ -1869,16 +1880,36 @@ class WhisperEncoder(PretrainedModel):
         ])
 
         self.ln_post = LayerNorm(config.hidden_size, dtype=self._dtype)
+        self.max_audio_feature_seq_len = 3000
 
-    def forward(self, x: Tensor, input_lengths=None):
-
-        x = self.conv1(x)
+    def forward(self, input_features: Tensor, input_lengths=None):
+        if default_net().plugin_config.remove_input_padding:
+            # BXT,D -> B,T,D -> B,D,T
+            input_features = input_features.view([
+                input_lengths.shape[0], self.max_audio_feature_seq_len,
+                self.config.n_mels
+            ])
+            input_features = transpose(input_features, 1, 2)
+        # Encoder conv needs to run in fp32 on Volta/Turing
+        x_type = input_features.dtype
+        input_features = cast(input_features, self._conv_dtype)
+        x = self.conv1(input_features)
         x = gelu(x)
         x = self.conv2(x)
+        x = cast(x, x_type)
         x = gelu(x)
         x = transpose(x, 2, 1)
-        x = x + cast(self.positional_embedding.value, x.dtype)
-
+        x = x + cast(
+            slice(input=self.positional_embedding.value,
+                  starts=[0, 0],
+                  sizes=[
+                      self.max_audio_feature_seq_len // 2,
+                      self.positional_embedding.shape[1]
+                  ],
+                  strides=[1, 1]), x.dtype)
+        if default_net().plugin_config.remove_input_padding:
+            #B,T,D -> BxT,D
+            x = x.view([-1, self.config.hidden_size])
         hidden_states = x
         for encoder_layer in self.encoder_layers:
             hidden_states = encoder_layer(hidden_states,
@@ -1886,21 +1917,37 @@ class WhisperEncoder(PretrainedModel):
 
         x = hidden_states
         x = self.ln_post(x)
-        x.mark_output('output', self._dtype)
+        x.mark_output('encoder_output', self._dtype)
         return x
 
     def prepare_inputs(self, max_batch_size=16):
 
         bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
-
-        x = Tensor(name="x",
-                   dtype=self._dtype,
-                   shape=[-1, self.config.n_mels, 3000],
-                   dim_range=OrderedDict([
-                       ("batch_size", [bs_range]),
-                       ("feature_dim", [self.config.n_mels]),
-                       ("feature_len_range", [3000]),
-                   ]))
+        # You may change max_audio_feature_seq_len here for distill-whisper models.
+        max_audio_feature_seq_len = self.max_audio_feature_seq_len
+        if not default_net().plugin_config.remove_input_padding:
+            x = Tensor(
+                name="input_features",
+                dtype=self._dtype,
+                shape=[-1, self.config.n_mels, max_audio_feature_seq_len],
+                dim_range=OrderedDict([
+                    ("batch_size", [bs_range]),
+                    ("feature_dim", [self.config.n_mels]),
+                    ("feature_len_range", [max_audio_feature_seq_len]),
+                ]))
+        else:
+            batch_seqlen_range = [
+                1,
+                (max_audio_feature_seq_len * max_batch_size + 1) // 2,
+                max_audio_feature_seq_len * max_batch_size,
+            ]
+            x = Tensor(name="input_features",
+                       dtype=self._dtype,
+                       shape=[-1, self.config.n_mels],
+                       dim_range=OrderedDict([
+                           ("batch_seqlen_range", [batch_seqlen_range]),
+                           ("feature_dim", [self.config.n_mels]),
+                       ]))
         input_lengths = Tensor(
             name="input_lengths",
             dtype=trt.int32,
@@ -1908,7 +1955,7 @@ class WhisperEncoder(PretrainedModel):
             dim_range=OrderedDict([("batch_size", [bs_range])]),
         )
 
-        return {'x': x, 'input_lengths': input_lengths}
+        return {'input_features': x, 'input_lengths': input_lengths}
 
     def precompute_relative_attention_bias(self, build_config):
         pass

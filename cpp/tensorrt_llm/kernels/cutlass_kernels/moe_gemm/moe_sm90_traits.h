@@ -38,13 +38,7 @@ constexpr bool isValidHopperMOESpecialisation()
 template <typename T, typename WeightType, typename EpilogueTag = cutlass_extensions::EpilogueOpDefault>
 constexpr bool isValidAmpereMOESpecialisation()
 {
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) and defined(ENABLE_FP8)
-    constexpr bool is_fp8
-        = cutlass::platform::is_same<T, __nv_fp8_e4m3>::value || cutlass::platform::is_same<T, __nv_fp8_e5m2>::value;
-    return !is_fp8;
-#else
-    return true;  // Default to true
-#endif
+    return true; // Default to true
 }
 
 } // namespace tensorrt_llm::kernels::cutlass_kernels

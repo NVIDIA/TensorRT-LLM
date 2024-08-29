@@ -21,7 +21,6 @@ from ...layers import (AttentionMaskType, CogVLMAttention, ColumnLinear,
                        Embedding, GatedMLP, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ...plugin import init_all_reduce_helper
 # this is to use to module global algo string with a quant_algo prefix
 from ...quantization import QuantMode
 from ...top_model_mixin import TopModelMixin
@@ -52,6 +51,7 @@ class CogvlmDecoderLayer(Module):
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
             bias=config.attn_bias,
+            position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
@@ -141,7 +141,6 @@ class CogvlmModel(Module):
 
     def __init__(self, config: CogVLMConfig) -> None:
         super().__init__()
-        init_all_reduce_helper()
 
         self.mapping = config.mapping
         self.use_prompt_tuning = config.use_prompt_tuning

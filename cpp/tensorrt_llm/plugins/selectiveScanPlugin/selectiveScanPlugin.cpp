@@ -29,18 +29,23 @@ static char const* SELECTIVE_SCAN_PLUGIN_NAME{"SelectiveScan"};
 PluginFieldCollection SelectiveScanPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> SelectiveScanPluginCreator::mPluginAttributes;
 
-SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dt_rank, bool isVariableB, bool isVariableC,
-    bool deltaSoftplus, nvinfer1::DataType type, bool removePadding, bool pagedState)
+SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dtRank, int nHeads, int nGroups, int chunkSize,
+    bool deltaSoftplus, nvinfer1::DataType type, bool removePadding, bool pagedState, bool zEnabled, bool isMamba2)
     : mDim(dim)
     , mDState(dstate)
-    , mDtRank(dt_rank)
-    , mIsVariableB(isVariableB)
-    , mIsVariableC(isVariableC)
+    , mDtRank(dtRank)
+    , mNHeads(nHeads)
+    , mNGroups(nGroups)
+    , mChunkSize(chunkSize)
     , mDeltaSoftplus(deltaSoftplus)
     , mType(type)
     , mRemovePadding(removePadding)
     , mPagedState(pagedState)
+    , mZEnabled(zEnabled)
+    , mIsMamba2(isMamba2)
+    , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
 {
+    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (!mIsMamba2), "Pre SM 80 GPUs do not support Mamba2");
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
@@ -49,17 +54,21 @@ SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dt_rank, bool 
 
 // Parameterized constructor
 SelectiveScanPlugin::SelectiveScanPlugin(void const* data, size_t length)
+    : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mDim);
     read(d, mDState);
     read(d, mDtRank);
-    read(d, mIsVariableB);
-    read(d, mIsVariableC);
+    read(d, mNHeads);
+    read(d, mNGroups);
+    read(d, mChunkSize);
     read(d, mDeltaSoftplus);
     read(d, mType);
     read(d, mRemovePadding);
     read(d, mPagedState);
+    read(d, mZEnabled);
+    read(d, mIsMamba2);
     TLLM_CHECK(d == a + length);
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
@@ -69,8 +78,8 @@ SelectiveScanPlugin::SelectiveScanPlugin(void const* data, size_t length)
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* SelectiveScanPlugin::clone() const noexcept
 {
-    auto* plugin = new SelectiveScanPlugin(
-        mDim, mDState, mDtRank, mIsVariableB, mIsVariableC, mDeltaSoftplus, mType, mRemovePadding, mPagedState);
+    auto* plugin = new SelectiveScanPlugin(mDim, mDState, mDtRank, mNHeads, mNGroups, mChunkSize, mDeltaSoftplus, mType,
+        mRemovePadding, mPagedState, mZEnabled, mIsMamba2);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -83,7 +92,16 @@ nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
 {
     if (outputIndex == 0)
     {
-        return inputs[getInputTensorIdx()];
+        if (mIsMamba2)
+        {
+            auto ret = inputs[getInputTensorIdx()];
+            ret.d[mRemovePadding ? 1 : 2] = exprBuilder.constant(mDim);
+            return ret;
+        }
+        else
+        {
+            return inputs[getInputTensorIdx()];
+        }
     }
     return inputs[getStateIdx()];
 }
@@ -91,7 +109,8 @@ nvinfer1::DimsExprs SelectiveScanPlugin::getOutputDimensions(
 bool SelectiveScanPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    if (pos == getHostRequestTypesIdx() || pos == getLastTokenIdsIdx() || (mPagedState && pos == getSlotMappingIdx()))
+    if (pos == getHostRequestTypesIdx() || pos == getLastTokenIdsIdx()
+        || (mRemovePadding && pos == getHostContextLengthIdx()) || (mPagedState && pos == getSlotMappingIdx()))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
@@ -117,14 +136,58 @@ void SelectiveScanPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc cons
 size_t SelectiveScanPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
     nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
-    return 0;
+    if (!mIsMamba2)
+        return 0;
+
+    int const NUM_BUFFERS = 6;
+    size_t workspaces[NUM_BUFFERS];
+
+    if (mRemovePadding)
+    {
+        int B = inputs[getLastTokenIdsIdx()].dims.d[0];
+        int BxL = inputs[getInputTensorIdx()].dims.d[0]; // num_tokens
+        int H = mNHeads;
+        int P = mDim / H;
+        int G = mNGroups;
+        int N = mDState;
+        int Q = mChunkSize;
+        int BxC = (BxL + Q - 1) / Q + B;
+
+        workspaces[0] = long(BxC) * H * N * P * 2; // g_mxOs_
+        workspaces[1] = long(BxC) * H * N * P * 4; // g_mxSt_ in float
+        workspaces[2] = long(BxC) * H * Q * 4;     // g_mxdc_ in float
+        workspaces[3] = long(BxC) * H * Q * 4;     // g_mxdA_ in float
+        workspaces[4] = long(BxC) * G * Q * Q * 2; // g_mxCB_
+        workspaces[5] = 1024;                      // TMA descs
+    }
+    else
+    {
+        int B = inputs[getInputTensorIdx()].dims.d[0];
+        int L = inputs[getInputTensorIdx()].dims.d[1];
+        int H = mNHeads;
+        int P = mDim / H;
+        int G = mNGroups;
+        int N = mDState;
+        int Q = mChunkSize;
+        int C = (L + Q - 1) / Q;
+
+        workspaces[0] = long(B * C) * H * N * P * 2; // g_mxOs_
+        workspaces[1] = long(B * C) * H * N * P * 4; // g_mxSt_ in float
+        workspaces[2] = long(B * C) * H * Q * 4;     // g_mxdc_ in float
+        workspaces[3] = long(B * C) * H * Q * 4;     // g_mxdA_ in float
+        workspaces[4] = long(B * C) * G * Q * Q * 2; // g_mxCB_
+        workspaces[5] = 1024;                        // TMA descs
+    }
+
+    return calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 }
 
 void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch, const size_t dim,
-    const size_t maxSeqLen, const size_t dstate, const size_t dtRank, bool const isVariableB, bool const isVariableC,
-    void* statePtr, void const* x, void const* delta, void const* deltaBias, void const* A, void const* BC,
-    void const* D, void const* z, int const* lastTokenIds, int const* slotMapping, void* out, bool deltaSoftplus,
-    bool removePadding)
+    const size_t maxSeqLen, const size_t numTokens, const size_t dstate, const size_t dtRank, const size_t nHeads,
+    const size_t nGroups, const size_t chunkSize, void* statePtr, void const* x, void const* delta,
+    void const* deltaBias, void const* A, void const* BC, void const* D, void const* z, void* osPtr, void* stPtr,
+    void* dcPtr, void* dAPtr, void* cbPtr, void* descPtr, int const* lastTokenIds, int const* slotMapping, void* out,
+    bool deltaSoftplus, bool removePadding)
 {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -132,14 +195,16 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.batch = batch;
     params.dim = dim;
     params.max_seqlen = maxSeqLen;
+    params.num_tokens = numTokens;
     params.dstate = dstate;
     params.dt_rank = dtRank;
+    params.nheads = nHeads;
+    params.ngroups = nGroups;
+    params.chunk_size = chunkSize;
 
     params.delta_softplus = deltaSoftplus;
     params.remove_padding = removePadding;
-
-    params.is_variable_B = isVariableB;
-    params.is_variable_C = isVariableC;
+    params.is_mamab2 = mIsMamba2;
 
     // Set the pointers and strides.
     params.u_ptr = const_cast<void*>(x);
@@ -151,6 +216,12 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
     params.out_ptr = out;
     params.x_ptr = statePtr;
     params.z_ptr = const_cast<void*>(z);
+    params.Os_ptr = osPtr;
+    params.St_ptr = stPtr;
+    params.dc_ptr = dcPtr;
+    params.dA_ptr = dAPtr;
+    params.CB_ptr = cbPtr;
+    params.desc_ptr = descPtr;
     params.last_token_ids_ptr = lastTokenIds;
     params.slot_mapping_ptr = slotMapping;
 }
@@ -162,24 +233,30 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
 {
     // inputs
     //     0.  input_tensor [batch_size, max_seq_len, dim] or [num_tokens, dim]
-    //     1.  state [batch_size, dstate, dim] or host [1] containing only pointer for paged_state
-    //     2.  delta [batch_size, max_seq_len, dim] or [num_tokens, dim]
-    //     3.  delta_bias [dim]
-    //     4.  A [dstate, dim]
-    //     5.  BC [batch_size, max_seq_len, dt_rank + dstate * 2] or [num_tokens, dt_rank + dstate * 2]
-    //     6.  D [dim]
-    //     7.  z [batch_size, max_seq_len, dim] or [num_tokens, dim]
-    //     8.  host_request_types [batch_size] int32. 0: context; 1: generation.
-    //     9.  last_token_ids [batch_size] int32
+    //     1.  state mamba: [batch_size, dstate, dim] or host [1] containing only pointer for paged_state
+    //               mamba2: [batch_size, nheads, dstate, dim] or host [1] containing only pointer for paged_state
+    //     2.  delta, mamba: [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
+    //                mamba2: [batch_size, seq_len, nheads] or [num_tokens, nheads] for remove_input_padding
+    //     3.  delta_bias, [dim] for mamba, [nheads] for mamba2
+    //     4.  A, [dstate, dim] for mamba, [nheads] for mamba2
+    //     5.  BC, mamba: [batch_size, seq_len, dstate * 2] or [num_tokens, dstate * 2] for remove_input_padding
+    //             mamba2: [batch_size, seq_len, ngroups * dstate * 2] or [num_tokens, ngroups * dstate * 2] for
+    //             remove_input_padding
+    //     6.  D, [dim] for mamba, [nheads] for mamba2
+    //     7.  host_request_types [batch_size] int32. 0: context; 1: generation.
+    //     8.  last_token_ids [batch_size] int32
+    //     9.  host_context_lengths [batch_size] int32, optional for remove_input_padding
     //    10.  state_slot_mapping [batch_size] int32, optional for paged state
+    //    11.  z [batch_size, max_seq_len, dim] or [num_tokens, dim]
     // outputs
     //     0. output_tensor [batch_size, max_seq_len, dim] or [num_tokens, dim]
-    //     1. state [batch_size, dstate, dim]
+    //     1. state, [batch_size, dstate, dim] for mamba, [batch_size, nheads, dstate, dim] for mamba2
     auto const batch_size = inputDesc[getHostRequestTypesIdx()].dims.d[0];
     int max_seq_len;
     if (mRemovePadding)
     {
-        max_seq_len = -1;
+        int const* host_context_length = static_cast<int const*>(inputs[getHostContextLengthIdx()]);
+        max_seq_len = *std::max_element(host_context_length, host_context_length + batch_size);
     }
     else
     {
@@ -192,17 +269,79 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     SSMParamsBase ssm_params;
 
     int const* slotMapping = mPagedState ? static_cast<int const*>(inputs[getSlotMappingIdx()]) : nullptr;
+    void const* z = mZEnabled ? inputs[getZIdx()] : nullptr;
 
     void* statePtr = mPagedState ? *reinterpret_cast<void**>(const_cast<void*>(inputs[getStateIdx()])) : outputs[1];
 
-    setSSMParams(ssm_params, batch_size, mDim, max_seq_len, mDState, mDtRank, mIsVariableB, mIsVariableC, statePtr,
-        inputs[getInputTensorIdx()], inputs[getDeltaIdx()], inputs[getDeltaBiasIdx()], inputs[getAIdx()],
-        inputs[getBCIdx()], inputs[getDIdx()], inputs[getZIdx()], static_cast<int const*>(inputs[getLastTokenIdsIdx()]),
-        slotMapping, outputs[0], mDeltaSoftplus, mRemovePadding);
+    // Workspace pointer shift
+    int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
+    size_t offset = 0;
+
+    T* mxOs = nullptr;
+    float* mxSt = nullptr;
+    float* mxdc = nullptr;
+    float* mxdA = nullptr;
+    T* mxCB = nullptr;
+    void* descs = nullptr;
+
+    if (!mIsMamba2 || reqTypes[0] == RequestType::kGENERATION) /* no workspace needed */
+        ;
+    else if (mRemovePadding)
+    {
+        int B = inputDesc[getLastTokenIdsIdx()].dims.d[0];
+        int BxL = inputDesc[getInputTensorIdx()].dims.d[0]; // num_tokens
+        int H = mNHeads;
+        int P = mDim / H;
+        int G = mNGroups;
+        int N = mDState;
+        int Q = mChunkSize;
+        int BxC = (BxL + Q - 1) / Q + B;
+
+        mxOs = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * N * P * 2));
+        mxSt = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * N * P * 4));
+        mxdc = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * Q * 4));
+        mxdA = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * H * Q * 4));
+        mxCB = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(BxC) * G * Q * Q * 2));
+        descs = nextWorkspacePtr(workspace_byte_ptr, offset, 1024);
+    }
+    else
+    {
+        int B = inputDesc[getInputTensorIdx()].dims.d[0];
+        int L = inputDesc[getInputTensorIdx()].dims.d[1];
+        int H = mNHeads;
+        int P = mDim / H;
+        int G = mNGroups;
+        int N = mDState;
+        int Q = mChunkSize;
+        int C = (L + Q - 1) / Q;
+
+        mxOs = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * N * P * 2));
+        mxSt = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * N * P * 4));
+        mxdc = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * Q * 4));
+        mxdA = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * H * Q * 4));
+        mxCB = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, long(B * C) * G * Q * Q * 2));
+        descs = nextWorkspacePtr(workspace_byte_ptr, offset, 1024);
+    }
+
+    int numTokens = inputDesc[getInputTensorIdx()].dims.d[0];
+    if (!mRemovePadding)
+        numTokens *= inputDesc[getInputTensorIdx()].dims.d[1];
+
+    setSSMParams(ssm_params, batch_size, mDim, max_seq_len, numTokens, mDState, mDtRank, mNHeads, mNGroups, mChunkSize,
+        statePtr, inputs[getInputTensorIdx()], inputs[getDeltaIdx()], inputs[getDeltaBiasIdx()], inputs[getAIdx()],
+        inputs[getBCIdx()], inputs[getDIdx()], z, mxOs, mxSt, mxdc, mxdA, mxCB, descs,
+        static_cast<int const*>(inputs[getLastTokenIdsIdx()]), slotMapping, outputs[0], mDeltaSoftplus, mRemovePadding);
 
     if (reqTypes[0] == RequestType::kCONTEXT)
     {
-        invokeSelectiveScan<T, float>(ssm_params, stream);
+        if (mIsMamba2)
+        {
+            invokeChunkScan<T, float>(ssm_params, stream, mDriver.get());
+        }
+        else
+        {
+            invokeSelectiveScan<T, float>(ssm_params, stream);
+        }
     }
     else if (reqTypes[0] == RequestType::kGENERATION)
     {
@@ -276,8 +415,9 @@ void SelectiveScanPlugin::terminate() noexcept {}
 
 size_t SelectiveScanPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mDim) + sizeof(mDState) + sizeof(mDtRank) + sizeof(mIsVariableB) + sizeof(mIsVariableC)
-        + sizeof(mDeltaSoftplus) + sizeof(mType) + sizeof(mRemovePadding) + sizeof(mPagedState);
+    return sizeof(mDim) + sizeof(mDState) + sizeof(mDtRank) + sizeof(mNHeads) + sizeof(mNGroups) + sizeof(mChunkSize)
+        + sizeof(mDeltaSoftplus) + sizeof(mType) + sizeof(mRemovePadding) + sizeof(mPagedState) + sizeof(mZEnabled)
+        + sizeof(mIsMamba2);
 }
 
 void SelectiveScanPlugin::serialize(void* buffer) const noexcept
@@ -286,12 +426,15 @@ void SelectiveScanPlugin::serialize(void* buffer) const noexcept
     write(d, mDim);
     write(d, mDState);
     write(d, mDtRank);
-    write(d, mIsVariableB);
-    write(d, mIsVariableC);
+    write(d, mNHeads);
+    write(d, mNGroups);
+    write(d, mChunkSize);
     write(d, mDeltaSoftplus);
     write(d, mType);
     write(d, mRemovePadding);
     write(d, mPagedState);
+    write(d, mZEnabled);
+    write(d, mIsMamba2);
     assert(d == a + getSerializationSize());
 }
 
@@ -306,15 +449,18 @@ SelectiveScanPluginCreator::SelectiveScanPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("dim", nullptr, PluginFieldType::kINT32, 16));
-    mPluginAttributes.emplace_back(PluginField("dstate", nullptr, PluginFieldType::kINT32, 16));
-    mPluginAttributes.emplace_back(PluginField("dt_rank", nullptr, PluginFieldType::kINT32, 16));
-    mPluginAttributes.emplace_back(PluginField("is_variable_B", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("is_variable_C", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("dim", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("dstate", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("dt_rank", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("nheads", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("ngroups", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("chunk_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("delta_softplus", nullptr, PluginFieldType::kINT8, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("paged_state", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("z_enabled", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("is_mamba2", nullptr, PluginFieldType::kINT8, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -337,8 +483,8 @@ PluginFieldCollection const* SelectiveScanPluginCreator::getFieldNames() noexcep
 IPluginV2* SelectiveScanPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int dim, dstate, dtRank;
-    bool isVariableB, isVariableC, deltaSoftplus, removePadding, pagedState;
+    int dim, dstate, dtRank, nHeads, nGroups, chunkSize;
+    bool deltaSoftplus, removePadding, pagedState, zEnabled, isMamab2;
     nvinfer1::DataType type;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -359,15 +505,20 @@ IPluginV2* SelectiveScanPluginCreator::createPlugin(char const* name, PluginFiel
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             dtRank = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
-        else if (!strcmp(attrName, "is_variable_B"))
+        else if (!strcmp(attrName, "nheads"))
         {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            isVariableB = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            nHeads = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
-        else if (!strcmp(attrName, "is_variable_C"))
+        else if (!strcmp(attrName, "ngroups"))
         {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            isVariableC = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            nGroups = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "chunk_size"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            chunkSize = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "delta_softplus"))
         {
@@ -389,11 +540,21 @@ IPluginV2* SelectiveScanPluginCreator::createPlugin(char const* name, PluginFiel
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
             pagedState = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "z_enabled"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            zEnabled = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
+        else if (!strcmp(attrName, "is_mamba2"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            isMamab2 = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
     }
     try
     {
-        auto* obj = new SelectiveScanPlugin(
-            dim, dstate, dtRank, isVariableB, isVariableC, deltaSoftplus, type, removePadding, pagedState);
+        auto* obj = new SelectiveScanPlugin(dim, dstate, dtRank, nHeads, nGroups, chunkSize, deltaSoftplus, type,
+            removePadding, pagedState, zEnabled, isMamab2);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

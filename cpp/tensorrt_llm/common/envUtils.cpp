@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cstdlib>
 
@@ -42,17 +43,6 @@ bool forceXQAKernels()
 {
     static bool const forceXQA = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0);
     return forceXQA;
-}
-
-int32_t xqaMaxNbCtaPerKVHeadFactor()
-{
-    return envXqaNbCtaPerKVHead().value_or(8);
-}
-
-std::optional<int32_t> envXqaNbCtaPerKVHead()
-{
-    static std::optional<int32_t> const ret = getIntEnv("TRTLLM_XQA_BLOCKS_PER_SEQUENCE");
-    return ret;
 }
 
 std::optional<bool> getEnvEnableXQAJIT()
@@ -141,6 +131,30 @@ int getEnvMmhaKernelBlockSize()
         }
     }
     return mmhaKernelBlockSize;
+}
+
+bool getEnvEnableFDL()
+{
+    static bool init = false;
+    static bool enableFDL = false;
+    if (!init)
+    {
+        init = true;
+        // FDL only available when arch >= 90
+        if (getSMVersion() >= 90)
+        {
+            char const* enable_fdl = std::getenv("TRTLLM_ENABLE_FDL");
+            if (enable_fdl)
+            {
+                // FDL will be enabled by setting the env variables `TRTLLM_ENABLE_FDL` to `1`
+                if (enable_fdl[0] == '1' && enable_fdl[1] == '\0')
+                {
+                    enableFDL = true;
+                }
+            }
+        }
+    }
+    return enableFDL;
 }
 
 } // namespace tensorrt_llm::common

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import jax
+import numpy as np
 import torch
 from jax import dlpack as jax_dlpack
 from torch.utils import dlpack as torch_dlpack
@@ -34,30 +35,31 @@ def split(v, tp_size, idx, dim=0):
     if len(v.shape) == 1:
         return torch.chunk(v, tp_size)[idx].contiguous()
     else:
-        return torch.chunk(v, tp_size, dim=dim)[idx]
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
-def get_weight(config, prefix, dtype, postfix='.weight'):
-    if config[prefix + postfix].dtype != dtype:
-        config[prefix + postfix].data = config[prefix + postfix].to(dtype)
-    return config[prefix + postfix].detach().cpu()
+        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
 
 def get_jax_weight(config, prefix, dtype, postfix='.weight', key_name='scale'):
+
     return torch.as_tensor((config[prefix + postfix][key_name])._value,
                            dtype=dtype).T
 
 
+def get_jax_weight_scale_tp(params, key, rank):
+    jax_obj = params[key]['w']
+    jax_scales = jax.device_put(jax_obj.scales, device=jax.devices('gpu')[rank])
+    torch_scales = torch_dlpack.from_dlpack(jax_dlpack.to_dlpack(jax_scales))
+    return torch.as_tensor(
+        np.asarray(jax_obj.weight.addressable_shards[rank].data)), torch_scales
+
+
 def get_jax_weight_scale(params, key):
     jax_obj = params[key]['w']
+
     jax_scales = jax.device_put(jax_obj.scales, device=jax.devices('cpu')[0])
-    # jax_scales = jax.device_put(jax_obj.scales, device=jax.devices('gpu')[rank])
-    torch_scales = torch_dlpack.from_dlpack(jax_dlpack.to_dlpack(jax_scales))
-    return torch.as_tensor(jax_obj.weight._value,
+
+    torch_scales = torch_dlpack.from_dlpack(
+        jax_dlpack.to_dlpack(jax_scales, copy=False))
+    return torch.as_tensor(np.asarray(jax_obj.weight),
                            dtype=torch.int8), torch_scales
 
 
@@ -70,7 +72,8 @@ def get_tllm_linear_weight(
 ):
     results = {}
     processed_weight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
-        weight.contiguous(), plugin_weight_only_quant_type, torch.bfloat16)
+        weight if weight.is_contiguous() else weight.contiguous(),
+        plugin_weight_only_quant_type, torch.bfloat16)
     results[prefix + postfix] = processed_weight
 
     results[prefix + 'per_channel_scale'] = torch_weight_scales.contiguous()
@@ -97,29 +100,25 @@ def convert_grok(hf_model,
     model_params = hf_model
     dtype = getattr(torch, dtype)
 
-    num_attention_heads = config['num_attention_heads']
-    hidden_size = config['hidden_size']
-    hidden_size // num_attention_heads
+    config['num_attention_heads']
+    config['hidden_size']
 
     layers_range = mapping.pp_layers(config['num_hidden_layers'])
-
-    # layers_range = mapping.pp_layers(2)
 
     def convert_layer(l):
         prefix = f'transformer/decoder_layer_{l}/'
         print(prefix)
         tllm_prex = f'transformer.layers.{l - layers_range[0]}.'
 
-        q_weight, q_scale = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/query')
-        k_weight, k_scale = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/key')
-        v_weight, v_scale = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/value')
+        wq, q_scale = get_jax_weight_scale_tp(
+            model_params, prefix + 'multi_head_attention/query',
+            mapping.tp_rank)
+        wk, k_scale = get_jax_weight_scale_tp(
+            model_params, prefix + 'multi_head_attention/key', mapping.tp_rank)
+        wv, v_scale = get_jax_weight_scale_tp(
+            model_params, prefix + 'multi_head_attention/value',
+            mapping.tp_rank)
 
-        wq = split(q_weight, mapping.tp_size, mapping.tp_rank, dim=1)
-        wk = split(k_weight, mapping.tp_size, mapping.tp_rank, dim=1)
-        wv = split(v_weight, mapping.tp_size, mapping.tp_rank, dim=1)
         qs = split(q_scale, mapping.tp_size, mapping.tp_rank, dim=1)
         ks = split(k_scale, mapping.tp_size, mapping.tp_rank, dim=1)
         vs = split(v_scale, mapping.tp_size, mapping.tp_rank, dim=1)
@@ -131,67 +130,107 @@ def convert_grok(hf_model,
                                    tllm_prex + 'attention.qkv.',
                                    plugin_weight_only_quant_type))
 
-        attn_dense_weight, attn_dense_scales = get_jax_weight_scale(
-            model_params, prefix + 'multi_head_attention/linear')
+        attn_dense_weight, attn_dense_scales = get_jax_weight_scale_tp(
+            model_params, prefix + 'multi_head_attention/linear',
+            mapping.tp_rank)
 
-        split_v = split_matrix_tp(attn_dense_weight,
-                                  tensor_parallel,
-                                  mapping.tp_rank,
-                                  dim=0)
-        split_scales = split_matrix_tp(attn_dense_scales,
-                                       tensor_parallel,
-                                       mapping.tp_rank,
-                                       dim=0)
+        split_scales = split(attn_dense_scales,
+                             tensor_parallel,
+                             mapping.tp_rank,
+                             dim=0)
 
         weights.update(
-            get_tllm_linear_weight(split_v, split_scales.squeeze(),
+            get_tllm_linear_weight(attn_dense_weight, split_scales.squeeze(),
                                    tllm_prex + 'attention.dense.',
                                    plugin_weight_only_quant_type))
+        if mapping.moe_ep_size > 1:
+            w3, s3 = get_jax_weight_scale(
+                model_params, f'transformer/decoder_layer_{l}/moe/linear_v')
 
-        w3, s3 = get_jax_weight_scale(
-            model_params, f'transformer/decoder_layer_{l}/moe/linear_v')
+            w2, s2 = get_jax_weight_scale(
+                model_params, f'transformer/decoder_layer_{l}/moe/linear_1')
 
-        w2, s2 = get_jax_weight_scale(
-            model_params, f'transformer/decoder_layer_{l}/moe/linear_1')
+            w1, s1 = get_jax_weight_scale(
+                model_params, f'transformer/decoder_layer_{l}/moe/linear')
 
-        w1, s1 = get_jax_weight_scale(
-            model_params, f'transformer/decoder_layer_{l}/moe/linear')
+            # moe expert parallel
+            w3_split = split(w3,
+                             mapping.moe_ep_size,
+                             mapping.moe_ep_rank,
+                             dim=0)
+            w2_split = split(w2,
+                             mapping.moe_ep_size,
+                             mapping.moe_ep_rank,
+                             dim=0)
+            w1_split = split(w1,
+                             mapping.moe_ep_size,
+                             mapping.moe_ep_rank,
+                             dim=0)
 
-        # moe expert parallel
-        w3_split = split(w3, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
-        w2_split = split(w2, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
-        w1_split = split(w1, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
+            s3_split = split(s3,
+                             mapping.moe_ep_size,
+                             mapping.moe_ep_rank,
+                             dim=0)
+            s2_split = split(s2,
+                             mapping.moe_ep_size,
+                             mapping.moe_ep_rank,
+                             dim=0)
+            s1_split = split(s1,
+                             mapping.moe_ep_size,
+                             mapping.moe_ep_rank,
+                             dim=0)
 
-        s3_split = split(s3, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
-        s2_split = split(s2, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
-        s1_split = split(s1, mapping.moe_ep_size, mapping.moe_ep_rank, dim=0)
-        # moe tensor parallel
-        w3_split = split(w3_split,
-                         mapping.moe_tp_size,
-                         mapping.moe_tp_rank,
-                         dim=2)
-        w2_split = split(w2_split,
-                         mapping.moe_tp_size,
-                         mapping.moe_tp_rank,
-                         dim=1)
-        w1_split = split(w1_split,
-                         mapping.moe_tp_size,
-                         mapping.moe_tp_rank,
-                         dim=2)
+            # moe tensor parallel
+            w3_split = split(w3_split,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=2)
+            w2_split = split(w2_split,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=1)
+            w1_split = split(w1_split,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=2)
 
-        s3_split = split(s3_split,
-                         mapping.moe_tp_size,
-                         mapping.moe_tp_rank,
-                         dim=2)
-        s2_split = split(s2_split,
-                         mapping.moe_tp_size,
-                         mapping.moe_tp_rank,
-                         dim=1)
-        s1_split = split(s1_split,
-                         mapping.moe_tp_size,
-                         mapping.moe_tp_rank,
-                         dim=2)
+            s3_split = split(s3_split,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=2)
+            s2_split = split(s2_split,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=1)
+            s1_split = split(s1_split,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=2)
+        else:
+            w3_split, s3 = get_jax_weight_scale_tp(
+                model_params, f'transformer/decoder_layer_{l}/moe/linear_v',
+                mapping.tp_rank)
 
+            w2_split, s2 = get_jax_weight_scale_tp(
+                model_params, f'transformer/decoder_layer_{l}/moe/linear_1',
+                mapping.tp_rank)
+
+            w1_split, s1 = get_jax_weight_scale_tp(
+                model_params, f'transformer/decoder_layer_{l}/moe/linear',
+                mapping.tp_rank)
+
+            s3_split = split(s3,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=2)
+            s2_split = split(s2,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=1)
+            s1_split = split(s1,
+                             mapping.moe_tp_size,
+                             mapping.moe_tp_rank,
+                             dim=2)
         weights.update(
             get_tllm_linear_weight(w2_split,
                                    s2_split.reshape(moe_config.num_experts, -1),
@@ -264,10 +303,7 @@ def convert_grok(hf_model,
                                               mapping.tp_rank)
 
     if use_parallel_embedding:
-        v = split_matrix_tp(v,
-                            mapping.tp_size,
-                            mapping.tp_rank,
-                            dim=sharding_dim)
+        v = split(v, mapping.tp_size, mapping.tp_rank, dim=sharding_dim)
 
     if mapping.is_first_pp_rank():
         weights['transformer.vocab_embedding.weight'] = v
@@ -319,7 +355,6 @@ def create_config_from_xai(dtype,
     n_head = hf_config['num_attention_heads']
     inter_size = hf_config['intermediate_size']
     n_layer = hf_config['num_hidden_layers']
-    # n_layer = 2
     n_embd = hf_config['hidden_size']
     n_kv_head = hf_config['num_key_value_heads']
     rms_norm_eps = hf_config['rms_norm_eps']

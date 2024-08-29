@@ -73,15 +73,3 @@ DecodingOutput::BeamHypotheses DecodingOutput::BeamHypotheses::slice(SizeType32 
     bh.batchDones = ITensor::slice(batchDones, batchIndex, size);
     return bh;
 }
-
-void DecodingOutput::BeamHypotheses::release()
-{
-    outputIdsCBA->release();
-    logProbsCBA->release();
-    sequenceLengthsCBA->release();
-    cumLogProbsCBA->release();
-    normedScoresCBA->release();
-    numBeamsCBA->release();
-    minNormedScoresCBA->release();
-    batchDones->release();
-}

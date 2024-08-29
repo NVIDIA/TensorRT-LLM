@@ -56,7 +56,7 @@ public:
 protected:
     void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
 
-    void computeTmpSize(int maxM, int n, int k) override;
+    void computeTmpSize(size_t maxM, size_t n, size_t k) override;
 
     bool checkTactic(int m, int n, int k, Config const& tactic) const override;
 

@@ -17,7 +17,6 @@
 #pragma once
 
 #include "lookaheadAlgorithm.h"
-#include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -33,16 +32,11 @@ class LookaheadDecodingLayer : public BaseLayer
 {
 public:
     using Base = BaseLayer;
-    using TensorPtr = runtime::ITensor::SharedPtr;
-    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
     using Base::mBufferManager;
 
-    LookaheadDecodingLayer(
-        DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> const& bufferManager);
+    LookaheadDecodingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~LookaheadDecodingLayer() override {}
-
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& baseSetupParams) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
@@ -51,15 +45,15 @@ public:
     void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
         std::shared_ptr<BaseDecodingInputs> const& inputParams) override;
 
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept;
+
 private:
     void forwardSyncCPU(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
         std::shared_ptr<BaseDecodingInputs> const& inputParams);
     void posIdsToMask(TensorPtr mask, TensorConstPtr posIds);
 
 private:
-    using Base::mStream;
-    using Base::mAllocator;
-    using Base::mWorkspaceSize;
     using Base::mDecoderDomain;
 
     TensorPtr mCurandStatesDevice;

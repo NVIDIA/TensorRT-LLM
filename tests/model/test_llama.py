@@ -86,8 +86,9 @@ class TestLLaMA(unittest.TestCase):
 
             # Initialize model
             config = tensorrt_llm.models.LLaMAConfig.from_dict(config)
-            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             weights = load_weights_from_hf_model(hf_llama, config)
+
+            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             tensorrt_llm_llama.load(weights)
             optimize_model(tensorrt_llm_llama, **opt_flags)
 
@@ -324,6 +325,13 @@ class TestLLaMA(unittest.TestCase):
                        device='cuda')
         ]  # ping-pong buffers
 
+        perf_knob_tensor_size = 16
+        # runtime_perf_knobs is not used in context phase
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -331,6 +339,7 @@ class TestLLaMA(unittest.TestCase):
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
             'host_request_types': ctx_host_request_types,
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -390,6 +399,10 @@ class TestLLaMA(unittest.TestCase):
             gen_last_token_ids = torch.ones_like(
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         step1_buffer = {
             'input_ids': step1_id,
@@ -398,6 +411,7 @@ class TestLLaMA(unittest.TestCase):
             'last_token_ids': gen_last_token_ids,
             'host_request_types': gen_host_request_types,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

@@ -16,6 +16,12 @@
 # Google Benchmark Preparation - Same as google test ../tests/CMakeLists.txt
 # Google Benchmark is provided under Apache-2.0 license
 include(FetchContent)
+set(BENCHMARK_ENABLE_TESTING
+    OFF
+    CACHE INTERNAL "Disable google-benchmark tests")
+set(BENCHMARK_ENABLE_INSTALL
+    OFF
+    CACHE INTERNAL "Disable google-benchmark install")
 FetchContent_Declare(
   googlebenchmark
   GIT_REPOSITORY https://github.com/google/benchmark.git

@@ -15,6 +15,8 @@
 
 import torch
 
+from ..._utils import pad_vocab_size
+
 
 def shuffle_qkv_weights(weights, config):
     # Input weights are organized as
@@ -24,11 +26,11 @@ def shuffle_qkv_weights(weights, config):
     # Output weights will be organized as
     # (q00, q01, ..., qnm), (k0, k1, .., kn), (v0, v1, .., vn)
 
-    num_heads = config['num_attention_heads']
-    num_kv_heads = config['num_key_value_heads']
+    num_heads = config.num_attention_heads
+    num_kv_heads = config.num_key_value_heads
     num_q_per_kv = num_heads // num_kv_heads
 
-    hidden_size = config['hidden_size']
+    hidden_size = config.hidden_size
     head_dim = hidden_size // num_heads
 
     input_shape = weights.shape
@@ -145,19 +147,19 @@ def get_tllm_linear_weight(weight,
     return results
 
 
-def split_weights_tp(config, weights, args, rank, dtype):
-    num_heads = config['num_attention_heads']
-    num_kv_heads = config['num_key_value_heads']
-    hidden_size = config['hidden_size']
+def split_weights_tp(config, weights, dtype):
+    num_heads = config.num_attention_heads
+    num_kv_heads = config.num_key_value_heads
+    hidden_size = config.hidden_size
 
     mha_mode = num_heads == num_kv_heads
-    tp_size = args.tp_size
-
-    use_weight_only = args.use_weight_only
+    tp_size = config.mapping.tp_size
+    rank = config.mapping.tp_rank
+    use_weight_only = config.quant_mode.is_weight_only()
     plugin_weight_only_quant_type = None
-    if use_weight_only and args.weight_only_precision == 'int8':
+    if use_weight_only and config.quant_mode.is_int8_weight_only() == 'int8':
         plugin_weight_only_quant_type = torch.int8
-    elif use_weight_only and args.weight_only_precision == 'int4':
+    elif use_weight_only and config.quant_mode.is_int4_weight_only() == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
 
     # Helper
@@ -165,7 +167,7 @@ def split_weights_tp(config, weights, args, rank, dtype):
         return get_tllm_linear_weight(weight, prefix, bias, use_weight_only,
                                       plugin_weight_only_quant_type)
 
-    for layer_id in range(config['num_hidden_layers']):
+    for layer_id in range(config.num_hidden_layers):
         layer_prefix = f"transformer.layers.{layer_id}."
 
         prefix = layer_prefix + 'attention.qkv'

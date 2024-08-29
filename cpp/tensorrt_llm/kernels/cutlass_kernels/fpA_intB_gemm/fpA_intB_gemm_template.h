@@ -548,6 +548,7 @@ template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuant
 std::vector<tkc::CutlassGemmConfig>
 CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, BiasType, OutputType>::getConfigs() const
 {
+
     static constexpr bool is_weight_only = !std::is_same<ActivationType, WeightType>::value;
     tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
         = tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;

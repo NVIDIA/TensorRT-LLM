@@ -3,15 +3,15 @@ import json
 import os
 import sys
 import tempfile
-from typing import List
+from typing import List, Optional
 
 import pytest
 import torch
 from transformers import AutoTokenizer
 
-from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams, TokenizerBase
+from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.hlapi.llm_utils import BuildConfig, _ParallelConfig
-from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.hlapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 from tensorrt_llm.models import PretrainedConfig
 
@@ -20,6 +20,10 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar
 
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
+
+skip_single_gpu = pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="The test needs at least 2 GPUs, skipping")
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
 # There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
@@ -436,12 +440,30 @@ def test_generate_with_stop_words():
         model=llama_model_path,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
+    stop_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
 
-    sampling_params = SamplingParams(max_new_tokens=6, stop_words=[[11]])
-
+    sampling_params = SamplingParams(stop_token_ids=[stop_id])
     for output in llm.generate(prompts, sampling_params=sampling_params):
-        print(output)
-        assert output.outputs[0].text == "D E F G H I"
+        assert output.outputs[0].text == "D E F G H I J K L M"
+
+    sampling_params = SamplingParams(stop_token_ids=[stop_id],
+                                     include_stop_str_in_output=True)
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        assert output.outputs[0].text == "D E F G H I J K L M N"
+
+    sampling_params = SamplingParams(stop="I J")
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        assert output.outputs[0].text == "D E F G H"
+
+    sampling_params = SamplingParams(stop="I J",
+                                     include_stop_str_in_output=True)
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        assert output.outputs[0].text == "D E F G H I J"
+
+    sampling_params = SamplingParams(stop=["F E", "I J"],
+                                     stop_token_ids=[stop_id])
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        assert output.outputs[0].text == "D E F G H"
 
 
 @force_ampere
@@ -451,14 +473,19 @@ def test_generate_with_bad_words():
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
 
-    # TODO[chunweiy]: Consider to make the generate api accept bad_words as a list of strings
-    bad_words = [llm.tokenizer.encode("H I", add_special_tokens=False)]
-    print('bad_words:', bad_words)
+    bad_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
 
-    sampling_params = SamplingParams(max_new_tokens=6, bad_words=bad_words)
+    sampling_params = SamplingParams(max_new_tokens=15, bad_token_ids=[bad_id])
     for output in llm.generate(prompts, sampling_params=sampling_params):
-        print(output)
-        assert output.outputs[0].text == "D E F G HI"
+        assert output.outputs[0].text == "D E F G H I J K L M\n\nI hope this"
+
+    sampling_params = SamplingParams(max_new_tokens=15, bad="I J")
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        assert output.outputs[0].text == "D E F G H I K L M N O P Q R S"
+
+    sampling_params = SamplingParams(max_new_tokens=15, bad=["F E", "I J"])
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        assert output.outputs[0].text == "D E F G H I K L M N O P Q R S"
 
 
 @force_ampere
@@ -487,7 +514,8 @@ def test_generate_with_logits_post_processor():
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
 
     def logits_post_processor(req_id: int, logits: torch.Tensor,
-                              ids: List[List[int]], stream_ptr: int):
+                              ids: List[List[int]], stream_ptr: int,
+                              client_id: Optional[int]):
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             logits[:] = float("-inf")
             logits[..., biased_word_id] = 0
@@ -506,15 +534,13 @@ def test_generate_with_logits_post_processor():
 
 @force_ampere
 def test_generate_block_reuse():
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                      enable_block_reuse=True),
-    )
-
-    # Check the configurations are correctly set
-    assert llm.args.build_config.plugin_config.use_paged_context_fmha is True
-    assert llm.args.build_config.plugin_config.paged_kv_cache is True
+    build_config = BuildConfig()
+    build_config.plugin_config._use_paged_context_fmha = True
+    build_config.plugin_config._paged_kv_cache = True
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                            enable_block_reuse=True),
+              build_config=build_config)
 
     sampling_params = SamplingParams(max_new_tokens=6)
 
@@ -523,7 +549,22 @@ def test_generate_block_reuse():
         print(output)
 
 
+def test_executor_results_cleanup():
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for i in range(20):
+        llm.generate(prompts, sampling_params=sampling_params)
+
+    num_remaining_results = len(llm._executor._results)
+    print(f"result.size: {num_remaining_results}")
+    assert num_remaining_results == 0
+    assert len(llm._executor._pending) == 0
+
+
 # TODO[chunweiy]: Add test for loading inmemory model
 
 if __name__ == '__main__':
-    test_llm_loading_from_hf()
+    #test_llm_loading_from_hf()
+    #test_llm_generate_async()
+    test_executor_results_cleanup()

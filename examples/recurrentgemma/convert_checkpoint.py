@@ -7,6 +7,7 @@ import time
 import typing
 from pathlib import Path
 
+# isort: off
 import flax
 import numpy as np
 import orbax
@@ -14,6 +15,7 @@ import safetensors.torch
 import torch
 from recurrentgemma import jax as recurrentgemma_jax
 from transformers import AutoConfig, AutoModelForCausalLM
+#isort: on
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -496,6 +498,7 @@ def main():
         rnn_hidden_size=ckpt_config["lru_width"],
         logits_soft_cap=ckpt_config["logits_soft_cap"],
         emb_scale_by_sqrt_dim=ckpt_config["embeddings_scale_by_sqrt_dim"],
+        rnn_conv_dim_size=ckpt_config["lru_width"],
     )
 
     trt_llm_config_dict = trt_llm_config.to_dict()

@@ -90,7 +90,7 @@ class TestCommunicationPlugin(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
+        network.plugin_config.set_nccl_plugin(dtype)
         _, workspace = current_all_reduce_helper().allocate_workspace(
             self.mapping, size * dtype_size)
 

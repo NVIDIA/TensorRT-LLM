@@ -72,13 +72,12 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
 
-    int const kAlignmentA = 8;
-    int const kAlignmentB = 8;
+    int constexpr kAlignment = 8;
 
     int problem_count = problem_sizes.size();
 
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<ElementA, LayoutA,
-        cutlass::ComplexTransform::kNone, kAlignmentA, ElementB, LayoutB, cutlass::ComplexTransform::kNone, kAlignmentB,
+        cutlass::ComplexTransform::kNone, kAlignment, ElementB, LayoutB, cutlass::ComplexTransform::kNone, kAlignment,
         ElementOutput, LayoutC, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
         cutlass::gemm::GemmShape<M1, N1, K1>, cutlass::gemm::GemmShape<M2, N2, K2>, cutlass::gemm::GemmShape<16, 8, 16>,
         cutlass::epilogue::thread::LinearCombination<ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value,
@@ -121,9 +120,13 @@ void groupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vect
 
         auto problem = problem_sizes.at(i);
         lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
+        TLLM_CHECK(lda_host[i] % kAlignment == 0);
         ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
+        TLLM_CHECK(ldb_host[i] % kAlignment == 0);
         ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+        TLLM_CHECK(ldc_host[i] % kAlignment == 0);
         ldd_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+        TLLM_CHECK(ldd_host[i] % kAlignment == 0);
     }
 
     cutlass::gemm::GemmCoord* problem_sizes_device = reinterpret_cast<cutlass::gemm::GemmCoord*>(gemmParamsWorkSpace);

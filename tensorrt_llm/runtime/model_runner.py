@@ -24,7 +24,7 @@ import tensorrt as trt
 import torch
 
 from .. import profiler
-from .._utils import mpi_comm, mpi_world_size, numpy_to_torch, trt_gte_10
+from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
 from ..bindings import MpiComm
 from ..bindings.executor import Executor
 from ..builder import Engine, get_engine_version
@@ -129,6 +129,12 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
+    # ReDrafter
+    redrafter_num_beams = config['pretrained_config'].get(
+        'redrafter_num_beams', 0)
+    redrafter_draft_len_per_beam = config['pretrained_config'].get(
+        'redrafter_draft_len_per_beam', 0)
+
     plugin_config = config['plugin_config']
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
     mamba_conv1d_plugin = bool(plugin_config['mamba_conv1d_plugin'])
@@ -136,7 +142,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     paged_kv_cache = plugin_config['paged_kv_cache']
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
-    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     lora_plugin = plugin_config.get('lora_plugin')
 
     model_config = ModelConfig(
@@ -163,12 +168,14 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         dtype=dtype,
-        use_custom_all_reduce=use_custom_all_reduce,
         lora_plugin=lora_plugin,
         lora_target_modules=lora_target_modules,
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
+        # ReDrafter
+        redrafter_num_beams=redrafter_num_beams,
+        redrafter_draft_len_per_beam=redrafter_draft_len_per_beam,
     )
 
     other_config = {
@@ -416,17 +423,21 @@ class ModelRunner(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.lora_manager = lora_manager
+        self.enable_context_fmha_fp32_acc = False
 
     @classmethod
-    def from_engine(cls,
-                    engine: Engine,
-                    lora_dir: Optional[List[str]] = None,
-                    rank: int = 0,
-                    debug_mode: bool = False,
-                    lora_ckpt_source: str = "hf",
-                    medusa_choices: List[List[int]] = None,
-                    stream: torch.cuda.Stream = None,
-                    gpu_weights_percent: float = 1) -> 'ModelRunner':
+    def from_engine(
+            cls,
+            engine: Engine,
+            lora_dir: Optional[List[str]] = None,
+            rank: int = 0,
+            debug_mode: bool = False,
+            lora_ckpt_source: str = "hf",
+            medusa_choices: List[List[int]] = None,
+            stream: torch.cuda.Stream = None,
+            gpu_weights_percent: float = 1,
+            enable_context_fmha_fp32_acc: Optional[bool] = None
+    ) -> 'ModelRunner':
         pretrained_config = engine.config.pretrained_config
         build_config = engine.config.build_config
 
@@ -439,7 +450,7 @@ class ModelRunner(ModelRunnerMixin):
 
         rnn_config_items = [
             'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
-            'state_dtype'
+            'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
         ]
         rnn_configs_kwargs = {}
         for item in rnn_config_items:
@@ -478,16 +489,19 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'max_draft_len') else 0,
             num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
                 pretrained_config, 'num_medusa_heads') else 0,
-            use_custom_all_reduce=build_config.plugin_config.
-            use_custom_all_reduce,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
+            redrafter_num_beams=pretrained_config.redrafter_num_beams
+            if hasattr(pretrained_config, 'redrafter_num_beams') else 0,
+            redrafter_draft_len_per_beam=pretrained_config.
+            redrafter_draft_len_per_beam if hasattr(
+                pretrained_config, 'redrafter_draft_len_per_beam') else 0,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
         max_seq_len = build_config.max_seq_len
         max_beam_width = build_config.max_beam_width
-        if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
+        if 'GLM' in pretrained_config.architecture and pretrained_config.chatglm_version in [
                 'glm', 'chatglm'
         ]:
             session_cls = ChatGLMGenerationSession
@@ -510,7 +524,7 @@ class ModelRunner(ModelRunnerMixin):
                               runtime_mapping,
                               debug_mode=debug_mode,
                               stream=stream)
-        if trt_gte_10() and session.runtime.engine.streamable_weights_size:
+        if session.runtime.engine.streamable_weights_size:
             session.runtime._set_weight_streaming(gpu_weights_percent)
 
         if session.use_lora_plugin:
@@ -523,23 +537,28 @@ class ModelRunner(ModelRunnerMixin):
         else:
             lora_manager = None
 
-        return cls(session=session,
-                   max_batch_size=max_batch_size,
-                   max_input_len=max_input_len,
-                   max_seq_len=max_seq_len,
-                   max_beam_width=max_beam_width,
-                   lora_manager=lora_manager)
+        runner = cls(session=session,
+                     max_batch_size=max_batch_size,
+                     max_input_len=max_input_len,
+                     max_seq_len=max_seq_len,
+                     max_beam_width=max_beam_width,
+                     lora_manager=lora_manager)
+        runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+        return runner
 
     @classmethod
-    def from_dir(cls,
-                 engine_dir: str,
-                 lora_dir: Optional[List[str]] = None,
-                 rank: int = 0,
-                 debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf",
-                 medusa_choices: List[List[int]] = None,
-                 stream: torch.cuda.Stream = None,
-                 gpu_weights_percent: float = 1) -> 'ModelRunner':
+    def from_dir(
+            cls,
+            engine_dir: str,
+            lora_dir: Optional[List[str]] = None,
+            rank: int = 0,
+            debug_mode: bool = False,
+            lora_ckpt_source: str = "hf",
+            medusa_choices: List[List[int]] = None,
+            stream: torch.cuda.Stream = None,
+            gpu_weights_percent: float = 1,
+            enable_context_fmha_fp32_acc: Optional[bool] = None
+    ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
 
@@ -613,7 +632,7 @@ class ModelRunner(ModelRunnerMixin):
             else:
                 lora_manager = None
 
-            if trt_gte_10() and session.runtime.engine.streamable_weights_size:
+            if session.runtime.engine.streamable_weights_size:
                 session.runtime._set_weight_streaming(gpu_weights_percent)
 
             profiler.stop('load tensorrt_llm engine')
@@ -621,12 +640,14 @@ class ModelRunner(ModelRunnerMixin):
                 "load tensorrt_llm engine")
             logger.info(f'Load engine takes: {loading_time} sec')
 
-            return cls(session=session,
-                       max_batch_size=max_batch_size,
-                       max_input_len=max_input_len,
-                       max_seq_len=max_input_len + max_output_len,
-                       max_beam_width=max_beam_width,
-                       lora_manager=lora_manager)
+            runner = cls(session=session,
+                         max_batch_size=max_batch_size,
+                         max_input_len=max_input_len,
+                         max_seq_len=max_input_len + max_output_len,
+                         max_beam_width=max_beam_width,
+                         lora_manager=lora_manager)
+            runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+            return runner
         else:
             # the new engine format
             engine = Engine.from_dir(engine_dir, rank)
@@ -637,9 +658,16 @@ class ModelRunner(ModelRunnerMixin):
                         f"{engine_dir}/{dir}" for dir in config_lora_dir
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
-            runner = ModelRunner.from_engine(engine, lora_dir, rank, debug_mode,
-                                             lora_ckpt_source, medusa_choices,
-                                             stream, gpu_weights_percent)
+            runner = ModelRunner.from_engine(
+                engine,
+                lora_dir,
+                rank,
+                debug_mode,
+                lora_ckpt_source,
+                medusa_choices,
+                stream,
+                gpu_weights_percent,
+                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -785,7 +813,8 @@ class ModelRunner(ModelRunnerMixin):
             sink_token_length=sampling_config.sink_token_length,
             lora_manager=self.lora_manager,
             lora_uids=lora_uids,
-            medusa_choices=medusa_choices)
+            medusa_choices=medusa_choices,
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()

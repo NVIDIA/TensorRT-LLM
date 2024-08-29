@@ -45,17 +45,6 @@ class TopModelMixin:
         '''
         raise NotImplementedError("Subclass shall override this")
 
-    @classmethod
-    def convert_hf_checkpoint(cls,
-                              hf_model_dir: str,
-                              dtype: Optional[str] = "float16",
-                              output_dir: Optional[str] = None,
-                              **kwargs):
-        '''
-        Convert Huggingface checkpoint to TRT-LLM checkpoint
-        '''
-        raise NotImplementedError("Subclass shall override this")
-
     def use_lora(self, lora_config: LoraConfig):
         '''
         Load lora weights from the give config to the module

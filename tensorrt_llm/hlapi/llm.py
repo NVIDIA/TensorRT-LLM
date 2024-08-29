@@ -10,19 +10,15 @@ from .. import bindings as tllm
 from ..bindings import executor as tllm
 from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
-from .llm_utils import (CachedModelLoader, LlmArgs, LlmBuildStats, ModelLoader,
+from .llm_utils import (LLMARGS_REMAINING_ARGS_DOCSTRING, CachedModelLoader,
+                        LlmArgs, LlmBuildStats, ModelLoader,
                         _ModelRuntimeContext)
 from .mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (SamplingParams, exception_handler, get_device_count,
-                    init_log_level)
-
-# This should be called before importing the following cpp-runtime modules
-init_log_level()
-
-from ..executor import GenerationExecutor, GenerationResult
+from .utils import (SamplingParams, append_docstring, exception_handler,
+                    get_device_count)
 
 
 class RequestOutput(GenerationResult):
@@ -58,7 +54,32 @@ class RequestOutput(GenerationResult):
         ]
 
 
+LLM_END_DOCSTRING = '\n'.join(
+    [' ' * 4 + _ for _ in LLMARGS_REMAINING_ARGS_DOCSTRING.split('\n')])
+
+
+@append_docstring(LLM_END_DOCSTRING)
 class LLM:
+    '''LLM class is the main class for running a LLM model.
+
+    Args:
+        model(str): The model name or a local path to the model directory. It could be a HuggingFace(HF) model name,
+            a local path to the HF model, or a local path to the TRT-LLM engine or checkpoint.
+
+        tokenizer(Optional[Union[str, Path, TokenizerBase, PreTrainedTokenizerBase]]): The tokenizer name or a local
+            path to the tokenizer directory.
+
+        skip_tokenizer_init: If true, skip initialization of tokenizer and detokenizer. generate and generate_async
+            will accept prompt token ids as input only.
+
+        tensor_parallel_size(int): The number of processes for tensor parallelism.
+
+        dtype(str): The data type for the model weights and activations.
+
+        revision(Optional[str]): The revision of the model.
+
+        tokenzier_revision(Optional[str]): The revision of the tokenizer.
+    '''
 
     def __init__(self,
                  model: str,
@@ -70,21 +91,6 @@ class LLM:
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any):
-        '''
-        Args:
-            model(str): The model name or a local path to the model directory. It could be a HuggingFace(HF) model name,
-                a local path to the HF model, or a local path to the TRT-LLM engine or checkpoint.
-            tokenizer(Optional[Union[str, Path, TokenizerBase, PreTrainedTokenizerBase]]): The tokenizer name or a local
-                path to the tokenizer directory.
-            skip_tokenizer_init: If true, skip initialization of tokenizer and detokenizer. generate and generate_async
-                will accept prompt token ids as input only.
-            tensor_parallel_size(int): The number of processes for tensor parallelism.
-            dtype(str): The data type for the model weights and activations.
-            revision(Optional[str]): The revision of the model.
-            tokenzier_revision(Optional[str]): The revision of the tokenizer.
-
-            kwargs: Contains the optional arguments for expert users, please refer to `llm_utils.LlmArgs` for more details.
-        '''
         try:
             self.args = LlmArgs.from_kwargs(
                 model=model,
@@ -127,6 +133,8 @@ class LLM:
         self.llm_build_stats = LlmBuildStats()
 
         self._build_model()
+        self._tokenizer = self._try_load_tokenizer()
+
         exception_handler.register(self)
 
     @property
@@ -143,8 +151,13 @@ class LLM:
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            prompts: The prompt text or token ids; could be either single prompt or batched prompts.
-            sampling_params: The sampling params for the generation, a default one will be used if not provided.
+            prompts (Union[str, Iterable[str], List[int], Iterable[List[int]]]): The prompt text or token ids.
+                Note, it must be single prompt or batched prompts.
+            sampling_params (Optional[Union[SamplingParams, List[SamplingParams]]]): The sampling params for the
+                generation, a default one will be used if not provided.
+
+        Returns:
+            Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.
         '''
         if isinstance(prompts, str) or isinstance(prompts[0], str):
             unbatched = isinstance(prompts, str)
@@ -183,9 +196,13 @@ class LLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            prompt: The prompt text or token ids; must be single prompt.
-            sampling_params: The sampling params for the generation, a default one will be used if not provided.
-            streaming: Whether to use the streaming mode for the generation.
+            prompt (Union[str, List[int]]): The prompt text or token ids; must be single prompt.
+            sampling_params (Optional[SamplingParams]): The sampling params for the generation, a default one will be
+                used if not provided.
+            streaming (bool): Whether to use the streaming mode for the generation.
+
+        Returns:
+            RequestOutput: The output data of the completion request to the LLM.
         '''
         if isinstance(prompt, str):
             prompt_token_ids = self._prepare_prompt_token_ids(prompt)
@@ -228,12 +245,7 @@ class LLM:
                     raise ValueError(
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
-                sampling_params.end_id = self.tokenizer.eos_token_id
-                if self.tokenizer.pad_token_id is not None:
-                    sampling_params.pad_id = self.tokenizer.pad_token_id
-                else:
-                    sampling_params.pad_id = self.tokenizer.eos_token_id
-            return sampling_params
+            return sampling_params.setup(self.tokenizer)
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
@@ -260,6 +272,9 @@ class LLM:
                                          workspace=self.workspace,
                                          llm_build_stats=self.llm_build_stats)
         self._engine_dir = model_loader()
+        # update the model_dir to a local dir for the runtime, such as tokenizer loading.
+        self.args.model = self._engine_dir
+        assert self.args.is_local_model
 
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
@@ -285,32 +300,39 @@ class LLM:
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size))
 
-    @property
-    def tokenizer(self) -> TokenizerBase:
+    def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
             return None
+
         if self.args.tokenizer is not None:
+            assert isinstance(self.args.tokenizer, TokenizerBase)
             return self.args.tokenizer
+
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
-        try:
-            self.args.tokenizer = ModelLoader.load_hf_tokenizer(
-                self.args.model_dir)
-        except:
-            pass
+        return ModelLoader.load_hf_tokenizer(self.args.model_dir)
 
-        return self.args.tokenizer
+    @property
+    def tokenizer(self) -> Optional[TokenizerBase]:
+        return self._tokenizer
 
     def save(self, engine_dir: str):
-        ''' Save the built engine to the given path. '''
+        ''' Save the built engine to the given path.
+
+        Args:
+            engine_dir (str): The path to save the engine.
+
+        Returns:
+            None
+        '''
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
             raise RuntimeError("The engine is not built yet.")
         if self._engine_dir.absolute() != os.path.abspath(engine_dir):
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
 
-    def shutdown(self):
+    def _shutdown(self):
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
 
@@ -323,11 +345,11 @@ class LLM:
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         del exc_value, traceback
-        self.shutdown()
+        self._shutdown()
         return exc_type is not None
 
     def __getstate__(self):
         raise RuntimeError("LLM object can not be pickled.")
 
     def __del__(self):
-        self.shutdown()
+        self._shutdown()

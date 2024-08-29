@@ -46,8 +46,8 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     }
     catch (nlohmann::json::out_of_range& e)
     {
-        TLLM_LOG_INFO("Parameter %s cannot be read from json:", std::string(name).c_str());
-        TLLM_LOG_INFO(e.what());
+        TLLM_LOG_DEBUG("Parameter %s cannot be read from json:", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
     }
     return value;
 }
@@ -62,13 +62,13 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     }
     catch (nlohmann::json::out_of_range const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     catch (nlohmann::json::type_error const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     return value;
 }
@@ -213,11 +213,13 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const removeInputPadding = pluginConfig.at("remove_input_padding").template get<bool>();
     auto const& pagedKvCache = pluginConfig.at("paged_kv_cache");
     auto const& tokensPerBlock = pluginConfig.at("tokens_per_block");
-    auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
     auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
     auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
+    auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
+        ? ModelConfig::ManageWeightsType::kEnabled
+        : ModelConfig::ManageWeightsType::kDisabled;
 
     TLLM_CHECK_WITH_INFO(
         !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
@@ -228,10 +230,10 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.usePagedKvCache(pagedKvCache);
     modelConfig.usePagedState(pagedState);
     modelConfig.setTokensPerBlock(tokensPerBlock);
-    modelConfig.useCustomAllReduce(useCustomAllReduce);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
+    modelConfig.setManageWeightsType(manageWeightsType);
 }
 
 void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,
@@ -340,22 +342,32 @@ GptJsonConfig parseJson(InputType&& input)
 
     if (engineVersionNone)
     {
-        if (name == std::string("chatglm_6b") || name == std::string("glm_10b"))
+        if (name == std::string("chatglm_6b"))
+        {
+            modelConfig.setModelVariant(ModelConfig::ModelVariant::kChatGlm);
+            // kChatGlm is only for ChatGLM-6B
+        }
+        if (name == std::string("glm_10b"))
         {
             modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
-            // kGlm is only for ChatGLM-6B and GLM-10B
+            // kGlm is only for GLM-10B
         }
     }
     else
     {
-        if (name == "ChatGLMForCausalLM")
+        if (name.find("GLM") != std::string::npos)
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
             auto const chatglmVersion = pretrainedConfig.at("chatglm_version").template get<std::string>();
-            if (chatglmVersion == "glm" || chatglmVersion == "chatglm")
+            if (chatglmVersion == "chatglm")
+            {
+                modelConfig.setModelVariant(ModelConfig::ModelVariant::kChatGlm);
+                // kChatGlm is only for ChatGLM-6B
+            }
+            if (chatglmVersion == "glm")
             {
                 modelConfig.setModelVariant(ModelConfig::ModelVariant::kGlm);
-                // kGlm is only for ChatGLM-6B and GLM-10B
+                // kGlm is only for GLM-10B
             }
         }
     }
@@ -368,8 +380,8 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& pretrainedConfig = json.at("pretrained_config");
 
             // TODO(rkobus): adjust param names
-            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "explicit_num_beams", 0);
-            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "explicit_draft_len_per_beam", 0);
+            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "redrafter_num_beams", 0);
+            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "redrafter_draft_len_per_beam", 0);
             auto const maxDraftLen = maxNumPaths * maxDraftPathLen;
 
             auto explicitDraftTokensModule
@@ -427,10 +439,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = pretrainedConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = pretrainedConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = pretrainedConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = pretrainedConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (pretrainedConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = pretrainedConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
@@ -449,10 +468,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = builderConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = builderConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = builderConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = builderConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (builderConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = builderConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }

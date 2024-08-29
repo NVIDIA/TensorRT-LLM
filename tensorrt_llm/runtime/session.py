@@ -23,7 +23,7 @@ import torch
 import tensorrt as trt
 # isort: on
 
-from .._utils import torch_dtype_to_trt, trt_dtype_to_torch, trt_gte_10
+from .._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from ..logger import logger
 
 
@@ -66,7 +66,7 @@ class Session(object):
             self._engine = self.runtime.deserialize_cuda_engine(engine_buffer)
 
         self._context = None
-        if not (trt_gte_10() and self.engine.streamable_weights_size):
+        if not self.engine.streamable_weights_size:
             self.__prepare_execution_contexts()
         return self
 
@@ -120,14 +120,14 @@ class Session(object):
 
     @property
     def context_mem_size(self) -> int:
-        return self.engine.device_memory_size
+        return self.engine.device_memory_size_v2
 
     def _print_engine_info(self):
         '''print engine info for debug purpose, internal use only.
         '''
         refittable = self.engine.refittable
         num_layers = self.engine.num_layers
-        device_memory_size = self.engine.device_memory_size
+        device_memory_size = self.engine.device_memory_size_v2
         name = self.engine.name
         nb_profiles = self.engine.num_optimization_profiles
         logger.info(
@@ -206,35 +206,33 @@ class Session(object):
         return outputs
 
     def _set_weight_streaming(self, gpu_weights_percent):
+        if not self.engine.streamable_weights_size:
+            assert gpu_weights_percent == 1, "Engine built without weight streaming. Cannot set gpu_weights_percent to a value other than 1."
+            return
+
         assert self.engine is not None
 
         self._context = None
 
-        if not trt_gte_10():
-            assert gpu_weights_percent == 1, "Weight streaming is only supported by TensorRT 10.0 or later."
-            return
-        else:
-            min = self.engine.minimum_weight_streaming_budget
-            max = self.engine.streamable_weights_size
-            budget = int(min + gpu_weights_percent * (max - min))
+        min = 0
+        max = self.engine.streamable_weights_size
+        budget = int(gpu_weights_percent * max)
 
-            budget_config = budget if gpu_weights_percent != 1 else 0
-            self.engine.weight_streaming_budget = budget_config
-            assert self.engine.weight_streaming_budget == budget_config, "Failed to set weight streaming budget!"
-            logger.info(
-                f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
-            )
+        self.engine.weight_streaming_budget_v2 = budget
+        assert self.engine.weight_streaming_budget_v2 == budget, "Failed to set weight streaming budget!"
+        logger.info(
+            f"Set gpu weights percent to {gpu_weights_percent}, which is {budget} bytes. Valid range: {min} bytes ~ {max} bytes."
+        )
 
-        if self.engine.streamable_weights_size:
-            try:
-                self.__prepare_execution_contexts()
-            except:
-                free_mem = torch.cuda.mem_get_info()[0]
-                if free_mem < budget:
-                    raise torch.cuda.OutOfMemoryError(
-                        f"Out of Memory: Memory budget is {budget} bytes but only {free_mem} bytes are available on the GPU."
-                    )
-                raise
+        try:
+            self.__prepare_execution_contexts()
+        except:
+            free_mem = torch.cuda.mem_get_info()[0]
+            if free_mem < budget:
+                raise torch.cuda.OutOfMemoryError(
+                    f"Out of Memory: Memory budget is {budget} bytes but only {free_mem} bytes are available on the GPU."
+                )
+            raise
 
     def run(self,
             inputs: Dict[str, Any],

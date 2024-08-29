@@ -53,6 +53,7 @@ class RmsNorm(Module):
 
     def __init__(self,
                  normalized_shape,
+                 num_groups=1,
                  eps=1e-06,
                  elementwise_affine=True,
                  dtype=None):
@@ -61,6 +62,10 @@ class RmsNorm(Module):
             normalized_shape = (normalized_shape, )
         self.normalized_shape = tuple(normalized_shape)
         self.elementwise_affine = elementwise_affine
+        self.num_groups = num_groups
+        num_channels = normalized_shape[-1]
+        if num_channels % num_groups != 0:
+            raise ValueError('num_channels must be divisible by num_groups')
         if self.elementwise_affine:
             self.weight = Parameter(shape=self.normalized_shape, dtype=dtype)
         else:
@@ -71,7 +76,8 @@ class RmsNorm(Module):
 
     def forward(self, x):
         weight = None if self.weight is None else self.weight.value
-        return rms_norm(x, self.normalized_shape, weight, self.eps)
+        return rms_norm(x, self.normalized_shape, self.num_groups, weight,
+                        self.eps)
 
 
 class GroupNorm(Module):

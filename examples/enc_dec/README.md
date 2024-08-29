@@ -17,6 +17,8 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
       - [Run with Triton Backend](#run-with-triton-backend)
       - [Run Python runtime](#run-python-runtime)
     - [Benchmark](#benchmark)
+      - [Benchmark C++ runtime](#benchmark-c-runtime)
+      - [Benchmark Python runtime](#benchmark-python-runtime)
     - [Run BART with LoRA](#run-bart-with-lora)
     - [Reminders](#reminders)
     - [Attention Scaling Factors](#attention-scaling-factors)
@@ -98,6 +100,8 @@ We should distinguish between `X` - TP size and `Y` - total number of GPU ranks:
 
 The default value of `--max_input_len` is 1024. When building DecoderModel, specify decoder input length with `--max_input_len=1` for encoder-decoder model to start generation from decoder_start_token_id of length 1. If the start token is a single token (the default behavior of T5/BART/etc.), you should set `--max_input_len` as 1; if you want the decoder-only type of generation, set `--max_input_len` above 1 to get similar behavior as HF's `decoder_forced_input_ids`.
 
+EncoderModel does not generate prompt. `--max_seq_len` should be the same as `--max_input_len`. `--max_seq_len` would be set as `--max_input_len` if not specified.
+
 DecoderModel takes `--max_encoder_input_len` and `--max_input_len` as model inputs, `--max_encoder_input_len` is set to 1024 as default since `--max_input_len` is 1024 for EncoderModel.
 
 To be noted:
@@ -113,7 +117,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -128,7 +131,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -166,7 +168,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -181,7 +182,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -238,6 +238,12 @@ mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt
 
 ### Benchmark
 
+#### Benchmark C++ runtime
+
+The tutorial for encoder-decoder C++ runtime benchmark can be found in [`benchmarks/cpp`](../../benchmarks/cpp/README.md#2-launch-c-benchmarking-inflightv1-batching)
+
+#### Benchmark Python runtime
+
 The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
 
 In `benchmarks/python/`:
@@ -245,17 +251,19 @@ In `benchmarks/python/`:
 ```bash
 # Example 1: Single-GPU benchmark
 python benchmark.py \
-    -m t5_small \
+    -m enc-dec \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
     --dtype float32 \
     --csv # optional
 
 # Example 2: Multi-GPU benchmark
 mpirun --allow-run-as-root -np 4 python benchmark.py \
-    -m t5_small \
+    -m enc-dec \
     --batch_size "1;8" \
     --input_output_len "60,20;128,20" \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
     --dtype float32 \
     --csv # optional
 ```
@@ -292,7 +300,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -308,7 +315,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
                 --output_dir tmp/trt_engines/bart-large-cnn/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -399,7 +405,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/encode
                 --paged_kv_cache disable \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -411,7 +416,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/decode
                 --output_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
                 --enable_xqa disable \
-                --use_custom_all_reduce disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1 \

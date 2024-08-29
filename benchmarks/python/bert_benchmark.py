@@ -18,9 +18,7 @@ import os
 import torch
 import tensorrt as trt
 #isort: on
-from allowed_configs import get_build_config
 from base_benchmark import BaseBenchmark
-from build import build_bert
 
 import tensorrt_llm
 from tensorrt_llm._utils import trt_dtype_to_torch
@@ -32,36 +30,17 @@ class BERTBenchmark(BaseBenchmark):
     def __init__(self, args, batch_sizes, in_lens, gpu_weights_percents, rank,
                  world_size):
         super().__init__(args.engine_dir, args.model, args.dtype, rank,
-                         world_size, args.serial_build)
+                         world_size)
         self.batch_sizes = batch_sizes
         self.in_lens = in_lens
         self.build_time = 0
-        self.mode = args.mode
         self.gpu_weights_percents = gpu_weights_percents
 
-        if args.engine_dir is not None:
-            # Deserialize engine from engine directory
-            self.serialize_path = os.path.join(args.engine_dir,
-                                               self.engine_name)
-            with open(self.serialize_path, 'rb') as f:
-                engine_buffer = f.read()
-        else:
-            # Build engine
-            for key, value in get_build_config(args.model).items():
-                setattr(self, key, value)
-            if args.force_num_layer_1:
-                self.num_layers = 1
-            if args.max_batch_size is not None:
-                self.max_batch_size = args.max_batch_size
-            if args.max_input_len is not None:
-                self.max_input_len = args.max_input_len
-
-            engine_buffer, build_time = build_bert(args)
-            self.build_time = build_time
-
-        assert engine_buffer is not None
-        if args.build_only:
-            return
+        # Deserialize engine from engine directory
+        self.serialize_path = os.path.join(args.engine_dir, self.engine_name)
+        with open(self.serialize_path, 'rb') as f:
+            engine_buffer = f.read()
+            assert engine_buffer is not None
 
         self.session = tensorrt_llm.runtime.Session.from_serialized_engine(
             engine_buffer)

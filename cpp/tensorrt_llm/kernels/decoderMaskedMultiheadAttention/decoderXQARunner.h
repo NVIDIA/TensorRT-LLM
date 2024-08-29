@@ -83,7 +83,7 @@ public:
      */
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
 
-    size_t getWorkspaceSize(int max_batch_beam_size, int max_num_tokens);
+    size_t getWorkspaceSize(int max_num_tokens);
 
     void prepare(XQAParams const& xqa_params)
     {
@@ -116,7 +116,7 @@ private:
     int mMultiProcessorCount;
 
     std::unique_ptr<DecoderXQAImpl> mJITImpl, mPrecompiledImpl;
-    DecoderXQAImpl* getImplFromXQAParams(XQAParams const& params);
+    DecoderXQAImpl* getImplFromXQAParams(XQAParams const& params, bool for_configure_plugin);
 
     friend DecoderXQAImplPrecompiled;
     friend DecoderXQAImplJIT;

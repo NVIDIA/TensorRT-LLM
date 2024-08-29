@@ -69,9 +69,9 @@ std::shared_ptr<tb::InferenceRequest> InferenceRequest::toTrtLlm() const
     auto inferenceRequest = std::make_shared<tb::InferenceRequest>(std::move(tensorMap), mRequestId);
     inferenceRequest->setIsStreaming(isStreaming());
 
-    if (mlogitsPostProcessor)
+    if (mLogitsPostProcessor)
     {
-        inferenceRequest->setLogitsPostProcessor(LlmRequest::callbackAdapter(mlogitsPostProcessor));
+        inferenceRequest->setLogitsPostProcessor(LlmRequest::callbackAdapter(mLogitsPostProcessor));
     }
 
     return inferenceRequest;
@@ -79,7 +79,7 @@ std::shared_ptr<tb::InferenceRequest> InferenceRequest::toTrtLlm() const
 
 std::string InferenceRequest::serialize() const
 {
-    TLLM_CHECK_WITH_INFO(mlogitsPostProcessor == std::nullopt,
+    TLLM_CHECK_WITH_INFO(mLogitsPostProcessor == std::nullopt,
         "Serializing InferenceRequest with logitsPostProcessor set is not supported."
         "Please set the callback after de-serialization");
     std::vector<std::int64_t> serialized{toTrtLlm()->serialize()};

@@ -38,8 +38,10 @@ class GenerationMixin:
         return res
 
     @staticmethod
-    def default_range(max_range, offset=0, min_range=1):
-        result = [min_range, (max_range + min_range) // 2, max_range]
+    def default_range(max_range, offset=0, min_range=1, opt_offset=0):
+        result = [
+            min_range, (max_range + min_range + opt_offset) // 2, max_range
+        ]
         return [elem + offset for elem in result]
 
     @staticmethod
@@ -288,6 +290,7 @@ class GenerationMixin:
         attention_mask = None
         cache_indirection = None
         host_request_types = None
+        runtime_perf_knobs = None
 
         if use_gpt_attention_plugin:
             if use_cache:
@@ -319,6 +322,13 @@ class GenerationMixin:
                 shape=[-1],
                 dim_range=OrderedDict([('batch_size_beam_width', bb_range)]),
             )
+            runtime_perf_knobs = Tensor(name='host_runtime_perf_knobs',
+                                        dtype=trt.int64,
+                                        shape=[16],
+                                        dim_range=OrderedDict([
+                                            ('perf_knob_size',
+                                             [16] * num_profiles)
+                                        ]))
         else:
             attention_mask = Tensor(
                 name='attention_mask',
@@ -380,6 +390,7 @@ class GenerationMixin:
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
             'host_request_types': host_request_types,
+            'host_runtime_perf_knobs': runtime_perf_knobs,
         }
 
     def prepare_basic_inputs(
@@ -398,7 +409,6 @@ class GenerationMixin:
             remove_input_padding=False,
             use_gpt_attention_plugin=False,
             use_gemm_plugin=False,
-            use_custom_all_reduce=False,
             paged_kv_cache=False,
             tokens_per_block=64,
             gather_context_logits=False,
@@ -412,6 +422,7 @@ class GenerationMixin:
             use_lora_plugin: bool = False,
             lora_target_modules: List[str] = None,
             speculative_decoding_draft_tokens_external: bool = False,
+            spec_decoding_is_generation_length_variable: bool = False,
             max_draft_len=0,
             multiple_profiles: bool = False,
             streamingllm: bool = False,
@@ -530,7 +541,7 @@ class GenerationMixin:
                     ]),
                 )
 
-        if use_custom_all_reduce and mapping.tp_size > 1:
+        if mapping.tp_size > 1:
             current_all_reduce_helper().set_workspace_tensor(
                 mapping, num_profiles)
 
@@ -680,8 +691,13 @@ class GenerationMixin:
                 ]),
             )
             spec_decoding_params = SpecDecodingParams(
+                spec_decoding_is_generation_length_variable=
+                spec_decoding_is_generation_length_variable,
+                spec_decoding_max_generation_length=tokens_per_engine_step,
+                spec_decoding_generation_lengths=
                 spec_decoding_generation_lengths,
-                spec_decoding_position_offsets, spec_decoding_packed_mask)
+                spec_decoding_position_offsets=spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_packed_mask)
 
         basic_inputs = {
             'input_ids': input_ids,

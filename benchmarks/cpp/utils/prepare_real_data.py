@@ -6,7 +6,7 @@ from typing import Optional
 import click
 from datasets import load_dataset
 from pydantic import BaseModel, model_validator
-from utils.utils import dataset_dump, get_norm_dist_tokens, print_dataset
+from utils.utils import dataset_dump, get_norm_dist_lengths, print_dataset
 
 
 def validate_output_len_dist(ctx, param, value):
@@ -214,8 +214,8 @@ def dataset(root_args, **kwargs):
     # output if randomized
     if kwargs['output_len_dist'] is not None:
         osl_mean, osl_stdev = kwargs['output_len_dist']
-        output_lens = get_norm_dist_tokens(osl_mean, osl_stdev, len(input_ids),
-                                           root_args.random_seed)
+        output_lens = get_norm_dist_lengths(osl_mean, osl_stdev, len(input_ids),
+                                            root_args.random_seed)
 
     logging.debug(f"Input lengths: {[len(i) for i in input_ids]}")
     logging.debug(f"Output lengths: {output_lens}")

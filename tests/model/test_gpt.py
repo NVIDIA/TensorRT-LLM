@@ -33,15 +33,13 @@ from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.layers import PositionEmbeddingType
+from tensorrt_llm.models.gpt.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 from tensorrt_llm.runtime.kv_cache_manager import (GenerationSequence,
                                                    KVCacheManager)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gpt.convert_checkpoint import convert_hf_gpt
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -86,12 +84,9 @@ class TestGPT(unittest.TestCase):
             'bias': getattr(gpt_config, 'bias', True),
             'apply_query_key_layer_scaling': apply_query_key_layer_scaling,
         }
-        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
-        weights = convert_hf_gpt(hf_gpt,
-                                 gpt_config,
-                                 "gpt2",
-                                 config.mapping,
-                                 dtype=dtype)
+        config = tensorrt_llm.models.GPTConfig.from_dict(config)
+        weights = load_weights_from_hf_model(hf_gpt, config)
+
         tensorrt_llm_gpt = tensorrt_llm.models.GPTForCausalLM(config)
         tensorrt_llm_gpt.load(weights)
 
@@ -237,16 +232,10 @@ class TestGPT(unittest.TestCase):
                        device='cuda')
         ]  # ping-pong buffers
 
-        ctx_shape = {
-            'input_ids': ctx_ids.shape,
-            'position_ids': ctx_position_ids.shape,
-            'context_lengths': ctx_context_lengths.shape,
-            'host_context_lengths': ctx_host_context_lengths.shape,
-            'last_token_ids': ctx_last_token_ids.shape,
-            'attention_mask': ctx_attention_mask.shape,
-            'host_request_types': ctx_host_request_types.shape,
-            'cache_indirection': cache_indirections[0].shape,
-        }
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'position_ids': ctx_position_ids,
@@ -256,7 +245,9 @@ class TestGPT(unittest.TestCase):
             'attention_mask': ctx_attention_mask,
             'host_request_types': ctx_host_request_types,
             'cache_indirection': cache_indirections[0],
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
+        ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
         for i in range(gpt_config.n_layer):
             shape = (batch_size, 2, gpt_config.n_head, 0,
                      gpt_config.n_embd // gpt_config.n_head)
@@ -328,6 +319,9 @@ class TestGPT(unittest.TestCase):
             ctx_attention_mask.new_ones((ctx_attention_mask.shape[0], 1))
         ],
                                        dim=-1)
+
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
         step1_shape = {
             'input_ids': gen_id.shape,
             'context_lengths': gen_context_lengths.shape,
@@ -337,6 +331,7 @@ class TestGPT(unittest.TestCase):
             'last_token_ids': gen_last_token_ids.shape,
             'attention_mask': gen_attention_mask.shape,
             'cache_indirection': cache_indirections[1].shape,
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs.shape
         }
         step1_buffer = {
             'input_ids': gen_id,
@@ -347,6 +342,7 @@ class TestGPT(unittest.TestCase):
             'last_token_ids': gen_last_token_ids.contiguous(),
             'attention_mask': gen_attention_mask.contiguous(),
             'cache_indirection': cache_indirections[1].contiguous(),
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs
         }
         for i in range(gpt_config.n_layer):
             shape = (batch_size, 2, gpt_config.n_head, seq_len,
@@ -549,6 +545,7 @@ class TestGPT(unittest.TestCase):
                        host_past_key_value_lengths,
                        host_max_attention_window_sizes,
                        host_sink_token_length,
+                       host_runtime_perf_knobs,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -562,6 +559,7 @@ class TestGPT(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
+                'host_runtime_perf_knobs': host_runtime_perf_knobs
             }
 
             assert host_request_types is not None
@@ -660,6 +658,12 @@ class TestGPT(unittest.TestCase):
             # and it will be added one after each step.
             sequence_length = ctx_context_lengths.detach().clone()
 
+            perf_knob_tensor_size = 16
+            ctx_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+                ctx_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
             res = run_engine(
                 context=runtime.ctx_context,
                 input_ids=ctx_ids,
@@ -672,7 +676,8 @@ class TestGPT(unittest.TestCase):
                 host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types)
+                host_request_types=host_request_types,
+                host_runtime_perf_knobs=ctx_runtime_perf_knobs)
 
             if gather_context_logits:
                 np.testing.assert_allclose(ref.cpu().numpy().flatten(),
@@ -733,6 +738,12 @@ class TestGPT(unittest.TestCase):
             # For step 1, the sequence_lengths = context_lengths + 1.
             sequence_length = torch.add(gen_context_lengths.detach().clone(), 1)
 
+            perf_knob_tensor_size = 16
+            gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+                gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
             res = run_engine(
                 context=runtime.context_1,
                 input_ids=gen_ids,
@@ -745,7 +756,8 @@ class TestGPT(unittest.TestCase):
                 host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types)
+                host_request_types=host_request_types,
+                host_runtime_perf_knobs=gen_runtime_perf_knobs)
 
             np.testing.assert_allclose(ref.cpu().numpy().flatten(),
                                        res.cpu().numpy().flatten(),
@@ -817,6 +829,12 @@ class TestGPT(unittest.TestCase):
             sequence_length = torch.tensor([seq_len] * num_context_input +
                                            [seq_len + 1] * num_generation_input,
                                            dtype=torch.int32).cuda()
+            perf_knob_tensor_size = 16
+            runtime_perf_knobs_tensor = torch.tensor([-1] *
+                                                     perf_knob_tensor_size,
+                                                     dtype=torch.int64)
+            if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+                runtime_perf_knobs_tensor[1] = 1  # enable_context_fmha_fp32_acc
 
             res = run_engine(
                 context=runtime.context_1,
@@ -831,7 +849,7 @@ class TestGPT(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-            )
+                host_runtime_perf_knobs=runtime_perf_knobs_tensor)
 
             np.testing.assert_allclose(ref_out.cpu().numpy(),
                                        res.cpu().numpy(),

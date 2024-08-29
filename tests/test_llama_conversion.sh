@@ -113,7 +113,7 @@ test_lora() {
             --lora_dir ${lora_dir} \
             --max_batch_size 1 \
             --max_input_len 512 \
-            --max_output_len 50
+            --max_seq_len 562
 
     mpirun -n 2 --allow-run-as-root \
     python ../run.py --engine_dir ./trt_engines/llama-v2-13b-with-lora \
@@ -167,7 +167,7 @@ test_llava() {
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 576 # 1 (max_batch_size) * 576 (num_visual_features)
 }
 

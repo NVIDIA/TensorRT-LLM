@@ -17,6 +17,7 @@ import sys
 import unittest
 
 import torch
+from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -31,11 +32,19 @@ class TestSqueeze(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    def test_squeeze(self):
+    @parameterized.expand([
+        (
+            [[[-3.0, -2.0, -1.0, 10.0, -25.0]], [[0.0, 1.0, 2.0, -2.0, -1.0]]],
+            1,
+        ),
+        (
+            [1.0],
+            0,
+        ),
+    ])
+    def test_squeeze(self, input_data, dim):
         dtype = 'float32'
-        input_data = torch.tensor([[[-3.0, -2.0, -1.0, 10.0, -25.0]],
-                                   [[0.0, 1.0, 2.0, -2.0, -1.0]]]).cuda()
-        dim = 1
+        input_data = torch.tensor(input_data).cuda()
         torch_dtype = str_dtype_to_torch(dtype)
         input_data = input_data.to(torch_dtype)
 

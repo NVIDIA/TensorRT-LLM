@@ -73,7 +73,7 @@ public:
     }
 
     template <typename... Args>
-    void log(const Level level, int const rank, std::string const& format, Args const&... args)
+    void log(Level const level, int const rank, std::string const& format, Args const&... args)
     {
         return log(level, rank, format.c_str(), args...);
     }
@@ -85,25 +85,25 @@ public:
         return level_;
     }
 
-    void setLevel(const Level level)
+    void setLevel(Level const level)
     {
         level_ = level;
-        log(INFO, "Set logger level by %s", getLevelName(level));
+        log(INFO, "Set logger level to %s", getLevelName(level));
     }
 
 private:
     static auto constexpr kPREFIX = "[TensorRT-LLM]";
 
 #ifndef NDEBUG
-    const Level DEFAULT_LOG_LEVEL = DEBUG;
+    Level const DEFAULT_LOG_LEVEL = DEBUG;
 #else
-    const Level DEFAULT_LOG_LEVEL = INFO;
+    Level const DEFAULT_LOG_LEVEL = INFO;
 #endif
     Level level_ = DEFAULT_LOG_LEVEL;
 
     Logger(); // NOLINT(modernize-use-equals-delete)
 
-    static inline char const* getLevelName(const Level level)
+    static inline char const* getLevelName(Level const level)
     {
         switch (level)
         {
@@ -117,12 +117,12 @@ private:
         TLLM_THROW("Unknown log level: %d", level);
     }
 
-    static inline std::string getPrefix(const Level level)
+    static inline std::string getPrefix(Level const level)
     {
         return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
     }
 
-    static inline std::string getPrefix(const Level level, int const rank)
+    static inline std::string getPrefix(Level const level, int const rank)
     {
         return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
     }
@@ -148,7 +148,7 @@ void Logger::log(Logger::Level level, char const* format, Args const&... args)
 }
 
 template <typename... Args>
-void Logger::log(const Logger::Level level, int const rank, char const* format, Args const&... args)
+void Logger::log(Logger::Level const level, int const rank, char const* format, Args const&... args)
 {
     if (level_ <= level)
     {

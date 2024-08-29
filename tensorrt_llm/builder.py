@@ -22,13 +22,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+import numpy as np
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import (str_dtype_to_trt, support_strongly_type, to_json_file,
-                     trt_gte_10)
+from ._utils import np_bfloat16, np_float8, str_dtype_to_trt, to_json_file
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
+from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
 from .logger import logger
 from .lora_manager import LoraConfig
@@ -112,7 +113,7 @@ class Builder():
             explicit_batch_flag = 1 << int(
                 trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
 
-        if support_strongly_type() and self.strongly_typed:
+        if self.strongly_typed:
             return Network()._init(
                 self.trt_builder.create_network(
                     explicit_batch_flag
@@ -131,6 +132,7 @@ class Builder():
                               int8: bool = False,
                               strongly_typed: bool = False,
                               opt_level: Optional[int] = None,
+                              force_num_profiles: Optional[int] = None,
                               profiling_verbosity: str = "layer_names_only",
                               use_strip_plan: bool = False,
                               weight_streaming: bool = False,
@@ -144,35 +146,15 @@ class Builder():
             @param int8: whether to build with int8 enabled or not. Can't be used together with refit option
             @return: A BuilderConfig object, return None if failed
         '''
-        if strongly_typed and not support_strongly_type():
-            logger.warning(
-                "TRT version does not support strongly_type. strongly_typed flag is ignored."
-            )
-
-        # In TRT 10.0, enable strongly_typed by default.
-        self.strongly_typed = self.strongly_typed or (strongly_typed and
-                                                      support_strongly_type())
+        self.strongly_typed = self.strongly_typed or strongly_typed
 
         quant_mode = kwargs.get("quant_mode", QuantMode(0))
         if not strongly_typed and precision not in self._ALLOWED_PRECISIONS:
             logger.error(
                 f"precision should be one of {self._ALLOWED_PRECISIONS}")
 
-        if use_strip_plan and not trt_gte_10():
-            logger.error(
-                "cannot use --strip_plan with tensorrt version 9.x or below")
-
-        if (use_refit or use_strip_plan) and int8 and not trt_gte_10():
-            # TRT folds weights into Myelin graph because network contains int8 tensor or Q/DQ nodes
-            # These folded weights can not be refitted
-            logger.error(
-                "can't use refit/strip_plan and int8 mode at the same time before tensorrt 10.0"
-            )
-
         config = self.trt_builder.create_builder_config()
         if weight_streaming:
-            assert trt_gte_10(), \
-                  "Weight streaming is only supported by TensorRT 10.0 or later."
             config.set_flag(trt.BuilderFlag.WEIGHT_STREAMING)
         if not self.strongly_typed:
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
@@ -194,6 +176,10 @@ class Builder():
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
+
+        # Use fine-grained refit when strip plan is enabled in TRT10.2+.
+        if use_strip_plan:
+            config.set_flag(trt.BuilderFlag.REFIT_INDIVIDUAL)
 
         if use_strip_plan:
             config.set_flag(trt.BuilderFlag.STRIP_PLAN)
@@ -240,6 +226,7 @@ class Builder():
                                      tensor_parallel=tensor_parallel,
                                      use_refit=use_refit,
                                      int8=int8,
+                                     force_num_profiles=force_num_profiles,
                                      strongly_typed=self.strongly_typed,
                                      use_strip_plan=use_strip_plan,
                                      **kwargs)
@@ -253,10 +240,15 @@ class Builder():
             logger.warning("There are no inputs in the network!")
             return
         num_profiles = len(list(input_tensors.values())[0].profiles)
+        force_num_profiles = getattr(
+            builder_config, "force_num_profiles") if hasattr(
+                builder_config, "force_num_profiles") else None
         for i in range(num_profiles):
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
             profile = self.trt_builder.create_optimization_profile()
             for input_name in input_tensors.keys():
+                if len(input_tensors[input_name].profiles) == 0:
+                    continue
                 shape_profile = input_tensors[input_name].profiles[i]
                 min_shape = [*shape_profile.min]
                 opt_shape = [*shape_profile.opt]
@@ -276,7 +268,16 @@ class Builder():
                 logger.debug(
                     f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
                 )
-            builder_config.trt_builder_config.add_optimization_profile(profile)
+            ret = builder_config.trt_builder_config.add_optimization_profile(
+                profile)
+            logger.debug(f"Added optimization profile: #{ret}")
+            if force_num_profiles is not None and (
+                    i + 1
+            ) == force_num_profiles and force_num_profiles < num_profiles:
+                logger.warning(
+                    f"Only adding {force_num_profiles} profiles instead of {num_profiles}."
+                )
+                break
         assert self._validate_named_dimensions(
             network, builder_config
         ), "Validation of the tensor dimension ranges failed, please check the dimension ranges, find the offensive tensor and dimension name in above the error log"
@@ -359,8 +360,10 @@ class Builder():
         return serialized_engine
 
     @_is_building
-    def build_engine(self, network: Network,
-                     builder_config: BuilderConfig) -> trt.IHostMemory:
+    def build_engine(self,
+                     network: Network,
+                     builder_config: BuilderConfig,
+                     managed_weights: list = None) -> trt.IHostMemory:
         '''
             @brief: Build one TensorRT engine from the network.
             @param network: Network object.
@@ -370,43 +373,58 @@ class Builder():
         assert isinstance(network, Network)
         builder_config.plugin_config = network.plugin_config
         builder_config.auto_parallel_config = network.auto_parallel_config
-        if builder_config.auto_parallel_config is not None:
-            mapping = builder_config.auto_parallel_config["mapping"]
-            builder_config.tensor_parallel = mapping.tp_size
-            builder_config.pipeline_parallel = mapping.pp_size
-            builder_config.moe_tensor_parallel = mapping.moe_tp_size
-            builder_config.moe_expert_parallel = mapping.moe_ep_size
         if builder_config.trt_builder_config.num_optimization_profiles == 0:
             self._add_optimization_profile(network, builder_config)
+        logger.info(
+            f"Total optimization profiles added: {builder_config.trt_builder_config.num_optimization_profiles}"
+        )
         engine = None
 
         # Rename weights
         if network.named_parameters is not None:
+            managed_parameters = []
             for name, param in network.named_parameters:
-                if param._get_weights() is None:
+                if param.is_managed(network):
+                    assert managed_weights is not None, "managed_weights should be provided when enabled"
+                    managed_parameters.append(param)
+                    param.set_name(name, network)
+                    continue
+                if param._get_weights(network) is None:
                     if not param.is_buffer:
                         logger.info(
                             f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was created"
                             " but unused in forward method, so not materialized to TRT network"
                         )
                     continue
-                if not network.trt_network.set_weights_name(
-                        param._get_weights(), name):
+                if not param.set_name(name, network):
                     raise RuntimeError(f'Failed to set weight: {name}')
+                # This mark_weights_refittable has no side effect when refit_individual is not enabled.
+                network.trt_network.mark_weights_refittable(name)
 
         network._fill_weights()
+
         # Build engine
         logger.info(f'Build TensorRT engine {network.trt_network.name}')
         tik = time.time()
         engine = self.trt_builder.build_serialized_network(
             network.trt_network, builder_config.trt_builder_config)
-        if engine is None:
-            logger.error('Engine building failed, please check the error log.')
-            return None
+        assert engine is not None, 'Engine building failed, please check the error log.'
 
         tok = time.time()
         t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
         logger.info(f'Total time of building {network.trt_network.name}: {t}')
+
+        if managed_weights is not None and network.named_parameters is not None:
+            for param in managed_parameters:
+                name = param.name
+                value: np.ndarray = param._value
+                if value is None:
+                    logger.error(f'Failed to get weight: {name}')
+                    continue
+                if value.dtype == np.float16 and value.ndim == 2 and network.plugin_config.gemm_plugin is None:
+                    # MOE has ndim=3 and uses plugin, no need to transpose
+                    value = value.transpose(1, 0)  # WAR for bug 4641821
+                managed_weights.append((name, value))
 
         return engine
 
@@ -450,6 +468,7 @@ class BuildConfig:
     gather_generation_logits: int = False
     strongly_typed: bool = False
     builder_opt: Optional[int] = None
+    force_num_profiles: Optional[int] = None
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
     max_draft_len: int = 0
@@ -469,34 +488,6 @@ class BuildConfig:
     dry_run: bool = False
     visualize_network: bool = False
 
-    def __post_init__(self):
-        """
-        Check and may modify max_num_tokens and opt_num_tokens after instantiation
-        """
-        max_num_tokens, opt_num_tokens = check_max_num_tokens(
-            max_num_tokens=self.max_num_tokens,
-            opt_num_tokens=self.opt_num_tokens,
-            max_batch_size=self.max_batch_size,
-            max_input_len=self.max_input_len,
-            max_seq_len=self.max_seq_len,
-            max_beam_width=self.max_beam_width,
-            remove_input_padding=self.plugin_config.remove_input_padding,
-            enable_context_fmha=self.plugin_config.context_fmha,
-            tokens_per_block=self.plugin_config.tokens_per_block,
-            multiple_profiles=self.plugin_config.multiple_profiles,
-        )
-        self.max_num_tokens, self.opt_num_tokens = max_num_tokens, opt_num_tokens
-
-        if self.plugin_config.remove_input_padding and self.plugin_config.context_fmha:
-            if self.max_input_len:
-                logger.warning(
-                    'padding removal and fMHA are both enabled, max_input_len is not required and will be ignored'
-                )
-        else:
-            assert self.max_input_len is not None, 'padding removal and fMHA aren\'t both enabled, max_input_len is required'
-            if self.max_seq_len:
-                assert self.max_input_len <= self.max_seq_len, 'max_input_len should not be larger than max_seq_len'
-
     @classmethod
     def from_dict(cls, config, plugin_config=None):
         max_input_len = config.pop('max_input_len')
@@ -510,8 +501,9 @@ class BuildConfig:
             'max_prompt_embedding_table_size', 0)
         gather_context_logits = config.pop('gather_context_logits', False)
         gather_generation_logits = config.pop('gather_generation_logits', False)
-        strongly_typed = config.pop('strongly_typed', False)
+        strongly_typed = config.pop('strongly_typed', True)
         builder_opt = config.pop('builder_opt', None)
+        force_num_profiles = config.pop('force_num_profiles', None)
         weight_sparsity = config.pop('weight_sparsity', False)
         profiling_verbosity = config.pop('profiling_verbosity',
                                          'layer_names_only')
@@ -551,6 +543,7 @@ class BuildConfig:
             gather_generation_logits=gather_generation_logits,
             strongly_typed=strongly_typed,
             builder_opt=builder_opt,
+            force_num_profiles=force_num_profiles,
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
             max_draft_len=max_draft_len,
@@ -623,10 +616,15 @@ class EngineConfig:
 
 class Engine:
 
-    def __init__(self, config: EngineConfig, engine: Union[trt.IHostMemory,
-                                                           None]):
+    def __init__(
+        self,
+        config: EngineConfig,
+        engine: Union[trt.IHostMemory, None],
+        managed_weights: list[tuple[str, np.ndarray]] = None,
+    ):
         self.config = config
         self.engine = engine
+        self.managed_weights = managed_weights
 
     def save(self, engine_dir: str):
         os.makedirs(engine_dir, exist_ok=True)
@@ -667,6 +665,12 @@ class Engine:
                 os.path.join(
                     engine_dir,
                     f'rank{self.config.pretrained_config.mapping.rank}.engine'))
+        if self.managed_weights is not None and len(self.managed_weights) > 0:
+            fn = os.path.join(
+                engine_dir,
+                f'rank{self.config.pretrained_config.mapping.rank}_managed_weights.safetensors'
+            )
+            serialize_managed_weights(self.managed_weights, fn)
 
     @classmethod
     def from_dir(cls, engine_dir: str, rank: int = 0):
@@ -731,6 +735,130 @@ def optimize_model_with_config(model: PretrainedModel,
     return model
 
 
+def _init_max_seq_len(model_config, build_config):
+    """
+    If max_seq_len is not specified, set it to max_position_embeddings * rotary_factor
+    Additional checks to ensure max_seq_len, max_input_len, and max_num_tokens have valid values.
+    """
+    # Extract rotary scaling which will be used for checks and default value of max_seq_len
+    rotary_scaling = getattr(model_config, "rotary_scaling", None)
+    if rotary_scaling is not None:
+        rotary_type = rotary_scaling.get('type',
+                                         rotary_scaling.get('rope_type'))
+        rotary_factor = rotary_scaling.get('factor',
+                                           1.0) if rotary_type != 'su' else 1
+    else:
+        rotary_factor = 1
+
+    if model_config.architecture == "EncoderModel":
+        if build_config.max_seq_len is None:
+            build_config.max_seq_len = build_config.max_input_len
+            logger.info(
+                f'max_seq_len is not specified for EncoderModel, using --max_input_len.'
+            )
+        assert build_config.max_input_len == build_config.max_seq_len, f"EncoderModel should have same --max_input_len ({build_config.max_input_len}) and --max_seq_len ({build_config.max_seq_len})."
+
+    if build_config.max_seq_len is None:
+        # Step 1: Find the upper bound of max_seq_len
+        deduced_max_seq_len = 2048
+        if model_config.max_position_embeddings is not None:
+            deduced_max_seq_len = model_config.max_position_embeddings
+
+        # Step 2: Scale max_seq_len with rotary scaling
+        if rotary_factor != 1:
+            deduced_max_seq_len = math.ceil(deduced_max_seq_len * rotary_factor)
+            logger.warning(
+                f'max_seq_len is scaled to {deduced_max_seq_len} by rotary scaling {rotary_factor}'
+            )
+
+        # Step 3: Assign the new max_seq_len
+        build_config.max_seq_len = int(deduced_max_seq_len)
+        logger.info(
+            f'max_seq_len is not specified, using deduced value {deduced_max_seq_len}'
+        )
+    else:
+        if not build_config.plugin_config.streamingllm and model_config.max_position_embeddings is not None \
+            and model_config.position_embedding_type != PositionEmbeddingType.relative:
+            if build_config.max_seq_len > model_config.max_position_embeddings * rotary_factor:
+                logger.warning(
+                    f'max_seq_len {build_config.max_seq_len} is larger than max_position_embeddings {model_config.max_position_embeddings} * rotary scaling {rotary_factor}, '
+                    'the model accuracy might be affected')
+
+    if build_config.max_input_len > build_config.max_seq_len:
+        logger.warning(
+            f'max_input_len is {build_config.max_input_len} is larger than max_seq_len {build_config.max_seq_len}, clipping it to max_seq_len'
+        )
+        build_config.max_input_len = build_config.max_seq_len
+
+    # Check and may modify max_num_tokens and opt_num_tokens (need to happen after max_seq_len is deduced)
+    max_num_tokens, opt_num_tokens = check_max_num_tokens(
+        max_num_tokens=build_config.max_num_tokens,
+        opt_num_tokens=build_config.opt_num_tokens,
+        max_batch_size=build_config.max_batch_size,
+        max_input_len=build_config.max_input_len,
+        max_seq_len=build_config.max_seq_len,
+        max_beam_width=build_config.max_beam_width,
+        remove_input_padding=build_config.plugin_config.remove_input_padding,
+        enable_context_fmha=build_config.plugin_config.context_fmha,
+        tokens_per_block=build_config.plugin_config.tokens_per_block,
+        multiple_profiles=build_config.plugin_config.multiple_profiles,
+    )
+    build_config.max_num_tokens, build_config.opt_num_tokens = max_num_tokens, opt_num_tokens
+
+    if build_config.plugin_config.remove_input_padding and build_config.plugin_config.context_fmha:
+        if build_config.max_input_len:
+            logger.warning(
+                'padding removal and fMHA are both enabled, max_input_len is not required and will be ignored'
+            )
+    else:
+        assert build_config.max_input_len is not None, 'padding removal and fMHA aren\'t both enabled, max_input_len is required'
+        if build_config.max_seq_len:
+            assert build_config.max_input_len <= build_config.max_seq_len, 'max_input_len should not be larger than max_seq_len'
+
+
+def serialize_managed_weights(managed_weights: list[tuple[str, np.ndarray]],
+                              path: str | Path,
+                              metadata=None) -> None:
+    header = {}
+    if metadata is not None:
+        header["__metadata__"] = metadata
+    begin = 0
+    for name, value in managed_weights:
+        size = value.size * value.itemsize
+        if value.dtype == np.float32:
+            dtype = "F32"
+        elif value.dtype == np.float16:
+            dtype = "F16"
+        elif value.dtype == np_bfloat16:
+            dtype = "BF16"
+        elif value.dtype == np_float8:
+            dtype = "F8_E4M3"
+        elif value.dtype == np.int64:
+            dtype = "I64"
+        elif value.dtype == np.int32:
+            dtype = "I32"
+        else:
+            raise RuntimeError(f"Unsupported dtype: {value.dtype}")
+        header[name] = {
+            "dtype": dtype,
+            "shape": value.shape,
+            "data_offsets": [begin, begin + size],
+        }
+        begin += size
+
+    header_json = json.dumps(header)
+    header_json_len = len(header_json)
+    with open(path, "wb") as f:
+        logger.info(
+            f"Serializing {len(managed_weights)} managed weights to {path}...")
+        f.write(header_json_len.to_bytes(8, byteorder="little"))
+        f.write(header_json.encode())
+        for name, value in managed_weights:
+            logger.debug(f"Serializing managed weight: {name}")
+            buf = value.tobytes()
+            f.write(buf)
+
+
 def build(model: PretrainedModel,
           build_config: BuildConfig,
           return_build_config: bool = False) -> Engine | BuildConfig:
@@ -744,6 +872,8 @@ def build(model: PretrainedModel,
     build_config = copy.deepcopy(build_config)
     build_config.plugin_config.dtype = model.config.dtype
 
+    _init_max_seq_len(model.config, build_config)
+
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
         build_config.strongly_typed = True
@@ -755,6 +885,15 @@ def build(model: PretrainedModel,
                 'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
             )
         build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
+
+    if hasattr(model.config, 'redrafter_num_beams') and hasattr(
+            model.config, 'redrafter_draft_len_per_beam'):
+        build_config.max_draft_len = model.config.redrafter_num_beams * model.config.redrafter_draft_len_per_beam
+        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS:
+            logger.warning(
+                'speculative_decoding_mode is not EXPLICIT_DRAFT_TOKENS for ReDrafter model. Overwriting speculative_decoding_mode'
+            )
+        build_config.speculative_decoding_mode = SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
 
     if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
         logger.info(
@@ -793,6 +932,11 @@ def build(model: PretrainedModel,
             raise RuntimeError(
                 "Paged Context FMHA doesn't work with int8 kv cache currently.")
 
+    if build_config.plugin_config.manage_weights:
+        if model.config.quant_mode & QuantMode.INT4_WEIGHTS or model.config.quant_mode & QuantMode.INT8_WEIGHTS:
+            raise RuntimeError(
+                "Managed weights is not supported with int4 or int8 weights.")
+
     model = optimize_model_with_config(model, build_config)
 
     builder = Builder()
@@ -805,6 +949,7 @@ def build(model: PretrainedModel,
         or model.config.quant_mode.has_int8_kv_cache(),
         strongly_typed=build_config.strongly_typed,
         opt_level=build_config.builder_opt,
+        force_num_profiles=build_config.force_num_profiles,
         profiling_verbosity=build_config.profiling_verbosity,
         quant_mode=model.config.quant_mode,
         use_strip_plan=build_config.use_strip_plan,
@@ -819,6 +964,7 @@ def build(model: PretrainedModel,
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
 
@@ -829,9 +975,10 @@ def build(model: PretrainedModel,
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
+    if use_fp8_rowwise:
+        network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
-    network.plugin_config.set_nccl_plugin(
-        nccl_plugin, network.plugin_config.use_custom_all_reduce)
+    network.plugin_config.set_nccl_plugin(nccl_plugin)
 
     # NOTE: Please never change the build_config object after this point!
     if return_build_config:
@@ -909,8 +1056,9 @@ def build(model: PretrainedModel,
         network.to_dot(f'rank{model.config.mapping.rank}.dot')
 
     # Network -> Engine
+    managed_weights = [] if network.plugin_config.manage_weights else None
     engine = None if build_config.dry_run else builder.build_engine(
-        network, builder_config)
+        network, builder_config, managed_weights)
     engine_config = EngineConfig(model.config, build_config, __version__)
 
     if build_config.output_timing_cache is not None and model.config.mapping.rank == 0:
@@ -918,4 +1066,17 @@ def build(model: PretrainedModel,
                                        build_config.output_timing_cache)
         assert ok, "Failed to save timing cache."
 
-    return Engine(engine_config, engine)
+    import psutil
+
+    # Get the current process
+    current_process = psutil.Process()
+    # Get resource usage for the current process (self)
+    rusage_s = current_process.memory_info()
+    # Get resource usage for all child processes
+    children = current_process.children(recursive=True)
+    rusage_c = [child.memory_info() for child in children]
+    logger.info(
+        f"Build phase peak memory: {rusage_s.rss / 1024 / 1024:.2f} MB, children: {sum([ru.rss for ru in rusage_c]) / 1024 / 1024:.2f} MB"
+    )
+
+    return Engine(engine_config, engine, managed_weights)

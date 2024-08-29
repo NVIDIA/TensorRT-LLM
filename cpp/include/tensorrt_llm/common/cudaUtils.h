@@ -28,6 +28,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
@@ -138,15 +139,22 @@ void checkEx(T result, std::initializer_list<T> const& validReturns, char const*
 #define check_cuda_error(val) check((val), #val, __FILE__, __LINE__)
 #define check_cuda_error_2(val, file, line) check((val), #val, file, line)
 
-inline bool isCudaLaunchBlocking()
+inline std::optional<bool> isCudaLaunchBlocking()
 {
     static bool firstCall = true;
-    static bool result = false;
+    static std::optional<bool> result = std::nullopt;
 
     if (firstCall)
     {
         char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-        result = env != nullptr && std::string(env) == "1";
+        if (env != nullptr && std::string(env) == "1")
+        {
+            result = true;
+        }
+        else if (env != nullptr && std::string(env) == "0")
+        {
+            result = false;
+        }
         firstCall = false;
     }
 
@@ -155,10 +163,11 @@ inline bool isCudaLaunchBlocking()
 
 inline void syncAndCheck(char const* const file, int const line)
 {
+    auto const cudaLaunchBlocking = isCudaLaunchBlocking();
 #ifndef NDEBUG
-    bool const checkError = true;
+    bool const checkError = cudaLaunchBlocking.value_or(true);
 #else
-    bool const checkError = isCudaLaunchBlocking();
+    bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif
 
     if (checkError)

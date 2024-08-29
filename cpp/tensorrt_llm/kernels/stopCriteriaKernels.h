@@ -48,7 +48,7 @@ namespace kernels
 //! \param maxSeqLen maximum length of the sequence
 //! \param stream stream
 void invokeStopWordsCriterion(runtime::TokenIdType const** outputIds, runtime::SizeType32 const** parentIds,
-    runtime::TokenIdType const** stopWords, FinishedState* finished, runtime::SizeType32* sequenceLengths,
+    runtime::TokenIdType const* const* stopWords, FinishedState* finished, runtime::SizeType32* sequenceLengths,
     runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* stopWordsLen, runtime::SizeType32* numNewTokens,
     runtime::SizeType32 maxStopWordsLen, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
     runtime::SizeType32 maxSeqLen, cudaStream_t stream);

@@ -35,6 +35,7 @@ class CogVLMConfig(PretrainedConfig):
         self.rotary_scaling = rotary_scaling
         self.vision_start = vision_start
         self.vision_length = vision_length
+        self.position_embedding_type = 'rope_gpt_neox'
         super().__init__(**kwargs)
 
     def to_dict(self):

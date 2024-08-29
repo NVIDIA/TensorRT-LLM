@@ -103,7 +103,7 @@ def test_build_get_updated_build_cache():
                    build_config=build_config,
                    enable_tqdm=True)
     args.setup()
-    ml = ModelLoader(args, tokenizer=None)
+    ml = ModelLoader(args)
 
     with TemporaryDirectory() as engine_dir:
         engine_dir = ml(Path(engine_dir))
