@@ -22,7 +22,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tensor.h"
 
 namespace tensorrt_llm::kernels
 {
@@ -92,7 +91,7 @@ struct AllReduceParams
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int32_t const* buffer, size_t tpSize, size_t tpRank, uint32_t flag_value);
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank);
 };
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);

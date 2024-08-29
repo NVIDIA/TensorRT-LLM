@@ -228,7 +228,7 @@ CumsumLastDimPluginCreator::CumsumLastDimPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("mInputLength", nullptr, PluginFieldType::kINT32, 49152));
+    mPluginAttributes.emplace_back(PluginField("input_length", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();

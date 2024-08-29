@@ -29,7 +29,7 @@ namespace tensorrt_llm::runtime
 
 namespace
 {
-void setPeerAccess(WorldConfig const& worldConfig, bool enable)
+bool setPeerAccess(WorldConfig const& worldConfig, bool enable)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const srcDevice = worldConfig.getDevice();
@@ -44,6 +44,12 @@ void setPeerAccess(WorldConfig const& worldConfig, bool enable)
 
         int canAccessPeer{0};
         TLLM_CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, srcDevice, destDevice));
+        if (canAccessPeer == 0)
+        {
+            TLLM_LOG_INFO("cudaDeviceCanAccessPeer failed for device: %d peerDevice: %d", srcDevice, destDevice);
+            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            return false;
+        }
 
         if (enable)
         {
@@ -60,14 +66,15 @@ void setPeerAccess(WorldConfig const& worldConfig, bool enable)
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return true;
 }
 } // namespace
 
-IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig)
+IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig, bool openIpc)
     : mTpRank(worldConfig.getTensorParallelRank())
     , mCommPtrs(worldConfig.getTensorParallelism())
 {
-    mOpenIpc = worldConfig.getTensorParallelism() <= worldConfig.getGpusPerNode();
+    mOpenIpc = openIpc && worldConfig.getTensorParallelism() <= worldConfig.getGpusPerNode();
     if (mOpenIpc)
     {
         allocateIpcMemory(bufferSize, manager, worldConfig);
@@ -140,7 +147,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    setPeerAccess(worldConfig, true);
+    auto const isP2pSupported = setPeerAccess(worldConfig, true);
 
     auto const tpSize = worldConfig.getTensorParallelism();
     auto const bufferSize = tpSize
@@ -151,12 +158,15 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
 
     for (auto size : {bufferSize, bufferSize, flagsSize, flagsSize})
     {
-        mIpcMemoryHandles.emplace_back(size, manager, worldConfig);
+        mIpcMemoryHandles.emplace_back(size, manager, worldConfig, isP2pSupported);
     }
 
-    mAllReduceCommPtrs = BufferManager::cpu(
-        ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize}), nvinfer1::DataType::kINT64);
+    mAllReduceCommPtrs
+        = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 1}),
+            nvinfer1::DataType::kINT64);
     auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
+    auto const flagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
+    *flagPtr = 0;
 
     for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
     {

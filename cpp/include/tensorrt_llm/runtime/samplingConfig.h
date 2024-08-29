@@ -285,7 +285,7 @@ public:
     OptVec<FloatType> lengthPenalty;           // [1] or [batch_size]
     OptVec<SizeType32> earlyStopping;          // [1] or [batch_size]
 
-    // speculative decoding, only the first value is used (in gptDecoderBatch.cpp)
+    // speculative decoding, only the first value is used (in gptDecoderBatched.cpp)
     OptVec<FloatType> draftAcceptanceThreshold; // [1] or [batch_size]
 
     // medusa params

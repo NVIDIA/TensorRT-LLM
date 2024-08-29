@@ -35,8 +35,11 @@ find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
-  ${PROJECT_SOURCE_DIR}/include ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include)
+  ${PROJECT_SOURCE_DIR}/include
+  ${3RDPARTY_DIR}/cutlass/include
+  ${3RDPARTY_DIR}/cutlass/tools/util/include
+  ${PROJECT_SOURCE_DIR}/tests/batch_manager
+  ${PROJECT_SOURCE_DIR}/tests/utils)
 
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
@@ -75,9 +78,9 @@ add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
 add_gtest(workerPoolTest runtime/workerPoolTest.cpp)
 add_gtest(transposeKVKernelTest runtime/transposeKVKernelTest.cpp)
 add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
-add_gtest(gptDecoderBatchTest runtime/gptDecoderBatchTest.cpp)
+add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
-add_gtest(allocatorTest common/allocatorTest.cpp)
+target_link_libraries(gptSessionTest PRIVATE modelSpecStatic)
 add_gtest(memoryUtilsTest common/memoryUtilsTest.cu)
 if(ENABLE_MULTI_DEVICE EQUAL 1)
   add_gtest(mpiUtilsTest common/mpiUtilsTest.cpp)
@@ -85,8 +88,9 @@ endif()
 add_gtest(quantizationTest common/quantizationTest.cpp)
 add_gtest(stringUtilsTest common/stringUtilsTest.cpp)
 add_gtest(tllmExceptionTest common/tllmExceptionTest.cpp)
-add_gtest(tensorTest common/tensorTest.cpp)
 add_gtest(stlUtilsTest common/stlUtilsTest.cpp)
+add_gtest(cudaProfilerUtilsTest common/cudaProfilerUtilsTest.cpp)
+add_gtest(timestampUtilsTest common/timestampUtilsTest.cpp)
 add_gtest(tllmRuntimeTest runtime/tllmRuntimeTest.cpp)
 add_gtest(tllmBuffersTest runtime/tllmBuffersTest.cpp)
 add_gtest(bufferManagerTest runtime/bufferManagerTest.cpp)
@@ -94,13 +98,17 @@ add_gtest(runtimeKernelTest runtime/runtimeKernelTest.cpp)
 add_gtest(samplingTest runtime/samplingTest.cpp)
 add_gtest(samplingConfigTest runtime/samplingConfigTest.cpp)
 add_gtest(iTensorTest runtime/iTensorTest.cpp)
+add_gtest(iBufferTest runtime/iBufferTest.cpp)
 add_gtest(worldConfigTest runtime/worldConfigTest.cpp)
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 add_gtest(mixtureOfExpertsTest kernels/mixtureOfExpertsTest.cu)
 add_gtest(ropeTest kernels/ropeTest.cu)
 if(${BUILD_PYT})
   add_gtest(torchTest runtime/torchTest.cpp)
+  add_gtest(thUtilsTest thop/thUtilsTest.cpp)
   target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+  target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
+                                           ${TORCH_LIBRARIES})
 endif()
 set(SAMPLING_KERNEL_TEST_SRC
     kernels/sampling/samplingTest.cpp
@@ -112,7 +120,8 @@ set(SAMPLING_KERNEL_TEST_SRC
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 add_gtest(weightOnlyKernelTest kernels/weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(smoothQuantKernelTest kernels/smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(fp8GemmKernelTest kernels/fp8Gemm/fp8GemmKernelTest.cpp)
+add_gtest(cudaCoreGemmKernelTest
+          kernels/cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest kernels/allReduce/allReduceKernelTest.cu)
 endif()
@@ -125,6 +134,7 @@ set(SAMPLING_LAYER_TEST_SRC
     layers/topKSamplingLayerTest.cpp layers/topPSamplingLayerTest.cpp)
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
+add_gtest(layerUtilsTest layers/layerUtilsTest.cpp)
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
 set(LOOKAHEAD_POOLMANAGER_TEST_SRC layers/randomLlm.cpp
                                    layers/lookaheadPoolManagerTest.cpp)
@@ -182,6 +192,8 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
       ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
   endif()
 endforeach()
+
+add_subdirectory(utils)
 
 if(BUILD_BATCH_MANAGER)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

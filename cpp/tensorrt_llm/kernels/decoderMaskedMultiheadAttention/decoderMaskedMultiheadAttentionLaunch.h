@@ -180,10 +180,29 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
         TLLM_CHECK_WITH_INFO(                                                                                          \
             res == cudaSuccess, "Sequence Length is too long for the MMHA kernel (not enough shared memory).");        \
     }                                                                                                                  \
-    mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer, Dh,                      \
-        DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, ENABLE_MULTI_BLOCK, POS_SHIFT,        \
-        BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>                                                      \
-        <<<grid, DYNAMIC_THDS_PER_BLOCK, dynamic_smem_sz, stream>>>(params, kv_cache_buffer, k_cache_buffer);
+    const auto mmhaFunc = mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer,    \
+        Dh, DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, ENABLE_MULTI_BLOCK, POS_SHIFT,    \
+        BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>;                                                     \
+    if (tensorrt_llm::common::getEnvEnableFDL())                                                                       \
+    {                                                                                                                  \
+        TLLM_LOG_DEBUG("Enable FDL in MMHA");                                                                          \
+        cudaLaunchConfig_t kernelConfig = {0};                                                                         \
+        kernelConfig.gridDim = grid;                                                                                   \
+        kernelConfig.blockDim = DYNAMIC_THDS_PER_BLOCK;                                                                \
+        kernelConfig.dynamicSmemBytes = dynamic_smem_sz;                                                               \
+        kernelConfig.stream = stream;                                                                                  \
+                                                                                                                       \
+        cudaLaunchAttribute attribute[1];                                                                              \
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                          \
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;                                                   \
+        kernelConfig.attrs = attribute;                                                                                \
+        kernelConfig.numAttrs = 1;                                                                                     \
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, mmhaFunc, params, kv_cache_buffer, k_cache_buffer));         \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        mmhaFunc<<<grid, DYNAMIC_THDS_PER_BLOCK, dynamic_smem_sz, stream>>>(params, kv_cache_buffer, k_cache_buffer);  \
+    }
 
 // if resources are not enough to launch 512 threads per block, we will fallback to 256.
 #define MMHA_512_BLOCKSIZE_CHECK()                                                                                     \

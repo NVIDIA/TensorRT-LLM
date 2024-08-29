@@ -18,10 +18,28 @@ from utils.cpp_paths import *
 from utils.llm_data import llm_models_root
 from utils.util import skip_pre_ampere
 
+_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..', '..'))
+from cpp.tests.resources.scripts.build_engines_utils import \
+    init_model_spec_module
+
+init_model_spec_module()
+
+import model_spec
+
+
+def get_model_spec() -> model_spec.ModelSpec:
+    if not hasattr(get_model_spec, 'model_spec_obj'):
+        model_spec_obj = model_spec.ModelSpec(
+            'input_tokens.npy',
+            _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
+                model_spec.KVCacheType.PAGED).use_packed_input()
+        get_model_spec.model_spec_obj = model_spec_obj
+
+    return get_model_spec.model_spec_obj
+
 
 @pytest.mark.parametrize("variant, results_file", [
-    ("fp16-plugin-packed-paged",
-     "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
+    (get_model_spec().get_model_path(), get_model_spec().get_results_file()),
 ])
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
@@ -102,8 +120,8 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
         inference_request_list.append(ir)
 
     def logits_post_processor(req_id: int, logits: _tor.Tensor,
-                              ids: _tp.List[_tp.List[int]],
-                              stream: _tor.Stream):
+                              ids: _tp.List[_tp.List[int]], stream: _tor.Stream,
+                              client_id: _tp.Optional[int]):
         del req_id, ids
 
         cuda_stream = _tor.cuda.Stream(
@@ -197,8 +215,7 @@ def test_gpt_manager(variant, results_file, llm_root: _pl.Path,
 
 
 @pytest.mark.parametrize("variant, results_file", [
-    ("fp16-plugin-packed-paged",
-     "output_tokens_fp16_plugin_packed_paged_tp1_pp1.npy"),
+    (get_model_spec().get_model_path(), get_model_spec().get_results_file()),
 ])
 def test_gpt_manager_constrained_generation(variant, results_file,
                                             llm_root: _pl.Path,
@@ -271,8 +288,8 @@ def test_gpt_manager_constrained_generation(variant, results_file,
         return fetched
 
     def logits_post_processor(req_id: int, logits: _tor.Tensor,
-                              ids: _tp.List[_tp.List[int]],
-                              stream: _tor.Stream):
+                              ids: _tp.List[_tp.List[int]], stream: _tor.Stream,
+                              client_id: _tp.Optional[int]):
         del req_id
 
         cuda_stream = _tor.cuda.Stream(

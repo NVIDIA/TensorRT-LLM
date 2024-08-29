@@ -28,7 +28,7 @@ set(SRCS
     decodingOutput.cpp
     generationConfig.cpp
     gptDecoder.cpp
-    gptDecoderBatch.cpp
+    gptDecoderBatched.cpp
     gptJsonConfig.cpp
     gptSession.cpp
     iBuffer.cpp

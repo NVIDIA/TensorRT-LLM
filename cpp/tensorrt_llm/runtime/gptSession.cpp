@@ -1,6 +1,3 @@
-//
-// Created by martinma on 5/24/23.
-//
 /*
  * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -23,8 +20,9 @@
 #include "iBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/safetensors.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/gptDecoderBatch.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
@@ -36,6 +34,7 @@
 
 #include <algorithm>
 #include <cstdlib> // std::getenv
+#include <cstring>
 #include <cuda_profiler_api.h>
 #include <memory>
 #include <sstream>
@@ -71,6 +70,13 @@ std::unordered_set<std::int32_t> populateMicrobatchIndexes()
 
 auto const kProfileMbIdxs = populateMicrobatchIndexes();
 
+GptSession::Config setPath(GptSession::Config const& original, std::string const& path)
+{
+    GptSession::Config config = original;
+    config.enginePath = std::filesystem::path(path);
+    return config;
+}
+
 } // namespace
 
 GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -97,6 +103,13 @@ GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConf
     // TODO compare expected and runtime tensor names?
 
     setup(sessionConfig);
+}
+
+GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    std::string const& engineFile, LoggerPtr logger)
+    : GptSession(
+        setPath(sessionConfig, engineFile), modelConfig, worldConfig, utils::loadEngine(engineFile), std::move(logger))
+{
 }
 
 nvinfer1::ILogger& GptSession::getLogger() const
@@ -172,8 +185,8 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(
-                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode()));
+            mDecoders.emplace_back(std::make_shared<GptDecoderBatched>(
+                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
         }
         else
         {
@@ -181,7 +194,7 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
         }
         constexpr SizeType32 maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, /* fusedDecoder*/ false, logitsType, mModelConfig);
+            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -301,7 +314,7 @@ void GptSession::setup(Config const& sessionConfig)
 
     // Store this param related to decoder buffer size and kv cache manager to check against
     // the input shape with the params given in generate().
-    // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
+    // GptDecoderBatched does not resize buffers, but allows smaller batchSize and beamWidth.
     // TODO refactor batch manager to remove dependency on maxSequenceLength.
     mDecoderMaxSequenceLength = maxSequenceLength;
     mDecoderMaxAttentionWindow = maxAttentionWindow;
@@ -326,7 +339,7 @@ void GptSession::setup(Config const& sessionConfig)
         }
     }
 
-    if (mWorldConfig.isTensorParallel() && mModelConfig.useCustomAllReduce())
+    if (mWorldConfig.isTensorParallel())
     {
         createCustomAllReduceWorkspace(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxSequenceLength);
     }
@@ -345,6 +358,13 @@ void GptSession::setup(Config const& sessionConfig)
             sessionConfig.kvCacheConfig);
     }
 
+    if (mModelConfig.getManageWeightsType() != ModelConfig::ManageWeightsType::kDisabled)
+    {
+        TLLM_CHECK_WITH_INFO(sessionConfig.enginePath.has_value(), "Engine path is not set.");
+        auto weightPath = sessionConfig.enginePath.value().parent_path()
+            / ("rank" + std::to_string(mWorldConfig.getLocalRank()) + "_managed_weights.safetensors");
+        mRuntime->loadManagedWeights(weightPath.string());
+    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -824,7 +844,7 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
         // TODO(micro batching) use mCommStream?
         if (beamWidth > 1)
         {
-            finalize(microBatchId);
+            finalize(microBatchId, samplingConfig);
         }
         else if (!mWorldConfig.isPipelineParallel())
         {
@@ -1146,7 +1166,7 @@ bool GptSession::shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, Size
     return nbFinished == batchSize * beamWidth;
 }
 
-void GptSession::finalize(SizeType32 microBatchId)
+void GptSession::finalize(SizeType32 microBatchId, SamplingConfig const& samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mRuntime->getBufferManager();
@@ -1164,7 +1184,7 @@ void GptSession::finalize(SizeType32 microBatchId)
         if (mWorldConfig.isLastPipelineParallelRank())
         {                                               // send ids from last to first
             auto& decoder = mDecoders.at(microBatchId); // only the last rank has the decoder
-            decoder->finalize();
+            decoder->finalize(samplingConfig);
             auto finalOutputIds = decoder->getOutputIds();
 
             auto const peer = pipelineGroup.front();
@@ -1203,7 +1223,7 @@ void GptSession::finalize(SizeType32 microBatchId)
     else
     {
         auto& decoder = mDecoders.at(microBatchId); // all ranks have the decoder
-        decoder->finalize();
+        decoder->finalize(samplingConfig);
         auto finalOutputIds = decoder->getOutputIds();
         manager.copy(*finalOutputIds, *outputIds);
         if (cumLogProbs)

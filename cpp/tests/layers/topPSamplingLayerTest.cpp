@@ -30,8 +30,6 @@ class TopPSamplingLayerTest : public BaseSamplingLayerTest<T>
         this->mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
         this->mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(this->mStream);
 
-        this->mAllocator = std::make_shared<tensorrt_llm::common::CudaAllocator>(*this->mBufferManager);
-
         int device;
         cudaGetDevice(&device);
         cudaGetDeviceProperties(&mDeviceProp, device);
@@ -44,7 +42,7 @@ class TopPSamplingLayerTest : public BaseSamplingLayerTest<T>
         auto const decodingDomain
             = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
         this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopPSamplingLayer<T>>(
-            decodingDomain, this->mStream->get(), this->mAllocator, &mDeviceProp);
+            decodingDomain, this->mBufferManager, &mDeviceProp);
     }
 
     struct cudaDeviceProp mDeviceProp;

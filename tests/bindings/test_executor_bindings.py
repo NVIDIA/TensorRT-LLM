@@ -14,6 +14,7 @@ import torch
 from binding_test_utils import *
 
 import tensorrt_llm.bindings.executor as trtllm
+import tensorrt_llm.version as trtllm_version
 
 _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
 from utils.cpp_paths import *
@@ -22,13 +23,21 @@ from utils.util import skip_pre_ampere
 
 
 @pytest.fixture
-def model_files(llm_root: Path, resource_path: Path, results_data_path):
+def model_files(llm_root: Path, resource_path: Path, results_data_path: Path):
     # Model engines and expected outputs need to be generated.
     if not results_data_path.exists():
         model_cache = llm_models_root()
         model_cache_arg = ["--model_cache", str(model_cache)
                            ] if model_cache is not None else []
         prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
+
+
+@pytest.fixture
+def lora_config_paths(llm_root: Path, resource_path: Path,
+                      lora_config_path: Path):
+    if not lora_config_path.exists():
+        prepare_lora_configs(llm_root, resource_path, lora_config_path)
+    return (lora_config_path / "source.npy", lora_config_path / "config.npy")
 
 
 def get_expected_num_tokens(prompt_len, max_new_tokens, streaming,
@@ -201,6 +210,61 @@ def test_single_request(streaming: bool, exclude_input_from_output: bool,
 
     executor.get_latest_iteration_stats()
     executor.get_latest_request_stats()
+
+
+@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
+def test_single_request_lora(model_files, model_path_lora, lora_config_paths):
+    streaming = False
+    exclude_input_from_output = False
+    output_config = trtllm.OutputConfig()
+    output_config.exclude_input_from_output = exclude_input_from_output
+
+    # Create executor
+    beam_width = 1
+
+    peft_cache_config = trtllm.PeftCacheConfig(num_put_workers=4,
+                                               num_ensure_workers=4)
+    executor_config = trtllm.ExecutorConfig(1,
+                                            peft_cache_config=peft_cache_config)
+    executor = trtllm.Executor(model_path_lora, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create the request
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    lora_weights = torch.tensor(np.load(lora_config_paths[0])).half()
+    lora_config = torch.tensor(np.load(lora_config_paths[1]))
+    request = trtllm.Request(input_tokens,
+                             max_new_tokens,
+                             streaming,
+                             trtllm.SamplingConfig(),
+                             output_config,
+                             lora_config=trtllm.LoraConfig(
+                                 0, lora_weights, lora_config))
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(
+        len(input_tokens), max_new_tokens, streaming,
+        exclude_input_from_output), f"{request_id}"
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -1026,7 +1090,9 @@ def test_logits_post_processor(model_files, model_path):
 
     # Define the logits post-processor callback
     def logits_post_processor(req_id: int, logits: torch.Tensor,
-                              ids: tp.List[tp.List[int]], stream_ptr: int):
+                              ids: tp.List[tp.List[int]], stream_ptr: int,
+                              client_id: tp.Optional[int]):
+        assert client_id == 123
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             logits[:] = float("-inf")
             logits[..., 42] = 0
@@ -1043,7 +1109,7 @@ def test_logits_post_processor(model_files, model_path):
     # Create the request
     max_new_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False)
+    request = trtllm.Request(input_tokens, max_new_tokens, False, client_id=123)
     request.logits_post_processor_name = "my_logits_pp"
 
     # Enqueue the request
@@ -1079,10 +1145,12 @@ def test_logits_post_processor(model_files, model_path):
 def test_logits_post_processor_batched(model_files, model_path):
 
     # Define the logits post-processor callback
-    def logits_post_processor_batched(req_id_batch: tp.List[int],
-                                      logits_batch: tp.List[torch.Tensor],
-                                      ids_batch: tp.List[tp.List[tp.List[int]]],
-                                      stream_ptr: int):
+    def logits_post_processor_batched(
+            req_id_batch: tp.List[int], logits_batch: tp.List[torch.Tensor],
+            ids_batch: tp.List[tp.List[tp.List[int]]], stream_ptr: int,
+            client_id_batch: tp.List[tp.Optional[int]]):
+        for client_id in client_id_batch:
+            assert client_id == 123
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             for logits in logits_batch:
                 logits[:] = float("-inf")
@@ -1098,7 +1166,7 @@ def test_logits_post_processor_batched(model_files, model_path):
     # Create the request
     max_new_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False)
+    request = trtllm.Request(input_tokens, max_new_tokens, False, client_id=123)
     request.logits_post_processor_name = request.BATCHED_POST_PROCESSOR_NAME
 
     batch_size = 4
@@ -1239,3 +1307,18 @@ def test_executor_config_pickle():
     assert config.max_beam_width == config_copy.max_beam_width
     assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
     assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
+
+
+def test_return_full_tokens():
+    max_new_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_new_tokens, False,
+                             trtllm.SamplingConfig())
+    request.return_all_generated_tokens = True
+    assert request.return_all_generated_tokens == True
+    request.return_all_generated_tokens = False
+    assert request.return_all_generated_tokens == False
+
+
+def test_executor_version():
+    assert trtllm.__version__ == trtllm_version.__version__

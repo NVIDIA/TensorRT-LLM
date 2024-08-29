@@ -11,12 +11,10 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers import AutoTokenizer
 
 import tensorrt_llm
-from tensorrt_llm import Mapping
+from tensorrt_llm import BuildConfig, Mapping, SamplingParams
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.auto_parallel import AutoParallelConfig, infer_cluster_config
-from tensorrt_llm.builder import BuildConfig, build
-from tensorrt_llm.executor import ExecutorBindingsWorker
-from tensorrt_llm.hlapi.utils import SamplingParams, print_traceback_on_error
+from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.models import LLaMAForCausalLM
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -61,7 +59,6 @@ def get_batch_output_text_expected(model_name):
 
 
 # 76s on ipp1-1197, loading weights 18s (varies based on network speed), network/engine creation 27s
-@print_traceback_on_error
 def build_and_run_tp2(rank, model_name, engine_dir, use_auto_parallel):
     '''Do not save the engine, all in one LLaMAForCausalLM object
     '''
@@ -88,35 +85,37 @@ def build_and_run_tp2(rank, model_name, engine_dir, use_auto_parallel):
             },
             **infer_cluster_config(),
         )
-
+    build_config = BuildConfig(max_batch_size=max_batch_size,
+                               max_input_len=max_isl,
+                               max_seq_len=max_osl + max_isl,
+                               strongly_typed=True,
+                               auto_parallel_config=auto_parallel_config)
     # build and run by one llama object
     llama = LLaMAForCausalLM.from_hugging_face(hf_model_dir, mapping=mapping)
-    engine = build(
-        llama,
-        BuildConfig(max_batch_size=max_batch_size,
-                    max_input_len=max_isl,
-                    max_seq_len=max_osl + max_isl,
-                    strongly_typed=True,
-                    auto_parallel_config=auto_parallel_config))
+    engine = tensorrt_llm.build(llama, build_config)
     engine.save(engine_dir)
+
     mpi_barrier()
     tensorrt_llm.logger.warning(f"Build finished for rank {rank}")
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
-    with ExecutorBindingsWorker(engine_dir) as executor:
-        executor.block_subordinates()
+    with GenerationExecutor.create(engine_dir) as executor:
+        if rank == 0:
+            batch_input_ids = [
+                tokenizer.encode(inp) for inp in batch_input_text
+            ]
+            outputs = executor.generate(
+                batch_input_ids,
+                sampling_params=SamplingParams(max_new_tokens=10))
 
-        batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
-        outputs = executor.generate(
-            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
-
-        for idx, output in enumerate(outputs):
-            tensorrt_llm.logger.info(f"{rank} input: {batch_input_text[idx]}")
-            output_text = tokenizer.decode(output.outputs[0].token_ids)
-            tensorrt_llm.logger.info(f"{rank} output: {output_text}")
-            assert output_text.endswith(
-                batch_output_text_expected[idx]
-            ), f"Expecting {batch_output_text_expected[idx]!r}, got {output_text!r}"
+            for idx, output in enumerate(outputs):
+                tensorrt_llm.logger.info(
+                    f"{rank} input: {batch_input_text[idx]}")
+                output_text = tokenizer.decode(output.outputs[0].token_ids)
+                tensorrt_llm.logger.info(f"{rank} output: {output_text}")
+                assert output_text.endswith(
+                    batch_output_text_expected[idx]
+                ), f"Expecting {batch_output_text_expected[idx]!r}, got {output_text!r}"
     mpi_barrier()
     return True
 

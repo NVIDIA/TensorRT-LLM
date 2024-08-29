@@ -944,7 +944,7 @@ __global__ void airTopPSampling(Counter<T, IdxT, AccT>* counters, HisT* histogra
 
     int const tid = threadIdx.x;
     int const batchId = blockIdx.y;
-    auto const batchSlot = batchSlots == nullptr ? batchId : batchSlots[batchId];
+    auto const batchSlot = batchSlots[batchId];
     auto counter = counters + batchId;
 
     // Skip kernel if this sampling method is not chosen
@@ -1238,7 +1238,7 @@ __global__ void airTopPInitialize(Counter<T, IdxT, AccT>* counters, int const ba
     int32_t const* batchSlots)
 {
     auto const batchIdx = blockIdx.x;
-    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    auto const batchSlot = batchSlots[batchIdx];
     Counter<T, IdxT, AccT>* counter = counters + batchIdx;
     IdxT offset = batchIdx * len;
     IdxT bufOffset = batchIdx * calcBufLen<T>(len);

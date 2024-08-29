@@ -32,8 +32,6 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/common/tllmException.h"
 
 #include "tensorrt_llm/executor/types.h"
@@ -77,7 +75,7 @@ private:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
-    static const uint64_t mMaxSeed{64};
+    static uint64_t const mMaxSeed{64};
     runtime::SizeType32 const mBatchSize{6};
     runtime::SizeType32 const mMaxBatchSize{2 * mBatchSize};
     runtime::SizeType32 const mBeamWidth{1};
@@ -134,12 +132,10 @@ private:
     TensorPtr mNextDraftTokensDevice;
     TensorPtr mTokensPerStepDevice;
 
-    std::vector<tensorrt_llm::common::Tensor> mLogitsVec;
+    std::vector<TensorPtr> mLogitsVec;
 
-    // Order is important because we pass mAllocator to mDecodeLayer and it is used in destructor
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::common::CudaAllocator> mAllocator;
     std::unique_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDecodeLayer;
 
     std::vector<T> mTestLogitsInit;

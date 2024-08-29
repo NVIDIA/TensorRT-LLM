@@ -136,7 +136,7 @@ def parse_input(tokenizer,
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
 
-    if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+    if 'GLM' in model_name and model_version == 'glm':
         for ids in batch_input_ids:
             ids.append(tokenizer.sop_token_id)
 
@@ -261,6 +261,7 @@ def main(args):
 
         if runtime_rank == 0:
             logger.debug(f"====== Example {i} ======")
+            logger.debug(f"input_lengths: {input_lengths}")
             logger.debug(f"input_text: {input_text}")
             logger.debug(f"answer: {get_answer(eg, data_name)}")
         outputs = runner.generate(
@@ -305,6 +306,7 @@ def main(args):
                 "id": i,
                 "prediction": output_beams_list[0][0],
                 "ground_truth": get_answer(eg, data_name),
+                "input_lengths": input_lengths,
             })
             if output_path is not None:
                 dump_jsonl(preds, output_path)

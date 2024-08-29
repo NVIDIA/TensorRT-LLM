@@ -16,21 +16,9 @@
 #
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
 
 # Exclude files in nvrtcWrapper folder.
 list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/src.*")
-
-# skip mmha 48, 80, 96, 112, 144, 160, 192 and 224 for fast build
-if(FAST_BUILD)
-  list(
-    FILTER
-    SRC_CU
-    EXCLUDE
-    REGEX
-    "instantiation/decoderMaskedMultiheadAttention(48|80|96|112|144|160|192|224).*cu$"
-  )
-endif()
 
 filter_cuda_archs("70" SRC_CPP)
 filter_cuda_archs("80" SRC_CPP)
@@ -38,7 +26,49 @@ filter_cuda_archs("86" SRC_CPP)
 filter_cuda_archs("89" SRC_CPP)
 filter_cuda_archs("90" SRC_CPP)
 
-add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
+set(basic_heads 32 64 128)
+foreach(HEAD ${basic_heads})
+  file(GLOB_RECURSE HEAD_SRCS
+       instantiation/decoderMaskedMultiheadAttention${HEAD}*.cu)
+  list(APPEND SRC_CU ${HEAD_SRCS})
+endforeach()
+
+# skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
+if(FAST_BUILD)
+  set(extra_heads 256)
+else()
+  set(extra_heads
+      48
+      80
+      96
+      104
+      112
+      144
+      160
+      192
+      224
+      256)
+endif()
+
+foreach(HEAD ${extra_heads})
+  file(GLOB_RECURSE HEAD_SRCS
+       instantiation/decoderMaskedMultiheadAttention${HEAD}*.cu)
+  list(APPEND SRC_CU_EXTRA ${HEAD_SRCS})
+endforeach()
+
+if(NOT WIN32)
+  add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
+
+  # Split some sources to shared library for Linux
+  add_library(${DECODER_SHARED_TARGET} SHARED ${SRC_CU_EXTRA})
+  set_property(TARGET ${DECODER_SHARED_TARGET}
+               PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET ${DECODER_SHARED_TARGET}
+               PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+else()
+  add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU} ${SRC_CU_EXTRA})
+endif()
+
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)

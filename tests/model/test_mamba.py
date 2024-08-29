@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 from parameterized import parameterized
-from transformers import AutoModelForCausalLM, MambaConfig
+from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -63,9 +63,11 @@ class TestMamba(unittest.TestCase):
             'hidden_act': 'silu',
             'num_attention_heads': 1,
             'rnn_hidden_size': hf_config.intermediate_size,
+            'rnn_conv_dim_size': hf_config.intermediate_size,
             'state_size': hf_config.state_size,
             'conv_kernel': hf_config.conv_kernel,
             'use_bias': hf_config.use_bias,
+            'mamba_version': 'Mamba1',
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         if load_mode == 'from_checkpoint':
@@ -154,6 +156,8 @@ class TestMamba(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_mamba(self, gemm_plugin, mamba_conv1d_plugin, dtype,
                    remove_padding):
+        from transformers import MambaConfig
+
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -217,7 +221,12 @@ class TestMamba(unittest.TestCase):
                     # gen
                     part_step1_id = step1_id[i].view(1, 1)
                     part_hf_gen_outputs = hf_mamba.forward(
-                        part_step1_id, cache_params=part_cache_params)
+                        part_step1_id,
+                        cache_params=part_cache_params,
+                        cache_position=torch.arange(
+                            hf_config.conv_kernel - 1,
+                            hf_config.conv_kernel,
+                            device=part_step1_id.device))
                     torch.cuda.synchronize()
                     gen_ref[i][:] = part_hf_gen_outputs.logits[0, -1, :]
             else:
@@ -229,7 +238,11 @@ class TestMamba(unittest.TestCase):
                 # gen
                 hf_outputs = hf_mamba.forward(step1_id,
                                               cache_params=cache_params,
-                                              use_cache=True)
+                                              use_cache=True,
+                                              cache_position=torch.arange(
+                                                  hf_config.conv_kernel - 1,
+                                                  hf_config.conv_kernel,
+                                                  device=step1_id.device))
                 gen_ref = hf_outputs.logits[:, -1, :]
 
         # get tensorrt llm mamba rumtime
@@ -349,6 +362,7 @@ class TestMamba(unittest.TestCase):
     ],
                           name_func=unittest_name_func)
     def test_loaders(self, path, load_mode):
+        from transformers import MambaConfig
         model_root = llm_models_root()
         if model_root is None:
             pytest.skip('Skipping since real weights are unavailable.')

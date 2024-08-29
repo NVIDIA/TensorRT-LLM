@@ -11,21 +11,113 @@ The detailed LLM quantization recipe is distributed to the README.md of the corr
 
 ## Installation
 
-1. If the dev environment is a docker container, please launch the docker with the following flags
+The NVIDIA TensorRT Model Optimizer quantization toolkit is installed automatically as a dependency of TensorRT-LLM.
 
 ```bash
-docker run --gpus all --ipc=host --ulimit memlock=-1 --shm-size=20g -it <the docker image with TensorRT-LLM installed> bash
-```
-
-2. Install the quantization toolkit `modelopt` and the related dependencies on top of the TensorRT-LLM installation or docker file.
-
-```bash
-# Install Modelopt
-pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-modelopt==0.9.3
 # Install the additional requirements
-cd <this example folder>
+cd examples/quantization
 pip install -r requirements.txt
 ```
+
+## Usage
+
+```bash
+# FP8 quantization.
+python quantize.py --model_dir $MODEL_PATH --qformat fp8 --kv_cache_dtype fp8 --output_dir $OUTPUT_PATH
+
+# INT4_AWQ tp4 quantization.
+python quantize.py --model_dir $MODEL_PATH --qformat int4_awq --awq_block_size 64 --tp_size 4 --output_dir $OUTPUT_PATH
+
+# INT8 SQ with INT8 kv cache.
+python quantize.py --model_dir $MODEL_PATH --qformat int8_sq --kv_cache_dtype int8 --output_dir $OUTPUT_PATH
+
+# FP8 quantization for NeMo model.
+python quantize.py --nemo_ckpt_path nemotron-3-8b-base-4k/Nemotron-3-8B-Base-4k.nemo \
+                   --dtype bfloat16 \
+                   --batch_size 64 \
+                   --qformat fp8 \
+                   --output_dir nemotron-3-8b/trt_ckpt/fp8/1-gpu
+
+# FP8 quantization for Medusa model.
+python quantize.py --model_dir $MODEL_PATH\
+                   --dtype float16 \
+                   --qformat fp8 \
+                   --kv_cache_dtype fp8 \
+                   --output_dir $OUTPUT_PATH \
+                   --calib_size 512 \
+                   --tp_size 1 \
+                   --medusa_model_dir /path/to/medusa_head/ \
+                   --num_medusa_heads 4
+```
+Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
+
+### Quantization Arguments:
+
+- model_dir: Hugging Face model path.
+- qformat: Specify the quantization algorithm applied to the checkpoint.
+    - fp8: Weights are quantized to FP8 tensor wise. Activation ranges are calibrated tensor wise.
+    - int8_sq: Weights are smoothed and quantized to INT8 channel wise. Activation ranges are calibrated tensor wise.
+    - int4_awq: Weights are re-scaled and block-wise quantized to INT4. Block size is specified by `awq_block_size`.
+    - w4a8_awq: Weights are re-scaled and block-wise quantized to INT4. Block size is specified by `awq_block_size`. Activation ranges are calibrated tensor wise.
+    - int8_wo: Actually nothing is applied to weights. Weights are quantized to INT8 channel wise when TRTLLM building the engine.
+    - int4_wo: Same as int8_wo but in INT4.
+    - full_prec: No quantization.
+- output_dir Path to save the quantized checkpoint.
+- dtype: Specify data type of model when loading from Hugging Face.
+- kv_cache_dtype: Specify kv cache data type.
+    - int8: Use int8 kv cache.
+    - fp8: Use FP8 kv cache.
+    - None (default): Use kv cache as model dtype.
+- batch_size: Batch size for calibration. Default is 1.
+- calib_size: Number of samples. Default is 512.
+- calib_max_seq_length: Max sequence length of calibration samples. Default is 512.
+- tp_size: Checkpoint is tensor paralleled by tp_size. Default is 1.
+- pp_size: Checkpoint is pipeline paralleled by pp_size. Default is 1.
+- awq_block_size: AWQ algorithm specific parameter. Indicate the block size when quantizing weights. 64 and 128 are supported by TRTLLM.
+
+#### NeMo model specific arguments:
+
+- nemo_ckpt_path: NeMo checkpoint path.
+- calib_tp_size: TP size for NeMo checkpoint calibration.
+- calib_pp_size: PP size for NeMo checkpoint calibration.
+
+#### Medusa specific arguments:
+
+- medusa_model_dir: Model path of medusa.
+- quant_medusa_head: Whether to quantize the weights of medusa heads.
+- num_medusa_heads: Number of medusa heads.
+- num_medusa_layers: Number of medusa layers.
+- max_draft_len: Max length of draft.
+- medusa_hidden_act: Activation function of medusa.
+
+### Building Arguments:
+
+There are several arguments for building stage which related to quantizaion.
+- use_fp8_context_fmha: This is Hopper-only feature. Use FP8 Gemm to calculate the attention operation.
+
+```python
+qkv scale = 1.0
+FP_O = quantize(softmax(FP8_Q * FP8_K), scale=1.0) * FP8_V
+FP_O * output_scale = FP8_O
+```
+
+### Checkpoint Conversion Arguments (not supported by all models)
+
+- FP8
+    - use_fp8_rowwise: Enable FP8 per-token per-channel quantization for linear layer. (FP8 from `quantize.py` is per-tensor).
+- INT8
+    - smoothquant: Enable INT8 quantization for linear layer. Set the α parameter (see https://arxiv.org/pdf/2211.10438.pdf) to Smoothquant the model, and output int8 weights. A good first try is 0.5. Must be in [0, 1].
+    - per_channel: Using per-channel quantization for weight when `smoothquant` is enabled.
+    - per_token: Using per-token quantization for activation when `smoothquant` is enabled.
+- Weight-Only
+    - use_weight_only: Weights are quantized to INT4 or INT8 channel wise.
+    - weight_only_precision: Indicate `int4` or `int8` when `use_weight_only` is enabled. Or `int4_gptq` when `quant_ckpt_path` is provided which means checkpoint is for GPTQ.
+    - quant_ckpt_path: Path of a GPTQ quantized model checkpoint in `.safetensors` format.
+    - group_size: Group size used in GPTQ quantization.
+    - per_group: Should be enabled when load from GPTQ.
+- KV Cache
+    - int8_kv_cache: By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV cache.
+    - fp8_kv_cache: By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV cache.
 
 ## APIs
 

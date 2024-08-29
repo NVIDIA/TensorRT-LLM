@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/allocator.h"
-#include "tensorrt_llm/common/cudaAllocator.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -32,20 +30,13 @@ class BaseLayer
 public:
     using SizeType32 = runtime::SizeType32;
     using TokenIdType = runtime::TokenIdType;
+    using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
+    using BufferPtr = runtime::IBuffer::SharedPtr;
+    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
-    BaseLayer(DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator)
-        : mBufferManager(nullptr)
-        , mStream(stream)
-        , mAllocator(std::move(allocator))
-        , mDecoderDomain(std::move(decoderDomain))
-    {
-    }
-
-    BaseLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> const& bufferManager)
+    BaseLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager)
         : mBufferManager(bufferManager)
-        , mStream(mBufferManager->getStream().get())
-        , mAllocator(std::make_shared<tensorrt_llm::common::CudaAllocator>(*mBufferManager))
         , mDecoderDomain(decoderDomain)
     {
     }
@@ -55,26 +46,14 @@ public:
     //! @returns cuda stream associated with layer
     [[nodiscard]] cudaStream_t getStream() const noexcept
     {
-        return mStream;
-    }
-
-    //! @brief set stream to the layer
-    void setStream(cudaStream_t stream) noexcept
-    {
-        mStream = stream;
+        return mBufferManager->getStream().get();
     }
 
     //! @returns workspace needed for this layer in bytes
-    [[nodiscard]] size_t getWorkspaceSize() const noexcept
+    [[nodiscard]] virtual size_t getWorkspaceSize() const noexcept
     {
-        return mWorkspaceSize;
-    }
-
-    //! @returns size of memory allocated by layer in bytes
-    [[nodiscard]] size_t getAllocatedSize() const noexcept
-    {
-        return mAllocatedSize;
-    }
+        return 0;
+    };
 
     // clang-format off
     //! \brief Virtual function to setup internal states of the layer with sampling params
@@ -84,11 +63,11 @@ public:
     //!
     //! \param batchSize current batch size configured in the system
     //! \param beamWidth current beam width configured in the system
-    //! \param batchSlots input tensor [maxBatchSize], address map of the new requests, in pinned memory
+    //! \param batchSlots input buffer [maxBatchSize], address map of the new requests, in pinned memory
     //! \param setupParams shared pointer to params inherited from BaseSetupParams
     // clang-format on
-    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
-        runtime::SizeType32 const* batchSlots, std::shared_ptr<BaseSetupParams> const& setupParams)
+    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams)
         = 0;
 
     // clang-format off
@@ -118,21 +97,9 @@ public:
 protected:
     // Buffer Manager
     std::shared_ptr<runtime::BufferManager> mBufferManager;
-    // Cuda stream
-    cudaStream_t mStream;
-    // Memory allocator
-    std::shared_ptr<tensorrt_llm::common::IAllocator> mAllocator;
-
-    // Required workspace size in bytes
-    size_t mWorkspaceSize{0};
-    // Allocated memory size in bytes
-    size_t mAllocatedSize{0};
 
     // Domain in which token decoding is computed
     DecoderDomain mDecoderDomain;
-
-    // TODO to be deprecated
-    bool mIsAllocateBuffer{false};
 };
 
 } // namespace tensorrt_llm::layers

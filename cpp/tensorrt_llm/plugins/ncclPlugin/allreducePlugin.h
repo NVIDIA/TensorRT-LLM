@@ -16,7 +16,6 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
@@ -84,7 +83,6 @@ private:
     kernels::AllReduceStrategyConfig mConfig;
     kernels::AllReduceFusionOp mOp;
     float mEps;
-    int32_t mCounter;
     std::shared_ptr<ncclComm_t> mNcclComm;
     int8_t mAffine;
     int8_t mBias;

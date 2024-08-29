@@ -43,7 +43,9 @@ public:
         executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
         std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
         std::optional<SizeType32> maxNumTokens = std::nullopt,
-        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{})
+        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{},
+        executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
+        = executor::ExtendedRuntimePerfKnobConfig{})
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
@@ -56,6 +58,7 @@ public:
         , maxBatchSize(maxBatchSize)
         , maxNumTokens(maxNumTokens)
         , schedulerConfig{schedulerConfig}
+        , extendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
     {
     }
 
@@ -66,7 +69,8 @@ public:
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
-            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig())
+            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
+            executorConfig.getExtendedRuntimePerfKnobConfig())
     {
     }
 
@@ -74,7 +78,9 @@ public:
     {
         return kvCacheConfig == other.kvCacheConfig && enableTrtOverlap == other.enableTrtOverlap
             && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
-            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig;
+            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig
+            && gpuWeightsPercent == other.gpuWeightsPercent
+            && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig;
     }
 
     friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
@@ -93,6 +99,7 @@ public:
     std::optional<SizeType32> maxBatchSize;
     std::optional<SizeType32> maxNumTokens;
     executor::SchedulerConfig schedulerConfig;
+    executor::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig;
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -76,7 +76,8 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
         if (modelConfig.computeGenerationLogits())
         {
             cacheGenerationFragmentPointerDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT64);
-            cacheGenerationFragmentPointerHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT64);
+            cacheGenerationFragmentPointerHost
+                = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT64);
 
             generationLogitsFragments = std::make_shared<std::vector<TensorPtr>>();
         }
@@ -87,7 +88,7 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
     bool transformerBased = modelConfig.isTransformerBased();
     bool rnnBased = modelConfig.isRnnBased();
 
-    contextLengthsHost = manager.emptyTensor(MemoryType::kPINNED, nvinfer1::DataType::kINT32);
+    contextLengthsHost = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     if (transformerBased)
     {
         if (modelConfig.useGptAttentionPlugin())
@@ -350,7 +351,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
         //// Note: reqPromptLenghts won't be used
         std::vector<SizeType32> reqPromptLengths;
         // Copy the generationInput tasks to host
-        promptTuningTasksHost = manager.copyFrom(*promptTuningParams.tasks, MemoryType::kPINNED);
+        promptTuningTasksHost = manager.copyFrom(*promptTuningParams.tasks, MemoryType::kPINNEDPOOL);
         // Update the promptTuningParams tasks tensor
         promptTuningParams.fillTasksTensor(promptTuningTasksHost, batchSize, 0, reqBeamWidths, reqPromptLengths,
             manager, modelConfig.usePackedInput());
@@ -451,7 +452,7 @@ void RuntimeBuffers::getRuntimeBuffers(TensorMap& inputBuffers, TensorMap& outpu
         rnnStateBuffers->getRuntimeBuffers(this, inputBuffers, outputBuffers, step, inputIds, modelConfig, worldConfig);
     }
 
-    if (modelConfig.useCustomAllReduce() && worldConfig.isTensorParallel())
+    if (worldConfig.isTensorParallel())
     {
         inputBuffers.insert_or_assign("all_reduce_workspace", commPtrs);
     }

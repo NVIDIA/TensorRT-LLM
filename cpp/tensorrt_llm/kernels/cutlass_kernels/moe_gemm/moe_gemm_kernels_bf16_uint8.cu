@@ -19,6 +19,6 @@
 namespace tensorrt_llm
 {
 #ifdef ENABLE_BF16
-template class MoeGemmRunner<__nv_bfloat16, uint8_t>;
+template class MoeGemmRunner<__nv_bfloat16, uint8_t, __nv_bfloat16>;
 #endif
 } // namespace tensorrt_llm

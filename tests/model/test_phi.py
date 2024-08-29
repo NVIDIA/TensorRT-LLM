@@ -30,7 +30,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
-from tensorrt_llm.models.phi.convert import convert_hf_weights
+from tensorrt_llm.models.phi.convert import load_weights_from_hf_model
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -66,7 +66,8 @@ class TestPhi(unittest.TestCase):
             'dtype': dtype,
             'num_hidden_layers': hf_config.num_hidden_layers,
             'num_attention_heads': hf_config.num_key_value_heads,
-            'partial_rotary_factor': hf_config.partial_rotary_factor,
+            'rotary_pct': hf_config.partial_rotary_factor,
+            'position_embedding_type': 'rope_gpt_neox',
             'rope_theta': hf_config.rope_theta,
             'hidden_size': hf_config.hidden_size,
             'intermediate_size': hf_config.intermediate_size,
@@ -84,7 +85,7 @@ class TestPhi(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_weights(hf_model, dtype=dtype)
+        weights = load_weights_from_hf_model(hf_model, config)
         trtllm_model = tensorrt_llm.models.PhiForCausalLM(config)
         trtllm_model.load(weights)
 
@@ -253,6 +254,13 @@ class TestPhi(unittest.TestCase):
                        dtype=torch.int32,
                        device='cuda')
         ]  # ping-pong buffers
+
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
         ctx_buffer = {
             'input_ids': ctx_ids,
             'context_lengths': ctx_context_lengths,
@@ -260,6 +268,7 @@ class TestPhi(unittest.TestCase):
             'position_ids': ctx_position_ids,
             'last_token_ids': ctx_last_token_ids,
             'cache_indirection': cache_indirections[0],
+            'host_runtime_perf_knobs': context_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -320,6 +329,11 @@ class TestPhi(unittest.TestCase):
                 gen_context_lengths).int().cuda()
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
 
+        gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                              dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
         step1_buffer = {
             'input_ids': step1_id,
             'context_lengths': gen_context_lengths,
@@ -327,6 +341,7 @@ class TestPhi(unittest.TestCase):
             'position_ids': gen_position_ids,
             'last_token_ids': gen_last_token_ids,
             'cache_indirection': cache_indirections[1],
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

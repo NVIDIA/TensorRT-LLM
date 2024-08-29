@@ -178,7 +178,7 @@ def test_ModelLoader():
     temp_dir = tempfile.TemporaryDirectory()
 
     def build_engine():
-        model_loader = ModelLoader(args, tokenizer=tokenizer)
+        model_loader = ModelLoader(args)
         engine_dir = model_loader(engine_dir=Path(temp_dir.name))
         assert engine_dir
         return engine_dir
@@ -188,7 +188,7 @@ def test_ModelLoader():
     args.setup()
     assert args.model_format is _ModelFormatKind.TLLM_ENGINE
     print(f'engine_dir: {args.model}')
-    model_loader = ModelLoader(args, tokenizer=tokenizer)
+    model_loader = ModelLoader(args)
     engine_dir = model_loader()
     assert engine_dir == args.model
 
@@ -199,7 +199,7 @@ def test_CachedModelLoader():
     args.enable_build_cache = True
     args.setup()
     stats = LlmBuildStats()
-    model_loader = CachedModelLoader(args, stats)
+    model_loader = CachedModelLoader(args, llm_build_stats=stats)
     engine_dir = model_loader()
     assert engine_dir
     assert engine_dir.exists() and engine_dir.is_dir()

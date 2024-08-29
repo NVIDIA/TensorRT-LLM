@@ -226,17 +226,15 @@ TEST(MPIUtils, SessionCommunicator)
     auto sessionRank = rank % sessionSize;
     auto& session = mpi::MpiComm::session();
     EXPECT_EQ(session, world);
-    session = world.split(sessionColor, sessionRank);
-    EXPECT_EQ(session, mpi::MpiComm::session());
-    EXPECT_NE(session, world);
-    EXPECT_EQ(session.getRank(), sessionRank);
-    EXPECT_LE(sessionSize - 1, session.getSize());
-    EXPECT_LE(session.getSize(), sessionSize);
+    auto session1 = world.split(sessionColor, sessionRank);
+    EXPECT_NE(session1, world);
+    EXPECT_EQ(session1.getRank(), sessionRank);
+    EXPECT_LE(sessionSize - 1, session1.getSize());
+    EXPECT_LE(session1.getSize(), sessionSize);
 
-    session = session.split(sessionRank, 0);
-    EXPECT_EQ(session, mpi::MpiComm::session());
-    EXPECT_EQ(session.getRank(), 0);
-    EXPECT_EQ(session.getSize(), 1);
+    auto session2 = session1.split(sessionRank, 0);
+    EXPECT_EQ(session2.getRank(), 0);
+    EXPECT_EQ(session2.getSize(), 1);
 }
 
 TEST(MPIUtils, VectorBcastEmpty)

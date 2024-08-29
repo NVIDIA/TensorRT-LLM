@@ -681,7 +681,7 @@ if __name__ == '__main__':
     args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
                                 args.moe_renorm_mode).validate()
     config = {
-        'architecture': 'DbrxForCausalLM',
+        'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
         'logits_dtype': args.logits_dtype,
         'vocab_size': args.vocab_size,

@@ -57,18 +57,19 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         return false;
     }
-    if (!forConfigurePlugin && xqaParams.host_past_key_value_lengths == nullptr)
+    if (xqaParams.num_kv_heads != 0 && xqaParams.num_q_heads % xqaParams.num_kv_heads != 0)
     {
         return false;
     }
-    if (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads)
+    bool is_vanilla_mha = xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads;
+    if (is_vanilla_mha && xqaParams.beam_width == 1)
     {
-        // Do not use XQA kernel for MHA.
+        // Do not use XQA kernel for vanilla MHA case for performance reasons.
         return false;
     }
-    if (xqaParams.multi_block_mode)
+    if (is_vanilla_mha && xqaParams.head_size <= 128)
     {
-        // TODO(minwei): Re-enable multi_block_mode once we figure out the issue.
+        // TODO(yaoy): remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
         return false;
     }
     if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,
@@ -76,6 +77,23 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
             xqaParams.position_embedding_type))
     {
         return false;
+    }
+    if (!forConfigurePlugin)
+    {
+        // Inference time checks.
+        if (xqaParams.host_past_key_value_lengths == nullptr)
+        {
+            return false;
+        }
+        for (int i = 0; i < xqaParams.batch_size; ++i)
+        {
+            // Only checks for non-medusa case, because medusa may not accept all tokens in host_past_key_value_lengths.
+            if (!xqaParams.multi_query_tokens
+                && xqaParams.host_past_key_value_lengths[i] + 1 > xqaParams.max_attention_window_size)
+            {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -108,11 +126,7 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads % xqaParams.num_kv_heads != 0)
-    {
-        return false;
-    }
-    int32_t head_grp_size = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;
@@ -150,11 +164,7 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     {
         return false;
     }
-    if (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads % xqaParams.num_kv_heads != 0)
-    {
-        return false;
-    }
-    int32_t head_grp_size = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    int32_t head_grp_size = xqaParams.num_kv_heads == 0 ? 1 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
     if (head_grp_size * xqaParams.beam_width > 32)
     {
         return false;

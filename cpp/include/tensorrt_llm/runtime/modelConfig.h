@@ -40,10 +40,11 @@ public:
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
-        kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
-        kMamba = 2,          // https://github.com/state-spaces/mamba
-        kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
-        kEncDec = 4,
+        kChatGlm = 1,        // https://github.com/THUDM/ChatGLM-6B
+        kGlm = 2,            // https://github.com/THUDM/GLM
+        kMamba = 3,          // https://github.com/state-spaces/mamba
+        kRecurrentGemma = 4, // https://github.com/google-deepmind/recurrentgemma
+        kEncDec = 5,
     };
 
     struct RnnConfig
@@ -51,12 +52,20 @@ public:
         SizeType32 stateSize = 0;
         SizeType32 convKernel = 0;
         SizeType32 rnnHiddenSize = 0;
+        SizeType32 rnnHeadSize = 0;
+        SizeType32 rnnConvDimSize = 0;
     };
 
     enum class LayerType : std::int32_t
     {
         kATTENTION,
         kRECURRENT,
+    };
+
+    enum class ManageWeightsType : std::int32_t
+    {
+        kDisabled,
+        kEnabled,
     };
 
     explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbAttentionLayers, SizeType32 nbRnnLayers, SizeType32 nbHeads,
@@ -84,7 +93,6 @@ public:
         , mComputeContextLogits(false)
         , mComputeGenerationLogits(false)
         , mModelVariant(ModelVariant::kGpt)
-        , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
@@ -97,6 +105,7 @@ public:
         , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
         , mLogitsDtype(nvinfer1::DataType::kFLOAT)
         , mUseShapeInference(true)
+        , mManageWeightsType(ManageWeightsType::kDisabled)
     {
     }
 
@@ -351,16 +360,6 @@ public:
         mModelVariant = modelVariant;
     }
 
-    [[nodiscard]] bool constexpr useCustomAllReduce() const noexcept
-    {
-        return mUseCustomAllReduce;
-    }
-
-    void constexpr useCustomAllReduce(bool customAllReduce) noexcept
-    {
-        mUseCustomAllReduce = customAllReduce;
-    }
-
     [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
     {
         return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
@@ -524,7 +523,7 @@ public:
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
     {
         return mModelVariant == ModelVariant::kGpt || mModelVariant == ModelVariant::kGlm
-            || mModelVariant == ModelVariant::kRecurrentGemma;
+            || mModelVariant == ModelVariant::kChatGlm || mModelVariant == ModelVariant::kRecurrentGemma;
     }
 
     [[nodiscard]] bool hasRnnConfig() const noexcept
@@ -582,6 +581,16 @@ public:
         return mUseShapeInference;
     }
 
+    [[nodiscard]] ManageWeightsType getManageWeightsType() const noexcept
+    {
+        return mManageWeightsType;
+    }
+
+    void setManageWeightsType(const ManageWeightsType manageWeightType) noexcept
+    {
+        mManageWeightsType = manageWeightType;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbAttentionLayers;
@@ -607,7 +616,6 @@ private:
     bool mComputeContextLogits;
     bool mComputeGenerationLogits;
     ModelVariant mModelVariant;
-    bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
 
@@ -637,6 +645,7 @@ private:
     // Logits datatype
     nvinfer1::DataType mLogitsDtype;
     bool mUseShapeInference;
+    ManageWeightsType mManageWeightsType;
 };
 
 } // namespace tensorrt_llm::runtime

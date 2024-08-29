@@ -144,7 +144,8 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
 }
 
 //! \brief Create new tensor from numpy file.
-[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager& manager, std::string const& npyFile, const MemoryType where)
+[[nodiscard]] ITensor::UniquePtr loadNpy(
+    BufferManager const& manager, std::string const& npyFile, const MemoryType where)
 {
     FILE* f_ptr = fopen(npyFile.c_str(), "rb");
     if (f_ptr == nullptr)
@@ -162,7 +163,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     dims.nbDims = shape.size();
     std::copy(shape.begin(), shape.end(), dims.d);
 
-    auto readWhere = where == MemoryType::kGPU ? MemoryType::kPINNED : where;
+    auto readWhere = where == MemoryType::kGPU ? MemoryType::kPINNEDPOOL : where;
     auto tensor = manager.allocate(readWhere, dims, type);
     auto data = tensor->data();
     auto eltSize = BufferDataType(tensor->getDataType()).getSize();
@@ -180,7 +181,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     return tensor;
 }
 
-void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& filename)
+void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename)
 {
     // Save tensor to NPY 1.0 format (see https://numpy.org/neps/nep-0001-npy-format.html)
     auto const tensorSize = tensor.getSize();
@@ -203,7 +204,7 @@ void saveNpy(BufferManager& manager, ITensor const& tensor, std::string const& f
 
     if (where == MemoryType::kGPU)
     {
-        auto tensorHost = manager.copyFrom(tensor, MemoryType::kPINNED);
+        auto tensorHost = manager.copyFrom(tensor, MemoryType::kPINNEDPOOL);
         manager.getStream().synchronize();
         saveNpy(manager, *tensorHost, filename);
         return;

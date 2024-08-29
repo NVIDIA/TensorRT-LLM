@@ -248,7 +248,6 @@ struct GemmFpAIntB
     GemmFpAIntB() {}
 
     /// Determines whether kernel satisfies alignment
-    CUTLASS_HOST_DEVICE
     static Status can_implement(Arguments const& args)
     {
         static int const kAlignmentA

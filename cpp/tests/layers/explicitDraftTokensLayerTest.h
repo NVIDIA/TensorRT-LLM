@@ -15,20 +15,13 @@
  */
 #pragma once
 
-#include <gtest/gtest.h>
-
-#include <memory>
-
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#include "tensorrt_llm/runtime/runtimeKernels.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
+#include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
-#include "tensorrt_llm/common/tllmException.h"
+#include <memory>
 
 namespace tensorrt_llm::tests::layers
 {
@@ -273,6 +266,7 @@ private:
     TensorPtr mOutputDraftProbs;
     TensorPtr mOutputTemperatures;
     TensorPtr mOutputGenerationLengths;
+    TensorPtr mOutputGenerationLengthsHost;
     TensorPtr mMaxGenLengthHost;
 
     // inputs
@@ -316,7 +310,6 @@ private:
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::common::CudaAllocator> mAllocator;
     std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<T>> mExplicitDraftTokensLayer;
 
     ExplicitDraftTokensDummyNetwork mNetwork;
@@ -341,6 +334,6 @@ public:
         DraftLettersVec const& nextDraftLetters, DraftLettersVec const& lastDraftLetters, SamplingParams& params);
 };
 
-typedef testing::Types<float, half> FloatAndHalfTypes;
+using FloatAndHalfTypes = testing::Types<float, half>;
 
 } // namespace tensorrt_llm::tests::layers

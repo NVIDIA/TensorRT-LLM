@@ -16,10 +16,8 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
 class LlmServer:
 
-    def __init__(self, llm: LLM, sampling_params: SamplingParams,
-                 kv_cache_config: KvCacheConfig):
+    def __init__(self, llm: LLM, kv_cache_config: KvCacheConfig):
         self.llm = llm
-        self.sampling_params = sampling_params
         self.kv_cache_config = kv_cache_config
 
         self.app = FastAPI()
@@ -49,7 +47,6 @@ class LlmServer:
 
         prompt = request_dict.pop("prompt", "")
         streaming = request_dict.pop("streaming", False)
-        assert not request_dict, f"Unexpected fields in request: {request_dict}"
 
         sampling_params = SamplingParams(**request_dict)
 
@@ -79,15 +76,19 @@ class LlmServer:
 
 @click.command()
 @click.argument("model_dir")
+@click.option("--tokenizer", type=str, default=None)
 @click.option("--host", type=str, default=None)
 @click.option("--port", type=int, default=8000)
 @click.option("--max_beam_width", type=int, default=1)
 @click.option("--tp_size", type=int, default=1)
+@click.option("--pp_size", type=int, default=1)
 def entrypoint(model_dir: str,
+               tokenizer: Optional[str] = None,
                host: Optional[str] = None,
                port: int = 8000,
                max_beam_width: int = 1,
-               tp_size: int = 1):
+               tp_size: int = 1,
+               pp_size: int = 1):
     host = host or "0.0.0.0"
     port = port or 8000
     logging.info(f"Starting server at {host}:{port}")
@@ -95,15 +96,14 @@ def entrypoint(model_dir: str,
     build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
 
     llm = LLM(model_dir,
+              tokenizer,
               tensor_parallel_size=tp_size,
+              pipeline_parallel_size=pp_size,
               build_config=build_config)
 
-    sampling_params = SamplingParams(max_new_tokens=1024)
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
 
-    server = LlmServer(llm=llm,
-                       sampling_params=sampling_params,
-                       kv_cache_config=kv_cache_config)
+    server = LlmServer(llm=llm, kv_cache_config=kv_cache_config)
 
     asyncio.run(server(host, port))
 

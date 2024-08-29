@@ -82,7 +82,7 @@ void testRoundTrip(BufferManager& manager)
         inputCpu[i] = convertType<T>(i);
     }
     auto inputGpu = manager.copyFrom(inputCpu, MemoryType::kGPU);
-    auto outputCpu = manager.copyFrom(*inputGpu, MemoryType::kPINNED);
+    auto outputCpu = manager.copyFrom(*inputGpu, MemoryType::kPINNEDPOOL);
     EXPECT_EQ(inputCpu.size(), outputCpu->getSize());
     manager.getStream().synchronize();
     auto outputCpuTyped = bufferCast<T>(*outputCpu);

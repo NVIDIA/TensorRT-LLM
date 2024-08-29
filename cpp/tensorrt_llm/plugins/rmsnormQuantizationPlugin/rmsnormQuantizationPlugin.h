@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include <cassert>
 #include <set>
@@ -28,7 +29,8 @@ namespace tensorrt_llm::plugins
 class RmsnormQuantizationPlugin : public BasePlugin
 {
 public:
-    RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, nvinfer1::DataType type);
+    RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, bool clampValEnabled,
+        tensorrt_llm::common::QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType);
 
     RmsnormQuantizationPlugin(void const* data, size_t length);
 
@@ -46,6 +48,11 @@ public:
         nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept override;
     int enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
+
+    template <typename T, typename QuantT>
+    void dispatchDataType(void* out, void const* input, void const* gamma, void const* beta, float const eps,
+        int const tokens, int const hidden_dim, cudaStream_t stream, void const* clampValPtr, void const* scale,
+        void* dynamic_scale, void* normed_output_quant) noexcept;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
@@ -66,7 +73,13 @@ private:
     bool mDynActScaling;
     nvinfer1::DataType mType;
 
-    const std::string mLayerName;
+    std::string const mLayerName;
+    // The quantized output data type.
+    nvinfer1::DataType mOutputType;
+    // Do we clamp the input tensor ?
+    bool mClampValEnabled;
+    // The quantization mode.
+    tensorrt_llm::common::QuantMode mQuantMode;
 };
 
 class RmsnormQuantizationPluginCreator : public BaseCreator

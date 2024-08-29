@@ -21,7 +21,6 @@ from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
-from ...plugin import init_all_reduce_helper
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig, QuantConfig)
 
@@ -132,7 +131,6 @@ class GrokModel(Module):
 
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
-        init_all_reduce_helper()
 
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():

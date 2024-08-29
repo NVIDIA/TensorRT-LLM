@@ -48,7 +48,7 @@ install_gcc_centos() {
   # https://gcc.gnu.org/gcc-9/changes.html
   GCC_VERSION="9.5.0"
   yum install -y gcc gcc-c++ file libtool make wget bzip2 bison yacc flex
-  wget https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz -O /tmp/gcc-${GCC_VERSION}.tar.gz
+  wget -q https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz -O /tmp/gcc-${GCC_VERSION}.tar.gz
   tar -xf /tmp/gcc-${GCC_VERSION}.tar.gz -C /tmp/ && cd /tmp/gcc-releases-gcc-${GCC_VERSION}
   ./contrib/download_prerequisites
   ./configure --disable-multilib --enable-languages=c,c++ --with-pi
@@ -58,6 +58,13 @@ install_gcc_centos() {
   yum clean all
 }
 
+init_centos_mirror() {
+  # Disable invalid mirrorlist.
+  sed -i -e 's/mirrorlist=/#mirrorlist=/g' /etc/yum.repos.d/CentOS-*
+  # Enable baseurl and replace "#baseurl=http://mirror.centos.org/centos/$releaseveer" with "baseurl=https://vault.centos.org/7.9.2009".
+  sed -E -i -e 's/#baseurl=http:\/\/mirror.centos.org\/centos\/(\$releasever|7)\/([[:alnum:]_-]*)\/\$basearch\//baseurl=https:\/\/vault.centos.org\/7.9.2009\/\2\/\$basearch\//g' /etc/yum.repos.d/CentOS-*
+}
+
 install_python_centos() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
@@ -65,6 +72,8 @@ install_python_centos() {
   PYTHON_ENV_FILE="/tmp/python${PYTHON_VERSION}_env"
   yum -y update
   yum -y install centos-release-scl-rh epel-release
+  init_centos_mirror
+  cat "/etc/yum.repos.d/CentOS-SCLo-scl-rh.repo"
   yum-builddep -y python3 && yum remove -y python3
   yum install -y wget yum-utils make gcc openssl11 openssl11-devel bzip2-devel libffi-devel zlib-devel
   ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
@@ -109,6 +118,7 @@ case "$ID" in
     init_ubuntu
     ;;
   centos)
+    init_centos_mirror
     install_python_centos "3.10.12"
     install_pyp_centos
     install_gcc_centos

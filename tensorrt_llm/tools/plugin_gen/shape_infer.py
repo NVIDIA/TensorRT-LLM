@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Tuple, Union
 
 from lark import Lark, Token, Tree
@@ -16,6 +17,7 @@ expr: value "+" value -> add
     | value "-" value -> sub
     | value "*" value -> mul
     | value "/" value -> div
+    | value "///" value -> cdiv
     | value
 
 shaped_tensor: name "[" value ("," value)* ("," "*")? "]" -> tensor
@@ -37,6 +39,11 @@ name: CNAME
 """.strip())
 
 
+class TargetType(Enum):
+    CONCRETE = 0  # to produce size_t
+    SYMBOLIC = 1  # to produce IDimensionExpr
+
+
 # Here we introduce a set of ASTs to represent the target's expression.
 # The Ast nodes from lark is not convenient to use.
 class _AST:
@@ -46,6 +53,7 @@ class _AST:
 @dataclass
 class NumberAST(_AST):
     value: int
+    target_type: TargetType = TargetType.CONCRETE
 
 
 @dataclass
@@ -53,6 +61,7 @@ class BinaryAST(_AST):
     op: str
     left: _AST
     right: _AST
+    target_type: TargetType = TargetType.CONCRETE
 
 
 @dataclass
@@ -102,25 +111,32 @@ class ToAst:
         assert left.data == "tensors"
         assert right.data == "tensors"
 
-        lefts = self.visit_tensors(left)
-        rights = self.visit_tensors(right)
+        lefts = self.visit_tensors(left, TargetType.SYMBOLIC)
+        rights = self.visit_tensors(right, TargetType.SYMBOLIC)
         return DeduceShapeRule(lefts, rights)
 
     def visit_DeduceDimSizeArg(self, left: Tree, expr: Tree,
                                right: Tree) -> DeduceDimSizeArgRule:
-        lefts = self.visit_tensors(left)
-        _expr = self.visit_expr(expr)
+        lefts = self.visit_tensors(left, TargetType.CONCRETE)
+        _expr = self.visit_expr(expr, TargetType.CONCRETE)
         rights = self.visit_name(right)
         return DeduceDimSizeArgRule(lefts, _expr, rights)
 
-    def visit_tensors(self, tree: Tree) -> List[ShapedTensorAST]:
+    def visit_tensors(self, tree: Tree,
+                      target_type: TargetType) -> List[ShapedTensorAST]:
         assert tree.data == "tensors", repr(tree)
-        return [self.visit_tensor(child) for child in tree.children]
+        return [
+            self.visit_tensor(child, target_type) for child in tree.children
+        ]
 
-    def visit_tensor(self, tree: Tree) -> ShapedTensorAST:
+    def visit_tensor(self, tree: Tree,
+                     target_type: TargetType) -> ShapedTensorAST:
         if tree.data == "tensor":
             arg_name = self.visit_name(tree.children[0])
-            dims = [self.visit_expr(child) for child in tree.children[1:]]
+            dims = [
+                self.visit_expr(child, target_type)
+                for child in tree.children[1:]
+            ]
             return ShapedTensorAST(arg_name, ShapeAST(dims))
 
         assert tree.data == "wildcard_tensor", repr(tree)
@@ -130,7 +146,7 @@ class ToAst:
     def visit_number(self, v: str) -> _AST:
         return NumberAST(int(v))
 
-    def visit_expr(self, tree: Tree) -> _AST:
+    def visit_expr(self, tree: Tree, target_type: TargetType) -> _AST:
         '''
         for expression of dims, like `m * 2 + 1`
         '''
@@ -138,7 +154,7 @@ class ToAst:
         def visit(tree: Union[Tree, Token]) -> _AST:
             if isinstance(tree, Token):
                 if tree.type == "SIGNED_NUMBER":
-                    return NumberAST(int(tree.value))
+                    return NumberAST(int(tree.value), target_type)
                 elif tree.type == "CNAME":
                     return DimAST(tree.value)
                 raise ValueError("Unexpected token: %s" % tree)
@@ -156,6 +172,8 @@ class ToAst:
                 else:
                     raise ValueError(f"Unexpected tree: {repr(tree)}")
 
+            # (add, sub, mul) have operator overloading for IDimensionExpr
+            # no need to do anything special
             elif tree.data == "add":
                 assert len(tree.children) == 2
                 return BinaryAST("+", visit(tree.children[0]),
@@ -171,7 +189,11 @@ class ToAst:
             elif tree.data == "div":
                 assert len(tree.children) == 2
                 return BinaryAST("/", visit(tree.children[0]),
-                                 visit(tree.children[1]))
+                                 visit(tree.children[1]), target_type)
+            elif tree.data == "cdiv":
+                assert len(tree.children) == 2
+                return BinaryAST("///", visit(tree.children[0]),
+                                 visit(tree.children[1]), target_type)
             else:
                 raise ValueError(f"Unexpected tree: {repr(tree)}")
 
@@ -304,7 +326,10 @@ class CppCodeTranspiler:
 
     def emit_expr(self, expr: _AST) -> str:
         if isinstance(expr, NumberAST):
-            return str(expr.value)
+            if expr.target_type == TargetType.SYMBOLIC:
+                return f"exprBuilder.constant({expr.value})"
+            else:
+                return str(expr.value)
         elif isinstance(expr, DimAST):
             return self.emit_dim(expr)
         elif isinstance(expr, BinaryAST):
@@ -319,4 +344,12 @@ class CppCodeTranspiler:
     def emit_binary(self, binary: BinaryAST) -> str:
         left = self.emit_expr(binary.left)
         right = self.emit_expr(binary.right)
-        return f"({left} {binary.op} {right})"
+        if binary.op == "/" and binary.target_type == TargetType.SYMBOLIC:
+            return f"exprBuilder.operation(nvinfer1::DimensionOperation::kFLOOR_DIV, *{left}, *{right})"
+        elif binary.op == "///":
+            if binary.target_type == TargetType.SYMBOLIC:
+                return f"exprBuilder.operation(nvinfer1::DimensionOperation::kCEIL_DIV, *{left}, *{right})"
+            else:
+                return f"(({left} + {right} - 1) / {right})"
+        else:
+            return f"({left} {binary.op} {right})"

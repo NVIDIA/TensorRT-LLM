@@ -9,6 +9,9 @@ from tensorrt_llm.tools.plugin_gen.shape_infer import *
     "a[m,n,k] -> b[m*n+k, 2*k, (3+1) * k]",
     "a[*] -> b[*]",
     "Q[m,n,k,*] : m -> batch_size",
+    "a[b, l, h] -> b[b, h, l /// 256, 256]",
+    "a[b, l, h] -> b[b, h, l /// 256, headsize]",
+    "b[b, l, h]: l -> seqlen",
 ])
 def test_ToAst(expr: str):
     ast = parser.parse(expr)

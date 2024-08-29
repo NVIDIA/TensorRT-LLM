@@ -12,18 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import Optional, Union
 
 from transformers import AutoModelForCausalLM
 
 from ..._utils import pad_vocab_size
-from ...functional import PositionEmbeddingType, Tensor
-from ...layers import (MLP, Attention, AttentionMaskType, Embedding, LayerNorm,
-                       ParallelLMHead)
+from ...functional import Tensor
+from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, LayerNorm)
+from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig, save_checkpoint)
-from .convert import convert_hf_config, convert_hf_weights
+                              PretrainedConfig, QuantConfig)
+from .config import PhiConfig
+from .convert import load_weights_from_hf_model
 
 
 class PhiDecoderLayer(Module):
@@ -44,8 +46,8 @@ class PhiDecoderLayer(Module):
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
-            rotary_embedding_percentage=config.partial_rotary_factor,
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            rotary_embedding_percentage=config.rotary_pct,
+            position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
@@ -140,6 +142,9 @@ class PhiModel(Module):
 
 
 class PhiForCausalLM(DecoderModelForCausalLM):
+    config_class = PhiConfig
+
+    config_class = PhiConfig
 
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
@@ -147,13 +152,13 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        lm_head = ParallelLMHead(config.hidden_size,
-                                 vocab_size_padded,
-                                 bias=True,
-                                 dtype=config.dtype,
-                                 tp_group=config.mapping.tp_group,
-                                 tp_size=config.mapping.tp_size,
-                                 gather_output=True)
+        lm_head = ColumnLinear(config.hidden_size,
+                               vocab_size_padded,
+                               bias=True,
+                               dtype=config.dtype,
+                               tp_group=config.mapping.tp_group,
+                               tp_size=config.mapping.tp_size,
+                               gather_output=True)
 
         super().__init__(config, transformer, lm_head)
 
@@ -162,21 +167,37 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         config.set_if_not_exist('rotary_base', 10000.0)
 
     @classmethod
-    def convert_hf_checkpoint(cls,
-                              hf_model_dir: str,
-                              dtype: Optional[str] = "float16",
-                              output_dir: Optional[str] = None,
-                              args=None):
-        '''
-        Convert Huggingface checkpoint to TRT-LLM checkpoint
-        '''
-        hf_model = AutoModelForCausalLM.from_pretrained(hf_model_dir,
-                                                        torch_dtype="auto",
-                                                        trust_remote_code=True)
-        config = convert_hf_config(hf_model.config, dtype, args)
-        weights = convert_hf_weights(hf_model, dtype, args)
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        import transformers
 
-        if output_dir:
-            save_checkpoint(output_dir, config=config, weights=weights)
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+        config = PhiConfig.from_hugging_face(hf_config_or_dir,
+                                             dtype=dtype,
+                                             mapping=mapping,
+                                             quant_config=quant_config,
+                                             **kwargs)
+        if not use_preloading:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
 
-        return {"weights": weights, "config": config}
+        assert isinstance(hf_model, transformers.PreTrainedModel)
+
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        model = cls(config)
+        model.load(weights)
+        return model

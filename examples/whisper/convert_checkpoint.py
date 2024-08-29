@@ -178,6 +178,14 @@ def convert_openai_whisper_encoder(
         model_params['encoder.conv2.weight'], -1).contiguous()
     weights['conv2.bias'] = model_params['encoder.conv2.bias'].contiguous()
 
+    # Encoder conv needs to run in fp32 on Volta/Turing
+    major, minor = torch.cuda.get_device_capability()
+    if not major >= 8:
+        weights['conv1.weight'] = weights['conv1.weight'].float()
+        weights['conv1.bias'] = weights['conv1.bias'].float()
+        weights['conv2.weight'] = weights['conv2.weight'].float()
+        weights['conv2.bias'] = weights['conv2.bias'].float()
+
     for i in range(model_metadata['n_audio_layer']):
         weights[
             f'encoder_layers.{i}.attention_layernorm.weight'] = model_params[

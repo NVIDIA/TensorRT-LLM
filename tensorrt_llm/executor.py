@@ -1,6 +1,8 @@
 import asyncio
 import atexit
 import datetime
+import json
+import math
 import secrets
 import threading
 import time
@@ -17,6 +19,7 @@ from janus import Queue as AsyncQueue
 
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
+from .builder import Engine
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
@@ -76,9 +79,9 @@ class GenerationRequest:
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
             "bad_words":
-            self.sampling_params.bad_words or [],
+            self.sampling_params._get_bad_words(),
             "stop_words":
-            self.sampling_params.stop_words or [],
+            self.sampling_params._get_stop_words(),
             "embedding_bias":
             self.sampling_params.embedding_bias,
             "external_draft_tokens_config":
@@ -182,6 +185,15 @@ class GenerationResult:
                 self.outputs[i].generation_logits = generation_logits[
                     i, :self.outputs[i].length]
 
+        if self.finished and not self._generation_request.sampling_params.include_stop_str_in_output:
+            for beam_output in self.outputs:
+                for stop_ids in self._generation_request.sampling_params._get_stop_words(
+                ):
+                    if beam_output.token_ids[-len(stop_ids):] == stop_ids:
+                        beam_output.token_ids = beam_output.token_ids[:-len(
+                            stop_ids)]
+                        break
+
         if context_logits is not None:
             self.context_logits = context_logits
 
@@ -259,6 +271,9 @@ class GenerationResult:
         repr = ", ".join(repr)
         repr = f"{self.__class__.__name__}({repr})"
         return repr
+
+    def __hash__(self):
+        return hash(self.request_id)
 
 
 class GenerationExecutor(ABC):
@@ -359,7 +374,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
@@ -377,7 +392,7 @@ class GenerationExecutor(ABC):
                 f"on {world_size} ranks.")
 
         worker_kwargs = {
-            "engine_dir": engine_dir,
+            "engine": engine,
             "executor_config": executor_config,
         }
 
@@ -402,7 +417,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
@@ -412,10 +427,15 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._pending: set = set()
         self.result_queue = None
         self.rank = mpi_rank()
-
-        self.engine = tllm.Executor(engine_dir,
-                                    tllm.ModelType.DECODER_ONLY,
-                                    executor_config=executor_config)
+        if isinstance(engine, Engine):
+            self.engine = tllm.Executor(engine.engine,
+                                        json.dumps(engine.config.to_dict()),
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config)
+        else:
+            self.engine = tllm.Executor(engine,
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config)
         self.awaiter_stop_event = threading.Event()
         self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
                                                daemon=True)
@@ -471,9 +491,28 @@ class ExecutorBindingsWorker(GenerationExecutor):
             for response in self.engine.await_responses(
                     timeout=datetime.timedelta(milliseconds=100)):
                 req_id = response.request_id
+
+                # If the req_id is not returned from enqueue_request in the main thread, wait.
+                # TODO[chunweiy]: use a pending list instead.
+                sleep_interval = 0.01
+                repeat_for_wait = math.ceil(
+                    2 /
+                    sleep_interval)  # We will wait for 2s for a single req_id
+
+                if req_id not in self._results:
+                    for i in range(repeat_for_wait):
+                        time.sleep(sleep_interval)
+                        if req_id in self._results:
+                            break
+                    else:
+                        if req_id not in self._results:
+                            raise RuntimeError(
+                                f"Request ID {req_id} not found in the results queue."
+                            )
+
+                queue = self.return_queue(req_id)
                 if response.has_error():
-                    self.return_queue(req_id).put(
-                        (req_id, None, None, response.error_msg))
+                    queue.put((req_id, None, None, response.error_msg))
                 else:
                     tensors = (
                         response.result.output_token_ids,
@@ -482,11 +521,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                         response.result.log_probs,
                         response.result.cum_log_probs,
                     )
-                    self.return_queue(req_id).put(
-                        (response.request_id, tensors, response.result.is_final,
-                         None))
-                    if response.result.is_final:
-                        self._pending.remove(req_id)
+                    queue.put((response.request_id, tensors,
+                               response.result.is_final, None))
+
+                # If the response is final or has an error, drop it from the registries.
+                if response.has_error() or response.result.is_final:
+                    self._pending.remove(req_id)
+                    self._results.pop(req_id)
 
     def stats_loop(self):
         while not self.awaiter_stop_event.is_set():
@@ -550,22 +591,21 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def wait_first_completed(
         self, futures: List[GenerationResult]
     ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.request_id for f in futures)
+        wait_set = set(futures)
 
         # clear already-finished requests
         for f in futures:
             if f._done:
-                wait_set.remove(f.request_id)
+                wait_set.pop(f)
                 yield f
 
         # wait remaining active requests
         while len(wait_set) > 0:
-            req_id = wait_set.pop()
-
-            if req_id not in self._pending:
-                yield self._results[req_id]
+            fut = wait_set.pop()
+            if fut.request_id not in self._pending:
+                yield fut
             else:
-                wait_set.add(req_id)
+                wait_set.add(fut)
 
 
 class Fifo:
@@ -650,7 +690,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
     @print_traceback_on_error
     @staticmethod
     def workers_main(
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
@@ -671,7 +711,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # TODO[chunweiy]: fix the non-rank0 process failure
         init_ok = True
         try:
-            executor = ExecutorBindingsWorker(engine_dir, executor_config)
+            executor = ExecutorBindingsWorker(engine, executor_config)
         except Exception as e:
             init_ok = False
             raise e
@@ -699,9 +739,15 @@ class ExecutorBindingsProxy(GenerationExecutor):
         while (res := self.result_queue.get()) is not None:
             req_id, *_ = res
             # Wait for this result ready in self._results
+            # This will make sure that the self._results[req_id] is ready to receive the result.
             while req_id not in self._results:
                 self._request_id_dispatcher_queue.get()
             self._results[req_id].queue.put(res)
+
+            # Drop the record if the result is final.
+            if res[2]:
+                self._results.pop(req_id)
+
             while not self._request_id_dispatcher_queue.empty():
                 self._request_id_dispatcher_queue.get()
 

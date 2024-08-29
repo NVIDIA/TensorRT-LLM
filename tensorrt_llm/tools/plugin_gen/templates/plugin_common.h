@@ -2,6 +2,8 @@
 #ifndef PLUGIN_UTILITY
 #define PLUGIN_UTILITY
 
+#include "NvInferPlugin.h"
+
 #include <cstring>
 #include <cublasLt.h>
 #include <cublas_v2.h>

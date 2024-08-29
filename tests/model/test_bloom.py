@@ -223,6 +223,12 @@ class TestBloom(unittest.TestCase):
                                                        dtype=torch.int32)
         host_sink_token_length = torch.tensor([0], dtype=torch.int32)
 
+        perf_knob_tensor_size = 16
+        context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+        if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
         cache_indirections = [
             torch.full((
                 batch_size,
@@ -260,6 +266,7 @@ class TestBloom(unittest.TestCase):
             if enable_remove_input_padding:
                 ctx_host_context_lengths = ctx_context_lengths.cpu()
                 ctx_buffer["host_context_lengths"] = ctx_host_context_lengths
+            ctx_buffer['host_runtime_perf_knobs'] = context_runtime_perf_knobs
         else:
             ctx_buffer['attention_mask'] = ctx_attention_mask
 
@@ -461,10 +468,14 @@ class TestBloom(unittest.TestCase):
         context_lengths = torch.ones(
             (batch_size)).type(torch.int32).cuda() * seq_len
 
-        decoder.setup(batch_size,
-                      max_context_length=seq_len,
-                      max_new_tokens=max_new_tokens,
-                      beam_width=num_beams)
+        enable_bloom_context_fmha_fp32_acc = context_fmha_type == ContextFMHAType.enabled_with_fp32_acc
+
+        decoder.setup(
+            batch_size,
+            max_context_length=seq_len,
+            max_new_tokens=max_new_tokens,
+            beam_width=num_beams,
+            enable_context_fmha_fp32_acc=enable_bloom_context_fmha_fp32_acc)
 
         output_ids = decoder.decode(input_ids, context_lengths, sampling_config)
         # TODO: change to actual ragged tensor after BLOOM plugin supports it

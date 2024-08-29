@@ -34,7 +34,9 @@ def trt_dtype_to_onnx(dtype):
         raise TypeError("%s is not supported" % dtype)
 
 
-def to_onnx(network, path):
+def to_onnx(network, path, name: str = None):
+    if name is None:
+        name = "debug_graph"
     inputs = []
     for i in range(network.num_inputs):
         network_input = network.get_input(i)
@@ -70,7 +72,7 @@ def to_onnx(network, path):
                              domain="com.nvidia"))
 
     onnx_model = helper.make_model(helper.make_graph(nodes,
-                                                     'attention',
+                                                     name,
                                                      inputs,
                                                      outputs,
                                                      initializer=None),

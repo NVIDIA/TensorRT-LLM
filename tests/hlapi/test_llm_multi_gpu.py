@@ -10,6 +10,7 @@ from parameterized import parameterized
 from tensorrt_llm.hlapi.llm import LLM, SamplingParams
 from tensorrt_llm.hlapi.llm_utils import KvCacheConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -21,15 +22,11 @@ from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 try:
     from .test_llm import (_test_llm_generate_async, default_model_name,
                            get_model_path, llama_model_path, mixtral_model_name,
-                           prompts)
+                           prompts, skip_single_gpu)
 except ImportError:
     from test_llm import (_test_llm_generate_async, default_model_name,
                           get_model_path, llama_model_path, mixtral_model_name,
-                          prompts)
-
-skip_single_gpu = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="The test needs at least 2 GPUs, skipping")
+                          prompts, skip_single_gpu)
 
 
 @pytest.fixture(scope="module")
@@ -58,16 +55,11 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@pytest.fixture(scope="module")
 @skip_single_gpu
-@pytest.mark.parametrize("enable_executor", [True, False])
 def test_llm_loading_from_ckpt_for_tp2(
-        engine_from_checkpoint: tempfile.TemporaryDirectory,
-        enable_executor: bool):
+        engine_from_checkpoint: tempfile.TemporaryDirectory):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-    llm = LLM(engine_from_checkpoint.name,
-              tokenizer=tokenizer,
-              enable_executor=enable_executor)
+    llm = LLM(engine_from_checkpoint.name, tokenizer=tokenizer)
 
     sampling_params = SamplingParams(max_new_tokens=8)
 
@@ -162,8 +154,8 @@ def llm_end2end_tp2_cases():
     }, )
 
 
-@skip_single_gpu
 @parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
+@skip_single_gpu
 def test_llm_end2end_tp2(llm_additional_options):
     model_path = get_model_path(default_model_name)
 
@@ -210,6 +202,20 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-hlapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
     subprocess.run(command, shell=True, check=True,
                    env=os.environ)  # nosec B603
+
+
+@skip_single_gpu
+def test_executor_results_cleanup():
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+              tensor_parallel_size=2)
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for i in range(20):
+        llm.generate(prompts, sampling_params=sampling_params)
+
+    num_remaining_results = len(llm._executor._results)
+    print(f"result.size: {num_remaining_results}")
+    assert num_remaining_results == 0
 
 
 if __name__ == '__main__':

@@ -18,6 +18,14 @@ from pathlib import Path
 
 import numpy as np
 import run
+from build_engines_utils import init_model_spec_module
+
+init_model_spec_module()
+import os
+
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 resources_dir = Path(__file__).parent.resolve().parent
 model_path = resources_dir / "models"
@@ -35,18 +43,30 @@ def generate_output(
     tp_size = 1
     pp_size = 1
     tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu/"
+    input_file = f"input_tokens_{model_name}.npy"
 
-    data_input_file_name = resources_dir / "data" / f"input_tokens_{model_name}.npy"
+    data_input_file_name = resources_dir / "data" / input_file
     if num_beams == 1:
         output_dir = resources_dir / "data" / model_name / "sampling"
     else:
         output_dir = resources_dir / "data" / model_name / f"beam_search_{num_beams}"
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    for engine_kind in ["fp16-plugin", "fp16-plugin-packed-paged"]:
-        engine_dir = model_path / 'rt_engine' / model_name / engine_kind / tp_pp_dir
-        output_npy_file_name = output_dir / f"output_tokens_{engine_kind.replace('-', '_')}_tp{tp_size}_pp{pp_size}.npy"
-        output_csv_file_name = output_dir / f"output_tokens_{engine_kind.replace('-', '_')}_tp{tp_size}_pp{pp_size}.csv"
+    model_spec_obj_list = [
+        model_spec.ModelSpec(
+            input_file, _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
+                model_spec.KVCacheType.CONTINUOUS),
+        model_spec.ModelSpec(input_file, _tb.DataType.HALF).use_gpt_plugin().
+        use_packed_input().set_kv_cache_type(model_spec.KVCacheType.PAGED),
+    ]
+
+    for model_spec_obj in model_spec_obj_list:
+        engine_dir = model_path / 'rt_engine' / model_name / model_spec_obj.get_model_path(
+        ) / tp_pp_dir
+        base_output_name = os.path.splitext(
+            model_spec_obj.get_results_file())[0]
+        output_npy_file_name = output_dir / f'{base_output_name}.npy'
+        output_csv_file_name = output_dir / f'{base_output_name}.csv'
 
         args_list = [
             '--engine_dir',
@@ -85,8 +105,13 @@ def generate_output(
         data = np.load(str(output_npy_file_name))
         if model_name == 'chatglm-6b':
             data[data == 3] = 130005
-        else:
+        elif model_name == 'chatglm2-6b' or model_name == 'chatglm3-6b':
             data[data == 0] = 2
+        elif model_name == 'glm-10b':
+            data[data == 50256] = 50258
+        else:
+            raise NameError('bad model name')
+
         np.save(str(output_npy_file_name), data)
 
 
@@ -97,4 +122,5 @@ if __name__ == '__main__':
     generate_output(model_name='chatglm2-6b', num_beams=2)
     generate_output(model_name='chatglm3-6b', num_beams=1)
     generate_output(model_name='chatglm3-6b', num_beams=2)
+    generate_output(model_name='glm-10b', num_beams=1)
     print("Done")

@@ -16,6 +16,7 @@
  */
 #include "sendPlugin.h"
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 
 #include <cassert>
@@ -93,7 +94,9 @@ int SendPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
         size *= inputDesc[0].dims.d[i];
     }
 
+    TLLM_LOG_DEBUG("start ncclSend with size %d", size);
     NCCLCHECK(ncclSend(inputs[0], size, (*getDtypeMap())[inputDesc[0].type], 1, mComm, stream));
+    TLLM_LOG_DEBUG("end ncclSend with size %d", size);
     return 0;
 }
 

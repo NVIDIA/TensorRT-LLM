@@ -42,11 +42,15 @@ Executor::Executor(std::filesystem::path const& encoderModelPath, std::filesyste
     mExecutor = std::make_unique<tle::Executor>(encoderModelPath, decoderModelPath, modelType, executorConfig);
 }
 
-Executor::Executor(std::string const& engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
+Executor::Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
     tle::ExecutorConfig const& executorConfig)
 {
-    mExecutor = std::make_unique<tle::Executor>(
-        std::vector<uint8_t>(engineBuffer.begin(), engineBuffer.end()), jsonConfigStr, modelType, executorConfig);
+    py::buffer_info info = engineBuffer.request();
+    auto begin = reinterpret_cast<uint8_t const*>(info.ptr);
+    // the buffer is just 1-D array of uint8_t, so .shape[0] == number of bytes
+    auto end = reinterpret_cast<uint8_t const*>(begin) + info.shape[0];
+    mExecutor
+        = std::make_unique<tle::Executor>(std::vector<uint8_t>(begin, end), jsonConfigStr, modelType, executorConfig);
 }
 
 Executor::Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
@@ -92,7 +96,7 @@ void Executor::initBindings(py::module_& m)
                  tle::ExecutorConfig const&>(),
             py::arg("encoder_model_path"), py::arg("decoder_model_path"), py::arg("model_type"),
             py::arg("executor_config"))
-        .def(py::init<std::string const&, std::string const&, tle::ModelType, tle::ExecutorConfig const&>(),
+        .def(py::init<py::buffer, std::string const&, tle::ModelType, tle::ExecutorConfig const&>(),
             py::arg("engine_buffer"), py::arg("json_config_str"), py::arg("model_type"), py::arg("executor_config"))
         .def(py::init<std::string const&, std::string const&, std::string const&, std::string const&, tle::ModelType,
                  tle::ExecutorConfig const&>(),

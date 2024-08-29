@@ -1160,7 +1160,7 @@ __global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, int c
 
 template <typename T>
 void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
-    std::vector<TensorPtr> fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
+    std::vector<TensorPtr> const& fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
     SizeType32 firstBatchSlotIdx, SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream,
     int stepOffset)
 {

@@ -55,8 +55,7 @@ static std::vector<DecodingLayers_t> createDecodingLayerTypes(executor::Decoding
 
 template <typename T>
 static std::vector<std::unique_ptr<BaseLayer>> createLayers(executor::DecodingMode const& mode,
-    DecoderDomain const& decodingDomain, cudaStream_t stream,
-    std::shared_ptr<tensorrt_llm::common::IAllocator> allocator)
+    DecoderDomain const& decodingDomain, std::shared_ptr<runtime::BufferManager> const& bufferManager)
 {
     std::vector<std::unique_ptr<BaseLayer>> layers;
     auto layerTypes = createDecodingLayerTypes(mode);
@@ -72,19 +71,19 @@ static std::vector<std::unique_ptr<BaseLayer>> createLayers(executor::DecodingMo
         switch (type)
         {
         case DecodingLayers_t::PENALTY_LAYER:
-            layer = std::make_unique<PenaltyLayer<T>>(mode, decodingDomain, stream, allocator);
+            layer = std::make_unique<PenaltyLayer<T>>(mode, decodingDomain, bufferManager);
             break;
 
         case DecodingLayers_t::BAN_WORDS_LAYER:
-            layer = std::make_unique<BanWordsLayer<T>>(mode, decodingDomain, stream, allocator);
+            layer = std::make_unique<BanWordsLayer<T>>(mode, decodingDomain, bufferManager);
             break;
 
         case DecodingLayers_t::DECODING_LAYER:
-            layer = std::make_unique<DecodingLayer<T>>(mode, decodingDomain, stream, allocator);
+            layer = std::make_unique<DecodingLayer<T>>(mode, decodingDomain, bufferManager);
             break;
 
         case DecodingLayers_t::STOP_CRITERIA_LAYER:
-            layer = std::make_unique<StopCriteriaLayer<T>>(mode, decodingDomain, stream, allocator);
+            layer = std::make_unique<StopCriteriaLayer<T>>(mode, decodingDomain, bufferManager);
             break;
 
         default: TLLM_CHECK_WITH_INFO(false, "Unknown DecodingLayers_t"); break;

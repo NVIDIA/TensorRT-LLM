@@ -29,12 +29,9 @@ from transformers import GPTJConfig, GPTJForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
+from tensorrt_llm.models.gptj.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
-from examples.gptj.convert_checkpoint import convert_hf_gptj
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
@@ -82,10 +79,7 @@ class TestGPTJ(unittest.TestCase):
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         config.set_rank(rank)
-        weights = convert_hf_gptj(hf_gpt,
-                                  gpt_config,
-                                  config.mapping,
-                                  dtype=dtype)
+        weights = load_weights_from_hf_model(hf_gpt, config)
         trtllm_model = tensorrt_llm.models.GPTJForCausalLM(config)
         trtllm_model.load(weights)
 
@@ -221,18 +215,21 @@ class TestGPTJ(unittest.TestCase):
                             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                             device='cuda'))
 
-        def run_engine(context,
-                       input_ids,
-                       context_lengths,
-                       host_request_types,
-                       position_ids,
-                       last_token_ids,
-                       cache_indirection,
-                       host_past_key_value_lengths,
-                       host_max_attention_window_sizes,
-                       host_sink_token_length,
-                       sequence_length,
-                       host_context_lengths=None):
+        def run_engine(
+            context,
+            input_ids,
+            context_lengths,
+            host_request_types,
+            position_ids,
+            last_token_ids,
+            cache_indirection,
+            host_past_key_value_lengths,
+            host_max_attention_window_sizes,
+            host_sink_token_length,
+            sequence_length,
+            host_runtime_perf_knobs,
+            host_context_lengths=None,
+        ):
 
             ctx_buffer = {
                 'input_ids': input_ids,
@@ -244,6 +241,7 @@ class TestGPTJ(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
+                'host_runtime_perf_knobs': host_runtime_perf_knobs,
             }
             ctx_buffer[
                 f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
@@ -330,6 +328,14 @@ class TestGPTJ(unittest.TestCase):
             host_context_lengths = ctx_context_lengths.cpu(
             ) if enable_remove_input_padding else None
 
+            perf_knob_tensor_size = 16
+            context_runtime_perf_knobs = torch.tensor([-1] *
+                                                      perf_knob_tensor_size,
+                                                      dtype=torch.int64)
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+                context_runtime_perf_knobs[
+                    1] = 1  # enable_context_fmha_fp32_acc
+
             res = run_engine(
                 context=runtime.ctx_context,
                 input_ids=ctx_ids,
@@ -342,7 +348,8 @@ class TestGPTJ(unittest.TestCase):
                 host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types)
+                host_request_types=host_request_types,
+                host_runtime_perf_knobs=context_runtime_perf_knobs)
 
             np.testing.assert_allclose(ref.cpu().numpy(),
                                        res.cpu().numpy(),
@@ -418,6 +425,12 @@ class TestGPTJ(unittest.TestCase):
             # For step 1, the sequence_lengths = context_lengths + 1.
             sequence_length_buffer = torch.add(ctx_context_lengths, 1)
 
+            perf_knob_tensor_size = 16
+            gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
+                                                  dtype=torch.int64)
+            if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+                gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
+
             res = run_engine(
                 context=runtime.context_1,
                 input_ids=step1_id,
@@ -431,7 +444,8 @@ class TestGPTJ(unittest.TestCase):
                 host_sink_token_length=host_sink_token_length,
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
-                host_request_types=host_request_types)
+                host_request_types=host_request_types,
+                host_runtime_perf_knobs=gen_runtime_perf_knobs)
 
             np.testing.assert_allclose(ref.cpu().numpy(),
                                        res.cpu().numpy(),

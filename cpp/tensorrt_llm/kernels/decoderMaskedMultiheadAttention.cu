@@ -79,6 +79,19 @@ namespace
     }                                                                                                                  \
     break;
 
+#define MMHA_LAUNCH_KERNE_EX3(Dh)                                                                                      \
+    if (has_qk_tanh_scale)                                                                                             \
+    {                                                                                                                  \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, true>(                        \
+            params, kv_cache_buffer, shift_k_cache, stream);                                                           \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, false>(                       \
+            params, kv_cache_buffer, shift_k_cache, stream);                                                           \
+    }                                                                                                                  \
+    break;
+
 template <typename T, typename KVCacheBuffer, typename KERNEL_PARAMS_TYPE>
 void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
@@ -88,7 +101,7 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     int const head_size = params.hidden_size_per_head;
     TLLM_CHECK_WITH_INFO(!has_implicit_rel_attn_bias || head_size == 32 || head_size == 64 || head_size == 128,
         "MMHA kernels haven't instantiate implicit_relative_attention_bias paths for head size %d.", head_size);
-    TLLM_CHECK_WITH_INFO(!has_qk_tanh_scale || head_size == 128,
+    TLLM_CHECK_WITH_INFO(!has_qk_tanh_scale || head_size == 128 || head_size == 256,
         "MMHA kernels haven't instantiate qk_tanh_scale paths for head size %d.", head_size);
     TLLM_CHECK_WITH_INFO(!(has_qk_tanh_scale && has_implicit_rel_attn_bias),
         "MMHA kernels haven't instantiate implicit_relative_attention_bias + qk_tanh_scale paths for head size %d.",
@@ -105,7 +118,7 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     case 32: MMHA_LAUNCH_KERNE_EX1(32);
     case 64: MMHA_LAUNCH_KERNE_EX1(64);
     case 128: MMHA_LAUNCH_KERNE_EX2(128);
-    case 256: MMHA_LAUNCH_KERNEL(256);
+    case 256: MMHA_LAUNCH_KERNE_EX3(256);
 #ifndef FAST_BUILD // skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
     case 48: MMHA_LAUNCH_KERNEL(48);
     case 80: MMHA_LAUNCH_KERNEL(80);

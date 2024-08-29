@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm import BuildConfig, Mapping, build, mpi_barrier
-from tensorrt_llm.executor import ExecutorBindingsWorker, SamplingParams
+from tensorrt_llm.executor import GenerationExecutor, SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 
 
@@ -40,15 +40,13 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
     tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
     sampling_params = SamplingParams(max_new_tokens=20)
 
-    with ExecutorBindingsWorker(engine_dir) as executor:
-        executor.block_subordinates()
-
-        for inp in dataset():
-            stream_output = executor.generate_async(
-                tokenizer.encode(inp),
-                sampling_params=sampling_params,
-                streaming=True)
-            if rank == 0:
+    with GenerationExecutor.create(engine_dir) as executor:
+        if rank == 0:
+            for inp in dataset():
+                stream_output = executor.generate_async(
+                    tokenizer.encode(inp),
+                    sampling_params=sampling_params,
+                    streaming=True)
                 for state in stream_output:
                     print(
                         f"Output: {tokenizer.decode(state.outputs[0].token_ids)}"
