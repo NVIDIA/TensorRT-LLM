@@ -16,12 +16,12 @@
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="_static/doctools.js?v=9a2dae69"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
         <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Release Notes" href="release-notes.html" />
+    <link rel="next" title="Key Features" href="key-features.html" />
     <link rel="prev" title="Overview" href="overview.html" /> 
 </head>
 
@@ -49,16 +49,16 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Quick Start Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#prerequisites">Prerequisites</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#launch-the-docker">Launch the Docker</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#retrieve-the-model-weights">Retrieve the Model Weights</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#compile-the-model-into-a-tensorrt-engine">Compile the Model into a TensorRT Engine</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#run-the-model">Run the Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#deploy-with-triton-inference-server">Deploy with Triton Inference Server</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#send-requests">Send Requests</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#llm-api">LLM API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#next-steps">Next Steps</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#links">Links</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#related-information">Related Information</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -67,6 +67,30 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -102,11 +126,6 @@
 <li class="toctree-l1"><a class="reference internal" href="reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -146,46 +165,46 @@
 <p>This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get setup and send HTTP requests using TensorRT-LLM.</p>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h2>
-<p>The steps below use the Llama 2 model, which is subject to a particular <a class="reference external" href="https://llama.meta.com/llama-downloads/">license</a>. To download the necessary model files, agree to the terms and <a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-7b-chat-hf?clone=true">authenticate with Hugging Face</a>.</p>
-</section>
-<section id="launch-the-docker">
-<h2>Launch the Docker<a class="headerlink" href="#launch-the-docker" title="Link to this heading"></a></h2>
-<p>Please be sure to complete the <a class="reference internal" href="installation/linux.html"><span class="std std-doc">installation</span></a> steps before proceeding with the following steps.</p>
-</section>
-<section id="retrieve-the-model-weights">
-<h2>Retrieve the Model Weights<a class="headerlink" href="#retrieve-the-model-weights" title="Link to this heading"></a></h2>
-<p>Pull the weights and tokenizer files for the chat-tuned variant of the 7B parameter Llama 2 model from the <a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-7b-chat-hf">Hugging Face Hub</a>.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
+<ul>
+<li><p>This quick start uses the Meta Llama 3.1 model. This model is subject to a particular <a class="reference external" href="https://llama.meta.com/llama-downloads/">license</a>. To download the model files, agree to the terms and <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct?clone=true">authenticate with Hugging Face</a>.</p></li>
+<li><p>Complete the <a class="reference internal" href="installation/linux.html"><span class="std std-doc">installation</span></a> steps.</p></li>
+<li><p>Pull the weights and tokenizer files for the chat-tuned variant of the Llama 3.1 8B model from the <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct">Hugging Face Hub</a>.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct</span>
 </pre></div>
 </div>
+</li>
+</ul>
 </section>
 <section id="compile-the-model-into-a-tensorrt-engine">
 <span id="quick-start-guide-compile"></span><h2>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading"></a></h2>
-<p>Use the included <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama model definition</a>. This is a minimal example that includes some of the optimizations available in TensorRT-LLM.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Launch the Tensorrt-LLM container</span>
-make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
+<p>Use the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama model definition</a> from the <code class="docutils literal notranslate"><span class="pre">examples/llama</span></code> directory of the GitHub repository.
+The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp"># </span>From<span class="w"> </span>the<span class="w"> </span>root<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>cloned<span class="w"> </span>repository,<span class="w"> </span>start<span class="w"> </span>the<span class="w"> </span>TensorRT-LLM<span class="w"> </span>container
+<span class="go">make -C docker release_run LOCAL_USER=1</span>
 
-<span class="c1"># Log in to huggingface-cli</span>
-<span class="c1"># You can get your token from huggingface.co/settings/token</span>
-huggingface-cli<span class="w"> </span>login<span class="w"> </span>--token<span class="w"> </span>*****
+<span class="gp"># </span>Log<span class="w"> </span><span class="k">in</span><span class="w"> </span>to<span class="w"> </span>huggingface-cli
+<span class="gp"># </span>You<span class="w"> </span>can<span class="w"> </span>get<span class="w"> </span>your<span class="w"> </span>token<span class="w"> </span>from<span class="w"> </span>huggingface.co/settings/token
+<span class="go">huggingface-cli login --token *****</span>
 
-<span class="c1"># Convert the model into TensorrtLLM checkpoint format</span>
-<span class="nb">cd</span><span class="w"> </span>exammples/llama
-python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="w"> </span>meta-llama/Llama-2-7b-chat-hf<span class="w"> </span>--output_dir<span class="w"> </span>llama-2-7b-ckpt
+<span class="gp"># </span>Convert<span class="w"> </span>the<span class="w"> </span>model<span class="w"> </span>into<span class="w"> </span>TensorRT-LLM<span class="w"> </span>checkpoint<span class="w"> </span>format
+<span class="go">cd examples/llama</span>
+<span class="go">pip install -r requirements.txt</span>
+<span class="go">pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.</span>
+<span class="go">python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt</span>
 
-<span class="c1"># Compile model</span>
-trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span>llama-2-7b-ckpt<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--gemm_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output_dir<span class="w"> </span>./llama-2-7b-engine
+<span class="gp"># </span>Compile<span class="w"> </span>model
+<span class="go">trtllm-build --checkpoint_dir llama-3.1-8b-ckpt \</span>
+<span class="go">    --gemm_plugin float16 \</span>
+<span class="go">    --output_dir ./llama-3.1-8b-engine</span>
 </pre></div>
 </div>
-<p>When you created the model definition with the TensorRT-LLM API, you built a graph of operations from <a class="reference external" href="https://developer.nvidia.com/tensorrt">NVIDIA TensorRT</a> primitives that formed the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.</p>
+<p>When you create a model definition with the TensorRT-LLM API, you build a graph of operations from <a class="reference external" href="https://developer.nvidia.com/tensorrt">NVIDIA TensorRT</a> primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.</p>
 <p>In this example, we included the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> plugin, which implements a FlashAttention-like fused attention kernel, and the <code class="docutils literal notranslate"><span class="pre">gemm</span></code> plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama example</a> and <a class="reference internal" href="reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> section.</p>
 </section>
 <section id="run-the-model">
 <h2>Run the Model<a class="headerlink" href="#run-the-model" title="Link to this heading"></a></h2>
-<p>Now that you’ve got your model engine, its time to run it.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>../run.py<span class="w"> </span>--engine_dir<span class="w"> </span>./llama-2-7b-engine<span class="w">  </span>--max_output_len<span class="w"> </span><span class="m">100</span><span class="w"> </span>--tokenizer_dir<span class="w"> </span>meta-llama/Llama-2-7b-chat-hf<span class="w"> </span>--input_text<span class="w"> </span><span class="s2">&quot;How do I count to nine in French?&quot;</span>
+<p>Now that you have the model engine, run the engine and perform inference.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">python3 ../run.py --engine_dir ./llama-3.1-8b-engine  --max_output_len 100 --tokenizer_dir Meta-Llama-3.1-8B-Instruct --input_text &quot;How do I count to nine in French?&quot;</span>
 </pre></div>
 </div>
 </section>
@@ -204,7 +223,7 @@ cp<span class="w"> </span>../TensorRT-LLM/examples/llama/out/*<span class="w">  
 <p>The <code class="docutils literal notranslate"><span class="pre">tensorrtllm_backend</span></code> repository includes the skeleton of a model repository under <code class="docutils literal notranslate"><span class="pre">all_models/inflight_batcher_llm/</span></code> that you can use.</p>
 </li>
 <li><p>Copy the model you compiled (<a class="reference internal" href="#quick-start-guide-compile"><span class="std std-ref">Compile the Model into a TensorRT Engine</span></a>) to the example model repository.</p></li>
-<li><p>Modify the configuration files from the model repository. Specify, where the compiled model engine is, what tokenizer to use, and how to handle memory allocation for the KV cache when performing inference in batches.</p>
+<li><p>Modify the configuration files from the model repository. Specify the path to the compiled model engine, the tokenizer, and how to handle memory allocation for the KV cache when performing inference in batches.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>tools/fill_template.py<span class="w"> </span>--in_place<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>all_models/inflight_batcher_llm/tensorrt_llm/config.pbtxt<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>decoupled_mode:true,engine_dir:/all_models/inflight_batcher_llm/tensorrt_llm/1,<span class="se">\</span>
@@ -213,15 +232,15 @@ max_num_sequences:4
 
 python<span class="w"> </span>tools/fill_template.py<span class="w"> </span>--in_place<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>all_models/inflight_batcher_llm/preprocessing/config.pbtxt<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tokenizer_type:llama,tokenizer_dir:meta-llama/Llama-2-7b-chat-hf
+<span class="w">    </span>tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
 
 python<span class="w"> </span>tools/fill_template.py<span class="w"> </span>--in_place<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>all_models/inflight_batcher_llm/postprocessing/config.pbtxt<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tokenizer_type:llama,tokenizer_dir:meta-llama/Llama-2-7b-chat-hf
+<span class="w">    </span>tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
 </pre></div>
 </div>
 </li>
-<li><p>Start the Docker container and launch the Triton Inference server. Specify <code class="docutils literal notranslate"><span class="pre">world</span> <span class="pre">size</span></code>, which is the number of GPUs the model was built for, and point to the <code class="docutils literal notranslate"><span class="pre">model_repo</span></code> that was just set up.</p>
+<li><p>Start Triton Inference Server in the container. Specify <code class="docutils literal notranslate"><span class="pre">world_size</span></code>, which is the number of GPUs the model was built for, and point to the <code class="docutils literal notranslate"><span class="pre">model_repo</span></code> that was just set up.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>--rm<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--network<span class="w"> </span>host<span class="w"> </span>--shm-size<span class="o">=</span>1g<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span>/all_models:/all_models<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span>/scripts:/opt/scripts<span class="w"> </span><span class="se">\</span>
@@ -255,6 +274,34 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
 </pre></div>
 </div>
 </section>
+<section id="llm-api">
+<h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading"></a></h2>
+<p>The LLM API is a Python API to setup &amp; infer with TensorRT-LLM directly in python.It allows for optimizing models by specifying a HuggingFace repo name or a model checkpoint. The LLM API handles checkpoint conversion, engine building, engine loading, and model inference, all from one python object.</p>
+<p>Note that these APIs are in incubation, they may change and  supports the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/index.html#supported-model">following models</a>, which will increase in coming release. We appreciate your patience and understanding as we improve this API.</p>
+<p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos"> 4</span>    <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos"> 5</span>    <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos"> 6</span>    <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span>    <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="p">]</span>
+<span class="linenos"> 9</span><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">10</span>
+<span class="linenos">11</span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">12</span>
+<span class="linenos">13</span><span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">14</span>
+<span class="linenos">15</span><span class="c1"># Print the outputs.</span>
+<span class="linenos">16</span><span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+<span class="linenos">17</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+<span class="linenos">18</span>    <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">19</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>To learn more about the LLM API, check out the <a class="reference internal" href="llm-api-examples/index.html"><span class="doc std std-doc">LLM Examples Introduction</span></a> and <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">API Reference</span></a>.</p>
+</section>
 <section id="next-steps">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading"></a></h2>
 <p>In this Quick Start Guide, you:</p>
@@ -270,8 +317,8 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples">examples/</a> for showcases of how to run a quick benchmark on latest LLMs.</p></li>
 </ul>
 </section>
-<section id="links">
-<h2>Links<a class="headerlink" href="#links" title="Link to this heading"></a></h2>
+<section id="related-information">
+<h2>Related Information<a class="headerlink" href="#related-information" title="Link to this heading"></a></h2>
 <ul class="simple">
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md">Best Practices Guide</a></p></li>
 <li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html">Support Matrix</a></p></li>
@@ -284,13 +331,13 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="overview.html" class="btn btn-neutral float-left" title="Overview" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="release-notes.html" class="btn btn-neutral float-right" title="Release Notes" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="key-features.html" class="btn btn-neutral float-right" title="Key Features" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d220f53f0>
+<jinja2.runtime.BlockReference object at 0x7f425218dab0>
 
 <div class="footer">
     <p>

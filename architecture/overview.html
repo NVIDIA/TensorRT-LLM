@@ -16,13 +16,13 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=9a2dae69"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Model Definition" href="core-concepts.html" />
-    <link rel="prev" title="Building from Source Code on Windows" href="../installation/build-from-source-windows.html" /> 
+    <link rel="prev" title="Runtime" href="../_cpp_gen/runtime.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -48,6 +48,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -56,6 +57,30 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="current">
@@ -95,11 +120,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
-</ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
@@ -135,11 +155,11 @@
              
   <section id="tensorrt-llm-architecture">
 <span id="architecture-overview"></span><h1>TensorRT-LLM Architecture<a class="headerlink" href="#tensorrt-llm-architecture" title="Link to this heading"></a></h1>
-<p>TensorRT-LLM is a toolkit to assemble optimized solutions to perform Large Language Model (LLM) inference. It offers a Python API to define models and compile efficient <a class="reference external" href="https://developer.nvidia.com/tensorrt">TensorRT</a> engines for NVIDIA GPUs. It also contains Python and C++ components to build runtimes to execute those engines as well as backends for the <a class="reference external" href="https://developer.nvidia.com/nvidia-triton-inference-server">Triton Inference
+<p>TensorRT-LLM is a toolkit to assemble optimized solutions to perform Large Language Model (LLM) inference. It offers a Model Definition API to define models and compile efficient <a class="reference external" href="https://developer.nvidia.com/tensorrt">TensorRT</a> engines for NVIDIA GPUs. It also contains Python and C++ components to build runtimes to execute those engines as well as backends for the <a class="reference external" href="https://developer.nvidia.com/nvidia-triton-inference-server">Triton Inference
 Server</a> to easily create web-based services for LLMs. TensorRT-LLM supports multi-GPU and multi-node configurations (through MPI).</p>
 <p>As a user, the very first step to create an inference solution is to either define your own model or select a pre-defined network architecture (refer to <span class="xref std std-ref">models</span> for the list of models supported by TensorRT-LLM). Once defined, that model must be trained using a training framework (training is outside of the scope of TensorRT-LLM). For pre-defined models, checkpoints can be downloaded from various providers. To illustrate that point, a lot of examples in TensorRT-LLM use model weights obtained from the <a class="reference external" href="https://huggingface.co">Hugging Face</a> hub and trained using <a class="reference external" href="https://developer.nvidia.com/nemo">NVIDIA Nemo</a> or <a class="reference external" href="https://pytorch.org">PyTorch</a>.</p>
-<p>Equipped with the model definition and the weights, a user must use TensorRT-LLM’s Python API to recreate the model in a way that can be compiled by TensorRT into an efficient engine. For ease of use, TensorRT-LLM already supports a handful of standard models.</p>
-<p>Together with the Python API to describe models, TensorRT-LLM provides users with components to create a runtime that executes the efficient TensorRT engine. Runtime components offer beam-search, along with extensive sampling functionalities such as top-K and top-P sampling. The exhaustive list can be found in the documentation of the <a class="reference internal" href="../advanced/gpt-runtime.html#gpt-runtime"><span class="std std-ref">C++ GPT Runtime</span></a>. The C++ runtime is the recommended runtime.</p>
+<p>Equipped with the model definition and the weights, a user must use TensorRT-LLM’s Model Definition API to recreate the model in a way that can be compiled by TensorRT into an efficient engine. For ease of use, TensorRT-LLM already supports a handful of standard models.</p>
+<p>Together with the Model Definition API to describe models, TensorRT-LLM provides users with components to create a runtime that executes the efficient TensorRT engine. Runtime components offer beam-search, along with extensive sampling functionalities such as top-K and top-P sampling. The exhaustive list can be found in the documentation of the <a class="reference internal" href="../advanced/gpt-runtime.html#gpt-runtime"><span class="std std-ref">C++ GPT Runtime</span></a>. The C++ runtime is the recommended runtime.</p>
 <p>TensorRT-LLM also includes Python and C++ backends for NVIDIA Triton Inference Server to assemble solutions for LLM online serving. The C++ backend implements in-flight batching as explained in the <a class="reference internal" href="../advanced/batch-manager.html#batch-manager"><span class="std std-ref">The Batch Manager in TensorRT-LLM</span></a> documentation and is the recommended backend.</p>
 <section id="model-weights">
 <h2>Model Weights<a class="headerlink" href="#model-weights" title="Link to this heading"></a></h2>
@@ -151,14 +171,14 @@ Server</a> to easily create web-based services for LLMs. TensorRT-LLM supports m
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="../installation/build-from-source-windows.html" class="btn btn-neutral float-left" title="Building from Source Code on Windows" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../_cpp_gen/runtime.html" class="btn btn-neutral float-left" title="Runtime" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="core-concepts.html" class="btn btn-neutral float-right" title="Model Definition" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d220022f0>
+<jinja2.runtime.BlockReference object at 0x7f426de48910>
 
 <div class="footer">
     <p>

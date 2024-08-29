@@ -29,8 +29,8 @@ Optional tensors that can be supplied to `InferenceRequest` are shown below. Def
 | `end_id` | [1] | `int32_t` | End token Id. If not specified, defaults to -1 |
 | `pad_id` | [1] | `int32_t` | Pad token Id |
 | `embedding_bias` | [1, vocab_size] | `float` | The bias is added to the logits for each token in the vocabulary before decoding occurs. Positive values in the bias encourage the sampling of tokens, while negative values discourage it. A value of `0.f` leaves the logit value unchanged. |
-| `bad_words_list` | [2, num_bad_words] | `int32_t` | Bad words list |
-| `stop_words_list` | [2, num_stop_words] | `int32_t` | Stop words list |
+| `bad_words_list` | [1, 2, num_bad_words] | `int32_t` | Bad words list. Consider an example with two bad words, where the first word contains tokens `[5, 7, 3]` and the second one contains tokens `[9, 2]`. In total there are 5 tokens so the tensor shape should be `[1, 2, 5]`. The first row of the tensor must contain the token ids, while the second row must store the include-scan offsets of the word lengths (in number of tokens). Hence, the `bad_word_list` tensor would look like: `[[[ 5, 7, 3, 9, 2][ 3, 5, -1, -1, -1]]]` |
+| `stop_words_list` | [1, 2, num_stop_words] | `int32_t` | Stop words list. See `bad_words_list` for the description of the expected tensor shape and content |
 | `prompt_embedding_table` | [1] | `float16` | P-tuning prompt embedding table |
 | `prompt_vocab_size` | [1] | `int32_t` | P-tuning prompt vocab size |
 | `lora_task_id` | [1] | `uint64_t` | Task ID for the given lora_weights.  This ID is expected to be globally unique.  To perform inference with a specific LoRA for the first time `lora_task_id` `lora_weights` and `lora_config` must all be given.  The LoRA will be cached, so that subsequent requests for the same task only require `lora_task_id`. If the cache is full the oldest LoRA will be evicted to make space for new ones.  An error is returned if `lora_task_id` is not cached |

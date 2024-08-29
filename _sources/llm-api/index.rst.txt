@@ -1,0 +1,48 @@
+API Reference
+-------------
+
+.. autoclass:: tensorrt_llm.hlapi.LLM
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.RequestOutput
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.SamplingParams
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.KvCacheConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.SchedulerConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.CapacitySchedulerPolicy
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.BuildConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.QuantConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.QuantAlgo
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:

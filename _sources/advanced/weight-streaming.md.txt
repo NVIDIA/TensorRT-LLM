@@ -41,20 +41,14 @@ python3 examples/summarize.py \
 We can also benchmark the efficiency of Weight Streaming. Here is an example:
 ```bash
 python3 benchmarks/python/benchmark.py \
-    -m opt_30b \
-    --mode ootb  \
+    --engine_dir /tmp/llama_7b/trt_engines/fp16/1-gpu/ \
     --batch_size "1;32" \
-    --max_batch_size "32" \
     --input_output_len "256,32" \
-    --max_input_len 256\
-    --max_seq_len 288 \
     --gpu_weights_percent "0.0;0.3;0.6;1.0" \
     --dtype float16 \
     --csv \
     --log_level verbose
-
 ```
-Here we use `ootb` mode so that the GEMM operators won't use plugins. `ootb-except-mha` mode is also valid.
 
 
 ### API Changes

@@ -16,7 +16,7 @@
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="_static/doctools.js?v=9a2dae69"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
         <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
@@ -60,6 +60,7 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -68,6 +69,30 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -103,11 +128,6 @@
 <li class="toctree-l1"><a class="reference internal" href="reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -148,7 +168,7 @@
 <h2>About TensorRT-LLM<a class="headerlink" href="#about-tensorrt-llm" title="Link to this heading"></a></h2>
 <p><a class="reference external" href="https://developer.nvidia.com/tensorrt">TensorRT-LLM</a> accelerates and optimizes inference performance for the latest large language models (LLMs) on NVIDIA GPUs. This open-source library is available for free on the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM GitHub repo</a> and as part of the <a class="reference external" href="https://www.nvidia.com/en-us/ai-data-science/generative-ai/nemo-framework/">NVIDIA NeMo framework</a>.</p>
 <p>LLMs have revolutionized the field of artificial intelligence and created entirely new ways of interacting with the digital world. But, as organizations and application developers around the world look to incorporate LLMs into their work, some of the challenges with running these models become apparent. Put simply, LLMs are large. That fact can make them expensive and slow to run without the right techniques.</p>
-<p>TensorRT-LLM offers a comprehensive library for compiling and optimizing LLMs for inference. TensorRT-LLM incorporates all of the optimizations (that is, kernel fusion and quantization, runtime optimizations like C++ implementations, KV caching, continuous in-flight batching, and paged attention) and more, while providing an intuitive Python API for defining and building new models.</p>
+<p>TensorRT-LLM offers a comprehensive library for compiling and optimizing LLMs for inference. TensorRT-LLM incorporates all of the optimizations (that is, kernel fusion and quantization, runtime optimizations like C++ implementations, KV caching, continuous in-flight batching, and paged attention) and more, while providing an intuitive Model Definition API for defining and building new models.</p>
 <p>Some of the major benefits that TensorRT-LLM provides are:</p>
 <section id="common-llm-support">
 <h3>Common LLM Support<a class="headerlink" href="#common-llm-support" title="Link to this heading"></a></h3>
@@ -160,7 +180,7 @@
 </section>
 <section id="multi-gpu-multi-node-inference">
 <h3>Multi-GPU Multi-Node Inference<a class="headerlink" href="#multi-gpu-multi-node-inference" title="Link to this heading"></a></h3>
-<p>TensorRT-LLM consists of pre– and post-processing steps and multi-GPU multi-node communication primitives in a simple, open-source Python API for groundbreaking LLM inference performance on GPUs. Refer to the <a class="reference internal" href="architecture/core-concepts.html#multi-gpu-multi-node"><span class="std std-ref">Multi-GPU and Multi-Node Support</span></a> section for more information.</p>
+<p>TensorRT-LLM consists of pre– and post-processing steps and multi-GPU multi-node communication primitives in a simple, open-source Model Definition API for groundbreaking LLM inference performance on GPUs. Refer to the <a class="reference internal" href="architecture/core-concepts.html#multi-gpu-multi-node"><span class="std std-ref">Multi-GPU and Multi-Node Support</span></a> section for more information.</p>
 </section>
 <section id="fp8-support">
 <h3>FP8 Support<a class="headerlink" href="#fp8-support" title="Link to this heading"></a></h3>
@@ -178,7 +198,7 @@
 <section id="what-can-you-do-with-tensorrt-llm">
 <h2>What Can You Do With TensorRT-LLM?<a class="headerlink" href="#what-can-you-do-with-tensorrt-llm" title="Link to this heading"></a></h2>
 <p>Let TensorRT-LLM accelerate inference performance on the latest LLMs on NVIDIA GPUs. Use TensorRT-LLM as an optimization backbone for LLM inference in NVIDIA NeMo, an end-to-end framework to build, customize, and deploy generative AI applications into production. NeMo provides complete containers, including TensorRT-LLM and NVIDIA Triton, for generative AI deployments.</p>
-<p>TensorRT-LLM improves ease of use and extensibility through an open-source modular Python API for defining, optimizing, and executing new architectures and enhancements as LLMs evolve, and can be customized easily.</p>
+<p>TensorRT-LLM improves ease of use and extensibility through an open-source modular Model Definition API for defining, optimizing, and executing new architectures and enhancements as LLMs evolve, and can be customized easily.</p>
 <p>If you’re eager to dive into the world of LLMs, now is the time to get started with TensorRT-LLM. Explore its capabilities, experiment with different models and optimizations, and embark on your journey to unlock the incredible power of AI-driven language models. To get started, refer to the <a class="reference internal" href="quick-start-guide.html#quick-start-guide"><span class="std std-ref">Quick Start Guide</span></a>.</p>
 </section>
 </section>
@@ -194,7 +214,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d21e1a320>
+<jinja2.runtime.BlockReference object at 0x7f4253465660>
 
 <div class="footer">
     <p>

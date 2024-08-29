@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../../">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tensorrt_llm.quantization.quantize_by_modelopt &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script src="../../../_static/jquery.js?v=5d32c60e"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+        <script src="../../../_static/doctools.js?v=888ff710"></script>
+        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">Module code</a></li>
+      <li class="breadcrumb-item active">tensorrt_llm.quantization.quantize_by_modelopt</li>
+      <li class="wy-breadcrumbs-aside">
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <h1>Source code for tensorrt_llm.quantization.quantize_by_modelopt</h1><div class="highlight"><pre>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Adapted from examples/quantization/hf_ptq.py</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span> <span class="nn">copy</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">random</span>
+<span class="kn">import</span> <span class="nn">sys</span>
+<span class="kn">import</span> <span class="nn">time</span>
+
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">safetensors</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">from</span> <span class="nn">datasets</span> <span class="kn">import</span> <span class="n">load_dataset</span>
+<span class="kn">from</span> <span class="nn">safetensors.torch</span> <span class="kn">import</span> <span class="n">load_file</span><span class="p">,</span> <span class="n">save_file</span>
+<span class="kn">from</span> <span class="nn">torch.utils.data</span> <span class="kn">import</span> <span class="n">DataLoader</span>
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
+
+<span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">.mode</span> <span class="kn">import</span> <span class="n">QuantAlgo</span>
+
+<span class="n">EMPTY_CFG</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;quant_cfg&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;*weight_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="p">},</span>
+        <span class="s2">&quot;*input_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">False</span>
+        <span class="p">},</span>
+        <span class="s2">&quot;*lm_head*&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">False</span>
+        <span class="p">},</span>
+        <span class="s2">&quot;*output_layer*&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">False</span>
+        <span class="p">},</span>
+        <span class="s2">&quot;default&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">False</span>
+        <span class="p">},</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;algorithm&quot;</span><span class="p">:</span> <span class="s2">&quot;max&quot;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="n">KV_CACHE_CFG</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;*.query_key_value.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;*.Wqkv.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;*.W_pack.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;*.c_attn.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;*.k_proj.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;*.v_proj.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+<span class="p">}</span>
+
+
+<span class="k">def</span> <span class="nf">quant_cfg_choices</span><span class="p">():</span>
+    <span class="kn">import</span> <span class="nn">modelopt.torch.quantization</span> <span class="k">as</span> <span class="nn">atq</span>
+    <span class="n">QUANT_CFG_CHOICES</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;int8_sq&quot;</span><span class="p">:</span> <span class="n">atq</span><span class="o">.</span><span class="n">INT8_SMOOTHQUANT_CFG</span><span class="p">,</span>
+        <span class="s2">&quot;fp8&quot;</span><span class="p">:</span> <span class="n">atq</span><span class="o">.</span><span class="n">FP8_DEFAULT_CFG</span><span class="p">,</span>
+        <span class="s2">&quot;int4_awq&quot;</span><span class="p">:</span> <span class="n">atq</span><span class="o">.</span><span class="n">INT4_AWQ_CFG</span><span class="p">,</span>
+        <span class="s2">&quot;w4a8_awq&quot;</span><span class="p">:</span> <span class="n">atq</span><span class="o">.</span><span class="n">W4A8_AWQ_BETA_CFG</span><span class="p">,</span>
+        <span class="s2">&quot;int8_wo&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
+        <span class="s2">&quot;int4_wo&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
+        <span class="s2">&quot;full_prec&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="k">return</span> <span class="n">QUANT_CFG_CHOICES</span>
+
+
+<span class="n">MODEL_NAME_PATTERN_MAP</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;GPT2&quot;</span><span class="p">:</span> <span class="s2">&quot;gpt2&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Xverse&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Llama&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Mistral&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GPTJ&quot;</span><span class="p">:</span> <span class="s2">&quot;gptj&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;FalconForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;falcon&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;RWForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;falcon&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;baichuan&quot;</span><span class="p">:</span> <span class="s2">&quot;baichuan&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;MPT&quot;</span><span class="p">:</span> <span class="s2">&quot;mpt&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Bloom&quot;</span><span class="p">:</span> <span class="s2">&quot;bloom&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;ChatGLM&quot;</span><span class="p">:</span> <span class="s2">&quot;chatglm&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;QWen&quot;</span><span class="p">:</span> <span class="s2">&quot;qwen&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Gemma&quot;</span><span class="p">:</span> <span class="s2">&quot;gemma&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;MixtralForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;ArcticForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3small&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Phi3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Starcoder2ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gptnext&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GLM&quot;</span><span class="p">:</span> <span class="s2">&quot;glm&quot;</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<span class="k">def</span> <span class="nf">get_tokenizer</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing tokenizer from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+        <span class="n">ckpt_path</span><span class="p">,</span>
+        <span class="n">model_max_length</span><span class="o">=</span><span class="n">max_seq_length</span><span class="p">,</span>
+        <span class="n">padding_side</span><span class="o">=</span><span class="s2">&quot;left&quot;</span><span class="p">,</span>
+        <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">model_type</span> <span class="ow">and</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen&quot;</span><span class="p">:</span>
+            <span class="c1"># qwen use token id 151643 as pad and eos tokens</span>
+            <span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_ids_to_tokens</span><span class="p">(</span><span class="mi">151643</span><span class="p">)</span>
+            <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_ids_to_tokens</span><span class="p">(</span><span class="mi">151643</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token</span>
+    <span class="k">assert</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Pad token for </span><span class="si">{</span><span class="n">model_type</span><span class="si">}</span><span class="s2"> cannot be set!&quot;</span>
+
+    <span class="k">return</span> <span class="n">tokenizer</span>
+
+
+<span class="k">def</span> <span class="nf">_get_vila_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">):</span>
+    <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">model_dir</span> <span class="o">+</span> <span class="s2">&quot;/../VILA&quot;</span><span class="p">)</span>
+    <span class="kn">from</span> <span class="nn">llava.model</span> <span class="kn">import</span> <span class="n">LlavaLlamaConfig</span><span class="p">,</span> <span class="n">LlavaLlamaModel</span>  <span class="c1"># noqa</span>
+    <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModel</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+        <span class="n">model_dir</span><span class="p">,</span>
+        <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+        <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">llm</span>
+
+
+<span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;fp16&quot;</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing model from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;bf16&quot;</span> <span class="ow">or</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">:</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
+    <span class="k">elif</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;fp16&quot;</span> <span class="ow">or</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;float16&quot;</span><span class="p">:</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float16</span>
+    <span class="k">elif</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;fp32&quot;</span> <span class="ow">or</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;float32&quot;</span><span class="p">:</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown dtype </span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo</span>
+    <span class="n">hf_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">model_cls</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span>
+    <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaForConditionalGeneration</span>
+        <span class="n">model_cls</span> <span class="o">=</span> <span class="n">LlavaForConditionalGeneration</span>
+    <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">_get_vila_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;glm&quot;</span><span class="p">:</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModelForSeq2SeqLM</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForSeq2SeqLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span>
+                                                      <span class="n">device_map</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span>
+                                                      <span class="n">torch_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                                                      <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+            <span class="n">ckpt_path</span><span class="p">,</span>
+            <span class="n">device_map</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span> <span class="k">if</span> <span class="n">device</span> <span class="o">!=</span> <span class="s2">&quot;cpu&quot;</span> <span class="k">else</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
+            <span class="n">torch_dtype</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+            <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
+            <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+
+    <span class="n">model_dtype</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">())</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="k">if</span> <span class="n">dtype</span> <span class="o">!=</span> <span class="n">model_dtype</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;[TensorRT-LLM][WARNING] The manually set model data type is </span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2">, &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;but the data type of the HuggingFace model is </span><span class="si">{</span><span class="n">model_dtype</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">model</span>
+
+
+<span class="k">def</span> <span class="nf">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+            <span class="k">return</span> <span class="n">v</span>
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span> <span class="nf">get_calib_dataloader</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="s2">&quot;cnn_dailymail&quot;</span><span class="p">,</span>
+                         <span class="n">tokenizer</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                         <span class="n">batch_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                         <span class="n">calib_size</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+                         <span class="n">block_size</span><span class="o">=</span><span class="mi">512</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Loading calibration dataset&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">dataset_name_or_dir</span> <span class="o">==</span> <span class="s2">&quot;pileval&quot;</span><span class="p">:</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span>
+            <span class="s2">&quot;json&quot;</span><span class="p">,</span>
+            <span class="n">data_files</span><span class="o">=</span><span class="s2">&quot;https://the-eye.eu/public/AI/pile/val.jsonl.zst&quot;</span><span class="p">,</span>
+            <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">][:</span><span class="n">calib_size</span><span class="p">]</span>
+    <span class="k">elif</span> <span class="s2">&quot;cnn_dailymail&quot;</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="p">:</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;3.0.0&quot;</span><span class="p">,</span> <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="s2">&quot;article&quot;</span><span class="p">][:</span><span class="n">calib_size</span><span class="p">]</span>
+    <span class="k">elif</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isdir</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">):</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Recognized local dataset repo </span><span class="si">{</span><span class="n">dataset_name_or_dir</span><span class="si">}</span><span class="s2"> for calibration; &quot;</span>
+            <span class="s2">&quot;assuming the calibration data are in the train split and text column.&quot;</span>
+        <span class="p">)</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">,</span> <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">][:</span><span class="n">calib_size</span><span class="p">]</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Unsupported dataset name or local repo directory: </span><span class="si">{</span><span class="n">dataset_name_or_dir</span><span class="si">}</span><span class="s2">.&quot;</span>
+        <span class="p">)</span>
+
+    <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_encode_plus</span><span class="p">(</span><span class="n">dataset</span><span class="p">,</span>
+                                                <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
+                                                <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                                <span class="n">truncation</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                                <span class="n">max_length</span><span class="o">=</span><span class="n">block_size</span><span class="p">)</span>
+    <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span>
+
+    <span class="n">calib_dataloader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span><span class="n">batch_encoded</span><span class="p">,</span>
+                                  <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+                                  <span class="n">shuffle</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">calib_dataloader</span>
+
+
+<span class="k">def</span> <span class="nf">quantize_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_cfg</span><span class="p">,</span> <span class="n">calib_dataloader</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="kn">import</span> <span class="nn">modelopt.torch.quantization</span> <span class="k">as</span> <span class="nn">atq</span>
+
+    <span class="k">def</span> <span class="nf">calibrate_loop</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">calib_dataloader</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Adjusts weights and scaling factors based on selected algorithms.&quot;&quot;&quot;</span>
+        <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">data</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">calib_dataloader</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Calibrating batch </span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="c1"># model might be mapped to different device because the device_map is auto</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">model</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Starting quantization...&quot;</span><span class="p">)</span>
+    <span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+    <span class="n">atq</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_cfg</span><span class="p">,</span> <span class="n">forward_loop</span><span class="o">=</span><span class="n">calibrate_loop</span><span class="p">)</span>
+    <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+        <span class="s2">&quot;Quantization done. Total time used: </span><span class="si">{:.2f}</span><span class="s2"> s.&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">end_time</span> <span class="o">-</span>
+                                                               <span class="n">start_time</span><span class="p">))</span>
+
+    <span class="k">return</span> <span class="n">model</span>
+
+
+<span class="k">def</span> <span class="nf">combine_medusa_weight</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">base_model_output_dir</span><span class="p">,</span>
+                          <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span> <span class="n">max_draft_len</span><span class="p">,</span>
+                          <span class="n">medusa_hidden_act</span><span class="p">,</span> <span class="n">medusa_model_dir</span><span class="p">,</span>
+                          <span class="n">quant_medusa_head</span><span class="p">):</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">medusa_model_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">fp</span><span class="p">:</span>
+        <span class="n">medusa_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
+
+    <span class="n">num_medusa_heads_from_config</span> <span class="o">=</span> <span class="n">medusa_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;medusa_num_heads&#39;</span><span class="p">,</span>
+                                                     <span class="n">num_medusa_heads</span><span class="p">)</span>
+    <span class="n">num_medusa_layers</span> <span class="o">=</span> <span class="n">medusa_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;medusa_num_layers&#39;</span><span class="p">,</span>
+                                          <span class="n">num_medusa_layers</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">num_medusa_heads</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">num_medusa_heads</span> <span class="o">=</span> <span class="n">num_medusa_heads_from_config</span>
+
+    <span class="k">assert</span> <span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;should have max_draft_len &gt; 0&quot;</span>
+
+    <span class="n">world_size</span> <span class="o">=</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="n">pp_size</span>
+    <span class="c1"># Process for each rank</span>
+    <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">world_size</span><span class="p">):</span>
+        <span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+                          <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+                          <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                          <span class="n">pp_size</span><span class="o">=</span><span class="n">pp_size</span><span class="p">)</span>
+        <span class="c1"># 1. Load medusa weight for each rank</span>
+        <span class="kn">from</span> <span class="nn">tensorrt_llm.models.medusa.weight</span> <span class="kn">import</span> <span class="n">load_medusa_hf</span>
+        <span class="n">medusa_weights</span> <span class="o">=</span> <span class="n">load_medusa_hf</span><span class="p">(</span><span class="n">medusa_path</span><span class="o">=</span><span class="n">medusa_model_dir</span><span class="p">,</span>
+                                        <span class="n">num_medusa_heads</span><span class="o">=</span><span class="n">num_medusa_heads</span><span class="p">,</span>
+                                        <span class="n">num_medusa_layers</span><span class="o">=</span><span class="n">num_medusa_layers</span><span class="p">,</span>
+                                        <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">)</span>
+        <span class="c1"># 2. Load base model safetensors (after quant)</span>
+        <span class="n">base_model_weights</span> <span class="o">=</span> <span class="n">load_file</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base_model_output_dir</span><span class="si">}</span><span class="s2">/rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s2">.safetensors&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 3. Combine and save weight</span>
+        <span class="n">base_model_weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">medusa_weights</span><span class="p">)</span>
+        <span class="n">save_file</span><span class="p">(</span><span class="n">base_model_weights</span><span class="p">,</span>
+                  <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base_model_output_dir</span><span class="si">}</span><span class="s2">/rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s2">.safetensors&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 4. Add medusa config into config.json</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base_model_output_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s1">&#39;r&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">base_model_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base_model_output_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s1">&#39;w&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">base_model_config</span><span class="p">[</span><span class="s1">&#39;architecture&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;MedusaForCausalLM&quot;</span>
+        <span class="n">base_model_config</span><span class="p">[</span><span class="s1">&#39;quantization&#39;</span><span class="p">][</span><span class="s1">&#39;exclude_modules&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="s1">&#39;lm_head&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;*router&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;*vocab_embedding&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;*position_embedding&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;*block_embedding&#39;</span><span class="p">,</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">quant_medusa_head</span><span class="p">:</span>
+            <span class="n">base_model_config</span><span class="p">[</span><span class="s1">&#39;quantization&#39;</span><span class="p">][</span><span class="s1">&#39;exclude_modules&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="s1">&#39;*medusa_heads*&#39;</span><span class="p">)</span>
+
+        <span class="n">base_model_config</span><span class="p">[</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">max_draft_len</span>
+        <span class="n">base_model_config</span><span class="p">[</span><span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">num_medusa_heads</span>
+        <span class="n">base_model_config</span><span class="p">[</span><span class="s1">&#39;num_medusa_layers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">num_medusa_layers</span>
+        <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">base_model_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Combine medusa heads&#39; weight, done.&quot;</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="quantize_and_export">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.quantize_and_export">[docs]</a>
+<span class="k">def</span> <span class="nf">quantize_and_export</span><span class="p">(</span><span class="o">*</span><span class="p">,</span>
+                        <span class="n">model_dir</span><span class="p">,</span>
+                        <span class="n">device</span><span class="p">,</span>
+                        <span class="n">calib_dataset</span><span class="p">,</span>
+                        <span class="n">dtype</span><span class="p">,</span>
+                        <span class="n">qformat</span><span class="p">,</span>
+                        <span class="n">kv_cache_dtype</span><span class="p">,</span>
+                        <span class="n">calib_size</span><span class="p">,</span>
+                        <span class="n">batch_size</span><span class="p">,</span>
+                        <span class="n">calib_max_seq_length</span><span class="p">,</span>
+                        <span class="n">awq_block_size</span><span class="p">,</span>
+                        <span class="n">output_dir</span><span class="p">,</span>
+                        <span class="n">tp_size</span><span class="p">,</span>
+                        <span class="n">pp_size</span><span class="p">,</span>
+                        <span class="n">seed</span><span class="p">,</span>
+                        <span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
+                        <span class="n">num_medusa_heads</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">num_medusa_layers</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">max_draft_len</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">medusa_hidden_act</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">medusa_model_dir</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                        <span class="n">quant_medusa_head</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">        Load model from the model_dir, call Modelopt to quantize the model, and then export</span>
+<span class="sd">        the quantized model as TRT-LLM checkpoint</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span> <span class="nn">modelopt</span>  <span class="c1"># noqa</span>
+    <span class="k">except</span> <span class="ne">ImportError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+            <span class="s2">&quot;Failed to import modelopt, pls check the Modelopt installation. Currently it is known to be unsupported on Windows OS&quot;</span>
+        <span class="p">)</span>
+        <span class="k">raise</span> <span class="n">e</span>
+
+    <span class="kn">from</span> <span class="nn">modelopt.torch.export</span> <span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">raise</span> <span class="ne">EnvironmentError</span><span class="p">(</span><span class="s2">&quot;GPU is required for inference.&quot;</span><span class="p">)</span>
+
+    <span class="n">random</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+    <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+
+    <span class="n">model</span> <span class="o">=</span> <span class="n">get_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">model_type</span> <span class="o">=</span> <span class="n">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="n">model_dir</span><span class="p">:</span>
+        <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">get_tokenizer</span><span class="p">(</span><span class="n">model_dir</span> <span class="o">+</span> <span class="s2">&quot;/llm&quot;</span><span class="p">,</span>
+                                  <span class="n">max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
+                                  <span class="n">model_type</span><span class="o">=</span><span class="n">model_type</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">get_tokenizer</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                  <span class="n">max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
+                                  <span class="n">model_type</span><span class="o">=</span><span class="n">model_type</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;full_prec&quot;</span><span class="p">,</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;int4_wo&quot;</span>
+                   <span class="p">]</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;No quantization applied, export </span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2"> model&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">if</span> <span class="s2">&quot;awq&quot;</span> <span class="ow">in</span> <span class="n">qformat</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">calib_size</span> <span class="o">&gt;</span> <span class="mi">32</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;AWQ calibration could take longer with calib_size = </span><span class="si">{</span><span class="n">calib_size</span><span class="si">}</span><span class="s2">, Using&quot;</span>
+                    <span class="s2">&quot; calib_size=32 instead&quot;</span><span class="p">)</span>
+                <span class="n">calib_size</span> <span class="o">=</span> <span class="mi">32</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">AWQ calibration could take longer than other calibration methods. Please&quot;</span>
+                <span class="s2">&quot; increase the batch size to speed up the calibration process. Batch size can be&quot;</span>
+                <span class="s2">&quot; set by adding the argument --batch_size &lt;batch_size&gt; to the command line.</span><span class="se">\n</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+
+        <span class="n">calib_dataloader</span> <span class="o">=</span> <span class="n">get_calib_dataloader</span><span class="p">(</span>
+            <span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="n">calib_dataset</span><span class="p">,</span>
+            <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
+            <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+            <span class="n">calib_size</span><span class="o">=</span><span class="n">calib_size</span><span class="p">,</span>
+            <span class="n">block_size</span><span class="o">=</span><span class="n">calib_max_seq_length</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="n">quant_cfg_choices</span><span class="p">():</span>
+            <span class="n">quant_cfg</span> <span class="o">=</span> <span class="n">quant_cfg_choices</span><span class="p">()[</span><span class="n">qformat</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported quantization format: </span><span class="si">{</span><span class="n">qformat</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="s2">&quot;awq&quot;</span> <span class="ow">in</span> <span class="n">qformat</span><span class="p">:</span>
+            <span class="n">quant_cfg</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">quant_cfg_choices</span><span class="p">()[</span><span class="n">qformat</span><span class="p">])</span>
+            <span class="n">weight_quantizer</span> <span class="o">=</span> <span class="n">quant_cfg</span><span class="p">[</span><span class="s2">&quot;quant_cfg&quot;</span><span class="p">][</span>
+                <span class="s2">&quot;*weight_quantizer&quot;</span><span class="p">]</span>  <span class="c1"># type: ignore</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">weight_quantizer</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">weight_quantizer</span> <span class="o">=</span> <span class="n">weight_quantizer</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">weight_quantizer</span><span class="p">[</span><span class="s2">&quot;block_sizes&quot;</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">awq_block_size</span>
+
+        <span class="k">if</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">kv_cache_dtype</span> <span class="o">==</span> <span class="s2">&quot;fp8&quot;</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">KV_CACHE_CFG</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                    <span class="n">value</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">)})</span>  <span class="c1"># type: ignore</span>
+            <span class="n">quant_cfg</span><span class="p">[</span><span class="s2">&quot;quant_cfg&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">KV_CACHE_CFG</span><span class="p">)</span>  <span class="c1"># type: ignore</span>
+
+        <span class="n">model</span> <span class="o">=</span> <span class="n">quantize_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_cfg</span><span class="p">,</span> <span class="n">calib_dataloader</span><span class="p">)</span>
+
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">inference_mode</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">model_type</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Unknown model type </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">. Continue exporting...&quot;</span>
+            <span class="p">)</span>
+            <span class="n">model_type</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;unknown:</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">&quot;</span>
+
+        <span class="n">export_path</span> <span class="o">=</span> <span class="n">output_dir</span>
+        <span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+
+        <span class="n">export_tensorrt_llm_checkpoint</span><span class="p">(</span><span class="n">model</span><span class="p">,</span>
+                                       <span class="n">model_type</span><span class="p">,</span>
+                                       <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="p">,</span> <span class="n">dtype</span><span class="p">),</span>
+                                       <span class="n">export_dir</span><span class="o">=</span><span class="n">export_path</span><span class="p">,</span>
+                                       <span class="n">inference_tensor_parallel</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                                       <span class="n">inference_pipeline_parallel</span><span class="o">=</span><span class="n">pp_size</span><span class="p">)</span>
+
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+
+        <span class="c1"># Workaround for wo quantization</span>
+        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;full_prec&quot;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span>
+                    <span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span>
+            <span class="k">elif</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span>
+                    <span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="c1"># HF uses rope_scaling while tensorrt_llm uses rotary_scaling</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+                <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span>
+                <span class="s2">&quot;rope_scaling&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;rotary_scaling&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">tensorrt_llm_config</span><span class="p">:</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;rotary_scaling&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+                <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;rope_scaling&quot;</span><span class="p">)</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+        <span class="c1"># Workaround for Modelopt 0.9.x fp8_kv_cache knob issue</span>
+        <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;kv_cache_quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+        <span class="c1"># Workaround for share_embedding_table</span>
+        <span class="k">if</span> <span class="n">pp_size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">with</span> <span class="n">safetensors</span><span class="o">.</span><span class="n">safe_open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/rank0.safetensors&quot;</span><span class="p">,</span>
+                                       <span class="n">framework</span><span class="o">=</span><span class="s1">&#39;pt&#39;</span><span class="p">,</span>
+                                       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">share_embedding_table</span> <span class="o">=</span> <span class="s1">&#39;lm_head.weight&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">f</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">share_embedding_table</span><span class="p">:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;share_embedding_table&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+        <span class="c1"># Workaround for qwen version</span>
+        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;qwen&#39;</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                                     <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;qwen_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span>
+            <span class="k">if</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen2&quot;</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;norm_epsilon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rms_norm_eps</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;rotary_base&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rope_theta</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span>
+                <span class="s2">&quot;intermediate_size&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">intermediate_size</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+        <span class="c1"># Set rotary parameters correctly for chatglm.</span>
+        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;chatglm&#39;</span><span class="p">:</span>
+            <span class="n">rotary_base</span> <span class="o">=</span> <span class="mf">10000.0</span>
+            <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="n">chatglm_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                                        <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">chatglm_version</span> <span class="o">=</span> <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;chatglm_version&#39;</span><span class="p">]</span>
+            <span class="n">rope_ratio</span> <span class="o">=</span> <span class="n">tensorrt_llm_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;rope_ratio&#39;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">chatglm_version</span> <span class="o">==</span> <span class="s1">&#39;chatglm2&#39;</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">rope_ratio</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s1">&#39;type&#39;</span><span class="p">:</span> <span class="s1">&#39;linear&#39;</span><span class="p">,</span>
+                        <span class="s1">&#39;factor&#39;</span><span class="p">:</span> <span class="n">rope_ratio</span>
+                    <span class="p">}</span>
+            <span class="k">elif</span> <span class="n">chatglm_version</span> <span class="o">==</span> <span class="s1">&#39;chatglm3&#39;</span><span class="p">:</span>
+                <span class="n">rotary_base</span> <span class="o">*=</span> <span class="n">rope_ratio</span>
+
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_base&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rotary_base</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_scaling&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rotary_embedding_scaling</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_pct&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.5</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">(</span>
+        <span class="p">)</span>  <span class="c1"># otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use</span>
+
+        <span class="c1"># Workaround for combining medusa head</span>
+        <span class="c1"># TODO: move these integration into modelopt to avoid redundant reading and writing</span>
+        <span class="k">if</span> <span class="n">medusa_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">combine_medusa_weight</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">export_path</span><span class="p">,</span>
+                                  <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span>
+                                  <span class="n">max_draft_len</span><span class="p">,</span> <span class="n">medusa_hidden_act</span><span class="p">,</span>
+                                  <span class="n">medusa_model_dir</span><span class="p">,</span> <span class="n">quant_medusa_head</span><span class="p">)</span>
+        <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">&quot;Quantized model exported to </span><span class="si">{}</span><span class="s2"> </span><span class="se">\n</span><span class="s2">Total time used </span><span class="si">{:.2f}</span><span class="s2"> s.&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span>
+                <span class="n">export_path</span><span class="p">,</span> <span class="n">end_time</span> <span class="o">-</span> <span class="n">start_time</span><span class="p">))</span></div>
+
+
+
+<span class="k">def</span> <span class="nf">unwrap_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">module_instances</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="c1"># Reference: https://github.com/NVIDIA/Megatron-LM/blob/core_r0.8.0/megatron/training/utils.py</span>
+    <span class="kn">from</span> <span class="nn">megatron.core</span> <span class="kn">import</span> <span class="n">DistributedDataParallel</span> <span class="k">as</span> <span class="n">DDP</span>
+    <span class="kn">from</span> <span class="nn">megatron.core.transformer.module</span> <span class="kn">import</span> <span class="n">Float16Module</span>
+
+    <span class="k">if</span> <span class="n">module_instances</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">module_instances</span> <span class="o">=</span> <span class="p">(</span><span class="n">DDP</span><span class="p">,</span> <span class="n">Float16Module</span><span class="p">)</span>
+
+    <span class="n">return_list</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="p">[</span><span class="n">model</span><span class="p">]</span>
+        <span class="n">return_list</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">unwrapped_model</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">model_module</span> <span class="ow">in</span> <span class="n">model</span><span class="p">:</span>
+        <span class="k">while</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">model_module</span><span class="p">,</span> <span class="n">module_instances</span><span class="p">):</span>
+            <span class="n">model_module</span> <span class="o">=</span> <span class="n">model_module</span><span class="o">.</span><span class="n">module</span>
+        <span class="n">unwrapped_model</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">model_module</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">return_list</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">unwrapped_model</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">unwrapped_model</span>
+
+
+<span class="k">def</span> <span class="nf">get_nemo_calib_dataloader</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="s2">&quot;cnn_dailymail&quot;</span><span class="p">,</span>
+                              <span class="n">batch_size</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+                              <span class="n">calib_size</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+                              <span class="n">max_sequence_length</span><span class="o">=</span><span class="mi">512</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">dataset_name_or_dir</span> <span class="o">==</span> <span class="s2">&quot;pileval&quot;</span><span class="p">:</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span>
+            <span class="s2">&quot;json&quot;</span><span class="p">,</span>
+            <span class="n">data_files</span><span class="o">=</span><span class="s2">&quot;https://the-eye.eu/public/AI/pile/val.jsonl.zst&quot;</span><span class="p">,</span>
+            <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">text_column</span> <span class="o">=</span> <span class="s2">&quot;text&quot;</span>
+    <span class="k">elif</span> <span class="s2">&quot;wikitext&quot;</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="p">:</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">,</span>
+                               <span class="s2">&quot;wikitext-103-v1&quot;</span><span class="p">,</span>
+                               <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">text_column</span> <span class="o">=</span> <span class="s2">&quot;text&quot;</span>
+    <span class="k">elif</span> <span class="s2">&quot;cnn_dailymail&quot;</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="p">:</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;3.0.0&quot;</span><span class="p">,</span> <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">text_column</span> <span class="o">=</span> <span class="s2">&quot;article&quot;</span>
+    <span class="k">elif</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isdir</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">):</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Recognized local dataset repo </span><span class="si">{</span><span class="n">dataset_name_or_dir</span><span class="si">}</span><span class="s2"> for calibration; &quot;</span>
+            <span class="s2">&quot;assuming the calibration data are in the train split and text column.&quot;</span>
+        <span class="p">)</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">,</span> <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
+        <span class="n">text_column</span> <span class="o">=</span> <span class="s2">&quot;text&quot;</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Unsupported dataset name or local repo directory: </span><span class="si">{</span><span class="n">dataset_name_or_dir</span><span class="si">}</span><span class="s2">.&quot;</span>
+        <span class="p">)</span>
+    <span class="n">calib_size</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">dataset</span><span class="p">),</span> <span class="n">calib_size</span><span class="p">),</span> <span class="n">batch_size</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">calib_size</span> <span class="o">//</span> <span class="n">batch_size</span><span class="p">):</span>
+        <span class="n">batch</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">i</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">:(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">][</span><span class="n">text_column</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">batch</span><span class="p">)):</span>
+            <span class="n">batch</span><span class="p">[</span><span class="n">j</span><span class="p">]</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="n">j</span><span class="p">][:</span><span class="n">max_sequence_length</span><span class="p">]</span>
+        <span class="k">yield</span> <span class="n">batch</span>
+
+
+<span class="k">def</span> <span class="nf">quantize_nemo_and_export</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">nemo_ckpt_path</span><span class="p">,</span> <span class="n">decoder_type</span><span class="p">,</span> <span class="n">calib_dataset</span><span class="p">,</span>
+                             <span class="n">calib_tp_size</span><span class="p">,</span> <span class="n">calib_pp_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">qformat</span><span class="p">,</span>
+                             <span class="n">kv_cache_dtype</span><span class="p">,</span> <span class="n">calib_size</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span>
+                             <span class="n">calib_max_seq_length</span><span class="p">,</span> <span class="n">awq_block_size</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">,</span>
+                             <span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">seed</span><span class="p">):</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">import</span> <span class="nn">modelopt</span>  <span class="c1"># noqa</span>
+    <span class="k">except</span> <span class="ne">ImportError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+            <span class="s2">&quot;Failed to import modelopt, pls check the modelopt installation. Currently it is known to be unsupported on Windows OS&quot;</span>
+        <span class="p">)</span>
+        <span class="k">raise</span> <span class="n">e</span>
+
+    <span class="kn">import</span> <span class="nn">modelopt.torch.quantization</span> <span class="k">as</span> <span class="nn">atq</span>
+    <span class="kn">from</span> <span class="nn">megatron.core</span> <span class="kn">import</span> <span class="n">parallel_state</span>
+    <span class="kn">from</span> <span class="nn">megatron.core.transformer.module</span> <span class="kn">import</span> <span class="n">Float16Module</span>
+    <span class="kn">from</span> <span class="nn">modelopt.torch.export</span> <span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
+    <span class="kn">from</span> <span class="nn">modelopt.torch.utils</span> <span class="kn">import</span> <span class="n">print_rank_0</span>
+    <span class="kn">from</span> <span class="nn">nemo.collections.nlp.models.language_modeling.megatron_gpt_model</span> <span class="kn">import</span> \
+        <span class="n">MegatronGPTModel</span>
+    <span class="kn">from</span> <span class="nn">nemo.collections.nlp.modules.common.text_generation_strategy</span> <span class="kn">import</span> \
+        <span class="n">GPTModelTextGenerationStrategy</span>
+    <span class="kn">from</span> <span class="nn">nemo.collections.nlp.parts.nlp_overrides</span> <span class="kn">import</span> <span class="p">(</span>
+        <span class="n">NLPDDPStrategy</span><span class="p">,</span> <span class="n">NLPSaveRestoreConnector</span><span class="p">)</span>
+    <span class="kn">from</span> <span class="nn">nemo.utils.model_utils</span> <span class="kn">import</span> <span class="n">load_config</span><span class="p">,</span> <span class="n">save_artifacts</span>
+    <span class="kn">from</span> <span class="nn">omegaconf.omegaconf</span> <span class="kn">import</span> <span class="n">open_dict</span>
+    <span class="kn">from</span> <span class="nn">pytorch_lightning.trainer.trainer</span> <span class="kn">import</span> <span class="n">Trainer</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">raise</span> <span class="ne">EnvironmentError</span><span class="p">(</span><span class="s2">&quot;GPU is required for the inference.&quot;</span><span class="p">)</span>
+
+    <span class="n">random</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+    <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
+
+    <span class="c1"># dtype is used for non-quantized layers</span>
+    <span class="n">supported_dtype</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">]</span>
+    <span class="k">assert</span> <span class="p">(</span><span class="n">dtype</span> <span class="ow">in</span> <span class="n">supported_dtype</span>
+            <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2"> not supported. Supported dtypes are </span><span class="si">{</span><span class="n">supported_dtype</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">torch_dtype</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+
+    <span class="n">model_cfg</span> <span class="o">=</span> <span class="n">load_config</span><span class="p">(</span><span class="n">nemo_ckpt_path</span><span class="p">)</span>
+
+    <span class="k">with</span> <span class="n">open_dict</span><span class="p">(</span><span class="n">model_cfg</span><span class="p">):</span>
+        <span class="n">model_cfg</span><span class="o">.</span><span class="n">activations_checkpoint_method</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">model_cfg</span><span class="o">.</span><span class="n">activations_checkpoint_granularity</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">model_cfg</span><span class="o">.</span><span class="n">tensor_model_parallel_size</span> <span class="o">=</span> <span class="n">calib_tp_size</span>
+        <span class="n">model_cfg</span><span class="o">.</span><span class="n">pipeline_model_parallel_size</span> <span class="o">=</span> <span class="n">calib_pp_size</span>
+        <span class="n">model_cfg</span><span class="o">.</span><span class="n">sequence_parallel</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="c1"># Only custom modelopt spec is supported for PTQ: this custom spec is largely based on local Megatron-LM</span>
+        <span class="c1"># layer definitions to avoid Transformer Engine implementations that are currently not supported.</span>
+        <span class="n">model_cfg</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="s2">&quot;modelopt&quot;</span>
+
+    <span class="c1"># trainer required for restoring model parallel models</span>
+    <span class="n">trainer_config</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s1">&#39;devices&#39;</span><span class="p">:</span> <span class="n">calib_tp_size</span> <span class="o">*</span> <span class="n">calib_pp_size</span><span class="p">,</span>
+        <span class="s1">&#39;num_nodes&#39;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="s1">&#39;accelerator&#39;</span><span class="p">:</span> <span class="s1">&#39;gpu&#39;</span><span class="p">,</span>
+        <span class="s1">&#39;logger&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="s1">&#39;precision&#39;</span><span class="p">:</span> <span class="n">model_cfg</span><span class="o">.</span><span class="n">precision</span><span class="p">,</span>
+        <span class="s1">&#39;enable_checkpointing&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="n">trainer</span> <span class="o">=</span> <span class="n">Trainer</span><span class="p">(</span><span class="n">strategy</span><span class="o">=</span><span class="n">NLPDDPStrategy</span><span class="p">(),</span> <span class="o">**</span><span class="n">trainer_config</span><span class="p">)</span>
+    <span class="n">connector</span> <span class="o">=</span> <span class="n">NLPSaveRestoreConnector</span><span class="p">()</span>
+
+    <span class="n">model</span> <span class="o">=</span> <span class="n">MegatronGPTModel</span><span class="o">.</span><span class="n">restore_from</span><span class="p">(</span>
+        <span class="n">restore_path</span><span class="o">=</span><span class="n">nemo_ckpt_path</span><span class="p">,</span>
+        <span class="n">trainer</span><span class="o">=</span><span class="n">trainer</span><span class="p">,</span>
+        <span class="n">override_config_path</span><span class="o">=</span><span class="n">model_cfg</span><span class="p">,</span>
+        <span class="n">save_restore_connector</span><span class="o">=</span><span class="n">connector</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">freeze</span><span class="p">()</span>
+
+    <span class="n">print_rank_0</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="c1"># Have to turn off activations_checkpoint_method for inference</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">module</span><span class="o">.</span><span class="n">language_model</span><span class="o">.</span><span class="n">encoder</span><span class="o">.</span><span class="n">activations_checkpoint_method</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="k">except</span> <span class="ne">AttributeError</span><span class="p">:</span>
+        <span class="k">pass</span>
+
+    <span class="c1"># Check whether the DDP is initialized</span>
+    <span class="k">if</span> <span class="n">parallel_state</span><span class="o">.</span><span class="n">is_unitialized</span><span class="p">():</span>
+
+        <span class="k">def</span> <span class="nf">dummy</span><span class="p">():</span>
+            <span class="k">return</span>
+
+        <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">strategy</span><span class="o">.</span><span class="n">launcher</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">model</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">strategy</span><span class="o">.</span><span class="n">launcher</span><span class="o">.</span><span class="n">launch</span><span class="p">(</span><span class="n">dummy</span><span class="p">,</span> <span class="n">trainer</span><span class="o">=</span><span class="n">model</span><span class="o">.</span><span class="n">trainer</span><span class="p">)</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">strategy</span><span class="o">.</span><span class="n">setup_environment</span><span class="p">()</span>
+
+    <span class="n">inference_config</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s1">&#39;greedy&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="s1">&#39;top_k&#39;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="s1">&#39;top_p&#39;</span><span class="p">:</span> <span class="mf">0.9</span><span class="p">,</span>
+        <span class="s1">&#39;temperature&#39;</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">,</span>
+        <span class="s1">&#39;add_BOS&#39;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="s1">&#39;tokens_to_generate&#39;</span><span class="p">:</span> <span class="mi">30</span><span class="p">,</span>
+        <span class="s1">&#39;all_probs&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="s1">&#39;repetition_penalty&#39;</span><span class="p">:</span> <span class="mf">1.2</span><span class="p">,</span>
+        <span class="s1">&#39;min_tokens_to_generate&#39;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="s1">&#39;compute_logprob&#39;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="s1">&#39;batch_size&#39;</span><span class="p">:</span> <span class="n">batch_size</span><span class="p">,</span>
+        <span class="s1">&#39;max_context_length&#39;</span><span class="p">:</span> <span class="n">calib_max_seq_length</span><span class="p">,</span>
+        <span class="s1">&#39;strategy&#39;</span><span class="p">:</span> <span class="n">GPTModelTextGenerationStrategy</span><span class="p">(</span><span class="n">model</span><span class="p">),</span>
+    <span class="p">}</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">set_inference_config</span><span class="p">(</span><span class="n">inference_config</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;full_prec&quot;</span><span class="p">,</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;int4_wo&quot;</span>
+                   <span class="p">]</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">print_rank_0</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;No quantization applied, export </span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2"> model&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">if</span> <span class="s2">&quot;awq&quot;</span> <span class="ow">in</span> <span class="n">qformat</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">calib_size</span> <span class="o">&gt;</span> <span class="mi">32</span><span class="p">:</span>
+                <span class="n">print_rank_0</span><span class="p">(</span>
+                    <span class="s2">&quot;AWQ calibration could take longer with calib_size =&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot; </span><span class="si">{</span><span class="n">calib_size</span><span class="si">}</span><span class="s2">, Using calib_size=32 instead&quot;</span><span class="p">)</span>
+                <span class="n">calib_size</span> <span class="o">=</span> <span class="mi">32</span>
+            <span class="n">print_rank_0</span><span class="p">(</span>
+                <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">AWQ calibration could take longer than other calibration methods. Please&quot;</span>
+                <span class="s2">&quot; increase the batch size to speed up the calibration process. Batch size can be&quot;</span>
+                <span class="s2">&quot; set by adding the argument inference.batch_size=&lt;batch_size&gt; to the command&quot;</span>
+                <span class="s2">&quot; line.</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="n">dataloader</span> <span class="o">=</span> <span class="n">get_nemo_calib_dataloader</span><span class="p">(</span>
+            <span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="n">calib_dataset</span><span class="p">,</span>
+            <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+            <span class="n">calib_size</span><span class="o">=</span><span class="n">calib_size</span><span class="p">,</span>
+            <span class="n">max_sequence_length</span><span class="o">=</span><span class="n">calib_max_seq_length</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="c1"># =================== Start Quantization ====================</span>
+        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="n">quant_cfg_choices</span><span class="p">():</span>
+            <span class="n">quant_cfg</span> <span class="o">=</span> <span class="n">quant_cfg_choices</span><span class="p">()[</span><span class="n">qformat</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported quantization format: </span><span class="si">{</span><span class="n">qformat</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="s2">&quot;awq&quot;</span> <span class="ow">in</span> <span class="n">qformat</span><span class="p">:</span>
+            <span class="n">quant_cfg</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">quant_cfg_choices</span><span class="p">()[</span><span class="n">qformat</span><span class="p">])</span>
+            <span class="n">weight_quantizer</span> <span class="o">=</span> <span class="n">quant_cfg</span><span class="p">[</span><span class="s2">&quot;quant_cfg&quot;</span><span class="p">][</span>
+                <span class="s2">&quot;*weight_quantizer&quot;</span><span class="p">]</span>  <span class="c1"># type: ignore</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">weight_quantizer</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">weight_quantizer</span> <span class="o">=</span> <span class="n">weight_quantizer</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">weight_quantizer</span><span class="p">[</span><span class="s2">&quot;block_sizes&quot;</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">awq_block_size</span>
+
+        <span class="k">if</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">kv_cache_dtype</span> <span class="o">==</span> <span class="s2">&quot;fp8&quot;</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">KV_CACHE_CFG</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                    <span class="n">value</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">)})</span>  <span class="c1"># type: ignore</span>
+            <span class="n">quant_cfg</span><span class="p">[</span><span class="s2">&quot;quant_cfg&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">KV_CACHE_CFG</span><span class="p">)</span>  <span class="c1"># type: ignore</span>
+
+        <span class="n">print_rank_0</span><span class="p">(</span><span class="n">quant_cfg</span><span class="p">)</span>
+
+        <span class="c1"># Always turn on FP8 kv cache to save memory footprint.</span>
+        <span class="c1"># For int8_sq, we use int8 kv cache.</span>
+        <span class="c1"># TODO: Investigate why enabling FP8 kv cache will cause accuracy regressions for nemotron.</span>
+        <span class="c1"># quant_cfg[&quot;quant_cfg&quot;][&quot;*output_quantizer&quot;] = {  # type: ignore[index]</span>
+        <span class="c1">#     &quot;num_bits&quot;: 8 if args.qformat == &quot;int8_sq&quot; else (4, 3),</span>
+        <span class="c1">#     &quot;axis&quot;: None,</span>
+        <span class="c1">#     &quot;enable&quot;: args.decoder_type != &quot;gptnext&quot;,</span>
+        <span class="c1"># }</span>
+
+        <span class="n">dataloader</span> <span class="o">=</span> <span class="p">[</span><span class="n">data</span> <span class="k">for</span> <span class="n">data</span> <span class="ow">in</span> <span class="n">dataloader</span><span class="p">]</span>
+
+        <span class="k">def</span> <span class="nf">forward_loop</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">batch</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
+                <span class="n">print_rank_0</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Calibrating batch </span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="n">model</span><span class="o">.</span><span class="n">predict_step</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
+
+        <span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">atq</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_cfg</span><span class="p">,</span>
+                             <span class="n">forward_loop</span><span class="p">)</span>  <span class="c1"># type: ignore[arg-type]</span>
+        <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+        <span class="n">tot_time</span> <span class="o">=</span> <span class="n">end_time</span> <span class="o">-</span> <span class="n">start_time</span>
+        <span class="n">tput</span> <span class="o">=</span> <span class="n">calib_size</span> <span class="o">/</span> <span class="n">tot_time</span>
+        <span class="n">print_rank_0</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Quantization done. Total time used </span><span class="si">{</span><span class="n">tot_time</span><span class="si">}</span><span class="s2">s. Throughput </span><span class="si">{</span><span class="n">tput</span><span class="si">}</span><span class="s2"> samples/s&quot;</span>
+        <span class="p">)</span>
+        <span class="c1"># =================== End Quantization ======================</span>
+
+        <span class="k">if</span> <span class="n">decoder_type</span> <span class="o">==</span> <span class="s2">&quot;gptnext&quot;</span><span class="p">:</span>
+            <span class="c1"># We found squared_relu may have an under-calibration problem.</span>
+            <span class="c1"># Clamp the scaling_factor with a min threshold to avoid under-calibration.</span>
+            <span class="n">maxbound</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;fp8&quot;</span><span class="p">:</span>
+                <span class="n">maxbound</span> <span class="o">=</span> <span class="mi">448</span>
+            <span class="k">elif</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int8_sq&quot;</span><span class="p">:</span>
+                <span class="n">maxbound</span> <span class="o">=</span> <span class="mi">127</span>
+            <span class="n">model</span> <span class="o">=</span> <span class="n">atq</span><span class="o">.</span><span class="n">postprocess_amax</span><span class="p">(</span>
+                <span class="n">model</span><span class="p">,</span> <span class="s2">&quot;*input_quantizer&quot;</span><span class="p">,</span>
+                <span class="k">lambda</span> <span class="n">amax</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">amax</span><span class="p">,</span> <span class="nb">min</span><span class="o">=</span><span class="mf">0.01</span> <span class="o">*</span> <span class="n">maxbound</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">atq</span><span class="o">.</span><span class="n">print_quant_summary</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">model_cfg</span><span class="o">.</span><span class="n">megatron_amp_O2</span><span class="p">:</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">unwrap_model</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">Float16Module</span><span class="p">)</span>
+
+    <span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+    <span class="n">export_tensorrt_llm_checkpoint</span><span class="p">(</span>
+        <span class="n">model</span><span class="p">,</span>
+        <span class="n">decoder_type</span><span class="p">,</span>
+        <span class="n">torch_dtype</span><span class="p">,</span>
+        <span class="n">export_dir</span><span class="o">=</span><span class="n">output_dir</span><span class="p">,</span>
+        <span class="n">inference_tensor_parallel</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+        <span class="n">inference_pipeline_parallel</span><span class="o">=</span><span class="n">pp_size</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">(</span>
+    <span class="p">)</span>  <span class="c1"># otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use</span>
+    <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+    <span class="n">print_rank_0</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;Model config exported to: </span><span class="si">{</span><span class="n">output_dir</span><span class="si">}</span><span class="s2">. Total time used </span><span class="si">{</span><span class="n">end_time</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">start_time</span><span class="si">}</span><span class="s2">s&quot;</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">save_artifacts</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">,</span> <span class="n">use_abspath</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</pre></div>
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+<jinja2.runtime.BlockReference object at 0x7f4251caf4c0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

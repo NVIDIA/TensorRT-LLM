@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=9a2dae69"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -48,6 +48,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -56,6 +57,30 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -89,17 +114,17 @@
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="troubleshooting.html">Troubleshooting</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Support Matrix</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#models">Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#llm-models">LLM Models</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#multi-modal-models">Multi-Modal Models </a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="#hardware">Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#software">Software</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -137,6 +162,75 @@
   <section id="support-matrix">
 <span id="id1"></span><h1>Support Matrix<a class="headerlink" href="#support-matrix" title="Link to this heading"></a></h1>
 <p>TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA GPUs. The following sections provide a list of supported GPU architectures as well as important features implemented in TensorRT-LLM.</p>
+<section id="models">
+<h2>Models<a class="headerlink" href="#models" title="Link to this heading"></a></h2>
+<section id="llm-models">
+<h3>LLM Models<a class="headerlink" href="#llm-models" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/arctic">Arctic</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/baichuan">Baichuan/Baichuan2</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">BART</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert">BERT</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bloom">BLOOM</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">ByT5</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/chatglm">GLM/ChatGLM/ChatGLM2/ChatGLM3/GLM-4</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Code LLaMA</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/dbrx">DBRX</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/exaone">Exaone</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">FairSeq NMT</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/falcon">Falcon</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">Flan-T5</a> <a class="footnote-reference brackets" href="#encdec" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma">Gemma/Gemma2</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">GPT</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj">GPT-J</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">GPT-Nemo</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox">GPT-NeoX</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/grok">Grok-1</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm">InternLM</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2">InternLM2</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba">Mamba</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">mBART</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Mistral</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Mistral NeMo</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral">Mixtral</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt">MPT</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron">Nemotron</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">mT5</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt">OPT</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi">Phi-1.5/Phi-2/Phi-3</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen">Qwen/Qwen1.5/Qwen2</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl">Qwen-VL</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma">RecurrentGemma</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt">Replit Code</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert">RoBERTa</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">SantaCoder</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork">Skywork</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/smaug">Smaug</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">StarCoder</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">T5</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/whisper">Whisper</a></p></li>
+</ul>
+</section>
+<section id="multi-modal-models">
+<h3>Multi-Modal Models <a class="footnote-reference brackets" href="#multimod" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a><a class="headerlink" href="#multi-modal-models" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">BLIP2 w/ OPT</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">BLIP2 w/ T5</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">CogVLM</a> <a class="footnote-reference brackets" href="#bf16only" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Deplot</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Fuyu</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Kosmos</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">LLaVA-v1.5</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">LLaVa-Next</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">NeVA</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Nougat</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Phi-3-vision</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Video NeVA</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">VILA</a></p></li>
+</ul>
+</section>
+</section>
 <section id="hardware">
 <span id="support-matrix-hardware"></span><h2>Hardware<a class="headerlink" href="#hardware" title="Link to this heading"></a></h2>
 <p>The following table shows the supported hardware for TensorRT-LLM.</p>
@@ -185,93 +279,55 @@
 </thead>
 <tbody>
 <tr class="row-even"><td><p>Container</p></td>
-<td><p>[24.05](<a class="reference external" href="https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html">https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html</a>)</p></td>
+<td><p><a class="reference external" href="https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html">24.07</a></p></td>
 </tr>
 <tr class="row-odd"><td><p>TensorRT</p></td>
-<td><p>[10.1](<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html">https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html</a>)</p></td>
+<td><p><a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html">10.3</a></p></td>
 </tr>
 <tr class="row-even"><td><p>Precision</p></td>
 <td><ul class="simple">
 <li><p>Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4</p></li>
 <li><p>Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4</p></li>
-<li><p>Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4(3)</p></li>
-<li><p>Turing (SM75) - FP32, FP16, INT8(1), INT4</p></li>
-<li><p>Volta (SM70) - FP32, FP16, INT8(1), INT4(2)</p></li>
-</ul>
-</td>
-</tr>
-<tr class="row-odd"><td><p>Models</p></td>
-<td><ul class="simple">
-<li><p>[Arctic](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/arctic">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/arctic</a>)</p></li>
-<li><p>[Baichuan](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/baichuan">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/baichuan</a>)</p></li>
-<li><p>[BART](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>)</p></li>
-<li><p>[BERT](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert</a>)</p></li>
-<li><p>[BLOOM](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bloom">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bloom</a>)</p></li>
-<li><p>[ByT5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>)</p></li>
-<li><p>[ChatGLM](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/chatglm">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/chatglm</a>)</p></li>
-<li><p>[DBRX](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/dbrx">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/dbrx</a>)</p></li>
-<li><p>[FairSeq NMT](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>)</p></li>
-<li><p>[Falcon](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/falcon">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/falcon</a>)</p></li>
-<li><p>[Flan-T5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>) (4)</p></li>
-<li><p>[Gemma](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma</a>)</p></li>
-<li><p>[GPT](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt</a>)</p></li>
-<li><p>[GPT-J](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj</a>)</p></li>
-<li><p>[GPT-Nemo](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt</a>)</p></li>
-<li><p>[GPT-NeoX](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox</a>)</p></li>
-<li><p>[InternLM](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm</a>)</p></li>
-<li><p>[InternLM2](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2</a>)</p></li>
-<li><p>[LLaMA](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama</a>)</p></li>
-<li><p>[LLaMA-v2](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama</a>)</p></li>
-<li><p>[Mamba](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba</a>)</p></li>
-<li><p>[mBART](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>)</p></li>
-<li><p>[Mistral](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral</a>)</p></li>
-<li><p>[MPT](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt</a>)</p></li>
-<li><p>[mT5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>)</p></li>
-<li><p>[OPT](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt</a>)</p></li>
-<li><p>[Phi-1.5/Phi-2/Phi-3](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi</a>)</p></li>
-<li><p>[Qwen/Qwen1.5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen</a>)</p></li>
-<li><p>[Qwen-VL](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl</a>)</p></li>
-<li><p>[RecurrentGemma](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma</a>)</p></li>
-<li><p>[Replit Code](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt</a>)</p></li>
-<li><p>[RoBERTa](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert</a>)</p></li>
-<li><p>[SantaCoder](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt</a>)</p></li>
-<li><p>[Skywork](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork</a>)</p></li>
-<li><p>[Smaug](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/smaug">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/smaug</a>)</p></li>
-<li><p>[StarCoder](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt</a>)</p></li>
-<li><p>[T5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec</a>)</p></li>
-<li><p>[Whisper](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/whisper">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/whisper</a>)</p></li>
-</ul>
-</td>
-</tr>
-<tr class="row-even"><td><p>Multi-Modal Models (5)</p></td>
-<td><ul class="simple">
-<li><p>[BLIP2 w/ OPT](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[BLIP2 w/ T5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[CogVLM](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)(6">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)(6</a>)</p></li>
-<li><p>[Deplot](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[Fuyu](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[Kosmos](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[LLaVA-v1.5](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[NeVA](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[Nougat](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[Phi-3-vision](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[Video NeVA](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
-<li><p>[VILA](<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal</a>)</p></li>
+<li><p>Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4<a class="footnote-reference brackets" href="#smgte89" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></li>
+<li><p>Turing (SM75) - FP32, FP16, INT8<a class="footnote-reference brackets" href="#smooth" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a>, INT4</p></li>
+<li><p>Volta (SM70) - FP32, FP16, INT8<a class="footnote-reference brackets" href="#smooth" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a>, INT4<a class="footnote-reference brackets" href="#smlt75" id="id8" role="doc-noteref"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></a></p></li>
 </ul>
 </td>
 </tr>
 </tbody>
 </table>
-<p>(1) INT8 SmoothQuant is not supported on SM70 and SM75.<br>
-(2) INT4 AWQ and GPTQ are not supported on SM &lt; 75.<br>
-(3) INT4 AWQ and GPTQ with FP8 activations require SM &gt;= 89.<br>
-(4) <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/main/examples/enc_dec">Encoder-Decoder</a> provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.
-(5) Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP2 family, LLaVA family, and so on.
-(6) Only supports bfloat16 precision.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Support for FP8 and quantized data types (INT8 or INT4) is not implemented for all the models. Refer to <a class="reference internal" href="precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples">examples</a> folder for additional information.</p>
 </div>
+<hr class="footnotes docutils" />
+<aside class="footnote-list brackets">
+<aside class="footnote brackets" id="encdec" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">1</a><span class="fn-bracket">]</span></span>
+<p>Encoder-Decoder provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.</p>
+</aside>
+<aside class="footnote brackets" id="multimod" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">2</a><span class="fn-bracket">]</span></span>
+<p>Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP2 family, LLaVA family, and so on.</p>
+</aside>
+<aside class="footnote brackets" id="bf16only" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">3</a><span class="fn-bracket">]</span></span>
+<p>Only supports bfloat16 precision.</p>
+</aside>
+<aside class="footnote brackets" id="smgte89" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id5">4</a><span class="fn-bracket">]</span></span>
+<p>INT4 AWQ and GPTQ with FP8 activations require SM &gt;= 89.</p>
+</aside>
+<aside class="footnote brackets" id="smooth" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></span>
+<span class="backrefs">(<a role="doc-backlink" href="#id6">1</a>,<a role="doc-backlink" href="#id7">2</a>)</span>
+<p>INT8 SmoothQuant is not supported on SM70 and SM75.</p>
+</aside>
+<aside class="footnote brackets" id="smlt75" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id8">6</a><span class="fn-bracket">]</span></span>
+<p>INT4 AWQ and GPTQ are not supported on SM &lt; 75.</p>
+</aside>
+</aside>
 </section>
 </section>
 
@@ -286,7 +342,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d21e09090>
+<jinja2.runtime.BlockReference object at 0x7f4251d25930>
 
 <div class="footer">
     <p>

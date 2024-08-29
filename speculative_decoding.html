@@ -16,7 +16,7 @@
         <script src="_static/jquery.js?v=5d32c60e"></script>
         <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="_static/doctools.js?v=9a2dae69"></script>
+        <script src="_static/doctools.js?v=888ff710"></script>
         <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
@@ -46,6 +46,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -54,6 +55,30 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -89,11 +114,6 @@
 <li class="toctree-l1"><a class="reference internal" href="reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -145,7 +165,12 @@ The combination of both these allows speculative decoding to result in reduced l
 <p>TensorRT-LLM supports several approaches for generating draft tokens, including:</p>
 <ol class="arabic simple">
 <li><p>Utilizing a smaller, auxiliary model, known as the draft model approach. For more information, refer to the <a class="reference external" href="https://arxiv.org/pdf/2211.17192.pdf">Fast Inference from Transformers via Speculative Decoding paper</a>.</p></li>
-<li><p>Implementing additional language model heads that predict tokens for future positions, as detailed in the <a class="reference external" href="https://arxiv.org/abs/2401.10774">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper</a>.</p></li>
+<li><p>Implementing additional language model heads that predict tokens for future positions:</p>
+<ol class="arabic simple">
+<li><p><a class="reference external" href="https://arxiv.org/abs/2401.10774">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper</a>.</p></li>
+<li><p><a class="reference external" href="https://arxiv.org/html/2403.09919v1">Recurrent Drafter for Fast Speculative Decoding in Large Language Models</a>.</p></li>
+</ol>
+</li>
 </ol>
 <section id="performance-improvements">
 <h2>Performance Improvements<a class="headerlink" href="#performance-improvements" title="Link to this heading"></a></h2>
@@ -199,7 +224,7 @@ and setting <code class="docutils literal notranslate"><span class="pre">enableB
 <li><p><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code> more than 1 is acceptable in general usage, but we use 1 in this example.</p></li>
 </ul>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MAX_DRAFT_LENGTH</span><span class="o">=</span><span class="m">10</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">COMMON_COMMAND</span><span class="o">=</span><span class="s2">&quot;--max_batch_size=1 --max_input_len=2048 --max_output_len=1024 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">COMMON_COMMAND</span><span class="o">=</span><span class="s2">&quot;--max_batch_size=1 --max_input_len=2048 --max_seq_len=3072 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits&quot;</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_COMMAND_FP16</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$COMMON_COMMAND</span><span class="s2">&quot;</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TARGET_COMMAND_FP16</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$DRAFT_COMMAND_FP16</span><span class="s2"> --max_draft_len=</span><span class="nv">$MAX_DRAFT_LENGTH</span><span class="s2"> --speculative_decoding_mode draft_tokens_external&quot;</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_COMMAND_FP8</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$COMMON_COMMAND</span><span class="s2"> --strongly_typed --use_fp8_context_fmha=enable&quot;</span>
@@ -427,6 +452,11 @@ However, similar to any new model, you can follow the same approach to define yo
 </section>
 </section>
 </section>
+<section id="redrafter">
+<h1>ReDrafter<a class="headerlink" href="#redrafter" title="Link to this heading"></a></h1>
+<p>This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read <a class="reference external" href="https://arxiv.org/html/2403.09919v1">the ReDrafter paper</a>.</p>
+<p>TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as <code class="docutils literal notranslate"><span class="pre">explicit_draft_tokens</span></code>. Please, visit the <span class="xref myst">ReDrafter README</span> for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.</p>
+</section>
 
 
            </div>
@@ -436,7 +466,7 @@ However, similar to any new model, you can follow the same approach to define yo
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f8e35c9c6a0>
+<jinja2.runtime.BlockReference object at 0x7f4251c815a0>
 
 <div class="footer">
     <p>

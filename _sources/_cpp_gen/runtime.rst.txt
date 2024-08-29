@@ -40,12 +40,6 @@ ________________
 .. doxygenfile:: decodingOutput.h
    :project: TensorRT-LLM
 
-explicitDraftTokensBuffers.h
-____________________________
-
-.. doxygenfile:: explicitDraftTokensBuffers.h
-   :project: TensorRT-LLM
-
 generationInput.h
 _________________
 
@@ -64,10 +58,10 @@ ____________
 .. doxygenfile:: gptDecoder.h
    :project: TensorRT-LLM
 
-gptDecoderBatch.h
-_________________
+explicitDraftTokensBuffers.h
+____________________________
 
-.. doxygenfile:: gptDecoderBatch.h
+.. doxygenfile:: explicitDraftTokensBuffers.h
    :project: TensorRT-LLM
 
 gptJsonConfig.h
@@ -88,10 +82,10 @@ _________
 .. doxygenfile:: iBuffer.h
    :project: TensorRT-LLM
 
-iGptDecoderBatch.h
-__________________
+gptDecoderBatched.h
+___________________
 
-.. doxygenfile:: iGptDecoderBatch.h
+.. doxygenfile:: gptDecoderBatched.h
    :project: TensorRT-LLM
 
 iStatefulGptDecoder.h
@@ -112,10 +106,10 @@ __________
 .. doxygenfile:: ipcUtils.h
    :project: TensorRT-LLM
 
-lookaheadModule.h
-_________________
+iGptDecoderBatched.h
+____________________
 
-.. doxygenfile:: lookaheadModule.h
+.. doxygenfile:: iGptDecoderBatched.h
    :project: TensorRT-LLM
 
 loraCache.h
@@ -136,10 +130,10 @@ ____________
 .. doxygenfile:: loraModule.h
    :project: TensorRT-LLM
 
-medusaModule.h
-______________
+modelConfig.h
+_____________
 
-.. doxygenfile:: medusaModule.h
+.. doxygenfile:: modelConfig.h
    :project: TensorRT-LLM
 
 memoryCounters.h
@@ -148,16 +142,46 @@ ________________
 .. doxygenfile:: memoryCounters.h
    :project: TensorRT-LLM
 
-modelConfig.h
-_____________
+samplingConfig.h
+________________
 
-.. doxygenfile:: modelConfig.h
+.. doxygenfile:: samplingConfig.h
    :project: TensorRT-LLM
 
 promptTuningParams.h
 ____________________
 
 .. doxygenfile:: promptTuningParams.h
+   :project: TensorRT-LLM
+
+speculativeDecodingMode.h
+_________________________
+
+.. doxygenfile:: speculativeDecodingMode.h
+   :project: TensorRT-LLM
+
+lookaheadModule.h
+_________________
+
+.. doxygenfile:: lookaheadModule.h
+   :project: TensorRT-LLM
+
+medusaModule.h
+______________
+
+.. doxygenfile:: medusaModule.h
+   :project: TensorRT-LLM
+
+tllmLogger.h
+____________
+
+.. doxygenfile:: tllmLogger.h
+   :project: TensorRT-LLM
+
+worldConfig.h
+_____________
+
+.. doxygenfile:: worldConfig.h
    :project: TensorRT-LLM
 
 rawEngine.h
@@ -172,33 +196,9 @@ _________
 .. doxygenfile:: request.h
    :project: TensorRT-LLM
 
-samplingConfig.h
-________________
-
-.. doxygenfile:: samplingConfig.h
-   :project: TensorRT-LLM
-
-speculativeDecodingMode.h
-_________________________
-
-.. doxygenfile:: speculativeDecodingMode.h
-   :project: TensorRT-LLM
-
 speculativeDecodingModule.h
 ___________________________
 
 .. doxygenfile:: speculativeDecodingModule.h
-   :project: TensorRT-LLM
-
-tllmLogger.h
-____________
-
-.. doxygenfile:: tllmLogger.h
-   :project: TensorRT-LLM
-
-worldConfig.h
-_____________
-
-.. doxygenfile:: worldConfig.h
    :project: TensorRT-LLM
 
