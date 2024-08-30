@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=9a2dae69"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -46,6 +46,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -54,6 +55,30 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -89,11 +114,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -162,20 +182,15 @@ python3<span class="w"> </span>examples/summarize.py<span class="w"> </span><spa
 </div>
 <p>We can also benchmark the efficiency of Weight Streaming. Here is an example:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>benchmarks/python/benchmark.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>-m<span class="w"> </span>opt_30b<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--mode<span class="w"> </span>ootb<span class="w">  </span><span class="se">\</span>
+<span class="w">    </span>--engine_dir<span class="w"> </span>/tmp/llama_7b/trt_engines/fp16/1-gpu/<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--batch_size<span class="w"> </span><span class="s2">&quot;1;32&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="s2">&quot;32&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--input_output_len<span class="w"> </span><span class="s2">&quot;256,32&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_input_len<span class="w"> </span><span class="m">256</span><span class="se">\</span>
-<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">288</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--gpu_weights_percent<span class="w"> </span><span class="s2">&quot;0.0;0.3;0.6;1.0&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--csv<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--log_level<span class="w"> </span>verbose
 </pre></div>
 </div>
-<p>Here we use <code class="docutils literal notranslate"><span class="pre">ootb</span></code> mode so that the GEMM operators won’t use plugins. <code class="docutils literal notranslate"><span class="pre">ootb-except-mha</span></code> mode is also valid.</p>
 <section id="api-changes">
 <h2>API Changes<a class="headerlink" href="#api-changes" title="Link to this heading"></a></h2>
 <p>To build engines with Weight Streaming enabled, some API changes are needed for the builder:</p>
@@ -206,7 +221,7 @@ python3<span class="w"> </span>examples/summarize.py<span class="w"> </span><spa
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d2294c3a0>
+<jinja2.runtime.BlockReference object at 0x7f425bf314e0>
 
 <div class="footer">
     <p>

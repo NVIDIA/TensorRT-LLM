@@ -1,0 +1,13 @@
+Examples
+=================================
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Scripts
+
+   llm_generate
+   llm_generate_async
+   llm_generate_async_streaming
+   llm_generate_distributed
+   llm_quantization
+   llm_auto_parallel

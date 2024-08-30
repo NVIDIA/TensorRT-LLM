@@ -2,7 +2,7 @@
 
 # Model Definition
 
-TensorRT-LLM has a Python API that can be used to define
+TensorRT-LLM has a Model Definition API that can be used to define
 Large Language Models. This API is built on top of the powerful
 [TensorRT Python API](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/index.html#)
 to create graph representations of deep neural networks in TensorRT. To become
@@ -53,7 +53,7 @@ def silu(input: Tensor) -> Tensor:
     return input * sigmoid(input)
 ```
 
-When the TensorRT-LLM's Python API is utilized, a graph of the network is
+When the TensorRT-LLM's Model Definition API is utilized, a graph of the network is
 assembled.  The graph can later be traversed or transformed using the graph
 traversal API exposed by the
 [`tensorrt.ILayer`](https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/LayerBase.html#tensorrt.ILayer)
@@ -229,7 +229,7 @@ connections between GPUs (through NVSwitch in DGX systems).
 
 The communication plugins can be found in
 [cpp/tensorrt_llm/plugins/ncclPlugin](source:cpp/tensorrt_llm/plugins/ncclPlugin)
-and the multi-GPU functions are exposed in the TensorRT-LLM Python API
+and the multi-GPU functions are exposed in the TensorRT-LLM Model Definition API
 as:
 
 ```python

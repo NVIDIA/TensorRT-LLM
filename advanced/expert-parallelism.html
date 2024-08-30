@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=9a2dae69"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -48,6 +48,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -56,6 +57,30 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -96,11 +121,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -153,8 +173,9 @@
 <section id="how-to-enable">
 <h2>How to Enable<a class="headerlink" href="#how-to-enable" title="Link to this heading"></a></h2>
 <p>The default parallel pattern is Tensor Parallel. You can enable Expert Parallel or hybrid parallel by setting <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> when calling <code class="docutils literal notranslate"><span class="pre">convert_coneckpoint.py</span></code>. If only <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.</p>
-<p>Be sure that the product of <code class="docutils literal notranslate"><span class="pre">moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">moe_ep_size</span></code> should equal to <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, since the total number of MoE paralleism across all GPUs must match the total number of parallelism in other parts of the model.</p>
-<p>The other parameters related to MoE structure, such as <code class="docutils literal notranslate"><span class="pre">num_experts_per_tok</span></code> (TopK in previous context), and <code class="docutils literal notranslate"><span class="pre">num_local_experts</span></code>, can be find in the model’s configuration file, such as the one for <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mixtral 8x7B model</a>.</p>
+<p>Ensure the product of <code class="docutils literal notranslate"><span class="pre">moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">moe_ep_size</span></code> is equal to <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, since the total number of MoE parallelism across all GPUs must match the total number of parallelism in other parts of the model.</p>
+<p>The other parameters related to the MoE structure, such as <code class="docutils literal notranslate"><span class="pre">num_experts_per_tok</span></code> (TopK in previous context) and <code class="docutils literal notranslate"><span class="pre">num_local_experts,</span></code> can be found in the model’s configuration file, such as the one for <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mixtral 8x7B model</a>.
+)</p>
 </section>
 </section>
 
@@ -169,7 +190,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d22922650>
+<jinja2.runtime.BlockReference object at 0x7f4261ad6470>
 
 <div class="footer">
     <p>

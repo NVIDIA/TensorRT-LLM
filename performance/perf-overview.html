@@ -16,7 +16,7 @@
         <script src="../_static/jquery.js?v=5d32c60e"></script>
         <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=9a2dae69"></script>
+        <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -48,6 +48,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -56,6 +57,30 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -83,24 +108,18 @@
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#known-issues">Known Issues</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#unexpected-extra-gpu-memory-allocation-when-enabling-multiple-profiles">Unexpected extra GPU memory allocation when enabling <code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#fused-matmul-gated-silu-llama">Fused Matmul + Gated-SiLU (LLaMA)</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#throughput-measurements">Throughput Measurements</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#reproducing-benchmarked-results">Reproducing Benchmarked Results</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#building-the-tensorrt-llm-container">Building the TensorRT-LLM Container</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="#methodology">Methodology</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#commands">Commands</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#variables">Variables</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#engine-building">Engine Building</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#engine-configuration-files">Engine Configuration Files</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#network-configuration-files-and-settings">Network Configuration Files and Settings</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#running-on-a100">Running on A100</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#engine-building">Engine Building</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#running-the-benchmark">Running the Benchmark</a></li>
 </ul>
 </li>
@@ -113,11 +132,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
@@ -168,6 +182,12 @@ performance that can be delivered by TensorRT-LLM.</p>
 <section id="known-issues">
 <h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
 <p>The following issues are being addressed to improve the efficiency of TensorRT-LLM.</p>
+<section id="unexpected-extra-gpu-memory-allocation-when-enabling-multiple-profiles">
+<h3>Unexpected extra GPU memory allocation when enabling <code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code><a class="headerlink" href="#unexpected-extra-gpu-memory-allocation-when-enabling-multiple-profiles" title="Link to this heading"></a></h3>
+<p>We observed that enabling multiple profiles can lead to extra
+unexpected GPU memory usage on some cases starting from v0.11.
+The issue will be addressed in future releases.</p>
+</section>
 <section id="fused-matmul-gated-silu-llama">
 <h3>Fused Matmul + Gated-SiLU (LLaMA)<a class="headerlink" href="#fused-matmul-gated-silu-llama" title="Link to this heading"></a></h3>
 <p>The current implementation combines two Matmul operations into one Matmul followed by
@@ -182,7 +202,7 @@ will support more data types and GPU architectures in the future release.</p>
 <p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
 and shows the throughput client-server scenario under maximum load.</p>
 <p>The performance numbers below were collected using the steps described in this document.</p>
-<p><strong>All data in the table below was generated using version 0.11.0 and presents token throughput in tokens/second.</strong></p>
+<p><strong>All data in the table below was generated using version 0.12.0 and presents token throughput in tokens/second.</strong></p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p></p></th>
@@ -213,8 +233,8 @@ and shows the throughput client-server scenario under maximum load.</p>
 <td><p>FP8</p></td>
 <td><p>FP8</p></td>
 <td><p>FP8</p></td>
-<td><p>FP16</p></td>
-<td><p>FP16</p></td>
+<td><p>Mixed</p></td>
+<td><p>Mixed</p></td>
 <td><p>FP8</p></td>
 </tr>
 <tr class="row-even"><td><p><strong>Model</strong></p></td>
@@ -230,429 +250,609 @@ and shows the throughput client-server scenario under maximum load.</p>
 <tr class="row-odd"><td><p>GPTJ 6B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>25116.54</p></td>
-<td><p>24998.09</p></td>
-<td><p>24456.84</p></td>
-<td><p>13328.96</p></td>
-<td><p>6168.8</p></td>
-<td><p>7737.44</p></td>
+<td><p>24834.76</p></td>
+<td><p>22454.79</p></td>
+<td><p>24429.55</p></td>
+<td><p>13085.91</p></td>
+<td><p>5864.81</p></td>
+<td><p>7647.24</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>1</p></td>
+<td><p>8348.93</p></td>
+<td><p>6656.25</p></td>
+<td><p>7831.38</p></td>
+<td><p>3882.21</p></td>
+<td><p>2194.57</p></td>
+<td><p>1843.91</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>5062.80</p></td>
+<td><p>3678.91</p></td>
+<td><p>3968.98</p></td>
+<td><p>2046.53</p></td>
+<td><p>1118.22</p></td>
+<td><p>980.67</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/128</p></td>
 <td><p>1</p></td>
-<td><p>2845.4</p></td>
-<td><p>2840.46</p></td>
-<td><p>2781.11</p></td>
-<td><p>1410.81</p></td>
-<td><p>662</p></td>
-<td><p>83.46</p></td>
+<td><p>2776.53</p></td>
+<td><p>2491.03</p></td>
+<td><p>2724.38</p></td>
+<td><p>1488.56</p></td>
+<td><p>657.01</p></td>
+<td><p>741.06</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>8165.91</p></td>
-<td><p>7936.16</p></td>
-<td><p>7643.02</p></td>
-<td><p>3503.41</p></td>
-<td><p>2213.44</p></td>
-<td><p>1927.91</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>3560.37</p></td>
-<td><p>3197.21</p></td>
-<td><p>3081.26</p></td>
-<td><p>1326.79</p></td>
-<td><p>893.43</p></td>
-<td><p></p></td>
+<td><p>3631.54</p></td>
+<td><p>2994.81</p></td>
+<td><p>3004.17</p></td>
+<td><p>1280.54</p></td>
+<td><p>854.37</p></td>
+<td><p>754.16</p></td>
 </tr>
-<tr class="row-odd"><td><p>LLaMA v2 7B</p></td>
+<tr class="row-even"><td><p>LLaMA v2 7B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>19695.41</p></td>
-<td><p>19509.49</p></td>
-<td><p>17684.88</p></td>
-<td><p>11605.69</p></td>
-<td><p>5286.1</p></td>
-<td><p>6655.52</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>1</p></td>
-<td><p>2471.89</p></td>
-<td><p>2401.29</p></td>
-<td><p>2342.71</p></td>
-<td><p>1173.81</p></td>
-<td><p>558.56</p></td>
-<td><p>644.72</p></td>
+<td><p>19706.35</p></td>
+<td><p>17803.58</p></td>
+<td><p>19068.99</p></td>
+<td><p>11393.48</p></td>
+<td><p>5272.39</p></td>
+<td><p>6345.72</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>1</p></td>
-<td><p>7867.28</p></td>
-<td><p>6689.51</p></td>
-<td><p>6814.72</p></td>
-<td><p>3074.4</p></td>
-<td><p>1813.79</p></td>
-<td><p>1591.51</p></td>
+<td><p>7651.12</p></td>
+<td><p>5472.34</p></td>
+<td><p>6610.03</p></td>
+<td><p>2964.65</p></td>
+<td><p>1785.79</p></td>
+<td><p>1551.37</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>4424.90</p></td>
+<td><p>3271.61</p></td>
+<td><p>3649.38</p></td>
+<td><p>1596.87</p></td>
+<td><p>957.12</p></td>
+<td><p>817.24</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>1</p></td>
+<td><p>2385.54</p></td>
+<td><p>2035.42</p></td>
+<td><p>2271.63</p></td>
+<td><p>1189.06</p></td>
+<td><p>564.77</p></td>
+<td><p>625.09</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>3215.63</p></td>
-<td><p>3015.84</p></td>
-<td><p>2820.31</p></td>
-<td><p>1289.87</p></td>
-<td><p>716.55</p></td>
-<td><p>653.19</p></td>
+<td><p>3191.34</p></td>
+<td><p>2726.29</p></td>
+<td><p>2802.41</p></td>
+<td><p>1243.96</p></td>
+<td><p>735.19</p></td>
+<td><p>641.56</p></td>
 </tr>
 <tr class="row-odd"><td><p>LLaMA v3 8B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>29084.05</p></td>
-<td><p>29197.48</p></td>
-<td><p>27781.28</p></td>
-<td><p>15225.75</p></td>
-<td><p>6450.88</p></td>
-<td><p>8929.6</p></td>
+<td><p>28288.75</p></td>
+<td><p>25420.52</p></td>
+<td><p>27399.75</p></td>
+<td><p>15567.44</p></td>
+<td><p>6586.88</p></td>
+<td><p>8745.80</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>1</p></td>
+<td><p>23230.62</p></td>
+<td><p>16426.68</p></td>
+<td><p>19198.73</p></td>
+<td><p>8817.39</p></td>
+<td><p>4882.13</p></td>
+<td><p>5084.49</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>16144.44</p></td>
+<td><p>9832.66</p></td>
+<td><p>12084.97</p></td>
+<td><p>5352.37</p></td>
+<td><p>3079.90</p></td>
+<td><p>2755.13</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/128</p></td>
 <td><p>1</p></td>
-<td><p>3699.64</p></td>
-<td><p>3780.47</p></td>
-<td><p>3555.57</p></td>
-<td><p>1844.38</p></td>
-<td><p>775.18</p></td>
-<td><p>1052.3</p></td>
+<td><p>3623.79</p></td>
+<td><p>3290.22</p></td>
+<td><p>3463.26</p></td>
+<td><p>1852.48</p></td>
+<td><p>781.63</p></td>
+<td><p>980.86</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>23723.81</p></td>
-<td><p>22055.94</p></td>
-<td><p>17894.85</p></td>
-<td><p>8415.67</p></td>
-<td><p>4837.47</p></td>
-<td><p>4497.21</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>11193.29</p></td>
-<td><p>8877.13</p></td>
-<td><p>8398.71</p></td>
-<td><p>3996.93</p></td>
-<td><p>2271.65</p></td>
-<td><p>1911.63</p></td>
+<td><p>11093.62</p></td>
+<td><p>7573.35</p></td>
+<td><p>8894.11</p></td>
+<td><p>3986.83</p></td>
+<td><p>2268.13</p></td>
+<td><p>2051.79</p></td>
 </tr>
-<tr class="row-odd"><td><p>Mistral 7B</p></td>
+<tr class="row-even"><td><p>Mistral 7B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>31618.59</p></td>
-<td><p>31868.45</p></td>
-<td><p>30400.21</p></td>
-<td><p>16108.11</p></td>
-<td><p>6749.91</p></td>
-<td><p>10237.23</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>1</p></td>
-<td><p>3791.1</p></td>
-<td><p>3795.27</p></td>
-<td><p>3618.11</p></td>
-<td><p>1896.76</p></td>
-<td><p>783.94</p></td>
-<td><p>1126.08</p></td>
+<td><p>30223.01</p></td>
+<td><p>27696.90</p></td>
+<td><p>29788.46</p></td>
+<td><p>16319.25</p></td>
+<td><p>6807.02</p></td>
+<td><p>9612.58</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>1</p></td>
-<td><p>25646.02</p></td>
-<td><p>20491.88</p></td>
-<td><p>20518.75</p></td>
-<td><p>10018.54</p></td>
-<td><p>5358.28</p></td>
-<td><p>5441.98</p></td>
+<td><p>24989.54</p></td>
+<td><p>17942.29</p></td>
+<td><p>20509.72</p></td>
+<td><p>9982.01</p></td>
+<td><p>5296.02</p></td>
+<td><p>5444.89</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>17036.14</p></td>
+<td><p>10846.03</p></td>
+<td><p>12807.80</p></td>
+<td><p>5718.89</p></td>
+<td><p>3241.33</p></td>
+<td><p>2931.17</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>1</p></td>
+<td><p>3678.80</p></td>
+<td><p>3294.02</p></td>
+<td><p>3521.71</p></td>
+<td><p>1887.75</p></td>
+<td><p>786.43</p></td>
+<td><p>1002.49</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>12068.11</p></td>
-<td><p>9462.96</p></td>
-<td><p>9504.59</p></td>
-<td><p>4383.42</p></td>
-<td><p>2465.77</p></td>
-<td><p>2213.69</p></td>
-</tr>
-<tr class="row-odd"><td><p>LLaMA v2 70B</p></td>
-<td><p>128/128</p></td>
-<td><p>2</p></td>
-<td><p>6652.29</p></td>
-<td><p>5619.41</p></td>
-<td><p>6502.44</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>10921.65</p></td>
-<td><p>11043</p></td>
-<td><p>10448.46</p></td>
-<td><p>6219.11</p></td>
-<td><p>2487.78</p></td>
-<td><p>1549.09</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>15878.34</p></td>
-<td><p></p></td>
-<td><p>14781.66</p></td>
-<td><p>10093.27</p></td>
-<td><p>4233.24</p></td>
-<td><p>1497.68</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>2</p></td>
-<td><p>766.38</p></td>
-<td><p>647.73</p></td>
-<td><p>747.14</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>1296.75</p></td>
-<td><p>1298.94</p></td>
-<td><p>1231.26</p></td>
-<td><p>714.07</p></td>
-<td><p>285.9</p></td>
-<td><p>179.19</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>1930.16</p></td>
-<td><p></p></td>
-<td><p>1808.02</p></td>
-<td><p>1230.66</p></td>
-<td><p>494.29</p></td>
-<td><p>176.24</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>2</p></td>
-<td><p>7014.86</p></td>
-<td><p>4844.17</p></td>
-<td><p>5267.56</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>13365.86</p></td>
-<td><p>11596.55</p></td>
-<td><p>9202.42</p></td>
-<td><p>3787.24</p></td>
-<td><p>2267.02</p></td>
-<td><p>1772.45</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>18861.53</p></td>
-<td><p></p></td>
-<td><p>17085.82</p></td>
-<td><p>7846.64</p></td>
-<td><p>5096.52</p></td>
-<td><p>2290.99</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>2</p></td>
-<td><p>3554.71</p></td>
-<td><p>2843.31</p></td>
-<td><p>2457.73</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>6604.37</p></td>
-<td><p>5969.11</p></td>
-<td><p>4586.99</p></td>
-<td><p>1994.1</p></td>
-<td><p>1137.22</p></td>
-<td><p>890.83</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>10034.12</p></td>
-<td><p></p></td>
-<td><p>7647.54</p></td>
-<td><p>4347.09</p></td>
-<td><p>2152.35</p></td>
-<td><p>1130.36</p></td>
-</tr>
-<tr class="row-odd"><td><p>LLaMA v3 70B</p></td>
-<td><p>128/128</p></td>
-<td><p>4</p></td>
-<td><p></p></td>
-<td><p>9872.81</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>15255</p></td>
-<td><p></p></td>
-<td><p>13853.05</p></td>
-<td><p></p></td>
-<td><p>4033.42</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>4</p></td>
-<td><p></p></td>
-<td><p>1284.88</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>1918.47</p></td>
-<td><p></p></td>
-<td><p>1738.94</p></td>
-<td><p></p></td>
-<td><p>476.42</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>4</p></td>
-<td><p></p></td>
-<td><p>9996.88</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>19071.39</p></td>
-<td><p></p></td>
-<td><p>10887.34</p></td>
-<td><p></p></td>
-<td><p>3373.71</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>4</p></td>
-<td><p></p></td>
-<td><p>4985.31</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>9387.81</p></td>
-<td><p></p></td>
-<td><p>6029.39</p></td>
-<td><p></p></td>
-<td><p>1824.06</p></td>
-<td><p></p></td>
+<td><p>11510.54</p></td>
+<td><p>8357.75</p></td>
+<td><p>9214.61</p></td>
+<td><p>4284.82</p></td>
+<td><p>2363.25</p></td>
+<td><p>2154.26</p></td>
 </tr>
 <tr class="row-odd"><td><p>Mixtral 8x7B</p></td>
 <td><p>128/128</p></td>
 <td><p>2</p></td>
-<td><p>26317.73</p></td>
-<td><p>21768.19</p></td>
-<td><p>24770.44</p></td>
-<td><p>11821.14</p></td>
-<td><p>5522.43</p></td>
+<td><p>24895.03</p></td>
+<td><p>8785.80</p></td>
+<td><p>24394.71</p></td>
+<td><p>15529.86</p></td>
+<td><p>5921.41</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>2</p></td>
-<td><p>3181.76</p></td>
-<td><p>2545.52</p></td>
-<td><p>2973.11</p></td>
-<td><p>1391.28</p></td>
-<td><p>636.77</p></td>
 <td><p></p></td>
+<td><p>4</p></td>
+<td><p>42014.24</p></td>
+<td><p>38828.53</p></td>
+<td><p>40197.42</p></td>
+<td><p>28132.17</p></td>
+<td><p>11414.95</p></td>
+<td><p>6820.26</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>2</p></td>
-<td><p>30105.61</p></td>
-<td><p>23643.33</p></td>
-<td><p>22120.85</p></td>
-<td><p>6337.02</p></td>
-<td><p>3698.23</p></td>
+<td><p>29389.21</p></td>
+<td><p>5474.69</p></td>
+<td><p>20873.02</p></td>
+<td><p>7066.02</p></td>
+<td><p>4306.98</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>52348.10</p></td>
+<td><p>41573.66</p></td>
+<td><p>40588.05</p></td>
+<td><p>21285.72</p></td>
+<td><p>10974.83</p></td>
+<td><p>7467.15</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>2</p></td>
+<td><p>21480.27</p></td>
+<td><p>2277.66</p></td>
+<td><p>12838.28</p></td>
+<td><p>3986.01</p></td>
+<td><p>2400.11</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>39182.04</p></td>
+<td><p>28626.55</p></td>
+<td><p>28337.31</p></td>
+<td><p>12447.13</p></td>
+<td><p>7278.89</p></td>
+<td><p>5233.43</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>2</p></td>
+<td><p>2934.44</p></td>
+<td><p>1003.51</p></td>
+<td><p>2898.27</p></td>
+<td><p>1834.77</p></td>
+<td><p>693.51</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>5152.40</p></td>
+<td><p>4724.01</p></td>
+<td><p>5028.61</p></td>
+<td><p>3393.18</p></td>
+<td><p>1362.93</p></td>
+<td><p>805.49</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>2</p></td>
+<td><p>14029.17</p></td>
+<td><p>2671.88</p></td>
+<td><p>10479.45</p></td>
+<td><p>3531.31</p></td>
+<td><p>1945.88</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>25436.05</p></td>
+<td><p>20302.56</p></td>
+<td><p>19971.72</p></td>
+<td><p>9622.66</p></td>
+<td><p>5221.74</p></td>
+<td><p>3616.30</p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA v3 70B</p></td>
+<td><p>128/128</p></td>
+<td><p>2</p></td>
+<td><p>5386.88</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>2959.22</p></td>
+<td><p>1301.14</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>8944.26</p></td>
+<td><p>8587.01</p></td>
+<td><p>8642.05</p></td>
+<td><p>5966.47</p></td>
+<td><p>2413.95</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>16125.20</p></td>
+<td><p></p></td>
+<td><p>15397.47</p></td>
+<td><p>10406.55</p></td>
+<td><p>4548.32</p></td>
+<td><p>1364.08</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>2</p></td>
+<td><p>7007.27</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>720.73</p></td>
+<td><p>500.83</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>12906.75</p></td>
+<td><p>10761.53</p></td>
+<td><p>8978.95</p></td>
+<td><p>4736.61</p></td>
+<td><p>2380.02</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>19417.37</p></td>
+<td><p></p></td>
+<td><p>14822.93</p></td>
+<td><p>6672.14</p></td>
+<td><p>3815.08</p></td>
+<td><p>1809.40</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>2</p></td>
+<td><p>6183.85</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>369.29</p></td>
+<td><p>251.24</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>8859.54</p></td>
+<td><p>7270.77</p></td>
+<td><p>6073.48</p></td>
+<td><p>2969.99</p></td>
+<td><p>1634.82</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>13969.95</p></td>
+<td><p></p></td>
+<td><p>10094.57</p></td>
+<td><p>4358.77</p></td>
+<td><p>2847.54</p></td>
+<td><p>1313.78</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>2</p></td>
+<td><p>696.59</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>301.46</p></td>
+<td><p>140.88</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1044.35</p></td>
+<td><p>1000.55</p></td>
+<td><p>1022.06</p></td>
+<td><p>681.72</p></td>
+<td><p>278.76</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2018.47</p></td>
+<td><p></p></td>
+<td><p>1933.15</p></td>
+<td><p>1279.46</p></td>
+<td><p>543.73</p></td>
+<td><p>163.36</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>2</p></td>
+<td><p>3525.18</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>87.54</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>6550.76</p></td>
+<td><p>4859.38</p></td>
+<td><p>4870.26</p></td>
+<td><p>2379.66</p></td>
+<td><p>1209.69</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>9706.95</p></td>
+<td><p></p></td>
+<td><p>7670.04</p></td>
+<td><p>3692.41</p></td>
+<td><p>2192.28</p></td>
+<td><p>895.23</p></td>
+</tr>
+<tr class="row-even"><td><p>LLaMA v2 70B</p></td>
+<td><p>128/128</p></td>
+<td><p>2</p></td>
+<td><p>6355.16</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>2927.71</p></td>
+<td><p>1374.05</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>10818.97</p></td>
+<td><p>10819.19</p></td>
+<td><p>10754.99</p></td>
+<td><p>6603.10</p></td>
+<td><p>2765.94</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>16667.25</p></td>
+<td><p></p></td>
+<td><p>16074.84</p></td>
+<td><p>11369.11</p></td>
+<td><p>4796.89</p></td>
+<td><p>1402.92</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>2</p></td>
+<td><p>6185.77</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>668.52</p></td>
+<td><p>445.04</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>12884.76</p></td>
+<td><p>11356.48</p></td>
+<td><p>8870.71</p></td>
+<td><p>5067.06</p></td>
+<td><p>2710.53</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>19053.13</p></td>
+<td><p></p></td>
+<td><p>17534.62</p></td>
+<td><p>8805.16</p></td>
+<td><p>5665.93</p></td>
+<td><p>2203.33</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>2</p></td>
+<td><p>4873.24</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>334.10</p></td>
+<td><p>215.70</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>8664.90</p></td>
+<td><p>6311.85</p></td>
+<td><p>7564.99</p></td>
+<td><p>3354.02</p></td>
+<td><p>1884.46</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>15110.32</p></td>
+<td><p></p></td>
+<td><p>10584.03</p></td>
+<td><p>5373.10</p></td>
+<td><p>3672.80</p></td>
+<td><p>1787.76</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>2</p></td>
+<td><p>732.09</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>302.49</p></td>
+<td><p>141.70</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1272.90</p></td>
+<td><p>1269.58</p></td>
+<td><p>1265.80</p></td>
+<td><p>774.93</p></td>
+<td><p>320.79</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2015.77</p></td>
+<td><p></p></td>
+<td><p>1943.96</p></td>
+<td><p>1355.78</p></td>
+<td><p>569.48</p></td>
+<td><p>165.52</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>2</p></td>
-<td><p>15002.42</p></td>
-<td><p>11683.11</p></td>
-<td><p>11486.66</p></td>
-<td><p>3024.95</p></td>
-<td><p>1710.53</p></td>
+<td><p>3508.50</p></td>
 <td><p></p></td>
+<td><p></p></td>
+<td><p>321.95</p></td>
+<td><p>212.97</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>6642.69</p></td>
+<td><p>5545.83</p></td>
+<td><p>4889.26</p></td>
+<td><p>2439.10</p></td>
+<td><p>1276.58</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>10178.71</p></td>
+<td><p></p></td>
+<td><p>8071.77</p></td>
+<td><p>4275.74</p></td>
+<td><p>2589.60</p></td>
+<td><p>1083.45</p></td>
 </tr>
 <tr class="row-odd"><td><p>Falcon 180B</p></td>
 <td><p>128/128</p></td>
 <td><p>4</p></td>
-<td><p>5647.01</p></td>
-<td><p></p></td>
-<td><p>5568.91</p></td>
+<td><p>5129.55</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>9304.06</p></td>
-<td><p></p></td>
-<td><p>8885.39</p></td>
-<td><p></p></td>
-<td><p>2171.78</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>4</p></td>
-<td><p>670.99</p></td>
-<td><p>693.82</p></td>
-<td><p>667.8</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -660,19 +860,19 @@ and shows the throughput client-server scenario under maximum load.</p>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>1103.18</p></td>
+<td><p>8370.98</p></td>
 <td><p></p></td>
-<td><p>1065.16</p></td>
+<td><p>8268.72</p></td>
 <td><p></p></td>
-<td><p>238.61</p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>4</p></td>
-<td><p>8358.01</p></td>
-<td><p>6655.38</p></td>
-<td><p>6376.89</p></td>
+<td><p>7823.79</p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -680,19 +880,59 @@ and shows the throughput client-server scenario under maximum load.</p>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>14514.24</p></td>
+<td><p>13278.59</p></td>
 <td><p></p></td>
-<td><p>12447.25</p></td>
+<td><p>13107.48</p></td>
 <td><p></p></td>
-<td><p>2657.9</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>4</p></td>
+<td><p>6374.10</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>12660.89</p></td>
+<td><p></p></td>
+<td><p>10493.79</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>4</p></td>
+<td><p>601.67</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>1002.57</p></td>
+<td><p></p></td>
+<td><p>991.22</p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>4</p></td>
-<td><p>4169.39</p></td>
-<td><p>3415.05</p></td>
-<td><p>3412.09</p></td>
+<td><p>3869.76</p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -700,69 +940,33 @@ and shows the throughput client-server scenario under maximum load.</p>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>7524.11</p></td>
+<td><p>7134.33</p></td>
 <td><p></p></td>
-<td><p>6326.46</p></td>
+<td><p>6386.83</p></td>
 <td><p></p></td>
-<td><p>1392.31</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><em>TP stands for Tensor Parallelism</em></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 </tbody>
 </table>
-<p><em>TP stands for Tensor Parallelism</em></p>
 </section>
 <section id="reproducing-benchmarked-results">
 <h2>Reproducing Benchmarked Results<a class="headerlink" href="#reproducing-benchmarked-results" title="Link to this heading"></a></h2>
-<section id="building-the-tensorrt-llm-container">
-<h3>Building the TensorRT-LLM Container<a class="headerlink" href="#building-the-tensorrt-llm-container" title="Link to this heading"></a></h3>
-<hr class="docutils" />
-<p>In order to benchmark TensorRT-LLM, you will need to follow the <span class="xref myst">Quick Start</span>
-build process to create a baseline container for building a wheel. Additionally, the development
-container needs a copy of the source code to build the wheel and the benchmarking script. Create the
-right build environment, use the following :</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
-<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
-git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>--recursive
-git<span class="w"> </span>lfs<span class="w"> </span>install
-git<span class="w"> </span>lfs<span class="w"> </span>pull
-make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>build
-make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
-</pre></div>
-</div>
 <blockquote>
-<div><p>[!WARNING]
-If you have elevated privileges on your system, then skip the <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">-C</span> <span class="pre">docker</span> <span class="pre">run</span> <span class="pre">LOCAL_USER=1</span></code>
-command above as it may make it so that you cannot access some required system libraries within the
-container because the build forces your UID and GID to match those that are set for your non-elevated
-user. There are cases where the container will be booted as root (i.e. on some SLURM systems with
-the pyxis plugin) which will cause libraries to be missing.</p>
+<div><p>[!NOTE] The only models supported in this workflow are those listed in the table above.</p>
 </div></blockquote>
-<p>If you are benchmarking in a shared environment, you need to specify the GPU indices that you would
-like the container to use, otherwise the Makefile defaults to loading the container with all GPUs on
-the system. For example, if you only have the 4 higher indices of GPUs on your system you can
-configure it using the following example:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">NV_GPU</span><span class="o">=</span><span class="m">0</span>,1,2,3
-make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">GPU_OPTS</span><span class="o">=</span><span class="s1">&#39;--gpus \&quot;device=${NV_GPU}\&quot;&#39;</span>
-</pre></div>
-</div>
-<p>Additionally, if you’d like to mount external storage to access persistent storage, or previously
-built engines, you can mount directories as follows (simply replace <code class="docutils literal notranslate"><span class="pre">source</span></code> and <code class="docutils literal notranslate"><span class="pre">destination</span></code> with
-the appropriate paths):</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">DOCKER_RUN_ARGS</span><span class="o">=</span><span class="s2">&quot;-v /source:/destination&quot;</span>
-</pre></div>
-</div>
-<p>Once the container starts, you’ll need to build the wheel and the benchmarking scripts. From the
-code root (the default directory when the container is loaded), the following commands will build
-the TensorRT-LLM wheel, install dependencies, and build the benchmark scripts:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--benchmarks<span class="w"> </span>--trt_root<span class="w"> </span>/usr/local/tensorrt
-pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.whl
-</pre></div>
-</div>
-</section>
-</section>
-<section id="methodology">
-<h2>Methodology<a class="headerlink" href="#methodology" title="Link to this heading"></a></h2>
-<p>The following tables are references for commands that are used as part of the benchmarking process.</p>
+<p>The following tables are references for commands that are used as part of the benchmarking process. For a more detailed
+description of this benchmarking workflow, see the <span class="xref myst">Benchmarking Suite README</span>.</p>
 <section id="commands">
 <h3>Commands<a class="headerlink" href="#commands" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
@@ -773,17 +977,17 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#engine-building"><span class="xref myst">Build</span></a></p></td>
-<td><p>Build a TensorRT-LLM engine</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-build</span> <span class="pre">--model_config</span> <span class="pre">$model_cfg</span> <span class="pre">--use_fused_mlp</span> <span class="pre">--gpt_attention_plugin</span> <span class="pre">float16</span> <span class="pre">--output_dir</span> <span class="pre">$engine_dir</span> <span class="pre">--max_batch_size</span> <span class="pre">$max_batch_size</span> <span class="pre">--max_input_len</span> <span class="pre">2048</span> <span class="pre">--max_output_len</span> <span class="pre">2048</span> <span class="pre">--reduce_fusion</span> <span class="pre">disable</span> <span class="pre">--workers</span> <span class="pre">$tp_size</span> <span class="pre">--max_num_tokens</span> <span class="pre">$max_num_tokens</span> <span class="pre">--use_paged_context_fmha</span> <span class="pre">enable</span> <span class="pre">--multiple_profiles</span> <span class="pre">enable</span></code></p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">Dataset</span></a></p></td>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">Dataset</span></a></p></td>
 <td><p>Create a synthetic dataset</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--output=$dataset_file</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=2000</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">--stdout</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span> <span class="pre">&gt;</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#engine-building"><span class="xref myst">Build</span></a></p></td>
+<td><p>Build a TensorRT-LLM engine</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">build</span> <span class="pre">--tp_size</span> <span class="pre">$tp_size</span> <span class="pre">--quantization</span> <span class="pre">FP8</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span></code></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#running-the-benchmark"><span class="xref myst">Run</span></a></p></td>
 <td><p>Run a benchmark with a dataset</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">$tp_size</span> <span class="pre">--allow-run-as-root</span> <span class="pre">--oversubscribe</span> <span class="pre">cpp/build/benchmarks/gptManagerBenchmark</span> <span class="pre">--engine_dir</span> <span class="pre">$engine_dir</span> <span class="pre">--type</span> <span class="pre">IFB</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span> <span class="pre">--eos_id</span> <span class="pre">-1</span> <span class="pre">--scheduler_policy</span> <span class="pre">guaranteed_no_evict</span> <span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.99</span> <span class="pre">--output_csv</span> <span class="pre">result.csv</span> <span class="pre">--request_rate</span> <span class="pre">-1.0</span> <span class="pre">--enable_chunked_context</span> <span class="pre">--warm_up</span> <span class="pre">0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">throughput</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span> <span class="pre">--engine_dir</span> <span class="pre">$engine_dir</span></code></p></td>
 </tr>
 </tbody>
 </table>
@@ -809,530 +1013,30 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
 <tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$engine_dir</span></code></p></td>
 <td><p>Location to store built engine file (can be deleted after running benchmarks).</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_cfg</span></code></p></td>
-<td><p>Name of the model configuration JSON file to use for building.</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_name</span></code></p></td>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_name</span></code></p></td>
 <td><p>HuggingFace model name eg. meta-llama/Llama-2-7b-hf or use the path to a local weights directory</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code></p></td>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code></p></td>
 <td><p>Location of the dataset file generated by <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$results_csv</span></code></p></td>
-<td><p>Path to store end results to.</p></td>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$num_requests</span></code></p></td>
+<td><p>The number of requests to generate for dataset generation</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></td>
-<td><p>Absolute maximum number of concurrent requests an engine can handle during one iteration.</p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></td>
-<td><p>Maximum number of total tokens an engine can handle during one iteration.</p></td>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$seq_len</span></code></p></td>
+<td><p>A sequence length of ISL + OSL</p></td>
 </tr>
 </tbody>
 </table>
-</section>
-<section id="engine-building">
-<h3>Engine Building<a class="headerlink" href="#engine-building" title="Link to this heading"></a></h3>
-<p>All benchmarks were run using a single engine with a configuration that is capable of handling the
-maximum sequence lengths encountered during benchmarking. For each benchmark, regardless of input/output
-sequence length, you can reuse the single engine to run all tests. Each engine will be built with a paged
-KV cache and in-flight batching enabled. For more information see the
-<a class="reference internal" href="../overview.html#in-flight-batching-and-paged-attention"><span class="std std-ref">documentation about in-flight batching</span></a>.</p>
-<p>In order to build an engine you will need to run the following command by specifying a configuration file
-for the model that you would like to build (see <a class="reference internal" href="#network-configuration-files"><span class="xref myst">below</span></a>). The general build
-command is as follows:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-build<span class="w"> </span>--model_config<span class="w"> </span><span class="nv">$model_cfg</span><span class="w"> </span>--use_fused_mlp<span class="w"> </span>--gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span>--output_dir<span class="w"> </span><span class="nv">$engine_dir</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="nv">$max_batch_size</span><span class="w"> </span>--max_input_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--max_output_len<span class="w"> </span><span class="m">2048</span><span class="w"> </span>--reduce_fusion<span class="w"> </span>disable<span class="w"> </span>--workers<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="nv">$max_num_tokens</span><span class="w"> </span>--use_paged_context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--multiple_profiles<span class="w"> </span><span class="nb">enable</span>
-</pre></div>
-</div>
-<p>Some notes about the command:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">--workers</span></code> affects the number of threads that build the engine file and does not necessarily need to match
-the TP size. Make sure to set the tensor parallelism in the <code class="docutils literal notranslate"><span class="pre">$model_cfg</span></code> JSON file. See <a class="reference internal" href="#network-configuration-files"><span class="xref myst">below</span></a></p></li>
-<li><p>You can run benchmarks for datasets that fit within the bounds of the <code class="docutils literal notranslate"><span class="pre">max_input_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> parameters.</p></li>
-</ul>
-</section>
-<section id="engine-configuration-files">
-<h3>Engine Configuration Files<a class="headerlink" href="#engine-configuration-files" title="Link to this heading"></a></h3>
-<p>In order to configure the TensorRT-LLM build process for benchmarking, you need to provide
-<code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> a configuration file that specifies the following the network configuration, parallelism
-mapping, and quantization options.</p>
-<p>Below we document how to benchmark each model on an H100-HBM3-80GB system and reproduce the throughput
-numbers we document on our [Performance section](#performance of-tensorrt-llm).</p>
-<blockquote>
-<div><p>[!Important]
-In order to change the parallelism for a build, you need to modify the <code class="docutils literal notranslate"><span class="pre">mapping</span></code> dictionary in your configuration file. The settings
-must conform to the following condition: <code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">==</span> <span class="pre">tp_size</span> <span class="pre">*</span> <span class="pre">pp_size</span></code>.</p>
-</div></blockquote>
-<blockquote>
-<div><p>[!Note]
-All configurations below are set to run utilizing FP8 by default. If you would like to run on an A100 system, see our notes about <a class="reference internal" href="#running-on-a100"><span class="xref myst">disabling FP8 quantization</span></a>.</p>
-</div></blockquote>
-</section>
-<section id="network-configuration-files-and-settings">
-<h3>Network Configuration Files and Settings<a class="headerlink" href="#network-configuration-files-and-settings" title="Link to this heading"></a></h3>
-<p>Each network has its own configuration file. All networks are configured to run using FP8 quantization by default. Additionally, each network has a specific tuning for the
-<code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code> parameters – at times varying for some
-input and output sequence legnths within the same model.</p>
-<blockquote>
-<div><p>![Note]
-General settings are specified by “General” in the “ISL/OSL” column. For special
-cases, specific input and output sequence lengths will be specified.</p>
-</div></blockquote>
-<table>
-<tr>
-<td> Model </td> <td> Configuration File (FP8) </td>
-</tr>
-<tr>
-<td> EleutherAI/gpt-j-6b </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GPTJForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">28</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50400</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gptj&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gelu_new&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;rotary_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>1</p></td>
-<td><p>2048</p></td>
-<td><p>128</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-odd"><td><p>1</p></td>
-<td><p>2048</p></td>
-<td><p>2048</p></td>
-<td><p>128, 128</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-<tr>
-<td> tiiuae/falcon-180B </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FalconForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">80</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">232</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">14848</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">65024</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2048</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gelu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;use_parallel_embedding&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;embedding_sharding_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;share_embedding_table&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;bias&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;parallel_attention&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;new_decoder_architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>4</p></td>
-<td><p>8192</p></td>
-<td><p>4096</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-odd"><td><p>8</p></td>
-<td><p>8192</p></td>
-<td><p>2048</p></td>
-<td><p>General</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-<tr>
-<td> meta-llama/Llama-2-7b-hf </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">11008</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_scaling&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>1</p></td>
-<td><p>8192</p></td>
-<td><p>4096</p></td>
-<td><p>General</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-</tr>
-<tr>
-<td> meta-llama/Llama-2-70b-hf </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">80</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">28672</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">10000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_scaling&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>2</p></td>
-<td><p>2048</p></td>
-<td><p>2048</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-odd"><td><p>4</p></td>
-<td><p>8192</p></td>
-<td><p>4096</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-even"><td><p>4</p></td>
-<td><p>8192</p></td>
-<td><p>256</p></td>
-<td><p>128, 4096</p></td>
-</tr>
-<tr class="row-odd"><td><p>8</p></td>
-<td><p>16384</p></td>
-<td><p>8192</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-even"><td><p>8</p></td>
-<td><p>16384</p></td>
-<td><p>1024</p></td>
-<td><p>128, 2048</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-<tr>
-<td> meta-llama/Meta-Llama-3-8B </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">128256</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">14336</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">500000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rope_theta&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">500000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_scaling&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>1</p></td>
-<td><p>8192</p></td>
-<td><p>2048</p></td>
-<td><p>General</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-<tr>
-<td> meta-llama/Meta-Llama-3-70B </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">80</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">128256</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">28672</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">500000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rope_theta&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">500000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_scaling&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>4</p></td>
-<td><p>1024</p></td>
-<td><p>2048</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-odd"><td><p>8</p></td>
-<td><p>16384</p></td>
-<td><p>8192</p></td>
-<td><p>General</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-<tr>
-<td> mistralai/Mixtral-8x7B-v0.1 </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MixtralForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32768</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;head_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;swiglu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">14336</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;moe_num_experts&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;moe_top_k&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rotary_base&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;rope_theta&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1000000.0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;kv_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>2</p></td>
-<td><p>3072</p></td>
-<td><p>2048</p></td>
-<td><p>General</p></td>
-</tr>
-<tr class="row-odd"><td><p>4</p></td>
-<td><p>8192</p></td>
-<td><p>8192</p></td>
-<td><p>General</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-<tr>
-<td> mistralai/Mistral-7B-v0.1 </td>
-<td>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
-<span class="w">    </span><span class="nt">&quot;architecture&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MistralForCausalLM&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;num_key_value_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;norm_epsilon&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">1e-05</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;vocab_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32000</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;max_position_embeddings&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32768</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;hidden_act&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;silu&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;logits_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;float32&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;position_embedding_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;rope_gpt_neox&quot;</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;use_parallel_embedding&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;embedding_sharding_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;share_embedding_table&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;intermediate_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">14336</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;use_prompt_tuning&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
-<span class="w">    </span><span class="nt">&quot;mapping&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;world_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;tp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;pp_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
-<span class="w">    </span><span class="p">},</span>
-<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
-<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span>
-<span class="w">    </span><span class="p">}</span>
-<span class="p">}</span>
-</pre></div>
-</div>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_num_tokens</span></code></p></th>
-<th class="head"><p><code class="docutils literal notranslate"><span class="pre">$max_batch_size</span></code></p></th>
-<th class="head"><p>ISL/OSL</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>1</p></td>
-<td><p>8192</p></td>
-<td><p>4098</p></td>
-<td><p>General</p></td>
-</tr>
-</tbody>
-</table>
-</td>
-</tr>
-</table>
-</section>
-<section id="running-on-a100">
-<h3>Running on A100<a class="headerlink" href="#running-on-a100" title="Link to this heading"></a></h3>
-<p>To run the benchmarks on A100, you will need to undefine or remove the following
-quantization fields from each config json file, because FP8 computation is a feature in H100 and newer GPUs.</p>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<span class="w">	</span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<span class="w">	</span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<span class="p">}</span>
-</pre></div>
-</div>
 </section>
 </section>
 <section id="preparing-a-dataset">
 <h2>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading"></a></h2>
 <p>In order to prepare a dataset, you can use the provided <a class="reference download internal" download="" href="../_downloads/ea8faa5e98124e92f96b66dc586fb429/prepare_dataset.py"><span class="xref download myst">script</span></a>.
 To generate a synthetic dataset, run the following command:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--output<span class="o">=</span><span class="nv">$dataset_file</span><span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--output<span class="o">=</span><span class="nv">$dataset_file</span><span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$dataset_file</span>
 </pre></div>
 </div>
-<p>The command will generate a JSON file located at the path specified <code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code> where all requests are of the same
+<p>The command will generate a text file located at the path specified <code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code> where all requests are of the same
 input/output sequence length combinations. The script works by using the tokenizer to retrieve the vocabulary size and
 randomly sample token IDs from it to create entirely random sequences. In the command above, all requests will be uniform
 because the standard deviations for both input and output sequences are set to 0.</p>
@@ -1344,46 +1048,108 @@ remain in the system longer and therefore require less requests to achieve stead
 <thead>
 <tr class="row-odd"><th class="head"><p>Input Length</p></th>
 <th class="head"><p>Output Length</p></th>
+<th class="head"><p>$seq_len</p></th>
 <th class="head"><p>$num_requests</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td><p>128</p></td>
 <td><p>128</p></td>
+<td><p>256</p></td>
 <td><p>30000</p></td>
 </tr>
 <tr class="row-odd"><td><p>128</p></td>
 <td><p>2048</p></td>
+<td><p>2176</p></td>
 <td><p>3000</p></td>
 </tr>
 <tr class="row-even"><td><p>128</p></td>
 <td><p>4096</p></td>
+<td><p>4224</p></td>
 <td><p>1500</p></td>
 </tr>
 <tr class="row-odd"><td><p>2048</p></td>
 <td><p>128</p></td>
+<td><p>2176</p></td>
 <td><p>3000</p></td>
 </tr>
 <tr class="row-even"><td><p>2048</p></td>
 <td><p>2048</p></td>
+<td><p>4096</p></td>
 <td><p>1500</p></td>
 </tr>
 </tbody>
 </table>
 </section>
+<section id="engine-building">
+<h2>Engine Building<a class="headerlink" href="#engine-building" title="Link to this heading"></a></h2>
+<p>All engines are built using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> sub-command. The basic command for FP8 quantized engines is as follows:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --dataset $dataset_file
+</pre></div>
+</div>
+<p>or if you would like to build for a specific sequence length:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --max_seq_length $seq_len
+</pre></div>
+</div>
+<p>If you would like to build an FP16 engine without any quantization, simply remove the <code class="docutils literal notranslate"><span class="pre">--quantization</span> <span class="pre">FP8</span></code> option.</p>
+<blockquote>
+<div><p>[!NOTE] If you specify FP8 quantization, the KV cache will automatically be set to FP8 as well!</p>
+</div></blockquote>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> sub-command will output the path where the engine is located upon a successful build. For example,</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
+ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+<span class="o">===========================================================</span>
+</pre></div>
+</div>
+</section>
 <section id="running-the-benchmark">
 <h2>Running the Benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading"></a></h2>
-<p>To run the benchmark with the generated data set, simply run the following command from the root of the
-TensorRT-LLM repository. See the <a class="reference internal" href="#variables"><span class="xref myst">variables</span></a> section for reference on variable values.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>mpirun<span class="w"> </span>-n<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span>--allow-run-as-root<span class="w"> </span>--oversubscribe<span class="w"> </span>cpp/build/benchmarks/gptManagerBenchmark<span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_dir</span><span class="w"> </span>--type<span class="w"> </span>IFB<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--eos_id<span class="w"> </span>-1<span class="w"> </span>--scheduler_policy<span class="w"> </span>guaranteed_no_evict<span class="w"> </span>--kv_cache_free_gpu_mem_fraction<span class="w"> </span><span class="m">0</span>.99<span class="w"> </span>--output_csv<span class="w"> </span>result.csv<span class="w"> </span>--request_rate<span class="w"> </span>-1.0<span class="w"> </span>--enable_chunked_context<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">0</span>
+<p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> sub-command. The benchmarker will
+run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
+the patch to the engine from the <a class="reference internal" href="#engine-building"><span class="xref myst">build</span></a> phase and a <a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">generated dataset</span></a>.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_dir</span>
+</pre></div>
+</div>
+<p>The results will be printed to the terminal upon benchmark completion. For example,</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span><span class="nv">DETAILS</span>
+<span class="o">===========================================================</span>
+Model:<span class="w">                  </span>meta-llama/Llama-2-7b-hf
+Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.12.0
+Dtype:<span class="w">                  </span>float16
+KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">         </span>FP8
+Quantization:<span class="w">           </span>FP8
+Max<span class="w"> </span>Input<span class="w"> </span>Length:<span class="w">       </span><span class="m">2048</span>
+Max<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">    </span><span class="nv">4098</span>
+
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>WORLD<span class="w"> </span>+<span class="w"> </span>RUNTIME<span class="w"> </span><span class="nv">INFORMATION</span>
+<span class="o">===========================================================</span>
+TP<span class="w"> </span>Size:<span class="w">                </span><span class="m">1</span>
+PP<span class="w"> </span>Size:<span class="w">                </span><span class="m">1</span>
+Max<span class="w"> </span>Runtime<span class="w"> </span>Batch<span class="w"> </span>Size:<span class="w"> </span><span class="m">4096</span>
+Max<span class="w"> </span>Runtime<span class="w"> </span>Tokens:<span class="w">     </span><span class="m">8192</span>
+Scheduling<span class="w"> </span>Policy:<span class="w">      </span>Guaranteed<span class="w"> </span>No<span class="w"> </span>Evict
+KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">99</span>.0%
+Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">3</span>.680275266452667e+18
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span><span class="nv">STATISTICS</span>
+<span class="o">===========================================================</span>
+Number<span class="w"> </span>of<span class="w"> </span>requests:<span class="w">             </span><span class="m">3000</span>
+Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0
+Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0
+Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">23405</span>.927228471104
+Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">182</span>.8588064724305
+Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>seconds<span class="o">)</span>:<span class="w">        </span><span class="m">16</span>.406100739
+<span class="o">===========================================================</span>
 </pre></div>
 </div>
 <blockquote>
-<div><p>[!Warning] GH200 benchmarks
-For GH200 benchmarks, the command above must be modified to use <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span></code> to avoid an out of memory scenario.</p>
+<div><p>[!WARNING] In some cases, the benchmarker may not print anything at all. This behavior usually
+means that the benchmark has hit an out of memory issue. Try reducing the KV cache percentage
+using the <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span></code> option to lower the percentage of used memory.</p>
 </div></blockquote>
-<p>The command will run the <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark</span></code> binary that will report the throughput and other metrics as part of its output
-that can be compared with the table in the <a class="reference internal" href="#peak-throughput"><span class="xref myst">Performance section</span></a> of this README.</p>
 </section>
 </section>
 
@@ -1398,7 +1164,7 @@ that can be compared with the table in the <a class="reference internal" href="#
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f0d220e4490>
+<jinja2.runtime.BlockReference object at 0x7f4253467580>
 
 <div class="footer">
     <p>
