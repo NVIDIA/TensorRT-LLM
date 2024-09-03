@@ -112,6 +112,7 @@ The following tensors are for a LoRA which has a `q` and `k` adapter.
 | moe_4h_to_h | 14 | for mixtral adapter for expert mlp layer: down projection |
 | moe_gate | 15 | for mixtral adapter for expert mlp layer: gate |
 | moe_router | 16 | for mixtral adapter for expert router layer |
+| mlp_router | 17 | for qwen2-moe adapter for shared expert gate layer |
 
 #### LoraCache configuration
 

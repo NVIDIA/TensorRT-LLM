@@ -118,9 +118,6 @@ class QWenInfer(object):
                 "`multi_query_mode` config is deprecated. Please rebuild the engine."
             )
             num_kv_heads = 1
-        # num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-        use_custom_all_reduce = config['build_config']['plugin_config'].get(
-            'use_custom_all_reduce', False)
 
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size=world_size,
@@ -142,7 +139,6 @@ class QWenInfer(object):
             remove_input_padding=remove_input_padding,
             dtype=dtype,
             quant_mode=quant_mode,
-            use_custom_all_reduce=use_custom_all_reduce,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
             max_beam_width=self.num_beams)
         sampling_config = SamplingConfig(

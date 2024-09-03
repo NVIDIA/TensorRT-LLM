@@ -68,7 +68,6 @@ def allreduce_benchmark(dtype: str,
         ]:
             builder = tllm.Builder()
             net = builder.create_network()
-            net.plugin_config.set_nccl_plugin(dtype, use_custom_all_reduce=True)
             _buffers, workspace = current_all_reduce_helper(
             ).allocate_workspace(mapping, size * dtype_size)
 

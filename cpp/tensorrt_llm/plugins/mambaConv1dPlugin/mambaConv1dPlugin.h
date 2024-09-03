@@ -44,7 +44,8 @@ namespace tensorrt_llm::plugins
 class MambaConv1dPlugin : public BasePlugin
 {
 public:
-    MambaConv1dPlugin(int dim, int dconv, nvinfer1::DataType type, bool removePadding, bool pagedState, bool applySilu);
+    MambaConv1dPlugin(int dim, int dconv, int preStride, int postStride, nvinfer1::DataType type, bool removePadding,
+        bool pagedState, bool applySilu);
 
     MambaConv1dPlugin(void const* data, size_t length);
 
@@ -132,7 +133,8 @@ private:
 
     void setMambaConv1dParams(tensorrt_llm::kernels::MambaConv1dParamsBase& params,
         // sizes
-        const size_t batch, const size_t dim, const size_t maxSeqLen, const size_t dconv,
+        const size_t batch, const size_t dim, const size_t maxSeqLen, const size_t dconv, const size_t preStride,
+        const size_t postStride,
         // device pointers
         void const* inPtr, void const* stateInPtr, void* stateOutPtr, void const* convWeight, void const* convBias,
         void* outPtr, int const* lastTokenIds, int const* stateSlotMapping, bool removePadding, bool applySilu);
@@ -140,6 +142,8 @@ private:
 private:
     int mDim;
     int mDConv;
+    int mPreStride;
+    int mPostStride;
     nvinfer1::DataType mType;
     bool mRemovePadding = false;
     bool mPagedState = false;

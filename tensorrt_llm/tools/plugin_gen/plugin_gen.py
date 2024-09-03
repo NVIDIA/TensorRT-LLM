@@ -15,11 +15,11 @@ try:
 except ImportError:
     raise ImportError("Triton is not installed. Please install it first.")
 
-from tensorrt_llm.tools.plugin_gen.core import (KernelMetaData,
-                                                PluginCmakeCodegen,
-                                                PluginCppCodegen,
-                                                PluginPyCodegen,
-                                                PluginRegistryCodegen)
+# isort: off
+from tensorrt_llm.tools.plugin_gen.core import (
+    KernelMetaData, PluginCmakeCodegen, PluginCppCodegen, PluginPyCodegen,
+    PluginRegistryCodegen, copy_common_files)
+# isort: on
 
 PYTHON_BIN = sys.executable
 
@@ -210,6 +210,7 @@ class Stage:
         PluginRegistryCodegen(out_path=os.path.join(self.config.sub_workspace,
                                                     'tritonPlugins.cpp'),
                               plugin_names=kernel_names).generate()
+        copy_common_files(self.config.sub_workspace)
         PluginCmakeCodegen(out_path=os.path.join(self.config.sub_workspace,
                                                  'CMakeLists.txt'),
                            plugin_names=kernel_names,

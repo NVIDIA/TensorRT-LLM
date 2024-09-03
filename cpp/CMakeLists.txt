@@ -38,7 +38,9 @@ option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
-option(USE_SHARED_NVRTC "Use shared NVRTC library instead of static" OFF)
+
+# Always use static NVRTC for IP protection reasons.
+set(USE_SHARED_NVRTC OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -128,6 +130,27 @@ if(INDEX_RANGE_CHECK)
   message(WARNING "Check index range to detect OOB accesses")
 endif()
 
+# Read the project version
+set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
+set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
+                                    ${TRTLLM_VERSION_DIR}/version.py)
+execute_process(
+  COMMAND python3 -c "import version; print(version.__version__)"
+  WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
+  OUTPUT_VARIABLE TRTLLM_VERSION
+  RESULT_VARIABLE TRTLLM_VERSION_RESULT
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if(TRTLLM_VERSION_RESULT EQUAL 0)
+  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
+else()
+  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
+endif()
+
+configure_file(
+  cmake/templates/version.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+
 # Determine CUDA version before enabling the language extension
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
@@ -139,7 +162,7 @@ if(CMAKE_CUDA_COMPILER)
         "${CMAKE_CUDA_COMPILER} --version | egrep -o 'V[0-9]+.[0-9]+.[0-9]+' | cut -c2-"
       RESULT_VARIABLE _BASH_SUCCESS
       OUTPUT_VARIABLE CMAKE_CUDA_COMPILER_VERSION
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     if(NOT _BASH_SUCCESS EQUAL 0)
       message(FATAL_ERROR "Failed to determine CUDA version")
@@ -330,7 +353,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
 
 if(UNIX)
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Og")
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
 # Note: The following are desirable settings that should be enabled if we

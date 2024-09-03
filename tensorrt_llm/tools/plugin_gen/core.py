@@ -1,9 +1,11 @@
 import glob
 import os
+import shutil
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Iterable, List, Tuple,
                     Union)
 
@@ -16,6 +18,7 @@ import jinja2
 import yaml
 
 pjoin = os.path.join
+cdir = Path(__file__).absolute().parent
 
 
 class DType(Enum):
@@ -510,10 +513,6 @@ class PluginCppCodegen:
             enqueue_body_arg_list=self.enqueue_body_arg_list,
             getNbOutputs_body=self.getNbOutputs_body,
             creator_constructor_body=self.creator_constructor_body,
-            plugin_common_header=open(
-                env.get_template('plugin_common.h').filename).read(),
-            plugin_common_source=open(
-                env.get_template('plugin_common.cpp').filename).read(),
             plugin_version='0',
             **_render_common_parameters(),
         )
@@ -686,6 +685,16 @@ class PluginCmakeCodegen:
 
             content = env.get_template("CMakeLists.txt.tpl").render(tpl_data)
             f.write(content)
+
+
+def copy_common_files(out_path: str):
+    out_path = Path(out_path)
+    files_to_copy = [
+        Path("templates/plugin_common.cpp"),
+        Path("templates/plugin_common.h")
+    ]
+    for file in files_to_copy:
+        shutil.copy(cdir / file, out_path)
 
 
 def setup_jinja_env() -> jinja2.Environment:

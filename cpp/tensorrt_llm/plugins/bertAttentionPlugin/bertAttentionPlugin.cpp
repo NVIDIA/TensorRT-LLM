@@ -53,11 +53,6 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
         {
             TLLM_LOG_WARNING("Fall back to unfused MHA because of unsupported data type.");
         }
-        else if (!MHARunner::fmha_supported(mHeadSize, mSM))
-        {
-            TLLM_LOG_WARNING(
-                "Fall back to unfused MHA because of unsupported head size %d in sm_{%d}.", mHeadSize, mSM);
-        }
         else if (mRelativeAttention)
         {
             TLLM_LOG_WARNING("Fall back to unfused MHA because of relative position embedding.");
@@ -300,10 +295,22 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     // We update mEnableContextFMHA in constructor to check this condition
     if (mEnableContextFMHA)
     {
-        // b, max_seqlen, actual_total_seqlen
-        mFMHARunner->setup(request_batch_size, request_seq_len, request_seq_len, request_batch_size * request_seq_len);
-        mFMHARunner->run(
-            const_cast<T*>(attention_input), cu_seqlens, fmha_tile_counter_ptr, nullptr, context_buf_, stream);
+        // Construct the fmha params for running kernels.
+        MHARunnerParams fmhaParams{};
+        fmhaParams.b = request_batch_size;
+        fmhaParams.qSeqLen = request_seq_len;
+        fmhaParams.kvSeqLen = request_seq_len;
+        fmhaParams.totalQSeqLen = request_batch_size * request_seq_len;
+        // Device buffer pointers.
+        fmhaParams.qkvPtr = attention_input;
+        fmhaParams.outputPtr = context_buf_;
+        fmhaParams.cuQSeqLenPtr = cu_seqlens;
+        fmhaParams.cuKvSeqLenPtr = cu_seqlens;
+        fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
+        fmhaParams.stream = stream;
+
+        // Run the fmha kernel.
+        mFMHARunner->run(fmhaParams);
     }
     else
     {
@@ -490,10 +497,23 @@ int BertAttentionPlugin::initialize() noexcept
         {
             TLLM_CHECK_WITH_INFO(false, "GPTAttentionPlugin received wrong data type.");
         }
-        // Paged KV FMHA it not needed.
-        mFMHARunner.reset(new FusedMHARunnerV2(data_type, false, mNumHeads, mHeadSize, mQScaling));
-        // set flags: force_fp32_acc, is_s_padded, causal_mask, num_kv_heads = num_heads
-        mFMHARunner->setup_flags(mFMHAForceFP32Acc, !mRemovePadding, false, mNumHeads);
+
+        // Construct the fmha runner.
+        MHARunnerFixedParams fmhaParams{};
+        fmhaParams.dataType = data_type;
+        fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.attentionMaskType = ContextAttentionMaskType::PADDING;
+        fmhaParams.isSPadded = !mRemovePadding;
+        fmhaParams.numQHeads = mNumHeads;
+        fmhaParams.numKvHeads = mNumHeads;
+        fmhaParams.headSize = mHeadSize;
+        fmhaParams.qScaling = mQScaling;
+
+        // Load kernels from the pre-compiled cubins.
+        mFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
+
+        // Fall back to unfused MHA kernels if not supported.
+        mEnableContextFMHA = mFMHARunner->isFmhaSupported();
     }
 
     return 0;

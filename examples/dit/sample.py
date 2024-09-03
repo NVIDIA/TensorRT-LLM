@@ -37,11 +37,15 @@ class TllmDiT(object):
         self.dtype = config['pretrained_config']['dtype']
 
         rank = tensorrt_llm.mpi_rank()
-        world_size = tp = config['pretrained_config']['mapping'][
-            'world_size']  # Only support TP
+        world_size = config['pretrained_config']['mapping']['world_size']
+        cp_size = config['pretrained_config']['mapping']['cp_size']
+        tp_size = config['pretrained_config']['mapping']['tp_size']
+        pp_size = config['pretrained_config']['mapping']['pp_size']
+        assert pp_size == 1
         self.mapping = tensorrt_llm.Mapping(world_size=world_size,
                                             rank=rank,
-                                            tp_size=tp,
+                                            cp_size=cp_size,
+                                            tp_size=tp_size,
                                             pp_size=1,
                                             gpus_per_node=args.gpus_per_node)
 
@@ -72,14 +76,12 @@ class TllmDiT(object):
 
         expected_tensor_names = ['latent', 'timestep', 'label', 'output']
 
-        self.use_custom_all_reduce = config['build_config']['plugin_config'][
-            'use_custom_all_reduce']
-        if self.mapping.tp_size > 1 and self.use_custom_all_reduce:
-            set_peer_access(self.mapping)
+        if self.mapping.tp_size > 1:
+            is_p2p_supported = set_peer_access(self.mapping)
             self.buffer, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.mapping.tp_size))
+                    self.mapping.tp_size), is_p2p_supported)
             self.inputs['all_reduce_workspace'] = self.all_reduce_workspace
             expected_tensor_names += ['all_reduce_workspace']
 

@@ -36,6 +36,7 @@ if PYTHON_BINDINGS:
 
 
 def parse_arguments(args=None):
+    # see `add_common_args` for extended list of arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--max_input_length', type=int, default=923)
     parser.add_argument('--max_output_len', type=int, required=True)
@@ -139,7 +140,7 @@ def parse_input(tokenizer,
                 range(base_vocab_size,
                       base_vocab_size + length)) + batch_input_ids[i]
 
-    if model_name == 'ChatGLMForCausalLM' and model_version == 'glm':
+    if input_file is None and 'GLM' in model_name and model_version == 'glm':
         for ids in batch_input_ids:
             ids.append(tokenizer.sop_token_id)
 
@@ -265,16 +266,6 @@ def main(args):
     if args.end_id:
         end_id = args.end_id
 
-    stop_words_list = None
-    if args.stop_words:
-        stop_words_list = tensorrt_llm.runtime.decode_words_list(
-            args.stop_words, tokenizer)
-
-    bad_words_list = None
-    if args.bad_words:
-        bad_words_list = tensorrt_llm.runtime.decode_words_list(
-            args.bad_words, tokenizer)
-
     prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
         prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
@@ -288,6 +279,23 @@ def main(args):
                                   num_prepend_vtokens=args.num_prepend_vtokens,
                                   model_name=model_name,
                                   model_version=model_version)
+
+    stop_words_list = None
+    if args.stop_words:
+        stop_words_list = tensorrt_llm.runtime.decode_words_list(
+            args.stop_words, tokenizer)
+    if model_version == 'glm4':  # add default stop token ids for GLM-4
+        glm4_stop_ids = [[151329], [151336], [151338]]
+        if stop_words_list is None:
+            stop_words_list = [glm4_stop_ids] * len(batch_input_ids)
+        else:
+            for req_stop_words_list in stop_words_list:
+                req_stop_words_list.extend(glm4_stop_ids)
+
+    bad_words_list = None
+    if args.bad_words:
+        bad_words_list = tensorrt_llm.runtime.decode_words_list(
+            args.bad_words, tokenizer)
 
     if is_enc_dec:
         encoder_input_ids = batch_input_ids
@@ -303,7 +311,7 @@ def main(args):
     encoder_input_lengths = [x.size(0)
                              for x in encoder_input_ids] if is_enc_dec else None
 
-    if not supports_inflight_batching(
+    if not args.use_py_session and not supports_inflight_batching(
             os.path.join(args.engine_dir, "decoder") if is_enc_dec else args.
             engine_dir):
         logger.warning(
@@ -321,6 +329,18 @@ def main(args):
             "Debug mode is not supported in C++ session for now, fallback to Python session."
         )
         args.use_py_session = True
+    if args.return_all_generated_tokens and args.use_py_session:
+        raise ValueError(
+            "Returning all the generated tokens at each step is not supported in the Python session, use C++ session instead."
+        )
+    if (not args.return_all_generated_tokens) and args.streaming and (
+            args.num_beams > 1):
+        logger.warning(
+            "Setting return_all_generated_tokens to True since streaming AND beam search are done simultaneously. "
+            "Returning the full beams at each streaming step is needed because beam search + streaming can change previous outputs. "
+            "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
+        )
+        args.return_all_generated_tokens = True
     runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
     runner_kwargs = dict(
         engine_dir=args.engine_dir,
@@ -351,7 +371,9 @@ def main(args):
             kv_cache_free_gpu_memory_fraction=args.
             kv_cache_free_gpu_memory_fraction,
             enable_chunked_context=args.enable_chunked_context,
-        )
+            multi_block_mode=args.multi_block_mode)
+    runner_kwargs.update(
+        enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
     runner = runner_cls.from_dir(**runner_kwargs)
 
     with torch.no_grad():
@@ -385,7 +407,8 @@ def main(args):
             output_sequence_lengths=True,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
             return_dict=True,
-            medusa_choices=args.medusa_choices)
+            medusa_choices=args.medusa_choices,
+            return_all_generated_tokens=args.return_all_generated_tokens)
         torch.cuda.synchronize()
 
     if args.streaming:
@@ -472,7 +495,9 @@ def main(args):
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
-                    return_dict=True)
+                    return_dict=True,
+                    return_all_generated_tokens=args.return_all_generated_tokens
+                )
                 torch.cuda.synchronize()
 
         tensorrt_llm.profiler.start("tmp")
@@ -504,7 +529,9 @@ def main(args):
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,
                     output_sequence_lengths=True,
-                    return_dict=True)
+                    return_dict=True,
+                    return_all_generated_tokens=args.return_all_generated_tokens
+                )
                 torch.cuda.synchronize()
         tensorrt_llm.profiler.stop("tmp")
 

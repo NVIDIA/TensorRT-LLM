@@ -217,7 +217,7 @@ public:
             scheduler, workspace};
     }
 
-    CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args)
+    static bool can_implement(Arguments const& args)
     {
         bool implementable = (args.mode == GemmUniversalMode::kGemm)
             or (args.mode == GemmUniversalMode::kBatched && cute::rank(ProblemShape{}) == 4);

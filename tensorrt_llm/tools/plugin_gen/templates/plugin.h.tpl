@@ -31,9 +31,7 @@ extern "C"
 #include <set>
 #include <string>
 #include <vector>
-
-[[ plugin_common_header ]]
-
+#include "plugin_common.h"
 
 namespace nvinfer1
 {

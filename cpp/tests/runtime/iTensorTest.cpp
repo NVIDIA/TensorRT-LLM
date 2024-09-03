@@ -690,3 +690,22 @@ TEST(BufferRangeTest, ConstType)
         EXPECT_EQ(tensorRange[i], tensorConst_RangeConst[i]);
     }
 }
+
+TEST(ITensorTest, GetDimension)
+{
+    auto shape = ITensor::makeShape({10, 11, 12});
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+    ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
+
+    auto firstDimensionFromStart = tensor->getDimension<0>();
+    EXPECT_EQ(firstDimensionFromStart, 10);
+
+    auto firstDimensionFromEnd = tensor->getDimension<-3>();
+    EXPECT_EQ(firstDimensionFromEnd, firstDimensionFromStart);
+
+    auto lastDimensionFromEnd = tensor->getDimension<-1>();
+    EXPECT_EQ(lastDimensionFromEnd, 12);
+
+    auto lastDimensionFromStart = tensor->getDimension<2>();
+    EXPECT_EQ(lastDimensionFromStart, lastDimensionFromEnd);
+}

@@ -54,6 +54,11 @@ public:
         return mUVM;
     }
 
+    [[nodiscard]] SizeType32 getPinnedPool() const
+    {
+        return mPinnedPool;
+    }
+
     [[nodiscard]] DiffType getGpuDiff() const
     {
         return mGpuDiff;
@@ -72,6 +77,11 @@ public:
     [[nodiscard]] DiffType getUVMDiff() const
     {
         return mUVMDiff;
+    }
+
+    [[nodiscard]] DiffType getPinnedPoolDiff() const
+    {
+        return mPinnedPoolDiff;
     }
 
     template <MemoryType T>
@@ -97,6 +107,11 @@ public:
         {
             mUVM += size;
             mUVMDiff = sizeDiff;
+        }
+        else if constexpr (T == MemoryType::kPINNEDPOOL)
+        {
+            mPinnedPool += size;
+            mPinnedPoolDiff = sizeDiff;
         }
         else
         {
@@ -130,6 +145,11 @@ public:
             mUVM -= size;
             mUVMDiff = sizeDiff;
         }
+        else if constexpr (T == MemoryType::kPINNEDPOOL)
+        {
+            mPinnedPool -= size;
+            mPinnedPoolDiff = sizeDiff;
+        }
         else
         {
             TLLM_THROW("Unknown memory type: %s", MemoryTypeString<T>::value);
@@ -147,8 +167,8 @@ public:
     [[nodiscard]] std::string toString() const;
 
 private:
-    std::atomic<SizeType32> mGpu{}, mCpu{}, mPinned{}, mUVM{};
-    std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{};
+    std::atomic<SizeType32> mGpu{}, mCpu{}, mPinned{}, mUVM{}, mPinnedPool{};
+    std::atomic<DiffType> mGpuDiff{}, mCpuDiff{}, mPinnedDiff{}, mUVMDiff{}, mPinnedPoolDiff{};
 };
 
 } // namespace tensorrt_llm::runtime

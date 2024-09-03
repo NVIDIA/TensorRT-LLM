@@ -59,7 +59,7 @@ void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     }
 }
 
-void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     int const originalN = n * getWeightTypeMultiplier(mWeightTypeId);
     std::vector<size_t> workspaces = {
@@ -299,6 +299,9 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     int const m = TLLM_INT32_CAST(m64);
     int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[1]);
     int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
+
+    if (m == 0)
+        return 0;
 
     bool const use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
 #if defined(ENABLE_BF16)

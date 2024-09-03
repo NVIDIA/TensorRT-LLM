@@ -18,8 +18,8 @@ import numpy as np
 
 from ..._common import default_net
 from ...functional import (ACT2FN, bert_attention, cast, concat, constant,
-                           expand, expand_mask, matmul, select, shape, slice,
-                           softmax, split, unsqueeze)
+                           cumsum, expand, expand_mask, index_select, matmul,
+                           select, shape, slice, softmax, split, unsqueeze)
 from ...layers import MLP, ColumnLinear, Embedding, LayerNorm, Linear, RowLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
@@ -82,16 +82,25 @@ class BertAttention(Module):
                                tp_group=tp_group,
                                tp_size=tp_size)
 
-    def forward(self, hidden_states, attention_mask=None, input_lengths=None):
+    def forward(self,
+                hidden_states,
+                attention_mask=None,
+                input_lengths=None,
+                max_input_length=None):
         qkv = self.qkv(hidden_states)
 
         # attention
         if default_net().plugin_config.bert_attention_plugin:
             assert input_lengths is not None
-            context = bert_attention(qkv, input_lengths,
+            context = bert_attention(qkv,
+                                     input_lengths,
                                      self.num_attention_heads,
-                                     self.attention_head_size, 1.0)
+                                     self.attention_head_size,
+                                     q_scaling=1.0,
+                                     max_input_length=max_input_length)
         else:
+            assert not default_net().plugin_config.remove_input_padding, \
+                   "remove_input_padding requires bert_attention_plugin enabled"
 
             def transpose_for_scores(x):
                 new_x_shape = concat([
@@ -156,12 +165,17 @@ class BertEncoderLayer(Module):
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         dtype=dtype)
 
-    def forward(self, hidden_states, attention_mask=None, input_lengths=None):
+    def forward(self,
+                hidden_states,
+                attention_mask=None,
+                input_lengths=None,
+                max_input_length=None):
         residual = hidden_states
 
         attention_output = self.attention(hidden_states,
                                           attention_mask=attention_mask,
-                                          input_lengths=input_lengths)
+                                          input_lengths=input_lengths,
+                                          max_input_length=max_input_length)
 
         hidden_states = residual + attention_output
 
@@ -219,53 +233,61 @@ class BertModel(Module):
                 input_lengths=None,
                 position_ids=None,
                 token_type_ids=None,
-                hidden_states=None):
+                hidden_states=None,
+                max_input_length=None):
+        # remove_input_padding requires these fields as explicit input
+        extended_attention_mask = None
+        if not default_net().plugin_config.remove_input_padding:
+            seq_len_2d = concat([1, shape(input_ids, 1)])
 
-        seq_len_2d = concat([1, shape(input_ids, 1)])
-
-        # create position ids
-        position_ids_buffer = constant(
-            np.expand_dims(
-                np.arange(self.max_position_embeddings).astype(np.int32), 0))
-        tmp_position_ids = slice(position_ids_buffer,
-                                 starts=[0, 0],
-                                 sizes=seq_len_2d)
-        tmp_position_ids = expand(tmp_position_ids, shape(input_ids))  #BxL
-        tmp_input_lengths = unsqueeze(input_lengths, 1)  #Bx1
-        tmp_input_lengths = expand(tmp_input_lengths, shape(input_ids))  #BxL
-        mask = tmp_position_ids < tmp_input_lengths  # BxL
-        mask = mask.cast('int32')
-
-        if position_ids is None:
-            if self.is_roberta:
-                # see create_position_ids_from_input_ids() in https://github.com/huggingface/transformers/blob/main/src/transformers/models/roberta/modeling_roberta.py
-                position_ids = (tmp_position_ids + 1) * mask
-                position_ids = position_ids + self.padding_idx
-            else:
-                position_ids = slice(position_ids_buffer,
+            # create position ids
+            position_ids_buffer = constant(
+                np.expand_dims(
+                    np.arange(self.max_position_embeddings).astype(np.int32),
+                    0))
+            tmp_position_ids = slice(position_ids_buffer,
                                      starts=[0, 0],
                                      sizes=seq_len_2d)
-                position_ids = expand(position_ids, shape(input_ids))
+            tmp_position_ids = expand(tmp_position_ids, shape(input_ids))  #BxL
+            tmp_input_lengths = unsqueeze(input_lengths, 1)  #Bx1
+            tmp_input_lengths = expand(tmp_input_lengths,
+                                       shape(input_ids))  #BxL
+            mask = tmp_position_ids < tmp_input_lengths  # BxL
+            mask = mask.cast('int32')
 
-        # create extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
-        extended_attention_mask = expand_mask(mask, tgt_len=1)  # BxL -> Bx1x1xL
+            if position_ids is None:
+                if self.is_roberta:
+                    # see create_position_ids_from_input_ids() in https://github.com/huggingface/transformers/blob/main/src/transformers/models/roberta/modeling_roberta.py
+                    position_ids = (tmp_position_ids + 1) * mask
+                    position_ids = position_ids + self.padding_idx
+                else:
+                    position_ids = slice(position_ids_buffer,
+                                         starts=[0, 0],
+                                         sizes=seq_len_2d)
+                    position_ids = expand(position_ids, shape(input_ids))
 
-        # create token_type_ids
-        if token_type_ids is None:
-            token_type_ids_buffer = constant(
-                np.expand_dims(
-                    np.zeros(self.max_position_embeddings).astype(np.int32), 0))
-            token_type_ids = slice(token_type_ids_buffer,
-                                   starts=[0, 0],
-                                   sizes=seq_len_2d)
-            token_type_ids = expand(token_type_ids, shape(input_ids))
+            # create extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
+            extended_attention_mask = expand_mask(mask,
+                                                  tgt_len=1)  # BxL -> Bx1x1xL
+
+            # create token_type_ids
+            if token_type_ids is None:
+                token_type_ids_buffer = constant(
+                    np.expand_dims(
+                        np.zeros(self.max_position_embeddings).astype(np.int32),
+                        0))
+                token_type_ids = slice(token_type_ids_buffer,
+                                       starts=[0, 0],
+                                       sizes=seq_len_2d)
+                token_type_ids = expand(token_type_ids, shape(input_ids))
 
         hidden_states = self.embedding(input_ids, position_ids, token_type_ids)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states,
                                   input_lengths=input_lengths,
-                                  attention_mask=extended_attention_mask)
+                                  attention_mask=extended_attention_mask,
+                                  max_input_length=max_input_length)
 
         return hidden_states
 
@@ -325,10 +347,28 @@ class BertPooler(Module):
         self.dense = Linear(hidden_size, hidden_size, dtype=dtype)
         self.activation = ACT2FN['tanh']
 
-    def forward(self, hidden_states):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
-        first_token_tensor = select(hidden_states, 1, 0)
+    def forward(self, hidden_states, input_lengths, remove_input_padding):
+        if not remove_input_padding:
+            # We "pool" the model by simply taking the hidden state corresponding
+            # to the first token.
+            first_token_tensor = select(hidden_states, 1, 0)
+        else:
+            # when remove_input_padding is enabled, the shape of hidden_states is [num_tokens, hidden_size]
+            # We can take the first token of each sequence according to input_lengths,
+            # and then do pooling similar to padding mode.
+            # For example, if input_lengths is [8, 5, 6], then the indices of first tokens
+            # should be [0, 8, 13]
+            first_token_indices = cumsum(
+                concat([
+                    0,
+                    slice(input_lengths,
+                          starts=[0],
+                          sizes=(shape(input_lengths) -
+                                 constant(np.array([1], dtype=np.int32))))
+                ]), 0)
+            first_token_tensor = index_select(hidden_states, 0,
+                                              first_token_indices)
+
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
         return pooled_output
@@ -389,20 +429,36 @@ class BertForSequenceClassification(Module):
                                                         dtype=dtype)
 
     def forward(self,
-                input_ids=None,
-                input_lengths=None,
+                input_ids,
+                input_lengths,
                 token_type_ids=None,
                 position_ids=None,
-                hidden_states=None):
+                hidden_states=None,
+                max_input_length=None):
+
+        remove_input_padding = default_net().plugin_config.remove_input_padding
+
+        # required as explicit input in remove_input_padding mode
+        # see examples/bert/run_remove_input_padding.py for how to create them from input_ids and input_lengths
+        if remove_input_padding:
+            assert token_type_ids is not None and \
+                   position_ids is not None and \
+                   max_input_length is not None, \
+                   "token_type_ids, position_ids, max_input_length is required " \
+                   "in remove_input_padding mode"
 
         hidden_states = self.bert.forward(input_ids=input_ids,
                                           input_lengths=input_lengths,
                                           token_type_ids=token_type_ids,
                                           position_ids=position_ids,
-                                          hidden_states=hidden_states)
+                                          hidden_states=hidden_states,
+                                          max_input_length=max_input_length)
 
         if not self.is_roberta:
-            pooled_output = self.pooler(hidden_states)
+            pooled_output = self.pooler(
+                hidden_states=hidden_states,
+                input_lengths=input_lengths,
+                remove_input_padding=remove_input_padding)
             logits = self.classifier(pooled_output)
         else:
             logits = self.classifier(hidden_states)

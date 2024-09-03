@@ -37,7 +37,7 @@ RnnStateBuffers::RnnStateBuffers(
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(modelConfig.isRnnBased());
-    TLLM_CHECK_WITH_INFO(modelConfig.hasRnnConfig(), "RNN only support Mamba now.");
+    TLLM_CHECK_WITH_INFO(modelConfig.hasRnnConfig(), "RNN only support Mamba1/Mamba2/RecurrentGemma now.");
     auto maxBatchSize = modelConfig.getMaxBatchSize();
     auto maxBeamWidth = modelConfig.getMaxBeamWidth();
     auto maxBatchBeam = maxBatchSize * maxBeamWidth;
@@ -46,23 +46,37 @@ RnnStateBuffers::RnnStateBuffers(
     mConvKernel = rnnConfig->convKernel;
     mStateSize = rnnConfig->stateSize;
     mRnnHiddenSize = rnnConfig->rnnHiddenSize;
+    mRnnHeadSize = rnnConfig->rnnHeadSize;
+    mRnnConvDimSize = rnnConfig->rnnConvDimSize;
     auto dType = modelConfig.getDataType();
     auto const localNbLayers = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism());
     mLocalNbLayers = localNbLayers;
     mMaxBeamWidth = maxBeamWidth;
     mUseMambaConv1dPlugin = modelConfig.useMambaConv1dPlugin();
-    auto rnnStatesShape = ITensor::makeShape({localNbLayers * maxBatchBeam, mStateSize, mRnnHiddenSize});
+    auto const rnnStatesShape = [&]()
+    {
+        if (mRnnHeadSize > 0)
+        {
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {localNbLayers * maxBatchBeam, mRnnHiddenSize / mRnnHeadSize, mStateSize, mRnnHeadSize});
+        }
+        else
+        {
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {localNbLayers * maxBatchBeam, mStateSize, mRnnHiddenSize});
+        }
+    }();
     auto const convStatesShape = [&]()
     {
         if (mUseMambaConv1dPlugin)
         {
             return tensorrt_llm::runtime::ITensor::makeShape(
-                {localNbLayers * maxBatchBeam, mConvKernel - 1, mRnnHiddenSize});
+                {localNbLayers * maxBatchBeam, mConvKernel - 1, mRnnConvDimSize});
         }
         else
         {
             return tensorrt_llm::runtime::ITensor::makeShape(
-                {localNbLayers * maxBatchBeam, mRnnHiddenSize, mConvKernel - 1});
+                {localNbLayers * maxBatchBeam, mRnnConvDimSize, mConvKernel - 1});
         }
     }();
     auto& bufferManager = runtime.getBufferManager();
@@ -96,18 +110,30 @@ RnnStateBuffers::RnnStateBuffers(
 void RnnStateBuffers::reshape(SizeType32 batchSize)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    auto rnnStatesShape = ITensor::makeShape({mLocalNbLayers * batchSize * mMaxBeamWidth, mStateSize, mRnnHiddenSize});
+    auto const rnnStatesShape = [&]()
+    {
+        if (mRnnHeadSize > 0)
+        {
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {mLocalNbLayers * batchSize * mMaxBeamWidth, mRnnHiddenSize / mRnnHeadSize, mStateSize, mRnnHeadSize});
+        }
+        else
+        {
+            return tensorrt_llm::runtime::ITensor::makeShape(
+                {mLocalNbLayers * batchSize * mMaxBeamWidth, mStateSize, mRnnHiddenSize});
+        }
+    }();
     auto const convStatesShape = [&]()
     {
         if (mUseMambaConv1dPlugin)
         {
             return tensorrt_llm::runtime::ITensor::makeShape(
-                {mLocalNbLayers * batchSize * mMaxBeamWidth, mConvKernel - 1, mRnnHiddenSize});
+                {mLocalNbLayers * batchSize * mMaxBeamWidth, mConvKernel - 1, mRnnConvDimSize});
         }
         else
         {
             return tensorrt_llm::runtime::ITensor::makeShape(
-                {mLocalNbLayers * batchSize * mMaxBeamWidth, mRnnHiddenSize, mConvKernel - 1});
+                {mLocalNbLayers * batchSize * mMaxBeamWidth, mRnnConvDimSize, mConvKernel - 1});
         }
     }();
     rnnStates->reshape(rnnStatesShape);

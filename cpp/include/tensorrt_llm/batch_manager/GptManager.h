@@ -40,7 +40,7 @@ class TrtGptModel;
 
 /* Responsible for shepherding requests through to completion
    using TRT Backend. */
-class GptManager
+class [[deprecated("Use the executor API instead.")]] GptManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -122,6 +122,9 @@ private:
     void decoupled_execution_loop();
     std::shared_ptr<std::thread> worker_thread_;
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
+
+    inline static std::string const kPROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP";
+    inline static std::string const kLEGACY_PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_GPTM_PROFILE_START_STOP";
 };
 
 } // namespace tensorrt_llm::batch_manager

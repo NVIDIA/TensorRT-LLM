@@ -31,11 +31,11 @@ namespace tensorrt_llm::runtime::decoder_batch
 class Request
 {
 public:
-    using ConstTensorPtr = ITensor::SharedConstPtr;
+    using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
     using BufferPtr = IBuffer::SharedPtr;
 
-    explicit Request(ConstTensorPtr ids, SizeType32 inputLen, std::optional<SizeType32> maxNewTokens = std::nullopt,
+    explicit Request(TensorConstPtr ids, SizeType32 inputLen, std::optional<SizeType32> maxNewTokens = std::nullopt,
         std::optional<SizeType32> endId = std::nullopt)
         : ids{std::move(ids)}
         , inputLen(inputLen)
@@ -46,7 +46,7 @@ public:
     }
 
     // mandatory parameters
-    ConstTensorPtr ids;  // [inputSeqLen], the input sequence of token ids, on gpu
+    TensorConstPtr ids;  // [inputSeqLen], the input sequence of token ids, on gpu
     SizeType32 inputLen; // the input length without draft tokens
 
     // optional parameters

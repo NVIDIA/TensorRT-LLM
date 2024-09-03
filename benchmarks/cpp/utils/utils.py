@@ -72,12 +72,19 @@ def get_exponential_dist_delays(mean_time_bet_reqs, num_reqs, random_seed):
     return np.random.exponential(mean_time_bet_reqs, num_reqs).tolist()
 
 
-def get_norm_dist_tokens(mean, stdev, num_reqs, random_seed):
+def get_norm_dist_lengths(mean, stdev, num_reqs, random_seed):
     # set seed for determinism
     np.random.seed(random_seed)
     numbers_list = np.random.normal(loc=mean, scale=stdev,
                                     size=num_reqs).tolist()
     return [max(1, math.ceil(x)) for x in numbers_list]
+
+
+def get_unif_dist_lengths(min_len, max_len, num_reqs, random_seed):
+    # set seed for determinism
+    rng = np.random.default_rng(random_seed)
+    numbers = rng.integers(low=min_len, high=max_len + 1, size=num_reqs)
+    return numbers.tolist()
 
 
 def gen_random_tokens(ip_lens, tokenizer, random_seed):

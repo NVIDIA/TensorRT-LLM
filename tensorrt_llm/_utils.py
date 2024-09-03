@@ -112,14 +112,12 @@ def trt_version():
     return trt.__version__
 
 
-# TRT supports strongly_typed in 9.1
-def support_strongly_type():
-    return version.parse(trt_version()) >= version.parse("9.1.0")
-
-
-# Check if TRT version >= 10
-def trt_gte_10():
-    return version.parse(trt_version()).major > 9
+def trt_gte(major: int, minor: int = 0):
+    """
+    Check if TRT version is greater than or equal to major.minor
+    """
+    trt_ver = version.parse(trt_version())
+    return trt_ver.major >= major and trt_ver.minor >= minor
 
 
 def torch_version():
@@ -295,6 +293,7 @@ _torch_to_trt_dtype_dict = {
     torch.int64: trt.int64,
     torch.int32: trt.int32,
     torch.int8: trt.int8,
+    torch.float8_e4m3fn: trt.fp8,
     torch.qint8: trt.int8,
     torch.bool: trt.bool,
     torch.bfloat16: trt.bfloat16

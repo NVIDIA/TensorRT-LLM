@@ -13,7 +13,6 @@ import yaml
 from ._utils import (DictConversion, pad_vocab_size, release_gc,
                      str_dtype_to_torch, torch_to_numpy)
 from .layers.linear import ColumnLinear
-from .logger import logger
 from .mapping import Mapping
 from .models.convert_utils import (get_model_path, load_state_dict,
                                    split_matrix_tp)
@@ -34,30 +33,43 @@ def get_all_nemo_lora_weights(lora_weights):
             m = layer_pattern.match(key)
             layer_idx = int(m.group(1))
             layer_weights[layer_idx][inout] = weights
+        else:
+            raise KeyError(f"unsupported key {key} from Nemo LoRA weights")
     return layer_weights
 
 
-def get_all_hf_lora_weights(lora_weights, hf_modules, component=None):
+# The pattern is {layer_prefix:1}.{layer_idx:2}.{module_prefix:3}.{module_name or {expert_name:5}.{expert_idx:6}.{module_name:7} :4}.lora_{A|B:8}.weight
+HF_LORA_PATTERN = re.compile(
+    r'(.*)\.(\d+)\.(\w+)\.(\w+|\w+\.\w+|(\w+)\.(\d+)\.(\w+))\.lora_(A|B)\.weight'
+)
+
+
+def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
     all_weights = defaultdict(lambda: defaultdict(dict))
-    pattern = re.compile(
-        r'(.*)\.(\d+)\.(\w+)\.(\w+|experts\.(\d+)\.(\w+))\.lora_(A|B)\.weight')
+    pattern = HF_LORA_PATTERN
     for key, weights in lora_weights.items():
         m = pattern.match(key)
         if not m:
             if "lm_head" not in key and "embed_tokens" not in key:
-                logger.warning(f"no match {key} from HF LoRA weights")
+                raise KeyError(f"unsupported key {key} from HF LoRA weights")
             continue
         if component is not None and component not in m.group(1):
             continue
         layer_idx = int(m.group(2))
-        expert_idx = m.group(5)
+        expert_idx = m.group(6)
         is_moe = expert_idx is not None
-        module_name = m.group(6 if is_moe else 4)
-        hf_module = m.group(3) + "." + module_name
+        if is_moe:
+            expert_name = m.group(5)
+            module_name = m.group(7)
+            hf_module = m.group(3) + "." + expert_name + "." + module_name
+        else:
+            module_name = m.group(4)
+            hf_module = m.group(3) + "." + module_name
         if hf_module not in hf_modules:
             hf_module = module_name
             assert hf_module in hf_modules
-        inout = "in" if m.group(7) == "A" else "out"
+        inout = "in" if m.group(8) == "A" else "out"
+        iter_fn(layer_idx, hf_module, expert_idx, inout, weights)
         if not is_moe:
             all_weights[layer_idx][hf_module][inout] = weights
         else:
@@ -66,31 +78,27 @@ def get_all_hf_lora_weights(lora_weights, hf_modules, component=None):
     return all_weights
 
 
-def get_hf_target_modules(lora_weights, hf_modules, lora_target_modules):
-    hf_target_modules = set()
-    pattern = re.compile(
-        r'(.*)\.(\d+)\.(\w+)\.(\w+|experts\.(\d+)\.(\w+))\.lora_(A|B)\.weight')
-    for key in lora_weights.keys():
-        m = pattern.match(key)
-        if not m:
-            if "lm_head" not in key and "embed_tokens" not in key:
-                logger.warning(f"no match {key} from HF LoRA weights")
-            continue
-        match_target_module = False
-        for module in lora_target_modules:
-            if module in key:
-                match_target_module = True
-                break
-        if not match_target_module:
-            continue
-        expert_idx = m.group(5)
-        is_moe = expert_idx is not None
-        module_name = m.group(6 if is_moe else 4)
-        hf_module = m.group(3) + "." + module_name
-        if hf_module not in hf_modules:
-            hf_module = module_name
-            assert hf_module in hf_modules
+def get_all_hf_lora_weights(lora_weights, hf_modules, component=None):
+
+    def iter_fn(layer_idx, hf_module, expert_idx, inout, weights):
+        if expert_idx is None:
+            all_weights[layer_idx][hf_module][inout] = weights
+        else:
+            all_weights[layer_idx][hf_module].setdefault(expert_idx, {})
+            all_weights[layer_idx][hf_module][expert_idx][inout] = weights
+
+    all_weights = defaultdict(lambda: defaultdict(dict))
+    iterate_hf_lora(iter_fn, lora_weights, hf_modules, component)
+    return all_weights
+
+
+def get_hf_target_modules(lora_weights, hf_modules):
+
+    def iter_fn(layer_idx, hf_module, expert_idx, inout, weights):
         hf_target_modules.add(hf_module)
+
+    hf_target_modules = set()
+    iterate_hf_lora(iter_fn, lora_weights, hf_modules)
     return hf_target_modules
 
 
@@ -146,7 +154,6 @@ class HfLoraLoader:
         lora_dir = lora_dirs[0]
         with open(f"{lora_dir}/adapter_config.json") as f:
             adapter_config = json.load(f)
-        self.lora_target_modules = adapter_config["target_modules"]
 
         lora_weight = load_state_dict(get_model_path(lora_dir, "adapter_model"))
         self.lora_weight = lora_weight
@@ -162,17 +169,16 @@ class HfLoraLoader:
     def get_target_modules(self, trtllm_modules_to_hf_modules):
         hf_modules_to_trtllm_modules = invert_module_mapping(
             trtllm_modules_to_hf_modules)
-        lora_target_modules = []
+        lora_target_modules = set()
         if self.is_valid:
             hf_target_modules = get_hf_target_modules(
                 self.lora_weight,
                 hf_modules=set(hf_modules_to_trtllm_modules.keys()),
-                lora_target_modules=self.lora_target_modules,
             )
             for m in hf_target_modules:
                 trtllm_module = hf_modules_to_trtllm_modules[m]
-                lora_target_modules.append(trtllm_module)
-        return lora_target_modules
+                lora_target_modules.add(trtllm_module)
+        return list(lora_target_modules)
 
 
 class NemoLoraLoader:
@@ -343,6 +349,7 @@ class LoraManager(object):
         "moe_4h_to_h": 14,
         "moe_gate": 15,
         "moe_router": 16,
+        "mlp_router": 17,
     }
 
     def __init__(self):
@@ -615,7 +622,7 @@ class LoraManager(object):
                         is_moe = False
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
-                    if lora_module in ["moe_router"]:
+                    if lora_module in ["moe_router", "mlp_router"]:
                         pass
                     elif "moe" in lora_module and runtime_mapping.has_moe_ep():
                         pass

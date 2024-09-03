@@ -16,40 +16,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tensorView.h"
 
 namespace tensorrt_llm::layers
 {
-
-inline nvinfer1::DataType toTrtDataType(tensorrt_llm::common::DataType type)
-{
-    using namespace tensorrt_llm;
-    switch (type)
-    {
-    case common::DataType::TYPE_FP32: return nvinfer1::DataType::kFLOAT;
-    case common::DataType::TYPE_FP16: return nvinfer1::DataType::kHALF;
-    case common::DataType::TYPE_BF16: return nvinfer1::DataType::kBF16;
-    case common::DataType::TYPE_FP8_E4M3: return nvinfer1::DataType::kFP8;
-    case common::DataType::TYPE_INT8: return nvinfer1::DataType::kINT8;
-    case common::DataType::TYPE_UINT8: return nvinfer1::DataType::kUINT8;
-    case common::DataType::TYPE_INT32: return nvinfer1::DataType::kINT32;
-    case common::DataType::TYPE_INT64: return nvinfer1::DataType::kINT64;
-    case common::DataType::TYPE_BOOL: return nvinfer1::DataType::kBOOL;
-    default: TLLM_THROW("Unsupported data type: %d", static_cast<int>(type));
-    }
-}
-
-inline runtime::ITensor::UniquePtr wrap(tensorrt_llm::common::Tensor tensor)
-{
-    using namespace tensorrt_llm::runtime;
-    auto type = toTrtDataType(tensor.type);
-    ITensor::Shape shape{};
-    shape.nbDims = tensor.shape.size();
-    std::copy(tensor.shape.begin(), tensor.shape.end(), shape.d);
-    return ITensor::wrap(const_cast<void*>(tensor.data), type, shape);
-}
 
 template <typename T>
 class BufferLocation : public runtime::BufferRange<T>

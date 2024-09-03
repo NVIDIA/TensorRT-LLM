@@ -46,13 +46,14 @@ public:
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
-        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
+        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
         bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
-        bool is_spec_decoding_enabled = false);
+        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
+        int32_t spec_decoding_max_generation_length = 1);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -94,6 +95,10 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Context FMHA custom mask buffer.
+        uint32_t const* fmha_custom_mask;
+        // Rotary inv_freq cache buffer to avoid re-computing.
+        float const* rotary_inv_freq;
         // Rotary cos sin cache buffer to avoid re-computing.
         float2 const* rotary_cos_sin;
         int32_t input_seq_length; // padded input length
@@ -129,6 +134,7 @@ protected:
         int32_t cross_qkv_length = 0;
         int32_t const* encoder_input_lengths = nullptr;
         int32_t num_encoder_tokens = 0;
+        int64_t const* runtime_perf_knobs = nullptr;
 
         std::string enqueueContextParamsToString() const
         {
@@ -138,6 +144,8 @@ protected:
 
             ss << "attention_input: " << attention_input << std::endl;
             ss << "qkv_bias: " << qkv_bias << std::endl;
+            ss << "fmha_custom_mask: " << fmha_custom_mask << std::endl;
+            ss << "rotary_inv_freq: " << rotary_inv_freq << std::endl;
             ss << "rotary_cos_sin: " << rotary_cos_sin << std::endl;
             ss << "input_seq_length: " << input_seq_length << std::endl;
             ss << "max_past_kv_len: " << max_past_kv_len << std::endl;
@@ -184,6 +192,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Rotary inv_freq cache buffer to avoid re-computing.
+        float const* rotary_inv_freq;
         // NOTE: input_seq_length might be larger than one in the medusa mode.
         int32_t input_seq_length;
         int32_t const* sequence_lengths;
@@ -193,7 +203,6 @@ protected:
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
         float const* attention_output_orig_quant;
-        float const* rotary_embedding_scaling_factors;
         T const* alibi_slopes;
         void* context_buf;
         void* key_value_cache;
@@ -224,7 +233,10 @@ protected:
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
         int32_t const* spec_decoding_generation_lengths = nullptr;
+        bool spec_decoding_is_generation_length_variable = false;
+        int32_t spec_decoding_max_generation_length = 1;
         int32_t total_num_input_tokens;
+        int64_t const* runtime_perf_knobs = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -276,6 +288,11 @@ protected:
         return mUseKVCache;
     }
 
+    bool useCustomMask() const
+    {
+        return mMaskType == tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK;
+    }
+
     void reserveSemaphoreArray(int32_t size);
 
     void debugCheckSemaphores(cudaStream_t stream);
@@ -324,6 +341,8 @@ protected:
     bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
     bool mIsSpecDecodingEnabled = false;
+    bool mSpecDecodingIsGenerationLengthVariable = false;
+    int32_t mSpecDecodingMaxGenerationLength = 1;
 
     // Speculative decoding packed mask.
     uint4* mSpecDecodingPackedMask;
@@ -338,7 +357,7 @@ protected:
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     std::shared_ptr<CUDADriverWrapper> mDriver;
-    UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
+    UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;

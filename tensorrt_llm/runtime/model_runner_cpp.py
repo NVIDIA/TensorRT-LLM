@@ -84,6 +84,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         kv_cache_enable_block_reuse: bool = False,
         enable_chunked_context: bool = False,
         is_enc_dec: bool = False,
+        multi_block_mode: Optional[bool] = None,
+        enable_context_fmha_fp32_acc: Optional[bool] = None
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -131,9 +133,19 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Enables chunked context.
             is_enc_dec (bool):
                 Whether the model is encoder-decoder architecture.
+            multi_block_mode (bool):
+                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
+            enable_context_fmha_fp32_acc (bool):
+                Enable FMHA runner FP32 accumulation.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
+        extended_runtime_perf_knob_config = trtllm.ExtendedRuntimePerfKnobConfig(
+        )
+        if multi_block_mode is not None:
+            extended_runtime_perf_knob_config.multi_block_mode = multi_block_mode
+        if enable_context_fmha_fp32_acc is not None:
+            extended_runtime_perf_knob_config.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
 
         if is_enc_dec:
             encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
@@ -164,7 +176,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Path(engine_dir) / "decoder", trtllm.ModelType.ENCODER_DECODER,
                 trtllm.ExecutorConfig(max_beam_width=max_beam_width,
                                       kv_cache_config=kv_cache_config,
-                                      gpu_weights_percent=gpu_weights_percent))
+                                      gpu_weights_percent=gpu_weights_percent,
+                                      extended_runtime_perf_knob_config=
+                                      extended_runtime_perf_knob_config))
 
             profiler.stop('load tensorrt_llm engine')
 
@@ -207,6 +221,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         decoding_config = trtllm.DecodingConfig()
         if medusa_choices is not None:
             decoding_config.medusa_choices = medusa_choices
+            if multi_block_mode is not None:
+                multi_block_mode = False  # Medusa doesn't support multi-block mode.
 
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
@@ -228,10 +244,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             assert max_beam_width <= model_config.max_beam_width
 
-        trtllm_config = trtllm.ExecutorConfig(max_beam_width=max_beam_width,
-                                              kv_cache_config=kv_cache_config,
-                                              decoding_config=decoding_config)
+        trtllm_config = trtllm.ExecutorConfig(
+            max_beam_width=max_beam_width,
+            kv_cache_config=kv_cache_config,
+            decoding_config=decoding_config,
+            gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
+        trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
+
         executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
                                    trtllm_config)
 
@@ -336,6 +356,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  output_cum_log_probs: bool = False,
                  prompt_table: Optional[Union[str, torch.Tensor]] = None,
                  prompt_tasks: Optional[str] = None,
+                 return_all_generated_tokens: bool = False,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -361,6 +382,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Custom stopping criteria.
             logits_processor (LogitsProcessor):
                 Custom logits processors.
+            return_all_generated_tokens (bool):
+                Whether the full output is returned at each streaming step
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -435,18 +458,20 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                                   len(batch_input_ids_list))
 
         requests = [
-            trtllm.Request(input_token_ids=input_ids,
-                           encoder_input_token_ids=encoder_input_ids_list[i]
-                           if encoder_input_ids is not None else None,
-                           max_new_tokens=max_new_tokens,
-                           pad_id=pad_id,
-                           end_id=end_id,
-                           stop_words=stop_words,
-                           bad_words=bad_words,
-                           sampling_config=sampling_config,
-                           streaming=streaming,
-                           output_config=output_config,
-                           prompt_tuning_config=prompt_tuning_config)
+            trtllm.Request(
+                input_token_ids=input_ids,
+                encoder_input_token_ids=encoder_input_ids_list[i]
+                if encoder_input_ids is not None else None,
+                max_new_tokens=max_new_tokens,
+                pad_id=pad_id,
+                end_id=end_id,
+                stop_words=stop_words,
+                bad_words=bad_words,
+                sampling_config=sampling_config,
+                streaming=streaming,
+                output_config=output_config,
+                prompt_tuning_config=prompt_tuning_config,
+                return_all_generated_tokens=return_all_generated_tokens)
             for i, (input_ids, stop_words, bad_words,
                     prompt_tuning_config) in enumerate(
                         zip(batch_input_ids_list, stop_words_list,
@@ -454,7 +479,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
         ]
 
         request_ids = self.session.enqueue_requests(requests)
-
         if not streaming:
             return self._initialize_and_fill_output(request_ids, end_id,
                                                     return_dict,
@@ -466,7 +490,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             return self._stream(request_ids, end_id, return_dict,
                                 output_sequence_lengths, output_log_probs,
                                 output_cum_log_probs, batch_input_ids,
-                                streaming, batch_input_ids_list)
+                                batch_input_ids_list, streaming,
+                                return_all_generated_tokens)
 
     def _prepare_words_list(self, words_list: List[List[List[int]]],
                             batch_size: int):
@@ -512,12 +537,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         return self._fill_output(responses, output_ids, end_id, return_dict,
                                  output_sequence_lengths, output_log_probs,
-                                 output_cum_log_probs, batch_input_ids,
-                                 streaming, request_ids)
+                                 output_cum_log_probs, batch_input_ids, [],
+                                 streaming, request_ids, False)
 
     def _stream(self, request_ids, end_id, return_dict, output_sequence_lengths,
                 output_log_probs, output_cum_log_probs, batch_input_ids,
-                streaming, batch_input_ids_list):
+                batch_input_ids_list, streaming, return_all_generated_tokens):
         output_ids = [[] for _ in range(len(request_ids))]
         for reqid_pos in range(len(request_ids)):
             output_ids[reqid_pos] = [
@@ -536,12 +561,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
             yield self._fill_output(responses, output_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
-                                    streaming, request_ids)
+                                    batch_input_ids_list, streaming,
+                                    request_ids, return_all_generated_tokens)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
-                     output_cum_log_probs, batch_input_ids, streaming,
-                     request_ids):
+                     output_cum_log_probs, batch_input_ids,
+                     batch_input_ids_list, streaming, request_ids,
+                     return_all_generated_tokens):
         cuda_device = torch.device("cuda")
 
         for response in responses:
@@ -551,7 +578,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
             reqid_pos = request_ids.index(response.request_id)
             for beam, output_tokens in enumerate(
                     response.result.output_token_ids):
-                output_ids[reqid_pos][beam] += output_tokens
+                if return_all_generated_tokens:
+                    output_ids[reqid_pos][
+                        beam] = batch_input_ids_list[reqid_pos] + output_tokens
+                else:
+                    output_ids[reqid_pos][beam] += output_tokens
 
         sequence_lengths = []
         for output in output_ids:

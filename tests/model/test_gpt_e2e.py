@@ -60,7 +60,7 @@ def build_engine(checkpoint_dir: str, engine_dir: str, *args):
         '--log_level=verbose',
         '--max_batch_size=256',
         '--max_input_len=40',
-        '--max_output_len=20',
+        '--max_seq_len=60',
         '--max_beam_width=2',
         '--builder_opt=0',
     ]

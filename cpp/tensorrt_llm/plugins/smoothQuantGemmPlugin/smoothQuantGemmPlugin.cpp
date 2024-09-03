@@ -51,7 +51,7 @@ void SmoothQuantGemmPluginProfiler::runTactic(int m, int n, int k, SmoothQuantGe
         aTmp, bTmp, mQuantMode, alphaColTmp, alphaRowTmp, cTmp, m, n, k, tactic, workspaceTmp, wsSize, stream);
 }
 
-void SmoothQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void SmoothQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(int8_t),                                  // A

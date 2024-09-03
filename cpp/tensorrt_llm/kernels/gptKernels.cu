@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -66,29 +67,43 @@ struct BlockPrefixCallbackOp
 //
 // That kernel uses a grid of batchSize blocks.
 
-template <int THREADS_PER_BLOCK, bool COMPUTE_KV_OFFSETS>
-__global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets(int* paddingOffsets, int* seqQOffsets,
-    int* seqKVOffsets, int const* seqQLengths, int const* seqKVLengths, uint32_t* fmha_tile_counter, int batchSize,
-    int maxQSeqLength, bool removePadding, float rotaryEmbeddingScale, float rotaryEmbeddingBase,
-    int rotaryEmbeddingDim, RotaryScalingType rotaryScalingType, int rotaryEmbeddingMaxPositions,
-    float* rotaryEmbeddingInvFreq, float2* rotaryEmbeddingCoeffCache)
+template <typename T, int THREADS_PER_BLOCK>
+__global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets(BuildDecoderInfoParams<T> params)
 {
     // Dynamic shared memory for storing seqOffsets.
-    extern __shared__ int smemSeqQOffsets[];
+    extern __shared__ int smem[];
+    int* smemSeqQOffsets = (int*) (smem);
 
     // Fixed Q sequence lengths.
-    bool const fixed_q_seqlen = seqQLengths == nullptr;
+    bool const fixed_q_seqlen = params.seqQLengths == nullptr;
+
+    // Whether to calculate cumulative KV sequence lengths.
+    bool const calculate_kv_offsets = params.seqKVOffsets != nullptr;
+
+    // Whether to calculate cumulative packed mask rows.
+    bool const calculate_packed_mask_row_offsets = params.packedMaskRowOffsets != nullptr;
+
+    // Compute the padding offsets for Encoder Inputs.
+    bool const need_encoder_padding_offsets = (params.encoderPaddingOffsets != nullptr) && calculate_kv_offsets;
+    [[maybe_unused]] int* smemEncoderSeqQOffsets;
 
     // The implementation of the parallel scan in the thread block (see CUB for details).
     using BlockScan = cub::BlockScan<int, THREADS_PER_BLOCK>;
 
     // Allocate storage in shared memory to do the scan.
     __shared__ typename BlockScan::TempStorage tempQStorage;
+    [[maybe_unused]] __shared__ typename BlockScan::TempStorage tempMaskStorage;
     [[maybe_unused]] __shared__ typename BlockScan::TempStorage tempKVStorage;
 
     // This prefixOp operator keeps a running sum for when we need multiple iterations of the loop.
     BlockPrefixCallbackOp prefixQOp(0);
+    BlockPrefixCallbackOp prefixMaskOp(0);
     BlockPrefixCallbackOp prefixKVOp(0);
+
+    if (need_encoder_padding_offsets)
+    {
+        smemEncoderSeqQOffsets = (int*) (&smemSeqQOffsets[params.batchSize + 1]);
+    }
 
     // Iterate over the sequences in the batch.
     //
@@ -96,7 +111,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     // loop as we have __syncthreads in it (and we need all threads to participate to avoid
     // deadlocks).
     // Only the last block computes the full sequence offsets.
-    bool const storeSeqOffsets = blockIdx.x == (batchSize - 1);
+    bool const storeSeqOffsets = blockIdx.x == (params.batchSize - 1);
     int const batchSizeBound = blockIdx.x + 1;
     for (int batchOffset = 0; batchOffset <= batchSizeBound; batchOffset += THREADS_PER_BLOCK)
     {
@@ -105,21 +120,28 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
 
         // Threads that correspond to valid sequences read the length.
         int seqQLength = 0;
+        [[maybe_unused]] int packedMaskRows = 0;
         [[maybe_unused]] int seqKVLength = 0;
         if (batchIdx < batchSizeBound)
         {
-            seqQLength = fixed_q_seqlen ? maxQSeqLength : seqQLengths[batchIdx];
-            if constexpr (COMPUTE_KV_OFFSETS)
-            {
-                seqKVLength = seqKVLengths[batchIdx];
-            }
+            seqQLength = fixed_q_seqlen ? params.maxQSeqLength : params.seqQLengths[batchIdx];
+            // Need to pad mask rows to multiple of 128 for each sequence in the batch.
+            packedMaskRows = calculate_packed_mask_row_offsets
+                ? divUp(seqQLength, int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT
+                : 0;
+            seqKVLength = calculate_kv_offsets ? params.seqKVLengths[batchIdx] : 0;
         }
 
         // Do the prefix-scan (it calls syncthreads internally).
         int seqQOffset;
+        [[maybe_unused]] int packedMaskRowOffset;
         [[maybe_unused]] int seqKVOffset;
         BlockScan(tempQStorage).ExclusiveSum(seqQLength, seqQOffset, prefixQOp);
-        if constexpr (COMPUTE_KV_OFFSETS)
+        if (calculate_packed_mask_row_offsets)
+        {
+            BlockScan(tempMaskStorage).ExclusiveSum(packedMaskRows, packedMaskRowOffset, prefixMaskOp);
+        }
+        if (calculate_kv_offsets)
         {
             BlockScan(tempKVStorage).ExclusiveSum(seqKVLength, seqKVOffset, prefixKVOp);
         }
@@ -128,15 +150,23 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         if (batchIdx <= batchSizeBound)
         {
             smemSeqQOffsets[batchIdx] = seqQOffset;
+            if (need_encoder_padding_offsets)
+            {
+                smemEncoderSeqQOffsets[batchIdx] = seqKVOffset;
+            }
         }
 
         // Store the result.
         if (batchIdx <= batchSizeBound && storeSeqOffsets)
         {
-            seqQOffsets[batchIdx] = removePadding ? seqQOffset : batchIdx * maxQSeqLength;
-            if constexpr (COMPUTE_KV_OFFSETS)
+            params.seqQOffsets[batchIdx] = params.removePadding ? seqQOffset : batchIdx * params.maxQSeqLength;
+            if (calculate_packed_mask_row_offsets)
             {
-                seqKVOffsets[batchIdx] = seqKVOffset;
+                params.packedMaskRowOffsets[batchIdx] = packedMaskRowOffset;
+            }
+            if (calculate_kv_offsets)
+            {
+                params.seqKVOffsets[batchIdx] = seqKVOffset;
             }
         }
 
@@ -144,44 +174,64 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         __syncthreads();
     }
 
-    // Compute the padding offsets.
-    // Block x dimension is the batch dimension, while threads iterate all tokens in the sequence.
     int batchIdx = blockIdx.x;
-    // The beginning of the sequence.
-    int seqBegin = smemSeqQOffsets[batchIdx];
-    // The offset to the 1st element of the next sequence.
-    int seqEnd = smemSeqQOffsets[batchIdx + 1];
-    // The length of the sequence.
-    int seqLength = seqEnd - seqBegin;
 
-    // The number of padded tokens in the previous sequences.
-    int paddingOffset = batchIdx * maxQSeqLength - seqBegin;
-    bool const need_padding_offsets = paddingOffsets != nullptr;
-
-    if (need_padding_offsets)
+    // Compute the padding offsets.
+    auto compute_padding_offset = [&](int* smem_offset, int maxSeqLength, int* paddingOffsets)
     {
+        // Block x dimension is the batch dimension, while threads iterate all tokens in the sequence.
+        int seqBegin = smem_offset[batchIdx];
+        // The offset to the 1st element of the next sequence.
+        int seqEnd = smem_offset[batchIdx + 1];
+        // The length of the sequence.
+        int seqLength = seqEnd - seqBegin;
+        // The number of padded tokens in the previous sequences.
+        int paddingOffset = batchIdx * maxSeqLength - seqBegin;
+
         // Iterate over the tokens to update the number of padded elements.
         for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
         {
             paddingOffsets[seqBegin + tokenIdx] = paddingOffset;
         }
+    };
+
+    if (params.paddingOffsets != nullptr)
+    {
+        compute_padding_offset(smemSeqQOffsets, params.maxQSeqLength, params.paddingOffsets);
+    }
+
+    if (need_encoder_padding_offsets)
+    {
+        compute_padding_offset(smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets);
     }
 
     // Each block generates the rotary embedding inv_freq tensor for the corresponding sequence.
     int zid = 2 * threadIdx.x;
-    int halfRotaryEmbeddingDim = rotaryEmbeddingDim / 2;
-    if (rotaryEmbeddingDim > 0 && zid < rotaryEmbeddingDim)
+    int halfRotaryEmbeddingDim = params.rotaryEmbeddingDim / 2;
+    if (params.rotaryEmbeddingDim > 0 && zid < params.rotaryEmbeddingDim)
     {
-        mmha::update_rotary_base_n_scale(rotaryEmbeddingBase, rotaryEmbeddingScale, rotaryScalingType,
-            rotaryEmbeddingDim, rotaryEmbeddingMaxPositions, seqKVLengths[batchIdx]);
-        float const invFreq = rotaryEmbeddingScale / powf(rotaryEmbeddingBase, zid / (float) rotaryEmbeddingDim);
-        rotaryEmbeddingInvFreq[batchIdx * halfRotaryEmbeddingDim + threadIdx.x] = invFreq;
+        mmha::update_rotary_base_n_scale(params.rotaryEmbeddingBase, params.rotaryEmbeddingScale,
+            params.rotaryScalingType, params.rotaryEmbeddingDim, params.rotaryEmbeddingMaxPositions,
+            params.seqKVLengths[batchIdx]);
+        // Recompute the rotary scales when it is dynamic scaling.
+        if (params.rotaryScalingType == RotaryScalingType::kDYNAMIC || params.rotaryEmbeddingInvFreqCache == nullptr)
+        {
+            float const invFreq = params.rotaryEmbeddingScale
+                / powf(params.rotaryEmbeddingBase, zid / (float) params.rotaryEmbeddingDim);
+            params.rotaryEmbeddingInvFreq[batchIdx * halfRotaryEmbeddingDim + threadIdx.x] = invFreq;
+        }
+        else
+        {
+            // Otherwise, expand the inv freq cache to batch size.
+            float const invFreqCache = params.rotaryEmbeddingInvFreqCache[threadIdx.x];
+            params.rotaryEmbeddingInvFreq[batchIdx * halfRotaryEmbeddingDim + threadIdx.x] = invFreqCache;
+        }
     }
 
     // Reset fmha tile counter to 0 before launching fmha kernels.
-    if (threadIdx.x == 0 && blockIdx.x == 0 && fmha_tile_counter != nullptr)
+    if (threadIdx.x == 0 && blockIdx.x == 0 && params.fmhaTileCounter != nullptr)
     {
-        fmha_tile_counter[0] = 0u;
+        params.fmhaTileCounter[0] = 0u;
     }
 }
 
@@ -283,26 +333,12 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
         "Rotary embedding dim is assumed to be smaller than 512 and multiple of 2.");
     TLLM_CHECK_WITH_INFO(
         !(params.seqKVLengths == nullptr && params.rotaryEmbeddingDim > 0), "KV sequence lengths buffer is invalid.");
-    const size_t smem_size = (params.batchSize + 1) * sizeof(int);
-    if (params.seqKVOffsets)
-    {
-        TLLM_CHECK_WITH_INFO(params.seqKVLengths != nullptr, "KV sequence lengths buffer is invalid.");
-        computeSeqAndPaddingOffsets<THREADS_PER_BLOCK, true>
-            <<<params.batchSize, THREADS_PER_BLOCK, smem_size, stream>>>(params.paddingOffsets, params.seqQOffsets,
-                params.seqKVOffsets, params.seqQLengths, params.seqKVLengths, params.fmhaTileCounter, params.batchSize,
-                params.maxQSeqLength, params.removePadding, params.rotaryEmbeddingScale, params.rotaryEmbeddingBase,
-                params.rotaryEmbeddingDim, params.rotaryScalingType, params.rotaryEmbeddingMaxPositions,
-                params.rotaryEmbeddingInvFreq, params.rotaryEmbeddingCoeffCache);
-    }
-    else
-    {
-        computeSeqAndPaddingOffsets<THREADS_PER_BLOCK, false>
-            <<<params.batchSize, THREADS_PER_BLOCK, smem_size, stream>>>(params.paddingOffsets, params.seqQOffsets,
-                params.seqKVOffsets, params.seqQLengths, params.seqKVLengths, params.fmhaTileCounter, params.batchSize,
-                params.maxQSeqLength, params.removePadding, params.rotaryEmbeddingScale, params.rotaryEmbeddingBase,
-                params.rotaryEmbeddingDim, params.rotaryScalingType, params.rotaryEmbeddingMaxPositions,
-                params.rotaryEmbeddingInvFreq, params.rotaryEmbeddingCoeffCache);
-    }
+    bool const need_encoder_padding_offsets
+        = (params.encoderPaddingOffsets != nullptr) && (params.seqKVOffsets != nullptr);
+    const size_t smem_size
+        = (need_encoder_padding_offsets ? (params.batchSize + 1) * 2 : (params.batchSize + 1)) * sizeof(int);
+    computeSeqAndPaddingOffsets<T, THREADS_PER_BLOCK>
+        <<<params.batchSize, THREADS_PER_BLOCK, smem_size, stream>>>(params);
 
     // Compute the attention mask, if needed.
     if (params.attentionMask != nullptr)

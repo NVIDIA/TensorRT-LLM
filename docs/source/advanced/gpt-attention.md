@@ -89,7 +89,7 @@ for IA3.
 _The masked MHA kernel has a special version that distributes the work across
 multiple CUDA thread-blocks on the GPU for cases where the GPU occupancy is
 low. That mode called multi-block can be enabled using the `multi_block_mode`
-flag. Users are recommended to test that mode in scenarios where both the batch
+flag during runtime. Users are recommended to test that mode in scenarios where both the batch
 size and the number of heads in the model are relatively small. The exact
 definition of small in that context will depend on the model of the GPU and is
 hard to predict but to provide with a rule of thumb, it is worth testing that
@@ -140,7 +140,7 @@ TensorRT-LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. With this feature,
 sequences in context phase can be processed together with sequences in
 generation phase. The purpose of that technique is to better interleave
-requests to reduce latency as well as make better use the of the GPUs.
+requests to reduce latency as well as make better use of the GPUs.
 For efficiency reasons (1), the support for inflight batching ***requires the
 input tensors to be packed (no padding)***.
 

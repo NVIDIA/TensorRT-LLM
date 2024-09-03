@@ -15,7 +15,6 @@
  */
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
@@ -25,7 +24,6 @@
 namespace tensorrt_llm::tests::layers
 {
 namespace tk = tensorrt_llm::kernels;
-namespace tcc = tensorrt_llm::common::conversion;
 namespace trk = tensorrt_llm::runtime::kernels;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;

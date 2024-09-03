@@ -46,7 +46,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 {
     int const bid = blockIdx.x; // Index of Batch
     int const tid = threadIdx.x;
-    auto const slot = bh.batchSlots ? bh.batchSlots[bid] : bid;
+    auto const slot = bh.batchSlots[bid];
     int const nMBS{bh.nMaxBatchSize};    // Only for bh.logProbsTiled
     int const nBM{bh.nBeamWidth};
     int const nCandidate{nBM * nBM * 2}; // Keep top 2K candidates from each beam output
@@ -358,7 +358,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
     constexpr auto PACKED_TOP_KMD_SIZE = 2 * PAD_2K + 2;
     int const nBM = gridDim.y;
     int const tid = threadIdx.x;
-    int const slot = batchSlots ? batchSlots[blockIdx.x] : blockIdx.x;
+    int const slot = batchSlots[blockIdx.x];
     int const section_start = nVLocal * blockIdx.z;
     int const section_end = std::min(section_start + nVLocal, nV);
     auto const nVOffset = (blockIdx.x * nBM + blockIdx.y) * nV;
@@ -481,7 +481,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
     auto const nBM = gridDim.y;
     auto const gbid = blockIdx.x * gridDim.y + blockIdx.y;
     int const tid = threadIdx.x;
-    auto const slot = batchSlots ? batchSlots[blockIdx.x] : blockIdx.x;
+    auto const slot = batchSlots[blockIdx.x];
     T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
 
     using KVPair = cub::KeyValuePair<int, T>;

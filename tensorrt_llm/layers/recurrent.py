@@ -262,7 +262,7 @@ class Recurrent(Module):
 
         self.conv1d = MambaConv1d(self.lru_width // tp_size,
                                   self.d_conv,
-                                  self.dtype,
+                                  dtype=self.dtype,
                                   apply_silu=False)
 
         self.rg_lru = RgLru(self.lru_width,

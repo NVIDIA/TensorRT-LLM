@@ -1,13 +1,18 @@
 import argparse
 import copy
 import json
+import os
+import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import List, Union
 
 import safetensors.torch
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.utils import CONFIG_NAME
+from transformers.utils.hub import cached_file
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -55,7 +60,10 @@ def get_tllm_linear_weight(weight, prefix, bias=None):
     return results
 
 
-def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
+def convert_hf_mamba(hf_mamba,
+                     rank=0,
+                     dtype='float32',
+                     mamba_version: str = 'Mamba1'):
     weights = {}
     tik = time.time()
 
@@ -127,12 +135,19 @@ def convert_hf_mamba(hf_mamba, rank=0, dtype='float32'):
 
 def rename_hf_to_tllm(name: str):
     """ Rename a HF parameter name by the corresponding TRT-LLM style name. """
+    # remove model
+    if 'model.' in name:
+        name = name.replace('model.', '')
+
     # change layer name
     if 'embeddings.' in name:
         name = name.replace('embeddings', 'vocab_embedding')
+    elif 'embedding.' in name:
+        name = name.replace('embedding', 'vocab_embedding')
+    norm_pattern = r'\d\.norm\.'
     if 'mixer.' in name:
         name = name.replace('mixer.', 'ssm.')
-    elif 'norm.' in name:
+    elif re.search(norm_pattern, name):
         name = name.replace('norm.', 'input_layernorm.')
     elif 'norm_f.' in name:
         name = name.replace('norm_f.', 'ln_f.')
@@ -147,7 +162,8 @@ def rename_hf_to_tllm(name: str):
 
 def convert_from_hf_checkpoint(model_dir: Union[str, Path],
                                rank=0,
-                               dtype: Union[str, torch.dtype] = torch.float32):
+                               dtype: Union[str, torch.dtype] = torch.float32,
+                               mamba_version: str = 'Mamba1'):
     logger.info('Loading weights from HF Mamba...')
     tik = time.time()
 
@@ -164,15 +180,19 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
             param = param.detach().cpu()
             if 'A_log' in name:
                 param = -torch.exp(param.float())
-                param = param.permute(1, 0).contiguous()
+                if mamba_version == 'Mamba1':
+                    param = param.permute(1, 0).contiguous()
             elif 'D' in name:
                 param = param.float()
             elif 'dt_proj.bias' in name:
                 param = param.float()
+            elif 'dt_bias' in name:
+                param = param.float()
             elif 'conv1d.weight' in name:
                 param = param.unsqueeze(3)
 
-            if 'in_proj' in name:
+            # split in_proj in Mamba1
+            if 'in_proj' in name and mamba_version == 'Mamba1':
                 in_proj_params = torch.split(param, param.size(0) // 2, dim=0)
                 weights[tllm_name.replace('proj', 'proj_x')] = in_proj_params[0]
                 weights[tllm_name.replace('proj', 'proj_z')] = in_proj_params[1]
@@ -181,9 +201,10 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
         del model_params
 
     # lm_head
-    if 'lm_head.weight' not in weights:
-        weights['lm_head.weight'] = copy.deepcopy(
-            weights['backbone.vocab_embedding.weight'])
+    emb = weights['backbone.vocab_embedding.weight']
+    if 'lm_head.weight' not in weights or weights['lm_head.weight'].data_ptr(
+    ) == emb.data_ptr():
+        weights['lm_head.weight'] = copy.deepcopy(emb)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -208,6 +229,100 @@ def convert(worker_rank, args, convert_args):
                                     args.output_dir / f'rank{rank}.safetensors')
 
 
+@dataclass
+class MambaConfig:
+
+    architectures: List[str] = field(
+        default_factory=lambda: ['MambaForCausalLM'])
+    d_intermediate: int = 0
+    vocab_size: int = 50277
+    attn_layer_idx: list = field(default_factory=list)
+    attn_cfg: dict = field(default_factory=dict)
+    rms_norm: bool = True
+    residual_in_fp32: bool = True
+    pad_vocab_size_multiple: int = 8
+    hidden_size: int = 2560
+    num_hidden_layers: int = 64
+    intermediate_size: int = 0
+    state_size: int = 128
+    conv_kernel: int = 4
+    use_bias: bool = False
+    headdim: int = 64
+    ngroups: int = 1
+    chunk_size: int = 256
+    ssm_rmsnorm: bool = True
+
+    def update(self, data_dict):
+        self.__dict__.update(data_dict)
+
+
+def load_config_hf(model_name):
+    resolved_archive_file = cached_file(
+        model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
+    if resolved_archive_file is None:
+        resolved_archive_file = os.path.join(model_name, 'params.json')
+    config = json.load(open(resolved_archive_file))
+    if 'transformers_version' in config:  # transformer compatible models
+        hf_config = AutoConfig.from_pretrained(model_name,
+                                               trust_remote_code=True)
+        # TODO: change mamba_version when transformers can support Mamba2 models
+        mamba_version = 'Mamba1'
+    elif 'ssm_cfg' in config:  # state-spaces/mamba models
+        ssm_cfg = config.pop('ssm_cfg')
+        cfg_to_mamba_cfg = {
+            'd_model': 'hidden_size',
+            'n_layer': 'num_hidden_layers',
+            'fused_add_norm': None,
+            'tie_embeddings': None,
+        }
+        ssm_cfg_to_mamba_cfg = {
+            'd_state': 'state_size',
+            'd_conv': 'conv_kernel',
+            'bias': 'use_bias',
+            'headdim': 'headdim',
+            'ngroups': 'ngroups',
+            'chunk_size': 'chunk_size',
+            'rmsnorm': 'ssm_rmsnorm',
+        }
+        for k in cfg_to_mamba_cfg:
+            if k in config:
+                v = config.pop(k)
+                if cfg_to_mamba_cfg[k] is not None:
+                    config[cfg_to_mamba_cfg[k]] = v
+        for k in ssm_cfg_to_mamba_cfg:
+            if k in ssm_cfg and ssm_cfg_to_mamba_cfg[k] is not None:
+                config[ssm_cfg_to_mamba_cfg[k]] = ssm_cfg[k]
+        hf_config = MambaConfig(**config)
+        if 'expand' in ssm_cfg:
+            expand = ssm_cfg['expand']
+            hf_config.intermediate_size = expand * hf_config.hidden_size
+        else:
+            hf_config.intermediate_size = 2 * hf_config.hidden_size
+        mamba_version = ssm_cfg.pop("layer", "Mamba1")
+    else:  # mistral format
+        cfg_to_mamba_cfg = {
+            'dim': 'hidden_size',
+            'n_layers': 'num_hidden_layers',
+            'n_groups': 'ngroups',
+            'fused_add_norm': None,
+            'tie_embeddings': None,
+            'model_type': None,
+        }
+        for k in cfg_to_mamba_cfg:
+            if k in config:
+                v = config.pop(k)
+                if cfg_to_mamba_cfg[k] is not None:
+                    config[cfg_to_mamba_cfg[k]] = v
+        hf_config = MambaConfig(**config)
+        if 'expand' in config:
+            expand = config['expand']
+            hf_config.intermediate_size = expand * hf_config.hidden_size
+        else:
+            hf_config.intermediate_size = 2 * hf_config.hidden_size
+        mamba_version = 'Mamba2'
+    return hf_config, mamba_version
+
+
 def main():
     print(tensorrt_llm.__version__)
 
@@ -217,8 +332,8 @@ def main():
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
 
-    hf_config = AutoConfig.from_pretrained(args.model_dir,
-                                           trust_remote_code=True)
+    hf_config, mamba_version = load_config_hf(args.model_dir)
+
     vocab_size = hf_config.vocab_size
     pad_vocab_size_multiple = hf_config.pad_vocab_size_multiple
     if vocab_size % pad_vocab_size_multiple != 0:
@@ -226,7 +341,7 @@ def main():
                                                  pad_vocab_size_multiple)
 
     config = {
-        'architecture': 'MambaForCausalLM',
+        'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
         'logits_dtype': 'float32',
         'hidden_size': hf_config.hidden_size,
@@ -239,15 +354,29 @@ def main():
         'hidden_act': 'silu',
         'num_attention_heads': 1,
         'rnn_hidden_size': hf_config.intermediate_size,
+        'rnn_conv_dim_size': hf_config.intermediate_size,
         'state_size': hf_config.state_size,
         'conv_kernel': hf_config.conv_kernel,
         'use_bias': hf_config.use_bias,
+        'mamba_version': mamba_version,
     }
+    if mamba_version == 'Mamba2':
+        conv_dim = hf_config.intermediate_size + 2 * hf_config.ngroups * hf_config.state_size
+        mamba2_cfg = {
+            'rnn_head_size': hf_config.headdim,
+            'rnn_conv_dim_size': conv_dim,
+            'ngroups': hf_config.ngroups,
+            'chunk_size': hf_config.chunk_size,
+            'ssm_rmsnorm': hf_config.ssm_rmsnorm,
+        }
+        config.update(mamba2_cfg)
 
     with (args.output_dir / 'config.json').open('w') as f:
         json.dump(config, f, indent=4)
 
     convert_from_ckpt = do_convert_from_ckpt(args)
+    # TODO: Add convert_hf_mamba support for Mamba2 when transformers can support Mamba2 models
+    assert convert_from_ckpt or mamba_version == 'Mamba2', "Mamba2 can only support convert from checkpoints."
     if not convert_from_ckpt:
         logger.info(f'Convert by using model')
         hf_mamba = AutoModelForCausalLM.from_pretrained(args.model_dir,
@@ -264,6 +393,7 @@ def main():
         convert_args['model_dir'] = args.model_dir
     else:
         convert_args['hf_mamba'] = hf_mamba
+    convert_args['mamba_version'] = mamba_version
 
     convert(0, args, convert_args)
 

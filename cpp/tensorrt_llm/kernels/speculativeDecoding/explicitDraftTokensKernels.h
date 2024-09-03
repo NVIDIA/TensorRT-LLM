@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -25,6 +24,39 @@
 
 namespace tensorrt_llm::kernels::speculative_decoding
 {
+
+template <typename T>
+struct FillRandDataExplicitDraftTokensParams
+{
+    //! [maxBatchSize]
+    T* randDataSample{nullptr};
+    //! [maxBatchSize, maxNumPaths, maxPathDraftLength]
+    T* randDataVerification{nullptr};
+    //! [maxBatchSize]
+    curandState_t* curandState{nullptr};
+    //! [forwardBatchSize]
+    runtime::SizeType32 const* batchSlots{nullptr};
+
+    runtime::SizeType32 batchSize{0};
+    runtime::SizeType32 numPaths{0};
+    runtime::SizeType32 draftLength{0};
+
+    bool skipVerification{false};
+
+    void checkParams() const
+    {
+        TLLM_CHECK(randDataSample);
+        TLLM_CHECK(randDataVerification);
+        TLLM_CHECK(curandState);
+
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(numPaths > 0);
+        TLLM_CHECK(draftLength > 0);
+    }
+};
+
+template <typename T>
+void invokeFillRandData(FillRandDataExplicitDraftTokensParams<T> const& params, cudaStream_t stream);
 
 template <typename T>
 struct FillContextExplicitDraftTokensParams

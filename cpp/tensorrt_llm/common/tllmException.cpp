@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/tllmException.h"
+#include "tensorrt_llm/common/stringUtils.h"
 
 #include <cstdlib>
 #if !defined(_MSC_VER)

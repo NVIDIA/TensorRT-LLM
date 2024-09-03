@@ -144,6 +144,37 @@ def gt_matmul_smooth_quant(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
     return ref
 
 
+def gt_matmul_fp8_rowwise(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
+    # Convert to float32 for PyTorch GT Matmul with accumulation in float32.
+    device = mat1.device
+    mat1 = mat1.to(dtype=torch.float32)
+    # Transpose the second matrix to support the native PyTorch format
+    mat2 = mat2.transpose(0, 1).to(dtype=torch.float32)
+    # Do matmul, float32 matmul must be in CPU. GPU does not support
+    ref = torch.matmul(mat1, mat2)
+    ref = ref.to(device)
+
+    m = 1
+    for ii in range(len(mat1.shape) - 1):
+        m *= mat1.shape[ii]
+    n = mat2.shape[1]
+
+    # Prepare per element scaling
+    scale_a = scale_a_.expand((m, 1)).float()
+    scale_b = scale_b_.expand((1, n)).float()
+    scaling = torch.matmul(scale_a, scale_b).reshape(ref.shape)
+    # Scale output and cast to right type
+    ref = ref * scaling
+
+    # Cast ref to the required output type
+    ref = ref.to(dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
+
+    if bias is not None:
+        ref += bias
+
+    return ref
+
+
 def gt_quantize_per_token(x):
     xmax, _ = x.abs().max(dim=-1, keepdim=True)
     x = (x * 127.0 / xmax).round().clip(-128, 127).to(dtype=torch.int8)

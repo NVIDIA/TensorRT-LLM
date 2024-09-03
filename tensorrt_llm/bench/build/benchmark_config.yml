@@ -1,0 +1,80 @@
+meta-llama/Llama-2-7b-hf:
+  tp1_pp1:
+    general:
+      max_batch_size: 4096
+      max_num_tokens: 8192
+meta-llama/Llama-2-70b-hf:
+  tp2_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 2048
+  tp4_pp1:
+    general:
+      max_batch_size: 4096
+      max_num_tokens: 8192
+    4224:
+      max_batch_size: 256
+      max_num_tokens: 8192
+  tp8_pp1:
+    general:
+      max_batch_size: 8192
+      max_num_tokens: 16384
+    2176:
+      max_batch_size: 1024
+      max_num_tokens: 16384
+tiiuae/falcon-180B:
+  tp4_pp1:
+    general:
+      max_batch_size: 4096
+      max_num_tokens: 8192
+  tp8_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 8192
+EleutherAI/gpt-j-6b:
+  tp1_pp1:
+    general:
+      max_batch_size: 128
+      max_num_tokens: 2048
+    256:
+      max_batch_size: 2048
+      max_num_tokens: 2048
+meta-llama/Meta-Llama-3-8B:
+  tp1_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 8192
+meta-llama/Meta-Llama-3-70B:
+  tp1_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 2048
+  tp2_pp1:
+    general:
+      max_batch_size: 256
+      max_num_tokens: 1024
+    4096:
+      max_batch_size: 2048
+      max_num_tokens: 1024
+  tp4_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 1024
+  tp8_pp1:
+    general:
+      max_batch_size: 8192
+      max_num_tokens: 16384
+mistralai/Mixtral-8x7B-v0.1:
+  tp2_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 3072
+  tp4_pp1:
+    general:
+      max_batch_size: 8192
+      max_num_tokens: 8192
+mistralai/Mistral-7B-v0.1:
+  tp1_pp1:
+    general:
+      max_batch_size: 4098
+      max_num_tokens: 8192

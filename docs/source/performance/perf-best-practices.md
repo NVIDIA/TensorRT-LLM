@@ -7,12 +7,12 @@ This document provides some best practices for tuning the performance of TensorR
 ## How To Measure Performance?
 
 TensorRT-LLM can be benchmarked using the included
-[C++](../../../benchmarks/cpp/README.md)
+[C++](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/README.md)
 and
-[Python](../../../benchmarks/python/README.md) tools. However, it is *strongly*
+[Python](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/python/README.md) tools. However, it is *strongly*
 recommended to use the C++ benchmarking tool. For detailed performance data and
 the steps to reproduce those results, see
-this [Document](perf-overview.md).
+this [Document](https://nvidia.github.io/TensorRT-LLM/performance/perf-overview.html).
 The [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend)
 can also be used to measure the performance of TensorRT-LLM for online serving.
 
@@ -26,10 +26,10 @@ runtime and, for some of them, decrease the engine build time.
 ### `max_batch_size`, `max_seq_len` and `max_num_tokens`
 
 <p align="center">
-    <img src="../media/max_bs_toks_len.svg" alt="Explain `max_batch_size`, `max_seq_len` and `max_num_tokens`" width="30%" height="auto">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/media/max_bs_toks_len.svg?raw=true" alt="Explain `max_batch_size`, `max_seq_len` and `max_num_tokens`" width="30%" height="auto">
 </p>
 
-Regarding the impacts of those three arguments to the GPU memory usage, please refer to [memory.md](../reference/memory.md)
+Regarding the impacts of those three arguments to the GPU memory usage, please refer to [memory.md](https://nvidia.github.io/TensorRT-LLM/reference/memory.html)
 
 #### `max_batch_size`
 
@@ -74,7 +74,7 @@ When increasing `--max_num_tokens` to some point, GPU utilization will plateau,
 going beyond that saturation point may hurt both first token latency as well as
 total end-to-end latency.
 
-See also [chunked context](../advanced/gpt-attention.md#chunked-context).
+See also [chunked context](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#chunked-context).
 
 ### Multiple profiles
 
@@ -84,6 +84,10 @@ disabled, because more optimization profiles help TensorRT have more chances to
 select better kernels.
 
 However, this feature will increase the engine build time.
+
+**Known issue**: We observed that enabling multiple profiles can lead to extra
+unexpected GPU memory usage on some cases starting from v0.11. The issue will be
+addressed in future releases.
 
 ### GPT Attention Plugin and Context Fused Multi-Head Attention
 
@@ -98,7 +102,7 @@ implementation that uses the `concat` operator to update the KV cache).
 
 Enabling the fused multi-head attention, during the context phase, will trigger
 a kernel that performs the MHA/MQA/GQA block using a single kernel, for more
-details, see this [Document](../advanced/gpt-attention.html#context-phase).
+details, see this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#context-phase).
 
 #### FP8 Context Fused Multi-Head Attention
 
@@ -113,7 +117,7 @@ argument in `trtllm-build` is used to control it.
 
 When input padding is removed, the different tokens are packed together. It
 reduces both the amount of computations and memory consumption. For more details, see
-this [Document](../advanced/gpt-attention.md#padded-and-packed-tensors).
+this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#padded-and-packed-tensors).
 
 ### Paged KV Cache
 
@@ -121,7 +125,7 @@ Paged KV cache is enabled by default, the `--paged_kv_cache` argument in
 `trtllm-build` is used to control it.
 
 The paged KV cache helps manage memory for the KV cache more efficiently (see
-this [Document](../advanced/gpt-attention.html#paged-kv-cache)). It usually leads to an
+this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#paged-kv-cache)). It usually leads to an
 increase in the batch size and an improved efficiency.
 
 ### In-flight Sequence Batching
@@ -132,12 +136,12 @@ cache are all enabled together.
 
 In-flight sequence batching schedules sequences in context phase together with
 sequences in generation phase to increase efficiency and reduce latency, see
-this [Document](../advanced/gpt-attention.html#in-flight-batching) for more details.
+this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#in-flight-batching) for more details.
 
 ### Multi-Block Mode
 
 When the following conditions are met, it is recommended to try the
-`--multi_block_mode` argument with `trtllm-build` and evaluate the impact on
+`--multi_block_mode` argument with `gptManagerBenchmark` and evaluate the impact on
 performance:
 
  1. `input_seq_len` > 1024 (An empirically derived value that indicates that the
@@ -158,24 +162,9 @@ runtime, hence it's possible that multi-block is not used even when
 also possible that multi-block is automatically used even when `--multi_block_mode`
 argument is disabled.
 
-### Custom AllReduce Plugin
+### Reduce Norm Fusion
 
-The custom AllReduce plugin activates a latency-optimized algorithm for
-the AllReduce operation instead of the native NCCL operator. However, the
-performance benefits may not be seen on PCIE-based systems.
-
-Starting from v0.10, an automatic fallback mechanism is supported for allreduce plugin, so that native NCCL kernel is used when hardware requirements are not satisfied to get the best performance. Currently, the `--use_custom_all_reduce` argument works more like a suggestion
-to the runtime, and will possibly be removed in the future releases.
-
-On NVLink-based nodes, it is recommended to enable the custom AllReduce plugin
-by using the `--use_custom_all_reduce` argument with `trtllm-build`. On PCIE-based
-nodes, it is not recommended to enabled that plugin.
-
-If you use `CUDA_VISIBLE_DEVICES` or `NVIDIA_VISIBLE_DEVICES`, please provide the full device list
-instead of limiting to single device, otherwise custom all reduce will be disabled since its kernels
-rely on P2P access to peer devices, which is not allowed when only a single device is visible.
-
-In addition, there is an experimental feature called "Reduce Norm Fusion"
+There is an experimental feature called "Reduce Norm Fusion"
 available to extend the custom AllReduce functionality. It can be enabled by
 using the `--reduce_fusion enable` argument with `trtllm-build` when the
 custom AllReduce is already enabled. This feature aims to fuse the ResidualAdd
@@ -205,7 +194,7 @@ To enable the features, use the `--use_parallel_embedding`,
 `--use_embedding_sharing`, `--use_lookup_plugin`, `--use_gemm_plugin`
 arguments, and set correct dimension to `--embedding_sharding_dim` argument
 with `trtllm-build`. See those
-[Examples](../../../examples/gpt#embedding-parallelism-and-sharing)
+[Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism-and-sharing)
 for details.
 
 ### Horizontal Fusion in Gated-MLP
@@ -260,7 +249,7 @@ recommended for the BERT model. They are enabled by default using the
 This part summarizes the runtime configuration knobs that can be tweaked to
 enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
-[Batch Manager API](../advanced/batch-manager.html#the-batch-manager-api)
+[Batch Manager API](https://nvidia.github.io/TensorRT-LLM/advanced/batch-manager.html#the-batch-manager-api)
 as well as the
 [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend).
 
@@ -307,7 +296,7 @@ inputs and outputs.
 There currently are two batch scheduler policies: `MAX_UTILIZATION` and
 `GUARANTEED_NO_EVICT`.
 
-As explained in the [GPT Manager Design](../advanced/batch-manager.html#gptmanager-design)
+As explained in the [GPT Manager Design](https://nvidia.github.io/TensorRT-LLM/advanced/batch-manager.html#gptmanager-design)
 section, the scheduling policy can be set to `MAX_UTILIZATION` to pack as many
 requests as possible at each iteration of the forward loop, when in-flight
 sequence batching is enabled. It maximizes the utilization of the GPUs by
@@ -338,7 +327,7 @@ and in most cases, was hurting latency.
 The `max_attention_window_size` flag sets the maximum number of tokens that are
 attended to in order to generate one token when using techniques like sliding window
 attention. See this
-[Document](../advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
+[Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
 for more details. It defaults to the maximum sequence length
 (`max_input_length + max_output_length` when building the engine), which means
 that the feature is disabled by default.

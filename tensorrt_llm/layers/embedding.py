@@ -17,7 +17,7 @@ from typing import Optional
 
 import torch
 
-from .._utils import set_obj_attrs
+from .._utils import set_obj_attrs, str_dtype_to_torch
 from ..functional import embedding, unsqueeze, where
 from ..mapping import Mapping
 from ..module import Module
@@ -54,6 +54,7 @@ class Embedding(Module):
         self.sharding_dim = sharding_dim
         self.tp_rank = tp_rank
         self.dtype = dtype
+        self.tp_dim = sharding_dim
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,
@@ -87,6 +88,17 @@ class Embedding(Module):
             loaded_weight = loaded_weight.narrow(sharding_dim, start_idx,
                                                  shard_size)
         param.value = loaded_weight
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        config = kwargs.get("config", None)
+        if weights is None:
+            return {}
+        weights = weights.to(str_dtype_to_torch(self.dtype))
+        if config.share_embedding_table:
+            return {}
+        else:
+            weights = weights.clone()
+            return {tllm_key: weights}
 
 
 class PromptTuningEmbedding(Embedding):

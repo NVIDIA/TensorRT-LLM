@@ -52,6 +52,7 @@ class BloomDecoderLayer(Module):
             tp_group=tp_group,
             tp_size=tp_size,
             tp_rank=tp_rank,
+            reorder=True,
             quant_mode=config.quant_mode)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size

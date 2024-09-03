@@ -148,7 +148,7 @@ If the engines are built successfully, you will see output like:
 
 `trtllm-build` enables FMHA kernels by default. You may disable it by adding `--context_fmha disable`.
 
-If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--context_fmha_fp32_acc enable`. However, it is expected to see performance drop.
+If you find that the default fp16 accumulation cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
 
 Note that the FMHA kernels have to be used together with `gpt_attention_plugin` enabled.
 
@@ -413,6 +413,21 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8-sq-ptpc/1-gpu \
 ```
 
 Note that GPT attention plugin is required to be enabled for SmoothQuant for now.
+
+User can also use `ModelOpt` to do INT8 quantization. Especially for gpt variant Starcoder2.
+```bash
+python3 example/quantization/quantize.py --model_dir starcoder2 \
+        --dtype float16 \
+        --qformat int8_sq \
+        --output_dir starcoder2/trt_ckpt/int8-sq/
+```
+Then, use `trtllm-build` to build engine(s).
+
+```bash
+trtllm-build --checkpoint_dir starcoder2/trt_ckpt/int8-sq/ \
+             --output_dir starcoder2/trt_engine/int8-sq/ \
+             --builder_opt 4
+```
 
 
 ### INT8 KV Cache

@@ -31,6 +31,7 @@ namespace tc = tensorrt_llm::common;
 
 ITensor::UniquePtr ITensor::slice(SharedPtr tensor, std::size_t offset, std::size_t size)
 {
+    TLLM_CHECK(tensor);
     return std::make_unique<TensorView>(std::move(tensor), offset, size);
 }
 
@@ -115,6 +116,10 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     case MemoryType::kPINNED:
         result.reset(new GenericTensor<PinnedBorrowingAllocator>( // NOLINT(modernize-make-unique)
             shape, capacity, type, PinnedBorrowingAllocator(data, capacityInBytes)));
+        break;
+    case MemoryType::kPINNEDPOOL:
+        result.reset(new GenericTensor<PinnedPoolBorrowingAllocator>( // NOLINT(modernize-make-unique)
+            shape, capacity, type, PinnedPoolBorrowingAllocator(data, capacityInBytes)));
         break;
     case MemoryType::kCPU:
         result.reset( // NOLINT(modernize-make-unique)

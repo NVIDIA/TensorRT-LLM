@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional, Union
+
 from ..._utils import pad_vocab_size
 from ...functional import (Tensor, is_gated_activation, non_gated_version, recv,
                            send)
@@ -23,8 +25,11 @@ from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantMode
-from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
+                              QuantConfig, check_share_embedding)
 from .config import GPTConfig
+from .convert import (load_hf_gpt, load_weights_from_hf_model,
+                      load_weights_from_nemo)
 
 
 def MLPFactory(hidden_size,
@@ -85,6 +90,8 @@ class GPTDecoderLayer(Module):
         local_layer_idx = layer_idx - layers_range[0]
         inner_layernorm = config.inner_layernorm if hasattr(
             config, "inner_layernorm") else False
+        attention_head_size = config.head_size if hasattr(config,
+                                                          "head_size") else None
         self.attention = Attention(
             local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
@@ -96,6 +103,7 @@ class GPTDecoderLayer(Module):
             apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
+            attention_head_size=attention_head_size,
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_percentage=config.rotary_pct,
             rotary_embedding_base=config.rotary_base,
@@ -272,6 +280,116 @@ class GPTForCausalLM(DecoderModelForCausalLM):
             "mlp_4h_to_h": "c_proj",
         }
         super().__init__(config, transformer, lm_head)
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a LLaMAForCausalLM object from give parameters
+        '''
+        import transformers
+
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = GPTConfig.from_hugging_face(hf_config_or_dir,
+                                             dtype=dtype,
+                                             mapping=mapping,
+                                             quant_config=quant_config,
+                                             **kwargs)
+
+        if not use_preloading:
+            hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
+        weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        device: str = 'cuda',
+        calib_dataset: str = 'cnn_dailymail',
+        calib_batches: int = 512,
+        calib_batch_size: int = 1,
+        calib_max_seq_length: int = 512,
+        random_seed: int = 1234,
+        tokenizer_max_seq_length: int = 2048,
+        **kwargs,
+    ):
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
+                             device=device,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
+            from . import convert
+
+            config = GPTConfig.from_hugging_face(hf_model_dir,
+                                                 dtype=dtype,
+                                                 mapping=mapping,
+                                                 quant_config=quant_config,
+                                                 **kwargs)
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             device=device,
+                             calib_dataset=calib_dataset)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
+
+    @classmethod
+    def from_nemo(cls,
+                  nemo_ckpt_dir: str,
+                  dtype: str = 'auto',
+                  mapping: Optional[Mapping] = None,
+                  quant_config: Optional[QuantConfig] = None,
+                  **kwargs):
+        config = GPTConfig.from_nemo(nemo_ckpt_dir,
+                                     dtype=dtype,
+                                     mapping=mapping,
+                                     quant_config=quant_config,
+                                     **kwargs)
+
+        weights = load_weights_from_nemo(nemo_ckpt_dir, config, **kwargs)
+
+        check_share_embedding(weights, config)
+        model = cls(config)
+        model.load(weights)
+        return model
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

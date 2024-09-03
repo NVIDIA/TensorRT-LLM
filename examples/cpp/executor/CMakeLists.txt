@@ -48,7 +48,7 @@ set(CMAKE_VERBOSE_MAKEFILE 1)
 project(executorExamples)
 
 # Compile options
-set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++")
+set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++ -DENABLE_MULTI_DEVICE=1")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_BUILD_TYPE release)
 
@@ -108,6 +108,11 @@ include_directories(${TRTLLM_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
 add_executable(executorExampleBasic executorExampleBasic.cpp)
 target_link_libraries(executorExampleBasic nvinfer_plugin_tensorrt_llm)
 
+add_executable(executorExampleLogitsProcessor
+               executorExampleLogitsProcessor.cpp)
+target_link_libraries(executorExampleLogitsProcessor
+                      nvinfer_plugin_tensorrt_llm)
+
 # Advanced
 if(NOT TARGET cxxopts::cxxopts)
   set(CXXOPTS_SRC_DIR ${TRTLLM_DIR}/3rdparty/cxxopts)
@@ -117,3 +122,16 @@ endif()
 add_executable(executorExampleAdvanced executorExampleAdvanced.cpp)
 target_link_libraries(executorExampleAdvanced nvinfer_plugin_tensorrt_llm
                       cxxopts::cxxopts)
+
+# MultiInstance
+
+find_package(MPI REQUIRED)
+message(STATUS "Using MPI_C_INCLUDE_DIRS: ${MPI_C_INCLUDE_DIRS}")
+message(STATUS "Using MPI_C_LIBRARIES: ${MPI_C_LIBRARIES}")
+include_directories(${MPI_C_INCLUDE_DIRS})
+
+add_executable(executorExampleAdvancedMultiInstances
+               executorExampleAdvancedMultiInstances.cpp)
+target_link_libraries(
+  executorExampleAdvancedMultiInstances nvinfer_plugin_tensorrt_llm
+  cxxopts::cxxopts ${MPI_C_LIBRARIES})

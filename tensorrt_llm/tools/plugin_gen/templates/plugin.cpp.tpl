@@ -22,10 +22,9 @@ using namespace nvinfer1;
 using nvinfer1::plugin::[[ plugin_name ]]Creator;
 using nvinfer1::plugin::[[ plugin_name ]];
 
-[[ plugin_common_source ]]
-
 PluginFieldCollection [[ plugin_name ]]Creator::mFC{};
 std::vector<PluginField> [[ plugin_name ]]Creator::mPluginAttributes;
+static bool triton_kernels_loaded = false;
 
 // constructor
 [[ plugin_name ]]::[[ plugin_name ]]( [[ construct_arg_list ]] )
@@ -160,12 +159,20 @@ int [[ plugin_name ]]::getNbOutputs() const noexcept
 
 int [[ plugin_name ]]::initialize() noexcept
 {
-    load_[[kernel_name]]();
-    return 0;
+  if (triton_kernels_loaded) {
+      return 0;
+  }
+  load_[[kernel_name]]();
+  triton_kernels_loaded = true;
+  return 0;
 }
 
 void [[ plugin_name ]]::terminate() noexcept {
+  if (!triton_kernels_loaded) {
+      return;
+  }
   unload_[[kernel_name]]();
+  triton_kernels_loaded = false;
 }
 
 size_t [[ plugin_name ]]::getSerializationSize() const noexcept

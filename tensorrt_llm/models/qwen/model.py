@@ -13,22 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-
-from tensorrt_llm.lora_manager import LoraConfig, use_lora
+import copy
+from typing import Optional, Union
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send, sigmoid
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, RowLinear)
+from ...lora_manager import (LoraConfig,
+                             get_default_trtllm_modules_to_hf_modules, use_lora)
+from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
+                              QuantConfig, check_share_embedding)
+from .config import QWenConfig
+from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
+                      load_weights_from_hf_model)
 
 
 class QWenDecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: QWenConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -52,6 +57,7 @@ class QWenDecoderLayer(Module):
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
+            bias=config.attn_bias,
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
@@ -62,7 +68,7 @@ class QWenDecoderLayer(Module):
 
         ClsMLP = GatedMLP
         mlp_kwargs = {}
-        if config.qwen_type == 'qwen2_moe':
+        if config.moe.has_moe():
             ClsMLP = MOE
             mlp_kwargs = {
                 "moe_config": config.moe,
@@ -98,7 +104,7 @@ class QWenDecoderLayer(Module):
                           ffn_hidden_size=intermediate_size,
                           hidden_act=config.hidden_act,
                           dtype=dtype,
-                          bias=False,
+                          bias=config.mlp_bias,
                           tp_group=tp_group,
                           tp_size=tp_size,
                           quant_mode=config.quant_mode,
@@ -137,10 +143,16 @@ class QWenDecoderLayer(Module):
 
         shared_output = None
         if self.config.qwen_type == 'qwen2_moe':
-            shared_output = self.shared_expert(hidden_states)
+            shared_output = self.shared_expert(
+                hidden_states, lora_layer_params=lora_layer_params)
             if self.shared_expert_gate is not None:
+                gate_lora_params = None
+                if lora_layer_params is not None:
+                    gate_lora_params = lora_layer_params.get_runtime_params(
+                        0, "mlp_router")
                 shared_output = sigmoid(
-                    self.shared_expert_gate(hidden_states)) * shared_output
+                    self.shared_expert_gate(hidden_states,
+                                            gate_lora_params)) * shared_output
 
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
@@ -156,7 +168,7 @@ class QWenDecoderLayer(Module):
 
 class QWenModel(Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: QWenConfig) -> None:
         super().__init__()
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():
@@ -214,9 +226,9 @@ class QWenModel(Module):
 
 
 class QWenForCausalLM(DecoderModelForCausalLM):
+    config_class = QWenConfig
 
-    def __init__(self, config: PretrainedConfig):
-        self.check_config(config)
+    def __init__(self, config: QWenConfig):
         transformer = QWenModel(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -241,13 +253,125 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 "mlp_4h_to_h": "mlp.c_proj",
                 "mlp_gate": "w1",
             }
+        elif config.qwen_type == 'qwen2_moe':
+            self.trtllm_modules_to_hf_modules = copy.copy(
+                get_default_trtllm_modules_to_hf_modules())
+            self.trtllm_modules_to_hf_modules.update({
+                "mlp_h_to_4h":
+                "mlp.shared_expert.gate_proj",
+                "mlp_4h_to_h":
+                "mlp.shared_expert.down_proj",
+                "mlp_gate":
+                "mlp.shared_expert.up_proj",
+                "mlp_router":
+                "mlp.shared_expert_gate",
+                "moe_h_to_4h":
+                "mlp.experts.gate_proj",
+                "moe_4h_to_h":
+                "mlp.experts.down_proj",
+                "moe_gate":
+                "mlp.experts.up_proj",
+            })
         else:
             self.trtllm_modules_to_hf_modules = None
         super().__init__(config, transformer, lm_head)
 
-    def check_config(self, config):
-        config.set_if_not_exist('rotary_base', 10000.0)
-        config.set_if_not_exist('rotary_scaling', None)
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        ''' Create a QWenForCausalLM object from give parameters
+        '''
+        import transformers
+
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        use_hf_gptq_checkpoint = kwargs.pop('use_hf_gptq_checkpoint', False)
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = QWenConfig.from_hugging_face(hf_config_or_dir,
+                                              dtype=dtype,
+                                              mapping=mapping,
+                                              quant_config=quant_config,
+                                              **kwargs)
+
+        if not use_preloading:
+            hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
+        if use_hf_gptq_checkpoint:
+            weights = load_weights_from_hf_gptq_model(hf_model, config)
+        else:
+            weights = load_weights_from_hf_model(hf_model, config)
+
+        check_share_embedding(weights, config)
+        model = QWenForCausalLM(config)
+        model.load(weights)
+        return model
+
+    def default_plugin_config(self, **kwargs):
+        plugin_config = super().default_plugin_config(**kwargs)
+        if self.quant_mode.is_int4_weight_only_per_group():
+            plugin_config.weight_only_groupwise_quant_matmul_plugin = 'auto'
+        return plugin_config
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        *,
+        calib_dataset='cnn_dailymail',
+        calib_batches=512,
+        calib_batch_size=1,
+        calib_max_seq_length=512,
+        random_seed=1234,
+        tokenizer_max_seq_length=2048,
+        **kwargs,
+    ):
+        if quant_config.requires_modelopt_quantization:
+            # modelopt quantization flow
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        elif quant_config.requires_calibration:
+            # non-modelopt quantization flow
+            from . import convert
+
+            config = QWenConfig.from_hugging_face(hf_model_dir,
+                                                  dtype=dtype,
+                                                  mapping=mapping,
+                                                  quant_config=quant_config,
+                                                  **kwargs)
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             calib_dataset=calib_dataset)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."
+            )
 
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

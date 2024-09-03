@@ -16,6 +16,7 @@
  */
 #include "recvPlugin.h"
 
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 
 #include <nccl.h>
@@ -91,7 +92,9 @@ int RecvPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     {
         size *= inputDesc[0].dims.d[i];
     }
+    TLLM_LOG_DEBUG("start ncclRecv with size %d", size);
     NCCLCHECK(ncclRecv(outputs[0], size, (*getDtypeMap())[inputDesc[0].type], 0, mComm, stream));
+    TLLM_LOG_DEBUG("end ncclRecv with size %d", size);
 
     return 0;
 }

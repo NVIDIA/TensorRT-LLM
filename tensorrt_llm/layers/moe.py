@@ -14,18 +14,23 @@
 # limitations under the License.
 from dataclasses import asdict, dataclass
 from enum import IntEnum
-from typing import List, Type, Union
+from typing import List, Optional, Type, Union
 
 import numpy as np
 import tensorrt as trt
+import torch
 
-from tensorrt_llm._utils import get_init_params, str_dtype_to_trt
+from tensorrt_llm._utils import (get_init_params, str_dtype_to_torch,
+                                 str_dtype_to_trt)
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
-from ..functional import (AllReduceStrategy, _add_plugin_info, _create_tensor,
-                          allreduce, cast, div, is_gated_activation,
-                          non_gated_version, softmax, sum, topk)
+from .._utils import int32_array
+from ..functional import (AllReduceFusionParams, _add_plugin_info,
+                          _create_tensor, allreduce, cast, concat, constant,
+                          div, expand, gather_nd, is_gated_activation,
+                          non_gated_version, nonzero, repeat_interleave,
+                          scatter_nd, shape, softmax, split, sum, topk)
 from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -57,6 +62,7 @@ class MoeConfig:
     num_experts: int = 0
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
+    tp_mode: int = 0
 
     def validate(self) -> "MoeConfig":
         if (self.num_experts == 0) != (self.top_k == 0):
@@ -80,8 +86,8 @@ def _moe_plugin(moe_config,
                 hidden_states,
                 routing,
                 finished,
-                expert_weight_1,
-                expert_weight_2,
+                expert_weights_1,
+                expert_weights_2,
                 expert_bias_1,
                 expert_bias_2,
                 expert_scale_1,
@@ -94,6 +100,8 @@ def _moe_plugin(moe_config,
                 dtype,
                 weight_dtype,
                 output_dtype,
+                lora_params: LoraParams,
+                lora_max_low_rank,
                 quant_mode=QuantMode(0),
                 tp_size=1,
                 ep_size=1,
@@ -113,8 +121,8 @@ def _moe_plugin(moe_config,
             return x.value
         return x
 
-    expert_weight_1 = from_parameter(expert_weight_1)
-    expert_weight_2 = from_parameter(expert_weight_2)
+    expert_weights_1 = from_parameter(expert_weights_1)
+    expert_weights_2 = from_parameter(expert_weights_2)
     expert_bias_1 = from_parameter(expert_bias_1)
     expert_bias_2 = from_parameter(expert_bias_2)
     expert_scale_1 = from_parameter(expert_scale_1)
@@ -124,6 +132,10 @@ def _moe_plugin(moe_config,
 
     # Create the plugin with our required state
     num_experts = moe_config.num_experts
+    p_remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int32(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int32), trt.PluginFieldType.INT32)
     # We pass the full number of experts (not divided by ep_size) even for EP mode
     p_num_experts = trt.PluginField("number_of_experts",
                                     np.array(num_experts, dtype=np.int32),
@@ -173,12 +185,36 @@ def _moe_plugin(moe_config,
         np.array(moe_config.normalization_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
-    pfc = trt.PluginFieldCollection([
-        p_num_experts, p_top_k, p_expert_hidden_size, p_expert_inter_size,
-        p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
-        p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
-        p_ep_size, p_ep_rank, p_normalization_mode
-    ])
+    p_force_determinism = trt.PluginField(
+        "force_determinism", np.array([int(False)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    use_lora = default_net().plugin_config.lora_plugin is not None
+    p_use_lora = trt.PluginField("use_lora", np.array([int(use_lora)],
+                                                      np.int32),
+                                 trt.PluginFieldType.INT32)
+    if use_lora:
+        p_lora_type_id = trt.PluginField(
+            "lora_type_id",
+            np.array([
+                int(str_dtype_to_trt(default_net().plugin_config.lora_plugin))
+            ], np.int32), trt.PluginFieldType.INT32)
+        p_max_low_rank = trt.PluginField(
+            "max_low_rank", np.array(lora_max_low_rank, dtype=np.int32),
+            trt.PluginFieldType.INT32)
+
+    pfc_inputs = [
+        p_remove_input_padding, p_num_experts, p_top_k, p_expert_hidden_size,
+        p_expert_inter_size, p_activation_type, p_type_id, p_weight_type_id,
+        p_output_type_id, p_quant_mode, p_use_finished, p_use_bias, p_tp_size,
+        p_tp_rank, p_ep_size, p_ep_rank, p_normalization_mode,
+        p_force_determinism, p_use_lora
+    ]
+
+    if use_lora:
+        pfc_inputs += [p_lora_type_id, p_max_low_rank]
+
+    pfc = trt.PluginFieldCollection(pfc_inputs)
 
     # Create the plugin with our constant inputs to the constructor
     plugin_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -187,7 +223,7 @@ def _moe_plugin(moe_config,
     moe_plugin = plugin_creator.create_plugin("mixture_of_experts", pfc)
 
     # Instantiate the plugin with our specific inputs
-    plugin_inputs = [hidden_states, routing, expert_weight_1, expert_weight_2]
+    plugin_inputs = [hidden_states, routing, expert_weights_1, expert_weights_2]
 
     if expert_bias_1:
         assert expert_bias_2
@@ -212,6 +248,34 @@ def _moe_plugin(moe_config,
         assert output_dtype == trt.fp8
         plugin_inputs += [expert_scale_4]
 
+    if use_lora:
+        moe_h_4h_weight_ptrs = lora_params.get_runtime_params(
+            0, "moe_h_to_4h").lora_weights_pointers
+        moe_h_4h_lora_ranks = lora_params.get_runtime_params(
+            0, "moe_h_to_4h").lora_ranks
+        plugin_inputs += (moe_h_4h_weight_ptrs + moe_h_4h_lora_ranks)
+
+        moe_4h_h_weight_ptrs = lora_params.get_runtime_params(
+            0, "moe_4h_to_h").lora_weights_pointers
+        moe_4h_h_lora_ranks = lora_params.get_runtime_params(
+            0, "moe_4h_to_h").lora_ranks
+        plugin_inputs += (moe_4h_h_weight_ptrs + moe_4h_h_lora_ranks)
+
+        moe_gate_weight_ptrs = None
+        moe_gate_lora_ranks = None
+        if is_gated_activation(act_fn):
+            moe_gate_weight_ptrs = lora_params.get_runtime_params(
+                0, "moe_gate").lora_weights_pointers
+            moe_gate_lora_ranks = lora_params.get_runtime_params(
+                0, "moe_gate").lora_ranks
+            plugin_inputs += (moe_gate_weight_ptrs + moe_gate_lora_ranks)
+
+        host_request_types = lora_params.host_request_types
+        plugin_inputs += [host_request_types]
+
+        if default_net().plugin_config.remove_input_padding:
+            plugin_inputs += [lora_params.host_context_lengths]
+
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
     _add_plugin_info(layer, plugin_creator, "mixture_of_experts", pfc)
@@ -228,14 +292,20 @@ class MOEWeightWrapper(Module):
 
     def __init__(self, in_features: int, out_features: int,
                  experts_per_node: int, quant_mode: QuantMode,
-                 dtype: Union[str, trt.DataType],
-                 weight_dtype: Union[str, trt.DataType], has_bias: bool):
+                 dtype: Union[str,
+                              trt.DataType], weight_dtype: Union[str,
+                                                                 trt.DataType],
+                 has_bias: bool, wrapper_tllm_to_externel_key_dict: dict,
+                 tp_size: int, tp_dim: int):
         super().__init__()
         self.quant_mode = quant_mode
         self.expert_shape = (experts_per_node, out_features, in_features)
         self.dtype = dtype
         self.weight_dtype = weight_dtype
         self.has_bias = has_bias
+        self.tllm_to_externel_key_dict = wrapper_tllm_to_externel_key_dict
+        self.tp_size = tp_size
+        self.tp_dim = tp_dim
 
         if quant_mode.is_weight_only():
             bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
@@ -248,7 +318,9 @@ class MOEWeightWrapper(Module):
         else:
             self.register_parameter('per_channel_scale', None)
 
-        self.weight = Parameter(shape=self.expert_shape, dtype=weight_dtype)
+        self.weight = Parameter(shape=self.expert_shape,
+                                dtype=weight_dtype,
+                                prefer_managed=True)
 
         if has_bias:
             self.bias = Parameter(shape=(experts_per_node, out_features),
@@ -264,6 +336,59 @@ class MOEWeightWrapper(Module):
         else:
             self.register_parameter('activation_scaling_factor', None)
             self.register_parameter('weights_scaling_factor', None)
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        if tllm_key.endswith("weight"):
+            if isinstance(weights, torch.Tensor):
+                weights = [weights]
+            if "fc" in tllm_key:
+                weights = torch.cat([
+                    torch.stack(weights[:len(weights) // 2]),
+                    torch.stack(weights[len(weights) // 2:])
+                ],
+                                    dim=-2)
+            elif "proj" in tllm_key:
+                weights = torch.stack(weights)
+            weights = weights.to(str_dtype_to_torch(self.dtype))
+
+        if not self.quant_mode.has_any_quant():
+            return weights
+        elif self.quant_mode.is_weight_only():
+            if "per_channel_scale" in tllm_key:
+                return {}
+            if weights.dim() > 2:
+                v = weights.transpose(-1, -2)
+            else:
+                v = weights.t()
+
+            amax = v.abs().max(dim=-2)[0].to(v.dtype)
+            if self.quant_mode.is_int8_weight_only():
+                scale = amax / 128.
+                qweight = torch.clamp((v / scale.unsqueeze(1)).round(), -128,
+                                      127).char()
+            else:
+                scale = amax / 8.
+                qweight = torch.clamp((v / scale.unsqueeze(1)).round(), -8,
+                                      7).char()
+                qweight[qweight < 0] += 16
+                qweight = qweight.view(torch.uint8)
+                qweight = (qweight[:, :, 1::2] * 16 + qweight[:, :, ::2]).view(
+                    torch.int8)
+            qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
+                qweight.contiguous(), torch.int8
+                if self.quant_mode.is_int8_weight_only() else torch.quint4x2,
+                torch.float16)
+            return {
+                tllm_key: qweight,
+                tllm_key.replace("weight", "per_channel_scale"): scale,
+            }
+        elif self.quant_mode.has_fp8_qdq():
+            if tllm_key.endswith("activation_scaling_factor"):
+                return 448.0 / weights
+            elif tllm_key.endswith("weights_scaling_factor"):
+                return 448.0 / weights
+            else:
+                return weights
 
 
 class MixtureOfExperts(Module):
@@ -322,6 +447,15 @@ class MixtureOfExperts(Module):
         elif quant_mode.has_fp8_qdq():
             self.weight_dtype = trt.fp8
 
+        rank_experts = self.mapping.ep_experts(self.num_experts)
+        self.wrapper_tllm_to_externel_key_dict = {
+            "mlp":
+            "block_sparse_moe",
+            "proj": [f"experts.{expert}.w2" for expert in rank_experts],
+            "fc": [f"experts.{expert}.w3" for expert in rank_experts] +
+            [f"experts.{expert}.w1" for expert in rank_experts]
+        }
+
         # Since output dimension is usually low (in the order of 10s), no TP at
         # all is more efficient as no allreduce required in the end.
         # Note that if we see models that have large number of experts, we may
@@ -336,8 +470,14 @@ class MixtureOfExperts(Module):
             tp_group=None,
             tp_size=1,
             strict_dtype=True)
+        self.router.tllm_to_externel_key_dict = {
+            "mlp": "block_sparse_moe",
+            "router": "gate"
+        }
 
         self.init_experts()
+
+        self.max_low_rank = None
 
     def init_experts(self):
         # Note we use horizontal fusion for gated activation to do the operation in one GEMM invocation
@@ -349,12 +489,20 @@ class MixtureOfExperts(Module):
 
         self.fc = MOEWeightWrapper(self.hidden_size, fc_out_size,
                                    self.experts_per_node, self.quant_mode,
-                                   self.dtype, self.weight_dtype, self.bias)
+                                   self.dtype, self.weight_dtype, self.bias,
+                                   self.wrapper_tllm_to_externel_key_dict,
+                                   self.mapping.moe_tp_size, 0)
         self.proj = MOEWeightWrapper(self.expert_inter_size, self.hidden_size,
                                      self.experts_per_node, self.quant_mode,
-                                     self.dtype, self.weight_dtype, self.bias)
+                                     self.dtype, self.weight_dtype, self.bias,
+                                     self.wrapper_tllm_to_externel_key_dict,
+                                     self.mapping.moe_tp_size, 1)
 
-    def forward(self, hidden_states, finished=None, lora_layer_params=None):
+    def forward(self,
+                hidden_states,
+                finished=None,
+                lora_layer_params=None,
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
         moe_router_lora_params = None
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
@@ -362,16 +510,12 @@ class MixtureOfExperts(Module):
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
         return self.forward_experts(hidden_states, routing, finished,
-                                    lora_layer_params)
+                                    lora_layer_params, reduce_fusion_params)
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params):
-        if lora_layer_params is not None:
-            for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
-                if lora_layer_params.get_runtime_params(0, module) is not None:
-                    raise RuntimeError(
-                        f"MoE plugin does not support {module} LoRA module, please disable MoE plugin"
-                    )
+                        lora_layer_params,
+                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+
         if self.quant_mode.has_fp8_qdq():
             assert self.fc.weight.value.dtype == trt.fp8, (
                 "mlp fc weight dtype should be fp8 in the fp8 quantization mode."
@@ -417,8 +561,8 @@ class MixtureOfExperts(Module):
         output = _moe_plugin(self.moe_config,
                              hidden_states_quant,
                              routing,
-                             expert_weight_1=self.fc.weight.value,
-                             expert_weight_2=self.proj.weight.value,
+                             expert_weights_1=self.fc.weight.value,
+                             expert_weights_2=self.proj.weight.value,
                              expert_bias_1=self.fc.bias,
                              expert_bias_2=self.proj.bias,
                              expert_scale_1=scale_1,
@@ -432,6 +576,8 @@ class MixtureOfExperts(Module):
                              dtype=dtype_quant,
                              weight_dtype=weight_dtype_quant,
                              output_dtype=output_dtype_quant,
+                             lora_params=lora_layer_params,
+                             lora_max_low_rank=self.max_low_rank,
                              quant_mode=self.quant_mode,
                              tp_size=self.mapping.moe_tp_size,
                              tp_rank=self.mapping.moe_tp_rank,
@@ -439,7 +585,9 @@ class MixtureOfExperts(Module):
                              ep_rank=self.mapping.moe_ep_rank)
 
         if self.tp_size > 1 and self.tp_group is not None:
-            output = allreduce(output, self.tp_group)
+            output = allreduce(output,
+                               self.tp_group,
+                               reduce_fusion_params=reduce_fusion_params)
 
         return output
 
@@ -451,12 +599,16 @@ class MixtureOfExperts(Module):
 
     def to(self,
            moe_cls: Type["MixtureOfExperts"],
-           config=None) -> "MixtureOfExperts":
+           quant_config=None) -> "MixtureOfExperts":
         from ..quantization.quantize import quantize
+        if isinstance(self, moe_cls):
+            return self
 
         new_moe = moe_cls(**get_init_params(self))
-        if config is not None:
-            quantize(new_moe, config.quantization)
+        # If config is not None, set quantization from config
+        if quant_config is not None:
+            quantize(new_moe, quant_config)
+
         new_moe.load_weights(self)
         new_moe.router = self.router
         return new_moe
@@ -474,16 +626,10 @@ class MoeOOTB(MOE):
             )
         ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
 
-        # In OOTB mode, when TP is enabled, using MLP class to do TP settings
-        # pass self.ffn_hidden_size to original size,
-        if self.mapping.has_moe_tp():
-            tp_size = self.mapping.moe_tp_size
-            tp_group = self.mapping.moe_tp_group
-        else:
-            tp_size = 1
-            tp_group = None
+        tp_size = 1
+        tp_group = None
         self.experts = ModuleList([
-            ClsMLP(self.hidden_size, self.ffn_hidden_size,
+            ClsMLP(self.hidden_size, self.expert_inter_size,
                    non_gated_version(self.hidden_act), self.bias, self.dtype,
                    tp_group, tp_size, self.quant_mode)
             for _ in range(self.experts_per_node)
@@ -521,7 +667,7 @@ class MoeOOTB(MOE):
                 gate_lora_weights_pointers,
             }],
             host_context_lengths=lora_layer_params.host_context_lengths,
-            max_context_length=lora_layer_params.max_context_length,
+            max_num_tokens=lora_layer_params.max_num_tokens,
             max_encoder_context_length=lora_layer_params.
             max_encoder_context_length,
             host_request_types=lora_layer_params.host_request_types,
@@ -531,7 +677,16 @@ class MoeOOTB(MOE):
         )
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params):
+                        lora_layer_params,
+                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+        # TODO: https://nvbugspro.nvidia.com/bug/4781396 after this nvbug is fixed, we will remove this check.
+        if lora_layer_params is not None:
+            for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
+                if lora_layer_params.get_runtime_params(0, module) is not None:
+                    raise RuntimeError(
+                        f"MoE  OOTB does not support {module} LoRA module, please enable MoE plugin"
+                    )
+
         if self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
             topk_values, topk_indices = topk(routing, self.top_k, dim=-1)
             topk_values = softmax(topk_values, -1)
@@ -539,29 +694,90 @@ class MoeOOTB(MOE):
             router_probs = softmax(routing, -1)
             topk_values, topk_indices = topk(router_probs, self.top_k, dim=-1)
 
-        output = hidden_states * 0.0  # Create output space
-        # Experts inference
+        hidden_size = shape(hidden_states, -1)
+        # [B*sq, hidden]
+        inputs_merged = hidden_states.view(concat([-1, hidden_size]))
+        flat_topk_indices = topk_indices.view(
+            concat([-1, shape(topk_indices, -1)]))
+        flat_topk_values = topk_values.view(concat([-1,
+                                                    shape(topk_values, -1)]))
+
+        # Create output space
+        zero_buffer = inputs_merged * 0.0
+        output = zero_buffer
+
+        expert_indices_stack = []
+        indices_stack = []
+        # When topk indices are equal to expert index, the expert will inference the tokens.
+        # Bundle all indices and experts index, then do mask once.
         for i, expert in enumerate(self.experts):
             if self.mapping.has_moe_ep():
                 index = i + self.experts_per_node * self.mapping.moe_ep_rank
             else:
                 index = i
-            # inference expert
-            out = expert(hidden_states,
-                         lora_layer_params=self.moe_to_expert_lora_params(
-                             lora_layer_params, index))
+            expert_indices_stack.append(
+                flat_topk_indices.view(concat([1, shape(flat_topk_indices)])))
 
-            expert_mask = topk_indices == index
-            expert_weights = cast(
-                sum(topk_values * cast(expert_mask, topk_values.dtype),
-                    dim=-1,
-                    keepdim=True), self.dtype)
+            indices_stack.append(constant(int32_array(index)))
 
-            output += out * expert_weights
-        if self.mapping.has_moe_ep() and self.mapping.moe_ep_group is not None:
+        all_expert_indices = concat(expert_indices_stack, dim=0)
+        indices = expand(
+            concat(indices_stack).view(concat([len(self.experts), 1, 1])),
+            shape(all_expert_indices))
+
+        # Create all experts mask
+        all_expert_mask = all_expert_indices == indices
+
+        experts_weights = cast(
+            sum(flat_topk_values *
+                cast(all_expert_mask, flat_topk_values.dtype),
+                dim=-1,
+                keepdim=True), self.dtype)
+
+        all_expert_mask = cast(
+            sum(cast(all_expert_mask, flat_topk_values.dtype),
+                dim=-1,
+                keepdim=True), 'bool')
+        all_expert_mask = repeat_interleave(all_expert_mask, shape(output, -1),
+                                            2)
+
+        # split the mask and weights for each expert
+        experts_mask = split(all_expert_mask, 1, dim=0)
+        expert_weights = split(experts_weights, 1, dim=0)
+
+        for i, expert in enumerate(self.experts):
+            if self.mapping.has_moe_ep():
+                index = i + self.experts_per_node * self.mapping.moe_ep_rank
+            else:
+                index = i
+            # get mask token index
+            non_zero_index = nonzero(experts_mask[i].view(
+                concat([-1, hidden_size])))
+            non_zero_index = non_zero_index.transpose(1, 0)
+            input_for_expert = gather_nd(inputs_merged, non_zero_index, 0)
+            input_for_expert = input_for_expert.view(concat([-1, hidden_size]),
+                                                     zero_is_placeholder=False)
+
+            # Expert inference
+            expert_output = expert(
+                input_for_expert,
+                lora_layer_params=self.moe_to_expert_lora_params(
+                    lora_layer_params, index))
+
+            # scatter expert output to real position
+            expert_finialized_output = zero_buffer
+            expert_finialized_output = scatter_nd(
+                expert_finialized_output, non_zero_index,
+                expert_output.view([-1])) * expert_weights[i]
+
+            output += expert_finialized_output
+
+        output = output.view(shape(hidden_states))
+
+        if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
-                               self.mapping.moe_ep_group,
-                               strategy=AllReduceStrategy.NCCL)
+                               self.mapping.tp_group,
+                               reduce_fusion_params=reduce_fusion_params)
 
         return output
 
@@ -569,8 +785,19 @@ class MoeOOTB(MOE):
         for i, expert in enumerate(self.experts):
             is_gated_act = is_gated_activation(self.hidden_act)
             # Gated weight pack in expert1 weights
-            # expert_weight_1
+            # expert_weights_1
             experts_weight_1_raw = moe.fc.weight.raw_value
+            fc1_weight_scale = None
+            fc1_activation_scale = None
+            fc2_weight_scale = None
+            fc2_activation_scale = None
+
+            if self.quant_mode.has_fp8_qdq():
+                fc1_weight_scale = moe.fc.weights_scaling_factor.raw_value
+                fc1_activation_scale = moe.fc.activation_scaling_factor.raw_value
+                fc2_weight_scale = moe.proj.weights_scaling_factor.raw_value
+                fc2_activation_scale = moe.proj.activation_scaling_factor.raw_value
+
             if self.quant_mode.is_weight_only():
                 expert.fc.weight.value = experts_weight_1_raw[
                     i, :, -self.expert_inter_size:]
@@ -584,7 +811,17 @@ class MoeOOTB(MOE):
                     expert.gate.weight.value = experts_weight_1_raw[
                         i, :self.expert_inter_size, :]
 
-            # expert_weight_2
+            if self.quant_mode.has_fp8_qdq():
+                expert.fc.activation_scaling_factor.value = fc1_activation_scale
+                expert.fc.weights_scaling_factor.value = fc1_weight_scale[i]
+                expert.proj.activation_scaling_factor.value = fc2_activation_scale
+                expert.proj.weights_scaling_factor.value = fc2_weight_scale[i]
+                if is_gated_act:
+                    expert.gate.activation_scaling_factor.value = fc1_activation_scale
+                    expert.gate.weights_scaling_factor.value = fc1_weight_scale[
+                        i]
+
+            # expert_weights_2
             experts_weight_2_raw = moe.proj.weight.raw_value
             expert.proj.weight.value = experts_weight_2_raw[i, :, :]
 

@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fused_gated_gemm/fused_gated_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
@@ -158,7 +159,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     common::check_cuda_error(cudaStreamCreate(&mStream));
 
     int const startMinMRounded = nextPowerOfTwo(dims.minM);
-    for (int m = startMinMRounded; m < maxM; m *= 2)
+    for (int m = std::max(1, startMinMRounded); m < maxM; m *= 2)
     {
         profileTactics(m, dims.n, dims.k);
     }
@@ -181,10 +182,11 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
 
     if (mSkip)
     {
+        TLLM_LOG_TRACE("Skip is set, no best config is set for this instance");
         return std::nullopt;
     }
 
-    int const mRounded = std::min(nextPowerOfTwo(m), getMaxProfileM());
+    int const mRounded = std::min(std::max(1, nextPowerOfTwo(m)), getMaxProfileM());
     fflush(stdout);
     return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
 }
@@ -322,6 +324,10 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
 
 template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
     std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFusedGatedGemmRunnerInterface>, GemmIdCore,
+    GemmIdCoreHash>;
+
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
 
 } // namespace tensorrt_llm::plugins

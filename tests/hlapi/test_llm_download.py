@@ -3,7 +3,7 @@ from tensorrt_llm.hlapi.utils import (download_hf_model,
                                       download_hf_pretrained_config)
 
 try:
-    from .test_llm import llama_model_path
+    from test_llm import llama_model_path
 except ImportError:
     from .test_llm import llama_model_path
 
