@@ -226,7 +226,7 @@ if __name__ == '__main__':
             hf_bert = globals()[f'{model_type}Model'].from_pretrained(args.model_dir, config=bert_config, add_pooling_layer=False)
         else:
             hf_bert = globals()[f'{model_type}Model'](bert_config,
-                                                    add_pooling_layer=False)
+                                                      add_pooling_layer=False)
         tensorrt_llm_bert = tensorrt_llm.models.BertModel(
             num_layers=bert_config.num_hidden_layers,
             num_heads=bert_config.num_attention_heads,
