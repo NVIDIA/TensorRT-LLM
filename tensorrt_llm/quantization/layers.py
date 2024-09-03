@@ -874,7 +874,9 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         using_head_as_leading_dim = kwargs.get("using_head_as_leading_dim",
                                                False)
         config = kwargs.get("config", None)
-        num_heads = config.num_heads
+        num_heads = config.num_attention_heads
+        if using_head_as_leading_dim:
+            assert config.num_attention_heads == config.num_key_value_heads, "using_head_as_leading_dim require head_size to be multiple of 3."
         if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
             return {}
         if self.is_qkv and type(weights) is list and len(weights) > 3:
@@ -1299,10 +1301,17 @@ class FP8Linear(Linear):
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
-        self.tllm_to_externel_key_dict = {
-            "activation_scaling_factor": "input_quantizer._amax",
-            "weights_scaling_factor": "weight_quantizer._amax",
-        }
+        if self.is_qkv:
+            self.tllm_to_externel_key_dict = {
+                "activation_scaling_factor": "input_scale",
+                "weight": ["weight", "weight_scale"],
+                "weights_scaling_factor": "",
+            }
+        else:
+            self.tllm_to_externel_key_dict = {
+                "activation_scaling_factor": "input_scale",
+                "weights_scaling_factor": "weight_scale",
+            }
 
     def forward(self, x, lora_runtime_params=None):
         assert lora_runtime_params is None or default_net(
@@ -1336,7 +1345,20 @@ class FP8Linear(Linear):
             w_quant_out = self.weight.value
 
         gemm_plugin = default_net().plugin_config.gemm_plugin
-        if gemm_plugin == 'fp8':
+
+        low_latency_gemm_plugin = default_net(
+        ).plugin_config.low_latency_gemm_plugin
+        if (low_latency_gemm_plugin == "fp8"):
+            return self.multiply_collect(
+                quantized_out,
+                w_quant_out,
+                gemm_plugin=None,
+                low_latency_gemm_plugin=low_latency_gemm_plugin,
+                use_fp8=True,
+                alpha=alpha,
+                lora_runtime_params=lora_runtime_params,
+                lora_hidden_state=lora_hidden_state)
+        elif gemm_plugin == 'fp8':
             return self.multiply_collect(
                 quantized_out,
                 w_quant_out,
@@ -1360,16 +1382,37 @@ class FP8Linear(Linear):
                 lora_hidden_state=lora_hidden_state)
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        # TODO: add FP8 modelopt format support
         if self.is_qkv:
-            if tllm_key.endswith("scaling_factor"):
-                return 448.0 / max(weights).unsqueeze(0)
+            if tllm_key.endswith("activation_scaling_factor"):
+                return max(weights).reshape(1, ).to(torch.float32)
+            elif tllm_key.endswith("weights_scaling_factor"):
+                return {}
+            elif tllm_key.endswith("weight"):
+                assert len(weights) == 6
+                weight_scaling_factors = weights[1::2]
+                new_amax = max(weight_scaling_factors).reshape(1, ).to(
+                    torch.float32)
+                for qkv_idx in range(3):
+                    idx = qkv_idx * 2
+                    weights[idx] = weights[idx].view(torch.float8_e4m3fn).to(
+                        torch.float32)
+                    weights[idx] *= weights[idx + 1]
+                    weights[idx] /= new_amax
+                    weights[idx] = weights[idx].to(torch.float8_e4m3fn)
+                weights = torch.cat(weights[::2])
+                scales = new_amax
+                return {
+                    tllm_key: weights,
+                    tllm_key.replace("weight", "weights_scaling_factor"): scales
+                }
             else:
                 return super().postprocess(tllm_key, weights, **kwargs)
         if tllm_key.endswith("scaling_factor"):
-            return 448.0 / weights.unsqueeze(0)
-        else:
-            return weights
+            return weights.reshape(1, ).to(torch.float32)
+        elif tllm_key.endswith("weight"):
+            return weights.view(torch.float8_e4m3fn)
+        elif tllm_key.endswith("bias"):
+            return weights.to(str_dtype_to_torch(self.bias.dtype))
 
 
 class FP8RowLinear(RowLinear):
@@ -1398,8 +1441,8 @@ class FP8RowLinear(RowLinear):
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(1, ), dtype=trt.float32)
         self.tllm_to_externel_key_dict = {
-            "activation_scaling_factor": "input_quantizer._amax",
-            "weights_scaling_factor": "weight_quantizer._amax",
+            "activation_scaling_factor": "input_scale",
+            "weights_scaling_factor": "weight_scale",
         }
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
@@ -1428,7 +1471,20 @@ class FP8RowLinear(RowLinear):
             w_quant_out = self.weight.value
 
         gemm_plugin = default_net().plugin_config.gemm_plugin
-        if gemm_plugin == 'fp8':
+        low_latency_gemm_plugin = default_net(
+        ).plugin_config.low_latency_gemm_plugin
+        if (low_latency_gemm_plugin == "fp8"):
+            ret = self.multiply_collect(
+                quantized_out,
+                w_quant_out,
+                gemm_plugin=None,
+                low_latency_gemm_plugin=low_latency_gemm_plugin,
+                use_fp8=True,
+                alpha=alpha,
+                lora_runtime_params=lora_runtime_params,
+                lora_hidden_state=lora_hidden_state,
+                reduce_fusion_params=reduce_fusion_params)
+        elif gemm_plugin == 'fp8':
             ret = self.multiply_collect(
                 quantized_out,
                 w_quant_out,
@@ -1455,11 +1511,12 @@ class FP8RowLinear(RowLinear):
         return ret
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        # TODO: add FP8 modelopt format support
         if tllm_key.endswith("scaling_factor"):
-            return 448.0 / weights.unsqueeze(0)
-        else:
-            return weights
+            return weights.reshape(1, ).to(torch.float32)
+        elif tllm_key.endswith("weight"):
+            return weights.view(torch.float8_e4m3fn)
+        elif tllm_key.endswith("bias"):
+            return weights.to(str_dtype_to_torch(self.bias.dtype))
 
 
 class Fp8RowwiseMLP(Module):

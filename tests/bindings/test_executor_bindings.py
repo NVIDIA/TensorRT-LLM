@@ -40,11 +40,11 @@ def lora_config_paths(llm_root: Path, resource_path: Path,
     return (lora_config_path / "source.npy", lora_config_path / "config.npy")
 
 
-def get_expected_num_tokens(prompt_len, max_new_tokens, streaming,
+def get_expected_num_tokens(prompt_len, max_tokens, streaming,
                             exclude_input_from_output):
     if not streaming and not exclude_input_from_output:
-        return prompt_len + max_new_tokens
-    return max_new_tokens
+        return prompt_len + max_tokens
+    return max_tokens
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -83,10 +83,12 @@ def test_shutdown(model_files, model_path):
                                executor_config)
 
     # Create the request
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False,
-                             trtllm.SamplingConfig())
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             sampling_config=trtllm.SamplingConfig())
 
     # Enqueue the request
     assert executor.can_enqueue_requests() == True
@@ -123,7 +125,7 @@ def test_embedding_bias(model_files, model_path):
                                executor_config)
 
     # Create the request
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
     # Set embedding bias so "biased_output" is always picked
     biased_output = 10
@@ -131,10 +133,10 @@ def test_embedding_bias(model_files, model_path):
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_output] = torch.finfo(torch.float32).max
     request = trtllm.Request(input_tokens,
-                             max_new_tokens,
-                             streaming,
-                             trtllm.SamplingConfig(),
-                             output_config,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             sampling_config=trtllm.SamplingConfig(),
+                             output_config=output_config,
                              embedding_bias=embedding_bias)
 
     # Enqueue the request
@@ -158,10 +160,10 @@ def test_embedding_bias(model_files, model_path):
         i += 1
     assert i < max_wait_ms
     assert len(tokens) == get_expected_num_tokens(
-        len(input_tokens), max_new_tokens, streaming,
+        len(input_tokens), max_tokens, streaming,
         exclude_input_from_output), f"{request_id}"
     # All generated tokens should equal biased_output
-    assert tokens[-max_new_tokens:] == [biased_output] * max_new_tokens
+    assert tokens[-max_tokens:] == [biased_output] * max_tokens
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -179,10 +181,13 @@ def test_single_request(streaming: bool, exclude_input_from_output: bool,
                                executor_config)
 
     # Create the request
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, streaming,
-                             trtllm.SamplingConfig(), output_config)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             sampling_config=trtllm.SamplingConfig(),
+                             output_config=output_config)
 
     # Enqueue the request
     request_id = executor.enqueue_request(request)
@@ -205,7 +210,7 @@ def test_single_request(streaming: bool, exclude_input_from_output: bool,
         i += 1
     assert i < max_wait_ms
     assert len(tokens) == get_expected_num_tokens(
-        len(input_tokens), max_new_tokens, streaming,
+        len(input_tokens), max_tokens, streaming,
         exclude_input_from_output), f"{request_id}"
 
     executor.get_latest_iteration_stats()
@@ -230,15 +235,15 @@ def test_single_request_lora(model_files, model_path_lora, lora_config_paths):
                                executor_config)
 
     # Create the request
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
     lora_weights = torch.tensor(np.load(lora_config_paths[0])).half()
     lora_config = torch.tensor(np.load(lora_config_paths[1]))
     request = trtllm.Request(input_tokens,
-                             max_new_tokens,
-                             streaming,
-                             trtllm.SamplingConfig(),
-                             output_config,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             sampling_config=trtllm.SamplingConfig(),
+                             output_config=output_config,
                              lora_config=trtllm.LoraConfig(
                                  0, lora_weights, lora_config))
 
@@ -263,7 +268,7 @@ def test_single_request_lora(model_files, model_path_lora, lora_config_paths):
         i += 1
     assert i < max_wait_ms
     assert len(tokens) == get_expected_num_tokens(
-        len(input_tokens), max_new_tokens, streaming,
+        len(input_tokens), max_tokens, streaming,
         exclude_input_from_output), f"{request_id}"
 
 
@@ -283,7 +288,7 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
 
     num_requests = 20
     max_prompt_len = 20
-    max_max_new_tokens = 20
+    max_max_tokens = 20
     end_id = -1
 
     # Enqueue the requests
@@ -291,14 +296,18 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
     expected_num_tokens = {}
     for i in range(num_requests):
         prompt_len = random.randint(1, max_prompt_len)
-        max_new_tokens = random.randint(1, max_max_new_tokens)
+        max_tokens = random.randint(1, max_max_tokens)
         input_tokens = [1] * prompt_len
-        request = trtllm.Request(input_tokens, max_new_tokens, streaming,
-                                 trtllm.SamplingConfig(), output_config, end_id)
+        request = trtllm.Request(input_tokens,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(),
+                                 output_config=output_config,
+                                 end_id=end_id)
         request_id = executor.enqueue_request(request)
         tokens[request_id] = []
         expected_num_tokens[request_id] = get_expected_num_tokens(
-            prompt_len, max_new_tokens, streaming, exclude_input_from_output)
+            prompt_len, max_tokens, streaming, exclude_input_from_output)
 
     # Get the new tokens for each request
     num_finished = 0
@@ -340,7 +349,7 @@ def test_multi_request_with_ids(streaming: bool,
 
     num_requests = 20
     max_prompt_len = 20
-    max_max_new_tokens = 20
+    max_max_tokens = 20
     end_id = -1
 
     # Enqueue the requests
@@ -348,14 +357,18 @@ def test_multi_request_with_ids(streaming: bool,
     expected_num_tokens = {}
     for i in range(num_requests):
         prompt_len = random.randint(1, max_prompt_len)
-        max_new_tokens = random.randint(1, max_max_new_tokens)
+        max_tokens = random.randint(1, max_max_tokens)
         input_tokens = [1] * prompt_len
-        request = trtllm.Request(input_tokens, max_new_tokens, streaming,
-                                 trtllm.SamplingConfig(), output_config, end_id)
+        request = trtllm.Request(input_tokens,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(),
+                                 output_config=output_config,
+                                 end_id=end_id)
         request_id = executor.enqueue_request(request)
         tokens[request_id] = []
         expected_num_tokens[request_id] = get_expected_num_tokens(
-            prompt_len, max_new_tokens, streaming, exclude_input_from_output)
+            prompt_len, max_tokens, streaming, exclude_input_from_output)
 
     # Get the new tokens for each request
     num_finished = 0
@@ -402,7 +415,7 @@ def test_get_num_responses_ready(streaming: bool,
                                executor_config)
 
     max_prompt_len = 20
-    max_max_new_tokens = 20
+    max_max_tokens = 20
 
     # Enqueue the requests
     num_requests = random.randint(1, 50)
@@ -410,13 +423,15 @@ def test_get_num_responses_ready(streaming: bool,
     req_num_expected_responses = {}
     for i in range(num_requests):
         prompt_len = random.randint(1, max_prompt_len)
-        max_new_tokens = random.randint(1, max_max_new_tokens)
+        max_tokens = random.randint(1, max_max_tokens)
 
-        request = trtllm.Request([1] * prompt_len, max_new_tokens, streaming,
-                                 trtllm.SamplingConfig(), output_config)
+        request = trtllm.Request([1] * prompt_len,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(),
+                                 output_config=output_config)
         request_id = executor.enqueue_request(request)
-        req_num_expected_responses[
-            request_id] = max_new_tokens if streaming else 1
+        req_num_expected_responses[request_id] = max_tokens if streaming else 1
         num_expected_responses += req_num_expected_responses[request_id]
 
     i = 0
@@ -474,14 +489,13 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
         assert len(output_shape) == 2
         assert input_shape[0] * beam_width == output_shape[0]
         max_seq_length = output_shape[1]
-        max_new_tokens = max_seq_length - max_input_length
+        max_tokens = max_seq_length - max_input_length
 
         end_ids = [pad_id for _ in range(len(given_input_lengths))]
         expected_lengths = []
         for i in range(len(given_input_lengths)):
             expected_lengths.append([
-                given_input_lengths[i] + max_new_tokens
-                for _ in range(beam_width)
+                given_input_lengths[i] + max_tokens for _ in range(beam_width)
             ])
 
         test_data = {
@@ -570,19 +584,19 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     # Create requests from input data
     num_requests = len(given_input_lengths)
     requests = []
-    req_max_new_tokens = []
+    req_max_tokens = []
 
     for i in range(num_requests):
         input_len = given_input_lengths[i]
-        max_new_tokens = test_data["max_seq_length"] - max_input_length
-        req_max_new_tokens.append(max_new_tokens)
+        max_tokens = test_data["max_seq_length"] - max_input_length
+        req_max_tokens.append(max_tokens)
         req_tokens = given_input[i][:input_len]
         requests.append(
             trtllm.Request(req_tokens,
-                           max_new_tokens,
-                           streaming,
-                           trtllm.SamplingConfig(beam_width),
-                           output_config,
+                           max_tokens=max_tokens,
+                           streaming=streaming,
+                           sampling_config=trtllm.SamplingConfig(beam_width),
+                           output_config=output_config,
                            end_id=-1))
 
     req_ids = executor.enqueue_requests(requests)
@@ -610,8 +624,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                 tokens[batch_id][beam] += new_tokens
 
             validate_results_shapes(result, given_input_lengths[batch_id],
-                                    req_max_new_tokens[batch_id],
-                                    tokens[batch_id])
+                                    req_max_tokens[batch_id], tokens[batch_id])
         i += 1
     assert i < max_wait_ms
     verify_output(tokens, test_data, given_input_lengths)
@@ -628,19 +641,21 @@ def test_finish_reason(streaming: bool, beam_width: int, model_files,
                                trtllm.ExecutorConfig(beam_width))
     requests = [
         # Finish due to length.
-        trtllm.Request([1, 2, 3, 4], 5, streaming,
-                       trtllm.SamplingConfig(beam_width)),
+        trtllm.Request([1, 2, 3, 4],
+                       max_tokens=5,
+                       streaming=streaming,
+                       sampling_config=trtllm.SamplingConfig(beam_width)),
         # Finish due to end id.
         trtllm.Request([1, 2, 3, 4],
-                       5,
-                       streaming,
-                       trtllm.SamplingConfig(beam_width),
+                       max_tokens=5,
+                       streaming=streaming,
+                       sampling_config=trtllm.SamplingConfig(beam_width),
                        end_id=4),
         # Finish due to stop word.
         trtllm.Request([1, 2, 3, 4],
-                       5,
-                       streaming,
-                       trtllm.SamplingConfig(beam_width),
+                       max_tokens=5,
+                       streaming=streaming,
+                       sampling_config=trtllm.SamplingConfig(beam_width),
                        stop_words=[[4, 2]]),
     ]
     req_ids = executor.enqueue_requests(requests)
@@ -711,9 +726,11 @@ def test_single_request_invalid_inputs(model_files, model_path):
     executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, streaming)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming)
     # Invalid embedding bias shape
     embedding_bias = torch.ones(1)
     request.embedding_bias = embedding_bias
@@ -743,9 +760,9 @@ def test_sampling_config():
         "top_p_min": 1.0,
         "top_p_reset_ids": 3,
         "top_p_decay": 1.0,
-        "random_seed": 7,
+        "seed": 7,
         "temperature": 1.0,
-        "min_length": 4,
+        "min_tokens": 4,
         "beam_search_diversity_rate": 1.0,
         "repetition_penalty": 1.0,
         "presence_penalty": 1.0,
@@ -762,6 +779,30 @@ def test_sampling_config():
     assert config.beam_width == beam_width
     for k in kwargs:
         assert getattr(config, k) is None
+
+
+def test_sampling_config_deprecated_args():
+    # random_seed -> seed
+    config = trtllm.SamplingConfig(seed=1)
+    assert config.seed == 1
+    assert config.random_seed == 1
+    config = trtllm.SamplingConfig(random_seed=2)
+    assert config.seed == 2
+    assert config.random_seed == 2
+    config = trtllm.SamplingConfig(seed=3, random_seed=4)
+    assert config.seed == 3
+    assert config.random_seed == 3
+
+    # min_length -> min_tokens
+    config = trtllm.SamplingConfig(min_tokens=1)
+    assert config.min_tokens == 1
+    assert config.min_length == 1
+    config = trtllm.SamplingConfig(min_length=2)
+    assert config.min_tokens == 2
+    assert config.min_length == 2
+    config = trtllm.SamplingConfig(min_tokens=3, min_length=4)
+    assert config.min_tokens == 3
+    assert config.min_length == 3
 
 
 def test_output_config():
@@ -836,7 +877,7 @@ def test_wakeup(model_files, model_path):
     thread = threading.Thread(target=resp_thread, args=(stop_signal, executor))
     thread.start()
     request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
-                             max_new_tokens=5,
+                             max_tokens=5,
                              streaming=True)
     executor.enqueue_request(request)
     time.sleep(2)
@@ -849,7 +890,7 @@ def test_wakeup(model_files, model_path):
 def test_request():
     kwargs = {
         "input_token_ids": [1, 2, 3],
-        "max_new_tokens": 1,
+        "max_tokens": 1,
         "streaming": False,
         "sampling_config": trtllm.SamplingConfig(),
         "output_config": trtllm.OutputConfig(),
@@ -878,6 +919,19 @@ def test_request():
     assert (request.prompt_tuning_config.embedding_table == torch.ones(
         100, 64)).all()
     assert isinstance(request.lora_config, trtllm.LoraConfig)
+
+
+def test_request_deprecated_args():
+    # max_new_tokens -> max_tokens
+    request = trtllm.Request([1, 2, 3], max_tokens=10)
+    assert request.max_tokens == 10
+    assert request.max_new_tokens == 10
+    request = trtllm.Request([1, 2, 3], max_new_tokens=20)
+    assert request.max_tokens == 20
+    assert request.max_new_tokens == 20
+    request = trtllm.Request([1, 2, 3], max_tokens=30, max_new_tokens=40)
+    assert request.max_tokens == 30
+    assert request.max_new_tokens == 30
 
 
 def test_result():
@@ -1090,6 +1144,8 @@ def test_executor_config():
     assert config.logits_post_processor_config is None
     assert config.decoding_config is None
     assert config.debug_config is None
+    assert config.recv_poll_period_ms == 0
+    assert config.max_seq_idle_microseconds == 180000000
 
     kwargs = {
         "max_beam_width":
@@ -1123,7 +1179,11 @@ def test_executor_config():
         "debug_config":
         trtllm.DebugConfig(dump_input_tensors=True,
                            dump_output_tensors=True,
-                           debug_tensor_names=["test"])
+                           debug_tensor_names=["test"]),
+        "recv_poll_period_ms":
+        50,
+        "max_seq_idle_microseconds":
+        240 * 1000 * 1000,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1218,9 +1278,12 @@ def test_logits_post_processor(model_files, model_path):
                                executor_config)
 
     # Create the request
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False, client_id=123)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             client_id=123)
     request.logits_post_processor_name = "my_logits_pp"
 
     # Enqueue the request
@@ -1243,13 +1306,12 @@ def test_logits_post_processor(model_files, model_path):
             tokens.extend(new_tokens)
         i += 1
     assert i < max_wait_ms
-    assert len(tokens) == get_expected_num_tokens(len(input_tokens),
-                                                  max_new_tokens, False,
-                                                  False), f"{request_id}"
+    assert len(tokens) == get_expected_num_tokens(len(input_tokens), max_tokens,
+                                                  False, False), f"{request_id}"
 
     # check that all output tokens are 42
     print(tokens)
-    assert tokens[-max_new_tokens:] == [42] * max_new_tokens
+    assert tokens[-max_tokens:] == [42] * max_tokens
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -1276,9 +1338,12 @@ def test_logits_post_processor_batched(model_files, model_path):
                                executor_config)
 
     # Create the request
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False, client_id=123)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             client_id=123)
     request.logits_post_processor_name = request.BATCHED_POST_PROCESSOR_NAME
 
     batch_size = 4
@@ -1305,8 +1370,8 @@ def test_logits_post_processor_batched(model_files, model_path):
             tokens[req_id].extend(new_tokens)
     assert i < max_wait_ms
 
-    expected_num_tokens = get_expected_num_tokens(len(input_tokens),
-                                                  max_new_tokens, False, False)
+    expected_num_tokens = get_expected_num_tokens(len(input_tokens), max_tokens,
+                                                  False, False)
     for req_id in request_ids:
         assert len(tokens[req_id]) == expected_num_tokens, f"{req_id}"
 
@@ -1326,8 +1391,11 @@ def test_iteration_stats():
     assert stats_json["timestamp"] == stats.timestamp
     assert stats_json["iter"] == stats.iter
     assert stats_json["iterLatencyMS"] == stats.iter_latency_ms
+    assert stats_json[
+        "newActiveRequestsQueueLatencyMS"] == stats.new_active_requests_queue_latency_ms
     assert stats_json["numActiveRequests"] == stats.num_active_requests
     assert stats_json["numQueuedRequests"] == stats.num_queued_requests
+    assert stats_json["numCompletedRequests"] == stats.num_completed_requests
     assert stats_json["maxNumActiveRequests"] == stats.max_num_active_requests
     assert stats_json["gpuMemUsage"] == stats.gpu_mem_usage
     assert stats_json["cpuMemUsage"] == stats.cpu_mem_usage
@@ -1476,7 +1544,11 @@ def test_executor_config_pickle():
         "debug_config":
         trtllm.DebugConfig(dump_input_tensors=True,
                            dump_output_tensors=True,
-                           debug_tensor_names=["test"])
+                           debug_tensor_names=["test"]),
+        "recv_poll_period_ms":
+        50,
+        "max_seq_idle_microseconds":
+        240 * 1000 * 1000,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1500,13 +1572,16 @@ def test_executor_config_pickle():
     assert config_copy.decoding_config.decoding_mode.isTopKandTopP
     assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
     assert config.debug_config.dump_input_tensors == config_copy.debug_config.dump_input_tensors
+    assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
 
 
 def test_return_full_tokens():
-    max_new_tokens = 5
+    max_tokens = 5
     input_tokens = [1, 2, 3, 4]
-    request = trtllm.Request(input_tokens, max_new_tokens, False,
-                             trtllm.SamplingConfig())
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=False,
+                             sampling_config=trtllm.SamplingConfig())
     request.return_all_generated_tokens = True
     assert request.return_all_generated_tokens == True
     request.return_all_generated_tokens = False

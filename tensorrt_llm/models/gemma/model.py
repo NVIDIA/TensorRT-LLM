@@ -255,8 +255,9 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
     def _load_gemma_weights_from_hf(hf_model_dir: "HfConfigOrDir",
                                     trt_llm_config: GemmaConfig, *,
                                     load_model_on_cpu: bool) -> Weights:
+        """`AutoModelForCausalLM.from_pretrained` will parse the correct gemma, whether Gemma or Gemma2 or future versions."""
         import transformers
-        hf_gemma = transformers.GemmaForCausalLM.from_pretrained(
+        hf_gemma = transformers.AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             device_map="cpu" if load_model_on_cpu else "auto",
             torch_dtype='auto',

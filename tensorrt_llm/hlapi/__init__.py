@@ -1,11 +1,10 @@
-from .llm import LLM, SamplingParams
+from .llm import LLM, RequestOutput, SamplingParams
 from .llm_utils import (BuildConfig, CapacitySchedulerPolicy, KvCacheConfig,
-                        LlmArgs, QuantAlgo, QuantConfig, SchedulerConfig)
-from .tokenizer import TokenizerBase
+                        QuantAlgo, QuantConfig, SchedulerConfig)
 
 __all__ = [
     'LLM',
-    'TokenizerBase',
+    'RequestOutput',
     'SamplingParams',
     'KvCacheConfig',
     'SchedulerConfig',
@@ -13,5 +12,4 @@ __all__ = [
     'BuildConfig',
     'QuantConfig',
     'QuantAlgo',
-    'LlmArgs',
 ]

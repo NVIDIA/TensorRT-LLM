@@ -30,6 +30,47 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
+   :caption: LLM API Examples
+   :hidden:
+
+   llm-api-examples/index.md
+   llm-api-examples/customization.md
+   llm-api-examples/llm_api_examples
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API
+   :hidden:
+   :glob:
+
+   llm-api/*
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Model Definition API
+   :hidden:
+
+   python-api/tensorrt_llm.layers.rst
+   python-api/tensorrt_llm.functional.rst
+   python-api/tensorrt_llm.models.rst
+   python-api/tensorrt_llm.plugin.rst
+   python-api/tensorrt_llm.quantization.rst
+   python-api/tensorrt_llm.runtime.rst
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: C++ API
+   :hidden:
+
+   _cpp_gen/executor.rst
+   _cpp_gen/runtime.rst
+
+
+.. toctree::
+   :maxdepth: 2
    :caption: Architecture
    :name: Architecture
 
@@ -74,38 +115,6 @@ Welcome to TensorRT-LLM's Documentation!
 
    reference/precision.md
    reference/memory.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: C++ API
-   :hidden:
-
-   _cpp_gen/executor.rst
-   _cpp_gen/runtime.rst
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: High Level API Examples
-   :hidden:
-
-   high-level-api-examples/high_level_api_examples
-   high-level-api-examples/introduction.md
-   high-level-api-examples/advanced.md
-
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Python API
-   :hidden:
-
-   python-api/tensorrt_llm.layers.rst
-   python-api/tensorrt_llm.functional.rst
-   python-api/tensorrt_llm.models.rst
-   python-api/tensorrt_llm.plugin.rst
-   python-api/tensorrt_llm.quantization.rst
-   python-api/tensorrt_llm.runtime.rst
 
 
 .. toctree::

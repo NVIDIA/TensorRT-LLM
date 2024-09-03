@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import os
 import subprocess  # nosec B404
+import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -27,9 +29,14 @@ def cli():
 @click.option("--model-path", type=str, required=True)
 @click.option("--samples-path", type=str, required=True)
 @click.option("--report-path-prefix", type=str, required=True)
-@click.option("--num-samples", type=int, default=-1)
+@click.option("--num-samples", type=int, default=None, show_default=True)
 @click.option("--tp-size", type=int, default=1, show_default=True)
-@click.option("--warmup", type=int, default=100, show_default=True)
+@click.option("--streaming/--no-streaming",
+              type=bool,
+              default=False,
+              show_default=True)
+@click.option("--warmup", type=int, default=2, show_default=True)
+@click.option("--concurrency", type=int, default=None, show_default=True)
 @click.option("--max-num-tokens", type=int, default=2048, show_default=True)
 @click.option("--max-input-length", type=int, required=True, default=200)
 @click.option("--max-seq-length", type=int, required=True, default=400)
@@ -44,10 +51,12 @@ def cli():
 def benchmark_main(model_path: str,
                    samples_path: str,
                    report_path_prefix: str,
-                   num_samples: int = -1,
+                   num_samples: Optional[int] = None,
                    tp_size: int = 1,
-                   warmup: int = 100,
-                   max_num_tokens=2048,
+                   streaming: bool = False,
+                   warmup: int = 2,
+                   concurrency: Optional[int] = None,
+                   max_num_tokens: int = 2048,
                    max_input_length: int = 200,
                    max_seq_length: int = 400,
                    max_batch_size: int = 128,
@@ -76,7 +85,9 @@ def benchmark_main(model_path: str,
             engine_output_dir = Path(temp_dir.name)
 
     def run_hlapi():
-        print_colored(f"Running HLAPI benchmark ...\n", "bold_green")
+        print_colored(f"Running HLAPI benchmark ...\n",
+                      "bold_green",
+                      writer=sys.stdout)
 
         build_config = BuildConfig(max_num_tokens=max_num_tokens,
                                    max_input_len=max_input_length,
@@ -85,9 +96,11 @@ def benchmark_main(model_path: str,
 
         evaluator = LLMPerfEvaluator.create(
             model=model_path,
-            num_samples=num_samples,
             samples_path=samples_path,
+            num_samples=num_samples,
+            streaming=streaming,
             warmup=warmup,
+            concurrency=concurrency,
             engine_cache_path=engine_output_dir,
             # The options should be identical to the cpp benchmark
             tensor_parallel_size=tp_size,
@@ -96,19 +109,17 @@ def benchmark_main(model_path: str,
         report = evaluator.run()
         report.display()
 
-        report_path = Path(report_path_prefix + ".json")
-        if report_path.exists():
-            for i in range(10000):
-                if (Path(f"report_path_prefix{i}.json").exists()):
-                    continue
-                else:
-                    report_path = Path(f"report_path_prefix{i}")
-                    break
-
+        report_path = Path(f"{report_path_prefix}.json")
+        i = 0
+        while report_path.exists():
+            report_path = Path(f"{report_path_prefix}{i}.json")
+            i += 1
         report.save_json(report_path)
 
     def run_gpt_manager_benchmark():
-        print_colored(f"Running gptManagerBenchmark ...\n", "bold_green")
+        print_colored(f"Running gptManagerBenchmark ...\n",
+                      "bold_green",
+                      writer=sys.stdout)
         if os.path.isfile(cpp_executable):
             cpp_executable_path = cpp_executable
         else:
@@ -117,18 +128,28 @@ def benchmark_main(model_path: str,
                 "../../cpp/build/benchmarks/gptManagerBenchmark")
 
         command = f"{cpp_executable_path} --engine_dir {engine_output_dir} --type IFB --dataset {samples_path} --warm_up {warmup} --output_csv {report_path_prefix}.cpp.csv --api executor"
+        if streaming:
+            command = f"{command} --streaming"
+        if concurrency:
+            command = f"{command} --concurrency {concurrency}"
         if tp_size > 1:
             command = f"mpirun -n {tp_size} {command}"
-        print_colored(f'cpp benchmark command: {command}\n', "grey")
+        print_colored(f'cpp benchmark command: {command}\n',
+                      "grey",
+                      writer=sys.stdout)
         output = subprocess.run(command,
                                 check=True,
                                 universal_newlines=True,
                                 shell=True,
                                 capture_output=True,
                                 env=os.environ)  # nosec B603
-        print_colored(f'cpp benchmark output: {output.stdout}', "grey")
+        print_colored(f'cpp benchmark output: {output.stdout}',
+                      "grey",
+                      writer=sys.stdout)
         if output.stderr:
-            print_colored(f'cpp benchmark error: {output.stderr}', "red")
+            print_colored(f'cpp benchmark error: {output.stderr}',
+                          "red",
+                          writer=sys.stdout)
 
     run_hlapi()
     if cpp_executable:

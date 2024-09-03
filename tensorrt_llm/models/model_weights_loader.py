@@ -9,6 +9,7 @@ import torch
 from safetensors import safe_open
 from tqdm import tqdm
 
+from tensorrt_llm.layers.moe import MOEWeightWrapper
 from tensorrt_llm.quantization.layers import (
     WeightOnlyGroupwiseQuantColumnLinear, WeightOnlyGroupwiseQuantRowLinear)
 
@@ -174,14 +175,17 @@ class ModelWeightsLoader:
         if self.format == ModelWeightsFormat.SAFETENSORS:
             tensor = self.shards[ptr_idx].get_slice(key)
             tensor_shape = tensor.get_shape()
+            if tensor_shape == []:
+                tensor = self.shards[ptr_idx].get_tensor(key).unsqueeze(0)
+                tensor_shape = tensor.shape
         elif self.format == ModelWeightsFormat.BINARY or self.format == ModelWeightsFormat.PYTORCH:
             tensor = self.shards[ptr_idx][key]
             tensor_shape = tensor.shape
 
         if tp_size <= 1 or tp_dim < 0:
-            res = tensor[:]
+            return tensor[:]
         else:
-            if len(tensor_shape) == 1 and tp_dim == 1:
+            if len(tensor_shape) == 1 and (tp_dim > 0 or tensor_shape[0] == 1):
                 return tensor[:]
             else:
                 width = tensor_shape[tp_dim]
@@ -193,7 +197,7 @@ class ModelWeightsLoader:
                 slice_obj = [slice(None)] * len(tensor_shape)
                 slice_obj[tp_dim] = slice(slice_start, slice_end)
                 res = tensor[tuple(slice_obj)]
-        return res
+                return res
 
     def load(self,
              tllm_key: str,
@@ -239,6 +243,8 @@ class ModelWeightsLoader:
         if skip_tp:
             tp_dim = -1
             tp_size = 1
+        if isinstance(sub_module, MOEWeightWrapper):
+            tp_rank = self.model.config.mapping.moe_tp_rank
         external_key = self.translate_to_external_key(
             tllm_key, tllm_to_externel_key_dict)
 

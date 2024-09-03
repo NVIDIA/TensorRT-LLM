@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import copy
 import operator
+import sys
 import time
 from functools import reduce
 from pathlib import Path
@@ -41,10 +42,12 @@ class GridSearcher:
         origin_build_config = kwargs.pop('build_config', BuildConfig())
         origin_kv_cache_config = kwargs.pop('kv_cache_config', KvCacheConfig())
 
-        print_colored("Tunable options: \n", color="green")
+        print_colored("Tunable options: \n", color="green", writer=sys.stdout)
         for key, value in self.tunable_space.items():
-            print_colored(f"  - {key}: {value}\n", color="green")
-        print_colored("\n")
+            print_colored(f"  - {key}: {value}\n",
+                          color="green",
+                          writer=sys.stdout)
+        print_colored("\n", writer=sys.stdout)
 
         for no, llm_kwargs in enumerate(space):
             if no >= self.prune_space_for_debug:
@@ -77,13 +80,17 @@ class GridSearcher:
             scheduler_config = SchedulerConfig(
                 llm_kwargs.pop('capacity_scheduling_policy'))
 
-            print_colored(f"Testing ", color="green")
-            print_colored(f"{no}/{self.space_size}", color="bold_red")
-            print_colored(f" case with {origin_llm_kwargs}\n", color="green")
+            print_colored(f"Testing ", color="green", writer=sys.stdout)
+            print_colored(f"{no}/{self.space_size}",
+                          color="bold_red",
+                          writer=sys.stdout)
+            print_colored(f" case with {origin_llm_kwargs}\n",
+                          color="green",
+                          writer=sys.stdout)
             if self.latest_latency_per_case is not None:
                 print_colored(
-                    f"Estimated remaining time: {self.latest_latency_per_case * (self.space_size - no):.2f} min\n"
-                )
+                    f"Estimated remaining time: {self.latest_latency_per_case * (self.space_size - no):.2f} min\n",
+                    writer=sys.stdout)
 
             _start_time = time.time()
             with LLMPerfEvaluator.create(

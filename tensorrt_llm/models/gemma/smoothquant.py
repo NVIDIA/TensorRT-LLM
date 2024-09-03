@@ -33,7 +33,8 @@ from transformers.pytorch_utils import Conv1D
 
 from tensorrt_llm._utils import pad_vocab_size, torch_to_numpy
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.gemma.weight import dup_kv_weight
+from tensorrt_llm.models.convert_utils import (dup_kv_weight, get_weight, split,
+                                               split_matrix_tp)
 
 if TYPE_CHECKING:
     from transformers import AutoModelForCausalLM, Cache
@@ -520,18 +521,6 @@ def get_tllm_linear_sq_weight(vals,
     return results
 
 
-def split(weight: torch.Tensor,
-          tp_size: int,
-          rank: int = 0,
-          dim: int = 0) -> torch.Tensor:
-    if tp_size == 1:
-        return weight
-    elif weight.ndim == 1:
-        return torch.chunk(weight, tp_size)[rank].contiguous()
-    else:
-        return torch.chunk(weight, tp_size, dim=dim)[rank].contiguous()
-
-
 def split_qkv_tp(qkv, n_head, n_kv_heads, head_size, tensor_parallel, rank):
     """
     Splits the QKV matrix according to tensor parallelism
@@ -543,30 +532,6 @@ def split_qkv_tp(qkv, n_head, n_kv_heads, head_size, tensor_parallel, rank):
     k = split(k, tensor_parallel, rank, dim=0)
     v = split(v, tensor_parallel, rank, dim=0)
     return torch.concatenate([q, k, v], dim=0).contiguous()
-
-
-def split_matrix_tp(weight: torch.Tensor, tp_size: int, rank: int,
-                    dim: int) -> torch.Tensor:
-    return split(weight, tp_size, rank, dim=dim)
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
-                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def get_tllm_linear_weight(

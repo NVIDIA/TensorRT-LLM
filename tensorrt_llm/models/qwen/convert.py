@@ -33,7 +33,9 @@ from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantAlgo
-from ..convert_utils import load_calib_dataset
+from ..convert_utils import (dup_kv_weight, get_weight, get_weight_and_bias,
+                             load_calib_dataset, split, split_matrix_tp,
+                             split_qkv_bias_tp, split_qkv_tp)
 from .config import QWenConfig
 from .utils import get_qwen_key_list, make_context
 
@@ -433,55 +435,6 @@ def capture_activation_range(model,
     return act_scales
 
 
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-
-def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV matrix according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.contiguous()
-
-
-def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV bias according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
-def get_weight(config, prefix, dtype):
-    if config[prefix + '.weight'].dtype != dtype:
-        config[prefix + '.weight'].data = config[prefix + '.weight'].to(dtype)
-    return config[prefix + '.weight'].detach()
-
-
-def get_bias(config, prefix, dtype):
-    if config[prefix + '.bias'].dtype != dtype:
-        config[prefix + '.bias'].data = config[prefix + '.bias'].to(dtype)
-    return config[prefix + '.bias'].detach()
-
-
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
-
-
 def get_tllm_linear_weight(weight,
                            prefix,
                            bias=None,
@@ -515,16 +468,6 @@ def get_tllm_linear_weight(weight,
         results[prefix + 'bias'] = bias
 
     return results
-
-
-def dup_kv_weight(v, num_head, tp_size):
-    assert tp_size % num_head == 0
-    reps = tp_size // num_head
-    head_size = v.shape[0] // num_head
-    v = v.reshape(num_head, head_size,
-                  -1)[:, None, :, :].expand(num_head, reps, head_size,
-                                            v.shape[1])
-    return v.reshape(num_head * reps * head_size, -1).clone().detach()
 
 
 def get_tllm_linear_sq_weight(vals,

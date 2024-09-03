@@ -58,28 +58,7 @@ Please refer to the [LLM quickstart](./quickstart_example.py) for the complete e
 
 ## Examples
 
-You can refer to [llm_examples.py](llm_examples.py) for all of the examples, and run it with the [run_examples.py](./run_examples.py) script, the command is as follows:
-
-```sh
-# To run examples with single GPU:
-python3 ./run_examples.py run_single_gpu --model_dir <llama-model-path>
-
-# Run the multi-GPU examples
-python3 ./run_examples.py run_multi_gpu --model_dir <llama-model-path>
-
-# Run the quantization examples
-python3 ./run_examples.py run_quant --model_dir <llama-model-path>
-```
-
-For 7B, 13B models those could be held in a single GPU, it should run all the examples automatically and print the results.
-
-For larger models, such as LLaMA v2 70B, at least two H100/A100 cards are required, the following command could be used to start a parallel task with Tensor Parallelism enabled.
-
-``` sh
-python3 llm_examples.py --task run_llm_on_tensor_parallel \
-    --prompt="<prompt>" \
-    --hf_model_dir=<llama-model-path>
-```
+You can refer to the scripts in the current directory for all of the examples.
 
 ## Model preparation
 The `LLM` class supports four kinds of model inputs:
@@ -214,42 +193,6 @@ from tensorrt_llm import LLM
 llm = LLM(<llama_model_path>, auto_parallel=True, world_size=2)
 ```
 
-### Multi-GPU multi-node (MGMN) support
-By default, the HLAPI will spawn MPI processes under the hood to support single-node-multi-gpu scenarios, what you need to do is to set the `parallel_config.tp_size/pp_size` to the number of GPUs you want to use.
-
-But for MGMN scenarios, since the jobs are managed by some cluster management systems, such as [Slurm](https://slurm.schedmd.com/documentation.html), you need to submit HLAPI tasks differently.
-
-Firstly, it is suggested to build the engine offline with the `trtllm-build` tools, please refer to [LLaMA's README](../llama/README.md) for more details.
-
-Secondly, you need to prepare a Python file containing the HLAPI task, a naive example is as below, note that, this Python script will be executed only once on MPI rank0, and it looks nothing special compared to the single-node-multi-gpu scenario, such as TP or PP.
-
-```python
-# Set the tensor_parallel_size and pipeline_parallel_size to the number of GPUs you want to use
-llm = LLM(model=<llama_model_path>, tensor_parallel_size=4, pipeline_parallel_size=2)
-for output in llm.generate([[32, 12]]):
-    print(output)
-```
-
-Thirdly, you need to prepare a Slurm script to submit the task, the script contains the following lines:
-
-```sh
-#SBATCH -N 2                                 # number of nodes
-#SBATCH --ntasks-per-node=4
-#SBATCH -p <partition>
-# more sbatch options here...
-
-srun --container-image="<docker-image>" \
-     --mpi=pmix \
-     ... \ # more srun options here
-     trtllm-hlapi-launch python3 <your-python-script>.py
-```
-
-The `trtllm-hlapi-launch` is a script provided by the HLAPI to launch the task and take care of the MPI runtime, you can find it in the local `bin` directory once you install the TensorRT-LLM package.
-
-Finally, you can submit the task with `sbatch <your-slurm-script>.sh`.
-
-Considering the Slurm or other cluster management systems may be highly customized and the task-submit command may be variant, the forementioned example is just a naive example. The key point is to submit the Python script with the MPI runtime, and the HLAPI will take care of the rest.
-
 ## Generation
 ### `asyncio`-based generation
 With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:
@@ -321,7 +264,7 @@ Apart from the arguments mentioned above, you can also customize the build confi
 ```python
 llm = LLM(<model-path>,
           build_config=BuildConfig(
-            max_new_tokens=4096,
+            max_num_tokens=4096,
             max_batch_size=128,
             max_beam_width=4))
 ```
@@ -335,7 +278,6 @@ from tensorrt_llm.hlapi import LLM, KvCacheConfig
 
 llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(
-            max_new_tokens=128,
             free_gpu_memory_fraction=0.8))
 ```
 

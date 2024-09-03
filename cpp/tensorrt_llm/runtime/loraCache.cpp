@@ -68,6 +68,7 @@ void LoraCachePageManager::initialize(BufferManager const& bufferManager)
             mConfig.getTotalNumPages() - static_cast<SizeType32>(pageIdx), mConfig.getMaxPagesPerBlock());
         auto const blockShape = ITensor::makeShape({numLocalPages, mConfig.getSlotsPerPage(), mConfig.getPageWidth()});
         TensorPtr block = bufferManager.allocate(mConfig.getMemoryType(), blockShape, mConfig.getDataType());
+        bufferManager.setZero(*block);
         mPageBlocks.push_back(block);
         for (SizeType32 i = 0; i < numLocalPages; ++i)
         {

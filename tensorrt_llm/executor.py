@@ -61,40 +61,25 @@ class GenerationRequest:
         return self
 
     def as_executor_request(self) -> tllm.Request:
-        request_kwargs = {
-            "input_token_ids":
-            self.prompt_token_ids,
-            "max_new_tokens":
-            self.sampling_params.max_new_tokens,
-            "streaming":
-            self.streaming,
-            "sampling_config":
-            self.sampling_params._get_sampling_config(),
-            "end_id":
-            self.sampling_params.end_id,
-            "pad_id":
-            self.sampling_params.pad_id,
-            "output_config":
-            self.sampling_params._get_output_config(),
-            # The following options in the Executor API are not yet exposed by the HLAPI:
-            # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "bad_words":
-            self.sampling_params._get_bad_words(),
-            "stop_words":
-            self.sampling_params._get_stop_words(),
-            "embedding_bias":
-            self.sampling_params.embedding_bias,
-            "external_draft_tokens_config":
-            self.sampling_params.external_draft_tokens_config,
-            "prompt_tuning_config":
-            self.sampling_params.prompt_tuning_config,
-            "lora_config":
-            self.sampling_params.lora_config,
-            "logits_post_processor_name":
-            self.sampling_params.logits_post_processor_name,
-        }
-        request = tllm.Request(**request_kwargs)
-        return request
+        return tllm.Request(
+            input_token_ids=self.prompt_token_ids,
+            max_tokens=self.sampling_params.max_tokens,
+            max_new_tokens=self.sampling_params.max_new_tokens,
+            streaming=self.streaming,
+            sampling_config=self.sampling_params._get_sampling_config(),
+            end_id=self.sampling_params.end_id,
+            pad_id=self.sampling_params.pad_id,
+            output_config=self.sampling_params._get_output_config(),
+            bad_words=self.sampling_params._get_bad_words(),
+            stop_words=self.sampling_params._get_stop_words(),
+            embedding_bias=self.sampling_params.embedding_bias,
+            external_draft_tokens_config=self.sampling_params.
+            external_draft_tokens_config,
+            prompt_tuning_config=self.sampling_params.prompt_tuning_config,
+            lora_config=self.sampling_params.lora_config,
+            logits_post_processor_name=self.sampling_params.
+            logits_post_processor_name,
+        )
 
 
 @dataclass(slots=True)
@@ -272,6 +257,9 @@ class GenerationResult:
         repr = f"{self.__class__.__name__}({repr})"
         return repr
 
+    def __hash__(self):
+        return hash(self.request_id)
+
 
 class GenerationExecutor(ABC):
     TERMINATE_REQUEST_ID = 0
@@ -433,7 +421,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             self.engine = tllm.Executor(engine,
                                         tllm.ModelType.DECODER_ONLY,
                                         executor_config=executor_config)
-        self.awaiter_stop_event = threading.Event()
+        self.thread_stop_event = threading.Event()
         self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
                                                daemon=True)
         self.stats_thread = threading.Thread(target=self.stats_loop,
@@ -483,7 +471,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def awaiter_loop(self):
         """ Gets responses from executor and places in the return queue."""
-        while not self.awaiter_stop_event.is_set():
+        while not self.thread_stop_event.is_set():
             # Get responses and place in queue.
             for response in self.engine.await_responses(
                     timeout=datetime.timedelta(milliseconds=100)):
@@ -520,11 +508,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     )
                     queue.put((response.request_id, tensors,
                                response.result.is_final, None))
-                    if response.result.is_final:
-                        self._pending.remove(req_id)
+
+                # If the response is final or has an error, drop it from the registries.
+                if response.has_error() or response.result.is_final:
+                    self._pending.remove(req_id)
+                    self._results.pop(req_id)
 
     def stats_loop(self):
-        while not self.awaiter_stop_event.is_set():
+        while not self.thread_stop_event.is_set():
             time.sleep(0.1)
             # Get stats and place in queue.
             for stats in self.engine.get_latest_iteration_stats():
@@ -556,7 +547,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def shutdown(self):
         if self.engine is not None:
-            self.awaiter_stop_event.set()
+            self.thread_stop_event.set()
             if self.engine.can_enqueue_requests():
                 if self.awaiter_thread.is_alive():
                     self.awaiter_thread.join()
@@ -585,22 +576,21 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def wait_first_completed(
         self, futures: List[GenerationResult]
     ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.request_id for f in futures)
+        wait_set = set(futures)
 
         # clear already-finished requests
         for f in futures:
             if f._done:
-                wait_set.remove(f.request_id)
+                wait_set.pop(f)
                 yield f
 
         # wait remaining active requests
         while len(wait_set) > 0:
-            req_id = wait_set.pop()
-
-            if req_id not in self._pending:
-                yield self._results[req_id]
+            fut = wait_set.pop()
+            if fut.request_id not in self._pending:
+                yield fut
             else:
-                wait_set.add(req_id)
+                wait_set.add(fut)
 
 
 class Fifo:
@@ -677,10 +667,11 @@ class ExecutorBindingsProxy(GenerationExecutor):
             "stats_queue_addr": stats_queue_addr,
         })
         self.workers_init_ok = False
-        self.dispatcher = threading.Thread(target=self.dispatcher_thread,
-                                           daemon=True)
-        self.stats_thread = threading.Thread(target=self.stats_main,
-                                             daemon=True)
+        self.thread_stop_event = threading.Event()
+        self.results_dispatcher_thread = threading.Thread(
+            target=self.results_dispatcher_loop, daemon=True)
+        self.stats_dispatcher_thread = threading.Thread(
+            target=self.stats_dispatcher_loop, daemon=True)
 
     @print_traceback_on_error
     @staticmethod
@@ -727,25 +718,35 @@ class ExecutorBindingsProxy(GenerationExecutor):
             else:
                 executor.block_subordinates()
 
-    def dispatcher_thread(self):
+    def results_dispatcher_loop(self):
         """ Collect centralized results from result queue and dispatch them in the
             correct GenerationResult queues. """
 
         while (res := self.result_queue.get()) is not None:
             req_id, *_ = res
             # Wait for this result ready in self._results
+            # This will make sure that the self._results[req_id] is ready to receive the result.
             while req_id not in self._results:
                 self._request_id_dispatcher_queue.get()
             self._results[req_id].queue.put(res)
+
+            # Drop the record if the result is final.
+            if res[2]:
+                self._results.pop(req_id)
+
             while not self._request_id_dispatcher_queue.empty():
                 self._request_id_dispatcher_queue.get()
+            if self.thread_stop_event.is_set():
+                break
 
-    def stats_main(self):
+    def stats_dispatcher_loop(self):
         while (stats := self.mp_stats_queue.get()) is not None:
             time.sleep(0.1)
             while self.stats_queue.full():
                 self.stats_queue.get()
             self.stats_queue.put(stats)
+            if self.thread_stop_event.is_set():
+                break
 
     def start(self):
         self.mpi_futures = self.mpi_session.submit(
@@ -754,9 +755,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.workers_init_ok = self.result_queue.get()
         if not self.workers_init_ok:
             raise RuntimeError("worker initialization failed")
-        self.dispatcher.start()
+        self.results_dispatcher_thread.start()
         self.create_stats_queue()
-        self.stats_thread.start()
+        self.stats_dispatcher_thread.start()
 
     def shutdown(self):
         if not self.workers_started:
@@ -765,12 +766,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
             self.request_queue.put(None)
         for f in self.mpi_futures:
             f.result()
-        if self.dispatcher.is_alive():
+        self.thread_stop_event.set()
+        if self.results_dispatcher_thread.is_alive():
             self.result_queue.put(None)
-            self.dispatcher.join()
-        if self.stats_thread.is_alive():
+            self.results_dispatcher_thread.join()
+        if self.stats_dispatcher_thread.is_alive():
             self.mp_stats_queue.put(None)
-            self.stats_thread.join()
+            self.stats_dispatcher_thread.join()
         self.workers_started = False
 
     def submit(self, request: GenerationRequest) -> GenerationResult:

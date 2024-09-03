@@ -1,7 +1,8 @@
-# Advanced Usage
+# Common Customizations
 
 ## Quantization
-By simply setting several flags in the `LLM`, TensorRT-LLM can quantize the HuggingFace model automatically. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization.
+
+By simply setting several flags in the `LLM`, TensorRT-LLM can quantize the Hugging Face model automatically. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization.
 
 ``` python
 from tensorrt_llm.hlapi import QuantConfig, QuantAlgo
@@ -11,10 +12,10 @@ quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
 llm = LLM(<model-dir>, quant_config=quant_config)
 ```
 
-
 ## Customization
 
-### Customizing sampling with `SamplingParams`
+### Customizing Sampling with SamplingParams
+
 With SamplingParams, you can customize the sampling strategy, such as beam search, temperature, and so on.
 
 To enable beam search with a beam size of 4, set the `sampling_params` as follows:
@@ -35,24 +36,26 @@ for output in llm.generate(<prompt>, sampling_params=sampling_params):
 ```
 
 `SamplingParams` manages and dispatches fields to C++ classes including:
+
 * [SamplingConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE)
 * [OutputConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12OutputConfigE)
 
-Please refer to these classes for more details.
+Refer to the class documentation for more details.
 
+### Build Configuration
 
-### Build configuration
 Apart from the arguments mentioned above, you can also customize the build configuration with the `build_config` class and other arguments borrowed from the lower-level APIs. For example:
 
 ```python
 llm = LLM(<model-path>,
           build_config=BuildConfig(
-            max_new_tokens=4096,
+            max_num_tokens=4096,
             max_batch_size=128,
             max_beam_width=4))
 ```
 
-### Runtime customization
+### Runtime Customization
+
 Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other arguments borrowed from the lower-level APIs. For example:
 
 
@@ -61,7 +64,6 @@ from tensorrt_llm.hlapi import LLM, KvCacheConfig
 
 llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(
-            max_new_tokens=128,
             free_gpu_memory_fraction=0.8))
 ```
 
@@ -85,6 +87,7 @@ for output in llm.generate([32, 12]):
 ```
 
 ### Disable Tokenizer
+
 For performance considerations, you can disable the tokenizer by passing `skip_tokenizer_init=True` when creating `LLM`. In this case, `LLM.generate` and `LLM.generate_async` will expect prompt token ids as input. For example:
 
 ```python
@@ -100,10 +103,10 @@ RequestOutput(request_id=1, prompt=None, prompt_token_ids=[1, 15043, 29892, 590,
 
 Note that the `text` field in `CompletionOutput` is empty since the tokenizer is deactivated.
 
-
 ## Generation
 
-### `asyncio`-based generation
+### Asyncio-Based Generation
+
 With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:
 
 ```python
@@ -115,7 +118,8 @@ async for output in llm.generate_async(<prompt>, streaming=True):
 
 When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields the token results as soon as they are available. Otherwise, it will return a generator that yields the final results only.
 
-### Future-style generation
+### Future-Style Generation
+
 The result of the `generate_async` method is a Future-like object, it doesn't block the thread unless the `.result()` is called.
 
 ```python

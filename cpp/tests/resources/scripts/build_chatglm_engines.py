@@ -97,7 +97,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
                             isdir=True,
                             cwd=model_dir)
                 else:
-                    run_command(["rsync", "-av",
+                    run_command(["rsync", "-rlptD",
                                  str(model_cache_dir), "."],
                                 cwd=model_dir)
             else:

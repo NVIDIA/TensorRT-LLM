@@ -53,7 +53,7 @@ def enqueue_requests(args: argparse.Namespace,
     for iter_id in range(args.batch_size):
         # Create the request.
         request = trtllm.Request(input_token_ids=prompt,
-                                 max_new_tokens=25,
+                                 max_tokens=25,
                                  end_id=tokenizer.eos_token_id,
                                  sampling_config=sampling_config,
                                  client_id=iter_id % 2)

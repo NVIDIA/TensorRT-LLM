@@ -77,10 +77,11 @@ def build_engines(model_cache: str, has_tllm_checkpoint: bool):
                         isdir=True,
                         cwd=models_dir)
         else:
-            run_command(
-                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
+            run_command(["rsync", "-rlptD",
+                         str(model_cache_dir), "."],
+                        cwd=models_dir)
             if has_tllm_checkpoint:
-                run_command(["rsync", "-av",
+                run_command(["rsync", "-rlptD",
                              str(base_model_cache_dir), "."],
                             cwd=models_dir)
 

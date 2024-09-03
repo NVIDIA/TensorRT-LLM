@@ -311,6 +311,7 @@ private:
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::layers::ExplicitDraftTokensLayer<typename T::LayerType>> mExplicitDraftTokensLayer;
+    std::shared_ptr<runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
     ExplicitDraftTokensDummyNetwork mNetwork;
 

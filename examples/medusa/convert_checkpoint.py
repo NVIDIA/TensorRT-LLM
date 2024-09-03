@@ -22,7 +22,9 @@ import tensorrt_llm
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
-from tensorrt_llm.models.convert_utils import load_calib_dataset
+from tensorrt_llm.models.convert_utils import (dup_kv_weight,
+                                               load_calib_dataset,
+                                               split_matrix_tp, split_qkv_tp)
 from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
 from tensorrt_llm.models.medusa.weight import (get_tllm_linear_weight,
                                                load_medusa_hf)
@@ -510,39 +512,6 @@ def capture_activation_range(model,
     return act_scales
 
 
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-
-def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV matrix according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.contiguous()
-
-
-def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV bias according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
 def get_weight(config, prefix, dtype):
     if config[prefix + '.weight'].dtype != dtype:
         config[prefix + '.weight'].data = config[prefix + '.weight'].to(dtype)
@@ -557,16 +526,6 @@ def get_bias(config, prefix, dtype):
 
 def get_weight_and_bias(config, prefix, dtype):
     return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
-
-
-def dup_kv_weight(v, num_head, tp_size):
-    assert tp_size % num_head == 0
-    reps = tp_size // num_head
-    head_size = v.shape[0] // num_head
-    v = v.reshape(num_head, head_size,
-                  -1)[:, None, :, :].expand(num_head, reps, head_size,
-                                            v.shape[1])
-    return v.reshape(num_head * reps * head_size, -1).clone().detach()
 
 
 def get_tllm_linear_sq_weight(vals,

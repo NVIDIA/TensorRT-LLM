@@ -265,7 +265,7 @@ def build_command(
               quant_config=quant_config)
     # Save the engine.
     llm.save(engine_dir)
-    llm.shutdown()
+    llm._shutdown()
     logger.set_level("info")
     logger.info(
         "\n\n===========================================================\n"

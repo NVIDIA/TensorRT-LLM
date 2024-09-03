@@ -6,53 +6,52 @@ This is the starting point to try out TensorRT-LLM. Specifically, this Quick Sta
 
 ## Prerequisites
 
-The steps below use the Llama 2 model, which is subject to a particular [license](https://llama.meta.com/llama-downloads/). To download the necessary model files, agree to the terms and [authenticate with Hugging Face](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf?clone=true).
+- This quick start uses the Meta Llama 3.1 model. This model is subject to a particular [license](https://llama.meta.com/llama-downloads/). To download the model files, agree to the terms and [authenticate with Hugging Face](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct?clone=true).
 
-## Launch the Docker
+- Complete the [installation](./installation/linux.md) steps.
 
-Please be sure to complete the [installation](./installation/linux.md) steps before proceeding with the following steps.
+- Pull the weights and tokenizer files for the chat-tuned variant of the Llama 3.1 8B model from the [Hugging Face Hub](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct).
 
-## Retrieve the Model Weights
-
-Pull the weights and tokenizer files for the chat-tuned variant of the 7B parameter Llama 2 model from the [Hugging Face Hub](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf).
-
-```bash
-git clone https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
-```
+  ```console
+  git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct
+  ```
 
 (quick-start-guide-compile)=
 ## Compile the Model into a TensorRT Engine
 
-Use the included [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama). This is a minimal example that includes some of the optimizations available in TensorRT-LLM.
+Use the [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) from the `examples/llama` directory of the GitHub repository.
+The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.
 
-```bash
-# Launch the Tensorrt-LLM container
+```console
+# From the root of the cloned repository, start the TensorRT-LLM container
 make -C docker release_run LOCAL_USER=1
 
 # Log in to huggingface-cli
 # You can get your token from huggingface.co/settings/token
 huggingface-cli login --token *****
 
-# Convert the model into TensorrtLLM checkpoint format
+# Convert the model into TensorRT-LLM checkpoint format
 cd exammples/llama
-python3 convert_checkpoint.py --model_dir meta-llama/Llama-2-7b-chat-hf --output_dir llama-2-7b-ckpt
+pip install -r requirements.txt
+pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.
+python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt
 
 # Compile model
-trtllm-build --checkpoint_dir llama-2-7b-ckpt \
+trtllm-build --checkpoint_dir llama-3.1-8b-ckpt \
     --gemm_plugin float16 \
-    --output_dir ./llama-2-7b-engine
+    --output_dir ./llama-3.1-8b-engine
 ```
 
-When you created the model definition with the TensorRT-LLM API, you built a graph of operations from [NVIDIA TensorRT](https://developer.nvidia.com/tensorrt) primitives that formed the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.
+When you create a model definition with the TensorRT-LLM API, you build a graph of operations from [NVIDIA TensorRT](https://developer.nvidia.com/tensorrt) primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.
 
 In this example, we included the `gpt_attention` plugin, which implements a FlashAttention-like fused attention kernel, and the `gemm` plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the [Llama example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) and {ref}`precision` section.
 
 ## Run the Model
 
-Now that you’ve got your model engine, its time to run it.
+Now that you have the model engine, run the engine and perform inference.
 
-```bash
-python3 ../run.py --engine_dir ./llama-2-7b-engine  --max_output_len 100 --tokenizer_dir meta-llama/Llama-2-7b-chat-hf --input_text "How do I count to nine in French?"
+```console
+python3 ../run.py --engine_dir ./llama-3.1-8b-engine  --max_output_len 100 --tokenizer_dir Meta-Llama-3.1-8B-Instruct --input_text "How do I count to nine in French?"
 ```
 
 ## Deploy with Triton Inference Server
@@ -73,7 +72,7 @@ To create a production-ready deployment of your LLM, use the [Triton Inference S
 
 2. Copy the model you compiled ({ref}`quick-start-guide-compile`) to the example model repository.
 
-3. Modify the configuration files from the model repository. Specify, where the compiled model engine is, what tokenizer to use, and how to handle memory allocation for the KV cache when performing inference in batches.
+3. Modify the configuration files from the model repository. Specify the path to the compiled model engine, the tokenizer, and how to handle memory allocation for the KV cache when performing inference in batches.
 
     ```bash
     python3 tools/fill_template.py --in_place \
@@ -84,14 +83,14 @@ To create a production-ready deployment of your LLM, use the [Triton Inference S
 
     python tools/fill_template.py --in_place \
         all_models/inflight_batcher_llm/preprocessing/config.pbtxt \
-        tokenizer_type:llama,tokenizer_dir:meta-llama/Llama-2-7b-chat-hf
+        tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
 
     python tools/fill_template.py --in_place \
         all_models/inflight_batcher_llm/postprocessing/config.pbtxt \
-        tokenizer_type:llama,tokenizer_dir:meta-llama/Llama-2-7b-chat-hf
+        tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
     ```
 
-4. Start the Docker container and launch the Triton Inference server. Specify `world size`, which is the number of GPUs the model was built for, and point to the `model_repo` that was just set up.
+4. Start Triton Inference Server in the container. Specify `world_size`, which is the number of GPUs the model was built for, and point to the `model_repo` that was just set up.
 
     ```bash
     docker run -it --rm --gpus all --network host --shm-size=1g \
@@ -125,11 +124,11 @@ curl -X POST localhost:8000/v2/models/ensemble/generate -d \
 }'
 ```
 
-## High Level API
+## LLM API
 We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
 Here we show you a preview of how it works and how to use it.
 
-Note that the APIs are not stable and only support the [few models](https://nvidia.github.io/TensorRT-LLM/high-level-api-examples/introduction.html#hlapi-supported-model). We appreciate your patience and understanding as we improve this API.
+Note that the APIs are not stable and only support the [few models](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/index.html#supported-model). We appreciate your patience and understanding as we improve this API.
 
 Here is a simple example to show how to use the HLAPI with TinyLlama.
 ```{eval-rst}
@@ -152,6 +151,7 @@ For more examples, refer to:
 
 - [examples/](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for showcases of how to run a quick benchmark on latest LLMs.
 
-## Links
- - [Best Practices Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md)
- - [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
+## Related Information
+
+- [Best Practices Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md)
+- [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)

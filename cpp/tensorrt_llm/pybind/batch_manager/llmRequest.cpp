@@ -73,13 +73,16 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto loraWeights = from_torch(mLoraWeights);
     auto loraConfig = from_torch(mLoraConfig);
     auto draftLogits = from_torch(mDraftLogits);
+    auto encoderInputFeatures = from_torch(mEncoderInputFeatures);
 
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
-        embeddingBias, badWordsList, stopWordsList, promptEmbeddingTable, mPromptVocabSize, mLoraTaskId, loraWeights,
-        loraConfig, mLookaheadConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits, mDraftTokens,
-        draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched,
-        mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority);
+        embeddingBias, badWordsList, stopWordsList, mPositionIds, promptEmbeddingTable, mPromptVocabSize, mLoraTaskId,
+        loraWeights, loraConfig, mLookaheadConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits,
+        mDraftTokens, draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor),
+        mApplyLogitsPostProcessorBatched, mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority,
+        encoderInputFeatures, mEncoderOutputLength, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+        mInputTokenExtraIds);
 }
 
 void LlmRequest::initBindings(py::module_& m)
@@ -88,25 +91,29 @@ void LlmRequest::initBindings(py::module_& m)
         .def(py::init<LlmRequest::RequestIdType, LlmRequest::SizeType32, LlmRequest::VecTokens, tr::SamplingConfig,
                  bool, std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::SizeType32>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
+                 std::optional<LlmRequest::TensorPtr>, std::optional<std::vector<LlmRequest::SizeType32>>,
+                 std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::SizeType32>, std::optional<uint64_t>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::SizeType32>, std::optional<uint64_t>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::TensorPtr>, std::optional<executor::LookaheadDecodingConfig>, bool, bool,
-                 bool, std::optional<LlmRequest::VecTokens>, std::optional<LlmRequest::TensorPtr>, bool,
+                 std::optional<executor::LookaheadDecodingConfig>, bool, bool, bool,
+                 std::optional<LlmRequest::VecTokens>, std::optional<LlmRequest::TensorPtr>, bool,
                  std::optional<LlmRequest::LogitsPostProcessor>, bool, std::optional<LlmRequest::VecTokens>, bool,
-                 std::optional<RequestIdType>, executor::PriorityType>(),
+                 std::optional<RequestIdType>, executor::PriorityType, std::optional<LlmRequest::TensorPtr>,
+                 std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::VecTokenExtraIds>>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
-            py::arg("stop_words_list") = std::nullopt, py::arg("prompt_embedding_table") = std::nullopt,
-            py::arg("prompt_vocab_size") = std::nullopt, py::arg("lora_task_id") = std::nullopt,
-            py::arg("lora_weights") = std::nullopt, py::arg("lora_config") = std::nullopt,
-            py::arg("lookahead_config") = std::nullopt, py::arg("return_log_probs") = false,
-            py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
-            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt,
-            py::arg("exclude_input_from_output") = false, py::arg("logits_post_processor") = std::nullopt,
-            py::arg("apply_logits_post_processor_batched") = false, py::arg("encoder_input_tokens") = std::nullopt,
-            py::arg("return_encoder_output") = false, py::arg("client_id") = std::nullopt,
-            py::arg("priority") = executor::Request::kDefaultPriority)
+            py::arg("stop_words_list") = std::nullopt, py::arg("position_ids") = std::nullopt,
+            py::arg("prompt_embedding_table") = std::nullopt, py::arg("prompt_vocab_size") = std::nullopt,
+            py::arg("lora_task_id") = std::nullopt, py::arg("lora_weights") = std::nullopt,
+            py::arg("lora_config") = std::nullopt, py::arg("lookahead_config") = std::nullopt,
+            py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
+            py::arg("return_generation_logits") = false, py::arg("draft_tokens") = std::nullopt,
+            py::arg("draft_logits") = std::nullopt, py::arg("exclude_input_from_output") = false,
+            py::arg("logits_post_processor") = std::nullopt, py::arg("apply_logits_post_processor_batched") = false,
+            py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
+            py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority,
+            py::arg("encoder_input_features") = std::nullopt, py::arg("encoder_output_length") = std::nullopt,
+            py::arg("input_token_extra_ids") = std::nullopt)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
         .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))
@@ -128,6 +135,9 @@ void LlmRequest::initBindings(py::module_& m)
         .def_property_readonly("embedding_bias", &LlmRequest::getEmbeddingBias)
         .def_property_readonly("bad_words_list", &LlmRequest::getBadWordsList)
         .def_property_readonly("stop_words_list", &LlmRequest::getStopWordsList)
+        .def_property_readonly("position_ids",
+            [](LlmRequest& self)
+            { return *self.getPositionIds().value_or(std::make_shared<std::vector<SizeType32>>()); })
         .def_property_readonly(
             "context_current_position", py::overload_cast<>(&LlmRequest::getContextCurrentPosition, py::const_))
         .def_property("context_chunk_size", &LlmRequest::getContextChunkSize, &LlmRequest::setContextChunkSize)

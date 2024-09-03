@@ -31,6 +31,10 @@ class BufferManagerTest;
 
 namespace tensorrt_llm::runtime
 {
+
+/// @brief Forward declaration as only used through pointer.
+class CudaMemPool;
+
 //! \brief A helper class for managing memory on host and device.
 class BufferManager
 {
@@ -40,6 +44,7 @@ public:
     using ITensorPtr = ITensor::UniquePtr;
 
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
+    using CudaMemPoolPtr = std::shared_ptr<CudaMemPool>;
 
     //! \brief Construct a BufferManager.
     //!
@@ -194,20 +199,8 @@ public:
 private:
     friend class ::BufferManagerTest;
 
-    void static initMemoryPool(int device);
-
-    std::size_t static memoryPoolReserved(int device);
-
-    std::size_t static memoryPoolUsed(int device);
-
-    std::size_t static memoryPoolFree(int device)
-    {
-        return memoryPoolReserved(device) - memoryPoolUsed(device);
-    }
-
-    void static memoryPoolTrimTo(int device, std::size_t size);
-
     CudaStreamPtr mStream;
+    CudaMemPoolPtr mPool;
     bool const mTrimPool;
 };
 

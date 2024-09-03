@@ -5,7 +5,51 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
-## TensorRT-LLM Release Next
+## TensorRT-LLM Release 0.12.0
+
+### Key Features and Enhancements
+  - Supported LoRA for MoE models.
+  - The `ModelWeightsLoader` is enabled for LLaMA family models (experimental), see `docs/source/architecture/model-weights-loader.md`.
+  - Supported FP8 FMHA for NVIDIA Ada Lovelace Architecture.
+  - Supported GPT-J, Phi, Phi-3, Qwen, GPT, GLM, Baichuan, Falcon and Gemma models for the `LLM` class.
+  - Supported FP8 OOTB MoE.
+  - Supported Starcoder2 SmoothQuant. (#1886)
+  - Supported ReDrafter Speculative Decoding, see “ReDrafter” section in `docs/source/speculative_decoding.md`.
+  - Supported padding removal for BERT, thanks to the contribution from @Altair-Alpha in #1834.
+  - Added in-flight batching support for GLM 10B model.
+  - Supported `gelu_pytorch_tanh` activation function, thanks to the contribution from @ttim in #1897.
+  - Added `chunk_length` parameter to Whisper, thanks to the contribution from @MahmoudAshraf97 in #1909.
+  - Added `concurrency` argument for `gptManagerBenchmark`.
+  - Executor API supports requests with different beam widths, see `docs/source/executor.md#sending-requests-with-different-beam-widths`.
+  - Added the flag `--fast_build` to `trtllm-build` command (experimental).
+
+### API Changes
+  - [BREAKING CHANGE] `max_output_len` is removed from `trtllm-build` command, if you want to limit sequence length on engine build stage, specify `max_seq_len`.
+  - [BREAKING CHANGE] The `use_custom_all_reduce` argument is removed from `trtllm-build`.
+  - [BREAKING CHANGE] The `multi_block_mode` argument is moved from build stage (`trtllm-build` and builder API) to the runtime.
+  - [BREAKING CHANGE] The build time argument `context_fmha_fp32_acc` is moved to runtime for decoder models.
+  - [BREAKING CHANGE] The arguments `tp_size`, `pp_size` and `cp_size` is removed from `trtllm-build` command.
+  - The C++ batch manager API is deprecated in favor of the C++ `executor` API, and it will be removed in a future release of TensorRT-LLM.
+  - Added a version API to the C++ library, a `cpp/include/tensorrt_llm/executor/version.h` file is going to be generated.
+
+### Model Updates
+  - Supported LLaMA 3.1 model.
+  - Supported Mamba-2 model.
+  - Supported EXAONE model, see `examples/exaone/README.md`.
+  - Supported Qwen 2 model.
+  - Supported GLM4 models, see `examples/chatglm/README.md`.
+  - Added LLaVa-1.6 (LLaVa-NeXT) multimodal support, see “LLaVA, LLaVa-NeXT and VILA” section in `examples/multimodal/README.md`.
+
+### Fixed Issues
+  - Fixed wrong pad token for the CodeQwen models. (#1953)
+  - Fixed typo in `cluster_infos` defined in `tensorrt_llm/auto_parallel/cluster_info.py`, thanks to the contribution from @saeyoonoh in #1987.
+  - Removed duplicated flags in the command at `docs/source/reference/troubleshooting.md`, thanks for the contribution from @hattizai in #1937.
+  - Fixed segmentation fault in TopP sampling layer, thanks to the contribution from @akhoroshev in #2039. (#2040)
+  - Fixed the failure when converting the checkpoint for Mistral Nemo model. (#1985)
+  - Propagated `exclude_modules` to weight-only quantization, thanks to the contribution from @fjosw in #2056.
+  - Fixed wrong links in README, thanks to the contribution from @Tayef-Shah in #2028.
+  - Fixed some typos in the documentation, thanks to the contribution from @lfz941 in #1939.
+  - Fixed the engine build failure when deduced `max_seq_len` is not an integer. (#2018)
 
 ### Infrastructure Changes
   - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.07-py3`.

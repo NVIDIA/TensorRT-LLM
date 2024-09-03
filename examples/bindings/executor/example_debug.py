@@ -32,7 +32,7 @@ if __name__ == "__main__":
 
     if executor.can_enqueue_requests():
         # Create the request.
-        request = trtllm.Request(input_token_ids=[1, 2, 3, 4], max_new_tokens=2)
+        request = trtllm.Request(input_token_ids=[1, 2, 3, 4], max_tokens=2)
 
         # Enqueue the request.
         request_id = executor.enqueue_request(request)

@@ -70,16 +70,14 @@ def main(model: str, tokenizer: str, tp_size: int):
         free_gpu_memory_fraction=0.8)
     kv_cache_config.enable_block_reuse = True
 
-    build_config = BuildConfig()
-    build_config.max_batch_size = 1
-    build_config.max_input_len = 6000
-    build_config.max_num_tokens = 10240
+    build_config = BuildConfig(max_batch_size=1,
+                               max_input_len=6000,
+                               max_num_tokens=10240)
 
-    sampling_params = SamplingParams()
-    sampling_params.beam_width = 1
-    sampling_params.max_new_tokens = 100
-    sampling_params.temperature = 0.5
-    sampling_params.top_p = 0.95
+    sampling_params = SamplingParams(beam_width=1,
+                                     max_tokens=100,
+                                     temperature=0.5,
+                                     top_p=0.95)
 
     llm = LLM(model,
               tokenizer,

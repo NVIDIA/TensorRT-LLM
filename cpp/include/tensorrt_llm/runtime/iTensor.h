@@ -403,12 +403,12 @@ public:
         return lhs.nbDims == count && std::equal(lhs.d, lhs.d + lhs.nbDims, dims);
     }
 
-    bool shapeEquals(Shape const& other) const
+    [[nodiscard]] bool shapeEquals(Shape const& other) const
     {
         return shapeEquals(getShape(), other);
     }
 
-    bool shapeEquals(std::initializer_list<SizeType32> const& other) const
+    [[nodiscard]] bool shapeEquals(std::initializer_list<SizeType32> const& other) const
     {
         return shapeEquals(getShape(), other.begin(), other.size());
     }

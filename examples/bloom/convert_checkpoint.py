@@ -20,7 +20,7 @@ from transformers.pytorch_utils import Conv1D
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
-from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict, load_calib_dataset
+from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict, load_calib_dataset, split_matrix_tp, get_weight_and_bias, split
 # isort: on
 
 
@@ -378,15 +378,6 @@ def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
     }
 
 
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].clone()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].clone()
-
-
 def reorder_qkv_weight_or_bias(v, n_head, n_hidden, is_bias=False):
     """ Reorder the qkv weight.
 
@@ -431,22 +422,6 @@ def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
     split_v = split(v, tensor_parallel, rank, dim=1)
     split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
     return split_v.contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
-def get_weight(config, prefix, dtype):
-    return config[prefix + '.weight'].to(dtype).detach()
-
-
-def get_bias(config, prefix, dtype):
-    return config[prefix + '.bias'].to(dtype).detach()
-
-
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
 
 
 def get_tllm_linear_weight(weight,

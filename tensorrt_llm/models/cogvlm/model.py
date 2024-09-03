@@ -14,9 +14,12 @@
 # limitations under the License.
 from typing import Optional
 
+import numpy as np
+
+from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import (Tensor, concat, maximum, minimum, recv, send, shape,
-                           slice)
+from ...functional import (Tensor, concat, constant, expand, op_and, recv, send,
+                           shape, slice, unsqueeze, where)
 from ...layers import (AttentionMaskType, CogVLMAttention, ColumnLinear,
                        Embedding, GatedMLP, PromptTuningEmbedding, RmsNorm)
 from ...mapping import Mapping
@@ -57,14 +60,10 @@ class CogvlmDecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank,
-            vision_start=config.vision_start,
-            vision_length=config.vision_length,
             quant_mode=config.quant_mode)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
-        self.vision_start = config.vision_start
-        self.vision_length = config.vision_length
         self.hidden_size = config.hidden_size
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
                             ffn_hidden_size=mlp_hidden_size,
@@ -86,20 +85,26 @@ class CogvlmDecoderLayer(Module):
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
 
-    def forward(self,
-                hidden_states,
-                attention_mask=None,
-                use_cache=False,
-                kv_cache_params=None,
-                attention_params=None,
-                lora_layer_params=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        use_cache=False,
+        kv_cache_params=None,
+        attention_params=None,
+        lora_layer_params=None,
+        vision_token_mask=None,
+        position_ids=None,
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(hidden_states,
                                           use_cache=use_cache,
                                           kv_cache_params=kv_cache_params,
-                                          attention_params=attention_params)
+                                          attention_params=attention_params,
+                                          vision_token_mask=vision_token_mask,
+                                          position_embedding=position_ids)
 
         if use_cache:
             attention_output, presents = attention_output
@@ -109,24 +114,10 @@ class CogvlmDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
 
-        bs = shape(hidden_states, 0)
-        seq_length = shape(hidden_states, 1)
-        bos = slice(hidden_states, [0, 0, 0],
-                    concat([bs, self.vision_start, self.hidden_size]))
-        vis_seq_length = minimum(self.vision_length + 1, seq_length - 1)
-        vision_hidden_states = slice(
-            hidden_states, [0, self.vision_start, 0],
-            concat([bs, vis_seq_length, self.hidden_size]))
-        text_seq_length = maximum(
-            0, seq_length - (self.vision_length + 1 + self.vision_start))
-        language_hidden_states = slice(
-            hidden_states, [0, self.vision_length + 1 + self.vision_start, 0],
-            concat([bs, text_seq_length, self.hidden_size]))
-
-        bos_qkv = self.mlp(bos)
-        language_qkv = self.mlp(language_hidden_states)
-        vision_qkv = self.vis_mlp(vision_hidden_states)
-        hidden_states = concat([bos_qkv, vision_qkv, language_qkv], dim=1)
+        vision_mlp_out = self.vis_mlp(hidden_states)
+        language_mlp_out = self.mlp(hidden_states)
+        hidden_states = where(vision_token_mask, vision_mlp_out,
+                              language_mlp_out)
 
         # hidden_states = self.mlp(hidden_states,
         #                          lora_layer_params=lora_layer_params)
@@ -144,6 +135,7 @@ class CogvlmModel(Module):
 
         self.mapping = config.mapping
         self.use_prompt_tuning = config.use_prompt_tuning
+        self.vocab_size = config.vocab_size
         EmbeddingCls = PromptTuningEmbedding if config.use_prompt_tuning else Embedding
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = EmbeddingCls(
@@ -192,12 +184,45 @@ class CogvlmModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
+        vision_mask = input_ids > (self.vocab_size - 1)
+
+        if default_net().plugin_config.remove_input_padding:
+            seq_length = shape(vision_mask, 0)  # lvvvvvvllvvvvlll
+            zero = constant(np.ascontiguousarray(np.zeros([1], dtype=bool)))
+            one = constant(np.ascontiguousarray(np.ones([1], dtype=bool)))
+
+            t1 = slice(vision_mask, [0], seq_length - 1)
+            t2 = slice(vision_mask, [1], seq_length - 1)
+            vision_token_mask = concat([op_and(t1 == one, t2 == one),
+                                        zero])  # 0111110001110000
+            vision_token_mask = unsqueeze(vision_token_mask,
+                                          -1)  # [num_tokens, 1]
+        else:
+            seq_length = shape(vision_mask,
+                               1)  # lvvvvvvllvvvvlll, lvvvvvvllvvvvlll
+            batch_size = shape(vision_mask, 0)
+            t1 = slice(vision_mask, [0, 0], concat([batch_size,
+                                                    seq_length - 1]))
+            t2 = slice(vision_mask, [0, 1], concat([batch_size,
+                                                    seq_length - 1]))
+            zero = expand(
+                constant(np.ascontiguousarray(np.zeros([1, 1], dtype=bool))),
+                concat([batch_size, 1]))
+            one = constant(np.ascontiguousarray(np.ones([1, 1], dtype=bool)))
+
+            vision_token_mask = concat([op_and(t1 == one, t2 == one), zero],
+                                       dim=1)  # 0111110001110000 [bs, seqlen]
+            vision_token_mask = unsqueeze(vision_token_mask,
+                                          -1)  # [bs, seqlen, 1]
+
         hidden_states = self.layers.forward(hidden_states,
                                             use_cache=use_cache,
                                             attention_mask=attention_mask,
                                             kv_cache_params=kv_cache_params,
                                             attention_params=attention_params,
-                                            lora_params=lora_params)
+                                            lora_params=lora_params,
+                                            vision_token_mask=vision_token_mask,
+                                            position_ids=position_ids)
 
         if use_cache:
             hidden_states, presents = hidden_states

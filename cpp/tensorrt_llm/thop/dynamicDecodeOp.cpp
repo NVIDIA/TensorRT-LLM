@@ -55,6 +55,8 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const maxBatchSize, size_t const maxB
     mDynamicDecodeLayer
         = std::make_shared<tl::DynamicDecodeLayer<T>>(tle::DecodingMode::Auto(), decodingDomain, bufferManager);
     mBatchSlots = tr::getDefaultBatchSlots(maxBatchSize, *bufferManager);
+    mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(bufferManager, decodingDomain,
+        tensorrt_llm::runtime::TRTDataType<T>::value, mDynamicDecodeLayer->getWorkspaceSize());
 }
 
 namespace
@@ -169,7 +171,8 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
 
     setupParams->penaltyParams = penaltyParams;
     setupParams->banWordsParams = banWordsParams;
-    mDynamicDecodeLayer->setup(batch_size, beam_width, tr::ITensor::slice(mBatchSlots, 0, batch_size), setupParams);
+    mDynamicDecodeLayer->setup(
+        batch_size, beam_width, tr::ITensor::slice(mBatchSlots, 0, batch_size), setupParams, mDecodingWorkspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -274,7 +277,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
         }
     }
 
-    mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams);
+    mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams, mDecodingWorkspace);
 
     if (finishedSumHost)
     {

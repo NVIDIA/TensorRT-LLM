@@ -78,10 +78,12 @@ def build_engines(model_cache: str):
                     isdir=True,
                     cwd=models_dir)
         else:
-            run_command(
-                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
-            run_command(
-                ["rsync", "-av", str(medusa_cache_dir), "."], cwd=models_dir)
+            run_command(["rsync", "-rlptD",
+                         str(model_cache_dir), "."],
+                        cwd=models_dir)
+            run_command(["rsync", "-rlptD",
+                         str(medusa_cache_dir), "."],
+                        cwd=models_dir)
 
     model_dir = models_dir / model_name
     medusa_dir = models_dir / medusa_name

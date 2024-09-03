@@ -22,7 +22,6 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 
 namespace tensorrt_llm::layers
 {
@@ -40,20 +39,17 @@ public:
     PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
         std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
-
-    T* getRuntimeLogitsDevice()
-    {
-        return tensorrt_llm::runtime::bufferCast<T>(*mRuntimeLogitsDevice);
-    }
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     //! @returns workspace needed for this layer in bytes
-    [[nodiscard]] size_t getWorkspaceSize() const noexcept;
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 private:
     void initialize();
@@ -65,12 +61,12 @@ private:
 
     executor::DecodingMode mDecodingMode;
 
+    size_t mWorkspaceSize{};
     TensorPtr mTemperatureDevice;
     TensorPtr mRepetitionPenaltyDevice;
     TensorPtr mPresencePenaltyDevice;
     TensorPtr mFrequencyPenaltyDevice;
     TensorPtr mMinLengthDevice;
-    TensorPtr mRuntimeLogitsDevice;
 
     TensorPtr mTemperature;
     TensorPtr mRepetitionPenalty;
@@ -91,7 +87,6 @@ private:
     BufferPtr mPenaltyWorkspaceDevice;
     BufferPtr mPenaltyWorkspacePrevDevice;
     TensorPtr mLogitsPtrsHost;
-    TensorPtr mLogitsPtrsDevice;
 };
 
 } // namespace tensorrt_llm::layers

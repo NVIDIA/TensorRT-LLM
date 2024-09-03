@@ -123,7 +123,7 @@ def build_engines(model_cache: Optional[str] = None,
                     cwd=hf_dir)
         else:
             run_command([
-                "rsync", "-av",
+                "rsync", "-rlptD",
                 str(Path(model_cache) / model_name / model_file_name), "."
             ],
                         cwd=hf_dir)

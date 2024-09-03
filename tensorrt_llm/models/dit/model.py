@@ -135,7 +135,7 @@ class DiTBlock(Module):
                                   dtype=dtype)
         self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = MLP(hidden_size=hidden_size,
-                       ffn_hidden_size=hidden_size * mlp_ratio,
+                       ffn_hidden_size=int(hidden_size * mlp_ratio),
                        hidden_act='gelu',
                        tp_group=mapping.tp_group,
                        tp_size=mapping.tp_size,
@@ -342,7 +342,7 @@ class DiT(PretrainedModel):
             current_all_reduce_helper().set_workspace_tensor(mapping, 1)
 
         def dit_default_range(max_batch_size):
-            return [2, (max_batch_size + 1) // 2, max_batch_size]
+            return [2, max(2, (max_batch_size + 1) // 2), max_batch_size]
 
         default_range = dit_default_range
         if self.cfg_scale is not None:
