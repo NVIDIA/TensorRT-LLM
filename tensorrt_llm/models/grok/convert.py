@@ -26,16 +26,8 @@ from ..._utils import pad_vocab_size, release_gc
 from ...layers import MoeConfig
 from ...logger import logger
 from ...quantization import QuantAlgo
+from ..convert_utils import split
 from ..modeling_utils import PretrainedConfig, QuantConfig, optimize_model
-
-
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
 
 def get_jax_weight(config, prefix, dtype, postfix='.weight', key_name='scale'):

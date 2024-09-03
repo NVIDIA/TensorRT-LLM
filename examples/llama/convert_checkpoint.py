@@ -134,6 +134,10 @@ def parse_arguments():
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .safetensors format')
+    parser.add_argument("--use_fp8",
+                        action="store_true",
+                        default=False,
+                        help="Enable FP8 per-tensor quantization")
     parser.add_argument("--use_fp8_rowwise",
                         action="store_true",
                         default=False,
@@ -246,6 +250,8 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
             quant_config.quant_algo = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
             quant_config.quant_algo = QuantAlgo.W4A16
+    elif args.use_fp8:
+        quant_config.quant_algo = QuantAlgo.FP8
     elif args.smoothquant:
         quant_config.smoothquant_val = args.smoothquant
         if args.per_channel:

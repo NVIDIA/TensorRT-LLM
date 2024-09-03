@@ -298,6 +298,15 @@ inline int getDeviceCount()
     return count;
 }
 
+/// @brief Identifies the memory type of the given pointer.
+template <typename T>
+cudaMemoryType getPtrCudaMemoryType(T* ptr)
+{
+    cudaPointerAttributes attributes{};
+    check_cuda_error(cudaPointerGetAttributes(&attributes, ptr));
+    return attributes.type;
+}
+
 /// Get the memory info
 /// \return The free and total amount of memory in bytes
 inline std::tuple<size_t, size_t> getDeviceMemoryInfo(bool const useUvm)

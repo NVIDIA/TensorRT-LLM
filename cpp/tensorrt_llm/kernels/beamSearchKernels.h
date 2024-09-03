@@ -37,51 +37,51 @@ struct BeamHypotheses
     // Candidate-Beam-Array (CBA): The arrays to place the candidate beams and related information
 
     // Scalar values
-    bool bReturnNormedScore{false};     // return normed_score / cum_log_probs, useless yet
-    int nMaxBatchSize{0};               // max batch size by model configuration
-    int nBatchSize{0};                  // batch size by runtime input data
+    bool bReturnNormedScore{false};     // return `normedScore` or `cumLogProbs`, always be `false` now
+    int nMaxBatchSize{0};               // buildtime max batch size
+    int nBatchSize{0};                  // runtime batch size
     int nBeamWidth{0};                  //
     int nMaxSeqLen{0};                  //
     int nVocabSize{0};                  // vocab_size_padded
 
     // Pointers from SamplingConfig
-    float const* diversityRates{nullptr};   // [BS]
-    float const* lengthPenalties{nullptr};  // [BS]
-    int const* earlyStoppings{nullptr};     // [BS]
+    float const* diversityRates{nullptr};           // [BS]
+    float const* lengthPenalties{nullptr};          // [BS]
+    int const* earlyStoppings{nullptr};             // [BS]
 
     // Pointers from input
-    int const* inputLengths{nullptr};   // [BS, BM]         %% context_length
-    int const* endIds{nullptr};         // [BS, BM]         %% self.end_ids
+    int const* inputLengths{nullptr};               // [BS, BM]         %% context_length
+    int const* endIds{nullptr};                     // [BS, BM]         %% self.end_ids
     runtime::SizeType32 const* batchSlots{nullptr}; // [BS]
 
     // Pointers for output
-    int* outputIds{nullptr};            // [BS, BM, MSL]    %% self.output_ids                      only used in gather_tree
-    float* logProbs{nullptr};           // [BS, BM, MSL]    %% self.log_probs                       only used in gather_tree
-    float* logProbsTiled{nullptr};      // [MSL, MBS, BM]   %% self.log_probs_tiled
-    int* sequenceLengths{nullptr};      // [BS, BM]         %% self.sequence_length_buffer
-    float* cumLogProbs{nullptr};        // [BS, BM]         %% self.cum_log_probs
+    int* outputIds{nullptr};                        // [BS, BM, MSL]    %% self.output_ids                      only used in gather_tree
+    float* logProbs{nullptr};                       // [BS, BM, MSL]    %% self.log_probs                       only used in gather_tree
+    float* logProbsTiled{nullptr};                  // [MSL, MBS, BM]   %% self.log_probs_tiled
+    int* sequenceLengths{nullptr};                  // [BS, BM]         %% self.sequence_length_buffer
+    float* cumLogProbs{nullptr};                    // [BS, BM]         %% self.cum_log_probs
 
     // Pointers of CBA
-    int* outputIdsCBA{nullptr};         // [BS, BM*2, MSL]  %% self.beam_hyps_output_ids_cba
-    float* logProbsCBA{nullptr};        // [BS, BM*2, MSL]  %% self.beam_hyps_log_probs_cba
-    int* sequenceLengthsCBA{nullptr};   // [BS, BM*2]       %% self.beam_hyps_seq_len_cba
-    float* cumLogProbsCBA{nullptr};     // [BS, BM*2]       %% self.beam_hyps_cum_log_probs_cba
-    float* normedScoresCBA{nullptr};    // [BS, BM*2]       %% self.beam_hyps_normed_scores_cba
-    int* numBeamsCBA{nullptr};          // [BS]             %% self.beam_hyps_num_beams             number of beams in CBA
-    float* minNormedScoresCBA{nullptr}; // [BS]             %% self.beam_hyps_min_normed_scores     worst score in CBA
+    int* outputIdsCBA{nullptr};                     // [BS, BM*2, MSL]  %% self.beam_hyps_output_ids_cba
+    float* logProbsCBA{nullptr};                    // [BS, BM*2, MSL]  %% self.beam_hyps_log_probs_cba
+    int* sequenceLengthsCBA{nullptr};               // [BS, BM*2]       %% self.beam_hyps_seq_len_cba
+    float* cumLogProbsCBA{nullptr};                 // [BS, BM*2]       %% self.beam_hyps_cum_log_probs_cba
+    float* normedScoresCBA{nullptr};                // [BS, BM*2]       %% self.beam_hyps_normed_scores_cba
+    int* numBeamsCBA{nullptr};                      // [BS]             %% self.beam_hyps_num_beams             number of beams in CBA
+    float* minNormedScoresCBA{nullptr};             // [BS]             %% self.beam_hyps_min_normed_scores     worst score in CBA
 
     // Pointers related to beam search process, they are initialized in those two functions:
     // [gptDecoder.cpp] GptDecoder<T>::forward or [dynamicDecodeOp.cpp] FtDynamicDecode<T>::forward
-    bool* batchDones{nullptr};          // [BS]             %% self.beam_hyps_is_done   whether a whole batch is finished
-    FinishedState* finished{nullptr};   // [BS*BM]          %% self.finished            whether and how a beam is finished
+    bool* batchDones{nullptr};                      // [BS]             %% self.beam_hyps_is_done               whether a whole batch is finished
+    FinishedState* finished{nullptr};               // [BS*BM]          %% self.finished                        whether and how a beam is finished
 
     // Pointers for backtrack of the beams, they are relocated in [dynamicDecodeLayer.cpp] DynamicDecodeLayer<T>::prepareIdsPtrs
-    int** outputIdsPtr{nullptr};        // [BS][BM, MSL]        %% self.output_ids
-    int** parentIdsPtr{nullptr};        // [BS][BM, MSL]        %% self.parent_ids
+    int** outputIdsPtr{nullptr};                    // [BS][BM, MSL]    %% self.output_ids
+    int** parentIdsPtr{nullptr};                    // [BS][BM, MSL]    %% self.parent_ids
 
     // Pointers for gather_tree(), read the unfinished beams from them and write to CBA for the final selection
-    int const* outputIdsUnfinish{nullptr};  // [BS, BM, MSL]   %% self.output_ids
-    int const* parentIdsUnfinish{nullptr};  // [BS, BM, MSL]   %% self.parent_ids
+    int const* outputIdsUnfinish{nullptr};          // [BS, BM, MSL]   %% self.output_ids
+    int const* parentIdsUnfinish{nullptr};          // [BS, BM, MSL]   %% self.parent_ids
 
     // clang-format on
 };

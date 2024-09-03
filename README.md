@@ -8,7 +8,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.5.1-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-10.3.0-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-0.12.0.dev-green)](./tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-0.13.0.dev-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture/overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Results](./docs/source/performance/perf-overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)
@@ -17,11 +17,8 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2024/08/13] 🏎️SDXL with #TensorRT Model Optimizer ⏱️⚡ 🏁 cache diffusion 🏁 quantization aware training 🏁 QLoRA 🏁 #Python 3.12
+* [2024/08/20] 🏎️SDXL with #TensorRT Model Optimizer ⏱️⚡ 🏁 cache diffusion 🏁 quantization aware training 🏁 QLoRA 🏁 #Python 3.12
 [➡️ link](https://developer.nvidia.com/blog/nvidia-tensorrt-model-optimizer-v0-15-boosts-inference-performance-and-expands-model-support/)
-<div align="center">
-<img src="docs/source/media/picture-08-20-2024.jpeg" width="40%">
-<div align="left">
 
 * [2024/08/13] 🐍 DIY Code Completion with #Mamba ⚡ #TensorRT #LLM for speed 🤖 NIM for ease ☁️ deploy anywhere
 [➡️ link](https://developer.nvidia.com/blog/revolutionizing-code-completion-with-codestral-mamba-the-next-gen-coding-llm/)
@@ -90,40 +87,20 @@ Serverless TensorRT-LLM (LLaMA 3 8B) | Modal Docs [➡️ link](https://modal.co
 
 ## TensorRT-LLM Overview
 
-TensorRT-LLM is an easy-to-use Python API to define Large
-Language Models (LLMs) and build
-[TensorRT](https://developer.nvidia.com/tensorrt) engines that contain
-state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.
-TensorRT-LLM contains components to create Python and C++ runtimes that
-execute those TensorRT engines. It also includes a
-[backend](https://github.com/triton-inference-server/tensorrtllm_backend)
-for integration with the
-[NVIDIA Triton Inference Server](https://developer.nvidia.com/nvidia-triton-inference-server);
-a production-quality system to serve LLMs.  Models built with TensorRT-LLM can
-be executed on a wide range of configurations going from a single GPU to
-multiple nodes with multiple GPUs (using
-[Tensor Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#tensor-parallelism)
-and/or
-[Pipeline Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#pipeline-parallelism)).
+TensorRT-LLM is a library for optimizing Large Language Model (LLM) inference.
+It provides state-of-the-art optimziations, including custom attention kernels, inflight batching, paged KV caching, quantization (FP8, INT4 [AWQ](https://arxiv.org/abs/2306.00978), INT8 [SmoothQuant](https://arxiv.org/abs/2211.10438), ++) and much more, to perform inference efficiently on NVIDIA GPUs
 
-The TensorRT-LLM Python API architecture looks similar to the
-[PyTorch](https://pytorch.org) API. It provides a
-[functional](./tensorrt_llm/functional.py) module containing functions like
-`einsum`, `softmax`, `matmul` or `view`. The [layers](./tensorrt_llm/layers)
-module bundles useful building blocks to assemble LLMs; like an `Attention`
-block, a `MLP` or the entire `Transformer` layer. Model-specific components,
-like `GPTAttention` or `BertAttention`, can be found in the
-[models](./tensorrt_llm/models) module.
+TensorRT-LLM provides a Python API to build LLMs into optimized
+[TensorRT](https://developer.nvidia.com/tensorrt) engines.
+It contains runtimes in Python (bindings) and C++ to execute those TensorRT engines.
+It also includes a [backend](https://github.com/triton-inference-server/tensorrtllm_backend) for integration with the [NVIDIA Triton Inference Server](https://developer.nvidia.com/nvidia-triton-inference-server).
+Models built with TensorRT-LLM can be executed on a wide range of configurations from a single GPU to multiple nodes with multiple GPUs (using [Tensor Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#tensor-parallelism) and/or [Pipeline Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#pipeline-parallelism)).
 
 TensorRT-LLM comes with several popular models pre-defined. They can easily be
-modified and extended to fit custom needs. Refer to the [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html) for a list of supported models.
+modified and extended to fit custom needs via a PyTorch-like Python API. Refer to the [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html) for a list of supported models.
 
-To maximize performance and reduce memory footprint, TensorRT-LLM allows the
-models to be executed using different quantization modes (refer to
-[`support matrix`](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html#software)).  TensorRT-LLM supports
-INT4 or INT8 weights (and FP16 activations; a.k.a.  INT4/INT8 weight-only) as
-well as a complete implementation of the
-[SmoothQuant](https://arxiv.org/abs/2211.10438) technique.
+TensorRT-LLM is built on top of the [TensorRT](https://developer.nvidia.com/tensorrt) Deep Learning Inference library. It leverages much of TensorRT's deep learning optimizations and adds LLM-specific optimizations on top, as described above. TensorRT is an ahead-of-time compiler; it builds "[Engines](https://docs.nvidia.com/deeplearning/tensorrt/quick-start-guide/index.html#ecosystem)" which are optimized representations of the compiled model containing the entire execution graph. These engines are optimized for a specific GPU architecture, and can be validated, benchmarked, and serialized for later deployment in a production environment.
+
 
 ## Getting Started
 

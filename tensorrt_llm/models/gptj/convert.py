@@ -1,47 +1,12 @@
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 
 from tensorrt_llm.quantization import QuantAlgo
 
+from ..convert_utils import get_weight, get_weight_and_bias, split_matrix_tp
 from .config import GPTJConfig
-
-
-def split(weight: torch.Tensor,
-          tp_size: int,
-          rank: int = 0,
-          dim: int = 0) -> torch.Tensor:
-    if tp_size == 1:
-        return weight
-    elif weight.ndim == 1:
-        return torch.chunk(weight, tp_size)[rank].contiguous()
-    else:
-        return torch.chunk(weight, tp_size, dim=dim)[rank].contiguous()
-
-
-def split_matrix(weight: torch.Tensor, tp_size: int, rank: int,
-                 dim: int) -> torch.Tensor:
-    return split(weight, tp_size, rank, dim=dim)
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
-                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def get_tllm_linear_weight(
@@ -115,9 +80,9 @@ def load_weights_from_hf_model(hf_model, config: GPTJConfig):
         q_weight = get_weight(model_params, f'{prefix}.attn.q_proj', dtype)
         k_weight = get_weight(model_params, f'{prefix}.attn.k_proj', dtype)
         v_weight = get_weight(model_params, f'{prefix}.attn.v_proj', dtype)
-        q_w = split_matrix(q_weight, mapping.tp_size, mapping.tp_rank, dim=0)
-        k_w = split_matrix(k_weight, mapping.tp_size, mapping.tp_rank, dim=0)
-        v_w = split_matrix(v_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+        q_w = split_matrix_tp(q_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+        k_w = split_matrix_tp(k_weight, mapping.tp_size, mapping.tp_rank, dim=0)
+        v_w = split_matrix_tp(v_weight, mapping.tp_size, mapping.tp_rank, dim=0)
         qkv_w = torch.concatenate([q_w, k_w, v_w], dim=0)
         weights.update(
             get_tllm_linear_weight(qkv_w, f'{tllm_prex}.attention.qkv', None,
@@ -126,10 +91,10 @@ def load_weights_from_hf_model(hf_model, config: GPTJConfig):
         # Attention dense (not bias)
         attn_dense_weight = get_weight(model_params, f'{prefix}.attn.out_proj',
                                        dtype)
-        attn_dense_w = split_matrix(attn_dense_weight,
-                                    mapping.tp_size,
-                                    mapping.tp_rank,
-                                    dim=1)
+        attn_dense_w = split_matrix_tp(attn_dense_weight,
+                                       mapping.tp_size,
+                                       mapping.tp_rank,
+                                       dim=1)
         weights.update(
             get_tllm_linear_weight(attn_dense_w, f'{tllm_prex}.attention.dense',
                                    None, use_weight_only,
@@ -137,14 +102,14 @@ def load_weights_from_hf_model(hf_model, config: GPTJConfig):
         # MLP fc_in (with bias)
         mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
             model_params, f'{prefix}.mlp.fc_in', dtype)
-        mlp_fc_w = split_matrix(mlp_fc_weight,
-                                mapping.tp_size,
-                                mapping.tp_rank,
-                                dim=0)
-        mlp_fc_b = split_matrix(mlp_fc_bias,
-                                mapping.tp_size,
-                                mapping.tp_rank,
-                                dim=0)
+        mlp_fc_w = split_matrix_tp(mlp_fc_weight,
+                                   mapping.tp_size,
+                                   mapping.tp_rank,
+                                   dim=0)
+        mlp_fc_b = split_matrix_tp(mlp_fc_bias,
+                                   mapping.tp_size,
+                                   mapping.tp_rank,
+                                   dim=0)
         weights.update(
             get_tllm_linear_weight(mlp_fc_w, f'{tllm_prex}.mlp.fc', mlp_fc_b,
                                    use_weight_only,
@@ -152,10 +117,10 @@ def load_weights_from_hf_model(hf_model, config: GPTJConfig):
         # MLP fc_out (with bias)
         mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
             model_params, f'{prefix}.mlp.fc_out', dtype)
-        mlp_proj_w = split_matrix(mlp_proj_weight,
-                                  mapping.tp_size,
-                                  mapping.tp_rank,
-                                  dim=1)
+        mlp_proj_w = split_matrix_tp(mlp_proj_weight,
+                                     mapping.tp_size,
+                                     mapping.tp_rank,
+                                     dim=1)
         # Only rank0 will get bias
         if mapping.tp_size > 1 and mapping.tp_rank > 0:
             mlp_proj_bias = torch.zeros(mlp_proj_weight.shape[0],
@@ -174,24 +139,24 @@ def load_weights_from_hf_model(hf_model, config: GPTJConfig):
         # Embedding
         embed_w = get_weight(model_params, 'transformer.wte', dtype)
         if config.use_parallel_embedding:
-            embed_w = split_matrix(embed_w,
-                                   mapping.tp_size,
-                                   mapping.tp_rank,
-                                   dim=0)
+            embed_w = split_matrix_tp(embed_w,
+                                      mapping.tp_size,
+                                      mapping.tp_rank,
+                                      dim=0)
         weights['transformer.vocab_embedding.weight'] = embed_w
 
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
         lm_head_w, ln_head_bias = get_weight_and_bias(model_params, 'lm_head',
                                                       dtype)
-        weights['lm_head.weight'] = split_matrix(lm_head_w,
-                                                 mapping.tp_size,
-                                                 mapping.tp_rank,
-                                                 dim=0)
-        weights['lm_head.bias'] = split_matrix(ln_head_bias,
-                                               mapping.tp_size,
-                                               mapping.tp_rank,
-                                               dim=0)
+        weights['lm_head.weight'] = split_matrix_tp(lm_head_w,
+                                                    mapping.tp_size,
+                                                    mapping.tp_rank,
+                                                    dim=0)
+        weights['lm_head.bias'] = split_matrix_tp(ln_head_bias,
+                                                  mapping.tp_size,
+                                                  mapping.tp_rank,
+                                                  dim=0)
         ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.ln_f',
                                              dtype)
         # ln_f weight and bias

@@ -11,6 +11,9 @@ from transformers import AutoModelForCausalLM, Blip2ForConditionalGeneration
 
 import tensorrt_llm
 from tensorrt_llm._utils import pad_vocab_size
+from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
+                                               split, split_matrix_tp,
+                                               split_qkv_bias_tp, split_qkv_tp)
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -91,39 +94,6 @@ def parse_arguments():
     return args
 
 
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-
-def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV matrix according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.contiguous()
-
-
-def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
-    """
-    Splits the QKV bias according to tensor parallelism
-    """
-    v = v.reshape(3, n_hidden)
-    split_v = split(v, tensor_parallel, rank, dim=1)
-    split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
 def split_embedding(
     param: torch.Tensor,
     tp_size: int,
@@ -146,18 +116,6 @@ def split_embedding(
         else:
             assert hidden_size % tp_size == 0
     return split(param, tp_size, tp_rank, dim=sharding_dim)
-
-
-def get_weight(config, prefix, dtype):
-    return config[prefix + '.weight'].to(dtype).detach()
-
-
-def get_bias(config, prefix, dtype):
-    return config[prefix + '.bias'].to(dtype).detach()
-
-
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
 
 
 def get_tllm_linear_weight(weight,

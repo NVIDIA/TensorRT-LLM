@@ -67,8 +67,9 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                     isdir=True,
                     cwd=models_dir)
         else:
-            run_command(
-                ["rsync", "-av", str(model_cache_dir), "."], cwd=models_dir)
+            run_command(["rsync", "-rlptD",
+                         str(model_cache_dir), "."],
+                        cwd=models_dir)
     else:
         print("Clone model from HF")
         hf_dir = _pl.Path(models_dir) / model_name

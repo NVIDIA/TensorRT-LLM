@@ -889,7 +889,7 @@ public:
             for (auto const& request : requests)
             {
                 inputLengths.push_back(request.getInputTokenIds().size());
-                maxNewTokens.push_back(request.getMaxNewTokens());
+                maxNewTokens.push_back(request.getMaxTokens());
             }
             auto const start = std::chrono::steady_clock::now();
             auto reqIds = mExecutor->enqueueRequests(std::move(requests));
@@ -1399,6 +1399,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
     auto samplingConfig = texec::SamplingConfig{beamWidth};
     auto outputConfig = texec::OutputConfig{false, returnContextLogits, returnGenerationLogits, false};
     return texec::Request(sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId,
+        std::nullopt,    // positionIds
         std::nullopt,    // badWords
         std::nullopt,    // stopWords
         std::nullopt,    // embeddingBias

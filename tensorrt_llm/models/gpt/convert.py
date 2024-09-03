@@ -21,7 +21,7 @@ import tarfile
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 import numpy as np
 import safetensors
@@ -37,7 +37,9 @@ from transformers.pytorch_utils import Conv1D
 from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
 from ...quantization import QuantAlgo
-from ..convert_utils import load_calib_dataset, retrieved_layer_index_from_name
+from ..convert_utils import (get_weight, get_weight_and_bias,
+                             load_calib_dataset,
+                             retrieved_layer_index_from_name)
 from .config import GPTConfig
 
 
@@ -150,25 +152,6 @@ def split_embedding(
         else:
             assert hidden_size % tp_size == 0
     return split(param, tp_rank, tp_size, is_column=(sharding_dim == 0))
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
-                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def get_tllm_linear_weight(

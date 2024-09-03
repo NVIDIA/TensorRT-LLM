@@ -41,7 +41,7 @@ namespace torch_ext
 namespace
 {
 // Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] ExplicitDraftTokensLayer<T>::setup
-void initializeCurandStates(
+void initializeDeviceCurandStates(
     uint64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
 {
     auto* curandStatePtr = get_ptr<curandState_t>(curandState);
@@ -104,7 +104,7 @@ void prepareRandomTensors(th::Tensor& curandState, // [maxBatchSize, 48], uint8_
 
     if (initialize)
     {
-        initializeCurandStates(batchSize, curandState, randomSeeds, stream);
+        initializeDeviceCurandStates(batchSize, curandState, randomSeeds, stream);
     }
 
     switch (scalarType)

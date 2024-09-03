@@ -38,7 +38,7 @@ def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
 
     ## Generation
     tokenizer = AutoTokenizer.from_pretrained(hf_model_dir)
-    sampling_params = SamplingParams(max_new_tokens=20)
+    sampling_params = SamplingParams(max_tokens=20)
 
     with GenerationExecutor.create(engine_dir) as executor:
         if rank == 0:

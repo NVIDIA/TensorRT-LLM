@@ -313,6 +313,17 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     }
     else
     {
+        // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
+        // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
+        //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
+        // cudaMemsetAsync(k_buf_2_, 0, reinterpret_cast<int8_t*>(qk_buf_) - reinterpret_cast<int8_t*>(k_buf_2_),
+        // stream);
+        // FIXME: the final solution is to change the add_fusedQKV_bias_transpose_kernel to map CTAs corresponding to
+        // the output shape, and set the padding part to 0. Without zero-initialize guarantee, these workspace buffers
+        // may contain random NaN values when IFB workload is high.
+        cudaMemsetAsync(k_buf_2_, 0,
+            reinterpret_cast<int8_t*>(v_buf_2_) - reinterpret_cast<int8_t*>(k_buf_2_) + v_buf_2_size, stream);
+
         // only non-FMHA path needs to split Q,K,V from QKV
         invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(attention_input), input_lengths,
             mRemovePadding ? padding_offset : nullptr, batch_size, input_seq_len, num_tokens, mNumHeads, mNumHeads,

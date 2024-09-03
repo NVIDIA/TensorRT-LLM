@@ -109,8 +109,7 @@ class Builder():
     def __init__(self):
         super().__init__()
         self._trt_builder = trt.Builder(logger.trt_logger)
-        # TODO: Enable strongly_typed on by default in TRT 10.0
-        self.strongly_typed = False
+        self.strongly_typed = True
 
     @property
     def trt_builder(self) -> trt.Builder:
@@ -141,7 +140,7 @@ class Builder():
                               tensor_parallel: int = 1,
                               use_refit: bool = False,
                               int8: bool = False,
-                              strongly_typed: bool = False,
+                              strongly_typed: bool = True,
                               opt_level: Optional[int] = None,
                               force_num_profiles: Optional[int] = None,
                               profiling_verbosity: str = "layer_names_only",
@@ -157,7 +156,7 @@ class Builder():
             @param int8: whether to build with int8 enabled or not. Can't be used together with refit option
             @return: A BuilderConfig object, return None if failed
         '''
-        self.strongly_typed = self.strongly_typed or strongly_typed
+        self.strongly_typed = self.strongly_typed and strongly_typed
 
         quant_mode = kwargs.get("quant_mode", QuantMode(0))
         if not strongly_typed and precision not in self._ALLOWED_PRECISIONS:
@@ -181,9 +180,6 @@ class Builder():
             if fp8:
                 config.set_flag(trt.BuilderFlag.FP8)
                 config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-
-        config.set_preview_feature(trt.PreviewFeature.PROFILE_SHARING_0806,
-                                   True)
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
@@ -432,7 +428,7 @@ class Builder():
                 if value is None:
                     logger.error(f'Failed to get weight: {name}')
                     continue
-                if value.dtype == np.float16 and value.ndim == 2 and network.plugin_config.gemm_plugin is None:
+                if value.dtype == np.float16 and value.ndim == 2 and network.plugin_config.gemm_plugin is None and network.plugin_config.low_latency_gemm_plugin is None:
                     # MOE has ndim=3 and uses plugin, no need to transpose
                     value = value.transpose(1, 0)  # WAR for bug 4641821
                 managed_weights.append((name, value))
@@ -478,7 +474,7 @@ class BuildConfig:
     kv_cache_type: KVCacheType = None
     gather_context_logits: int = False
     gather_generation_logits: int = False
-    strongly_typed: bool = False
+    strongly_typed: bool = True
     builder_opt: Optional[int] = None
     force_num_profiles: Optional[int] = None
     profiling_verbosity: str = 'layer_names_only'

@@ -17,17 +17,15 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/request.h"
 #include <tensorrt_llm/runtime/common.h>
 #include <tensorrt_llm/runtime/speculativeDecodingModule.h>
 
 #include <optional>
 #include <utility>
 #include <vector>
-
-namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm::layers
 {
@@ -257,9 +255,9 @@ public:
     runtime::SizeType32 maxStopWordsLen{0};
     //! [maxBatchSize], on gpu
     std::optional<TensorConstPtr> sequenceLimitLength;
-    //! [maxBatchSize][2, stop_words_length], on gpu
+    //! [maxBatchSize][2, stop_words_length], pinned
     std::optional<TensorConstPtr> stopWordsPtr;
-    //! [maxBatchSize], on gpu
+    //! [maxBatchSize], pinned
     std::optional<TensorConstPtr> stopWordsLengths;
 };
 
@@ -275,7 +273,7 @@ public:
         , ite{ite}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
-        , batchSlots{batchSlots}
+        , batchSlots{std::move(batchSlots)}
     {
     }
 
@@ -294,9 +292,9 @@ public:
     //! DynamicDecodeLayer::forward checks for it
     //! Need both of these fields to support legacy code during transition period to the batched decoder
     //! [forwardBatchSize, beamWidth, vocabSizePadded]
-    std::optional<TensorPtr> logits;
+    std::optional<TensorConstPtr> logits;
     //! [forwardBatchSize][beamWidth, vocabSizePadded], on gpu
-    std::optional<std::vector<TensorPtr>> logitsVec;
+    std::optional<std::vector<TensorConstPtr>> logitsVec;
     //! [forwardBatchSize], on pinned memory
     TensorConstPtr batchSlots;
 
@@ -330,8 +328,7 @@ public:
     //! optional parameters
     //! [localBatchSize]
     curandState_t* curandStates{};
-    //! Pointer to the workspace for sampling computation
-    void* samplingWorkspace{};
+
     //! Flag to mark that logits tensor contains probabilities
     bool probsComputed{};
 };

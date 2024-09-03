@@ -16,11 +16,12 @@
 
 #pragma once
 
+#include <utility>
+
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
-
-#include <utility>
+#include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
 namespace tensorrt_llm::layers
 {
@@ -35,9 +36,9 @@ public:
     using TensorConstPtr = runtime::ITensor::SharedConstPtr;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    BaseLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager)
-        : mBufferManager(bufferManager)
-        , mDecoderDomain(decoderDomain)
+    BaseLayer(DecoderDomain decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager)
+        : mBufferManager(std::move(bufferManager))
+        , mDecoderDomain(std::move(decoderDomain))
     {
     }
 
@@ -66,8 +67,9 @@ public:
     //! \param batchSlots input buffer [maxBatchSize], address map of the new requests, in pinned memory
     //! \param setupParams shared pointer to params inherited from BaseSetupParams
     // clang-format on
-    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams)
+    virtual void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
         = 0;
 
     // clang-format off
@@ -77,8 +79,9 @@ public:
     //! \param outputs shared pointer to params inherited from BaseDecodingOutputs
     //! \param inputs shared pointer to params inherited from BaseForwardParams
     // clang-format on
-    virtual void forwardAsync(
-        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+    virtual void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
         = 0;
 
     // clang-format off
@@ -89,8 +92,9 @@ public:
     //! \param outputs shared pointer to params inherited from BaseDecodingOutputs
     //! \param inputs shared pointer to params inherited from BaseForwardParams
     // clang-format on
-    virtual void forwardSync(
-        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+    virtual void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
     {
     }
 

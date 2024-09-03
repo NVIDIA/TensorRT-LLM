@@ -42,12 +42,12 @@ To get more information on all the arguments, please run `python3 ./fastapi_serv
 
 ### Send requests
 
-You can pass request arguments like "max_new_tokens", "top_p", "top_k" in your JSON dict:
+You can pass request arguments like "max_tokens", "top_p", "top_k" in your JSON dict:
 ```
-curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_new_tokens": 8}'
+curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_tokens": 8}'
 ```
 
 You can also use the streaming interface with:
 ```
-curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_new_tokens": 8, "streaming": true}'
+curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_tokens": 8, "streaming": true}'
 ```

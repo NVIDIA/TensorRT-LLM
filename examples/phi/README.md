@@ -10,7 +10,6 @@ models using TensorRT-LLM and run on a single GPU.
   - [Usage](#usage)
     - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
     - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
-      - [Fused MultiHead Attention (FMHA)](#fused-multihead-attention-fmha)
     - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
     - [4. Quantization](#4-quantization)
     - [5. Run Phi-3 with LoRA](#5-run-phi-3-with-lora)
@@ -70,19 +69,11 @@ Examples of build invocations:
 trtllm-build \
     --checkpoint_dir ./phi-checkpoint \
     --output_dir ./phi-engine \
-    --gemm_plugin float16 \
+    --gemm_plugin auto \
     --max_batch_size 8 \
     --max_input_len 1024 \
     --max_seq_len 2048
 ```
-
-#### Fused MultiHead Attention (FMHA)
-
-You can enable the FMHA kernels for phi by adding `--context_fmha enable` to the invocation of `trtllm-build`. Note that it is disabled by default because of possible accuracy issues due to the use of Flash Attention.
-
-If you find that the default fp16 accumulation (`--context_fmha`) cannot meet the requirement, you can try to enable fp32 accumulation by adding `--enable_context_fmha_fp32_acc` to the inference command (`run.py` or `summarize.py`). However, it is expected to see performance drop.
-
-Note `--context_fmha` has to be used together with `--gpt_attention_plugin float16`.
 
 ### 3. Summarization using the Phi model
 

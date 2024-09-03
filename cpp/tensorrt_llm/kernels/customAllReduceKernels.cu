@@ -337,9 +337,9 @@ void rms_norm_kernel_launcher(AllReduceParams params, cudaStream_t stream)
     if (cta_size * details::kBytesPerAccess / sizeof(T) < params.fusion_params.hidden_size)
     {
         smem_size = params.fusion_params.hidden_size * sizeof(T);
-        if (tensorrt_llm::common::getEnvEnableFDL())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
-            TLLM_LOG_DEBUG("Enable FDL in rms_norm_kernel");
+            TLLM_LOG_DEBUG("Enable PDL in rms_norm_kernel");
             cudaLaunchConfig_t kernelConfig = {0};
             kernelConfig.gridDim = cta_num;
             kernelConfig.blockDim = cta_size;
@@ -362,9 +362,9 @@ void rms_norm_kernel_launcher(AllReduceParams params, cudaStream_t stream)
     }
     else
     {
-        if (tensorrt_llm::common::getEnvEnableFDL())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
-            TLLM_LOG_DEBUG("Enable FDL in rms_norm_kernel");
+            TLLM_LOG_DEBUG("Enable PDL in rms_norm_kernel");
             cudaLaunchConfig_t kernelConfig = {0};
             kernelConfig.gridDim = cta_num;
             kernelConfig.blockDim = cta_size;
@@ -517,9 +517,9 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams params, cudaStream
     if (cta_size * kPackedSize < params.fusion_params.hidden_size)
     {
         smem_size = params.fusion_params.hidden_size * sizeof(T);
-        if (tensorrt_llm::common::getEnvEnableFDL())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
-            TLLM_LOG_DEBUG("Enable FDL in one_shot_all_reduce_norm_kernel");
+            TLLM_LOG_DEBUG("Enable PDL in one_shot_all_reduce_norm_kernel");
 
             cudaLaunchConfig_t kernelConfig = {0};
             kernelConfig.gridDim = cta_num;
@@ -544,7 +544,7 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams params, cudaStream
     }
     else
     {
-        if (tensorrt_llm::common::getEnvEnableFDL())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
             cudaLaunchConfig_t kernelConfig = {0};
             kernelConfig.gridDim = cta_num;
@@ -558,7 +558,7 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams params, cudaStream
             kernelConfig.attrs = attribute;
             kernelConfig.numAttrs = 1;
 
-            TLLM_LOG_DEBUG("Enable FDL in one_shot_all_reduce_norm_kernel");
+            TLLM_LOG_DEBUG("Enable PDL in one_shot_all_reduce_norm_kernel");
             TLLM_CUDA_CHECK(cudaLaunchKernelEx(
                 &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>, params));
         }
@@ -980,9 +980,9 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
         auto output_ptr = params.local_output_buffer_ptr;
         params.local_output_buffer_ptr = params.fusion_params.intermediate_buffer;
 
-        if (tensorrt_llm::common::getEnvEnableFDL())
+        if (tensorrt_llm::common::getEnvEnablePDL())
         {
-            TLLM_LOG_DEBUG("Enable FDL in twoShotAllReduceKernel");
+            TLLM_LOG_DEBUG("Enable PDL in twoShotAllReduceKernel");
             cudaLaunchConfig_t kernelConfig = {0};
             kernelConfig.gridDim = blocks_per_grid;
             kernelConfig.blockDim = threads_per_block;

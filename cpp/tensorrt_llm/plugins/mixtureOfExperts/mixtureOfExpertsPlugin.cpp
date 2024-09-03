@@ -114,7 +114,7 @@ size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
         + mGemmProfiler->getSerializationSize(mGemmId1) + mGemmProfiler->getSerializationSize(mGemmId2)
         + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
 
-    if (mUseLora)
+    if (hasLora())
     {
         size += mLoraProfiler->getSerializationSize(mLoraGemmId1);
         size += mLoraProfiler->getSerializationSize(mLoraGemmId2);
@@ -158,7 +158,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(void const* data, size_t length,
     mGemmProfiler->deserialize(d, mDims, mGemmId1);
     mGemmProfiler->deserialize(d, mDims, mGemmId2);
 
-    if (mUseLora)
+    if (hasLora())
     {
         mLoraProfiler->deserialize(d, mDims, mLoraGemmId1);
         mLoraProfiler->deserialize(d, mDims, mLoraGemmId2);
@@ -200,7 +200,7 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     mGemmProfiler->serialize(d, mGemmId1);
     mGemmProfiler->serialize(d, mGemmId2);
 
-    if (mUseLora)
+    if (hasLora())
     {
         mLoraProfiler->serialize(d, mLoraGemmId1);
         mLoraProfiler->serialize(d, mLoraGemmId2);
@@ -216,11 +216,7 @@ void MixtureOfExpertsPlugin::init()
     TLLM_CHECK_WITH_INFO(mType != DataType::kFP8 || tensorrt_llm::common::getSMVersion() >= 89,
         "MoE FP8 is not supported for architectures less than SM89");
 
-    if (mUseLora)
-    {
-        TLLM_CHECK_WITH_INFO(mType == mLoraType && mType != DataType::kFP8,
-            "The lora type need to keep same with moe, FP8 is not supported now");
-    }
+    TLLM_CHECK_WITH_INFO(!hasLora() || mLoraType == mOutputType, "The LoraType need to keep same with moe OutputType.");
 
     if (mWeightType == nvinfer1::DataType::kINT8 && mQuantMode.hasInt4Weights())
     {
@@ -296,7 +292,7 @@ void MixtureOfExpertsPlugin::init()
         mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
     mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mK);
 
-    if (mUseLora)
+    if (hasLora())
     {
         auto cublasHandle = getCublasHandle();
         auto cublasLtHandle = getCublasLtHandle();
@@ -372,6 +368,10 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == mOutputType;
     }
+    else if (hasLora() && hasExpertFp8QuantScales() && pos == getInputFP8DequantIndex())
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
     else if (hasLora() && pos == getHostRequestTypeIndex())
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
@@ -440,7 +440,7 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
     mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
         mType, mWeightType, mQuantMode};
 
-    if (mUseLora)
+    if (hasLora())
     {
         auto const N = utils::computeNDimension(true, in[getHostRequestTypeIndex()].max);
         mLoraGemmId1 = GemmIdCublas(N, mExpertHiddenSize, mLoraType, false, true, mLoraType);
@@ -453,7 +453,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
     size_t dtype_size = tensorrt_llm::common::getDTypeSize(mType);
 
     size_t moe_workspace_size = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize,
-        mNumExperts, mK, mActivationType, mNormalizationMode, mParallelismConfig, mUseLora);
+        mNumExperts, mK, mActivationType, mNormalizationMode, mParallelismConfig, hasLora());
 
     // Output of post-softmax routing probabilities
     size_t scale_probabilities_size = num_tokens * mNumExperts * sizeof(float);
@@ -465,10 +465,11 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
     size_t selected_expert_size = mK * num_tokens * sizeof(int);
 
     size_t lora_workspace_size = 0;
-    if (mUseLora)
+    if (hasLora())
     {
-        lora_workspace_size = std::max(mLoraImpl1->getWorkspaceSize(num_tokens, num_reqs, mLoraType),
-            mLoraImpl2->getWorkspaceSize(num_tokens, num_reqs, mLoraType));
+        int64_t num_reqs_lora = std::min(num_tokens * mK, static_cast<int64_t>(num_reqs * mNumExperts));
+        lora_workspace_size = std::max(mLoraImpl1->getWorkspaceSize(num_tokens * mK, num_reqs_lora, mLoraType),
+            mLoraImpl2->getWorkspaceSize(num_tokens * mK, num_reqs_lora, mLoraType));
     }
 
     std::vector<size_t> workspaces{
@@ -524,7 +525,7 @@ MOEParallelismConfig MixtureOfExpertsPlugin::getParallelismConfig() const
 }
 
 QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(
-    void const* scale_1, void const* scale_2, void const* scale_3, void const* scale_4) const
+    void const* scale_1, void const* scale_2, void const* scale_3, void const* scale_4, void const* scale_5) const
 {
     if (hasExpertIntQuantScales())
     {
@@ -536,14 +537,14 @@ QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(
         TLLM_CHECK(scale_1 && scale_2 && scale_3);
         TLLM_CHECK(scale_4 || !hasExpertFp8FinalQuantScales());
         return QuantParams::FP8(static_cast<float const*>(scale_1), static_cast<float const*>(scale_2),
-            static_cast<float const*>(scale_3), static_cast<float const*>(scale_4));
+            static_cast<float const*>(scale_3), static_cast<float const*>(scale_4), static_cast<float const*>(scale_5));
     }
     return {};
 }
 
 int MixtureOfExpertsPlugin::getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensors) const
 {
-    if (!mUseLora)
+    if (!hasLora())
         return 0;
     int num_reqs = input_tensors[getLoraFC1RanksIndex()].dims.d[0];
     return num_reqs;
@@ -552,7 +553,7 @@ int MixtureOfExpertsPlugin::getNumLoraRequests(nvinfer1::PluginTensorDesc const*
 LoraParams MixtureOfExpertsPlugin::getLoraParams(
     nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace)
 {
-    TLLM_CHECK(mUseLora);
+    TLLM_CHECK(hasLora());
 
     int const num_reqs = getNumLoraRequests(inputDesc);
     int64_t const num_tokens = getNumTokens(inputDesc);
@@ -697,7 +698,8 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             inputs[getExpertFP8Dequant1Index()], //
             inputs[getExpertFP8Quant2Index()],   //
             inputs[getExpertFP8Dequant2Index()], //
-            hasExpertFp8FinalQuantScales() ? inputs[getExpertFP8QuantFinalIndex()] : nullptr);
+            hasExpertFp8FinalQuantScales() ? inputs[getExpertFP8QuantFinalIndex()] : nullptr,
+            hasLora() ? inputs[getInputFP8DequantIndex()] : nullptr);
     }
 
     LoraParams lora_params{};
@@ -724,7 +726,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
         workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
         static_cast<int*>(workspace.selected_experts), mSparseMixerEpsilon, mParallelismConfig, mNormalizationMode,
-        mUseLora, lora_params, stream);
+        hasLora(), lora_params, stream);
 
     return 0;
 }
@@ -756,7 +758,7 @@ int MixtureOfExpertsPlugin::initialize() noexcept
     mGemmProfiler->setGemmToProfile(kernels::GemmProfilerBackend::GemmToProfile::GEMM_2);
     mGemmProfiler->profileTactics(this, mType, mDims, mGemmId2);
 
-    if (mUseLora)
+    if (hasLora())
     {
         mLoraImpl1->setGemmConfig();
         mLoraImpl2->setGemmConfig();

@@ -22,11 +22,13 @@ import weakref
 from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 from packaging import version
 
+from tensorrt_llm.bindings import GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 # isort: off
@@ -509,3 +511,10 @@ class BaseEnumMeta(EnumMeta):
         except ValueError:
             return False
         return True
+
+
+def supports_inflight_batching(engine_dir):
+    config_path = Path(engine_dir) / "config.json"
+    json_config = GptJsonConfig.parse_file(config_path)
+    model_config = json_config.model_config
+    return model_config.supports_inflight_batching

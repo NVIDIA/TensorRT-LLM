@@ -79,7 +79,7 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
     export COMMON_COMMAND="--max_batch_size=1 --max_input_len=2048 --max_seq_len=3072 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits"
     export DRAFT_COMMAND_FP16="$COMMON_COMMAND"
     export TARGET_COMMAND_FP16="$DRAFT_COMMAND_FP16 --max_draft_len=$MAX_DRAFT_LENGTH --speculative_decoding_mode draft_tokens_external"
-    export DRAFT_COMMAND_FP8="$COMMON_COMMAND --strongly_typed --use_fp8_context_fmha=enable"
+    export DRAFT_COMMAND_FP8="$COMMON_COMMAND --use_fp8_context_fmha=enable"
     export TARGET_COMMAND_FP8="$DRAFT_COMMAND_FP8 --max_draft_len=$MAX_DRAFT_LENGTH --speculative_decoding_mode draft_tokens_external"
 
     # Build checkpoints and engines in tensorrt_llm/examples/llama/

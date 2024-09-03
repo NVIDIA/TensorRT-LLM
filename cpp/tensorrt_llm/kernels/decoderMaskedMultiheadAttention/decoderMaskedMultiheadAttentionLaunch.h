@@ -146,7 +146,7 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     grid.z = params.seq_len_tile;
 }
 
-#define MMHA_LAUNCH_CHECK(DYNAMIC_THDS_PER_BLOCK)                                                                      \
+#define MMHA_LAUNCH_CHECK(DYNAMIC_THDS_PER_BLOCK, DO_MULTI_BLOCK)                                                      \
     std::size_t const dynamic_smem_sz{                                                                                 \
         mmha::smem_size_in_bytes<T, Dh, DO_MULTI_BLOCK>(params, DYNAMIC_THDS_PER_BLOCK)};                              \
     /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */              \
@@ -183,9 +183,9 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     const auto mmhaFunc = mmha::masked_multihead_attention_kernel<T, T_cache, TKcache, KVCacheBuffer, KCacheBuffer,    \
         Dh, DYNAMIC_THDS_PER_BLOCK, KernelParamsType::DO_CROSS_ATTENTION, HAS_BEAMS, ENABLE_MULTI_BLOCK, POS_SHIFT,    \
         BLOCK_SPARSE_ATTN, IMPLICIT_REL_ATTN_BIAS, QK_TANH_SCALE>;                                                     \
-    if (tensorrt_llm::common::getEnvEnableFDL())                                                                       \
+    if (tensorrt_llm::common::getEnvEnablePDL())                                                                       \
     {                                                                                                                  \
-        TLLM_LOG_DEBUG("Enable FDL in MMHA");                                                                          \
+        TLLM_LOG_DEBUG("Enable PDL in MMHA");                                                                          \
         cudaLaunchConfig_t kernelConfig = {0};                                                                         \
         kernelConfig.gridDim = grid;                                                                                   \
         kernelConfig.blockDim = DYNAMIC_THDS_PER_BLOCK;                                                                \
@@ -205,11 +205,11 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     }
 
 // if resources are not enough to launch 512 threads per block, we will fallback to 256.
-#define MMHA_512_BLOCKSIZE_CHECK()                                                                                     \
-    MMHA_LAUNCH_CHECK(512);                                                                                            \
+#define MMHA_512_BLOCKSIZE_CHECK(DO_MULTI_BLOCK)                                                                       \
+    MMHA_LAUNCH_CHECK(512, DO_MULTI_BLOCK);                                                                            \
     if (available_blocks <= 0)                                                                                         \
     {                                                                                                                  \
-        MMHA_LAUNCH_CHECK(256);                                                                                        \
+        MMHA_LAUNCH_CHECK(256, DO_MULTI_BLOCK);                                                                        \
         dynamic_block_size = 256;                                                                                      \
     }                                                                                                                  \
     else                                                                                                               \
@@ -218,15 +218,32 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
     }
 
 // if resources are not enough to launch 1024 threads per block, we will fallback to 512.
-#define MMHA_1024_BLOCKSIZE_CHECK()                                                                                    \
-    MMHA_LAUNCH_CHECK(1024);                                                                                           \
+#define MMHA_1024_BLOCKSIZE_CHECK(DO_MULTI_BLOCK)                                                                      \
+    MMHA_LAUNCH_CHECK(1024, DO_MULTI_BLOCK);                                                                           \
     if (available_blocks > 0)                                                                                          \
     {                                                                                                                  \
         dynamic_block_size = 1024;                                                                                     \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        MMHA_512_BLOCKSIZE_CHECK();                                                                                    \
+        MMHA_512_BLOCKSIZE_CHECK(DO_MULTI_BLOCK);                                                                      \
+    }
+
+// The previous dynamic_block_size might be calculated based on muli-block-mode enabled,
+// while the final launch set it disabled, so we need to fallback to smaller kernel block size
+// if there are not enough resources.
+#define MMHA_DYNAMIC_LAUNCH(DO_MULTI_BLOCK)                                                                            \
+    if (dynamic_block_size == 256)                                                                                     \
+    {                                                                                                                  \
+        MMHA_KERNEL(256, DO_MULTI_BLOCK);                                                                              \
+    }                                                                                                                  \
+    else if (dynamic_block_size == 512)                                                                                \
+    {                                                                                                                  \
+        MMHA_KERNEL(512, DO_MULTI_BLOCK);                                                                              \
+    }                                                                                                                  \
+    else if (dynamic_block_size == 1024)                                                                               \
+    {                                                                                                                  \
+        MMHA_KERNEL(1024, DO_MULTI_BLOCK);                                                                             \
     }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -268,16 +285,16 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
     int available_blocks = -1;
     if (dynamic_block_size < 512)
     {
-        MMHA_LAUNCH_CHECK(256);
+        MMHA_LAUNCH_CHECK(256, DO_MULTI_BLOCK);
         dynamic_block_size = 256;
     }
     else if (dynamic_block_size < 1024)
     {
-        MMHA_512_BLOCKSIZE_CHECK();
+        MMHA_512_BLOCKSIZE_CHECK(DO_MULTI_BLOCK);
     }
     else if (dynamic_block_size == 1024)
     {
-        MMHA_1024_BLOCKSIZE_CHECK();
+        MMHA_1024_BLOCKSIZE_CHECK(DO_MULTI_BLOCK);
     }
 
     // Block size can be finetuned by TRTLLM_MMHA_KERNEL_BLOCK_SIZE.
@@ -306,7 +323,8 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
         }
         else
         {
-            MMHA_KERNEL(512, false);
+            MMHA_512_BLOCKSIZE_CHECK(false);
+            MMHA_DYNAMIC_LAUNCH(false);
         }
         break;
     case 1024:
@@ -316,7 +334,8 @@ void mmha_launch_kernel_ex(KernelParamsType const& params, KVCacheBuffer const& 
         }
         else
         {
-            MMHA_KERNEL(1024, false);
+            MMHA_1024_BLOCKSIZE_CHECK(false);
+            MMHA_DYNAMIC_LAUNCH(false);
         }
         break;
     default: TLLM_CHECK_WITH_INFO(false, "Wrong kernel block size for launching the MMHA kernel.");

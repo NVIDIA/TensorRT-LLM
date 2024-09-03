@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/tensorView.h"
 
 namespace tensorrt_llm::layers
 {

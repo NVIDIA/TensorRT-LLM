@@ -25,10 +25,6 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
-
-#include "tensorrt_llm/common/tllmException.h"
 
 namespace tensorrt_llm::tests::layers
 {
@@ -95,6 +91,7 @@ private:
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::layers::MedusaDecodingLayer<T>> mMedusaDecodingLayer;
+    std::shared_ptr<runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
 private:
     void allocateBuffers();

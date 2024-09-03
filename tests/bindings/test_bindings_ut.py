@@ -266,6 +266,7 @@ def test_llm_request():
         "max_new_tokens": 5,
         "sampling_config": sampling_config,
         "input_tokens": [0, 1, 2],
+        "position_ids": [0, 1, 2],
         "is_streaming": True,
         "pad_id": 99,
         "end_id": 100,
@@ -299,6 +300,7 @@ def test_llm_request():
     assert llm_request.get_token(1, 2) == 2
     assert llm_request.get_tokens(1) == [0, 1, 2]
     assert llm_request.max_num_generated_tokens == 0
+    assert llm_request.position_ids == [0, 1, 2]
 
     llm_request.add_new_token(42, 0)
     assert llm_request.get_token(0, 3) == 42
@@ -358,6 +360,9 @@ def test_inference_request():
 
     ir = _tb.InferenceRequest(42, logits_post_processor)
     setattr(ir, _tb.tensor_names.INPUT_IDS, input_ids)
+
+    ir.position_ids = torch.tensor((0, 1), dtype=torch.int32)
+    torch.equal(ir.position_ids, torch.tensor((0, 1), dtype=torch.int32))
 
     assert ir.request_id == 42
     assert ir.input_ids is not None

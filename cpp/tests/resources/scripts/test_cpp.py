@@ -383,6 +383,18 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         model_cache_arg=model_cache_arg,
                         only_multi_gpu_arg=['--tp', '4', '--pp', '1'])
 
+    prepare_model_tests(model_name="gpt",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
+
+    prepare_model_tests(model_name="chatglm",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
+
 
 def prepare_model_tests(model_name: str,
                         python_exe: str,
@@ -624,6 +636,30 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         local_commands=[
             "executor/executorTest",
             "--gtest_filter=LlamaExecutorTest/LogitsProcParamsTest*tp2_pp2*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    xml_output_file = build_dir / "results-multi-gpu-dist-executor_gpt.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=2,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=DistExecutorTest.GPTTokenComparison"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    xml_output_file = build_dir / "results-multi-gpu-dist-executor_chatglm.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=2,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=DistExecutorTest.ChatGLMTokenComparison"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)

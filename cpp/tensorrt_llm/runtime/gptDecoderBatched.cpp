@@ -886,7 +886,7 @@ void GptDecoderBatched::forwardDecoder(
     auto const maxDecodingEngineTokens
         = *std::max_element(std::begin(mNumDecodingEngineTokens), std::end(mNumDecodingEngineTokens));
 
-    std::vector<TensorPtr> logitsVec;
+    std::vector<SharedConstPtr> logitsVec;
     auto targetLogitsPtrsSlice = ITensor::slice(mTargetLogitsPtrs, step, 1);
     auto targetLogitsPtrsSlicePtr = reinterpret_cast<void const**>(bufferCast<int64_t>(*targetLogitsPtrsSlice));
     SizeType32 targetLogitsIdx = 0;
@@ -896,7 +896,7 @@ void GptDecoderBatched::forwardDecoder(
         {
             continue;
         }
-        auto& targetLogits = allTargetLogits[bi];
+        auto const& targetLogits = allTargetLogits[bi];
         TensorPtr logitsSlice = ITensor::slice(targetLogits, step, singleRequest);
         logitsVec.push_back(logitsSlice);
         targetLogitsPtrsSlicePtr[targetLogitsIdx++] = logitsSlice->data();

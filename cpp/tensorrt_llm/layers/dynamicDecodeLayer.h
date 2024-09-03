@@ -19,9 +19,6 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/penaltyLayer.h"
-#include "tensorrt_llm/runtime/iTensor.h"
-
-namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm::layers
 {
@@ -36,20 +33,19 @@ public:
         std::shared_ptr<runtime::BufferManager> bufferManager);
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
-        runtime::IBuffer::SharedConstPtr batchSlots, std::shared_ptr<BaseSetupParams> const& setupParams) override;
+        runtime::ITensor::SharedConstPtr batchSlots, std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
-    // Function is only used by test.
-    // It is guaranteed by LayersFactory that the first layer is the Penalty layer.
-    T* getRuntimeLogitsDevice()
-    {
-        return dynamic_cast<PenaltyLayer<T>*>(mLayers[0].get())->getRuntimeLogitsDevice();
-    }
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 private:
     void allocateBuffer();
@@ -59,11 +55,9 @@ private:
 
     void prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> const& outputs, BufferConstPtr batchSlots,
         runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen);
-    void prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<DecodingInputs> const& params, TensorPtr outputIdsPtrsHost, TensorPtr parentIdsPtrsHost,
-        BufferConstPtr batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
-        runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep,
-        runtime::SizeType32 cyclicStep, bool outputLogProbs, cudaStream_t stream);
+    void prepareOutputData(std::shared_ptr<BaseDecodingOutputs> const& outputs, BufferConstPtr batchSlots,
+        runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize, runtime::SizeType32 beamWidth,
+        runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxTokensPerStep, bool outputLogProbs, cudaStream_t stream);
 
 private:
     using Base::mDecoderDomain;

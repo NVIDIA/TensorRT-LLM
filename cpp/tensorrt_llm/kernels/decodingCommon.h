@@ -219,5 +219,6 @@ void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, in
 //! \param stream stream
 template <typename T>
 void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+
 } // namespace kernels
 } // namespace tensorrt_llm
