@@ -17,6 +17,7 @@ import copy
 from typing import Optional, Union
 
 from ..._utils import pad_vocab_size
+from ...logger import logger
 from ...functional import Tensor, recv, send, sigmoid
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, RowLinear)
@@ -309,13 +310,19 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
         if not use_preloading:
             hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
+
+        logger.info(f"HuggingFace model: {hf_model}")
+
+        model = QWenForCausalLM(config)
+
+        logger.info(f"TensorRT-LLM model: {model}")
+
         if use_hf_gptq_checkpoint:
             weights = load_weights_from_hf_gptq_model(hf_model, config)
         else:
             weights = load_weights_from_hf_model(hf_model, config)
 
         check_share_embedding(weights, config)
-        model = QWenForCausalLM(config)
         model.load(weights)
         return model
 
