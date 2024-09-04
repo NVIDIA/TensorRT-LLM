@@ -185,7 +185,8 @@ class GenerationMixin:
                                  mapping=Mapping(),
                                  streamingllm=False,
                                  attn_layer_idx=None,
-                                 opt_batch_size=None):
+                                 opt_batch_size=None,
+                                 num_kv_heads_per_layer=None):
 
         default_range = GenerationMixin.default_range
 
@@ -258,16 +259,24 @@ class GenerationMixin:
         else:
             if kv_cache_type != KVCacheType.PAGED:
                 for i in layers_range:
+                    if num_kv_heads_per_layer is not None:
+                        heads_dim_name = f"num_heads_{attn_layer_idx[i]}"
+                        kv_heads = num_kv_heads_per_layer[i]
+                    else:
+                        heads_dim_name = "num_heads"
+                        kv_heads = num_kv_heads
+
                     kv_dim_range = OrderedDict([
                         ('batch_size_beam_width', bb_range),
                         ('kv', [2] * num_profiles),
-                        ('num_heads', [num_kv_heads] * num_profiles),
+                        (heads_dim_name, [kv_heads] * num_profiles),
                         ('past_key_len', kv_cache_range),
                         ('head_size', [head_size] * num_profiles),
                     ])
+
                     kv = Tensor(name=f'past_key_value_{attn_layer_idx[i]}',
                                 dtype=kv_dtype,
-                                shape=[-1, 2, num_kv_heads, -1, head_size],
+                                shape=[-1, 2, kv_heads, -1, head_size],
                                 dim_range=kv_dim_range)
                     past_key_value.append(kv)
             else:
@@ -774,7 +783,6 @@ class GenerationMixin:
             mapping=mapping,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size)
-
         for key, value in attention_inputs.items():
             basic_inputs[key] = value
 

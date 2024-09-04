@@ -144,6 +144,8 @@ class PhiModel(Module):
 class PhiForCausalLM(DecoderModelForCausalLM):
     config_class = PhiConfig
 
+    config_class = PhiConfig
+
     def __init__(self, config: PretrainedConfig):
         self.check_config(config)
         transformer = PhiModel(config)

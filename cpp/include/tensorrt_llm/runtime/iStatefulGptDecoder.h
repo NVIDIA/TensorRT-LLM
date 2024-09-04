@@ -29,6 +29,11 @@
 
 #include <NvInferRuntime.h>
 
+namespace tensorrt_llm::batch_manager
+{
+struct DecoderBuffers;
+}
+
 namespace tensorrt_llm::runtime
 {
 

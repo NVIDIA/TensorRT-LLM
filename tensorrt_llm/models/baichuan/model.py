@@ -110,11 +110,9 @@ class BaichuanModel(Module):
         super().__init__()
         hidden_size = config.hidden_size
 
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            share_embedding_table=config.share_embedding_table)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
 
         self.layers = DecoderLayerList(BaichuanDecoderLayer, config)
         self.ln_f = RmsNorm(normalized_shape=hidden_size,

@@ -19,6 +19,8 @@
 
 #include <NvInferRuntime.h>
 
+#include "tensorrt_llm/common/logger.h"
+
 namespace tensorrt_llm::plugins::utils
 {
 using DimType64 = int64_t;
@@ -63,9 +65,14 @@ inline DimType64 computeNDimension(bool transB, nvinfer1::Dims const& dims)
     return N;
 }
 
+inline std::int32_t logErrorReturn0(char const* variable)
+{
+    TLLM_LOG_ERROR("Value of %s is out of range for int32_t", variable);
+    return 0;
+}
+
 #define TLLM_INT32_CAST(value)                                                                                         \
-    ((value > 0x7FFFFFFFLL || value < -0x80000000LL)                                                                   \
-            ? (TLLM_LOG_ERROR("Value of " #value " is out of range for int32_t"), 0)                                   \
-            : static_cast<int32_t>(value))
+    ((value > 0x7FFFFFFFLL || value < -0x80000000LL) ? tensorrt_llm::plugins::utils::logErrorReturn0(#value)           \
+                                                     : static_cast<int32_t>(value))
 
 } // namespace tensorrt_llm::plugins::utils

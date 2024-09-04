@@ -20,6 +20,8 @@
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/memoryCounters.h"
+#include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <algorithm>
@@ -122,6 +124,8 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->logProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(mBufferManager);
+    dOutput->finishReasons
+        = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
     mNumDraftTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     mCurandStates = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT8);
@@ -180,6 +184,10 @@ void GptDecoderBatched::allocateSpeculativeDecodingBuffers()
                 = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
         }
     }
+    if (mSpeculativeDecodingMode.isLookaheadDecoding())
+    {
+        dInput->lookaheadInputs = DecodingInput::LookaheadInputs();
+    }
     if (mSpeculativeDecodingMode.needsKVCacheRewind())
     {
         speculativeDecodingOutputs.acceptedTokensLen
@@ -200,6 +208,17 @@ void GptDecoderBatched::setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inp
 
     TLLM_CHECK(mSpeculativeDecodingMode.isExplicitDraftTokens());
     mJointDecodingOutput->explicitDraftTokensBuffers = std::move(explicitDraftTokensBuffers);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatched::setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(mSpeculativeDecodingMode.isLookaheadDecoding());
+    mJointDecodingOutput->lookaheadOutputs = std::move(lookaheadDecodingBuffers);
+    mJointDecodingInput->lookaheadInputs->tokensPerStep = mJointDecodingOutput->lookaheadOutputs->generationLengths;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -269,6 +288,9 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     mBufferManager.setZero(*dOutput.newTokensSteps);
     mFinishedSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
     mBufferManager.setZero(*mFinishedSteps);
+
+    dOutput.finishReasons->reshape(maxBatchSizeXmaxBeamWidth);
+    mBufferManager.setZero(*dOutput.finishReasons);
 
     mBatchSlotsSetup->reshape(ITensor::makeShape({maxBatchSize}));
     mBatchSlotsDecoder->reshape(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize}));
@@ -684,8 +706,15 @@ void GptDecoderBatched::newRequestLookahead(SizeType32 batchIdx, decoder_batch::
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // TODO(nkorobov) add lookahead layer
-    TLLM_LOG_WARNING("Lookahead decoding is not supported yet.");
+    TLLM_CHECK(mJointDecodingOutput->lookaheadOutputs);
+
+    auto& stream = mRuntimeStream;
+
+    // The first generation step only generate 1 token.
+    TensorPtr curTokensPerStepSlice
+        = ITensor::slice(constPointerCast(mJointDecodingInput->lookaheadInputs->tokensPerStep), batchIdx, 1);
+    kernels::invokeFill(*curTokensPerStepSlice, 1, *stream);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -747,7 +776,7 @@ void GptDecoderBatched::newRequests(std::vector<SizeType32> const& seqSlots,
 
     TensorPtr batchSlotsView = ITensor::slice(mBatchSlotsSetup, 0, localBatchSize);
     auto samplingConfig = SamplingConfig(samplingConfigs);
-    mDecoder->setup(samplingConfig, localBatchSize, batchSlotsView, {*mJointDecodingOutput});
+    mDecoder->setup(samplingConfig, localBatchSize, batchSlotsView, {*mJointDecodingOutput}, {requests});
 
     auto const& stream = mDecoderStream;
     CudaEvent event{};
@@ -905,7 +934,7 @@ void GptDecoderBatched::forwardDecoder(
     TensorPtr newTokensStepView = ITensor::slice(dOutput.newTokensSteps, step, mMaxDecodingDecoderTokens);
 
     dInput.logitsVec = logitsVec;
-    dInput.finished = finishedStepsInput;
+    dInput.finishReasons = finishedStepsInput;
 
     if (maxBeamWidth > 1 && input.seqSlots)
     {
@@ -925,7 +954,7 @@ void GptDecoderBatched::forwardDecoder(
     }
 
     dOutput.newTokens = newTokensStepView;
-    dOutput.finished = finishedStepsOutput;
+    dOutput.finishReasons = finishedStepsOutput;
     dOutput.lengths = sequenceLengths;
 
     if (localBatchDecoderIdx > 0)
@@ -1057,7 +1086,7 @@ CudaEvent GptDecoderBatched::postProcessRequest(
     slice(dOutput.cumLogProbs, dJointOutput.cumLogProbs);
     slice(dOutput.cacheIndirection, dJointOutput.cacheIndirection);
     slice(dOutput.lengths, dJointOutput.lengths);
-    slice(dOutput.finished, dJointOutput.finished);
+    slice(dOutput.finishReasons, dJointOutput.finishReasons);
     slice(dOutput.logProbs, dJointOutput.logProbs);
 
     dOutput.newTokens = ITensor::view(dJointOutput.newTokens);

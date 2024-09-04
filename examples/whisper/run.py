@@ -125,32 +125,24 @@ class WhisperEncoding:
             session = Session.from_serialized_engine(f.read())
         return session
 
-    def get_audio_features(self, mel):
-        # Input_lengths here are actually encoder_output_lengths for whisper.
-        # Since the conv subsampling layer in the whisper decoder, seq_len would divide by 2.
-        input_lengths = torch.tensor(
-            [mel.shape[2] // 2 for _ in range(mel.shape[0])],
-            dtype=torch.int32,
-            device=mel.device)
-        encoder_max_input_length = torch.max(input_lengths).item()
+    def get_audio_features(self,
+                           mel,
+                           mel_input_lengths,
+                           encoder_downsampling_factor=2):
         if self.encoder_config['plugin_config']['remove_input_padding']:
-            mel_input_lengths = torch.full((mel.shape[0], ),
-                                           mel.shape[2],
-                                           dtype=torch.int32,
-                                           device='cuda')
             # mel B,D,T -> B,T,D -> BxT, D
             mel = mel.transpose(1, 2)
             mel = remove_tensor_padding(mel, mel_input_lengths)
 
         inputs = OrderedDict()
         inputs['input_features'] = mel
-        inputs['input_lengths'] = input_lengths
+        inputs['input_lengths'] = mel_input_lengths
 
         output_list = [
             TensorInfo('input_features', str_dtype_to_trt(self.dtype),
                        mel.shape),
             TensorInfo('input_lengths', str_dtype_to_trt('int32'),
-                       input_lengths.shape)
+                       mel_input_lengths.shape)
         ]
 
         output_info = (self.session).infer_shapes(output_list)
@@ -168,8 +160,10 @@ class WhisperEncoding:
                               stream=stream.cuda_stream)
         assert ok, 'Engine execution failed'
         stream.synchronize()
-        audio_features = outputs['encoder_output']
-        return audio_features, encoder_max_input_length, input_lengths
+        encoder_output = outputs['encoder_output']
+        encoder_output_lengths = mel_input_lengths // encoder_downsampling_factor
+
+        return encoder_output, encoder_output_lengths
 
 
 class WhisperDecoding:
@@ -308,6 +302,7 @@ class WhisperTRTLLM(object):
     def process_batch(
             self,
             mel,
+            mel_input_lengths,
             text_prefix="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
             num_beams=1):
         prompt_id = self.tokenizer.encode(
@@ -315,13 +310,13 @@ class WhisperTRTLLM(object):
         prompt_id = torch.tensor(prompt_id)
         batch_size = mel.shape[0]
         decoder_input_ids = prompt_id.repeat(batch_size, 1)
-
-        encoder_output, encoder_max_input_length, encoder_input_lengths = self.encoder.get_audio_features(
-            mel)
+        encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
+            mel, mel_input_lengths)
+        encoder_max_input_length = torch.max(encoder_output_lengths).item()
         output_ids = self.decoder.generate(decoder_input_ids,
                                            encoder_output,
                                            encoder_max_input_length,
-                                           encoder_input_lengths,
+                                           encoder_output_lengths,
                                            self.eot_id,
                                            max_new_tokens=96,
                                            num_beams=num_beams)
@@ -350,7 +345,13 @@ def decode_wav_file(
     mel = mel.unsqueeze(0)
     # repeat the mel spectrogram to match the batch size
     mel = mel.repeat(batch_size, 1, 1)
-    predictions = model.process_batch(mel, text_prefix, num_beams)
+    # TODO: use the actual input_lengths rather than padded input_lengths
+    feature_input_lengths = torch.full((mel.shape[0], ),
+                                       mel.shape[2],
+                                       dtype=torch.int32,
+                                       device=mel.device)
+    predictions = model.process_batch(mel, feature_input_lengths, text_prefix,
+                                      num_beams)
     prediction = predictions[0]
 
     # remove all special tokens in the prediction
@@ -411,7 +412,13 @@ def decode_dataset(
             for wave in waveforms
         ]
         features = torch.cat(features, dim=0).type(str_dtype_to_torch(dtype))
-        predictions = model.process_batch(features, text_prefix, num_beams)
+        # TODO: use the actual input_lengths rather than padded input_lengths
+        feature_input_lengths = torch.full((features.shape[0], ),
+                                           features.shape[2],
+                                           dtype=torch.int32,
+                                           device=features.device)
+        predictions = model.process_batch(features, feature_input_lengths,
+                                          text_prefix, num_beams)
         for wav_id, label, prediction in zip(ids, texts, predictions):
             # remove all special tokens in the prediction
             prediction = re.sub(r'<\|.*?\|>', '', prediction)

@@ -635,6 +635,16 @@ public:
         mManageWeightsType = manageWeightType;
     }
 
+    [[nodiscard]] std::string const& getModelName() const noexcept
+    {
+        return mModelName;
+    }
+
+    void setModelName(std::string const& modelName)
+    {
+        mModelName = modelName;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbAttentionLayers;
@@ -692,6 +702,7 @@ private:
     nvinfer1::DataType mLogitsDtype;
     bool mUseShapeInference;
     ManageWeightsType mManageWeightsType;
+    std::string mModelName;
 };
 
 } // namespace tensorrt_llm::runtime

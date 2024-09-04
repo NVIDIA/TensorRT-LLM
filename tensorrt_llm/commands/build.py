@@ -33,6 +33,7 @@ from tensorrt_llm.lora_manager import LoraConfig, LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def parse_arguments():
@@ -106,9 +107,7 @@ def parse_arguments():
         help='It equals to max_batch_size*max_beam_width by default, set this '
         'value as close as possible to the actual number of tokens on your workload. '
         'Note that this argument might be removed in the future.')
-    parser.add_argument('--cp_size', type=int, default=1)
-    parser.add_argument('--tp_size', type=int, default=1)
-    parser.add_argument('--pp_size', type=int, default=1)
+
     parser.add_argument(
         '--max_prompt_embedding_table_size',
         '--max_multimodal_len',
@@ -130,15 +129,6 @@ def parse_arguments():
         default=argparse.SUPPRESS,
         help=
         'Deprecated. Set this option to enable is equvilient to `--kv_cache_type paged` for transformer based models.'
-    )
-    parser.add_argument(
-        '--use_fused_mlp',
-        default=False,
-        action='store_true',
-        help=
-        'Enable horizontal fusion in GatedMLP, reduces layer input traffic and potentially improves performance. '
-        'For FP8 PTQ, the downside is slight reduction of accuracy because one of the quantization scaling factors is discarded. '
-        '(An example for reference only: 0.45734 vs 0.45755 for LLaMA-v2 7B using `modelopt/examples/hf/instruct_eval/mmlu.py`).'
     )
     parser.add_argument(
         '--gather_all_token_logits',
@@ -444,9 +434,6 @@ def main():
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
-        'cp_size': args.cp_size,
-        'tp_size': args.tp_size,
-        'pp_size': args.pp_size,
         'lora_dir': args.lora_dir,
         'lora_ckpt_source': args.lora_ckpt_source,
         'max_lora_rank': args.max_lora_rank,
@@ -465,6 +452,11 @@ def main():
         ckpt_dir = ckpt_dir_or_model_config
 
     model_config = PretrainedConfig.from_json_file(config_path)
+
+    # avoid ValueError if not supported quantization is chosen with use_fused_mlp
+    quant_algo = model_config.quantization.quant_algo
+    if quant_algo and quant_algo != QuantAlgo.FP8:
+        kwargs['use_fused_mlp'] = False
 
     if args.build_config is None:
         if args.multiple_profiles == "enable" and args.opt_num_tokens is not None:

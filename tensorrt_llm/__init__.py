@@ -48,12 +48,15 @@ from .functional import Tensor, constant
 from .hlapi.llm import LLM, LlmArgs, SamplingParams
 from .logger import logger
 from .mapping import Mapping
+from .models.automodel import AutoConfig, AutoModelForCausalLM
 from .module import Module
 from .network import Network, net_guard
 from .parameter import Parameter
 from .version import __version__
 
 __all__ = [
+    'AutoConfig',
+    'AutoModelForCausalLM',
     'logger',
     'str_dtype_to_trt',
     'torch_dtype_to_trt',

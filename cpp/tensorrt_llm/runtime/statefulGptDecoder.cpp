@@ -55,7 +55,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 
     dOutput->newTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput->finished
+    dOutput->finishReasons
         = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     dOutput->finishedSum = mBufferManager.pinnedPool(ITensor::makeShape({1}), nvSizeType);
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -129,9 +129,9 @@ void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWid
     dOutput.newTokens->reshape(batchSizeXbeamWidth);
     mBufferManager.setZero(*dOutput.newTokens);
     dOutput.parentIds->reshape(outputIdsShape);
-    dOutput.finished->reshape(batchSizeXbeamWidth);
-    dInput.finished = ITensor::view(dOutput.finished);
-    mBufferManager.setZero(*dOutput.finished);
+    dOutput.finishReasons->reshape(batchSizeXbeamWidth);
+    dInput.finishReasons = ITensor::view(dOutput.finishReasons);
+    mBufferManager.setZero(*dOutput.finishReasons);
 
     dOutput.finishedSum->reshape(batchSizeShape);
     mBufferManager.setZero(*dOutput.finishedSum);
@@ -266,7 +266,7 @@ void StatefulGptDecoder::newBatch(
     // output
     auto& dOutput = *mDecodingOutput;
     manager.setZero(*dOutput.newTokens);
-    manager.setZero(*dOutput.finished);
+    manager.setZero(*dOutput.finishReasons);
     manager.setZero(*dOutput.finishedSum);
 
     // If outputs contains cumLogProbs, use that

@@ -42,9 +42,6 @@ Install the dependencies and setup `git-lfs`.
 # Install dependencies
 pip install -r requirements.txt
 
-# Install NeMo and Megatron-Core required by Modelopt
-bash ../quantization/install_requirements.sh
-
 # Setup git-lfs
 git lfs install
 ```

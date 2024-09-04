@@ -84,6 +84,30 @@ Welcome to TensorRT-LLM's Documentation!
    _cpp_gen/executor.rst
    _cpp_gen/runtime.rst
 
+
+.. toctree::
+   :maxdepth: 2
+   :caption: High Level API Examples
+   :hidden:
+
+   high-level-api-examples/high_level_api_examples
+   high-level-api-examples/introduction.md
+   high-level-api-examples/advanced.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Python API
+   :hidden:
+
+   python-api/tensorrt_llm.layers.rst
+   python-api/tensorrt_llm.functional.rst
+   python-api/tensorrt_llm.models.rst
+   python-api/tensorrt_llm.plugin.rst
+   python-api/tensorrt_llm.quantization.rst
+   python-api/tensorrt_llm.runtime.rst
+
+
 .. toctree::
    :maxdepth: 2
    :caption: Blogs

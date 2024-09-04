@@ -332,6 +332,7 @@ GptJsonConfig parseJson(InputType&& input)
     }();
 
     auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
+    modelConfig.setModelName(name);
 
     parseBuilderConfig(modelConfig, builderConfig);
 

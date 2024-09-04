@@ -5,7 +5,9 @@ __pycache__/
 *.cache
 *.nsys-rep
 .VSCodeCounter
-build*/
+cpp/build*
+build
+!tensorrt_llm/bench/build
 !builders/
 *.egg-info/
 .coverage

@@ -20,8 +20,14 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include <optional>
 #include <utility>
+
+namespace tensorrt_llm::batch_manager
+{
+class LookaheadDecodingBuffers;
+}
 
 namespace tensorrt_llm::runtime
 {
@@ -81,10 +87,10 @@ public:
                                          // Vector of views on newTokensSteps for each token
 
     // optional parameters
-    TensorPtr finished; // [BS, BM], set to true by decoding if any of the stop conditions are met or if
-                        // DecodingInput.finished is true. In beam search and to determine whether to stop according to
-                        // DecodingInput.sequenceLimitLength
-    TensorPtr finishedSum; // [BS], the sum of finished sequences per request, in pinned memory
+    TensorPtr finishReasons; // [BS, BM], set to FinishedState by decoding if any of the stop conditions are met or if
+                             // DecodingInput.finished is true. In beam search and to determine whether to stop
+                             // according to DecodingInput.sequenceLimitLength
+    TensorPtr finishedSum;   // [BS], the sum of finished sequences per request, in pinned memory
 
     // mandatory parameters for beam search
     TensorPtr logProbs;         // [BS, BM, MSL], must be float*
@@ -110,6 +116,8 @@ public:
     std::optional<SpeculativeDecodingOutputs> speculativeDecodingOutputs;
 
     std::optional<ExplicitDraftTokensBuffers::Inputs> explicitDraftTokensBuffers;
+
+    std::optional<LookaheadDecodingBuffers> lookaheadOutputs;
 };
 
 } // namespace tensorrt_llm::runtime

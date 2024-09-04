@@ -488,7 +488,7 @@ class BuildConfig:
     use_refit: bool = False
     input_timing_cache: str = None
     output_timing_cache: str = None
-    lora_config: LoraConfig = LoraConfig()
+    lora_config: LoraConfig = field(default_factory=LoraConfig)
     auto_parallel_config: AutoParallelConfig = field(
         default_factory=AutoParallelConfig)
     weight_sparsity: bool = False
@@ -1131,10 +1131,17 @@ def build(model: PretrainedModel,
                                        build_config.output_timing_cache)
         assert ok, "Failed to save timing cache."
 
-    import resource
-    rusage_c = resource.getrusage(resource.RUSAGE_CHILDREN)
-    rusage_s = resource.getrusage(resource.RUSAGE_SELF)
+    import psutil
+
+    # Get the current process
+    current_process = psutil.Process()
+    # Get resource usage for the current process (self)
+    rusage_s = current_process.memory_info()
+    # Get resource usage for all child processes
+    children = current_process.children(recursive=True)
+    rusage_c = [child.memory_info() for child in children]
     logger.info(
-        f"Build phase peak memory: {rusage_s.ru_maxrss / 1024:.2f} MB, children: {rusage_c.ru_maxrss / 1024:.2f} MB"
+        f"Build phase peak memory: {rusage_s.rss / 1024 / 1024:.2f} MB, children: {sum([ru.rss for ru in rusage_c]) / 1024 / 1024:.2f} MB"
     )
+
     return Engine(engine_config, engine, managed_weights)

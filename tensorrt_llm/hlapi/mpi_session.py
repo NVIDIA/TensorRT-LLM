@@ -123,7 +123,8 @@ class MpiCommSession(MpiSession):
             )
 
         if mpi_rank() != 0:
-            raise RuntimeError('only rank 0 can start multi-node session')
+            raise RuntimeError(
+                f'only rank 0 can start multi-node session, got {mpi_rank()}')
         if not external_mpi_comm_available(n_workers):
             raise RuntimeError('The LLM instance should be launched by mpirun.')
 

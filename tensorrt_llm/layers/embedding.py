@@ -44,8 +44,7 @@ class Embedding(Module):
                  tp_size: int = 1,
                  tp_group: Optional[list] = None,
                  sharding_dim: int = 0,
-                 tp_rank: Optional[int] = None,
-                 share_embedding_table: bool = False):
+                 tp_rank: Optional[int] = None):
         super().__init__()
         # num_embeddings records the total vocab size no matter using TP or not
         self.num_embeddings = num_embeddings
@@ -56,7 +55,6 @@ class Embedding(Module):
         self.tp_rank = tp_rank
         self.dtype = dtype
         self.tp_dim = sharding_dim
-        self.share_embedding_table = share_embedding_table
 
         if sharding_dim == 1:
             self.weight = Parameter(shape=(self.num_embeddings,
@@ -91,11 +89,12 @@ class Embedding(Module):
                                                  shard_size)
         param.value = loaded_weight
 
-    def postprocess(self, tllm_key, weights):
+    def postprocess(self, tllm_key, weights, **kwargs):
+        config = kwargs.get("config", None)
         if weights is None:
             return {}
         weights = weights.to(str_dtype_to_torch(self.dtype))
-        if self.share_embedding_table:
+        if config.share_embedding_table:
             return {}
         else:
             weights = weights.clone()
@@ -119,10 +118,9 @@ class PromptTuningEmbedding(Embedding):
                  tp_size=1,
                  tp_group=None,
                  sharding_dim=0,
-                 tp_rank=0,
-                 share_embedding_table=False):
+                 tp_rank=0):
         super().__init__(num_embeddings, embedding_dim, dtype, tp_size,
-                         tp_group, sharding_dim, tp_rank, share_embedding_table)
+                         tp_group, sharding_dim, tp_rank)
         if vocab_size is None:
             vocab_size = num_embeddings
         self.vocab_size = vocab_size

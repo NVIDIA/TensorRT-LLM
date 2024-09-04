@@ -7,7 +7,6 @@ import torch
 import tensorrt as trt
 
 from ..logger import logger
-from .._ipc_utils import set_peer_access
 from .._utils import torch_to_numpy, trt_dtype_to_torch, mpi_world_size, mpi_rank
 from ..plugin.plugin import CustomAllReduceHelper
 from .generation import ModelConfig, SamplingConfig, LoraManager, GenerationSession
@@ -329,11 +328,10 @@ class EncDecModelRunner:
             device=self.device).contiguous()
 
         if self.encoder_runtime_mapping.tp_size > 1:
-            is_p2p_supported = set_peer_access(self.encoder_runtime_mapping)
             ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.encoder_runtime_mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.encoder_runtime_mapping.tp_size), is_p2p_supported)
+                    self.encoder_runtime_mapping.tp_size))
             inputs['all_reduce_workspace'] = all_reduce_workspace
 
         if self.encoder_model_config.lora_plugin:

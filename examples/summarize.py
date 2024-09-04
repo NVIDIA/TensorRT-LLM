@@ -141,7 +141,7 @@ def main(args):
         bad_words_list = tensorrt_llm.runtime.decode_words_list(
             args.bad_words, tokenizer)
 
-    # random_seed = 5
+    random_seed = args.random_seed
     temperature = args.temperature
     num_beams = args.num_beams
     length_penalty = args.length_penalty
@@ -149,6 +149,7 @@ def main(args):
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
+    torch.manual_seed(random_seed)
 
     output_dir = Path(args.output_dir) if args.output_dir else None
     if output_dir is not None:
@@ -204,8 +205,10 @@ def main(args):
             else:
                 if 'qwen' in model_name.lower() and 'qwen2' in model_version:
                     messages = [{
-                        "role": "system",
-                        "content": "You are a helpful assistant."
+                        "role":
+                        "system",
+                        "content":
+                        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
                     }, {
                         "role": "user",
                         "content": curr_text
@@ -348,18 +351,28 @@ def main(args):
             local_early_stopping = "never"
 
         with torch.no_grad():
+            hf_config = {}
+            if num_beams == 1:
+                hf_config.update({
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "do_sample": True,
+                })
+            else:
+                hf_config.update({
+                    "num_beams": num_beams,
+                    "num_return_sequences": num_beams,
+                    "early_stopping": local_early_stopping,
+                })
             outputs = model.generate(batch_input_ids,
                                      max_new_tokens=output_len,
-                                     top_k=top_k,
                                      temperature=temperature,
                                      eos_token_id=end_id,
                                      pad_token_id=pad_id,
-                                     num_beams=num_beams,
-                                     num_return_sequences=num_beams,
                                      length_penalty=length_penalty,
-                                     early_stopping=local_early_stopping,
                                      output_scores=True,
-                                     return_dict_in_generate=True)
+                                     return_dict_in_generate=True,
+                                     **hf_config)
             if eval_ppl and batch_size == 1:
                 # model.generate cannot return context logits?
                 # Will cause additional latency

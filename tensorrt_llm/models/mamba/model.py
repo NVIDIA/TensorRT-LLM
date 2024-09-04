@@ -21,7 +21,7 @@ from ..._common import default_net
 from ..._utils import str_dtype_to_trt
 from ...functional import (Tensor, arange, cast, concat, expand,
                            gather_last_token_logits, shape, unsqueeze)
-from ...layers import Embedding, LayerNorm, Linear, Mamba, Mamba2, RmsNorm
+from ...layers import ColumnLinear, Embedding, LayerNorm, Mamba, Mamba2, RmsNorm
 from ...module import Module, ModuleList
 from ...plugin import current_all_reduce_helper
 from ..generation_mixin import GenerationMixin
@@ -38,6 +38,7 @@ class MambaLayer(Module):
         self.last_layer = layer_idx == n_layer - 1
 
         if config.mamba_version == 'Mamba1':
+            assert config.mapping.tp_size == 1, "Mamba1 can not support tensor parallelism."
             self.ssm = Mamba(config.hidden_size,
                              config.rnn_hidden_size,
                              d_state=config.state_size,
@@ -54,7 +55,9 @@ class MambaLayer(Module):
                               chunk_size=config.chunk_size,
                               bias=config.use_bias,
                               rmsnorm=config.ssm_rmsnorm,
-                              dtype=config.dtype)
+                              dtype=config.dtype,
+                              tp_group=config.mapping.tp_group,
+                              tp_size=config.mapping.tp_size)
         if config.rms_norm:
             self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                            eps=config.norm_epsilon,
@@ -105,17 +108,15 @@ class MambaModel(Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.d_conv = config.conv_kernel
-        self.d_inner = config.rnn_hidden_size
+        self.d_inner = config.rnn_hidden_size // config.mapping.tp_size
         n_layer = config.num_hidden_layers
         self.residual_in_fp32 = config.residual_in_fp32
         if config.vocab_size % config.pad_vocab_size_multiple != 0:
             config.vocab_size += config.pad_vocab_size_multiple - (
                 config.vocab_size % config.pad_vocab_size_multiple)
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            share_embedding_table=config.share_embedding_table)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
         self.layers = ModuleList(
             [MambaLayer(config, i) for i in range(n_layer)])
         if config.rms_norm:
@@ -180,10 +181,10 @@ class MambaForCausalLM(PretrainedModel):
 
         self.config = config
         self.mamba_version = config.mamba_version
-        self.d_inner = config.rnn_hidden_size
+        self.d_inner = config.rnn_hidden_size // config.mapping.tp_size
         self.d_conv = config.conv_kernel
         self.d_state = config.state_size
-        self.conv_dim = config.rnn_conv_dim_size
+        self.conv_dim = config.rnn_conv_dim_size // config.mapping.tp_size
         self.gather_context_logits = False
 
         if isinstance(logits_dtype, str):
@@ -193,11 +194,13 @@ class MambaForCausalLM(PretrainedModel):
             self._logits_dtype = logits_dtype
 
         self.backbone = MambaModel(config)
-        self.lm_head = Linear(config.hidden_size,
-                              config.vocab_size,
-                              bias=False,
-                              dtype=dtype,
-                              gather_output=False)
+        self.lm_head = ColumnLinear(config.hidden_size,
+                                    config.vocab_size,
+                                    bias=False,
+                                    dtype=dtype,
+                                    tp_group=config.mapping.tp_group,
+                                    tp_size=config.mapping.tp_size,
+                                    gather_output=True)
 
     def __post_init__(self):
         return

@@ -149,11 +149,9 @@ class RecurrentGemmaModel(Module):
         self.lru_width = config.rnn_hidden_size
         n_layer = config.num_hidden_layers
 
-        self.vocab_embedding = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.dtype,
-            share_embedding_table=config.share_embedding_table)
+        self.vocab_embedding = Embedding(config.vocab_size,
+                                         config.hidden_size,
+                                         dtype=config.dtype)
         self.layers = ModuleList(
             [ResidualLayer(config, layer_idx=i) for i in range(n_layer)])
 

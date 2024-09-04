@@ -585,9 +585,9 @@ def quantize(hf_model_dir: str,
                                               use_fast=False,
                                               trust_remote_code=True)
     dataset = load_calib_dataset(calib_dataset)
+
     act_range = capture_activation_range(hf_model.cuda(), tokenizer, dataset)
     smoother = {}
-
     if config.quantization.use_plugin_sq:
         smooth_baichuan_model(hf_model, act_range,
                               config.quantization.smoothquant_val, smoother)
