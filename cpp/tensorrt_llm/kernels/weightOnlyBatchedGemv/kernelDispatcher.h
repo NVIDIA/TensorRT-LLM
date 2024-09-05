@@ -41,24 +41,12 @@ void dispatcher(Params& params, cudaStream_t s)
             return;                                                                                                    \
         }                                                                                                              \
     } while (0);
-    if constexpr (EnableZero)
-    {
-        // clang-format off
-        DISPATCHER_FOR_M(1, 1, 4, 128);
-        DISPATCHER_FOR_M(2, 2, 4, 128);
-        DISPATCHER_FOR_M(3, 3, 4, 128);
-        DISPATCHER_FOR_M(4, 4, 4, 128);
-        // clang-format on
-    }
-    else
-    {
-        // clang-format off
-        DISPATCHER_FOR_M(1, 1, 8, 128);
-        DISPATCHER_FOR_M(2, 2, 8, 128);
-        DISPATCHER_FOR_M(3, 3, 8, 128);
-        DISPATCHER_FOR_M(4, 4, 8, 128);
-        // clang-format on
-    }
+    // clang-format off
+    DISPATCHER_FOR_M(1, 1, 4, 128);
+    DISPATCHER_FOR_M(2, 2, 4, 128);
+    DISPATCHER_FOR_M(3, 3, 4, 128);
+    DISPATCHER_FOR_M(4, 4, 4, 128);
+    // clang-format on
     throw std::runtime_error("unsupported m");
 #undef DISPATCHER_FOR_M
 }
