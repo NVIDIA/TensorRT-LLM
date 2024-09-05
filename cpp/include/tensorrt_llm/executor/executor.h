@@ -54,9 +54,9 @@ public:
         std::optional<FloatType> const& topP = std::nullopt, std::optional<FloatType> const& topPMin = std::nullopt,
         std::optional<TokenIdType> const& topPResetIds = std::nullopt,
         std::optional<FloatType> const& topPDecay = std::nullopt,
-        std::optional<RandomSeedType> const& randomSeed = std::nullopt,
+        std::optional<RandomSeedType> const& seed = std::nullopt,
         std::optional<FloatType> const& temperature = std::nullopt,
-        std::optional<SizeType32> const& minLength = std::nullopt,
+        std::optional<SizeType32> const& minTokens = std::nullopt,
         std::optional<FloatType> const& beamSearchDiversityRate = std::nullopt,
         std::optional<FloatType> const& repetitionPenalty = std::nullopt,
         std::optional<FloatType> const& presencePenalty = std::nullopt,
@@ -73,8 +73,10 @@ public:
     [[nodiscard]] std::optional<FloatType> getTopPMin() const;
     [[nodiscard]] std::optional<SizeType32> getTopPResetIds() const;
     [[nodiscard]] std::optional<FloatType> getTopPDecay() const;
+    [[nodiscard]] std::optional<RandomSeedType> getSeed() const;
     [[nodiscard]] std::optional<RandomSeedType> getRandomSeed() const;
     [[nodiscard]] std::optional<FloatType> getTemperature() const;
+    [[nodiscard]] std::optional<SizeType32> getMinTokens() const;
     [[nodiscard]] std::optional<SizeType32> getMinLength() const;
     [[nodiscard]] std::optional<FloatType> getBeamSearchDiversityRate() const;
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
@@ -90,8 +92,10 @@ public:
     void setTopPMin(std::optional<FloatType> const& topPMin);
     void setTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     void setTopPDecay(std::optional<FloatType> const& topPDecay);
+    void setSeed(std::optional<RandomSeedType> const& seed);
     void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
     void setTemperature(std::optional<FloatType> const& temperature);
+    void setMinTokens(std::optional<SizeType32> const& minTokens);
     void setMinLength(std::optional<SizeType32> const& minLength);
     void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
@@ -110,7 +114,7 @@ private:
     static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
     static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
     static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& penalty);
-    static std::optional<SizeType32> const& checkMinLength(std::optional<SizeType32> const& minLength);
+    static std::optional<SizeType32> const& checkMinTokens(std::optional<SizeType32> const& minTokens);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
@@ -130,11 +134,11 @@ private:
     /// @brief Controls decay in the top-P algorithm. The decay value. Default is 1.f
     std::optional<FloatType> mTopPDecay;
     /// @brief Controls the random seed used by the random number generator in sampling
-    std::optional<RandomSeedType> mRandomSeed;
+    std::optional<RandomSeedType> mSeed;
     /// @brief Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
     std::optional<FloatType> mTemperature;
     /// @brief Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
-    std::optional<SizeType32> mMinLength;
+    std::optional<SizeType32> mMinTokens;
     /// @brief Controls the diversity in beam search.
     std::optional<FloatType> mBeamSearchDiversityRate;
     /// @brief Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f.
@@ -201,15 +205,21 @@ private:
 class PromptTuningConfig
 {
 public:
-    explicit PromptTuningConfig(Tensor embeddingTable);
+    explicit PromptTuningConfig(
+        Tensor embeddingTable, std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt);
 
     [[nodiscard]] Tensor getEmbeddingTable() const;
+
+    [[nodiscard]] std::optional<VecTokenExtraIds> getInputTokenExtraIds() const;
 
 private:
     friend class Serialization;
     /// @brief The prompt embedding table. Expected shape: [task vocab_size, hidden_size]. Data type must match model
     /// weights.
     Tensor mEmbeddingTable;
+
+    /// @brief The input token extra ids for KV Cache reuse when p-tuning is enabled
+    std::optional<VecTokenExtraIds> mInputTokenExtraIds;
 };
 
 /// @brief Configuration for LoRA
@@ -286,6 +296,7 @@ public:
     [[nodiscard]] VecTokens popFirstGenTokens() && noexcept;
     [[nodiscard]] void const* getState() const noexcept;
     [[nodiscard]] void* getState() noexcept;
+    [[nodiscard]] void* releaseState() noexcept;
 
 private:
     friend class Serialization;
@@ -308,12 +319,13 @@ public:
     /// @brief The Request constructor
 
     /// @param inputTokenIds The input token ids
-    /// @param maxNewTokens  The maximum number of tokens to generate
+    /// @param maxTokens  The maximum number of tokens to generate
     /// @param streaming Indicates if the responses should be streamed or not. Default is false.
     /// @param samplingConfig The sampling configuration
     /// @param outputConfig The output configuration
     /// @param endId The end token id
     /// @param padId The pad token id
+    /// @param positionIds The input position ids
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]
@@ -329,9 +341,12 @@ public:
     /// @param encoderInputFeatures Encoder input features for multimodal models.
     /// @param encoderOutputLength Encoder output length if encoder input and output have different lengths (due to
     /// convolution down-sampling, etc.)
-    Request(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming = false,
+    /// @param type Indicate the request type for disaggregated serving mode.
+    /// @param contextPhaseParams Generated token ID  from context only executor.
+    Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
+        std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
@@ -342,6 +357,7 @@ public:
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
+        RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt);
@@ -356,12 +372,14 @@ public:
     ~Request();
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
+    [[nodiscard]] SizeType32 getMaxTokens() const;
     [[nodiscard]] SizeType32 getMaxNewTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
     [[nodiscard]] OutputConfig getOutputConfig() const;
     [[nodiscard]] std::optional<SizeType32> getEndId() const;
     [[nodiscard]] std::optional<SizeType32> getPadId() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> getPositionIds() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
@@ -377,12 +395,14 @@ public:
     [[nodiscard]] std::optional<ContextPhaseParams> const& getContextPhaseParams() const;
     [[nodiscard]] std::optional<Tensor> getEncoderInputFeatures() const;
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
+    [[nodiscard]] RequestType getRequestType() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
     void setOutputConfig(OutputConfig const& outputConfig);
     void setEndId(SizeType32 endId);
     void setPadId(SizeType32 padId);
+    void setPositionIds(std::vector<SizeType32> const& positionIds);
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
@@ -395,6 +415,7 @@ public:
     void setClientId(IdType clientId);
     void setPriority(PriorityType priority);
     void setReturnAllGeneratedTokens(bool returnAllGeneratedTokens);
+    void setRequestType(RequestType const& requestType);
     void setContextPhaseParams(ContextPhaseParams contextPhaseParams);
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
@@ -815,7 +836,8 @@ public:
         std::optional<DecodingConfig> decodingConfig = std::nullopt, float gpuWeightsPercent = 1,
         std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
-        std::optional<DebugConfig> debugConfig = std::nullopt);
+        std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
+        uint64_t maxSeqIdleMicroseconds = 180000000);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -835,6 +857,8 @@ public:
     [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
     [[nodiscard]] ExtendedRuntimePerfKnobConfig getExtendedRuntimePerfKnobConfig() const;
     [[nodiscard]] std::optional<DebugConfig> getDebugConfig() const;
+    [[nodiscard]] SizeType32 getRecvPollPeriodMs() const;
+    [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -854,6 +878,8 @@ public:
     void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
     void setDebugConfig(DebugConfig const& debugConfig);
+    void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
+    void setMaxSeqIdleMicroseconds(uint64_t maxNumTokens);
 
 private:
     friend class Serialization;
@@ -909,6 +935,13 @@ private:
 
     /// @brief Debugging configuration.
     std::optional<DebugConfig> mDebugConfig;
+
+    /// @brief The time in ms between polls for new communication in orchestrator mode. Use 0 for busy loop.
+    SizeType32 mRecvPollPeriodMs;
+
+    /// @brief The maximum time in microseconds a scheduled request can remain idle before getting terminated. Default
+    /// is 3 minutes.
+    uint64_t mMaxSeqIdleMicroseconds;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
@@ -926,11 +959,11 @@ public:
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
         ModelType modelType, ExecutorConfig const& executorConfig);
 
-    Executor(std::vector<uint8_t> const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
+    Executor(BufferView const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
         ExecutorConfig const& executorConfig);
 
-    Executor(std::vector<uint8_t> const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
-        std::vector<uint8_t> const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
+    Executor(BufferView const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
+        BufferView const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
         ExecutorConfig const& executorConfig);
 
     Executor(std::shared_ptr<Model> model, ExecutorConfig const& executorConfig);

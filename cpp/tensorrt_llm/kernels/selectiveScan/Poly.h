@@ -632,7 +632,7 @@ FT_DEV_CEXPR auto get(Poly<bias_, Ts_...> x_)
 template <auto A_, class... Ts_>
 FT_DEV_CEXPR auto ltzeroImp(Poly<A_, Ts_...> x_)
 {
-    constexpr decltype(A_) p2 = ((-A_) ^ (-A_ - 1)) / 2 + 1;
+    constexpr decltype(A_) p2 = A_ ? ((-A_) ^ (-A_ - 1)) / 2 + 1 : 0;
 
     constexpr auto n1 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<1>))::Terms>;
     constexpr auto n2 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<p2>))::Terms>;
@@ -664,7 +664,7 @@ FT_DEV_CEXPR auto ltzeroImp(Poly<A_, Ts_...> x_)
 template <auto A_, class... Ts_>
 FT_DEV_CEXPR auto lezeroImp(Poly<A_, Ts_...> x_)
 {
-    constexpr decltype(A_) p2 = ((+A_) ^ (+A_ - 1)) / 2 + 1;
+    constexpr decltype(A_) p2 = A_ ? ((+A_) ^ (+A_ - 1)) / 2 + 1 : 0;
 
     constexpr auto n1 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<1>))::Terms>;
     constexpr auto n2 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<p2>))::Terms>;
@@ -696,7 +696,7 @@ FT_DEV_CEXPR auto lezeroImp(Poly<A_, Ts_...> x_)
 template <auto A_, class... Ts_>
 FT_DEV_CEXPR auto gtzeroImp(Poly<A_, Ts_...> x_)
 {
-    constexpr decltype(A_) p2 = ((+A_) ^ (+A_ - 1)) / 2 + 1;
+    constexpr decltype(A_) p2 = A_ ? ((+A_) ^ (+A_ - 1)) / 2 + 1 : 0;
 
     constexpr auto n1 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<1>))::Terms>;
     constexpr auto n2 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<p2>))::Terms>;
@@ -728,7 +728,7 @@ FT_DEV_CEXPR auto gtzeroImp(Poly<A_, Ts_...> x_)
 template <auto A_, class... Ts_>
 FT_DEV_CEXPR auto gezeroImp(Poly<A_, Ts_...> x_)
 {
-    constexpr decltype(A_) p2 = ((-A_) ^ (-A_ - 1)) / 2 + 1;
+    constexpr decltype(A_) p2 = A_ ? ((-A_) ^ (-A_ - 1)) / 2 + 1 : 0;
 
     constexpr auto n1 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<1>))::Terms>;
     constexpr auto n2 = std::tuple_size_v<typename decltype((x_ - cn<A_>) .filterDiv(cn<p2>))::Terms>;
@@ -1152,29 +1152,29 @@ FT_DEV_CEXPR auto swizzle(Poly<biasA_, TsA_...> a_)
 
     if constexpr (decltype(a_)::divisible(cn<line_>))
     {
-        if constexpr (decltype(a_ / cn<line_>)::divisible(cn<mode_ / unit_>)
-            && decltype(a_ % cn<line_>)::divisible(cn<unit_>))
+        if constexpr (decltype(Poly{a_ / cn<line_>})::divisible(cn<mode_ / unit_>)
+            && decltype(Poly{a_ % cn<line_>})::divisible(cn<unit_>))
         {
             if constexpr (mode_ == unit_)
                 return get(a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<UNROLL>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<UNROLL>))
                 return biasA_ + get<ID>(a_) + (get<UNROLL>(a_) ^ get(a_ / cn<line_> % cn<mode_ / unit_> * cn<unit_>))
                     + get<NONE>(a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<ID>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<ID>))
                 return biasA_ + (get<ID>(a_) ^ get(a_ / cn<line_> % cn<mode_ / unit_> * cn<unit_>)) + get<UNROLL>(a_)
                     + get<NONE>(a_);
             else
                 return get(a_) ^ get(a_ / cn<line_> % cn<mode_ / unit_> * cn<unit_>);
         }
 #if 1
-        else if constexpr (decltype(a_ % cn<line_>)::divisible(cn<unit_>))
+        else if constexpr (decltype(Poly{a_ % cn<line_>})::divisible(cn<unit_>))
         {
             if constexpr (mode_ == unit_)
                 return get(a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<UNROLL>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<UNROLL>))
                 return biasA_ + get<ID>(a_)
                     + (get<UNROLL>(a_) ^ get(a_ / cn<line_>) % cn<mode_ / unit_> * cn<unit_>) +get<NONE>(a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<ID>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<ID>))
                 return biasA_ + (get<ID>(a_) ^ get(a_ / cn<line_>) % cn<mode_ / unit_> * cn<unit_>) +get<UNROLL>(a_)
                     + get<NONE>(a_);
 #endif
@@ -1203,16 +1203,16 @@ FT_DEV_CEXPR auto swizzle(Poly<biasA_, TsA_...> a_, Poly<biasB_, TsB_...> b_)
 
     if constexpr (decltype(a_)::divisible(cn<line_>))
     {
-        if constexpr (decltype(a_ / cn<line_>)::divisible(cn<mode_ / unit_>)
-            && decltype(a_ % cn<line_>)::divisible(cn<unit_>))
+        if constexpr (decltype(Poly{a_ / cn<line_>})::divisible(cn<mode_ / unit_>)
+            && decltype(Poly{a_ % cn<line_>})::divisible(cn<unit_>))
         {
             if constexpr (mode_ == unit_)
                 return get(b_ + a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<UNROLL>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<UNROLL>))
                 return biasB_ + biasA_ + get<ID>(b_ + a_)
                     + (get<UNROLL>(b_) + (get<UNROLL>(a_) ^ get(a_ / cn<line_> % cn<mode_ / unit_> * cn<unit_>)))
                     + get<NONE>(b_ + a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<ID>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<ID>))
                 return biasB_ + biasA_
                     + (get<ID>(b_) + (get<ID>(a_) ^ get(a_ / cn<line_> % cn<mode_ / unit_> * cn<unit_>)))
                     + get<UNROLL>(b_ + a_) + get<NONE>(b_ + a_);
@@ -1220,15 +1220,15 @@ FT_DEV_CEXPR auto swizzle(Poly<biasA_, TsA_...> a_, Poly<biasB_, TsB_...> b_)
                 return get(b_) + (get(a_) ^ get(a_ / cn<line_> % cn<mode_ / unit_> * cn<unit_>));
         }
 #if 1
-        else if constexpr (decltype(a_ % cn<line_>)::divisible(cn<unit_>))
+        else if constexpr (decltype(Poly{a_ % cn<line_>})::divisible(cn<unit_>))
         {
             if constexpr (mode_ == unit_)
                 return get(b_ + a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<UNROLL>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<UNROLL>))
                 return biasB_ + biasA_ + get<ID>(b_ + a_)
                     + (get<UNROLL>(b_) + (get<UNROLL>(a_) ^ get(a_ / cn<line_>) % cn<mode_ / unit_> * cn<unit_>) )
                     + get<NONE>(b_ + a_);
-            else if constexpr (decltype(a_ % cn<line_> / cn<unit_>)::hasOnly(cn<ID>))
+            else if constexpr (decltype(Poly{a_ % cn<line_> / cn<unit_>})::hasOnly(cn<ID>))
                 return biasB_ + biasA_
                     + (get<ID>(b_) + (get<ID>(a_) ^ get(a_ / cn<line_>) % cn<mode_ / unit_> * cn<unit_>) )
                     + get<UNROLL>(b_ + a_) + get<NONE>(b_ + a_);

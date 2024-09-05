@@ -25,11 +25,11 @@ import torch
 
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.convert_utils import dup_kv_weight, split
 from tensorrt_llm.models.deci.layer_config import (AttentionConfig,
                                                    AttentionImplementation,
                                                    DeciLayerConfig, FFNConfig,
                                                    FFNImplementation)
-from tensorrt_llm.models.llama.convert import dup_kv_weight, split
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 

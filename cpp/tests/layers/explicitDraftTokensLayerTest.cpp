@@ -824,6 +824,8 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
             mSamplingParams.getMaxDraftPathLen(), mSamplingParams.getVocabSize()}),
         dataType);
     mPackedTemperatures = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), dataType);
+    mDecodingWorkspace = std::make_shared<tensorrt_llm::runtime::DecodingLayerWorkspace>(mBufferManager, decodingDomain,
+        TRTDataType<typename T::DataType>::value, mExplicitDraftTokensLayer->getWorkspaceSize());
 }
 
 template <typename T>
@@ -875,7 +877,8 @@ void ExplicitDraftTokensLayerTest<T>::setup()
     setupParams->temperatures = mOutputTemperatures;
     setupParams->dtype = TRTDataType<DataType>::value;
 
-    mExplicitDraftTokensLayer->setup(mSamplingParams.getBatchSize(), 1, mBatchSlots, setupParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mExplicitDraftTokensLayer->setup(mSamplingParams.getBatchSize(), 1, mBatchSlots, setupParams, mDecodingWorkspace);
 
     mStream->synchronize();
 
@@ -907,8 +910,7 @@ void ExplicitDraftTokensLayerTest<T>::setup()
         {
             for (SizeType32 ti = 0; ti < nextDraftTokens[bi][pi].size(); ++ti)
             {
-                auto idx
-                    = tc::flat_index3(bi, pi, ti, mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen());
+                auto idx = flat_index3(bi, pi, ti, mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen());
                 nextDraftTokensRange[idx] = nextDraftTokens[bi][pi][ti];
                 lastDraftTokensRange[idx] = lastDraftTokens[bi][pi][ti];
                 nextDraftIndicesRange[idx] = nextDraftIndices[bi][pi][ti];
@@ -1079,14 +1081,13 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
             for (SizeType32 ti = 0; ti < generationLengths[bi]; ++ti)
             {
                 auto const batchSlot = batchSlots[bi];
-                auto const maskIdx = tc::flat_index3(
+                auto const maskIdx = flat_index3(
                     bi, ti, 0, mNetwork.getMaxNextGenerationLength(), mNetwork.getMaxNextGenerationLength());
                 auto const bitmask = boolArrayToBitmask(masks.begin() + maskIdx, mNetwork.getMaxNextGenerationLength());
                 for (SizeType32 mi = 0; mi < bitmask.size(); ++mi)
                 {
-                    auto const packedMaskIdx
-                        = tc::flat_index3(batchSlot, ti, mi, mSamplingParams.getMaxDecodingTokens(),
-                            static_cast<SizeType32>(divUp(mSamplingParams.getMaxDecodingTokens(), 32)));
+                    auto const packedMaskIdx = flat_index3(batchSlot, ti, mi, mSamplingParams.getMaxDecodingTokens(),
+                        static_cast<SizeType32>(divUp(mSamplingParams.getMaxDecodingTokens(), 32)));
                     EXPECT_EQ(bitmask[mi], packedMasks[packedMaskIdx]) << " bi: " << bi << " ti: " << ti;
                 }
             }
@@ -1132,7 +1133,7 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
             // Check draft tokens for the next iteration.
             for (SizeType32 ti = 0; ti < generatedLength - 1; ++ti)
             {
-                auto const idx = tc::flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingDraftTokens());
+                auto const idx = flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingDraftTokens());
                 EXPECT_EQ(outputNextDraftTokens[idx], compressedDraftTokens[compressedIdx + ti + 1])
                     << " bi: " << bi << " ti: " << ti;
             }
@@ -1160,7 +1161,7 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
             // Check pos ids for the next iteration.
             for (SizeType32 ti = 0; ti < generatedLength; ++ti)
             {
-                auto const idx = tc::flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingTokens());
+                auto const idx = flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingTokens());
                 // Minus -1 to account for context phase correction of pos ids
                 EXPECT_EQ(nextPosIds[idx], packedPosIds[compressedIdx + ti] - 1) << " bi: " << bi << " ti: " << ti;
             }
@@ -1181,7 +1182,7 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
             {
                 for (SizeType32 ti = 0; ti < nextDraftTokens[bi][pi].size(); ++ti)
                 {
-                    auto idx = tc::flat_index3(
+                    auto idx = flat_index3(
                         batchSlot, pi, ti, mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen());
                     EXPECT_EQ(nextDraftTokensRange[idx], nextDraftTokens[bi][pi][ti])
                         << "bi: " << bi << " pi: " << pi << " ti: " << ti;
@@ -1228,9 +1229,9 @@ void ExplicitDraftTokensLayerTest<T>::checkLayerResult()
                 {
                     for (SizeType32 vi = 0; vi < mSamplingParams.getVocabSize(); ++vi)
                     {
-                        auto const outProbIdx = tc::flat_index4(batchSlot, pi, ti, vi, mSamplingParams.getMaxNumPaths(),
+                        auto const outProbIdx = flat_index4(batchSlot, pi, ti, vi, mSamplingParams.getMaxNumPaths(),
                             mSamplingParams.getMaxDraftPathLen(), mSamplingParams.getVocabSize());
-                        auto const inProbIdx = tc::flat_index4(bi, pi, ti, vi, mSamplingParams.getMaxNumPaths(),
+                        auto const inProbIdx = flat_index4(bi, pi, ti, vi, mSamplingParams.getMaxNumPaths(),
                             mSamplingParams.getMaxDraftPathLen(), mSamplingParams.getVocabSize());
                         EXPECT_EQ(outDraftProbs[outProbIdx], inDraftProbs[inProbIdx])
                             << "bi: " << bi << " pi: " << pi << " ti: " << ti << " vi: " << vi;
@@ -1368,8 +1369,8 @@ void ExplicitDraftTokensLayerTest<T>::checkPackResult()
         auto const basePosId = BufferRange<SizeType32>(*mPackedPositionIdsBase)[bi];
         for (SizeType32 ti = 0; ti < maxGenLength; ++ti)
         {
-            auto const outPosOffsetIdx = tc::flat_index2(bi, ti, maxGenLength);
-            auto const inPosOffsetIdx = tc::flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingTokens());
+            auto const outPosOffsetIdx = flat_index2(bi, ti, maxGenLength);
+            auto const inPosOffsetIdx = flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingTokens());
             EXPECT_EQ(BufferRange<SizeType32>(*mPackedPositionOffsets)[outPosOffsetIdx],
                 BufferRange<SizeType32>(*mNextPosIds)[inPosOffsetIdx] - basePosId + 1)
                 << "bi: " << bi << " ti: " << ti;
@@ -1381,8 +1382,7 @@ void ExplicitDraftTokensLayerTest<T>::checkPackResult()
         for (SizeType32 mi = 0; mi < numTokens * numPackedMasks; ++mi)
         {
             auto const outMaskIdx = outputMaskStartId * numPackedMasks + mi;
-            auto const inMaskIdx
-                = tc::flat_index2(batchSlot, mi, mSamplingParams.getMaxDecodingTokens() * numPackedMasks);
+            auto const inMaskIdx = flat_index2(batchSlot, mi, mSamplingParams.getMaxDecodingTokens() * numPackedMasks);
             EXPECT_EQ(
                 BufferRange<int32_t>(*mPackedPackedMasks)[outMaskIdx], BufferRange<int32_t>(*mPackedMasks)[inMaskIdx])
                 << "bi: " << bi << " mi: " << mi;
@@ -1406,7 +1406,8 @@ void ExplicitDraftTokensLayerTest<T>::runTest(std::vector<std::string> const& pr
     auto inputTensors = createInputTensors();
     auto outputTensors = createOutputTensors();
 
-    mExplicitDraftTokensLayer->forwardAsync(outputTensors, inputTensors);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mExplicitDraftTokensLayer->forwardAsync(outputTensors, inputTensors, mDecodingWorkspace);
 
     mStream->synchronize();
 

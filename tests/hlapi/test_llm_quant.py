@@ -21,7 +21,7 @@ def test_llm_int4_awq_quantization():
 
     llm = LLM(llama_model_path, quant_config=quant_config)
 
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I"
@@ -36,7 +36,7 @@ def test_llm_fp8_quantization():
     assert quant_config.quant_mode.has_any_quant()
 
     llm = LLM(llama_model_path, quant_config=quant_config)
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I"

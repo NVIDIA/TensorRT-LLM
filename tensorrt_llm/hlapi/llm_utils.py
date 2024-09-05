@@ -56,7 +56,7 @@ from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (GpuArch, download_hf_model, download_hf_pretrained_config,
                     file_with_glob_exists, file_with_suffix_exists,
-                    print_colored, print_traceback_on_error)
+                    print_colored, print_traceback_on_error, set_docstring)
 
 
 @dataclass
@@ -151,12 +151,9 @@ class _ModelInfo:
         raise NotImplementedError()
 
 
-@dataclass
-class LlmArgs:
-    '''
-    The arguments for constructing a LLM instance.
-
-    Parameters:
+LLMARGS_STAET_DOCSTRING = "The arguments for constructing a LLM instance.\n\nParameters:\n"
+# The arguments locate in LLM class's explicit arg-list.
+LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
     model (str or Path): The model name or a local model directory.
         Note that if the value could be both a model name or a local model directory,
         the local model directory will be prioritized.
@@ -182,7 +179,9 @@ class LlmArgs:
 
     revision (str, optional): The revision of the model to use.
         Default is None.
+"""
 
+LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
     build_config (BuildConfig, default=BuildConfig()): The build configuration for the model.
         Default is an empty BuildConfig instance.
 
@@ -223,7 +222,13 @@ class LlmArgs:
         Default is None.
 
     enable_tqdm (bool, default=False): Whether to display a progress bar during model building.
-    '''
+"""
+
+
+@set_docstring(LLMARGS_STAET_DOCSTRING + LLMARGS_EXPLICIT_ARGS_DOCSTRING +
+               LLMARGS_REMAINING_ARGS_DOCSTRING)
+@dataclass
+class LlmArgs:
 
     model: Union[str, Path]
 

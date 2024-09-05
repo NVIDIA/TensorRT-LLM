@@ -232,7 +232,7 @@ class FalconForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_by_shard = kwargs.pop('load_by_shard', False)
-        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        # load_model_on_cpu is ignored here, since specify target device_map will fail when workers > 1.
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -257,10 +257,7 @@ class FalconForCausalLM(DecoderModelForCausalLM):
             weights = load_weights_from_hf_by_shard(hf_model_dir, config)
         else:
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                trust_remote_code=True,
-                torch_dtype='auto',
-                device_map='auto' if not load_model_on_cpu else 'cpu')
+                hf_model_dir, torch_dtype='auto')
             weights = load_weights_from_hf_model(hf_model, config)
 
         check_share_embedding(weights, config)

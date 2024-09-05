@@ -148,6 +148,40 @@ else()
   endif()
 endif()
 
+set(INTERNAL_CUTLASS_KERNELS_TARGET
+    tensorrt_llm_internal_cutlass_kernels_static)
+set(INTERNAL_CUTLASS_KERNELS_TARGET_ARCH ${TARGET_ARCH})
+if(BUILD_INTERNAL_CUTLASS_KERNELS)
+  add_subdirectory(kernels/internal_cutlass_kernels)
+else()
+  add_library(${INTERNAL_CUTLASS_KERNELS_TARGET} STATIC IMPORTED)
+  if(NOT WIN32) # Linux
+    if(USE_CXX11_ABI)
+      set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
+          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/libtensorrt_llm_internal_cutlass_kernels_static.a"
+      )
+    else()
+      set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
+          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/libtensorrt_llm_internal_cutlass_kernels_static.pre_cxx11.a"
+      )
+    endif()
+  else() # Windows
+    set(INTERNAL_CUTLASS_KERNELS_LIB_LOC
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernels/internal_cutlass_kernels/${INTERNAL_CUTLASS_KERNELS_TARGET_ARCH}/tensorrt_llm_internal_cutlass_kernels_static.lib"
+    )
+  endif()
+  set_property(TARGET ${INTERNAL_CUTLASS_KERNELS_TARGET}
+               PROPERTY IMPORTED_LOCATION ${INTERNAL_CUTLASS_KERNELS_LIB_LOC})
+  file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_LOC}
+       INTERNAL_CUTLASS_KERNELS_LIB_SIZE)
+  if(INTERNAL_CUTLASS_KERNELS_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The internal_cutlass_kernels library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
+    )
+  endif()
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
@@ -170,6 +204,30 @@ if(NOT WIN32)
                     DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol")
 else()
   add_custom_target(check_symbol)
+endif()
+
+if(NOT WIN32)
+  if(USE_CXX11_ABI)
+    add_custom_command(
+      OUTPUT
+        "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
+      COMMAND nm -C $<TARGET_FILE:${INTERNAL_CUTLASS_KERNELS_TARGET}> | grep -q
+              'std::__cxx11::'
+      DEPENDS ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  else()
+    add_custom_command(
+      OUTPUT
+        "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
+      COMMAND nm -C $<TARGET_FILE:${INTERNAL_CUTLASS_KERNELS_TARGET}> | grep -qv
+              'std::__cxx11::'
+      DEPENDS ${INTERNAL_CUTLASS_KERNELS_TARGET})
+  endif()
+  add_custom_target(
+    check_symbol_internal_cutlass_kernels
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol_internal_cutlass_kernels"
+  )
+else()
+  add_custom_target(check_symbol_internal_cutlass_kernels)
 endif()
 
 if(NOT WIN32)
@@ -307,10 +365,15 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
 link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
+link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
+
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
+# Cyclic dependency of internal_cutlass_kernels on TRT-LLM
+target_link_libraries(${INTERNAL_CUTLASS_KERNELS_TARGET}
+                      INTERFACE ${SHARED_TARGET})
 
 if(NOT WIN32)
   set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
@@ -321,6 +384,7 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${NVRTC_WRAPPER_TARGET})
 
 add_dependencies(${SHARED_TARGET} check_symbol)
 add_dependencies(${SHARED_TARGET} check_symbol_executor)
+add_dependencies(${SHARED_TARGET} check_symbol_internal_cutlass_kernels)
 
 if(BUILD_PYT)
   add_subdirectory(thop)

@@ -23,8 +23,8 @@ from typing import List, Optional
 import torch
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
+from tensorrt_llm._utils import supports_inflight_batching  # noqa
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.bindings import GptJsonConfig
 from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
@@ -71,13 +71,6 @@ DEFAULT_PROMPT_TEMPLATES = {
     'Qwen2ForCausalLM': QWEN_PROMPT_TEMPLATE,
     'Qwen2MoeForCausalLM': QWEN_PROMPT_TEMPLATE,
 }
-
-
-def supports_inflight_batching(engine_dir):
-    config_path = Path(engine_dir) / "config.json"
-    json_config = GptJsonConfig.parse_file(config_path)
-    model_config = json_config.model_config
-    return model_config.supports_inflight_batching
 
 
 def read_decoder_start_token_id(engine_dir):
@@ -194,7 +187,7 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
 
         # download mel filters file
         subprocess.run([
-            "wget", f"--directory-prefix={engine_dir}",
+            "wget", "-nc", f"--directory-prefix={engine_dir}",
             "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
         ],
                        check=True)

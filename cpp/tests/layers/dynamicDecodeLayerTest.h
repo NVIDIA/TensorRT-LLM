@@ -23,16 +23,9 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#include "tensorrt_llm/kernels/penaltyKernels.h"
-#include "tensorrt_llm/kernels/samplingTopKKernels.h"
-#include "tensorrt_llm/kernels/samplingTopPKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
-#include "tensorrt_llm/runtime/tllmLogger.h"
-
-#include "tensorrt_llm/common/tllmException.h"
 
 #include "tensorrt_llm/executor/types.h"
 
@@ -73,6 +66,7 @@ private:
     void SetUp() override;
 
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
+    using TensorConstPtr = tensorrt_llm::runtime::ITensor::SharedConstPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
     static uint64_t const mMaxSeed{64};
@@ -132,11 +126,12 @@ private:
     TensorPtr mNextDraftTokensDevice;
     TensorPtr mTokensPerStepDevice;
 
-    std::vector<TensorPtr> mLogitsVec;
+    std::vector<TensorConstPtr> mLogitsVec;
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::unique_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDecodeLayer;
+    std::shared_ptr<runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
     std::vector<T> mTestLogitsInit;
 

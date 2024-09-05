@@ -9,9 +9,9 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams, TokenizerBase
+from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.hlapi.llm_utils import BuildConfig, _ParallelConfig
-from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.hlapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 from tensorrt_llm.models import PretrainedConfig
 
@@ -86,7 +86,7 @@ def test_llm_loading_from_hf():
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
 
-    sampling_params = SamplingParams(max_new_tokens=8)
+    sampling_params = SamplingParams(max_tokens=8)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
@@ -108,7 +108,7 @@ def test_llm_loading_from_ckpt():
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         )
 
-        sampling_params = SamplingParams(max_new_tokens=8)
+        sampling_params = SamplingParams(max_tokens=8)
 
         for output in llm.generate(prompts, sampling_params=sampling_params):
             print(output)
@@ -165,7 +165,7 @@ def test_llm_without_tokenizer():
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
 
-    sampling_params = SamplingParams(end_id=2, pad_id=2, max_new_tokens=8)
+    sampling_params = SamplingParams(end_id=2, pad_id=2, max_tokens=8)
 
     prompts = [[23, 14, 3]]
 
@@ -212,7 +212,7 @@ def _test_llm_generate_async(model_name=default_model_name,
         world_size=world_size,
     )
 
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
 
     def test_async(streaming: bool):
 
@@ -301,14 +301,14 @@ def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
     sampling_params_list = [
         SamplingParams(end_id=-1, pad_id=-1) for _ in range(2)
     ]
-    sampling_params_list[0].max_new_tokens = 4
-    sampling_params_list[1].max_new_tokens = 8
+    sampling_params_list[0].max_tokens = 4
+    sampling_params_list[1].max_tokens = 8
 
     for i, output in enumerate(
             llm.generate(prompts, sampling_params=sampling_params_list)):
         output_len = len(output.outputs[0].token_ids)
         print(f"output_len: {output_len}")
-        assert output_len <= sampling_params_list[i].max_new_tokens
+        assert output_len <= sampling_params_list[i].max_tokens
 
 
 @force_ampere
@@ -318,19 +318,19 @@ def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
     [
         # temperature
         SamplingParams(
-            max_new_tokens=6, temperature=0.5, beam_search_diversity_rate=0.5),
+            max_tokens=6, temperature=0.5, beam_search_diversity_rate=0.5),
         # topK
-        SamplingParams(max_new_tokens=6, top_k=10, top_p=0.92),
+        SamplingParams(max_tokens=6, top_k=10, top_p=0.92),
         # topP
-        SamplingParams(max_new_tokens=6, top_p=0.92),
+        SamplingParams(max_tokens=6, top_p=0.92),
         # penalty
-        SamplingParams(max_new_tokens=8,
+        SamplingParams(max_tokens=8,
                        length_penalty=1.0,
                        presence_penalty=0.0,
                        repetition_penalty=1.0,
-                       min_length=5),
+                       min_tokens=5),
         # early stopping
-        SamplingParams(max_new_tokens=6, early_stopping=5),
+        SamplingParams(max_tokens=6, early_stopping=5),
     ])
 def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
                                       sampling_params: SamplingParams):
@@ -352,7 +352,7 @@ def test_generate_with_beam_search():
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
 
-    sampling_params = SamplingParams(max_new_tokens=6, beam_width=2)
+    sampling_params = SamplingParams(max_tokens=6, beam_width=2)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
@@ -377,7 +377,7 @@ def test_generate_with_streaming_llm():
     assert build_config.plugin_config.streamingllm is True
     #assert build_config.plugin_config.use_paged_context_fmha is False
 
-    sampling_params = SamplingParams(max_new_tokens=4)
+    sampling_params = SamplingParams(max_tokens=4)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         assert output.outputs[0].text == "D E F G"
@@ -415,7 +415,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
         build_config=build_config,
     )
     sampling_params = SamplingParams(
-        max_new_tokens=8,
+        max_tokens=8,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         return_log_probs=return_log_probs)
@@ -426,7 +426,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
             assert len(prompts[0].split()) + 1 == output.context_logits.shape[0]
         if gather_generation_logits:
             assert output.outputs[0].generation_logits is not None
-            assert sampling_params.max_new_tokens == output.outputs[
+            assert sampling_params.max_tokens == output.outputs[
                 0].generation_logits.shape[0]
         if return_log_probs:
             assert output.outputs[0].logprobs is not None
@@ -475,15 +475,15 @@ def test_generate_with_bad_words():
 
     bad_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
 
-    sampling_params = SamplingParams(max_new_tokens=15, bad_token_ids=[bad_id])
+    sampling_params = SamplingParams(max_tokens=15, bad_token_ids=[bad_id])
     for output in llm.generate(prompts, sampling_params=sampling_params):
         assert output.outputs[0].text == "D E F G H I J K L M\n\nI hope this"
 
-    sampling_params = SamplingParams(max_new_tokens=15, bad="I J")
+    sampling_params = SamplingParams(max_tokens=15, bad="I J")
     for output in llm.generate(prompts, sampling_params=sampling_params):
         assert output.outputs[0].text == "D E F G H I K L M N O P Q R S"
 
-    sampling_params = SamplingParams(max_new_tokens=15, bad=["F E", "I J"])
+    sampling_params = SamplingParams(max_tokens=15, bad=["F E", "I J"])
     for output in llm.generate(prompts, sampling_params=sampling_params):
         assert output.outputs[0].text == "D E F G H I K L M N O P Q R S"
 
@@ -500,7 +500,7 @@ def test_generate_with_embedding_bias():
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
-    sampling_params = SamplingParams(max_new_tokens=6,
+    sampling_params = SamplingParams(max_tokens=6,
                                      embedding_bias=embedding_bias)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
@@ -524,7 +524,7 @@ def test_generate_with_logits_post_processor():
               kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
               logits_post_processor_map={"my_logits_pp": logits_post_processor})
 
-    sampling_params = SamplingParams(max_new_tokens=6,
+    sampling_params = SamplingParams(max_tokens=6,
                                      logits_post_processor_name="my_logits_pp")
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
@@ -542,15 +542,29 @@ def test_generate_block_reuse():
                                             enable_block_reuse=True),
               build_config=build_config)
 
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
 
     prompts = ["A B C", "A B C D"]
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
 
 
+def test_executor_results_cleanup():
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for i in range(20):
+        llm.generate(prompts, sampling_params=sampling_params)
+
+    num_remaining_results = len(llm._executor._results)
+    print(f"result.size: {num_remaining_results}")
+    assert num_remaining_results == 0
+    assert len(llm._executor._pending) == 0
+
+
 # TODO[chunweiy]: Add test for loading inmemory model
 
 if __name__ == '__main__':
-    test_llm_loading_from_hf()
-    test_llm_generate_async()
+    #test_llm_loading_from_hf()
+    #test_llm_generate_async()
+    test_executor_results_cleanup()

@@ -60,6 +60,7 @@ class TestSmoothQuantGemm(unittest.TestCase):
 
         # Create builder
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         # Create empty network
         network = builder.create_network()
         # Allow SQ plugin of dtype type

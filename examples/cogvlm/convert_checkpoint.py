@@ -267,14 +267,12 @@ def create_config_from_args(args: argparse.Namespace):
         'intermediate_size': args.inter_size,
         'num_key_value_heads': args.n_kv_head,
         'vocab_size': args.vocab_size,
-        'position_embedding_type': 'rope_gpt_neox',
+        'position_embedding_type': 'learned_absolute',
         'max_position_embeddings': args.n_positions,
         'hidden_act': args.hidden_act,
         'rotary_base': args.rotary_base,
         'rotary_scaling': args.rotary_scaling,
         'norm_epsilon': args.rms_norm_eps,
-        'vision_start': args.vision_start,
-        'vision_length': args.vision_length,
         'quantization': {
             'quant_algo': None,
             'kv_cache_quant_algo': None,
@@ -367,8 +365,6 @@ def main():
         args.n_positions = hf_config.max_position_embeddings
 
         args.architecture = hf_config.architectures[0]
-        args.vision_start = 1
-        args.vision_length = hf_config.vision_config['num_positions'] - 1
 
     elif args.meta_ckpt_dir is not None:
         with open(Path(args.meta_ckpt_dir, "params.json")) as fp:

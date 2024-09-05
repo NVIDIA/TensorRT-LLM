@@ -15,15 +15,12 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 template <typename T>
 struct TopPSamplingKernelParams
@@ -155,5 +152,9 @@ uint32_t calcAirTopPBlockNum(int batchSize, int len, int smCnt, bool isDetermini
 template <typename T>
 [[nodiscard]] size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic = false);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+void invokeSetTopPRuntimeArgs(runtime::SizeType32 batchSize, runtime::SizeType32 topK,
+    runtime::SizeType32* runtimeTopKDevicePtr, runtime::SizeType32 runtimeTopKSize, float topP,
+    float* runtimeTopPDevicePtr, runtime::SizeType32 runtimeTopPSize, bool* skipDecode,
+    runtime::SizeType32 const* batchSlotsDevicePtr, float* initialTopPBuf, cudaStream_t stream);
+
+} // namespace tensorrt_llm::kernels

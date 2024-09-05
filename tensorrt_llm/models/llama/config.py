@@ -119,7 +119,7 @@ class LLaMAConfig(PretrainedConfig):
         if hf_config.model_type == "exaone":
             hidden_act = hf_config.activation_function
             # NOTE
-            # Exaone also uses RMS norm but they represent as layer_norm_epsilon.
+            # EXAONE also uses RMS norm but they represent as layer_norm_epsilon.
             norm_epsilon = getattr(hf_config, "layer_norm_epsilon", 1e-5)
         else:
             hidden_act = hf_config.hidden_act

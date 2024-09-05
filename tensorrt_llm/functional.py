@@ -4471,6 +4471,79 @@ class RopeEmbeddingUtils:
 
         return qkv
 
+    @staticmethod
+    def apply_rotary_pos_emb_cogvlm(qkv, position_embedding,
+                                    num_attention_heads, attention_head_size,
+                                    max_position_embeddings,
+                                    rotary_embedding_scale,
+                                    remove_input_padding) -> Tensor:
+        input = qkv[0] if isinstance(qkv, list) else qkv
+        input_shape = shape(input)
+        batch_size = 1 if remove_input_padding else shape(input, 0)
+        seqlen = shape(input, 0 if remove_input_padding else 1)
+        if isinstance(qkv, list):
+            query, key, value = qkv
+        else:
+            qkv = qkv.view(
+                concat([
+                    batch_size,
+                    seqlen,
+                    3,
+                    num_attention_heads,
+                    attention_head_size,
+                ]))
+            query, key, value = split(qkv, 1, dim=2)
+        q_shape = concat([
+            batch_size,
+            seqlen,
+            num_attention_heads,
+            attention_head_size,
+        ])
+        query = query.view(q_shape)
+        key = key.view(q_shape)
+        value = value.view(q_shape)
+
+        embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
+            max_position_embeddings, attention_head_size).squeeze(0)
+        embedding_weight /= rotary_embedding_scale  # [max_position_embeddings, attention_head_size]
+
+        if remove_input_padding:
+            position_embedding = unsqueeze(position_embedding, 0)  # [1, seqlen]
+
+        embedding_weight = constant(embedding_weight)  # float32
+        position_embedding = embedding(
+            position_embedding,
+            embedding_weight)  # [1, seqlen, attention_head_size]
+        sin, cos = split(position_embedding, attention_head_size // 2,
+                         dim=-1)  # [1, seqlen, attention_head_size//2]
+
+        input_dtype = query.dtype
+        fp32_query = cast(query, "float32")
+        fp32_key = cast(key, "float32")
+        fp32_query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=fp32_query,
+            position_embedding=[cos, sin],
+            pos_emb_type=PositionEmbeddingType.rope_gpt_neox)
+        fp32_key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=fp32_key,
+            position_embedding=[cos, sin],
+            pos_emb_type=PositionEmbeddingType.rope_gpt_neox)
+
+        query = cast(fp32_query, input_dtype)
+        key = cast(fp32_key, input_dtype)
+
+        if isinstance(qkv, list):
+            qkv = [
+                query.view(input_shape),
+                key.view(input_shape),
+                value.view(input_shape),
+            ]
+        else:
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(input_shape)
+
+        return qkv
+
 
 @gw.record_signature
 def gpt_attention(
@@ -6182,3 +6255,47 @@ def scatter_nd(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
                                                  source.trt_tensor,
                                                  mode=trt.ScatterMode.ND)
     return _create_tensor(scatter_layer.get_output(0), scatter_layer)
+
+
+def low_latency_gemm(input: Tensor,
+                     mat2: Tensor,
+                     alpha: Optional[np.ndarray] = None,
+                     strict_dtype: Optional[trt.DataType] = None) -> Tensor:
+    if not default_net().plugin_config.low_latency_gemm_plugin:
+        raise RuntimeError("Low Latency GEMM is only support with plugin")
+    elif default_net().plugin_config.low_latency_gemm_plugin != "fp8":
+        raise RuntimeError("Low Latency GEMM plugin only support fp8")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            "LowLatencyGemm", "1", TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+        if ((input.dtype != trt.fp8) or ((mat2.dtype) != trt.fp8)):
+            raise TypeError("Low Latency GEMM only support fp8 input")
+        if (alpha):
+            assert (isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
+                    and alpha.size
+                    == 1), "`alpha` must be passed as a float32 ndarray"
+        alpha = alpha if alpha else np.array(1.0, dtype=np.float32)
+        alpha = trt.PluginField("alpha", alpha.flatten(),
+                                trt.PluginFieldType.FLOAT32)
+
+        if strict_dtype is not None:
+            assert isinstance(strict_dtype, trt.DataType)
+            p_dtype = strict_dtype
+            if (p_dtype not in [trt.float32, trt.float16, trt.bfloat16]):
+                raise ValueError(
+                    "strict_dtype must be float32, float16 or bfloat16 in low latency gemm plugin"
+                )
+        else:
+            raise RuntimeError(
+                "need to use strict dtype in  low latency gemm plugin fp8")
+        pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                                  trt.PluginFieldType.INT32)
+        pfc = trt.PluginFieldCollection([alpha, pf_type])
+        low_latency_gemm_plug = plg_creator.create_plugin(
+            "low_latency_gemm", pfc)
+        plug_inputs = [input.trt_tensor, mat2.trt_tensor]
+        layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                               low_latency_gemm_plug)
+        _add_plugin_info(layer, plg_creator, "low_latency_gemm", pfc)
+        return _create_tensor(layer.get_output(0), layer)

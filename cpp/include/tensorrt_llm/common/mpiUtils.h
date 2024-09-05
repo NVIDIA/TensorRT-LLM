@@ -384,6 +384,12 @@ public:
 
     void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
 
+    //! \brief Returns if a message with the specified source and tag is available
+    bool iprobe(int source, int tag, MPI_Status* status) const;
+
+    //! \brief Poll every periodMs until a message is available
+    void recvPoll(int source, int tag, int periodMs) const;
+
     bool operator==(MpiComm const& rhs) const
     {
         return mComm == rhs.mComm;

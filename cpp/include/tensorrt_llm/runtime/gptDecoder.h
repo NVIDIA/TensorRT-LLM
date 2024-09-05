@@ -16,9 +16,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -44,6 +42,8 @@ namespace runtime
 {
 
 class SpeculativeDecodingModule;
+
+class DecodingLayerWorkspace;
 
 class IGptDecoder
 {
@@ -117,6 +117,7 @@ public:
 private:
     std::shared_ptr<BufferManager> mManager;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
+    std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingLayerWorkspace;
 
     TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
                               // been written to use that shape.

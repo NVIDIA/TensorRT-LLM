@@ -217,8 +217,8 @@ private:
     WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
-    kernels::QuantParams getQuantParams(
-        void const* scale_1, void const* scale_2, void const* scale_3 = nullptr, void const* scale_4 = nullptr) const;
+    kernels::QuantParams getQuantParams(void const* scale_1, void const* scale_2, void const* scale_3 = nullptr,
+        void const* scale_4 = nullptr, void const* scale_5 = nullptr) const;
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
     kernels::LoraParams getLoraParams(
@@ -334,9 +334,14 @@ private:
         return getExpertFP8Dequant2Index() + hasExpertFp8FinalQuantScales();
     }
 
+    IndexType getInputFP8DequantIndex() const
+    {
+        return getExpertFP8QuantFinalIndex() + (hasExpertFp8QuantScales() && hasLora());
+    }
+
     IndexType getLoraFC1WeightPtrsIndex() const
     {
-        return getExpertFP8QuantFinalIndex() + hasLora();
+        return getInputFP8DequantIndex() + hasLora();
     }
 
     IndexType getLoraFC1RanksIndex() const

@@ -1162,13 +1162,16 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const token_num,
     int const head_num, int const kv_head_num, int const size_per_head, float const* scale, int const int8_mode)
 {
-    //   QKV: [token_num, hidden + 2 * kv_head_num * size_per_head]
-    //   qkv_bias: [hidden + 2 * kv_head_num * size_per_head]
+    //   source input QKV may or may not have padding, but target output Q/K/V must be with padding in order to do
+    //   attention! QKV: [token_num, hidden + 2 * kv_head_num * size_per_head] (remove padding) or [batch * seq_len,
+    //   hidden + 2 * kv_head_num * size_per_head] (keep padding) qkv_bias: [hidden + 2 * kv_head_num * size_per_head]
     //   q_buf: [batch, head_num, seq_len, size_per_head]
     //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
     // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
-    bool const has_padding = padding_offset != nullptr;
+    bool const remove_padding
+        = padding_offset != nullptr; // remove padding mode will have padding_offset to indicate the padding length,
+                                     // while keep padding mode doesn't need this
     int const hidden = head_num * size_per_head; // hidden dim Q
     int const n = hidden + 2 * kv_head_num * size_per_head;
 
@@ -1177,11 +1180,13 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int const bias_id = index % n;
 
         int const token_idx = index / n;
-        int const token_padded_idx = token_idx + (has_padding ? padding_offset[token_idx] : 0);
+        int const token_padded_idx = token_idx
+            + (remove_padding ? padding_offset[token_idx]
+                              : 0); // recover token idx in padding mode by adding the offset
         int const target_batch_id = token_padded_idx / seq_len;
         int const actual_seq_len = seq_lens[target_batch_id];
         int const seq_id = token_padded_idx % seq_len;
-        bool const valid_seq = seq_id < actual_seq_len || has_padding;
+        bool const valid_seq = seq_id < actual_seq_len || remove_padding;
 
         int qkv_id;
         int head_id;
@@ -1238,7 +1243,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
             }
         }
         // Write to split QKV buffer
-        if (head_num == kv_head_num || qkv_id == 0) // QKV or Q when MQA/GQA
+        if (head_num == kv_head_num || qkv_id == 0) // QKV when MHA or Q when MQA/GQA
         {
             int const target_batch_stride = head_num * seq_len * size_per_head;
             int const target_head_stride = seq_len * size_per_head;
@@ -1321,12 +1326,12 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     int const token_idx = blockIdx.x;
     int const token_padding_offset = (padding_offset == nullptr || token_idx < 0) ? 0 : padding_offset[token_idx];
     int const tgt_token_idx = token_idx + token_padding_offset;
-    bool const has_padding = padding_offset != nullptr;
+    bool const remove_padding = padding_offset != nullptr;
 
     int const batch_idx = tgt_token_idx / seq_len;
     int const seq_idx = tgt_token_idx % seq_len;
     int const actual_seq_len = seq_lens[batch_idx];
-    bool const valid_seq = seq_idx < actual_seq_len || has_padding;
+    bool const valid_seq = seq_idx < actual_seq_len || remove_padding;
 
     int const head_idx = blockIdx.y;
     int const tidx = threadIdx.x;

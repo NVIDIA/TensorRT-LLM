@@ -37,6 +37,8 @@ tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/*.pyi
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
+docs/source/llm-api
+docs/source/llm-api-examples/llm_*.rst
 *.swp
 
 # Testing

@@ -37,7 +37,7 @@ namespace tensorrt_llm::runtime::utils
 std::string getNumpyTypeDesc(nvinfer1::DataType type)
 {
     using dt = nvinfer1::DataType;
-    static const std::unordered_map<dt, std::string> type_map{{dt::kBOOL, "?"}, {dt::kUINT8, "u1"}, {dt::kINT8, "i1"},
+    static std::unordered_map<dt, std::string> const type_map{{dt::kBOOL, "?"}, {dt::kUINT8, "u1"}, {dt::kINT8, "i1"},
         {dt::kINT32, "i4"}, {dt::kINT64, "i8"}, {dt::kHALF, "f2"}, {dt::kFLOAT, "f4"}};
 
     if (type == dt::kBF16)
@@ -56,7 +56,7 @@ nvinfer1::DataType typeFromNumpyDesc(std::string const& type)
     TLLM_LOG_DEBUG("numpy type: %s", type.c_str());
 
     using dt = nvinfer1::DataType;
-    static const std::unordered_map<std::string, dt> type_map{{"?", dt::kBOOL}, {"u1", dt::kUINT8}, {"i1", dt::kINT8},
+    static std::unordered_map<std::string, dt> const type_map{{"?", dt::kBOOL}, {"u1", dt::kUINT8}, {"i1", dt::kINT8},
         {"i4", dt::kINT32}, {"i8", dt::kINT64}, {"f2", dt::kHALF}, {"f4", dt::kFLOAT}};
     TLLM_CHECK_WITH_INFO(type_map.count(type) > 0, "numpy data type '" + type + "' not supported");
     return type_map.at(type);
@@ -157,7 +157,7 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
 
 //! \brief Create new tensor from numpy file.
 [[nodiscard]] ITensor::UniquePtr loadNpy(
-    BufferManager const& manager, std::string const& npyFile, const MemoryType where)
+    BufferManager const& manager, std::string const& npyFile, MemoryType const where)
 {
     FILE* f_ptr = fopen(npyFile.c_str(), "rb");
     if (f_ptr == nullptr)
@@ -182,8 +182,8 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     auto size = tensor->getSize();
 
     size_t n_elems = fread(data, eltSize, size, f_ptr);
-    fclose(f_ptr);
-    TLLM_CHECK_WITH_INFO(n_elems == size, "reading tensor failed");
+    auto const statusCode = fclose(f_ptr);
+    TLLM_CHECK_WITH_INFO(statusCode == 0 && n_elems == size, "reading tensor failed");
 
     if (where == MemoryType::kGPU)
     {
@@ -225,8 +225,8 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
     char const magic[]
         = "\x93"
           "NUMPY";
-    const uint8_t npy_major = 1;
-    const uint8_t npy_minor = 0;
+    uint8_t const npy_major = 1;
+    uint8_t const npy_minor = 0;
 
     std::stringstream header_stream;
     header_stream << "{'descr': '" << getNumpyTypeDesc(dtype) << "', 'fortran_order': False, 'shape': (";

@@ -18,7 +18,7 @@ def get_executor_request(request: InferenceRequest,
                          streaming: bool = False) -> trtllm.Request:
     return trtllm.Request(
         input_token_ids=request.logits,
-        max_new_tokens=request.output_tokens,
+        max_tokens=request.output_tokens,
         stop_words=[],
         bad_words=[],
         streaming=streaming,

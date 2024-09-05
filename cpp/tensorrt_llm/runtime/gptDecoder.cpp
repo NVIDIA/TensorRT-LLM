@@ -20,13 +20,13 @@
 #include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
+#include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
 #include <memory>
 
 #include <NvInferRuntime.h>
 
 namespace tle = tensorrt_llm::executor;
-namespace tc = tensorrt_llm::common;
 namespace tl = tensorrt_llm::layers;
 namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
@@ -54,6 +54,10 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
                                        static_cast<SizeType32>(maxBatchSize), static_cast<SizeType32>(maxBeamWidth)}),
         nvFloatType);
     mManager->setZero(*mLogProbsTiled);
+
+    mDecodingLayerWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        mManager, decodingDomain, TRTDataType<T>::value, mDynamicDecodeLayer->getWorkspaceSize());
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -164,7 +168,8 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     }
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
-    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots, setupParams);
+    mDecodingLayerWorkspace->setDeviceBatchSlots(batchSlots);
+    mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots, setupParams, mDecodingLayerWorkspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -244,8 +249,7 @@ void prepareMedusaInputs(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareExplicitDraftTokensInput(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -287,8 +291,8 @@ void prepareLookaheadInputs(
 }
 
 template <typename T>
-std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input, size_t maxBatchSize,
-    tle::DecodingMode const& decodingMode, std::shared_ptr<BufferManager> bufferManager)
+std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
+    DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
 {
     auto constexpr ite = 0;
 
@@ -323,7 +327,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input
     {
         if (input.logitsVec)
         {
-            std::vector<TensorPtr> logitsVec;
+            std::vector<TensorConstPtr> logitsVec;
             for (auto const& logits : input.logitsVec.value())
             {
                 TLLM_CHECK(logits->getDataType() == TRTDataType<T>::value);
@@ -371,7 +375,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(DecodingInput const& input
     // Explicit draft tokens
     if (decodingMode.isExplicitDraftTokens())
     {
-        prepareExplicitDraftTokensInput(input, maxBatchSize, forwardParams);
+        prepareExplicitDraftTokensInput(input, forwardParams);
     }
 
     if (input.lookaheadInputs)
@@ -570,10 +574,10 @@ template <typename T>
 void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode, mManager);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
     auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
 
-    mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams);
+    mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams, mDecodingLayerWorkspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -582,10 +586,10 @@ template <typename T>
 void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode, mManager);
+    auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
     auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
 
-    mDynamicDecodeLayer->forwardSync(outputParams, forwardParams);
+    mDynamicDecodeLayer->forwardSync(outputParams, forwardParams, mDecodingLayerWorkspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

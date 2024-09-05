@@ -56,7 +56,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
     executor = GenerationExecutor.create(args.engine_dir)
-    sampling_params = SamplingParams(max_new_tokens=5)
+    sampling_params = SamplingParams(max_tokens=5)
 
     input_str = "What should you say when someone gives you a gift? You should say:"
     output = executor.generate(tokenizer.encode(input_str),

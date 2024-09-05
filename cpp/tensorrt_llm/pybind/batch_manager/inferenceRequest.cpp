@@ -105,6 +105,7 @@ void InferenceRequest::initBindings(py::module_& m)
             nullptr, // passing logits processor in the cpp->python direction doesn't work. getter is then undefined
             &InferenceRequest::setLogitsPostProcessor)
         .def_property("input_ids", &InferenceRequest::getInputIdsUnchecked, &InferenceRequest::setInputIds)
+        .def_property("position_ids", &InferenceRequest::getPositionIdsUnchecked, &InferenceRequest::setPositionIds)
         .def_property(
             "draft_input_ids", &InferenceRequest::getDraftInputIdsUnchecked, &InferenceRequest::setDraftInputIds)
         .def_property("draft_logits", &InferenceRequest::getDraftLogitsUnchecked, &InferenceRequest::setDraftLogits)

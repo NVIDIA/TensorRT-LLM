@@ -133,28 +133,28 @@ int getEnvMmhaKernelBlockSize()
     return mmhaKernelBlockSize;
 }
 
-bool getEnvEnableFDL()
+bool getEnvEnablePDL()
 {
     static bool init = false;
-    static bool enableFDL = false;
+    static bool enablePDL = false;
     if (!init)
     {
         init = true;
-        // FDL only available when arch >= 90
+        // PDL only available when arch >= 90
         if (getSMVersion() >= 90)
         {
-            char const* enable_fdl = std::getenv("TRTLLM_ENABLE_FDL");
-            if (enable_fdl)
+            char const* enable_pdl = std::getenv("TRTLLM_ENABLE_PDL");
+            if (enable_pdl)
             {
-                // FDL will be enabled by setting the env variables `TRTLLM_ENABLE_FDL` to `1`
-                if (enable_fdl[0] == '1' && enable_fdl[1] == '\0')
+                // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+                if (enable_pdl[0] == '1' && enable_pdl[1] == '\0')
                 {
-                    enableFDL = true;
+                    enablePDL = true;
                 }
             }
         }
     }
-    return enableFDL;
+    return enablePDL;
 }
 
 } // namespace tensorrt_llm::common

@@ -36,6 +36,7 @@ namespace inference_request
 {
 // Input tensors
 auto constexpr kInputIdsTensorName = "input_ids";
+auto constexpr kPositionIdsTensorName = "position_ids";
 auto constexpr kDraftInputIdsTensorName = "draft_input_ids";
 auto constexpr kDraftLogitsTensorName = "draft_logits";
 auto constexpr kMaxNewTokensTensorName = "request_output_len";
@@ -188,6 +189,7 @@ public:
 
     static std::array constexpr kTensorNames = {
         inference_request::kInputIdsTensorName,
+        inference_request::kPositionIdsTensorName,
         inference_request::kDraftInputIdsTensorName,
         inference_request::kDraftLogitsTensorName,
         inference_request::kMaxNewTokensTensorName,
@@ -256,6 +258,7 @@ public:
     }
 
     TENSOR_GETTER_SETTER(InputIds, inference_request::kInputIdsTensorName)
+    TENSOR_GETTER_SETTER(PositionIds, inference_request::kPositionIdsTensorName)
     TENSOR_GETTER_SETTER(DraftInputIds, inference_request::kDraftInputIdsTensorName)
     TENSOR_GETTER_SETTER(DraftLogits, inference_request::kDraftLogitsTensorName)
     TENSOR_GETTER_SETTER(MaxNewTokens, inference_request::kMaxNewTokensTensorName)

@@ -22,10 +22,8 @@
 #include <vector>
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
@@ -33,8 +31,6 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tests/layers/randomLlm.h"
 
@@ -43,7 +39,6 @@ namespace tensorrt_llm::tests::layers
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
 
-namespace tk = tensorrt_llm::kernels;
 namespace trk = tensorrt_llm::runtime::kernels;
 
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -205,13 +200,13 @@ private:
 
     void newRequests(std::vector<SizeType32> requestIds);
 
-    void manageBatch(void);
+    void manageBatch();
 
-    void llmForward(void);
+    void llmForward();
 
-    void decodeForward(void);
+    void decodeForward();
 
-    void verifyDecode(void);
+    void verifyDecode();
 
 protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
@@ -255,6 +250,7 @@ protected:
     std::vector<TensorPtr> mPrompt;
     std::vector<std::shared_ptr<RandomLlm>> mLlm;
     std::shared_ptr<LookaheadDecodingLayer<float>> mDecoder;
+    std::shared_ptr<DecodingLayerWorkspace> mDecodingWorkspace;
     SizeType32 mVocabSize;
     SizeType32 mMaxTokensPerStep;
     TestParam mTestParam;
@@ -269,7 +265,7 @@ void LookaheadDecodingLayerTest::SetUp()
     mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
     mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
 
-    int32_t device;
+    int32_t device = 0;
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&mDeviceProp, device);
 
@@ -405,6 +401,8 @@ void LookaheadDecodingLayerTest::allocateBuffers()
     trk::invokeFill(*mOutputIds, int32_t{0}, *mStream);
     trk::invokeFill(*mSequenceLengths, int32_t{0}, *mStream);
     trk::invokeFill(*mTokensPerStep, mMaxTokensPerStep, *mStream);
+    mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        mBufferManager, decodingDomain, TRTDataType<float>::value, mDecoder->getWorkspaceSize());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -475,19 +473,21 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
     TensorPtr newRequestSlots = ITensor::slice(mBatchSlotsMax, batchSize, requestSize);
     PRINT_VALUES(newRequestSlots);
     PRINT_VALUES(mBatchSlotsMax);
-    mDecoder->setup(requestSize, beamSize, newRequestSlots, setupParams);
+    mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
+    mDecodingWorkspace->setDeviceBatchSlots(newRequestSlots);
+    mDecoder->setup(requestSize, beamSize, newRequestSlots, setupParams, mDecodingWorkspace);
 
     PRINT_VALUES(mPositionOffsets);
 
     batchSize += requestIds.size();
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
-    TLLM_LOG_DEBUG("newwRequests mBatchSlots %s", D(mBatchSlots).values<int32_t>().c_str());
+    TLLM_LOG_DEBUG("new Requests mBatchSlots %s", D(mBatchSlots).values<int32_t>().c_str());
     PRINT_VALUES(mSequenceLengths);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadDecodingLayerTest::manageBatch(void)
+void LookaheadDecodingLayerTest::manageBatch()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const maxBatchSize = mTestParam.maxBatchSize;
@@ -602,12 +602,11 @@ void convertBoolToInt32(TensorPtr const& dst, TensorConstPtr const& src)
     }
 }
 
-void LookaheadDecodingLayerTest::llmForward(void)
+void LookaheadDecodingLayerTest::llmForward()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
-    PRINT_VALUES(mBatchSlots);
 
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
@@ -652,7 +651,7 @@ void LookaheadDecodingLayerTest::llmForward(void)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadDecodingLayerTest::decodeForward(void)
+void LookaheadDecodingLayerTest::decodeForward()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -684,18 +683,20 @@ void LookaheadDecodingLayerTest::decodeForward(void)
 
     PRINT_VALUES(mTokensPerStep);
 
-    mDecoder->forwardAsync(outputParams, inputParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mDecoder->forwardAsync(outputParams, inputParams, mDecodingWorkspace);
 
     mStream->synchronize();
 
-    mDecoder->forwardSync(outputParams, inputParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mDecoder->forwardSync(outputParams, inputParams, mDecodingWorkspace);
 
     mStream->synchronize();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadDecodingLayerTest::verifyDecode(void)
+void LookaheadDecodingLayerTest::verifyDecode()
 {
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
     for (SizeType32 bi = 0; bi < batchSize; bi++)
