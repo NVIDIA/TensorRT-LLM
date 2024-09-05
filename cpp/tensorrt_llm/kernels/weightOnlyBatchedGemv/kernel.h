@@ -88,7 +88,7 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);
     GMemIterator<EnableActScale, AccessTypeA, 1, Details::kAccessNumA, TypeA> act_scale_iterator(
         act_scale, real_offset_k, CtaK / Details::kInterleave, 0);
-    SHMemIterator<Mandatory, AccessTypeW, Threads, CtaK * CtaN / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, uint8_t> weight_iterator(
+    SHMemIterator<Mandatory, AccessTypeW, Threads, CtaK / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, uint8_t> weight_iterator(
         weight, interleaved_offset_n * interleaved_k / Details::kElemsPerByteW, shmem_w, tid * StepK / Details::kElemsPerByteW,
         CtaK / Details::kElemsPerByteW, CtaK * CtaN / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW, interleaved_k / CtaK);

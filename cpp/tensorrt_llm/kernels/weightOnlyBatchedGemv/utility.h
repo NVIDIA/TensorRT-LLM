@@ -343,7 +343,7 @@ public:
                 int const c = Elements * sizeof(T);
                 static_assert(c % 4 == 0);
                 int const s = threadIdx.x % Grouped;
-                if (threadIdx.x % Grouped + g_iter <= k_max_iter_)
+                if (s + g_iter <= k_max_iter_)
                 {
                     __pipeline_memcpy_async(
                         sh_addr_ + (sh_iter + s) * sh_step_ + ii * sh_stride_,
@@ -356,14 +356,18 @@ public:
             {
                 int const c = Elements / VecSize;
                 int const s = threadIdx.x % Grouped / c;
-                int const i = threadIdx.x % c;
-                if (threadIdx.x % Grouped / c + g_iter <= k_max_iter_)
+                // this for loop is mostly single iteration
+                for (int i = threadIdx.x % c; i < c; i += blockDim.x * blockDim.y * blockDim.z)
                 {
-                    __pipeline_memcpy_async(
-                        reinterpret_cast<TVec*>(sh_addr_ + (sh_iter + s) * sh_step_ + ii * sh_stride_) + i,
-                        reinterpret_cast<TVec*>(g_addr_  + (g_iter  + s) * g_step_  + ii * g_stride_ ) + i,
-                        sizeof(TVec)
-                    );
+                    // s should be float to compare with k_max_iter_
+                    if (threadIdx.x % Grouped / c + g_iter <= k_max_iter_)
+                    {
+                        __pipeline_memcpy_async(
+                            reinterpret_cast<TVec*>(sh_addr_ + (sh_iter + s) * sh_step_ + ii * sh_stride_) + i,
+                            reinterpret_cast<TVec*>(g_addr_  + (g_iter  + s) * g_step_  + ii * g_stride_ ) + i,
+                            sizeof(TVec)
+                        );
+                    }
                 }
             }
         }
