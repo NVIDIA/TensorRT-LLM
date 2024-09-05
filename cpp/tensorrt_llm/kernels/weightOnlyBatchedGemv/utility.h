@@ -303,10 +303,7 @@ public:
 
     __device__ __forceinline__ void copy_to_shmem(int iter)
     {
-        if constexpr (Enable)
-        {
-            // Do nothing
-        }
+        // Do nothing
     }
 
 private:
@@ -330,7 +327,6 @@ public:
         , sh_stride_(sh_stride)
         , k_max_iter_(k_max_iter)
     {
-
     }
 
     __device__ __forceinline__ void copy_to_shmem(int g_iter, int sh_iter = 0, int ii = 0)

@@ -72,35 +72,45 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     // number of k-iterations which would be loaded in a single shared memory block load
     int const sh_sz_group = (GroupSize != 0 ? near_sz_group / (sz_per_iter > (sizeof(AccessTypeA) / sizeof(TypeA)) ? 
                                 sz_per_iter / (sizeof(AccessTypeA) / sizeof(TypeA)) : 1) : 1);
-
+    
     __shared__ TypeA shmem_sz[sz_per_iter * (GroupSize != 0 ? Threads / near_sz_group : 1) * sh_sz_group * (EnableZero ? 2 : 1)];
     __shared__ uint8_t shmem_w[CtaK / Details::kElemsPerByteW * CtaN * W_STAGE];
-    
+    __shared__ TypeA shmem_a[CtaK / Details::kInterleave * W_STAGE * (EnableActScale ? CtaM + 1 : CtaM)];
+
     TypeA* sh_scale = shmem_sz + sz_per_iter * offset_k_group;
     TypeA* sh_zero = nullptr;
+    TypeA* sh_actscale = nullptr;
+
     if constexpr (EnableZero)
     {
         sh_zero = shmem_sz + sz_per_iter * (GroupSize != 0 ? Threads / near_sz_group * sh_sz_group : 1);
         sh_zero += sz_per_iter * offset_k_group;
     }
+
+    if constexpr (EnableActScale)
+    {
+        sh_actscale = shmem_a + CtaK / Details::kInterleave * CtaM * W_STAGE;
+    }
     
-    GMemIterator<Mandatory, AccessTypeA, CtaM, Details::kAccessNumA, TypeA> act_iterator(
-        act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);
-    GMemIterator<EnableActScale, AccessTypeA, 1, Details::kAccessNumA, TypeA> act_scale_iterator(
-        act_scale, real_offset_k, CtaK / Details::kInterleave, 0);
+    SHMemIterator<Mandatory, AccessTypeA, Threads, CtaK / Details::kInterleave, StepK, TypeA> act_iterator(
+        act, 0, shmem_a, offset_m * origin_k + real_offset_k,
+        CtaK / Details::kInterleave, CtaK * CtaM / Details::kInterleave,
+        origin_k, CtaK / Details::kInterleave, interleaved_k / CtaK);
+    SHMemIterator<EnableActScale, AccessTypeA, Threads, CtaK / Details::kInterleave, StepK, TypeA> act_scale_iterator(
+        act_scale, 0, sh_actscale, real_offset_k,
+        CtaK / Details::kInterleave, CtaK / Details::kInterleave,
+        0, 0, interleaved_k / CtaK);
     SHMemIterator<Mandatory, AccessTypeW, Threads, CtaK / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, uint8_t> weight_iterator(
         weight, interleaved_offset_n * interleaved_k / Details::kElemsPerByteW, shmem_w, tid * StepK / Details::kElemsPerByteW,
         CtaK / Details::kElemsPerByteW, CtaK * CtaN / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW, interleaved_k / CtaK);
     SHMemIterator<Mandatory, AccessTypeA, near_sz_group, sz_per_iter, 1, TypeA> scales_iterator(
         scales, offset_k_group * n + blk_offset_n, sh_scale, thr_offset_n,
-        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
-        (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
+        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
         Details::kInterleave, Details::kInterleave, (GroupSize != 0 ? interleaved_k / CtaK : 1));
     SHMemIterator<EnableZero, AccessTypeA, near_sz_group, sz_per_iter, 1, TypeA> zeros_iterator(
         zeros, offset_k_group * n + blk_offset_n, sh_zero, thr_offset_n,
-        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
-        (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
+        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
         Details::kInterleave, Details::kInterleave, (GroupSize != 0 ? interleaved_k / CtaK : 1));
 
     out += offset_m * n + tile_id_n * CtaN * Details::kInterleave;
@@ -115,6 +125,12 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     {
         weight_iterator.copy_to_shmem(0, 0, i);
     }
+#pragma unroll
+    for (int i = 0; i < CtaM; ++i)
+    {
+        act_iterator.copy_to_shmem(0, 0, i);
+    }
+    act_scale_iterator.copy_to_shmem(0);
     __pipeline_commit();
 
     TypeA tile_acc[CtaM * CtaN];
@@ -142,6 +158,12 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
             {
                 weight_iterator.copy_to_shmem(iter + 1, (iter + 1) % W_STAGE, i);
             }
+#pragma unroll
+            for (int i = 0; i < CtaM; ++i)
+            {
+                act_iterator.copy_to_shmem(iter + 1, (iter + 1) % W_STAGE, i);
+            }
+            act_scale_iterator.copy_to_shmem(iter + 1, (iter + 1) % W_STAGE);
             __pipeline_commit();
         }
         __pipeline_wait_prior(1);
@@ -152,7 +174,6 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
             scales_iterator.load(vec_scale + i, iter % sh_sz_group, i);
             zeros_iterator.load(vec_zero + i, iter % sh_sz_group, i);
         }
-        act_scale_iterator.load(vec_act_scale, iter);
 #pragma unroll
         for (int i = 0; i < CtaN; ++i)
         {
@@ -161,10 +182,11 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
                 tile_w, tile_w_quantized, vec_scale + i, vec_zero + i, alpha);
             pack_to_vec2<Details, StepK>(tile_w_pack2, tile_w, i);
         }
+        act_scale_iterator.load(vec_act_scale, iter % W_STAGE);
 #pragma unroll
         for (int i = 0; i < CtaM; ++i)
         {
-            act_iterator.load(tile_a, iter, i);
+            act_iterator.load(tile_a, iter % W_STAGE, i);
             apply_scale<Details, 1, StepK, EnableActScale>(tile_a, vec_act_scale);
             mma<Details, 1, CtaN, StepK>(tile_acc + i * CtaN, tile_w_pack2, tile_a);
         }
