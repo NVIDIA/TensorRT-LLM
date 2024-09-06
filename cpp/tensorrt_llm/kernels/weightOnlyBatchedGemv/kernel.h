@@ -64,12 +64,13 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         = (tid * StepK / (Details::kInterleave * Details::LayoutDetails::kTileSize)) * Details::LayoutDetails::kTileSize
         + ((tid * StepK) % Details::LayoutDetails::kTileSize);
     int const offset_k_group = (GroupSize != 0 ? real_offset_k / GroupSize : 0);
+    
     // number of threads with neighboring scale or zero values
-    int const near_sz_group = (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : 32);
+    static constexpr int near_sz_group = (GroupSize != 0 ? GroupSize / Details::kInterleave / Details::kThreadsPerInterleavedTile : 32);
     // number of scale or zero values needed in a single block per k iterations
-    int const sz_per_iter = CtaN * Details::kInterleave;
+    static constexpr int sz_per_iter = CtaN * Details::kInterleave;
     // number of k-iterations which would be loaded in a single shared memory block load
-    int const sh_sz_group = (GroupSize != 0 ? near_sz_group / (sz_per_iter > (sizeof(AccessTypeA) / sizeof(TypeA)) ? 
+    static constexpr int sh_sz_group = (GroupSize != 0 ? near_sz_group / (sz_per_iter > (sizeof(AccessTypeA) / sizeof(TypeA)) ? 
                                 sz_per_iter / (sizeof(AccessTypeA) / sizeof(TypeA)) : 1) : 1);
     
     __shared__ TypeA shmem_sz[sz_per_iter * (GroupSize != 0 ? Threads / near_sz_group : 1) * sh_sz_group * (EnableZero ? 2 : 1)];
@@ -91,28 +92,24 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         sh_actscale = shmem_a + CtaK / Details::kInterleave * CtaM;
     }
     
-    SHMemIterator<Mandatory, AccessTypeA, Threads, CtaK / Details::kInterleave, StepK, TypeA> act_iterator(
-        act, 0, shmem_a, real_offset_k,
-        CtaK / Details::kInterleave, 0, origin_k, CtaK / Details::kInterleave,
-        interleaved_k / CtaK);
-    SHMemIterator<EnableActScale, AccessTypeA, Threads, CtaK / Details::kInterleave, StepK, TypeA> act_scale_iterator(
-        act_scale, 0, sh_actscale, real_offset_k,
-        CtaK / Details::kInterleave, 0, 0, 0,
-        interleaved_k / CtaK);
-    SHMemIterator<Mandatory, AccessTypeW, Threads, CtaK / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, uint8_t> weight_iterator(
-        weight, interleaved_offset_n * interleaved_k / Details::kElemsPerByteW, shmem_w, tid * StepK / Details::kElemsPerByteW,
-        CtaK / Details::kElemsPerByteW, 0, interleaved_k / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
-        interleaved_k / CtaK);
-    SHMemIterator<Mandatory, AccessTypeA, near_sz_group, sz_per_iter, 1, TypeA> scales_iterator(
-        scales, offset_k_group * n + blk_offset_n, sh_scale, thr_offset_n,
-        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
-        Details::kInterleave, Details::kInterleave,
-        (GroupSize != 0 ? interleaved_k / CtaK : 1));
-    SHMemIterator<EnableZero, AccessTypeA, near_sz_group, sz_per_iter, 1, TypeA> zeros_iterator(
-        zeros, offset_k_group * n + blk_offset_n, sh_zero, thr_offset_n,
-        (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0),
-        Details::kInterleave, Details::kInterleave,
-        (GroupSize != 0 ? interleaved_k / CtaK : 1));
+    SHMemIterator<Mandatory, AccessTypeA, 0, CtaK / Details::kInterleave, StepK,
+        ShMemOptimizer<true, 0, CtaK / Details::kInterleave>, TypeA> act_iterator(
+            act, 0, shmem_a, real_offset_k, CtaK / Details::kInterleave, origin_k, interleaved_k / CtaK);
+    SHMemIterator<EnableActScale, AccessTypeA, 0, CtaK / Details::kInterleave, StepK,
+        ShMemOptimizer<false, 0, 0>, TypeA> act_scale_iterator(
+            act_scale, 0, sh_actscale, real_offset_k, CtaK / Details::kInterleave, 0, interleaved_k / CtaK);
+    SHMemIterator<Mandatory, AccessTypeW, 0, CtaK / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, 
+        ShMemOptimizer<true, 0, CtaK / Details::kElemsPerByteW>, uint8_t> weight_iterator(
+            weight, interleaved_offset_n * interleaved_k / Details::kElemsPerByteW, shmem_w, tid * StepK / Details::kElemsPerByteW,
+            CtaK / Details::kElemsPerByteW, interleaved_k / Details::kElemsPerByteW, interleaved_k / CtaK);
+    SHMemIterator<Mandatory, AccessTypeA, near_sz_group, sz_per_iter, 1,
+        ShMemOptimizer<false, (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0), Details::kInterleave>, TypeA> scales_iterator(
+            scales, offset_k_group * n + blk_offset_n, sh_scale, thr_offset_n, (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
+            0, (GroupSize != 0 ? interleaved_k / CtaK : 1));
+    SHMemIterator<EnableZero, AccessTypeA, near_sz_group, sz_per_iter, 1,
+        ShMemOptimizer<false, (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0), Details::kInterleave>, TypeA> zeros_iterator(
+            zeros, offset_k_group * n + blk_offset_n, sh_zero, thr_offset_n, (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
+            0, (GroupSize != 0 ? interleaved_k / CtaK : 1));
 
     out += offset_m * n + tile_id_n * CtaN * Details::kInterleave;
     if constexpr (EnableBias)
@@ -155,16 +152,16 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
 #pragma unroll
         for (int i = 0; i < CtaN; ++i)
         {
-            scales_iterator.load(vec_scale + i, iter % sh_sz_group, i);
-            zeros_iterator.load(vec_zero + i, iter % sh_sz_group, i);
-            weight_iterator.load(tile_w_quantized + i * StepK / Details::kElemsPerByteW, 0, i);
+            scales_iterator.load(vec_scale + i, i, iter % sh_sz_group);
+            zeros_iterator.load(vec_zero + i, i, iter % sh_sz_group);
+            weight_iterator.load(tile_w_quantized + i * StepK / Details::kElemsPerByteW, i);
         }
 #pragma unroll
         for (int i = 0; i < CtaM; ++i)
         {
-            act_iterator.load(tile_a + i * StepK, 0, i);
+            act_iterator.load(tile_a + i * StepK, i);
         }    
-        act_scale_iterator.load(vec_act_scale, 0);
+        act_scale_iterator.load(vec_act_scale);
 
         // Prefetch next stage
         if (idx_k + CtaK < interleaved_k)

@@ -114,6 +114,14 @@ struct KernelDetails
     static constexpr bool kUseInterleavedConverter = UseInterleavedConverter;
 };
 
+template <bool GtoShStrided_, int ShStep_, int ShStride_>
+struct ShMemOptimizer
+{
+    static constexpr bool GtoShStrided = GtoShStrided_;
+    static constexpr int ShStep = ShStep_;
+    static constexpr int ShStride = ShStride_;
+};
+
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm
