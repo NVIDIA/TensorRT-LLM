@@ -329,7 +329,7 @@ public:
     {
     }
 
-    __device__ __forceinline__ void copy_to_shmem(int g_iter, int sh_iter = 0, int ii = 0)
+    __device__ __forceinline__ void copy_to_shmem(int iter, int ii = 0)
     // __pipeline_memcpy_async will use synced version in sm < 80
     {
         if constexpr (Enable)
@@ -339,11 +339,11 @@ public:
                 int const c = Elements * sizeof(T);
                 static_assert(c % 4 == 0);
                 int const s = threadIdx.x % Grouped;
-                if (s + g_iter <= k_max_iter_)
+                if (s + iter <= k_max_iter_)
                 {
                     __pipeline_memcpy_async(
-                        sh_addr_ + (sh_iter + s) * sh_step_ + ii * sh_stride_,
-                        g_addr_  + (g_iter  + s) * g_step_  + ii * g_stride_ ,
+                        sh_addr_ + s * sh_step_ + ii * sh_stride_,
+                        g_addr_  + (iter + s) * g_step_  + ii * g_stride_ ,
                         c
                     );
                 }
@@ -356,11 +356,11 @@ public:
                 for (int i = threadIdx.x % c; i < c; i += blockDim.x * blockDim.y * blockDim.z)
                 {
                     // s should be float to compare with k_max_iter_
-                    if (threadIdx.x % Grouped / c + g_iter <= k_max_iter_)
+                    if (threadIdx.x % Grouped / c + iter <= k_max_iter_)
                     {
                         __pipeline_memcpy_async(
-                            reinterpret_cast<TVec*>(sh_addr_ + (sh_iter + s) * sh_step_ + ii * sh_stride_) + i,
-                            reinterpret_cast<TVec*>(g_addr_  + (g_iter  + s) * g_step_  + ii * g_stride_ ) + i,
+                            reinterpret_cast<TVec*>(sh_addr_ + s * sh_step_ + ii * sh_stride_) + i,
+                            reinterpret_cast<TVec*>(g_addr_ + (iter + s) * g_step_ + ii * g_stride_) + i,
                             sizeof(TVec)
                         );
                     }
