@@ -114,12 +114,20 @@ struct KernelDetails
     static constexpr bool kUseInterleavedConverter = UseInterleavedConverter;
 };
 
-template <bool GtoShStrided_, int ShStep_, int ShStride_>
+template <bool GtoShStrided_, int ShStep_, int ShStride_, int Elements_, int Continuous_, typename TVec_, typename T_>
 struct ShMemOptimizer
 {
+    using T = T_;
+    using TVec = TVec_;
     static constexpr bool GtoShStrided = GtoShStrided_;
     static constexpr int ShStep = ShStep_;
     static constexpr int ShStride = ShStride_;
+    static constexpr int Elements = Elements_;
+    static constexpr int Continuous = Continuous_;
+    static constexpr int VecSize = sizeof(TVec) / sizeof(T);
+    static constexpr int c_sh = Elements_ * sizeof(T) / (Elements_ < VecSize ? 1 : sizeof(TVec));
+    static constexpr int c_load = Continuous_ / VecSize;
+
 };
 
 } // namespace weight_only

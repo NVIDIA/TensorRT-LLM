@@ -72,10 +72,11 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     // number of k-iterations which would be loaded in a single shared memory block load
     static constexpr int sh_sz_group = (GroupSize != 0 ? near_sz_group / (sz_per_iter > (sizeof(AccessTypeA) / sizeof(TypeA)) ? 
                                 sz_per_iter / (sizeof(AccessTypeA) / sizeof(TypeA)) : 1) : 1);
+    static constexpr int CtaKInterleave = CtaK / Details::kInterleave;
     
     __shared__ TypeA shmem_sz[sz_per_iter * (GroupSize != 0 ? Threads / near_sz_group : 1) * sh_sz_group * (EnableZero ? 2 : 1)];
     __shared__ uint8_t shmem_w[CtaK / Details::kElemsPerByteW * CtaN];
-    __shared__ TypeA shmem_a[CtaK / Details::kInterleave * (EnableActScale ? CtaM + 1 : CtaM)];
+    __shared__ TypeA shmem_a[CtaKInterleave * (EnableActScale ? CtaM + 1 : CtaM)];
 
     TypeA* sh_scale = shmem_sz + sz_per_iter * offset_k_group;
     TypeA* sh_zero = nullptr;
@@ -89,26 +90,26 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
 
     if constexpr (EnableActScale)
     {
-        sh_actscale = shmem_a + CtaK / Details::kInterleave * CtaM;
+        sh_actscale = shmem_a + CtaKInterleave * CtaM;
     }
     
-    SHMemIterator<Mandatory, AccessTypeA, 0, CtaK / Details::kInterleave, StepK,
-        ShMemOptimizer<true, 0, CtaK / Details::kInterleave>, TypeA> act_iterator(
-            act, 0, shmem_a, real_offset_k, CtaK / Details::kInterleave, origin_k, interleaved_k / CtaK);
-    SHMemIterator<EnableActScale, AccessTypeA, 0, CtaK / Details::kInterleave, StepK,
-        ShMemOptimizer<false, 0, 0>, TypeA> act_scale_iterator(
-            act_scale, 0, sh_actscale, real_offset_k, CtaK / Details::kInterleave, 0, interleaved_k / CtaK);
-    SHMemIterator<Mandatory, AccessTypeW, 0, CtaK / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, 
-        ShMemOptimizer<true, 0, CtaK / Details::kElemsPerByteW>, uint8_t> weight_iterator(
+    SHMemIterator<Mandatory, 0,
+    ShMemOptimizer<true, 0, CtaKInterleave, CtaKInterleave, StepK, AccessTypeA, TypeA>> act_iterator(
+            act, 0, shmem_a, real_offset_k, CtaKInterleave, origin_k, interleaved_k / CtaK);
+    SHMemIterator<EnableActScale, 0,
+    ShMemOptimizer<false, 0, 0, CtaKInterleave, StepK, AccessTypeA, TypeA>> act_scale_iterator(
+            act_scale, 0, sh_actscale, real_offset_k, CtaKInterleave, 0, interleaved_k / CtaK);
+    SHMemIterator<Mandatory, 0,  
+    ShMemOptimizer<true, 0, CtaK / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW, StepK / Details::kElemsPerByteW, AccessTypeW, uint8_t>> weight_iterator(
             weight, interleaved_offset_n * interleaved_k / Details::kElemsPerByteW, shmem_w, tid * StepK / Details::kElemsPerByteW,
             CtaK / Details::kElemsPerByteW, interleaved_k / Details::kElemsPerByteW, interleaved_k / CtaK);
-    SHMemIterator<Mandatory, AccessTypeA, near_sz_group, sz_per_iter, 1,
-        ShMemOptimizer<false, (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0), Details::kInterleave>, TypeA> scales_iterator(
-            scales, offset_k_group * n + blk_offset_n, sh_scale, thr_offset_n, (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
+    SHMemIterator<Mandatory, near_sz_group, 
+    ShMemOptimizer<false, (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0), Details::kInterleave, sz_per_iter, 1, AccessTypeA, TypeA>> scales_iterator(
+            scales, offset_k_group * n + blk_offset_n, sh_scale, thr_offset_n, (GroupSize != 0 ? CtaKInterleave / GroupSize * n : 0),
             0, (GroupSize != 0 ? interleaved_k / CtaK : 1));
-    SHMemIterator<EnableZero, AccessTypeA, near_sz_group, sz_per_iter, 1,
-        ShMemOptimizer<false, (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0), Details::kInterleave>, TypeA> zeros_iterator(
-            zeros, offset_k_group * n + blk_offset_n, sh_zero, thr_offset_n, (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0),
+    SHMemIterator<EnableZero, near_sz_group, 
+    ShMemOptimizer<false, (GroupSize != 0 ? sz_per_iter * Threads / near_sz_group : 0), Details::kInterleave, sz_per_iter, 1, AccessTypeA, TypeA>> zeros_iterator(
+            zeros, offset_k_group * n + blk_offset_n, sh_zero, thr_offset_n, (GroupSize != 0 ? CtaKInterleave / GroupSize * n : 0),
             0, (GroupSize != 0 ? interleaved_k / CtaK : 1));
 
     out += offset_m * n + tile_id_n * CtaN * Details::kInterleave;

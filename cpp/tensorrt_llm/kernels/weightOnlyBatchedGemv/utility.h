@@ -312,9 +312,12 @@ private:
     int stride_;
 };
 
-template <bool Enable, typename TVec, int Grouped, int Elements, int Continuous, typename ShTraits, typename T>
+template <bool Enable, int Grouped, typename ShTraits>
 class SHMemIterator
 {
+    using T = typename ShTraits::T;
+    using TVec = typename ShTraits::TVec;
+
 public:
     __device__ __forceinline__  SHMemIterator(T* g_addr, int g_offset, T* sh_addr, int sh_offset,
     int g_step, int g_stride, float k_max_iter)
@@ -334,27 +337,22 @@ public:
         {
             if constexpr (Grouped == 0)
             {   // Grouped == 0 is for weight / act case
-                if (iter <= k_max_iter_)
-                {   // this for loop is mostly single iteration
-                    for (int i = threadIdx.x; i < c_sh; i += CtaSize)
-                    {
-                        if constexpr (ShTraits::GtoShStrided)
-                        { // W, A
-                            __pipeline_memcpy_async(
-                                reinterpret_cast<TVec*>(sh_addr_ + ii * sh_stride_) + i,
-                                reinterpret_cast<TVec*>(g_addr_ + iter * g_step_ + ii * g_stride_) + i,
-                                sizeof(TVec)
-                            );
-                        }
-                        else
-                        { // As
-                            __pipeline_memcpy_async(
-                                reinterpret_cast<TVec*>(sh_addr_) + i,
-                                reinterpret_cast<TVec*>(g_addr_ + iter * g_step_) + i,
-                                sizeof(TVec)
-                            );
-                        }
-                    }
+                int const i = threadIdx.x;
+                if constexpr (ShTraits::GtoShStrided)
+                { // W, A
+                    __pipeline_memcpy_async(
+                        reinterpret_cast<TVec*>(sh_addr_ + ii * sh_stride_) + i,
+                        reinterpret_cast<TVec*>(g_addr_ + iter * g_step_ + ii * g_stride_) + i,
+                        sizeof(TVec)
+                    );
+                }
+                else
+                { // As
+                    __pipeline_memcpy_async(
+                        reinterpret_cast<TVec*>(sh_addr_) + i,
+                        reinterpret_cast<TVec*>(g_addr_ + iter * g_step_) + i,
+                        sizeof(TVec)
+                    );
                 }
             }
             else
@@ -379,16 +377,13 @@ public:
                     if (threadIdx.x % Grouped / c_sh + iter <= k_max_iter_)
                     {
                         int const s = threadIdx.x % Grouped / c_sh;
-                        // this for loop is mostly single iteration
-                        for (int i = threadIdx.x % c_sh; i < c_sh; i += CtaSize)
-                        {
-                            static_assert(!ShTraits::GtoShStrided);
-                            __pipeline_memcpy_async(
-                                reinterpret_cast<TVec*>(sh_addr_ + s * sh_step_) + i,
-                                reinterpret_cast<TVec*>(g_addr_ + (iter + s) * g_step_) + i,
-                                sizeof(TVec)
-                            );
-                        }
+                        int const i = threadIdx.x % c_sh;
+                        static_assert(!ShTraits::GtoShStrided);
+                        __pipeline_memcpy_async(
+                            reinterpret_cast<TVec*>(sh_addr_ + s * sh_step_) + i,
+                            reinterpret_cast<TVec*>(g_addr_ + (iter + s) * g_step_) + i,
+                            sizeof(TVec)
+                        );
                     }
                 }
             }
@@ -433,11 +428,6 @@ public:
     }
 
 private:
-    static constexpr int VecSize = sizeof(TVec) / sizeof(T);
-    static constexpr int c_sh = Elements * sizeof(T) / (Elements < VecSize ? 1 : sizeof(TVec));
-    static constexpr int c_load = Continuous / VecSize;
-    const int CtaSize = blockDim.x * blockDim.y * blockDim.z;
-
     T* g_addr_;
     T* sh_addr_;
     int sh_offset_;
@@ -446,6 +436,11 @@ private:
     // Decimal value represents that the last k iteration will only use a few warps
     float k_max_iter_;
 
+    static constexpr int VecSize = ShTraits::VecSize;
+    static constexpr int c_sh = ShTraits::c_sh;
+    static constexpr int c_load = ShTraits::c_load;
+    static constexpr int Continuous = ShTraits::Continuous;
+    static constexpr int Elements = ShTraits::Elements;
     static constexpr int sh_step_ = ShTraits::ShStep;
     static constexpr int sh_stride_ = ShTraits::ShStride;
 };
