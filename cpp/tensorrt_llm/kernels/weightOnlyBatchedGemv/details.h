@@ -53,7 +53,7 @@ struct ColumnMajor
     using DetailsA = TypeDetailsA;
     using DetailsW = TypeDetailsW;
     using AccessTypeA = float4;
-    using AccessTypeW = int;
+    using AccessTypeW = typename std::conditional<TypeDetailsW::kElemBits == 8, int2, int>::type;
     static constexpr int kAccessSize = 128;
     static constexpr int kStepK = kAccessSize / TypeDetailsA::kElemBits;
     static constexpr int kTileSize = TileSizeK;
