@@ -34,7 +34,7 @@ def enqueue_requests(args: argparse.Namespace,
     request_ids = []
     for tokens in input_tokens:
         req = trtllm.Request(input_token_ids=tokens,
-                             max_new_tokens=args.max_new_tokens,
+                             max_tokens=args.max_tokens,
                              streaming=args.streaming,
                              sampling_config=sampling_config,
                              output_config=output_config)
@@ -126,11 +126,11 @@ if __name__ == "__main__":
         help=
         "Exclude input token when writing output toekns. Only has effect for streaming=False since in streaming mode, input tokens are never included in output."
     )
-    parser.add_argument("--max_new_tokens",
+    parser.add_argument("--max_tokens",
                         type=int,
                         required=False,
                         default=10,
-                        help="The beam width")
+                        help="The max number of tokens to be generated")
     parser.add_argument(
         "--timeout_ms",
         type=int,

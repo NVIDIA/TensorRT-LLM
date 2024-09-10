@@ -16,17 +16,12 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
-#include <numeric>
-
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 static constexpr runtime::SizeType32 TOP_K_MAX = 1024;
@@ -187,5 +182,9 @@ template <typename T>
     return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
 }
 
-} // namespace kernels
-} // namespace tensorrt_llm
+void invokeSetupTopKRuntimeArgs(runtime::SizeType32 batchSize, runtime::SizeType32 topK,
+    runtime::SizeType32* runtimeTopKDevicePtr, runtime::SizeType32 runtimeTopKSize, float topP,
+    float* runtimeTopPDevicePtr, runtime::SizeType32 runtimeTopPSize, bool* skipDecodeDevicePtr,
+    runtime::SizeType32 const* batchSlotsDevicePtr, cudaStream_t stream);
+
+} // namespace tensorrt_llm::kernels

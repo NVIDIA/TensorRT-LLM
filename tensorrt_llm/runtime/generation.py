@@ -3025,6 +3025,7 @@ class GenerationSession(object):
             this_tgt_cache_indirection = cache_indirections[1]
             next_src_cache_indirection = cache_indirections[1]
 
+        position_ids_raw = kwargs.get('position_ids', None)
         if step == 0:
             model_inputs = self._prepare_context_inputs(
                 batch_size=batch_size,
@@ -3037,7 +3038,17 @@ class GenerationSession(object):
                 pad_id=scfg.pad_id,
                 eos_id=scfg.end_id)
 
-            position_ids = model_inputs.get('position_ids', None)
+            if position_ids_raw is None:
+                # default iota position ids
+                position_ids = model_inputs.get('position_ids', None)
+            else:
+                # user input position ids
+                if self.remove_input_padding:
+                    position_ids = torch.cat(position_ids_raw, dim=0)
+                else:
+                    padded_position_ids = torch.nn.utils.rnn.pad_sequence(
+                        position_ids_raw, batch_first=True, padding_value=0)
+                    position_ids = padded_position_ids
             last_token_ids = model_inputs.get('last_token_ids')
             attention_mask = model_inputs.get('attention_mask', None)
             context_runtime_perf_knobs = model_inputs.get(
@@ -3199,7 +3210,13 @@ class GenerationSession(object):
                 attention_mask=attention_mask,
             )
 
-            position_ids = model_inputs.get('position_ids', None)
+            if position_ids_raw is None:
+                position_ids = model_inputs.get('position_ids', None)
+            else:
+                position_ids = torch.cat(
+                    [p[-1:] + step + 1 for p in position_ids_raw], dim=0)
+                if not self.remove_input_padding:
+                    position_ids = torch.unsqueeze(position_ids, 1)
             last_token_ids = model_inputs.get('last_token_ids')
             attention_mask = model_inputs.get('attention_mask', None)
             gen_runtime_perf_knobs = model_inputs.get('host_runtime_perf_knobs',

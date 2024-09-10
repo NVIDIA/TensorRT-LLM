@@ -17,7 +17,7 @@ def main(model_dir: str, tp_size: int, engine_dir: str):
             engine_dir) != os.path.abspath(model_dir):
         llm.save(engine_dir)
 
-    sampling_params = SamplingParams(max_new_tokens=10, end_id=-1)
+    sampling_params = SamplingParams(max_tokens=10, end_id=-1)
 
     prompt_token_ids = [45, 12, 13]
     for output in llm.generate([prompt_token_ids],

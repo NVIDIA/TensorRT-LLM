@@ -72,15 +72,14 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
     prompt = "A B C D"
     prompt_token_ids = tokenizer.encode(prompt)
-    max_new_tokens = 8
+    max_tokens = 8
 
     with GenerationExecutor.create(
             llama_7b_bs2_path,
             executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
         result = executor.generate(prompt_token_ids,
                                    sampling_params=SamplingParams(
-                                       max_new_tokens=max_new_tokens,
-                                       beam_width=2))
+                                       max_tokens=max_tokens, beam_width=2))
         assert similar(tokenizer.decode(result.outputs[0].token_ids),
                        'E F G H I J K L')
         assert similar(tokenizer.decode(result.outputs[1].token_ids),
@@ -95,8 +94,8 @@ def test_sync_generation(llama_7b_path: Path):
 
     expected_output = "E F G H"
     expected_long_output = "E F G H I J K L"
-    sampling_params0 = SamplingParams(max_new_tokens=4)
-    sampling_params1 = SamplingParams(max_new_tokens=8)
+    sampling_params0 = SamplingParams(max_tokens=4)
+    sampling_params1 = SamplingParams(max_tokens=8)
     with GenerationExecutor.create(llama_7b_path) as executor:
         # Simple generations (synchronous)
         result = executor.generate(prompt_token_ids,
@@ -153,7 +152,7 @@ def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_tp2_path)
     prompt = "deep learning"
     prompt_token_ids = tokenizer.encode(prompt)
-    sampling_params = SamplingParams(max_new_tokens=4)
+    sampling_params = SamplingParams(max_tokens=4)
 
     with GenerationExecutor.create(llama_7b_tp2_path) as executor:
 
@@ -174,7 +173,7 @@ def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     prompt = "deep learning"
     prompt_token_ids = tokenizer.encode(prompt)
     tp_size = 2
-    sampling_params = SamplingParams(max_new_tokens=4)
+    sampling_params = SamplingParams(max_tokens=4)
 
     executor = GenerationExecutor.create(llama_7b_tp2_path,
                                          model_world_size=tp_size)

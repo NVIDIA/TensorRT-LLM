@@ -1,15 +1,15 @@
-# Exaone
+# EXAONE
 
-This document shows how to build and run a [Exaone](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) model in TensorRT-LLM.
+This document shows how to build and run a [EXAONE](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct) model in TensorRT-LLM.
 
-The TensorRT-LLM Exaone implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../tensorrt_llm/models/llama/model.py).
+The TensorRT-LLM EXAONE implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../tensorrt_llm/models/llama/model.py).
 See the LLaMA example [`examples/llama`](../llama) for details.
 
-- [Exaone](#exaone)
+- [EXAONE](#exaone)
   - [Support Matrix](#support-matrix)
   - [Download model checkpoints](#download-model-checkpoints)
   - [TensorRT-LLM workflow](#tensorrt-llm-workflow)
-    - [Convert checkpoint and build TRTLLM engine](#convert-checkpoint-and-build-trtllm-engine)
+    - [Convert checkpoint and build TensorRT engine(s)](#convert-checkpoint-and-build-tensorrt-engines)
     - [Run Engine](#run-engine)
 
 ## Support Matrix
@@ -19,7 +19,7 @@ See the LLaMA example [`examples/llama`](../llama) for details.
 
 ## Download model checkpoints
 
-First, download the HuggingFace FP16 checkpoints of Exaone model.
+First, download the HuggingFace FP32 checkpoints of EXAONE model.
 
 ```bash
 git clone https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct hf_models/exaone
@@ -28,9 +28,9 @@ git clone https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct hf_models/
 ## TensorRT-LLM workflow
 Next, we build the model with `trtllm-build`.
 
-### Convert checkpoint and build TRTLLM engine
+### Convert checkpoint and build TensorRT engine(s)
 
-As written above, we will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for Exaone model.
+As written above, we will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model.
 ```bash
 # Build a single-GPU float16 engine from HF weights.
 
@@ -58,7 +58,7 @@ trtllm-build \
     --output_dir trt_engines/exaone/fp16_wq_8/1-gpu \
     --gemm_plugin auto
 ```
-> **NOTE**: Exaone model is currently not supported with `--load_by_shard`.
+> **NOTE**: EXAONE model is currently not supported with `--load_by_shard`.
 
 
 ### Run Engine

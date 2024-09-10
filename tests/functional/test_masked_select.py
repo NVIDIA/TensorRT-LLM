@@ -59,6 +59,7 @@ class TestFunctional(unittest.TestCase):
         mask_data = torch.randint(2, mask_shape).to(torch.bool)
 
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()

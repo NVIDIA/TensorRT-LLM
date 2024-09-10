@@ -27,16 +27,6 @@ from ...mapping import Mapping
 Weights = Dict[str, torch.Tensor]
 
 
-def dup_kv_weight(v, num_head, tp_size):
-    assert tp_size % num_head == 0
-    reps = tp_size // num_head
-    head_size = v.shape[0] // num_head
-    v = v.reshape(num_head, head_size,
-                  -1)[:, None, :, :].expand(num_head, reps, head_size,
-                                            v.shape[1])
-    return v.reshape(num_head * reps * head_size, -1).clone().detach()
-
-
 def quantize_fp8_weights(weights: Weights, num_layers: int,
                          mapping: Mapping) -> Weights:
 

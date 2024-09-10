@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include <stdexcept>
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
@@ -27,15 +26,12 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
@@ -367,5 +363,47 @@ template void invokeBatchTopKSampling(TopKSamplingKernelParams<float> const& par
 
 template void invokeBatchTopKSampling(TopKSamplingKernelParams<half> const& params, cudaStream_t stream);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+__global__ void setupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs, SizeType32 topKsSize,
+    float topP, float* topPs, SizeType32 topPsSize, bool* skipDecode, SizeType32 const* batchSlots)
+{
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
+    {
+        auto const batchSlot = batchSlots[bi];
+        auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
+        auto p = topPsSize > 1 ? topPs[batchSlot] : topP;
+
+        if (k == 0 && p == 0.0f)
+        {
+            // TensorRT-LLM's topp implementation does not support topp = 0.0f, but it
+            // equivalent to greedy search. So, we set the topk = 1 as an alternative
+            // solution.
+            k = 1;
+        }
+        if (k > 0 && p == 0.0f)
+        {
+            // This case corresponds to the old topk sampling, which is equivalent to
+            // the old topk_topp sampling with topp=1.0f. TopKSamplingLayer and
+            // TopKTopPSamplingLayer are now merged by TopKSamplingLayer. Thus, we
+            // replace the case topk>0 and topp=0.0f by topk>0 and topp=1.0f for the
+            // compatibility.
+            p = 1.0f;
+        }
+        topKs[batchSlot] = k;
+        topPs[batchSlot] = p;
+        skipDecode[batchSlot] = k == 0;
+    }
+}
+
+void invokeSetupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* runtimeTopKDevicePtr,
+    SizeType32 runtimeTopKSize, float topP, float* runtimeTopPDevicePtr, SizeType32 runtimeTopPSize,
+    bool* skipDecodeDevicePtr, SizeType32 const* batchSlotsDevicePtr, cudaStream_t stream)
+{
+    dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+    dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+    // support topK up to TOP_K_MAX.
+    setupTopKRuntimeArgs<<<grid, block, 0, stream>>>(batchSize, topK, runtimeTopKDevicePtr, runtimeTopKSize, topP,
+        runtimeTopPDevicePtr, runtimeTopPSize, skipDecodeDevicePtr, batchSlotsDevicePtr);
+}
+
+} // namespace tensorrt_llm::kernels

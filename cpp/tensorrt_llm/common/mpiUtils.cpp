@@ -27,6 +27,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <type_traits>
 #ifndef _WIN32
 #include <unistd.h>
@@ -127,10 +128,10 @@ std::vector<int> getWorldRanks(MpiComm const& comm)
     MPICHECK(MPI_Group_free(&group));
     MPICHECK(MPI_Group_free(&worldGroup));
     std::sort(worldRanks.begin(), worldRanks.end());
-    return worldRanks;
 #else
-    TLLM_THROW("Multi device support is disabled.");
+    std::vector<int> worldRanks{0};
 #endif
+    return worldRanks;
 }
 
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
@@ -320,6 +321,27 @@ void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) 
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
+}
+
+bool MpiComm::iprobe(int source, int tag, MPI_Status* status) const
+{
+#if ENABLE_MULTI_DEVICE
+    int flag{0};
+    MPICHECK(MPI_Iprobe(source, tag, mComm, &flag, status));
+    return flag != 0;
+#else
+    TLLM_THROW("Multi device support is disabled.");
+    return false;
+#endif
+}
+
+void MpiComm::recvPoll(int source, int tag, int periodMs) const
+{
+    MPI_Status status;
+    while (!iprobe(source, tag, &status))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(periodMs));
+    }
 }
 
 int MpiComm::getRank() const

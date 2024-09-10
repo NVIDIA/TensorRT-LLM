@@ -1,7 +1,7 @@
 import fnmatch
 import re
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from datasets import load_dataset
@@ -15,7 +15,7 @@ def split(v, tp_size, idx, dim=0):
     if len(v.shape) == 1:
         return torch.chunk(v, tp_size)[idx].contiguous()
     else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].clone()
+        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
 
 def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
@@ -25,7 +25,7 @@ def split_qkv_tp(v, n_head, n_hidden, tensor_parallel, rank):
     v = v.reshape(3, n_hidden, n_hidden)
     split_v = split(v, tensor_parallel, rank, dim=1)
     split_v = split_v.reshape(3 * (n_hidden // tensor_parallel), n_hidden)
-    return split_v.clone()
+    return split_v.contiguous()
 
 
 def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
@@ -35,7 +35,7 @@ def split_qkv_bias_tp(v, n_head, n_hidden, tensor_parallel, rank):
     v = v.reshape(3, n_hidden)
     split_v = split(v, tensor_parallel, rank, dim=1)
     split_v = split_v.reshape(3 * (n_hidden // tensor_parallel))
-    return split_v.clone()
+    return split_v.contiguous()
 
 
 def split_matrix_tp(v, tensor_parallel, rank, dim):
@@ -61,6 +61,35 @@ def weight_only_quantize(weight: torch.Tensor,
         return processed_torch_weights, torch_weight_scales
     else:
         return v, torch_weight_scales
+
+
+def get_weight(params: Dict[str, torch.Tensor], prefix: str,
+               dtype: torch.dtype) -> torch.Tensor:
+    if f'{prefix}.weight' not in params:
+        return None
+    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
+
+
+def get_bias(params: Dict[str, torch.Tensor], prefix: str,
+             dtype: torch.dtype) -> torch.Tensor:
+    if f'{prefix}.bias' not in params:
+        return None
+    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
+
+
+def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
+                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
+    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
+
+
+def dup_kv_weight(v, num_head, tp_size):
+    assert tp_size % num_head == 0
+    reps = tp_size // num_head
+    head_size = v.shape[0] // num_head
+    v = v.reshape(num_head, head_size,
+                  -1)[:, None, :, :].expand(num_head, reps, head_size,
+                                            v.shape[1])
+    return v.reshape(num_head * reps * head_size, -1).clone().detach()
 
 
 def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],

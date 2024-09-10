@@ -39,14 +39,14 @@ void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     half* actPtr = reinterpret_cast<half*>(workspace);
     int8_t* weightPtr
         = reinterpret_cast<int8_t*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(actPtr), m * k * sizeof(half)));
-    half* scalesPtr = reinterpret_cast<half*>(
-        nextWorkspacePtr(reinterpret_cast<int8_t*>(weightPtr), originalN * k * sizeof(int8_t)));
+    half* scalesPtr
+        = reinterpret_cast<half*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(weightPtr), n * k * sizeof(int8_t)));
     half* outputPtr
         = reinterpret_cast<half*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(scalesPtr), originalN * sizeof(half)));
     char* workspacePtr
         = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(outputPtr), m * originalN * sizeof(half)));
 
-    int const wsSize = mRunner->getWorkspaceSize(m, n, k);
+    int const wsSize = mRunner->getWorkspaceSize(m, originalN, k);
 
     if (mWeightTypeId == WeightTypeId::INT8)
     {
@@ -63,11 +63,11 @@ void WeightOnlyQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, si
 {
     int const originalN = n * getWeightTypeMultiplier(mWeightTypeId);
     std::vector<size_t> workspaces = {
-        maxM * k * sizeof(half),              // A
-        originalN * k * sizeof(int8_t),       // B
-        originalN * sizeof(half),             // scales
-        maxM * originalN * sizeof(half),      // C
-        mRunner->getWorkspaceSize(maxM, n, k) // workspace
+        maxM * k * sizeof(half),                      // A
+        n * k * sizeof(int8_t),                       // B
+        originalN * sizeof(half),                     // scales
+        maxM * originalN * sizeof(half),              // C
+        mRunner->getWorkspaceSize(maxM, originalN, k) // workspace
     };
     size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
     setTmpWorkspaceSizeInBytes(bytes);

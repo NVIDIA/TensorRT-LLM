@@ -49,6 +49,7 @@ using TokenIdType = std::int32_t;
 using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using IdType = std::uint64_t;
+using VecTokenExtraIds = std::vector<IdType>;
 using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
@@ -61,6 +62,7 @@ using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&
     std::vector<std::optional<IdType>> const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
+using BufferView = std::basic_string_view<uint8_t>;
 
 enum class DataType
 {
@@ -74,6 +76,13 @@ enum class DataType
     kFP16,
     kFP32,
     kUNKNOWN
+};
+
+enum class RequestType
+{
+    REQUEST_TYPE_CONTEXT_AND_GENERATION = 0,
+    REQUEST_TYPE_CONTEXT_ONLY = 1,
+    REQUEST_TYPE_GENERATION_ONLY = 2
 };
 
 //! \brief For converting a C++ data type to a `TrtLmmDataType`.
@@ -281,10 +290,14 @@ struct IterationStats
     IterationType iter;
     /// @brief Iteration latency (ms)
     double iterLatencyMS;
+    /// @brief The total time spent in queue by the requests that became active in this iteration (ms)
+    double newActiveRequestsQueueLatencyMS;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
     /// @brief Number of queued requests
     SizeType32 numQueuedRequests;
+    /// @brief  Number of requests that were completed in this iteration
+    SizeType32 numCompletedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
     /// @brief GPU memory usage in bytes

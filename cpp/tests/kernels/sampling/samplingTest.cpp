@@ -30,8 +30,7 @@ void SamplingKernelTest<T>::SetUp()
     mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
     mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
 
-    int32_t device;
-    cudaGetDevice(&device);
+    auto const device = tc::getDevice();
     cudaGetDeviceProperties(&mDeviceProp, device);
 }
 
@@ -114,7 +113,7 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
 
     std::mt19937 gen(42);
 
-    auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    auto* batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
     auto probsPtr = BufferRange<T*>(*mProbsPtrsDevice);
     auto probsDevicePtr = bufferCast<T>(*mProbsDevice);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
@@ -349,7 +348,7 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
     {
         for (int32_t bi = 0; bi < batchSize; ++bi)
         {
-            auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+            auto* batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
             auto const batchSlot = batchSlotsPtr[bi];
             bool passed = checkResult("cum log probs", bufferCast<float>(*cumLogProbsHost) + batchSlot,
                 bufferCast<float>(*mExpectedCumLogProbsHost) + batchSlot, 1);

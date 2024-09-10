@@ -358,6 +358,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             self,
             batch_input_ids: List[torch.Tensor],
             *,
+            position_ids: List[torch.Tensor] = None,
             encoder_input_ids: List[torch.Tensor] = None,
             encoder_input_features: List[
                 torch.Tensor] = None,  # TODO: add to doc string
@@ -388,6 +389,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         Args:
             batch_input_ids (List[torch.Tensor]):
                 A list of input id tensors. Each tensor is of shape (sequence_length, ).
+            position_ids (List[torch.Tensor]):
+                A list of position id tensors. Each tensor is of shape (sequence_length, ).
             encoder_input_ids (List[torch.Tensor]):
                 A list of encoder input id tensors for encoder-decoder models (optional). Each tensor is of shape (sequence_length, ).
             encoder_input_features: (List[torch.Tensor]):
@@ -451,12 +454,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
             # Note: Due to a Python3.10 bug one cannot use inspect on it currently
             accepted_parameters = [
                 "num_beams", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-                "top_p_decay", "random_seed", "temperature", "min_length",
+                "top_p_decay", "temperature", "min_tokens",
                 "beam_search_diversity_rate", "repetition_penalty",
                 "presence_penalty", "frequency_penalty", "length_penalty",
                 "early_stopping", "no_repeat_ngram_size"
             ]
-            rename_params = {"num_beams": "beam_width"}
+            rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
             sampling_params = {
                 k: v
                 for k, v in kwargs.items() if k in accepted_parameters
@@ -498,7 +501,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 if encoder_output_lengths is not None else None,
                 encoder_input_features=encoder_input_features[i].contiguous()
                 if encoder_input_features is not None else None,
-                max_new_tokens=max_new_tokens,
+                position_ids=position_ids[i].tolist()
+                if position_ids is not None else None,
+                max_tokens=max_new_tokens,
                 pad_id=pad_id,
                 end_id=end_id,
                 stop_words=stop_words,

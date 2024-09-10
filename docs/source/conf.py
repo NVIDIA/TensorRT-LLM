@@ -11,7 +11,7 @@ import sys
 
 import pygit2
 
-sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('.'))
 
 project = 'tensorrt_llm'
 copyright = '2024, NVidia'
@@ -72,9 +72,10 @@ print('CPP_GEN_DIR', CPP_GEN_DIR)
 
 
 def setup(app):
-    from docs.source.generate_examples import generate_examples
+    from helper import generate_examples, generate_llmapi
 
     generate_examples()
+    generate_llmapi()
 
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):

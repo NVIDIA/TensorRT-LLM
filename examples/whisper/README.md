@@ -63,43 +63,59 @@ python3 convert_checkpoint.py \
 # Build the large-v3 model using trtllm-build
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
               --output_dir ${output_dir}/encoder \
-              --paged_kv_cache disable \
               --moe_plugin disable \
               --enable_xqa disable \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --gemm_plugin disable \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable \
-              --max_input_len 1500
+              --max_input_len 3000 --max_seq_len=3000
 
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --output_dir ${output_dir}/decoder \
-              --paged_kv_cache disable \
               --moe_plugin disable \
               --enable_xqa disable \
               --max_beam_width ${MAX_BEAM_WIDTH} \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --max_seq_len 114 \
               --max_input_len 14 \
-              --max_encoder_input_len 1500 \
+              --max_encoder_input_len 3000 \
               --gemm_plugin ${INFERENCE_PRECISION} \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
-              --gpt_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable
+              --gpt_attention_plugin ${INFERENCE_PRECISION}
 ```
 
 ### Run
+Different types of runtime are provided for whisper models. Following an order of serving performance and good usability, we recommend:
+- (NEW) Python binding of C++ runtime w/ Paged KV Cache and Inflight Batching (IFB)
+- Python runtime w/ Static Batching
+
+Please refer to the documentation for the details of [paged kv cache](../../docs/source/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../docs/source/advanced/gpt-attention.md#inflight-batching).
+
+#### Run C++ runtime
+**Note: to use inflight batching and paged kv cache features in C++ runtime, please make sure you have set `--paged_kv_cache enable` and `--remove_input_padding enable` (which is by default enabled) in the `trtllm-build` command. Meanwhile, if using Python runtime, it is recommended to disable these flag by `--paged_kv_cache disable` and `--remove_input_padding disable` to avoid any unnecessary overhead.**
 
 ```bash
 # choose the engine you build [./whisper_large_v3, ./whisper_large_v3_int8]
-output_dir=./whisper_large_v3_int8
+output_dir=./whisper_large_v3
 # decode a single audio file
 # If the input file does not have a .wav extension, ffmpeg needs to be installed with the following command:
 # apt-get update && apt-get install -y ffmpeg
+# Inferencing via python binding of C++ runtime with inflight batching (IFB)
 python3 run.py --name single_wav_test --engine_dir $output_dir --input_file assets/1221-135766-0002.wav
 # decode a whole dataset
 python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup --name librispeech_dummy_large_v3
 ```
+
+
+For pure C++ runtime, there is no example given yet. Please check the [`Executor`](../../cpp/include/tensorrt_llm/executor/executor.h) API to implement your own end-to-end workflow. It is highly recommended to leverage more encapsulated solutions such as the above C++ Python binding or [Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend).
+
+<!-- #### Run with Triton Backend
+[Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/whisper.md) contains the tutorial on how to run whisper engines with Tritonserver. -->
+
+#### Run Python runtime
+
+For pure Python runtime, you can simply add the `--use_py_session` option.
+
 ### Distil-Whisper
 TensorRT-LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
 You can do so by running the script [distil_whisper/convert_from_distil_whisper.py](./convert_from_distil_whisper.py) as follows:
@@ -134,31 +150,30 @@ python3 convert_checkpoint.py \
 
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
               --output_dir ${output_dir}/encoder \
-              --paged_kv_cache disable \
               --moe_plugin disable \
               --enable_xqa disable \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --gemm_plugin disable \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable \
-              --max_input_len 1500
+              --max_input_len 3000 --max_seq_len=3000
 
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --output_dir ${output_dir}/decoder \
-              --paged_kv_cache disable \
               --moe_plugin disable \
               --enable_xqa disable \
               --max_beam_width ${MAX_BEAM_WIDTH} \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --max_seq_len 114 \
               --max_input_len 14 \
-              --max_encoder_input_len 1500 \
+              --max_encoder_input_len 3000 \
               --gemm_plugin ${INFERENCE_PRECISION} \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
-              --gpt_attention_plugin ${INFERENCE_PRECISION} \
-              --remove_input_padding disable
+              --gpt_attention_plugin ${INFERENCE_PRECISION}
 
+# use cpp runtime python bindings
 python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --name librispeech_dummy_${output_dir}
+# use python runtime
+python3 run.py --engine_dir $output_dir --dataset hf-internal-testing/librispeech_asr_dummy --name librispeech_dummy_${output_dir} --use_py_session
 ```
 </details>
 

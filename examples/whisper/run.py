@@ -32,9 +32,12 @@ import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
-from tensorrt_llm.bindings import KVCacheType
-from tensorrt_llm.runtime import ModelConfig, SamplingConfig
+from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
+from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
+
+if PYTHON_BINDINGS:
+    from tensorrt_llm.runtime import ModelRunnerCpp
 
 
 def parse_arguments():
@@ -61,6 +64,9 @@ def parse_arguments():
     parser.add_argument('--accuracy_check',
                         action='store_true',
                         help="only for CI test")
+    parser.add_argument('--use_py_session',
+                        action='store_true',
+                        help="use python session or cpp session")
     return parser.parse_args()
 
 
@@ -272,18 +278,21 @@ class WhisperDecoding:
 
 class WhisperTRTLLM(object):
 
-    def __init__(self, engine_dir, debug_mode=False, assets_dir=None):
+    def __init__(self,
+                 engine_dir,
+                 debug_mode=False,
+                 assets_dir=None,
+                 use_py_session=False):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
         engine_dir = Path(engine_dir)
-
-        self.encoder = WhisperEncoding(engine_dir)
-        self.decoder = WhisperDecoding(engine_dir,
-                                       runtime_mapping,
-                                       debug_mode=False)
-        is_multilingual = (self.decoder.decoder_config['vocab_size'] >= 51865)
+        encoder_config = read_config('encoder', engine_dir)
+        decoder_config = read_config('decoder', engine_dir)
+        self.n_mels = encoder_config['n_mels']
+        self.num_languages = encoder_config['num_languages']
+        is_multilingual = (decoder_config['vocab_size'] >= 51865)
         if is_multilingual:
             tokenizer_name = "multilingual"
             assert (Path(assets_dir) / "multilingual.tiktoken").exists(
@@ -293,33 +302,68 @@ class WhisperTRTLLM(object):
             assert (Path(assets_dir) / "gpt2.tiktoken").exists(
             ), "gpt2.tiktoken file is not existed in assets_dir"
         self.tokenizer = get_tokenizer(name=tokenizer_name,
-                                       num_languages=self.encoder.num_languages,
+                                       num_languages=self.num_languages,
                                        tokenizer_dir=assets_dir)
         self.eot_id = self.tokenizer.encode(
             "<|endoftext|>",
             allowed_special=self.tokenizer.special_tokens_set)[0]
+        if use_py_session:
+            self.encoder = WhisperEncoding(engine_dir)
+            self.decoder = WhisperDecoding(engine_dir,
+                                           runtime_mapping,
+                                           debug_mode=debug_mode)
+        else:
+            json_config = GptJsonConfig.parse_file(engine_dir / 'decoder' /
+                                                   'config.json')
+            assert json_config.model_config.supports_inflight_batching
+            runner_kwargs = dict(engine_dir=engine_dir,
+                                 is_enc_dec=True,
+                                 max_batch_size=16,
+                                 max_input_len=3000,
+                                 max_output_len=96,
+                                 max_beam_width=4,
+                                 debug_mode=debug_mode,
+                                 kv_cache_free_gpu_memory_fraction=0.9)
+            self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
+        self.use_py_session = use_py_session
 
     def process_batch(
             self,
             mel,
             mel_input_lengths,
             text_prefix="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
-            num_beams=1):
+            num_beams=1,
+            max_new_tokens=96):
         prompt_id = self.tokenizer.encode(
             text_prefix, allowed_special=self.tokenizer.special_tokens_set)
         prompt_id = torch.tensor(prompt_id)
         batch_size = mel.shape[0]
         decoder_input_ids = prompt_id.repeat(batch_size, 1)
-        encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
-            mel, mel_input_lengths)
-        encoder_max_input_length = torch.max(encoder_output_lengths).item()
-        output_ids = self.decoder.generate(decoder_input_ids,
-                                           encoder_output,
-                                           encoder_max_input_length,
-                                           encoder_output_lengths,
-                                           self.eot_id,
-                                           max_new_tokens=96,
-                                           num_beams=num_beams)
+        if self.use_py_session:
+            encoder_output, encoder_output_lengths = self.encoder.get_audio_features(
+                mel, mel_input_lengths)
+            encoder_max_input_length = torch.max(encoder_output_lengths).item()
+            output_ids = self.decoder.generate(decoder_input_ids,
+                                               encoder_output,
+                                               encoder_max_input_length,
+                                               encoder_output_lengths,
+                                               self.eot_id,
+                                               max_new_tokens=max_new_tokens,
+                                               num_beams=num_beams)
+        else:
+            with torch.no_grad():
+                outputs = self.model_runner_cpp.generate(
+                    batch_input_ids=decoder_input_ids,
+                    encoder_input_features=mel.transpose(1, 2),
+                    encoder_output_lengths=mel_input_lengths // 2,
+                    max_new_tokens=max_new_tokens,
+                    end_id=self.eot_id,
+                    pad_id=self.eot_id,
+                    num_beams=num_beams,
+                    output_sequence_lengths=True,
+                    return_dict=True)
+                torch.cuda.synchronize()
+                output_ids = outputs['output_ids'].cpu().numpy().tolist()
         texts = []
         for i in range(len(output_ids)):
             text = self.tokenizer.decode(output_ids[i][0]).strip()
@@ -337,7 +381,7 @@ def decode_wav_file(
         normalizer=None,
         mel_filters_dir=None):
     mel, total_duration = log_mel_spectrogram(input_file_path,
-                                              model.encoder.n_mels,
+                                              model.n_mels,
                                               device='cuda',
                                               return_duration=True,
                                               mel_filters_dir=mel_filters_dir)
@@ -406,7 +450,7 @@ def decode_dataset(
 
         features = [
             log_mel_spectrogram(wave,
-                                model.encoder.n_mels,
+                                model.n_mels,
                                 device='cuda',
                                 mel_filters_dir=mel_filters_dir).unsqueeze(0)
             for wave in waveforms
@@ -432,7 +476,8 @@ def decode_dataset(
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
-    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir)
+    model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir,
+                          args.use_py_session)
     normalizer = EnglishTextNormalizer()
     if args.enable_warmup:
         results, total_duration = decode_dataset(

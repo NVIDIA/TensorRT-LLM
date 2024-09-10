@@ -757,6 +757,7 @@ class ModelRunner(ModelRunnerMixin):
 
     def generate(self,
                  batch_input_ids: List[torch.Tensor],
+                 position_ids: List[torch.Tensor] = None,
                  sampling_config: Optional[SamplingConfig] = None,
                  prompt_table: Optional[Union[str, torch.Tensor]] = None,
                  prompt_tasks: Optional[str] = None,
@@ -864,6 +865,7 @@ class ModelRunner(ModelRunnerMixin):
             streaming=streaming,
             stopping_criteria=stopping_criteria,
             logits_processor=logits_processor,
+            position_ids=position_ids,
             **ptuning_kwargs)
         if sampling_config.return_dict:
             if streaming:

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
 #include <curand_kernel.h>
 
@@ -36,11 +37,13 @@ public:
 
     ExplicitDraftTokensLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     //! @returns workspace needed for this layer in bytes
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
@@ -48,16 +51,20 @@ public:
 private:
     void allocateBuffer();
 
-    void convertPackedMask(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
+    void convertPackedMask(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
 
-    void packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
-
-    template <typename Dtype>
-    void fillContextBuffers(
-        SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& setupParams);
+    void packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
 
     template <typename Dtype>
-    void splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
+    void fillContextBuffers(SizeType32 batchSize, BufferConstPtr batchSlots,
+        ExplicitDraftTokensSetupParams const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
+
+    template <typename Dtype>
+    void splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
 
 private:
     using Base::mDecoderDomain;
@@ -67,10 +74,9 @@ private:
 
     size_t mScanWorkspaceSizeInBytes{0};
     size_t mReduceWorkspaceSizeInBytes{0};
+    size_t mWorkspaceSize{0};
 
-    TensorPtr mRandomSeedsDevice;
     TensorPtr mCurandStatesDevice;
-    BufferPtr mWorkspaceDevice;
     TensorPtr mGenerationLengthInclusiveSum;
     TensorPtr mMaxGenerationLength;
     TensorPtr mTemperatureDevice;

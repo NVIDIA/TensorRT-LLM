@@ -280,6 +280,7 @@ class HfParser:
     def load_parameters(self,
                         checkpoint_path: Path,
                         load_model_on_cpu: bool = False) -> Weights:
+        """`AutoModelForCausalLM.from_pretrained` will parse the correct gemma, whether Gemma or Gemma2 or future versions."""
         from transformers import AutoModelForCausalLM
         hf_model = AutoModelForCausalLM.from_pretrained(
             checkpoint_path,
@@ -910,8 +911,9 @@ def non_modelopt_quantize_if_needed(
     return weights
 
 
-def load_gemma_weights_from_hf_model(hf_model: "transformers.GemmaForCausalLM",
-                                     config: GemmaConfig) -> Weights:
+def load_gemma_weights_from_hf_model(
+        hf_model: "transformers.AutoModelForCausalLM",
+        config: GemmaConfig) -> Weights:
     return load_gemma_weights(parameters_or_model_dir=dict(
         hf_model.named_parameters()),
                               trt_llm_config=config,

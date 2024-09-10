@@ -240,6 +240,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()
@@ -334,6 +335,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.gemm_plugin = dtype
@@ -415,6 +417,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.gemm_plugin = dtype
@@ -505,6 +508,7 @@ class TestLayer(unittest.TestCase):
             input_ids = ids
 
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
 
         if enable_lookup_plugin:
@@ -708,6 +712,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
 
         with tensorrt_llm.net_guard(net):
@@ -1579,6 +1584,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.mamba_conv1d_plugin = dtype
@@ -1920,6 +1926,7 @@ class TestLayer(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.mamba_conv1d_plugin = dtype

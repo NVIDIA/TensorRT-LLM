@@ -61,7 +61,7 @@ def test_llm_loading_from_ckpt_for_tp2(
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm = LLM(engine_from_checkpoint.name, tokenizer=tokenizer)
 
-    sampling_params = SamplingParams(max_new_tokens=8)
+    sampling_params = SamplingParams(max_tokens=8)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
@@ -138,7 +138,7 @@ def test_llm_pp2():
         auto_parallel=False,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
-    sampling_params = SamplingParams(max_new_tokens=8, beam_width=1)
+    sampling_params = SamplingParams(max_tokens=8, beam_width=1)
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I J K"
@@ -188,7 +188,7 @@ def test_llm_end2end_tp2(llm_additional_options):
 
     assert len(llm_additional_options) == 0
 
-    sampling_params = SamplingParams(max_new_tokens=8)
+    sampling_params = SamplingParams(max_tokens=8)
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I J K"
@@ -202,6 +202,20 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-hlapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
     subprocess.run(command, shell=True, check=True,
                    env=os.environ)  # nosec B603
+
+
+@skip_single_gpu
+def test_executor_results_cleanup():
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+              tensor_parallel_size=2)
+    sampling_params = SamplingParams(max_new_tokens=6)
+    for i in range(20):
+        llm.generate(prompts, sampling_params=sampling_params)
+
+    num_remaining_results = len(llm._executor._results)
+    print(f"result.size: {num_remaining_results}")
+    assert num_remaining_results == 0
 
 
 if __name__ == '__main__':

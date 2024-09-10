@@ -3,7 +3,7 @@ import functools
 import os
 import time
 from collections import defaultdict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import safetensors
@@ -13,7 +13,8 @@ from transformers import AutoModel, AutoTokenizer
 
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.models import ChatGLMConfig
-from tensorrt_llm.models.convert_utils import load_calib_dataset
+from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
+                                               load_calib_dataset)
 from tensorrt_llm.quantization import QuantAlgo
 
 from .config import GLM_ARCH1_VERSIONS, GLM_ARCH2_VERSIONS
@@ -91,25 +92,6 @@ def split_embedding(
         else:
             assert hidden_size % tp_size == 0
     return split(param, tp_size, tp_rank, dim=sharding_dim)
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
-                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def swap_and_split_mlp(weight: torch.Tensor,

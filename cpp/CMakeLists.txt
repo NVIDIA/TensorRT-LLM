@@ -96,6 +96,23 @@ else()
   message(STATUS "Importing nvrtc wrapper")
 endif()
 
+if(EXISTS
+   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/internal_cutlass_kernels/CMakeLists.txt"
+)
+  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT ON)
+else()
+  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT OFF)
+endif()
+option(BUILD_INTERNAL_CUTLASS_KERNELS
+       "Build internal cutlass kernels from source"
+       ${BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT})
+
+if(BUILD_INTERNAL_CUTLASS_KERNELS)
+  message(STATUS "Building internal cutlass kernels")
+else()
+  message(STATUS "Importing internal cutlass kernels")
+endif()
+
 if(BUILD_PYT)
   message(STATUS "Building PyTorch")
 else()

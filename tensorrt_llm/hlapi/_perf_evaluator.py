@@ -1,7 +1,7 @@
 import asyncio
 import json
-import math
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -23,32 +23,92 @@ from .utils import is_directory_empty, print_colored
 class PerfItem:
     start: float
     end: float
+    time_on_first_token: Optional[float] = None
     num_out_tokens: int = 0
 
     @property
     def lantency(self) -> float:
         return self.end - self.start
 
+    @property
+    def time_to_first_token(self) -> Optional[float]:
+        if self.time_on_first_token is None:
+            return None
+        else:
+            return self.time_on_first_token - self.start
+
+    @property
+    def inter_token_latency(self) -> Optional[float]:
+        if self.time_on_first_token is None or self.num_out_tokens <= 1:
+            return None
+        else:
+            return (self.end -
+                    self.time_on_first_token) / (self.num_out_tokens - 1)
+
 
 @dataclass
 class Report:
     num_samples: int
     total_latency: float
-    avg_latency: float
     seq_throughput: float
     token_throughput: float
-    ave_tokens_per_sample: float
+    avg_sl: float
+    max_sl: float
+    min_sl: float
+    p99_sl: float
+    p90_sl: float
+    p50_sl: float
+    avg_ttft: Optional[float] = None
+    max_ttft: Optional[float] = None
+    min_ttft: Optional[float] = None
+    p99_ttft: Optional[float] = None
+    p90_ttft: Optional[float] = None
+    p50_ttft: Optional[float] = None
+    avg_itl: Optional[float] = None
+    max_itl: Optional[float] = None
+    min_itl: Optional[float] = None
+    p99_itl: Optional[float] = None
+    p90_itl: Optional[float] = None
+    p50_itl: Optional[float] = None
     memory_usage_samples: "MemoryContinuousMonitorThread.RecordList" = field(
         default_factory=list)
 
     def display(self):
-        print_colored("Performance Report:\n", color="bold_green")
+        print_colored("Performance Report:\n",
+                      color="bold_green",
+                      writer=sys.stdout)
         print(f"num_samples: {self.num_samples}")
-        print(f"total_latency: {self.total_latency:.2f}")
-        print(f"avg_latency: {self.avg_latency:.2f}")
-        print(f"seq_throughput: {self.seq_throughput:.2f}")
-        print(f"token_throughput: {self.token_throughput:.2f}")
-        print(f"average tokens per sample: {self.ave_tokens_per_sample:.2f}")
+        print(f"total_latency (ms): {self.total_latency*1000:.2f}")
+        print(f"seq_throughput (seq/sec): {self.seq_throughput:.2f}")
+        print(f"token_throughput (token/sec): {self.token_throughput:.2f}")
+        print("", flush=True)
+
+        print(f"avg_sequence_latency (ms): {self.avg_sl*1000:.2f}")
+        print(f"max_sequence_latency (ms): {self.max_sl*1000:.2f}")
+        print(f"min_sequence_latency (ms): {self.min_sl*1000:.2f}")
+        print(f"p99_sequence_latency (ms): {self.p99_sl*1000:.2f}")
+        print(f"p90_sequence_latency (ms): {self.p90_sl*1000:.2f}")
+        print(f"p50_sequence_latency (ms): {self.p50_sl*1000:.2f}")
+        print("", flush=True)
+
+        if self.avg_ttft:
+            print(f"avg_time_to_first_token (ms): {self.avg_ttft*1000:.2f}")
+            print(f"max_time_to_first_token (ms): {self.max_ttft*1000:.2f}")
+            print(f"min_time_to_first_token (ms): {self.min_ttft*1000:.2f}")
+            print(f"p99_time_to_first_token (ms): {self.p99_ttft*1000:.2f}")
+            print(f"p90_time_to_first_token (ms): {self.p90_ttft*1000:.2f}")
+            print(f"p50_time_to_first_token (ms): {self.p50_ttft*1000:.2f}")
+            print("", flush=True)
+
+        if self.avg_itl:
+            print(f"avg_inter_token_latency (ms): {self.avg_itl*1000:.2f}")
+            print(f"max_inter_token_latency (ms): {self.max_itl*1000:.2f}")
+            print(f"min_inter_token_latency (ms): {self.min_itl*1000:.2f}")
+            print(f"p99_inter_token_latency (ms): {self.p99_itl*1000:.2f}")
+            print(f"p90_inter_token_latency (ms): {self.p90_itl*1000:.2f}")
+            print(f"p50_inter_token_latency (ms): {self.p50_itl*1000:.2f}")
+            print("", flush=True)
+
         if self.memory_usage_samples:
             print("Memory Usage:\n")
             min_record, max_record, average_record = self.memory_usage_samples.get_min(
@@ -60,7 +120,9 @@ class Report:
             print(
                 f"  gpu memory usage: (min: {min_record[1]}, max: {max_record[1]}, average: {average_record[1]})"
             )
-        print_colored("__________________________________\n", color="green")
+        print_colored("__________________________________\n",
+                      color="green",
+                      writer=sys.stdout)
 
     def save_json(self, path: Path, **kwargs):
         with open(path, 'w') as f:
@@ -130,7 +192,7 @@ class MemoryContinuousMonitorThread(threading.Thread):
             time.sleep(self.sampling_interval)
 
     def monitor(self) -> "MemoryContinuousMonitorThread.Record":
-        return self.Record(time.time(), get_host_memory_usage(),
+        return self.Record(time.perf_counter(), get_host_memory_usage(),
                            list(get_gpu_memory_usage()))
 
     def stop(self):
@@ -152,9 +214,10 @@ class LLMPerfEvaluator:
     def create(cls,
                model: str,
                samples_path: Path,
-               num_samples: int = -1,
-               warmup: int = 100,
-               batch_size: int = -1,
+               num_samples: Optional[int] = None,
+               streaming: bool = False,
+               warmup: int = 2,
+               concurrency: Optional[int] = None,
                engine_cache_path: Optional[Path] = None,
                memory_monitor_interval: Optional[int] = None,
                **kwargs) -> 'LLMPerfEvaluator':
@@ -163,8 +226,9 @@ class LLMPerfEvaluator:
             model: The model name or a local path to the model directory.
             samples_path: path to the input data samples
             num_samples: number of the heading samples to run, if set to -1, all samples will be used
+            streaming: Whether to enable streaming generation
             warmup: number of samples for warmup runs
-            batch_size: batch size for the runs, if left default, the batch size will be the same as the number of samples
+            concurrency: Concurrent number of connections with LLM. if left default, the concurrency will be the number of samples
             engine_cache_path: path to the engine file, if provided, the engine will save the built engine to the path and reuse it for the next runs
             memory_monitor_interval: the interval to monitor the host and GPU memory usage, if set to None, the memory monitor will be disabled
             kwargs: the additional arguments are for the LLM constructor
@@ -192,38 +256,41 @@ class LLMPerfEvaluator:
             raise e
 
         if engine_cache_path is not None and not from_cache:
-            print_colored(f"Saving engine to {engine_cache_path}\n", "green")
+            print_colored(f"Saving engine to {engine_cache_path}\n",
+                          "green",
+                          writer=sys.stdout)
             llm.save(engine_cache_path)
 
         samples: List[Sample] = list(cls.load_dataset(samples_path))
-        assert len(
-            samples
-        ) >= num_samples, f"num_samples {num_samples} is too large. The dataset only has {len(samples)} samples."
-        samples = samples[:num_samples] if num_samples > 0 else samples
+        if num_samples is not None:
+            assert len(samples) >= num_samples, \
+                f"num_samples {num_samples} is too large. The dataset only has {len(samples)} samples."
+            samples = samples[:num_samples]
 
         return cls(llm,
-                   warmup=warmup,
                    samples=samples,
-                   max_num_samples=num_samples,
-                   batch_size=batch_size,
+                   streaming=streaming,
+                   warmup=warmup,
+                   concurrency=concurrency,
                    memory_monitor_thread=memory_monitor_thread)
 
     def __init__(self,
                  llm: LLM,
                  samples: List[Sample],
-                 warmup: int,
-                 max_num_samples: int,
-                 batch_size: int,
+                 streaming: bool = False,
+                 warmup: int = 2,
+                 concurrency: Optional[int] = None,
                  memory_monitor_thread: Optional[
                      MemoryContinuousMonitorThread] = None):
         self.llm = llm
         self.samples = samples
+        self.streaming = streaming
         self.warmup = warmup
-        self.max_num_samples = max_num_samples
-        self.perf_items = []
-        self.batch_size = batch_size if batch_size > 0 else len(self.samples)
+        self.concurrency = len(
+            self.samples) if concurrency is None else concurrency
         self.memory_monitor_thread = memory_monitor_thread
 
+        self.perf_items: List[PerfItem] = []
         self.start = None
         self.end = None
 
@@ -238,53 +305,64 @@ class LLMPerfEvaluator:
             beam_width=beam_width,
         )
 
-        async def lane(num_tasks: int,
-                       sampling_params: SamplingParams,
-                       warmup=False):
+        async def lane(sampling_params: SamplingParams,
+                       is_warmup: bool = False):
             nonlocal sample_offset
+            num_samples = self.warmup if is_warmup else len(self.samples)
 
-            for i in range(num_tasks):
+            while sample_offset < num_samples:
                 sample = self.samples[sample_offset]
                 sample_offset += 1
-                sampling_params.max_new_tokens = sample.output_len
+                sampling_params.max_tokens = sample.output_len
                 sampling_params.end_id = -2
                 sampling_params.pad_id = -2
 
-                start = time.time()
+                start = time.perf_counter()
+                time_on_first_token = None
                 output = self.llm.generate_async(
-                    sample.input_ids, sampling_params=sampling_params)
-                output = await output.aresult()
-                end = time.time()
+                    sample.input_ids,
+                    sampling_params=sampling_params,
+                    streaming=self.streaming)
+                if self.streaming:
+                    async for stream_output in output:
+                        if time_on_first_token is None:
+                            time_on_first_token = time.perf_counter()
+                    output = stream_output
+                else:
+                    output = await output.aresult()
+                end = time.perf_counter()
 
                 perf_item = PerfItem(start=start,
                                      end=end,
+                                     time_on_first_token=time_on_first_token,
                                      num_out_tokens=sum(
                                          beam_output.length
                                          for beam_output in output.outputs))
-                if not warmup:
+                if not is_warmup:
                     self.perf_items.append(perf_item)
 
         if self.warmup > 0:
             logger.warning("warming up ...")
-            for i in range(math.ceil(self.warmup / len(self.samples))):
-                asyncio.run(
-                    lane(min(self.warmup, len(self.samples)),
-                         sampling_params,
-                         warmup=True))
+
+            async def run_lanes():
+                lanes = [
+                    lane(sampling_params, is_warmup=True)
+                    for _ in range(min(self.concurrency, self.warmup))
+                ]
+                await asyncio.gather(*lanes)
+
+            asyncio.run(run_lanes())
             sample_offset = 0
 
         logger.warning("running ...")
-        self.start = time.time()
 
         async def run_lanes():
-            num_tasks = len(self.samples) // self.batch_size
-            lanes = [
-                lane(num_tasks, sampling_params) for _ in range(self.batch_size)
-            ]
+            lanes = [lane(sampling_params) for _ in range(self.concurrency)]
             await asyncio.gather(*lanes)
 
+        self.start = time.perf_counter()
         asyncio.run(run_lanes())
-        self.end = time.time()
+        self.end = time.perf_counter()
 
         return self._generate_report()
 
@@ -299,22 +377,45 @@ class LLMPerfEvaluator:
 
     def _generate_report(self) -> Report:
         num_samples = len(self.perf_items)
-        total_latency = self.end - self.start
-        avg_latency = total_latency / num_samples
-        seq_throughput = num_samples / total_latency
-        token_throughput = sum(
-            [perf_item.num_out_tokens
-             for perf_item in self.perf_items]) / total_latency
         total_tokens = sum(
             [perf_item.num_out_tokens for perf_item in self.perf_items])
+        total_latency = self.end - self.start
+        seq_throughput = num_samples / total_latency
+        token_throughput = total_tokens / total_latency
+
+        sls = [perf_item.lantency for perf_item in self.perf_items]
+        ttfts = [
+            perf_item.time_to_first_token for perf_item in self.perf_items
+            if perf_item.time_to_first_token is not None
+        ]
+        itls = [
+            perf_item.inter_token_latency for perf_item in self.perf_items
+            if perf_item.inter_token_latency is not None
+        ]
 
         return Report(
             num_samples=num_samples,
             total_latency=total_latency,
-            avg_latency=avg_latency,
             seq_throughput=seq_throughput,
             token_throughput=token_throughput,
-            ave_tokens_per_sample=total_tokens / num_samples,
+            avg_sl=np.mean(sls),
+            max_sl=np.max(sls),
+            min_sl=np.min(sls),
+            p99_sl=np.percentile(sls, 99),
+            p90_sl=np.percentile(sls, 90),
+            p50_sl=np.median(sls),
+            avg_ttft=np.mean(ttfts) if ttfts else None,
+            max_ttft=np.max(ttfts) if ttfts else None,
+            min_ttft=np.min(ttfts) if ttfts else None,
+            p99_ttft=np.percentile(ttfts, 99) if ttfts else None,
+            p90_ttft=np.percentile(ttfts, 90) if ttfts else None,
+            p50_ttft=np.median(ttfts) if ttfts else None,
+            avg_itl=np.mean(itls) if itls else None,
+            max_itl=np.max(itls) if itls else None,
+            min_itl=np.min(itls) if itls else None,
+            p99_itl=np.percentile(itls, 99) if itls else None,
+            p90_itl=np.percentile(itls, 90) if itls else None,
+            p50_itl=np.median(itls) if itls else None,
             memory_usage_samples=self.memory_monitor_thread.memory_samples
             if self.memory_monitor_thread else [])
 

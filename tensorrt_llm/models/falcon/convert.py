@@ -1,10 +1,11 @@
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 
 from ...quantization import QuantAlgo
-from ..convert_utils import (iterate_shard_files, load_state_dict,
+from ..convert_utils import (get_weight, get_weight_and_bias,
+                             iterate_shard_files, load_state_dict,
                              retrieved_layer_index_from_name)
 from .config import FalconConfig
 
@@ -132,26 +133,6 @@ def split_qkv_weight(weight: torch.Tensor,
 def split_matrix(weight: torch.Tensor, tp_size: int, rank: int,
                  dim: int) -> torch.Tensor:
     return split(weight, tp_size, rank, dim=dim)
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> Optional[torch.Tensor]:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> Optional[torch.Tensor]:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(
-    params: Dict[str, torch.Tensor], prefix: str, dtype: torch.dtype
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def get_tllm_linear_weight(
@@ -360,7 +341,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: FalconConfig):
     num_attention_heads = config.num_attention_heads
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
-    num_kv_heads = getattr(config, 'num_kv_heads', num_attention_heads)
+    num_kv_heads = getattr(config, 'num_key_value_heads', num_attention_heads)
     num_hidden_layers = config.num_hidden_layers
     use_weight_only = config.quantization.quant_algo in [
         QuantAlgo.W8A16, QuantAlgo.W4A16

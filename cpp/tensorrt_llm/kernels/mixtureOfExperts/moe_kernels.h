@@ -133,16 +133,17 @@ struct QuantParams
     float const* quant_fc2 = nullptr;
     float const* dequant_fc2 = nullptr;
     float const* quant_final = nullptr;
+    float const* dequant_input = nullptr;
 
-    static QuantParams FP8(
-        float const* dequant_fc1, float const* quant_fc2, float const* dequant_fc2, float const* quant_final = nullptr)
+    static QuantParams FP8(float const* dequant_fc1, float const* quant_fc2, float const* dequant_fc2,
+        float const* quant_final = nullptr, float const* dequant_input = nullptr)
     {
-        return QuantParams{nullptr, nullptr, dequant_fc1, quant_fc2, dequant_fc2, quant_final};
+        return QuantParams{nullptr, nullptr, dequant_fc1, quant_fc2, dequant_fc2, quant_final, dequant_input};
     }
 
     static QuantParams Int(void const* fc1_weight_scales, void const* fc2_weight_scales)
     {
-        return QuantParams{fc1_weight_scales, fc2_weight_scales, nullptr, nullptr, nullptr, nullptr};
+        return QuantParams{fc1_weight_scales, fc2_weight_scales, nullptr, nullptr, nullptr, nullptr, nullptr};
     }
 };
 
@@ -379,7 +380,7 @@ private:
         HopperGroupedGemmInput layout_info, int64_t gemm_n, int64_t gemm_k, int const num_experts, T const* in,
         WeightType const* weights, float const* fp8_dequant, T const* bias, UnfusedGemmOutputType* output,
         cudaStream_t stream);
-    std::vector<size_t> getWorkspaceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
+    std::vector<size_t> getWorkspaceDeviceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const num_experts_per_node, int const k,
         ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, bool use_lora) const;
     void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
@@ -399,15 +400,18 @@ private:
         return moe_gemm_runner_.supportsHopperSpecialisation() && !use_deterministic_hopper_reduce_;
     }
 
-    bool setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows, bool is_gated_activation,
-        int num_experts_per_node, bool needs_num_valid, LoraParams& lora_params, cudaStream_t stream);
+    bool setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size, int64_t hidden_size,
+        int start_expert, bool is_gated_activation, int num_experts_per_node, bool needs_num_valid,
+        LoraParams& lora_params, cudaStream_t stream);
 
-    T const* loraFC1(int64_t expanded_num_rows, int64_t inter_size, int64_t hidden_size, int num_experts_per_node,
-        int start_expert, int64_t const* num_valid_tokens_ptr, bool is_gated_activation,
-        ScaleBiasType const* fc1_expert_biases, LoraParams& lora_params, cudaStream_t stream);
+    ScaleBiasType const* loraFC1(int64_t expanded_num_rows, int64_t inter_size, int64_t hidden_size,
+        int num_experts_per_node, int start_expert, int64_t const* num_valid_tokens_ptr, bool is_gated_activation,
+        ScaleBiasType const* fc1_expert_biases, LoraParams& lora_params, float const* input_fp8_dequant,
+        cudaStream_t stream);
 
     void loraFC2(int64_t inter_size, int64_t hidden_size, int num_experts_per_node, int start_expert,
-        int64_t const* num_valid_tokens_ptr, LoraParams& lora_params, cudaStream_t stream);
+        int64_t const* num_valid_tokens_ptr, int64_t num_tokens, LoraParams& lora_params, float const* fc2_fp8_quant,
+        cudaStream_t stream);
 
     CubKeyValueSorter sorter_;
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
@@ -431,9 +435,10 @@ private:
     void* fc2_result_{};
     T* fc1_result_{};
     float const** alpha_scale_ptr_array_ = nullptr;
-    T* lora_fc1_result_{};
-    T* lora_add_bias_{};
-    T* lora_fc2_result_{};
+    ScaleBiasType* lora_input_{};
+    ScaleBiasType* lora_fc1_result_{};
+    ScaleBiasType* lora_add_bias_{};
+    ScaleBiasType* lora_fc2_result_{};
 
     HopperGroupedGemmInput hopper_grouped_gemm_input_;
 

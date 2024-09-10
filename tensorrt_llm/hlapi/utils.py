@@ -1,4 +1,5 @@
 import hashlib
+import io
 import os
 import sys
 import tempfile
@@ -32,7 +33,7 @@ def print_traceback_on_error(func):
     return wrapper
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """
     Sampling parameters for text generation.
@@ -40,7 +41,8 @@ class SamplingParams:
     Args:
         end_id (int): The end token id.
         pad_id (int): The pad token id.
-        max_new_tokens (int): The maximum number of tokens to generate.
+        max_tokens (int): The maximum number of tokens to generate.
+        max_new_tokens (int): The maximum number of tokens to generate. This argument is being deprecated; please use max_tokens instead.
         bad (Union[str, List[str]]): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output.
         bad_token_ids (List[int]): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output.
         stop (Union[str, List[str]]): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True.
@@ -58,9 +60,11 @@ class SamplingParams:
         top_p_min (float): Controls decay in the top-P algorithm. topPMin is lower-bound. Default is 1.e-6.
         top_p_reset_ids (int): Controls decay in the top-P algorithm. Indicates where to reset the decay. Default is 1.
         top_p_decay (float): Controls decay in the top-P algorithm. The decay value. Default is 1.f
-        random_seed (int): Controls the random seed used by the random number generator in sampling
+        seed (int): Controls the random seed used by the random number generator in sampling
+        random_seed (int): Controls the random seed used by the random number generator in sampling. This argument is being deprecated; please use seed instead.
         temperature (float): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
-        min_length (int): Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
+        min_tokens (int): Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
+        min_length (int): Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1. This argument is being deprecated; please use min_tokens instead.
         beam_search_diversity_rate (float): Controls the diversity in beam search.
         repetition_penalty (float): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. Default is 1.f
         presence_penalty (float): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
@@ -86,7 +90,8 @@ class SamplingParams:
 
     end_id: Optional[int] = None
     pad_id: Optional[int] = None
-    max_new_tokens: int = 32
+    max_tokens: int = 32
+    max_new_tokens: Optional[int] = None
 
     bad: Optional[Union[str, List[str]]] = None
     bad_token_ids: Optional[List[int]] = None
@@ -114,8 +119,10 @@ class SamplingParams:
     top_p_min: Optional[float] = None
     top_p_reset_ids: Optional[int] = None
     top_p_decay: Optional[float] = None
+    seed: Optional[int] = None
     random_seed: Optional[int] = None
     temperature: Optional[float] = None
+    min_tokens: Optional[int] = None
     min_length: Optional[int] = None
     beam_search_diversity_rate: Optional[float] = None
     repetition_penalty: Optional[float] = None
@@ -192,8 +199,8 @@ class SamplingParams:
     def _get_sampling_config(self) -> tllme.SamplingConfig:
         expected_fields = [
             "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-            "top_p_decay", "random_seed", "temperature", "min_length",
-            "beam_search_diversity_rate", "repetition_penalty",
+            "top_p_decay", "seed", "random_seed", "temperature", "min_tokens",
+            "min_length", "beam_search_diversity_rate", "repetition_penalty",
             "presence_penalty", "frequency_penalty", "length_penalty",
             "early_stopping", "no_repeat_ngram_size"
         ]
@@ -228,7 +235,9 @@ class SamplingParams:
                for f in expected_fields})
 
 
-def print_colored(message, color: str = None):
+def print_colored(message,
+                  color: str = None,
+                  writer: io.TextIOWrapper = sys.stderr):
     colors = dict(
         grey="\x1b[38;20m",
         yellow="\x1b[33;20m",
@@ -240,9 +249,9 @@ def print_colored(message, color: str = None):
     reset = "\x1b[0m"
 
     if color:
-        sys.stderr.write(colors[color] + message + reset)
+        writer.write(colors[color] + message + reset)
     else:
-        sys.stderr.write(message)
+        writer.write(message)
 
 
 def file_with_glob_exists(directory, glob) -> bool:
@@ -368,3 +377,23 @@ def download_hf_pretrained_config(model: str,
             allow_patterns=["config.json"],
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
+
+
+def append_docstring(docstring: str):
+    ''' A decorator to append a docstring to a function. '''
+
+    def decorator(fn):
+        fn.__doc__ = (fn.__doc__ or '') + docstring
+        return fn
+
+    return decorator
+
+
+def set_docstring(docstring: str):
+    ''' A decorator to set a docstring to a function. '''
+
+    def decorator(fn):
+        fn.__doc__ = docstring
+        return fn
+
+    return decorator

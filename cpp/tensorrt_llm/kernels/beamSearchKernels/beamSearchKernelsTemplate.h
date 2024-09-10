@@ -349,7 +349,7 @@ __device__ __forceinline__ MD reduce_md_op(MD a, MD b)
     return res;
 }
 
-template <typename T, int ITEMS_PER_THREAD, int PAD_2K, int THREADBLOCK_SIZE>
+template <typename T, int PAD_2K, int THREADBLOCK_SIZE>
 __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
     void beamStage1Kernel(T const* __restrict logits, T const* __restrict bias, float* __restrict pTemp,
         int const* __restrict endIds, FinishedState const* __restrict finished, int const nV, int const nVLocal,
@@ -475,7 +475,7 @@ __launch_bounds__(THREADBLOCK_SIZE, 1) __global__
 template <typename T, int PAD_2K, int THREADBLOCK_SIZE, bool IS_FAST_KERNEL>
 __launch_bounds__(THREADBLOCK_SIZE) __global__
     void beamStage2Kernel(int* __restrict pTempId, T* __restrict pTempVal, float* __restrict pTemp,
-        float const* __restrict cumLogProbs, int const nV, int const nVPart, runtime::SizeType32 const* batchSlots)
+        float const* __restrict cumLogProbs, runtime::SizeType32 const* batchSlots, int const nV, int const nVPart)
 {
     constexpr int PACKED_TOP_KMD_SIZE = 2 * PAD_2K + 2;
     auto const nBM = gridDim.y;
@@ -565,7 +565,10 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
 
         for (int i = 0; i < 2 * nBM; ++i)
         {
-            float val = (float) buf_smem_kv[i].value - total_md.m - d_total_log;
+            float val = (float) buf_smem_kv[i].value;
+            // Old version (do softmax in `beamStage*Kernel`) is below
+            // We reserve this because we do not know whether HF will unify its workflow as simpling
+            // float val = (float) buf_smem_kv[i].value - total_md.m - d_total_log;
             pTempId[gbid * 2 * nBM + i] = buf_smem_kv[i].key;
             pTempVal[gbid * 2 * nBM + i] = val + cumLogProbsValue;
         }
@@ -581,14 +584,14 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__
         }                                                                                                              \
         beamStage2Kernel<T, PAD_2K, N_VOCAB_PART, IS_FAST_KERNEL>                                                      \
             <<<dim3(nBS, nBM), N_VOCAB_PART, IS_FAST_KERNEL * nShareMemory, stream>>>(                                 \
-                pTempId, pTempVal, pTemp, cumLogProbs, nV, nVPart, batchSlots);                                        \
+                pTempId, pTempVal, pTemp, cumLogProbs, batchSlots, nV, nVPart);                                        \
     }                                                                                                                  \
     return;
 
 template <typename T, int PAD_2K>
 __inline__ void beamStage2KernelLauncher(float* pTemp, float const* cumLogProbs, int* pTempId, T* pTempVal,
-    int const nBS, int const nBM, int const nVPart, int const nV, int const max_smem_per_block, cudaStream_t stream,
-    runtime::SizeType32 const* batchSlots)
+    runtime::SizeType32 const* batchSlots, int const nBS, int const nBM, int const nVPart, int const nV,
+    int const max_smem_per_block, cudaStream_t stream)
 {
     // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
     size_t const nShareMemory = sizeof(float) * nVPart * (2 * PAD_2K + 2) + sizeof(cub::KeyValuePair<int, T>) * PAD_2K;
@@ -627,21 +630,24 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     // ┃ pTemp    ┃ BS * PAD_K * VP * (2 * (PAD_K * 2) + 2) |                          | float     |
     // ┗━━━━━━━━━━┛ --------------------------------------------------------------------------------
 
-    // Stage1: gridDim(BS*BM,nVPart,1), blockDim(nBlockSize,1,1)
+    // Stage1: gridDim(BS,BM,nVPart), blockDim(nBlockSize,1,1)
     // Each ThreadBlock takes `nVocabChunk` contiguous elements in logits to do TopK and reduce_md,
     //   then writes output into pTemp.
-    // At end of this kernel, each ThreadBlock holds the indexes and values of the top 2*BM elements,
+    // At end of this kernel, each ThreadBlock holds the indices and values of the top 2*BM elements,
     //   as well as the m(x) and l(x) of those elements (see paper of Flash Attention, arXiv:2205.14135)
     // pTemp.shape = [BS*BM, nVPart, 2*PAD_2K+2]
-    // The content of the last dimension of pTemp (updated by each ThreadBlock, we call it "Tile"):
-    //                  ┏━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━┓
-    //                  ┃ topk_id ┃ topk_val ┃ md    ┃
-    //                  ┗━━━━━━━━━┻━━━━━━━━━━┻━━━━━━━┛
-    // | allocated size | PAD_2K  | PAD_2K   | 2     |
-    // | used size      | BM * 2  | BM * 2   | 2     |
-    // | data type      | int     | float    | float |
 
-    // Stage2: gridDim(BS*BM,1,1), blockDim(32/64/128,1,1)
+    // The content of the last dimension of pTemp (updated by each ThreadBlock, we call it "Tile"):
+    //             | allocated size | used size | data type |
+    // ┏━━━━━━━━━━┓ -----------------------------------------
+    // ┃ topk_id  ┃ PAD_2K          | BM * 2    | int       |
+    // ┣━━━━━━━━━━┫ -----------------------------------------
+    // ┃ topk_val ┃ PAD_2K          | BM * 2    | float     |
+    // ┣━━━━━━━━━━┫ -----------------------------------------
+    // ┃    md    ┃ 2               | 2         | float     |
+    // ┗━━━━━━━━━━┛ -----------------------------------------
+
+    // Stage2: gridDim(BS,BM,1), blockDim(32/64/128,1,1)
     // Each TheadBlock takes `nVPart` contiguous Tiles in pTemp to do reduce_topk and reduce_md,
     //   writes output topk_id into in pTempId, writes topk_value + cumLogProbs into pTempVal.
 
@@ -651,7 +657,6 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     //   + selects BM elements for the next generation step if not.
     //   + maintains related score array, min_normed_score / batchDones / finished, etc..
 
-    int constexpr items_per_thread = 1;
     int constexpr nBlockSize = (PAD_K < 16) ? ((PAD_K < 8) ? nBlockSizeForSmallBeamWidth : 128) : 64;
     int const nBS{bh.nBatchSize};
     int const nBM{bh.nBeamWidth};
@@ -668,7 +673,7 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     // Upper limit count of ThreadBlock, gotten by using no share memory
     int max_active_blocks = -1;
     TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_active_blocks, beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize>, nBlockSize, 0));
+        &max_active_blocks, beamStage1Kernel<T, 2 * PAD_K, nBlockSize>, nBlockSize, 0));
 
     // Find the max smem on the device and use that to determine the vocab parts in the best case.
     int max_smem_per_sm = -1;
@@ -677,7 +682,7 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
     cudaFuncAttributes attr;
-    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize>));
+    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, 2 * PAD_K, nBlockSize>));
 
     // One ThreadBlock must at least have share memory of `sizeof(T) * nV / nMaxVocabPartForStage1FastKernel` bytes
     int const static_smem = attr.sharedSizeBytes;
@@ -702,18 +707,18 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     int const dyn_smem_size = sizeof(T) * nVocabChunk;
     if (dyn_smem_size >= (48 << 10))
     {
-        TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem_size));
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+            beamStage1Kernel<T, 2 * PAD_K, nBlockSize>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem_size));
     }
 
     dim3 gridSize(nBS, nBM, nVPart);
-    beamStage1Kernel<T, items_per_thread, 2 * PAD_K, nBlockSize><<<gridSize, nBlockSize, dyn_smem_size, stream>>>(
+    beamStage1Kernel<T, 2 * PAD_K, nBlockSize><<<gridSize, nBlockSize, dyn_smem_size, stream>>>(
         logits, bias, pTemp, endIds, finished, nV, nVocabChunk, batchSlots, dyn_smem_size);
 
     sync_check_cuda_error();
 
     beamStage2KernelLauncher<T, 2 * PAD_K>(
-        pTemp, bh.cumLogProbs, pTempId, pTempVal, nBS, nBM, nVPart, nV, max_smem_per_block, stream, batchSlots);
+        pTemp, bh.cumLogProbs, pTempId, pTempVal, batchSlots, nBS, nBM, nVPart, nV, max_smem_per_block, stream);
 
     sync_check_cuda_error();
 

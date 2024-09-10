@@ -17,6 +17,7 @@ from typing import List, Optional
 
 import numpy as np
 import tensorrt as trt
+import torch
 
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, is_same_dtype, trt_dtype_to_np,
@@ -586,19 +587,10 @@ class Attention(Module):
                 max_position_embeddings,
                 rotary_embedding_dim,
             )
-            # cogvlm attention.
-            if hasattr(config, 'vision_start') and hasattr(
-                    config, 'vision_length'):
-                rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_cogvlm_attention_plugin(
-                    max_position_embeddings, rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale,
-                    rotary_embedding_scale_type, config.vision_start,
-                    config.vision_length)
-            else:
-                rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-                    max_position_embeddings, rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale,
-                    rotary_embedding_scale_type, rotary_embedding_scaling)
+            rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                max_position_embeddings, rotary_embedding_dim,
+                rotary_embedding_base, rotary_embedding_scale,
+                rotary_embedding_scale_type, rotary_embedding_scaling)
             model_cls.register_parameter(
                 'embed_positions',
                 Parameter(embed_positions, dtype='float32', is_buffer=True))
@@ -1349,6 +1341,12 @@ class Attention(Module):
                                         dtype=self.dtype)
         self.rel_attn_table.value = precomputed_relative_attention
 
+    def postprocess(self, tllm_key, weights, **kwargs):
+        if tllm_key.endswith("kv_cache_scaling_factor") and weights is None:
+            return {tllm_key: torch.ones(1, )}
+        else:
+            return {tllm_key: weights}
+
 
 class BertAttention(Module):
 
@@ -1571,14 +1569,12 @@ class CogVLMAttention(Attention):
             attention_mask_type=AttentionMaskType.causal,
             bias=True,
             dtype=None,
-            position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
+            position_embedding_type=PositionEmbeddingType.learned_absolute,
             rotary_embedding_base=10000.0,
             rotary_embedding_scaling=None,
             tp_group=None,
             tp_size=1,
             tp_rank=0,
-            vision_start=1,
-            vision_length=1225,
             quant_mode: QuantMode = QuantMode(0),
             dense_bias=None,
     ):
@@ -1597,9 +1593,6 @@ class CogVLMAttention(Attention):
                          tp_size=tp_size,
                          tp_rank=tp_rank,
                          quant_mode=quant_mode)
-
-        self.vision_length = vision_length
-        self.vision_start = vision_start
 
         self.vis_qkv = ColumnLinear(
             hidden_size,
@@ -1624,29 +1617,22 @@ class CogVLMAttention(Attention):
                 hidden_states: Tensor,
                 use_cache=False,
                 kv_cache_params=None,
-                attention_params=None):
+                attention_params=None,
+                vision_token_mask=None,
+                position_embedding=None):
 
         assert isinstance(hidden_states, Tensor)
-        assert (not default_net().plugin_config.remove_input_padding)
         assert (default_net().plugin_config.gpt_attention_plugin)
 
-        bs = shape(hidden_states, 0)
-        seq_length = shape(hidden_states, 1)
-        bos = slice(hidden_states, [0, 0, 0],
-                    concat([bs, self.vision_start, self.hidden_size]))
-        vis_seq_length = minimum(self.vision_length + 1, seq_length - 1)
-        vision_hidden_states = slice(
-            hidden_states, [0, self.vision_start, 0],
-            concat([bs, vis_seq_length, self.hidden_size]))
-        text_seq_length = maximum(
-            0, seq_length - (self.vision_length + 1 + self.vision_start))
-        language_hidden_states = slice(
-            hidden_states, [0, self.vision_length + 1 + self.vision_start, 0],
-            concat([bs, text_seq_length, self.hidden_size]))
-        bos_qkv = self.qkv(bos)
-        language_qkv = self.qkv(language_hidden_states)
-        vision_qkv = self.vis_qkv(vision_hidden_states)
-        qkv = concat([bos_qkv, vision_qkv, language_qkv], dim=1)
+        vision_qkv = self.vis_qkv(hidden_states)
+        language_qkv = self.qkv(hidden_states)
+        qkv = where(vision_token_mask, vision_qkv, language_qkv)
+
+        qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_cogvlm(
+            qkv, position_embedding, self.num_attention_heads,
+            self.attention_head_size, self.max_position_embeddings,
+            self.rotary_embedding_scale,
+            default_net().plugin_config.remove_input_padding)
 
         assert attention_params is None or attention_params.is_valid(
             default_net().plugin_config.gpt_attention_plugin,
@@ -1679,8 +1665,6 @@ class CogVLMAttention(Attention):
             ) or self.quant_mode.has_fp8_qdq(
             ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
 
-            rotary_inv_freq = attention_params.rotary_inv_freq
-            rotary_cos_sin = attention_params.embed_positions_for_gpt_attention
             attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
@@ -1699,14 +1683,7 @@ class CogVLMAttention(Attention):
                 num_kv_heads=self.num_attention_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
-                rotary_embedding_dim=self.rotary_embedding_dim,
-                rotary_embedding_base=self.rotary_embedding_base,
-                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
-                rotary_embedding_scale=self.rotary_embedding_scale,
-                rotary_embedding_max_positions=self.max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
-                rotary_inv_freq=rotary_inv_freq,
-                rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
                 attention_output_orig_quant_scale=
@@ -1717,8 +1694,6 @@ class CogVLMAttention(Attention):
                 alibi_slopes=None,
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
-                vision_start=self.vision_start,
-                vision_length=self.vision_length,
                 kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
                 host_kv_cache_block_offsets=kv_cache_params.
                 host_kv_cache_block_offsets,
@@ -1738,24 +1713,9 @@ class CogVLMAttention(Attention):
                 host_runtime_perf_knobs=attention_params.host_runtime_perf_knobs
             )
 
-        bs = shape(context, 0)
-        seq_length = shape(context, 1)
-        bos = slice(context, [0, 0, 0],
-                    concat([bs, self.vision_start, self.hidden_size]))
-        vis_seq_length = minimum(self.vision_length + 1, seq_length - 1)
-        vision_hidden_states = slice(
-            context, [0, self.vision_start, 0],
-            concat([bs, vis_seq_length, self.hidden_size]))
-        text_seq_length = maximum(
-            0, seq_length - (self.vision_length + 1 + self.vision_start))
-        language_hidden_states = slice(
-            context, [0, self.vision_length + 1 + self.vision_start, 0],
-            concat([bs, text_seq_length, self.hidden_size]))
-
-        bos_dense = self.dense(bos)
-        language_dense = self.dense(language_hidden_states)
-        vision_dense = self.vis_dense(vision_hidden_states)
-        context = concat([bos_dense, vision_dense, language_dense], dim=1)
+        vision_dense = self.vis_dense(context)
+        language_dense = self.dense(context)
+        context = where(vision_token_mask, vision_dense, language_dense)
 
         if use_cache:
             return (context, past_key_value)

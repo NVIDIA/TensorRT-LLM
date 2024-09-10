@@ -75,6 +75,7 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         network = builder.create_network()
         network.plugin_config.rmsnorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
@@ -120,6 +121,7 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
     def test_sq_rms_norm_no_plugin(self):
         # Create builder
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         # Create empty network
         network = builder.create_network()
         with tensorrt_llm.net_guard(network):

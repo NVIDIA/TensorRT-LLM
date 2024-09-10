@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/cudaMemPool.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -53,7 +54,9 @@ public:
         PointerType ptr{};
         static_cast<TDerived*>(this)->allocateImpl(&ptr, n);
         if constexpr (count)
+        {
             MemoryCounters::getInstance().allocate<memoryType>(n);
+        }
         return ptr;
     }
 
@@ -63,7 +66,9 @@ public:
         {
             static_cast<TDerived*>(this)->deallocateImpl(ptr, n);
             if constexpr (count)
+            {
                 MemoryCounters::getInstance().deallocate<memoryType>(n);
+            }
         }
     }
 
@@ -99,11 +104,14 @@ class CudaAllocatorAsync : public BaseAllocator<CudaAllocatorAsync, MemoryType::
 
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
+    using CudaPoolPtr = std::shared_ptr<CudaMemPool>;
 
-    explicit CudaAllocatorAsync(CudaStreamPtr stream)
+    explicit CudaAllocatorAsync(CudaStreamPtr stream, CudaPoolPtr memPool)
         : mCudaStream(std::move(stream))
+        , mMemPool(std::move(memPool))
     {
         TLLM_CHECK_WITH_INFO(static_cast<bool>(mCudaStream), "Undefined CUDA stream");
+        TLLM_CHECK_WITH_INFO(static_cast<bool>(mMemPool), "Undefined CUDA mem pool");
     }
 
     [[nodiscard]] CudaStreamPtr getCudaStream() const
@@ -114,7 +122,7 @@ public:
 protected:
     void allocateImpl(PointerType* ptr, std::size_t n)
     {
-        TLLM_CUDA_CHECK(::cudaMallocAsync(ptr, n, mCudaStream->get()));
+        TLLM_CUDA_CHECK(::cudaMallocAsync(ptr, n, mMemPool->getPool(), mCudaStream->get()));
     }
 
     void deallocateImpl(PointerType ptr, [[maybe_unused]] std::size_t n)
@@ -124,6 +132,7 @@ protected:
 
 private:
     CudaStreamPtr mCudaStream;
+    CudaPoolPtr mMemPool;
 };
 
 class UVMAllocator : public BaseAllocator<UVMAllocator, MemoryType::kUVM>
@@ -368,7 +377,7 @@ void MemoryPool<TAllocator>::allocateImpl(MemoryPool::PointerType* ptr, std::siz
     // Align requested size to kAlignment
     // When requesting 0 B, default to allocating 1 B (from "Effective C++", item 51)
     // See https://stackoverflow.com/questions/2660076/returning-aligned-memory-with-new
-    const std::size_t alignedRequest{
+    std::size_t const alignedRequest{
         requestedSize == 0 ? kAlignment : common::ceilDiv(requestedSize, kAlignment) * kAlignment};
 
     TLLM_LOG_DEBUG("MemoryPool: Requested to reserve %zu B (%zu B aligned)", requestedSize, alignedRequest);

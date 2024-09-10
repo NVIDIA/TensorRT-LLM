@@ -105,8 +105,7 @@ def build_and_run_tp2(rank, model_name, engine_dir, use_auto_parallel):
                 tokenizer.encode(inp) for inp in batch_input_text
             ]
             outputs = executor.generate(
-                batch_input_ids,
-                sampling_params=SamplingParams(max_new_tokens=10))
+                batch_input_ids, sampling_params=SamplingParams(max_tokens=10))
 
             for idx, output in enumerate(outputs):
                 tensorrt_llm.logger.info(

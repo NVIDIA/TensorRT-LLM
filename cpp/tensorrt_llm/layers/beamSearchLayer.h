@@ -19,12 +19,6 @@
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/decodingOutput.h"
-
-#include <optional>
-#include <utility>
-
-namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm::layers
 {
@@ -37,11 +31,13 @@ class BeamSearchLayer : public BaseLayer
 public:
     BeamSearchLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    void setup(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth, BufferConstPtr batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+    void setup(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+        std::shared_ptr<BaseDecodingInputs> const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
@@ -51,13 +47,13 @@ private:
 private:
     using Base::mDecoderDomain;
 
-    BufferPtr mWorkspace;
-    TensorPtr mDiversityRateDevice; //<! [batchSize] shaped, in device memory.
-    TensorPtr mLengthPenaltyDevice; //<! [batchSize] shaped, in device memory.
-    TensorPtr mEarlyStoppingDevice; //<! [batchSize] shaped, in device memory.
-    TensorPtr mDiversityRateHost;   //<! [batchSize] shaped, in pinned host memory.
-    TensorPtr mLengthPenaltyHost;   //<! [batchSize] shaped, in pinned host memory.
-    TensorPtr mEarlyStoppingHost;   //<! [batchSize] shaped, in pinned host memory.
+    size_t mWorkspaceSize;
+    TensorPtr mBeamSearchDiversityRateDevice; //<! [batchSize] shaped, in device memory.
+    TensorPtr mLengthPenaltyDevice;           //<! [batchSize] shaped, in device memory.
+    TensorPtr mEarlyStoppingDevice;           //<! [batchSize] shaped, in device memory.
+    TensorPtr mBeamSearchDiversityRateHost;   //<! [batchSize] shaped, in pinned host memory.
+    TensorPtr mLengthPenaltyHost;             //<! [batchSize] shaped, in pinned host memory.
+    TensorPtr mEarlyStoppingHost;             //<! [batchSize] shaped, in pinned host memory.
 };
 
 } // namespace tensorrt_llm::layers

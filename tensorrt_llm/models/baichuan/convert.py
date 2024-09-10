@@ -249,7 +249,7 @@ def capture_activation_range(
     num_samples: int = 512,
 ):
     model.eval()
-    next(model.parameters()).device
+    device = next(model.parameters()).device
     act_scales: defaultdict[Any, Dict[str,
                                       torch.Tensor]] = defaultdict(lambda: {
                                           "x": None,
@@ -306,10 +306,9 @@ def capture_activation_range(
         line[0] = line[0].replace(" n't", "n't")
         line_encoded = tokenizer(line,
                                  return_tensors="pt",
+                                 max_length=test_token_num,
                                  padding=True,
-                                 truncation=True)["input_ids"].type(torch.int64)
-        line_encoded = line_encoded[:, -test_token_num:]
-        line_encoded = line_encoded.cuda()
+                                 truncation=True).input_ids.to(device)
         model(line_encoded)
 
     for h in hooks:
@@ -586,7 +585,7 @@ def quantize(hf_model_dir: str,
                                               trust_remote_code=True)
     dataset = load_calib_dataset(calib_dataset)
 
-    act_range = capture_activation_range(hf_model.cuda(), tokenizer, dataset)
+    act_range = capture_activation_range(hf_model, tokenizer, dataset)
     smoother = {}
     if config.quantization.use_plugin_sq:
         smooth_baichuan_model(hf_model, act_range,

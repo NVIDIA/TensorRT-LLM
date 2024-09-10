@@ -46,21 +46,21 @@ Executor::Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigS
     tle::ExecutorConfig const& executorConfig)
 {
     py::buffer_info info = engineBuffer.request();
-    auto begin = reinterpret_cast<uint8_t const*>(info.ptr);
-    // the buffer is just 1-D array of uint8_t, so .shape[0] == number of bytes
-    auto end = reinterpret_cast<uint8_t const*>(begin) + info.shape[0];
-    mExecutor
-        = std::make_unique<tle::Executor>(std::vector<uint8_t>(begin, end), jsonConfigStr, modelType, executorConfig);
+    uint8_t const* data = reinterpret_cast<uint8_t const*>(info.ptr);
+    size_t size = info.size;
+    mExecutor = std::make_unique<tle::Executor>(tle::BufferView(data, size), jsonConfigStr, modelType, executorConfig);
 }
 
 Executor::Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
     std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,
     tle::ExecutorConfig const& executorConfig)
 {
-    mExecutor
-        = std::make_unique<tle::Executor>(std::vector<uint8_t>(encoderEngineBuffer.begin(), encoderEngineBuffer.end()),
-            encoderJsonConfigStr, std::vector<uint8_t>(decoderEngineBuffer.begin(), decoderEngineBuffer.end()),
-            decoderJsonConfigStr, modelType, executorConfig);
+    uint8_t const* encoderData = reinterpret_cast<uint8_t const*>(encoderEngineBuffer.data());
+    size_t encoderSize = encoderEngineBuffer.size();
+    uint8_t const* decoderData = reinterpret_cast<uint8_t const*>(decoderEngineBuffer.data());
+    size_t decoderSize = decoderEngineBuffer.size();
+    mExecutor = std::make_unique<tle::Executor>(tle::BufferView(encoderData, encoderSize), encoderJsonConfigStr,
+        tle::BufferView(decoderData, decoderSize), decoderJsonConfigStr, modelType, executorConfig);
 }
 
 py::object Executor::enter()

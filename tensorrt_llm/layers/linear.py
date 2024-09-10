@@ -23,7 +23,7 @@ from .._common import default_net, default_trtnet
 from .._utils import set_obj_attrs, str_dtype_to_torch, str_dtype_to_trt
 from ..functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
                           _add_plugin_info, _create_tensor, allgather,
-                          allreduce, cast, matmul)
+                          allreduce, cast, low_latency_gemm, matmul)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -204,9 +204,12 @@ class LinearBase(Module, metaclass=ABCMeta):
         ).plugin_config.manage_weights and self.prefer_managed_weight:
             use_gemm_plugin = default_net(
             ).plugin_config.gemm_plugin is not None
+            use_low_latency_gemm_plugin = default_net(
+            ).plugin_config.low_latency_gemm_plugin == 'fp8'
             return self.weight.get_managed_tensor(
                 network=default_net(),
-                need_transpose=self.weight_is_kn() and not use_gemm_plugin)
+                need_transpose=self.weight_is_kn() and not use_gemm_plugin
+                and not use_low_latency_gemm_plugin)
         else:
             return self.weight.get_constant_tensor(network=default_net())
 
@@ -215,13 +218,18 @@ class LinearBase(Module, metaclass=ABCMeta):
         x,
         weight,
         gemm_plugin: Optional[str] = None,
+        low_latency_gemm_plugin: Optional[str] = None,
         use_fp8: bool = False,
         alpha: Optional[np.ndarray] = None,
         lora_runtime_params: Optional[LoraRuntimeParams] = None,
         lora_hidden_state: Optional[Tensor] = None,
     ):
         hidden_state = x
-        if gemm_plugin:
+        if low_latency_gemm_plugin:
+            strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
+                self.dtype, str) else self.dtype
+            x = low_latency_gemm(x, weight, alpha, strict_dtype)
+        elif gemm_plugin:
             if gemm_plugin == 'fp8':
                 strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
                     self.dtype, str) else self.dtype
@@ -255,6 +263,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             x,
             weight,
             gemm_plugin: Optional[str] = None,
+            low_latency_gemm_plugin: Optional[str] = None,
             use_fp8: bool = False,
             alpha: Optional[np.ndarray] = None,
             lora_runtime_params: Optional[LoraRuntimeParams] = None,
@@ -264,6 +273,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             x,
             weight,
             gemm_plugin=gemm_plugin,
+            low_latency_gemm_plugin=low_latency_gemm_plugin,
             use_fp8=use_fp8,
             alpha=alpha,
             lora_runtime_params=lora_runtime_params,
@@ -349,7 +359,7 @@ class Linear(LinearBase):
         if self.is_qkv:
             if isinstance(weights, list):
                 if config.remove_duplicated_kv_heads:
-                    head_size = config.hidden_size // config.num_heads if config.head_size is None else config.head_size
+                    head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
                     k, v = weights[1:]
                     k = k.reshape([
                         k.shape[0] // head_size // 2, 2, head_size,
@@ -368,8 +378,10 @@ class Linear(LinearBase):
                 weights = torch.cat(weights)
             if using_head_as_leading_dim:
                 # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]
-                head_dim = self.out_features // (3 * config.num_heads)
-                w = weights.reshape(config.num_heads, 3, head_dim, -1)
+                assert config.num_attention_heads == config.num_key_value_heads, "using_head_as_leading_dim require head_size to be multiple of 3."
+                num_heads = config.num_attention_heads
+                head_dim = self.out_features // (3 * num_heads)
+                w = weights.reshape(num_heads, 3, head_dim, -1)
                 w = w.transpose(0, 1)
                 if w.shape[-1] > 1:
                     weights = w.reshape(-1, self.in_features)  # Weight

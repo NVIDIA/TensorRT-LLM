@@ -107,8 +107,9 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
 }
 
 template <typename T>
-void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
-    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -120,28 +121,28 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferC
     { // sampling layers
         TLLM_CHECK_WITH_INFO(
             beamWidth == 1, "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else if (mDecodingMode.isBeamSearch())
     { // beam search layer
         TLLM_CHECK_WITH_INFO(beamWidth > 1, "Decoding mode is beam search, but beamWidth <= 1 (%d <= 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else if (mDecodingMode.isMedusa())
     {
         TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Medusa, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else if (mDecodingMode.isLookahead())
     {
         TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Lookahead, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
         TLLM_CHECK_WITH_INFO(
             beamWidth == 1, "Decoding mode is ExplicitDraftTokens, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else
     {
@@ -154,22 +155,24 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferC
 }
 
 template <typename T>
-void DecodingLayer<T>::forwardAsync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+void DecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto [outputParams, inputParams] = prepareParams(baseOutputs, baseInputs);
-    mDecodingLayer->forwardAsync(outputParams, inputParams);
+    mDecodingLayer->forwardAsync(outputParams, inputParams, workspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void DecodingLayer<T>::forwardSync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+void DecodingLayer<T>::forwardSync(std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto [outputParams, inputParams] = prepareParams(baseOutputs, baseInputs);
-    mDecodingLayer->forwardSync(outputParams, inputParams);
+    mDecodingLayer->forwardSync(outputParams, inputParams, workspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -210,7 +213,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
 
         // In sampling, we have supported batch sampling. So, we always compute all
         // sentences once.
-        TensorPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
+        TensorConstPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
         auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, params->batchSlots, step, ite, localBatchSize);
 

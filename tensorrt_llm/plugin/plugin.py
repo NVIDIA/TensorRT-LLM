@@ -19,6 +19,7 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields
 from enum import IntEnum
 from pathlib import Path
+from textwrap import dedent
 from typing import List, Optional, Tuple
 
 import tensorrt as trt
@@ -38,7 +39,8 @@ def plugin_lib_path() -> str:
 
 
 def _load_plugin_lib():
-    winmode = 0 if platform.system() == "Windows" else None
+    on_windows = platform.system() == "Windows"
+    winmode = 0 if on_windows else None
     handle = ctypes.CDLL(plugin_lib_path(),
                          mode=ctypes.RTLD_GLOBAL,
                          winmode=winmode)
@@ -47,8 +49,21 @@ def _load_plugin_lib():
         handle.initTrtLlmPlugins.restype = ctypes.c_bool
     except AttributeError as err:
         raise ImportError('TensorRT-LLM Plugin is unavailable') from err
-    assert handle.initTrtLlmPlugins(None,
-                                    TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
+
+    try:
+        assert handle.initTrtLlmPlugins(
+            None, TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
+    except OSError as e:
+        windows_err = """
+        The error above may be caused by an outdated Microsoft Visual C++ Redistributable Version.
+        Please install the latest MSVC from the link below and re-launch.
+
+        https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version
+        """
+        err_msg = dedent(windows_err if on_windows else "Unknown error")
+        raise RuntimeError(err_msg) from e
+    except Exception as e:
+        raise e
 
 
 class ContextFMHAType(IntEnum):
@@ -65,7 +80,8 @@ DEFAULT_PLUGIN_DTYPE_OPTIONS = [
 PLUGIN_DTYPE_OPTIONS_MAP = {
     "gemm_swiglu_plugin": ["fp8", None],
     "gemm_plugin":
-    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None]
+    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None],
+    "low_latency_gemm_plugin": ["fp8", None],
 }
 
 
@@ -155,6 +171,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _quantize_tensor_plugin: bool = field(default=False, init=False)
     _moe_plugin: Optional[str] = field(default="auto", init=False)
     _mamba_conv1d_plugin: Optional[str] = field(default="auto", init=False)
+    _low_latency_gemm_plugin: Optional[str] = field(default=None, init=False)
 
     # Features
     _context_fmha: bool = field(default=True, init=False)
@@ -285,6 +302,7 @@ cli_plugin_args = [
     "moe_plugin",
     "mamba_conv1d_plugin",
     "nccl_plugin",
+    "low_latency_gemm_plugin",
 
     # Features
     "context_fmha",

@@ -329,6 +329,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     auto tensorNames = m.def_submodule("tensor_names");
     // Input tensor names
     tensorNames.attr("INPUT_IDS") = py::str(tb::inference_request::kInputIdsTensorName);
+    tensorNames.attr("POSITION_IDS") = py::str(tb::inference_request::kPositionIdsTensorName);
     tensorNames.attr("DRAFT_INPUT_IDS") = py::str(tb::inference_request::kDraftInputIdsTensorName);
     tensorNames.attr("DRAFT_LOGITS") = py::str(tb::inference_request::kDraftLogitsTensorName);
     tensorNames.attr("MAX_NEW_TOKENS") = py::str(tb::inference_request::kMaxNewTokensTensorName);

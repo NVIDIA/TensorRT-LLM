@@ -19,6 +19,8 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    cudaMemPool.cpp
+    decodingLayerWorkspace.cpp
     explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
     layerProfiler.cpp

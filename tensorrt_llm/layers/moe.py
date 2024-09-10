@@ -37,7 +37,7 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from ..quantization import QuantMode
-from ..quantization.functional import quantize
+from ..quantization.functional import postprocess_weight_only, quantize
 from .linear import RowLinear
 
 activation_str_to_int_map = {
@@ -96,6 +96,7 @@ def _moe_plugin(moe_config,
                 expert_scale_2,
                 expert_scale_3,
                 expert_scale_4,
+                act_scale,
                 hidden_size,
                 ffn_hidden_size,
                 act_fn,
@@ -131,6 +132,7 @@ def _moe_plugin(moe_config,
     expert_scale_2 = from_parameter(expert_scale_2)
     expert_scale_3 = from_parameter(expert_scale_3)
     expert_scale_4 = from_parameter(expert_scale_4)
+    act_scale = from_parameter(act_scale)
 
     # Create the plugin with our required state
     num_experts = moe_config.num_experts
@@ -256,6 +258,10 @@ def _moe_plugin(moe_config,
         plugin_inputs += [expert_scale_4]
 
     if use_lora:
+        if quant_mode.has_fp8_qdq():
+            assert act_scale
+            plugin_inputs += [act_scale]
+
         moe_h_4h_weight_ptrs = lora_params.get_runtime_params(
             0, "moe_h_to_4h").lora_weights_pointers
         moe_h_4h_lora_ranks = lora_params.get_runtime_params(
@@ -363,32 +369,10 @@ class MOEWeightWrapper(Module):
         elif self.quant_mode.is_weight_only():
             if "per_channel_scale" in tllm_key:
                 return {}
-            if weights.dim() > 2:
-                v = weights.transpose(-1, -2)
-            else:
-                v = weights.t()
-
-            amax = v.abs().max(dim=-2)[0].to(v.dtype)
-            if self.quant_mode.is_int8_weight_only():
-                scale = amax / 128.
-                qweight = torch.clamp((v / scale.unsqueeze(1)).round(), -128,
-                                      127).char()
-            else:
-                scale = amax / 8.
-                qweight = torch.clamp((v / scale.unsqueeze(1)).round(), -8,
-                                      7).char()
-                qweight[qweight < 0] += 16
-                qweight = qweight.view(torch.uint8)
-                qweight = (qweight[:, :, 1::2] * 16 + qweight[:, :, ::2]).view(
-                    torch.int8)
-            qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
-                qweight.contiguous(), torch.int8
-                if self.quant_mode.is_int8_weight_only() else torch.quint4x2,
-                torch.float16)
-            return {
-                tllm_key: qweight,
-                tllm_key.replace("weight", "per_channel_scale"): scale,
-            }
+            weights = weights.to(str_dtype_to_torch(self.dtype))
+            return postprocess_weight_only(
+                tllm_key, weights,
+                1 if self.quant_mode.is_int8_weight_only() else 2)
         elif self.quant_mode.has_fp8_qdq():
             if tllm_key.endswith("activation_scaling_factor"):
                 return 448.0 / weights
@@ -542,11 +526,13 @@ class MixtureOfExperts(Module):
             fc1_dequant = self.fc.weights_scaling_factor.value * self.fc.activation_scaling_factor.value
             fc2_quant = div(1.0, self.proj.activation_scaling_factor.value)
             fc2_dequant = self.proj.weights_scaling_factor.value * self.proj.activation_scaling_factor.value
+            fc1_act_dequant = self.fc.activation_scaling_factor.value
 
             scale_1 = fc1_dequant
             scale_2 = fc2_quant
             scale_3 = fc2_dequant
             scale_4 = None
+            scale_5 = fc1_act_dequant
 
             output_dtype_quant = self.dtype
 
@@ -565,6 +551,7 @@ class MixtureOfExperts(Module):
             scale_2 = self.proj.per_channel_scale
             scale_3 = None
             scale_4 = None
+            scale_5 = None
         output = _moe_plugin(self.moe_config,
                              hidden_states_quant,
                              routing,
@@ -576,6 +563,7 @@ class MixtureOfExperts(Module):
                              expert_scale_2=scale_2,
                              expert_scale_3=scale_3,
                              expert_scale_4=scale_4,
+                             act_scale=scale_5,
                              finished=finished,
                              hidden_size=self.hidden_size,
                              ffn_hidden_size=self.expert_inter_size,

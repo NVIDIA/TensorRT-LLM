@@ -160,7 +160,7 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
 
 ## CogVLM
 
-Currently, CogVLM only support bfloat16 precision and doesn't support `remove_input_padding` feature.
+Currently, CogVLM only support bfloat16 precision.
 
 1. Download Huggingface weights
 
@@ -188,11 +188,11 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu \
     --gemm_plugin bfloat16 \
     --gpt_attention_plugin bfloat16 \
-    --remove_input_padding disable \
+    --remove_input_padding enable \
     --max_batch_size 48 \
     --max_input_len 2048 \
     --max_seq_len 3076 \
-    --paged_kv_cache disable \
+    --paged_kv_cache enable \
     --enable_xqa disable \
     --bert_attention_plugin disable \
     --moe_plugin disable \
@@ -216,6 +216,8 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --temperature 0.2 \
     --repetition_penalty 1.2 \
     --enable_context_fmha_fp32_acc
+
+    CogVLM uses model_runner_cpp by default. To switch to model_runner, set `--use_py_session` in the command mentioned above.
     ```
 
 ## Deplot
@@ -625,7 +627,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
 
 2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/phi`.
     ```bash
-    python ../gpt/convert_checkpoint.py \
+    python ../phi/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --dtype float16

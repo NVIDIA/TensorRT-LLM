@@ -18,22 +18,16 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include <cstdint>
-#include <ios>
+#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include <memory>
-#include <sstream>
 #include <tuple>
 
 namespace tensorrt_llm::layers
@@ -117,20 +111,21 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
     auto const maxBatchShape1D = ITensor::makeShape({maxBatchSize});
     auto const maxBatchShape2D = ITensor::makeShape({maxBatchSize, maxTokensPerStep});
 
-    auto workspaceSize = getTopKWorkspaceSize<T>(maxBatchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
-    mSamplingWorkspaceDevice
-        = mBufferManager->gpu(ITensor::makeShape({static_cast<int32_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
+    mWorkspaceSize = getTopKWorkspaceSize<T>(maxBatchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
     mTargetTokensDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
-    mRandomSeedsDevice = mBufferManager->gpu(maxBatchShape1D, nvinfer1::DataType::kINT64);
     mSamplingMaskDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kBOOL);
-    mCurandStatesDevice = mBufferManager->gpu(maxBatchShape1D, nvinfer1::DataType::kINT8);
+    mCurandStatesDevice
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 
+    mSetupWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(
+        std::make_pair(maxBatchShape1D, nvinfer1::DataType::kINT64));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
-    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -159,7 +154,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
             SizeType32 bi1orN = (algoConfigs.size() == 1) ? 0 : bi;
             TLLM_LOG_DEBUG("CPU ALGO [ %d ] setup prompt %s", gbi, D(mCpuAlgo->mPrompts[bi]).values().c_str());
             auto [w, n, g] = algoConfigs[bi1orN].get();
-            SizeType32 runtimeTokensPerStep;
+            SizeType32 runtimeTokensPerStep = 0;
             std::tie(runtimeTokensPerStep, std::ignore, std::ignore, std::ignore)
                 = executor::LookaheadDecodingConfig(w, n, g).calculateSpeculativeResource();
             TLLM_CHECK_WITH_INFO(runtimeTokensPerStep <= mDecoderDomain.getMaxDecodingTokens(),
@@ -203,37 +198,16 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
         mBufferManager->getStream().synchronize(); // sync outputs cpu to gpu
     }
 
-    auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
-    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
-    if (setupParams->randomSeed)
-    {
-        auto& randomSeed = setupParams->randomSeed.value();
-        if (randomSeed.size() == 1)
-        {
-            invokeCurandInitialize(curandStatesDevicePtr, batchSlotsPtr, batchSize, randomSeed.front(), getStream());
-            sync_check_cuda_error();
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(randomSeed.size() == batchSize, "Random seed vector size mismatch.");
-            cudaAutoCpy(bufferCast<uint64_t>(*mRandomSeedsDevice), randomSeed.data(), batchSize, getStream());
-            invokeCurandBatchInitialize(curandStatesDevicePtr, batchSlotsPtr, batchSize,
-                bufferCast<uint64_t>(*mRandomSeedsDevice), getStream());
-            sync_check_cuda_error();
-        }
-    }
-    else
-    {
-        invokeCurandInitialize(
-            curandStatesDevicePtr, batchSlotsPtr, batchSize, DefaultDecodingParams::getSeed(), getStream());
-    }
+    workspace->initializeDeviceCurandStates(
+        setupParams->randomSeed, batchSize, workspace->getDeviceBatchSlots(), mCurandStatesDevice);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void LookaheadDecodingLayer<T>::forwardAsync(
-    std::shared_ptr<BaseDecodingOutputs> const& outputParams, std::shared_ptr<BaseDecodingInputs> const& inputParams)
+void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
+    std::shared_ptr<BaseDecodingInputs> const& inputParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto inputs = std::dynamic_pointer_cast<LookaheadDecodingInputs>(inputParams);
@@ -254,10 +228,10 @@ void LookaheadDecodingLayer<T>::forwardAsync(
     params.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     params.maxSeqLen = mDecoderDomain.getMaxDecodingTokens();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.batchSlots = bufferCast<SizeType32>(*inputs->batchSlots);
+    params.batchSlots = workspace->getDeviceBatchSlotsPtr();
     params.logProbs = bufferCastOrNull<T>(inputs->logits);
     params.outputIds = bufferCast<TokenIdType>(*mTargetTokensDevice);
-    params.workspace = bufferCast<int8_t>(*mSamplingWorkspaceDevice);
+    params.workspace = workspace->getRawWorkspaceDevicePtr();
     params.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
     params.tokensPerStep = bufferCast<SizeType32>(*inputs->curTokensPerStep.value());
 
@@ -284,7 +258,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(
 template <typename T>
 size_t LookaheadDecodingLayer<T>::getWorkspaceSize() const noexcept
 {
-    return mSamplingWorkspaceDevice->getSizeInBytes();
+    return std::max(mWorkspaceSize, mSetupWorkspaceSize);
 }
 
 template <typename T>
@@ -306,7 +280,7 @@ void LookaheadDecodingLayer<T>::posIdsToMask(TensorPtr mask, TensorConstPtr posI
     if (len > 0)
     {
         std::vector<std::pair<SizeType32, SizeType32>> stack;
-        stack.push_back(std::make_pair(0, posIdsRange[0] - 1));
+        stack.emplace_back(0, posIdsRange[0] - 1);
         for (auto i = 1; i < len + 1; i++)
         {
             auto cur = posIdsRange[i - 1];
@@ -315,7 +289,7 @@ void LookaheadDecodingLayer<T>::posIdsToMask(TensorPtr mask, TensorConstPtr posI
                 stack.pop_back();
             }
             TLLM_CHECK(stack.size() > 0 ? cur == stack.back().second + 1 : true);
-            stack.push_back(std::make_pair(i, cur));
+            stack.emplace_back(i, cur);
             for (auto prev : stack)
             {
                 setBit(maskLocation.at(i, prev.first / 32), prev.first % 32);

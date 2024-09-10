@@ -354,7 +354,8 @@ class DecoderLayerList(ModuleList):
                 attention_params=None,
                 position_ids=None,
                 lora_params=None,
-                spec_decoding_params=None):
+                spec_decoding_params=None,
+                vision_token_mask=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
@@ -370,6 +371,8 @@ class DecoderLayerList(ModuleList):
             kwargs = {}
             if position_ids is not None:
                 kwargs['position_ids'] = position_ids
+            if vision_token_mask is not None:
+                kwargs['vision_token_mask'] = vision_token_mask
             if lora_layer_params is not None:
                 kwargs['lora_layer_params'] = lora_layer_params
             if spec_decoding_params is not None:

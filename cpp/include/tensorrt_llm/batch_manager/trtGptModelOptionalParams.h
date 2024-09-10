@@ -46,7 +46,7 @@ public:
         executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{},
         executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
         = executor::ExtendedRuntimePerfKnobConfig{},
-        std::optional<executor::DebugConfig> debugConfig = std::nullopt)
+        std::optional<executor::DebugConfig> debugConfig = std::nullopt, uint64_t maxSeqIdleMicroseconds = 180000000)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
@@ -61,6 +61,7 @@ public:
         , schedulerConfig{schedulerConfig}
         , extendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
         , debugConfig{std::move(debugConfig)}
+        , maxSeqIdleMicroseconds{maxSeqIdleMicroseconds}
     {
     }
 
@@ -72,7 +73,8 @@ public:
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
-            executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig())
+            executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
+            executorConfig.getMaxSeqIdleMicroseconds())
     {
     }
 
@@ -81,7 +83,7 @@ public:
         : TrtGptModelOptionalParams(other.kvCacheConfig, other.enableTrtOverlap, other.deviceIds,
             other.normalizeLogProbs, other.enableChunkedContext, other.peftCacheManagerConfig, other.decodingConfig,
             other.gpuWeightsPercent, other.maxBeamWidth, other.maxBatchSize, other.maxNumTokens, other.schedulerConfig,
-            other.extendedRuntimePerfKnobConfig)
+            other.extendedRuntimePerfKnobConfig, other.debugConfig, other.maxSeqIdleMicroseconds)
     {
     }
 
@@ -100,6 +102,7 @@ public:
             && schedulerConfig == other.schedulerConfig                             //
             && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig //
             && debugConfig == other.debugConfig                                     //
+            && maxSeqIdleMicroseconds == other.maxSeqIdleMicroseconds               //
             ;
     }
 
@@ -121,6 +124,8 @@ public:
     executor::SchedulerConfig schedulerConfig;
     executor::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig;
     std::optional<executor::DebugConfig> debugConfig;
+    // Sequence is considered idle if not updated for this amount of time.
+    uint64_t maxSeqIdleMicroseconds;
 };
 
 } // namespace tensorrt_llm::batch_manager
