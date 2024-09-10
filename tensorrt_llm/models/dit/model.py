@@ -28,6 +28,7 @@ from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...parameter import Parameter
 from ...plugin import current_all_reduce_helper
+from ...quantization import QuantMode
 from ..modeling_utils import PretrainedConfig, PretrainedModel
 
 
@@ -121,7 +122,8 @@ class DiTBlock(Module):
                  num_heads,
                  mapping=Mapping(),
                  mlp_ratio=4.0,
-                 dtype=None):
+                 dtype=None,
+                 quant_mode=QuantMode(0)):
         super().__init__()
         self.dtype = dtype
         self.norm1 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -132,14 +134,16 @@ class DiTBlock(Module):
                                   tp_rank=mapping.tp_rank,
                                   cp_group=mapping.cp_group,
                                   cp_size=mapping.cp_size,
-                                  dtype=dtype)
+                                  dtype=dtype,
+                                  quant_mode=quant_mode)
         self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = MLP(hidden_size=hidden_size,
                        ffn_hidden_size=int(hidden_size * mlp_ratio),
                        hidden_act='gelu',
                        tp_group=mapping.tp_group,
                        tp_size=mapping.tp_size,
-                       dtype=dtype)
+                       dtype=dtype,
+                       quant_mode=quant_mode)
         self.adaLN_modulation = Linear(hidden_size,
                                        6 * hidden_size,
                                        tp_group=mapping.tp_group,
@@ -228,7 +232,9 @@ class DiT(PretrainedModel):
                      config.num_attention_heads,
                      mlp_ratio=config.mlp_ratio,
                      mapping=config.mapping,
-                     dtype=self.dtype) for _ in range(config.num_hidden_layers)
+                     dtype=self.dtype,
+                     quant_mode=config.quant_mode)
+            for _ in range(config.num_hidden_layers)
         ])
         self.final_layer = FinalLayer(config.hidden_size,
                                       config.patch_size,
@@ -236,8 +242,9 @@ class DiT(PretrainedModel):
                                       mapping=config.mapping,
                                       dtype=self.dtype)
 
-    def __post_init__(self):
-        return
+    # We need to invoke default `__post_init__()` for quantized layers.
+    #  def __post_init__(self):
+    #     return
 
     def check_config(self, config: PretrainedConfig):
         config.set_if_not_exist('input_size', 32)

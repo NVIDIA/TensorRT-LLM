@@ -209,6 +209,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property("max_prompt_embedding_table_size", &tr::ModelConfig::getMaxPromptEmbeddingTableSize,
             &tr::ModelConfig::setMaxPromptEmbeddingTableSize)
         .def_property_readonly("use_prompt_tuning", &tr::ModelConfig::usePromptTuning)
+        .def_property("use_lora_plugin", py::overload_cast<>(&tr::ModelConfig::useLoraPlugin, py::const_),
+            py::overload_cast<bool>(&tr::ModelConfig::useLoraPlugin))
         .def_property("compute_context_logits", py::overload_cast<>(&tr::ModelConfig::computeContextLogits, py::const_),
             py::overload_cast<bool>(&tr::ModelConfig::computeContextLogits))
         .def_property("compute_generation_logits",
@@ -333,6 +335,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorNames.attr("DRAFT_INPUT_IDS") = py::str(tb::inference_request::kDraftInputIdsTensorName);
     tensorNames.attr("DRAFT_LOGITS") = py::str(tb::inference_request::kDraftLogitsTensorName);
     tensorNames.attr("MAX_NEW_TOKENS") = py::str(tb::inference_request::kMaxNewTokensTensorName);
+    tensorNames.attr("NUM_RETURN_SEQUENCES") = py::str(tb::inference_request::kNumReturnSequencesTensorName);
     tensorNames.attr("BEAM_WIDTH") = py::str(tb::inference_request::kBeamWidthTensorName);
     tensorNames.attr("END_ID") = py::str(tb::inference_request::kEndIdTensorName);
     tensorNames.attr("PAD_ID") = py::str(tb::inference_request::kPadIdTensorName);

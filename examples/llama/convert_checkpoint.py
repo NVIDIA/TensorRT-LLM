@@ -413,6 +413,7 @@ def convert_and_save_hf(args):
                               pp_size=args.pp_size,
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
+            tik = time.time()
             llama = LLaMAForCausalLM.from_hugging_face(
                 model_dir,
                 args.dtype,
@@ -421,8 +422,11 @@ def convert_and_save_hf(args):
                 load_by_shard=load_by_shard,
                 **override_fields,
             )
+            print(f'Total time of reading and converting {time.time()-tik} s')
+            tik = time.time()
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
+            print(f'Total time of saving checkpoint {time.time()-tik} s')
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
         release_gc()

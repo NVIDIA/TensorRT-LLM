@@ -67,7 +67,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
-        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt)
+        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList,
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
@@ -82,7 +82,8 @@ public:
             returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength,
             tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
-                               : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt))
+                               : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
+            numReturnSequences)
     {
     }
 

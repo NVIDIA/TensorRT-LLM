@@ -477,6 +477,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
+    excluded_tests.append("ExplicitDraftTokensDecoding")
     excluded_tests.append("Mamba")
     excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
@@ -576,6 +577,18 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "batch_manager/cacheTransceiverTest",
     ]
     run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
+    if _os.path.exists(
+            _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
+        ucx_trans_test = [
+            "mpirun",
+            "-n",
+            "2",
+            "--allow-run-as-root",
+            "batch_manager/ucxDataTransceiverTest",
+        ]
+        run_command(ucx_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     trt_model_test = produce_mpirun_command(
@@ -957,6 +970,8 @@ if __name__ == "__main__":
         test_args.run_encoder = True
         test_args.run_bart = True
         test_args.run_t5 = True
+        test_args.run_medusa = True
+        test_args.run_redrafter = True
 
     del test_args.run_all_models
 

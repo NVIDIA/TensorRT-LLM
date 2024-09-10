@@ -82,7 +82,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mDraftTokens, draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor),
         mApplyLogitsPostProcessorBatched, mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority,
         encoderInputFeatures, mEncoderOutputLength, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        mInputTokenExtraIds);
+        mInputTokenExtraIds, mNumReturnSequences);
 }
 
 void LlmRequest::initBindings(py::module_& m)
@@ -98,7 +98,8 @@ void LlmRequest::initBindings(py::module_& m)
                  std::optional<LlmRequest::VecTokens>, std::optional<LlmRequest::TensorPtr>, bool,
                  std::optional<LlmRequest::LogitsPostProcessor>, bool, std::optional<LlmRequest::VecTokens>, bool,
                  std::optional<RequestIdType>, executor::PriorityType, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::VecTokenExtraIds>>(),
+                 std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::VecTokenExtraIds>,
+                 LlmRequest::SizeType32>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
@@ -113,7 +114,7 @@ void LlmRequest::initBindings(py::module_& m)
             py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
             py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority,
             py::arg("encoder_input_features") = std::nullopt, py::arg("encoder_output_length") = std::nullopt,
-            py::arg("input_token_extra_ids") = std::nullopt)
+            py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
         .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))
@@ -176,5 +177,6 @@ void LlmRequest::initBindings(py::module_& m)
         .def_property(
             "draft_logits", [](LlmRequest& self) { return self.getDraftLogits(); },
             [](LlmRequest& self, LlmRequest::TensorPtr& logits)
-            { self.setDraftLogits(std::make_optional<LlmRequest::TensorPtr>(logits)); });
+            { self.setDraftLogits(std::make_optional<LlmRequest::TensorPtr>(logits)); })
+        .def_property("num_return_sequences", &LlmRequest::getNumReturnSequences, &LlmRequest::setNumReturnSequences);
 }

@@ -24,6 +24,7 @@
 #include <deque>
 #include <filesystem>
 #include <list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -343,6 +344,7 @@ public:
     /// convolution down-sampling, etc.)
     /// @param type Indicate the request type for disaggregated serving mode.
     /// @param contextPhaseParams Generated token ID  from context only executor.
+    /// @param numReturnSequences The number of returning sequences.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -360,7 +362,7 @@ public:
         RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
-        std::optional<SizeType32> encoderOutputLength = std::nullopt);
+        std::optional<SizeType32> encoderOutputLength = std::nullopt, SizeType32 numReturnSequences = 1);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -396,6 +398,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getEncoderInputFeatures() const;
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] RequestType getRequestType() const;
+    [[nodiscard]] SizeType32 getNumReturnSequences() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -419,6 +422,7 @@ public:
     void setContextPhaseParams(ContextPhaseParams contextPhaseParams);
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
+    void setNumReturnSequences(SizeType32 numReturnSequences);
 
 private:
     friend class Serialization;
@@ -461,6 +465,12 @@ struct Result
 
     /// @brief The decoding iterations it takes.
     SizeType32 decodingIter{0};
+
+    /// @brief The index of the output sequence where 0 <= sequenceIndex < numReturnSequences
+    SizeType32 sequenceIndex{0};
+
+    /// @brief Indicates if this is the final result for a given sequence in the request
+    bool isSequenceFinal;
 };
 
 /// @brief Class that holds either an error or a result
@@ -583,7 +593,7 @@ private:
 class ExtendedRuntimePerfKnobConfig
 {
 public:
-    explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = false, bool enableContextFMHAFP32Acc = false);
+    explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = true, bool enableContextFMHAFP32Acc = false);
 
     bool operator==(ExtendedRuntimePerfKnobConfig const& other) const
     {
@@ -612,27 +622,33 @@ class DebugConfig
     using StringVec = std::vector<std::string>;
 
 public:
-    explicit DebugConfig(bool dumpInputTensors = false, bool dumpOuputTensors = false, StringVec debugTensorNames = {});
+    explicit DebugConfig(bool debugInputTensors = false, bool debugOutputTensors = false,
+        StringVec debugTensorNames = {}, SizeType32 debugTensorsMaxIterations = 0);
 
     bool operator==(DebugConfig const& other) const;
 
-    [[nodiscard]] bool getDumpInputTensors() const;
-    [[nodiscard]] bool getDumpOutputTensors() const;
+    [[nodiscard]] bool getDebugInputTensors() const;
+    [[nodiscard]] bool getDebugOutputTensors() const;
     [[nodiscard]] StringVec const& getDebugTensorNames() const;
+    [[nodiscard]] SizeType32 getDebugTensorsMaxIterations() const;
 
-    void setDumpInputTensors(bool dumpInputTensors);
-    void setDumpOuputTensors(bool dumpOuputTensors);
+    void setDebugInputTensors(bool debugInputTensors);
+    void setDebugOutputTensors(bool debugOutputTensors);
     void setDebugTensorNames(StringVec const& debugTensorNames);
+    void setDebugTensorsMaxIterations(SizeType32 debugTensorsMaxIterations);
 
 private:
     friend class Serialization;
 
-    /// @brief If true, dump all input tensors.
-    bool mDumpInputTensors;
-    /// @brief If true, dump all output tensors.
-    bool mDumpOuputTensors;
-    /// @brief If not empty, only dump tensors in this list.
+    /// @brief If true, debug all input tensors.
+    bool mDebugInputTensors;
+    /// @brief If true, debug all output tensors.
+    bool mDebugOutputTensors;
+    /// @brief If not empty, only debug tensors in this list.
     StringVec mDebugTensorNames;
+    /// @brief If > 0, provide debug tensors for at most debugTensorsMaxIterations past iterations,
+    /// else dump them to files.
+    SizeType32 mDebugTensorsMaxIterations;
 };
 
 SizeType32 const kDefaultIterStatsMaxIterations = 1000;
@@ -960,7 +976,8 @@ public:
         ModelType modelType, ExecutorConfig const& executorConfig);
 
     Executor(BufferView const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
-        ExecutorConfig const& executorConfig);
+        ExecutorConfig const& executorConfig,
+        std::optional<std::map<std::string, Tensor>> const& managedWeights = std::nullopt);
 
     Executor(BufferView const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
         BufferView const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
@@ -1021,19 +1038,24 @@ public:
     /// @param id The request id for which to cancel the response
     void cancelRequest(IdType requestId);
 
-    /// @brief  Signals the server to shutdown
-    ///         This call is blocking. Only returns when all requests have terminated or timeout has been reached
+    /// @brief   Signals the server to shutdown.
+    /// @details This call is blocking. Only returns when all requests have terminated or timeout has been reached
     void shutdown();
 
-    /// @brief  Returns the per-iterations statistics computed since last call to getLatestIterationStats
-    ///         Contains at most iterStatsMaxIterations iterations
+    /// @brief  Returns the per-iterations statistics computed since last call to getLatestIterationStats.
+    ///         Contains at most iterStatsMaxIterations iterations.
     /// @return Iteration stats
     std::deque<IterationStats> getLatestIterationStats();
 
-    /// @brief  Returns the request stats of each iteration computed since last call to getLatestRequestStats
-    ///         Contains at most requestStatsMaxIterations iterations
+    /// @brief  Returns the request stats of each iteration computed since last call to getLatestRequestStats.
+    ///         Contains at most requestStatsMaxIterations iterations.
     /// @return Request stats grouped by iterations
     std::deque<RequestStatsPerIteration> getLatestRequestStats();
+
+    /// @brief  Returns the debug tensors of each iteration computed since last call to getLatestDebugTensors.
+    ///         Contains at most debugTensorsMaxIterations iterations.
+    /// @return Request debug tensors grouped by iterations
+    std::deque<DebugTensorsPerIteration> getLatestDebugTensors();
 
     /// @brief  Indicates if the current process is allowed to enqueueRequests
     [[nodiscard]] bool canEnqueueRequests() const;

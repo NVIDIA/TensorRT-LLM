@@ -26,6 +26,11 @@ def client():
     del app_instance.llm
 
 
+def test_health(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+
+
 def test_generate(client):
     response = client.post("/generate", json={"prompt": "A B C"})
     assert response.status_code == 200

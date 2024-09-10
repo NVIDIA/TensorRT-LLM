@@ -31,13 +31,13 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 import tensorrt_llm.models.modeling_utils
-from examples.medusa.convert_checkpoint import convert_hf_llama
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.convert import (dup_kv_weight,
                                                get_tllm_linear_weight,
                                                get_weight, get_weight_and_bias,
                                                split)
+from tensorrt_llm.models.medusa.weight import convert_hf_llama
 
 BASE_MODEL_TLLM_WEIGHT_PREFIX = "base_model."
 DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
@@ -388,7 +388,7 @@ def hf_llama_config(
 
 def hf_redrafter_config(
     tllm_base_model_config: tensorrt_llm.models.modeling_utils.PretrainedConfig,
-    redrafter_config: Namespace,  # DrafterConfig
+    drafter_config: Namespace,  # DrafterConfig
     redrafter_num_beams: int,
     redrafter_draft_len_per_beam: int,
     redrafter_greedy_search: bool,
@@ -398,10 +398,10 @@ def hf_redrafter_config(
     tllm_config.base_model_architecture = tllm_config.architecture
     tllm_config.architecture = "ReDrafterForCausalLM"
     setattr(tllm_config, "redrafter_num_layers",
-            redrafter_config.num_draft_layers)
-    setattr(tllm_config, "redrafter_hidden_size", redrafter_config.hidden_size)
-    setattr(tllm_config, "redrafter_exit_dim", redrafter_config.exit_dim)
-    setattr(tllm_config, "redrafter_is_rnn", redrafter_config.rnn)
+            drafter_config.num_draft_layers)
+    setattr(tllm_config, "redrafter_hidden_size", drafter_config.hidden_size)
+    setattr(tllm_config, "redrafter_exit_dim", drafter_config.exit_dim)
+    setattr(tllm_config, "redrafter_is_rnn", drafter_config.rnn)
 
     # These three configs look like runtime parameters. But for TensorRT-LLM
     # implementation, they are required to be provided at engine build time and
@@ -517,11 +517,11 @@ def create_and_save_config(args):
         with open(Path(args.drafter_model_dir, "config.json")) as fp:
             drafter_hf_config = Namespace(**json.load(fp))
         tllm_model_config = hf_redrafter_config(
-            tllm_model_config,
-            drafter_hf_config,
-            args.redrafter_draft_len_per_beam,
-            args.redrafter_num_beams,
-            args.redrafter_greedy_search,
+            tllm_base_model_config=tllm_model_config,
+            drafter_config=drafter_hf_config,
+            redrafter_num_beams=args.redrafter_num_beams,
+            redrafter_draft_len_per_beam=args.redrafter_draft_len_per_beam,
+            redrafter_greedy_search=args.redrafter_greedy_search,
         )
 
     with open(os.path.join(args.output_dir, "config.json"), "w") as f:

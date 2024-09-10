@@ -358,23 +358,24 @@ class Linear(LinearBase):
         config = kwargs.get("config", None)
         if self.is_qkv:
             if isinstance(weights, list):
-                if config.remove_duplicated_kv_heads:
-                    head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
-                    k, v = weights[1:]
-                    k = k.reshape([
-                        k.shape[0] // head_size // 2, 2, head_size,
-                        self.in_features
-                    ])
-                    v = v.reshape([
-                        v.shape[0] // head_size // 2, 2, head_size,
-                        self.in_features
-                    ])
-                    assert (k[:, 0] == k[:, 1]).all()
-                    assert (v[:, 0] == v[:, 1]).all()
-                    k = k[:, 0].reshape([-1, self.in_features])
-                    v = v[:, 0].reshape([-1, self.in_features])
-                    weights[1] = k
-                    weights[2] = v
+                if hasattr(config, "remove_duplicated_kv_heads"):
+                    if config.remove_duplicated_kv_heads:
+                        head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
+                        k, v = weights[1:]
+                        k = k.reshape([
+                            k.shape[0] // head_size // 2, 2, head_size,
+                            self.in_features
+                        ])
+                        v = v.reshape([
+                            v.shape[0] // head_size // 2, 2, head_size,
+                            self.in_features
+                        ])
+                        assert (k[:, 0] == k[:, 1]).all()
+                        assert (v[:, 0] == v[:, 1]).all()
+                        k = k[:, 0].reshape([-1, self.in_features])
+                        v = v[:, 0].reshape([-1, self.in_features])
+                        weights[1] = k
+                        weights[2] = v
                 weights = torch.cat(weights)
             if using_head_as_leading_dim:
                 # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]

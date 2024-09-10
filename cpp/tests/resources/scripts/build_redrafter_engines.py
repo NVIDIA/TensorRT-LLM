@@ -17,23 +17,31 @@
 import argparse as _arg
 import pathlib as _pl
 import platform as _pf
+import sys as _sys
 
-from build_engines_utils import run_command, wincopy
+from build_engines_utils import init_model_spec_module, run_command, wincopy
+
+init_model_spec_module()
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
-def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path,
-                 has_tllm_checkpoint: bool):
+def build_engine(base_model_dir: _pl.Path, drafter_model_dir: _pl.Path,
+                 engine_dir: _pl.Path, *args):
 
-    if not has_tllm_checkpoint:
-        raise RuntimeError(
-            'Convert checkpoint is not supported for ReDrafter. '
-            'Provide a path that contains a checkpoint in the tllm_ckpt folder and set --has_tllm_checkpoint flag'
-        )
-    else:
-        checkpoint_dir = weight_dir / 'tllm_ckpt'
+    covert_cmd = [
+        _sys.executable, "examples/redrafter/convert_checkpoint.py"] + (
+        ['--model_dir', str(base_model_dir)] if base_model_dir else []) + [
+            '--drafter_model_dir', str(drafter_model_dir), \
+            '--output_dir', str(engine_dir), '--dtype=float16',
+            '--redrafter_num_beams=5', '--redrafter_draft_len_per_beam=5'
+        ] + list(args)
+
+    run_command(covert_cmd)
 
     build_args = ["trtllm-build"] + (
-        ['--checkpoint_dir', str(checkpoint_dir)] if engine_dir else []) + [
+        ['--checkpoint_dir', str(engine_dir)] if engine_dir else []) + [
             '--output_dir',
             str(engine_dir),
             '--gemm_plugin=float16',
@@ -49,50 +57,54 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path,
     run_command(build_args)
 
 
-def build_engines(model_cache: str, has_tllm_checkpoint: bool):
+def build_engines(model_cache: str):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    model_name = 'vicuna_redrafter'
-    if has_tllm_checkpoint:
-        base_model_name = 'vicuna-7b-v1.3'
-    # FIXME(nkorobov): rename folder in the cache
-    # model_name = 'redrafter-vicuna-7b-v1.3'
+    model_name = 'vicuna-7b-redrafter'
+    base_model_name = 'vicuna-7b-v1.3'
+    drafter_model_name = 'redrafter-vicuna-7b-v1.3'
 
     if model_cache:
-        print("Copy model from model_cache")
-        model_cache_dir = _pl.Path(model_cache) / model_name
-        assert model_cache_dir.is_dir()
-        if has_tllm_checkpoint:
-            base_model_cache_dir = _pl.Path(model_cache) / base_model_name
-            assert base_model_cache_dir.is_dir()
+        print(f"Copy model from {model_cache}")
+        base_model_cache_dir = _pl.Path(model_cache) / base_model_name
+        drafter_cache_dir = _pl.Path(model_cache) / drafter_model_name
+        assert base_model_cache_dir.is_dir(), base_model_cache_dir
+        assert drafter_cache_dir.is_dir(), drafter_cache_dir
 
         if _pf.system() == "Windows":
-            wincopy(source=str(model_cache_dir),
-                    dest=model_name,
+            wincopy(source=str(base_model_cache_dir),
+                    dest=base_model_name,
                     isdir=True,
                     cwd=models_dir)
-            if has_tllm_checkpoint:
-                wincopy(source=str(base_model_cache_dir),
-                        dest=base_model_name,
-                        isdir=True,
-                        cwd=models_dir)
+            wincopy(source=str(drafter_cache_dir),
+                    dest=drafter_model_name,
+                    isdir=True,
+                    cwd=models_dir)
         else:
             run_command(["rsync", "-rlptD",
-                         str(model_cache_dir), "."],
+                         str(base_model_cache_dir), "."],
                         cwd=models_dir)
-            if has_tllm_checkpoint:
-                run_command(["rsync", "-rlptD",
-                             str(base_model_cache_dir), "."],
-                            cwd=models_dir)
+            run_command(["rsync", "-rlptD",
+                         str(drafter_cache_dir), "."],
+                        cwd=models_dir)
 
-    model_dir = models_dir / model_name
-    assert model_dir.is_dir()
+    base_model_dir = models_dir / base_model_name
+    drafter_model_dir = models_dir / drafter_model_name
+    assert base_model_dir.is_dir()
+    assert drafter_model_dir.is_dir()
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
-    print(f"\nBuilding fp16 engine")
-    build_engine(model_dir, engine_dir / 'fp16-plugin-packed-paged/tp1-pp1-gpu',
-                 has_tllm_checkpoint)
+    model_spec_obj = model_spec.ModelSpec('input_tokens.npy', _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
+    model_spec_obj.use_packed_input()
+    model_spec_obj.use_explicit_draft_tokens_decoding()
+
+    full_engine_path = engine_dir / model_spec_obj.get_model_path(
+    ) / 'tp1-pp1-gpu'
+    print(f"\nBuilding fp16 engine at {str(full_engine_path)}")
+    build_engine(base_model_dir, drafter_model_dir, full_engine_path)
 
     print("Done.")
 
@@ -102,9 +114,5 @@ if __name__ == "__main__":
     parser.add_argument("--model_cache",
                         type=str,
                         help="Directory where models are stored")
-    parser.add_argument(
-        "--has_tllm_checkpoint",
-        action='store_true',
-        help="True if the provided path contains the trt-llm checkpoint.")
 
     build_engines(**vars(parser.parse_args()))

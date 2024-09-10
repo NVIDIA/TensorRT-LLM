@@ -160,6 +160,10 @@ or manually set a max sequence length that you plan to run with specifically:
 trtllm-bench --model meta-llama/Llama-2-7b-hf build --max_seq_len 256 --quantization FP8
 ```
 
+> [!NOTE] `trtllm-bench build` reproduces benchmark engines for performance study. These engine
+configurations are not guaranteed to be optimal for all cases and should be viewed as reproducers
+for the benchmark data we provide on our [Performance Overview](../docs/source/performance/perf-overview.md).
+
 Looking a little closer, the `build` sub-command
 will perform a lookup and build an engine using those reference settings. The
 look up table directly corresponds to the performance table found in our

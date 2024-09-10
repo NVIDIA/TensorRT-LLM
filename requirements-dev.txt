@@ -10,6 +10,7 @@ pybind11-stubgen
 pytest-cov
 pytest-forked
 pytest-xdist
+pytest-timeout
 rouge_score
 cloudpickle
 typing-extensions==4.8.0

@@ -157,7 +157,7 @@ struct BenchmarkParams
     int randomSeed = 430;
     std::optional<std::vector<int>> maxAttentionWindowVec{std::nullopt};
     std::optional<int> sinkTokenLength{std::nullopt};
-    bool multiBlockMode{false};
+    bool multiBlockMode{true};
     bool enableContextFMHAFP32Acc{false};
 
     // lora / peft params
@@ -1943,7 +1943,7 @@ int main(int argc, char* argv[])
 
     options.add_options()("multi_block_mode",
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel",
-        cxxopts::value<bool>()->default_value("false"));
+        cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "encoder_engine_dir", "Directory that store the engines of the encoder models.", cxxopts::value<std::string>());
 

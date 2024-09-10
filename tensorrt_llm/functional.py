@@ -5529,6 +5529,7 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'gelu_pytorch_tanh': gelu,
+    'openai-gelu': gelu,
     'geglu': geglu,
     'gegelu': gegelu,
     'identity': identity,

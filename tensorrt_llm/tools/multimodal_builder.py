@@ -188,11 +188,6 @@ def build_trt_engine(model_type,
 
     profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
                       [nMaxBS, *max_size])
-    if model_type == "pix2struct":
-        inputT = network.get_input(1)
-        P = input_sizes[0]  # Number of patches
-        inputT.shape = [nBS, P]
-        profile.set_shape(inputT.name, [nMinBS, P], [nOptBS, P], [nMaxBS, P])
     config.add_optimization_profile(profile)
 
     t0 = time()
@@ -268,7 +263,6 @@ def build_pix2struct_engine(args):
     dtype = torch.float16
     inputs = processor(text="dummy", images=raw_image, return_tensors="pt")
     image = inputs['flattened_patches'].to(args.device, dtype)
-    attention_mask = inputs['attention_mask'].to(args.device, torch.int)
 
     class pix2structVisionWrapper(torch.nn.Module):
 
@@ -276,7 +270,8 @@ def build_pix2struct_engine(args):
             super().__init__()
             self.encoder = encoder
 
-        def forward(self, image, attention_mask):
+        def forward(self, image):
+            attention_mask = (image.abs().sum(dim=-1) != 0)
             vision_x = self.encoder.embeddings(image)
             img_features = self.encoder.encoder(vision_x,
                                                 attention_mask=attention_mask)
@@ -293,17 +288,12 @@ def build_pix2struct_engine(args):
     # falls within a relatively narrow range. To improve performance, we can avoid using
     # dynamic axis for the input patches and instead use a fixed number of patches along
     # with an attention mask.
-    export_onnx(wrapper, (image, attention_mask),
+    export_onnx(wrapper, (image, ),
                 f'{args.output_dir}/onnx',
-                input_names=['input', 'attention_mask'],
-                dynamic_axes={
-                    'input': {
-                        0: 'batch'
-                    },
-                    'attention_mask': {
-                        0: 'batch'
-                    }
-                })
+                input_names=['input'],
+                dynamic_axes={'input': {
+                    0: 'batch'
+                }})
     build_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2]],  # Number of Patches, Hidden Dimension

@@ -32,7 +32,7 @@ using runtime::SizeType32;
 struct PeftCacheManagerConfig
 {
 
-    static float constexpr kDefaultDeviceCachePercent = 0.05;
+    static float constexpr kDefaultDeviceCachePercent = 0.02;
     static size_t constexpr kDefaultHostCacheSize = 1024 * 1024 * 1024;
 
     explicit PeftCacheManagerConfig(SizeType32 numHostModuleLayer = 0, SizeType32 numDeviceModuleLayer = 0,

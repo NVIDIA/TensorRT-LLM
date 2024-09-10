@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/safetensors.h"
+#include "tensorrt_llm/executor/tensor.h"
 #include "tllmLogger.h"
 
 #include <limits>
@@ -345,21 +346,41 @@ void TllmRuntime::reportToProfiler(SizeType32 contextId)
     mContexts[contextId]->reportToProfiler();
 }
 
-void TllmRuntime::loadManagedWeights(std::string const& weightsPath)
+void TllmRuntime::loadManagedWeights(RawEngine const& rawEngine, int localRank)
 {
     auto& engine = getEngine();
     auto& manager = getBufferManager();
-
-    std::shared_ptr<common::safetensors::ISafeTensor> managed_weights
-        = common::safetensors::ISafeTensor::open(weightsPath.c_str());
-    for (auto const& name : managed_weights->keys())
+    if (rawEngine.getManagedWeightsMapOpt().has_value())
     {
-        TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
-        auto const weight = managed_weights->getTensor(name.c_str());
-        TLLM_CHECK(weight->dtype() == engine.getTensorDataType(name.c_str()));
-        auto weightsDevice
-            = std::shared_ptr<ITensor>{manager.allocate(MemoryType::kGPU, weight->trtDims(), weight->dtype())};
-        manager.copy(weight->data(), *weightsDevice, MemoryType::kCPU);
-        mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
+        TLLM_LOG_DEBUG("Loading managed weights from raw engine");
+        auto executorMap = rawEngine.getManagedWeightsMapOpt().value();
+        for (auto const& [name, weight] : executorMap)
+        {
+            TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
+            auto iTensor = tensorrt_llm::executor::detail::toITensor(weight);
+            auto weightsDevice = std::shared_ptr<ITensor>{
+                manager.allocate(MemoryType::kGPU, iTensor->getShape(), iTensor->getDataType())};
+            manager.copy(iTensor->data(), *weightsDevice, MemoryType::kCPU);
+            mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
+        }
+    }
+    else
+    {
+        TLLM_LOG_DEBUG("Loading managed weights from file");
+        auto const enginePath = rawEngine.getPathOpt();
+        TLLM_CHECK_WITH_INFO(enginePath.has_value(), "Engine path is not set.");
+        auto weightPath
+            = enginePath->parent_path() / ("rank" + std::to_string(localRank) + "_managed_weights.safetensors");
+        auto managed_weights = common::safetensors::ISafeTensor::open(weightPath.string().c_str());
+        for (auto const& name : managed_weights->keys())
+        {
+            TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
+            auto const weight = managed_weights->getTensor(name.c_str());
+            TLLM_CHECK(weight->dtype() == engine.getTensorDataType(name.c_str()));
+            auto weightsDevice
+                = std::shared_ptr<ITensor>{manager.allocate(MemoryType::kGPU, weight->trtDims(), weight->dtype())};
+            manager.copy(weight->data(), *weightsDevice, MemoryType::kCPU);
+            mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
+        }
     }
 }

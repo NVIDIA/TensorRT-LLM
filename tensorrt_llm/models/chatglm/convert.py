@@ -13,8 +13,9 @@ from transformers import AutoModel, AutoTokenizer
 
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.models import ChatGLMConfig
-from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
-                                               load_calib_dataset)
+from tensorrt_llm.models.convert_utils import (generate_int8, get_weight,
+                                               get_weight_and_bias,
+                                               load_calib_dataset, smooth_gemm)
 from tensorrt_llm.quantization import QuantAlgo
 
 from .config import GLM_ARCH1_VERSIONS, GLM_ARCH2_VERSIONS
@@ -131,62 +132,6 @@ def get_tllm_linear_weight(
 
 
 @torch.no_grad()
-def apply_smoothing(
-    scales,
-    gemm_weights,
-    norm_weights=None,
-    norm_bias=None,
-    dtype=torch.float32,
-    norm_1p=False,
-):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-
-    if norm_weights is not None:
-        assert norm_weights.numel() == scales.numel()
-        norm_weights.div_(scales).to(dtype)
-    if norm_bias is not None:
-        assert norm_bias.numel() == scales.numel()
-        norm_bias.div_(scales).to(dtype)
-    if norm_1p:
-        norm_weights += (1 / scales) - 1
-
-    for gemm in gemm_weights:
-        gemm.mul_(scales.view(1, -1)).to(dtype)
-
-
-@torch.no_grad()
-def smooth_gemm(
-    gemm_weights,
-    act_scales,
-    norm_weights=None,
-    norm_bias=None,
-    alpha=0.5,
-    weight_scales=None,
-):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, gemm_weights, norm_weights, norm_bias, orig_dtype)
-
-    return scales
-
-
-@torch.no_grad()
 def capture_activation_range(
     model,
     tokenizer,
@@ -236,117 +181,6 @@ def capture_activation_range(
         h.remove()
 
     return scales
-
-
-def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=True):
-    """
-     This function has two purposes:
-      - compute quantized weights, scaled either per-tensor or per-column
-      - compute scaling factors
-
-      Depending on the GEMM API (CUTLASS/CUBLAS) the required scaling factors differ.
-      CUTLASS uses two sets of scaling factors. One for the activation X, one for the weight W.
-      CUBLAS only has one (we can't do per-row scaling). So we must provide pre-multiplied scaling factor.
-
-      Here is the list of what we need (T means per-tensor, C per-column):
-        - scale_x_orig_quant puts fp activation into the quantized range (i.e. [-128, 127], for int8). Used before the GEMM. (T)
-        - scale_y_quant_orig puts quantized activation into the fp range. Used if the GEMM outputs int8. (T)
-        - scale_w_quant_orig puts weights from quant range to fp range (used with CUTLASS) (T, C)
-        - scale_y_accum_quant puts the GEMM result (XW) from accumulation range (int32)
-          to quant range (int8) (used for CUBLAS) (T, C)
-
-      Note that we don't do anything special about row-parallel GEMM. Theoretically, we could have per-GPU scaling factors too,
-      but then the model would change depending on the number of GPUs used.
-
-      For QKV projection, the behavior is special. Even if we have a single matrix to perform QKV projection, we consider it
-      as three different matrices: Q, K, and V. So per-tensor actually means one scaling factor for each Q, K and V.
-      For our GEMM implementation to respect this behavior, we use per-column mode and replicate values along columns.
-    """
-
-    # For ChatGLM2/3-6B models (num_kv_head == 2), we regard multi_query_mode == True to reuse code from gpt and baichuan examples.
-    if act_range["w"].dtype == torch.bfloat16:
-        act_range["w"] = act_range["w"].to(torch.float32)
-
-    def to_np(tensor):
-        return tensor.cpu().numpy().astype(np.float32)
-
-    if is_qkv and multi_query_mode:
-        hidden_dim, local_dim = weights.shape
-
-        kv_dim = (local_dim - hidden_dim) // 2
-        scale_w_q = act_range["w"][0:hidden_dim]
-        scale_w_k = act_range["w"][hidden_dim:hidden_dim + kv_dim]
-        scale_w_v = act_range["w"][-kv_dim:]
-
-        scale_w_qkv_t = torch.concat([
-            scale_w_q.max(dim=0, keepdim=True)[0],
-            scale_w_k.max(dim=0, keepdim=True)[0],
-            scale_w_v.max(dim=0, keepdim=True)[0]
-        ])
-        scale_w_orig_quant_t = 127. / to_np(scale_w_qkv_t)
-        scale_w_orig_quant_c = 127. / to_np(act_range["w"])
-    elif is_qkv and not multi_query_mode:
-        scale_w_orig_quant_t = 127. / to_np(act_range["w"].reshape(3, -1).max(
-            dim=-1, keepdims=True)[0])
-        scale_w_orig_quant_c = 127. / to_np(act_range["w"].reshape(3, -1))
-
-    else:
-        scale_w_orig_quant_t = 127. / to_np(act_range["w"].max())
-        scale_w_orig_quant_c = 127. / to_np(act_range["w"])
-    scale_w_quant_orig_t = 1.0 / scale_w_orig_quant_t
-    scale_w_quant_orig_c = 1.0 / scale_w_orig_quant_c
-
-    # compute the rest of needed scaling factors
-    act_range_x_max = act_range["x"].max().to(torch.float32).item()
-    act_range_y_max = act_range["y"].max().to(torch.float32).item()
-    scale_x_orig_quant_t = np.array(127. / act_range_x_max).astype(np.float32)
-    scale_y_orig_quant_t = np.array(127. / act_range_y_max).astype(np.float32)
-    scale_y_quant_orig_t = np.array(act_range_y_max / 127.).astype(np.float32)
-    scale_y_accum_quant_t = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_t)
-    scale_y_accum_quant_c = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_c)
-    if is_qkv and not multi_query_mode:
-        scale_y_accum_quant_t = np.broadcast_to(scale_y_accum_quant_t,
-                                                scale_w_orig_quant_c.shape)
-        scale_w_quant_orig_t = np.broadcast_to(scale_w_quant_orig_t,
-                                               scale_w_orig_quant_c.shape)
-    if is_qkv and multi_query_mode:
-        scale_q_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[0],
-                                            scale_w_q.shape)
-        scale_k_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[1],
-                                            scale_w_k.shape)
-        scale_v_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[2],
-                                            scale_w_v.shape)
-        scale_y_accum_quant_t = np.concatenate(
-            [scale_q_y_accum_t, scale_k_y_accum_t, scale_v_y_accum_t])
-        scale_w_quant_orig_t = np.concatenate([
-            np.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
-            np.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
-            np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
-        ])
-
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
-
-    if is_qkv and multi_query_mode:
-        scale_w_orig_quant_t_expand = np.ones([weights.shape[-1]])
-        scale_w_orig_quant_t_expand[:hidden_dim] = scale_w_orig_quant_t[0]
-        scale_w_orig_quant_t_expand[hidden_dim:hidden_dim +
-                                    kv_dim] = scale_w_orig_quant_t[1]
-        scale_w_orig_quant_t_expand[-kv_dim:] = scale_w_orig_quant_t[2]
-        weight_int8 = to_i8(weights * scale_w_orig_quant_t_expand)
-    else:
-        weight_int8 = to_i8(weights * scale_w_orig_quant_t)
-    return {
-        "weight.int8": weight_int8,
-        "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
-        "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
-        "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
-        "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
-        "scale_y_accum_quant": scale_y_accum_quant_t.astype(np.float32),
-        "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
-        "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
-    }
 
 
 @torch.no_grad()

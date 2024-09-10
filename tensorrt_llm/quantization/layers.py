@@ -18,7 +18,6 @@ from typing import Optional
 import numpy as np
 import tensorrt as trt
 import torch
-import torch.nn.functional as F
 
 from .._common import default_net, precision
 from .._utils import fp32_array, is_same_dtype, str_dtype_to_torch
@@ -40,7 +39,7 @@ from .functional import (
     postprocess_fp8_rowwise, postprocess_weight_only, quantize,
     quantize_fp8_per_token, quantize_per_token, quantize_tensor,
     smooth_quant_gemm, smooth_quant_layer_norm, smooth_quant_rms_norm,
-    weight_only_groupwise_quant_matmul, weight_only_quant_matmul)
+    weight_only_groupwise_quant_matmul, weight_only_quant_matmul, pad_like)
 # isort: on
 from .mode import QuantMode
 
@@ -557,6 +556,15 @@ class WeightOnlyQuantLinear(Linear):
         transb=False,
         is_qkv=False,
     ):
+        multiple = 64 * tp_size
+        self.is_padded = False
+        if in_features % multiple > 0:
+            in_features = math.ceil(in_features / multiple) * multiple
+            self.is_padded = True
+        if out_features % multiple > 0:
+            out_features = math.ceil(out_features / multiple) * multiple
+            self.is_padded = True
+
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -583,6 +591,8 @@ class WeightOnlyQuantLinear(Linear):
         self.transa = transa
         self.transb = transb
         self.tp_rank = tp_rank
+        if self.is_padded:
+            self.tp_dim = -1
 
     def forward(self, x, lora_runtime_params=None):
         # ootb has not supported int4 yet.
@@ -615,8 +625,10 @@ class WeightOnlyQuantLinear(Linear):
             return {}
         weights = super().postprocess(tllm_key, weights, **kwargs)[tllm_key]
         weights = weights.to(str_dtype_to_torch(self.dtype))
-        return postprocess_weight_only(tllm_key, weights,
-                                       self.weight_only_quant_mode)
+        return postprocess_weight_only(
+            tllm_key, weights,
+            torch.int8 if self.weight_only_quant_mode == 1 else torch.quint4x2,
+            self)
 
 
 WeightOnlyQuantColumnLinear = WeightOnlyQuantLinear
@@ -635,6 +647,15 @@ class WeightOnlyQuantRowLinear(RowLinear):
             tp_rank=0,
             quant_mode=QuantMode.use_weight_only(),
     ):
+        multiple = 64 * tp_size
+        self.is_padded = False
+        if in_features % multiple > 0:
+            in_features = math.ceil(in_features / multiple) * multiple
+            self.is_padded = True
+        if out_features % multiple > 0:
+            out_features = math.ceil(out_features / multiple) * multiple
+            self.is_padded = True
+
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -653,6 +674,8 @@ class WeightOnlyQuantRowLinear(RowLinear):
         self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                            dtype=dtype)
         self.tp_rank = tp_rank
+        if self.is_padded:
+            self.tp_dim = -1
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         hidden_state = x
@@ -689,8 +712,10 @@ class WeightOnlyQuantRowLinear(RowLinear):
         if "per_channel_scale" in tllm_key:
             return {}
         weights = weights.to(str_dtype_to_torch(self.dtype))
-        return postprocess_weight_only(tllm_key, weights,
-                                       self.weight_only_quant_mode)
+        return postprocess_weight_only(
+            tllm_key, weights,
+            torch.int8 if self.weight_only_quant_mode == 1 else torch.quint4x2,
+            self)
 
 
 class WeightOnlyQuantEmbedding(Embedding):
@@ -750,20 +775,6 @@ def unpack_int32_into_int8(w_packed):
     w_unpacked[:, ::2] = w_packed_int4x2 % 16
     w_unpacked[:, 1::2] = w_packed_int4x2 // 16
     return w_unpacked.contiguous()
-
-
-def pad_like(w, target_shape, value=0):
-    if w.shape != target_shape:
-        pad_dim = []
-        for dim in range(len(target_shape)):
-            current_dim = -1 - dim
-            pad_dim.append(0)
-            pad_dim.append(
-                max(0, target_shape[current_dim] - w.shape[current_dim]))
-        res = F.pad(w, pad_dim, value=value)
-        return res
-    else:
-        return w
 
 
 class WeightOnlyGroupwiseQuantLinear(Linear):

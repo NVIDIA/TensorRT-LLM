@@ -260,6 +260,7 @@ def main(args):
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
                 lora_uids=args.lora_task_uids,
+                lookahead_config=args.lookahead_config,
                 output_sequence_lengths=True,
                 return_dict=True,
                 medusa_choices=args.medusa_choices)
@@ -452,6 +453,12 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if args.lookahead_config is not None:
+            args.lookahead_config = ast.literal_eval(args.lookahead_config)
+            assert len(
+                args.lookahead_config
+            ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
+            runner_kwargs.update(lookahead_config=args.lookahead_config)
         if not args.use_py_session:
             runner_kwargs.update(
                 max_batch_size=max_batch_size,

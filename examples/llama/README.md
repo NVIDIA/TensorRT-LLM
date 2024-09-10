@@ -274,7 +274,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
 
 ### Long context length
-To use the model with Long context lengths, it is necessary to add `--multi_block_mode` in the runtime command to enable faster decoding in multi-head attention.
+With long context lengths, multi_block_mode is turned on by default to enable faster decoding in multi-head attention. To disable this feature, add `--multi_block_mode=False` to the runtime command.
 
 
 A few LLaMA models are fine-tuned for long context length that TRT-LLM can support today. For example https://huggingface.co/Yukang/LongAlpaca-70B employs rotary scaling plus fine-tuning to support up to 32K context length. The following show the steps for running LongAlpaca-70B in TRT-LLM:

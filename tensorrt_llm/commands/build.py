@@ -28,7 +28,7 @@ from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
-from tensorrt_llm.logger import logger
+from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.lora_manager import LoraConfig, LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
@@ -39,237 +39,285 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 def parse_arguments():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--checkpoint_dir', type=str, default=None)
-    parser.add_argument('--model_config', type=str, default=None)
-    parser.add_argument('--build_config', type=str, default=None)
-    parser.add_argument('--model_cls_file', type=str, default=None)
-    parser.add_argument('--model_cls_name', type=str, default=None)
     parser.add_argument(
-        '--input_timing_cache',
+        '--checkpoint_dir',
         type=str,
         default=None,
-        help=
-        'The path to read timing cache, will be ignored if the file does not exist'
-    )
-    parser.add_argument('--output_timing_cache',
-                        type=str,
-                        default='model.cache',
-                        help='The path to write timing cache')
-    parser.add_argument('--log_level', type=str, default='info')
+        help="The directory path that contains TensorRT-LLM checkpoint.")
     parser.add_argument(
-        '--profiling_verbosity',
+        '--model_config',
         type=str,
-        default='layer_names_only',
-        choices=['layer_names_only', 'detailed', 'none'],
-        help=
-        'The profiling verbosity for the generated TRT engine. Set to detailed can inspect tactic choices and kernel parameters.'
-    )
-    parser.add_argument('--enable_debug_output',
-                        default=False,
-                        action='store_true')
+        default=None,
+        help="The file path that saves TensorRT-LLM checkpoint config.")
+    parser.add_argument(
+        '--build_config',
+        type=str,
+        default=None,
+        help="The file path that saves TensorRT-LLM build config.")
+    parser.add_argument(
+        '--model_cls_file',
+        type=str,
+        default=None,
+        help="The file path that defines customized TensorRT-LLM model.")
+    parser.add_argument('--model_cls_name',
+                        type=str,
+                        default=None,
+                        help="The customized TensorRT-LLM model class name.")
     parser.add_argument(
         '--output_dir',
         type=str,
         default='engine_outputs',
-        help='The path to save the serialized engine files and model configs')
-    parser.add_argument('--workers',
-                        type=int,
-                        default='1',
-                        help='The number of workers for building in parallel')
+        help=
+        "The directory path to save the serialized engine files and engine config file."
+    )
+
     parser.add_argument(
         '--max_batch_size',
         type=int,
         default=256,
-        help="Max number of requests that the engine can handle.")
+        help="Maximum number of requests that the engine can schedule.")
     parser.add_argument('--max_input_len',
                         type=int,
                         default=1024,
-                        help="Max input length of one request.")
+                        help="Maximum input length of one request.")
     parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',
         type=int,
         default=None,
-        help="Max total length of one request, including prompt and outputs. "
-        "If unspecified, will try to deduce from the model config.")
-    parser.add_argument('--max_beam_width', type=int, default=1)
+        help="Maximum total length of one request, including prompt and outputs. "
+        "If unspecified, the value is deduced from the model config.")
+    parser.add_argument(
+        '--max_beam_width',
+        type=int,
+        default=1,
+        help="Maximum number of beams for beam search decoding.")
     parser.add_argument(
         '--max_num_tokens',
         type=int,
         default=8192,
-        help="Max number of batched input tokens after padding is removed "
-        "(triggered by `--remove_input_padding`) in each batch.")
+        help=
+        "Maximum number of batched input tokens after padding is removed in each batch. "
+        "Currently, the input padding is removed by default; "
+        "you may explicitly disable it by specifying ``--remove_input_padding disable``."
+    )
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
         default=None,
-        help='It equals to max_batch_size*max_beam_width by default, set this '
-        'value as close as possible to the actual number of tokens on your workload. '
-        'Note that this argument might be removed in the future.')
-
+        help=
+        "Optimal number of batched input tokens after padding is removed in each batch "
+        "It equals to ``max_batch_size * max_beam_width`` by default, set this "
+        "value as close as possible to the actual number of tokens on your workload. "
+        "Note that this argument might be removed in the future.")
+    parser.add_argument(
+        '--max_encoder_input_len',
+        type=int,
+        default=1024,
+        help="Maximum encoder input length for enc-dec models. "
+        "Set ``max_input_len`` to 1 to start generation from decoder_start_token_id of length 1."
+    )
     parser.add_argument(
         '--max_prompt_embedding_table_size',
         '--max_multimodal_len',
         type=int,
         default=0,
         help=
-        'Setting to a value > 0 enables support for prompt tuning or multimodal input.'
-    )
+        "Maximum prompt embedding table size for prompt tuning, or maximum multimodal input size for multimodal models. "
+        "Setting a value > 0 enables prompt tuning or multimodal input.")
     parser.add_argument(
         '--kv_cache_type',
         default=argparse.SUPPRESS,
         type=KVCacheType,
         help=
-        'Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed.'
+        "Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed."
     )
     parser.add_argument(
         '--paged_kv_cache',
         type=str,
         default=argparse.SUPPRESS,
         help=
-        'Deprecated. Set this option to enable is equvilient to `--kv_cache_type paged` for transformer based models.'
+        "Deprecated. Enabling this option is equvilient to ``--kv_cache_type paged`` for transformer based models."
     )
-    parser.add_argument(
-        '--gather_all_token_logits',
-        action='store_true',
-        default=False,
-        help='Enable both gather_context_logits and gather_generation_logits')
-    parser.add_argument('--gather_context_logits',
-                        action='store_true',
-                        default=False,
-                        help='Gather context logits')
-    parser.add_argument('--gather_generation_logits',
-                        action='store_true',
-                        default=False,
-                        help='Gather generation logits')
 
-    parser.add_argument('--builder_opt', type=int, default=None)
-    parser.add_argument('--builder_force_num_profiles', type=int, default=None)
-    parser.add_argument('--logits_dtype',
-                        type=str,
-                        default=None,
-                        choices=['float16', 'float32'])
-    parser.add_argument('--weight_sparsity', default=False, action='store_true')
     parser.add_argument(
-        '--max_draft_len',
-        type=int,
-        default=0,
-        help=
-        'Maximum lengths of draft tokens for speculative decoding target model.'
-    )
-    parser.add_argument(
-        '--lora_dir',
+        '--input_timing_cache',
         type=str,
         default=None,
-        nargs="+",
-        help="The directory of LoRA weights. "
-        "Use config from the first directory if multiple directories are provided."
-    )
-    parser.add_argument('--lora_ckpt_source',
-                        type=str,
-                        default="hf",
-                        choices=["hf", "nemo"],
-                        help="The source of lora checkpoint.")
-    parser.add_argument(
-        '--lora_target_modules',
-        nargs='+',
-        default=None,
-        choices=LoraManager.LORA_MODULE_IDS.keys(),
         help=
-        "Add lora in which modules. Only be activated when use_lora_plugin is enabled."
+        "The file path to read the timing cache. This option is ignored if the file does not exist."
     )
-    parser.add_argument(
-        '--max_lora_rank',
-        type=int,
-        default=64,
-        help='maximum lora rank for different lora modules. '
-        'It is used to compute the workspace size of lora plugin.')
-    parser.add_argument('--auto_parallel',
+    parser.add_argument('--output_timing_cache',
+                        type=str,
+                        default='model.cache',
+                        help="The file path to write the timing cache.")
+    parser.add_argument('--builder_opt',
                         type=int,
-                        default=1,
-                        help='MPI world size for auto parallel.')
+                        default=None,
+                        choices=[0, 1, 2, 3, 4, 5],
+                        help="TensorRT builder optimization level.")
     parser.add_argument(
-        '--gpus_per_node',
-        type=int,
-        default=8,
-        help=
-        'Number of GPUs each node has in a multi-node setup. This is a cluster spec and can be greater/smaller than world size'
-    )
-    parser.add_argument(
-        '--cluster_key',
+        '--profiling_verbosity',
         type=str,
-        default=None,
-        choices=cluster_infos.keys(),
+        default='layer_names_only',
+        choices=['layer_names_only', 'detailed', 'none'],
         help=
-        'Unique name for target GPU type. Inferred from current GPU type if not specified.'
+        "The profiling verbosity for the generated TensorRT engine. Setting to detailed allows inspecting tactic choices and kernel parameters."
     )
+    parser.add_argument(
+        '--builder_force_num_profiles',
+        type=int,
+        default=None,
+        help="If specified, force to use the number of profiles.")
     parser.add_argument(
         '--strip_plan',
         default=False,
         action='store_true',
         help=
-        'Whether to strip weights from the final TRT engine under the assumption that the refit weights will be identical to those provided at build time.'
+        "Enable stripping weights from the final TensorRT engine under the assumption that the refit weights are identical to those provided at build time."
     )
-    parser.add_argument(
-        '--max_encoder_input_len',
-        type=int,
-        default=1024,
-        help=
-        'Specify max encoder input length when using enc-dec models. Set max_input_len to 1 to start generation from decoder_start_token_id of length 1.'
-    )
-    parser.add_argument(
-        '--visualize_network',
-        default=False,
-        action='store_true',
-        help=
-        'TRT Networks will be exported to ONNX prior to Engine build for debugging. '
-    )
-    parser.add_argument(
-        '--dry_run',
-        default=False,
-        action='store_true',
-        help=
-        'Run through the build process except the actual Engine build for debugging. '
-    )
-    parser.add_argument('--speculative_decoding_mode',
-                        default=None,
-                        choices=[
-                            "draft_tokens_external",
-                            "lookahead_decoding",
-                            "medusa",
-                            "explicit_draft_tokens",
-                        ],
-                        help='Mode of speculative decoding.')
+    parser.add_argument('--weight_sparsity',
+                        default=False,
+                        action='store_true',
+                        help="Enable weight sparsity.")
     parser.add_argument(
         '--weight_streaming',
         default=False,
         action='store_true',
         help=
-        'Specify whether offloading weights to CPU and streaming loading at runtime.',
+        "Enable offloading weights to CPU and streaming loading at runtime.",
     )
     parser.add_argument(
         '--fast_build',
         default=False,
         action='store_true',
         help=
-        'Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization.',
+        "Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization.",
     )
 
-    plugin_config_parser = parser.add_argument_group("plugin_config")
+    parser.add_argument('--workers',
+                        type=int,
+                        default=1,
+                        help="The number of workers for building in parallel.")
+    parser.add_argument('--log_level',
+                        type=str,
+                        default='info',
+                        choices=severity_map.keys(),
+                        help="The logging level.")
+    parser.add_argument('--enable_debug_output',
+                        default=False,
+                        action='store_true',
+                        help="Enable debug output.")
+    parser.add_argument(
+        '--visualize_network',
+        default=False,
+        action='store_true',
+        help=
+        "Export TensorRT Networks to ONNX prior to Engine build for debugging.")
+    parser.add_argument(
+        '--dry_run',
+        default=False,
+        action='store_true',
+        help=
+        "Run through the build process except the actual Engine build for debugging."
+    )
+
+    logits_parser = parser.add_argument_group("Logits arguments")
+    logits_parser.add_argument('--logits_dtype',
+                               type=str,
+                               default=None,
+                               choices=['float16', 'float32'],
+                               help="The data type of logits.")
+    logits_parser.add_argument('--gather_context_logits',
+                               action='store_true',
+                               default=False,
+                               help="Enable gathering context logits.")
+    logits_parser.add_argument('--gather_generation_logits',
+                               action='store_true',
+                               default=False,
+                               help="Enable gathering generation logits.")
+    logits_parser.add_argument(
+        '--gather_all_token_logits',
+        action='store_true',
+        default=False,
+        help=
+        "Enable both ``gather_context_logits`` and ``gather_generation_logits``."
+    )
+
+    lora_parser = parser.add_argument_group("LoRA arguments")
+    lora_parser.add_argument(
+        '--lora_dir',
+        type=str,
+        default=None,
+        nargs="+",
+        help="The directory of LoRA weights. "
+        "If multiple directories are provided, the first one is used for configuration."
+    )
+    lora_parser.add_argument('--lora_ckpt_source',
+                             type=str,
+                             default="hf",
+                             choices=["hf", "nemo"],
+                             help="The source type of LoRA checkpoint.")
+    lora_parser.add_argument(
+        '--lora_target_modules',
+        nargs='+',
+        default=None,
+        choices=LoraManager.LORA_MODULE_IDS.keys(),
+        help=
+        "The target module names that LoRA is applied. Only effective when ``lora_plugin`` is enabled."
+    )
+    lora_parser.add_argument(
+        '--max_lora_rank',
+        type=int,
+        default=64,
+        help="Maximum LoRA rank for different LoRA modules. "
+        "It is used to compute the workspace size of LoRA plugin.")
+
+    spec_parser = parser.add_argument_group("Speculative decoding arguments")
+    spec_parser.add_argument('--speculative_decoding_mode',
+                             default=None,
+                             choices=[
+                                 "draft_tokens_external",
+                                 "lookahead_decoding",
+                                 "medusa",
+                                 "explicit_draft_tokens",
+                             ],
+                             help="Mode of speculative decoding.")
+    spec_parser.add_argument(
+        '--max_draft_len',
+        type=int,
+        default=0,
+        help=
+        "Maximum lengths of draft tokens for speculative decoding target model."
+    )
+
+    autopp_parser = parser.add_argument_group("Auto parallel arguments")
+    autopp_parser.add_argument('--auto_parallel',
+                               type=int,
+                               default=1,
+                               help="MPI world size for auto parallel.")
+    autopp_parser.add_argument(
+        '--gpus_per_node',
+        type=int,
+        default=8,
+        help=
+        "Number of GPUs each node has in a multi-node setup. This is a cluster spec and can be greater/smaller than world size. "
+        "This option is only used for auto parallel specified with ``--auto_parallel``."
+    )
+    autopp_parser.add_argument(
+        '--cluster_key',
+        type=str,
+        default=None,
+        choices=cluster_infos.keys(),
+        help=
+        "Unique name for target GPU type. Inferred from current GPU type if not specified. "
+        "This option is only used for auto parallel specified with ``--auto_parallel``."
+    )
+
+    plugin_config_parser = parser.add_argument_group("Plugin config arguments")
     add_plugin_argument(plugin_config_parser)
-
-    args = parser.parse_args()
-    if args.gather_all_token_logits:
-        args.gather_context_logits = True
-        args.gather_generation_logits = True
-
-    if args.gather_context_logits and args.max_draft_len > 0:
-        raise RuntimeError(
-            "Gather context logits is not support with draft len > 0. "
-            "If want to get the accepted tokens' logits from target model, please just enable gather_generation_logits"
-        )
-    return args
+    return parser
 
 
 def build_model(
@@ -405,7 +453,17 @@ def parallel_build(model_config: PretrainedConfig,
 
 
 def main():
-    args = parse_arguments()
+    parser = parse_arguments()
+    args = parser.parse_args()
+    if args.gather_all_token_logits:
+        args.gather_context_logits = True
+        args.gather_generation_logits = True
+    if args.gather_context_logits and args.max_draft_len > 0:
+        raise RuntimeError(
+            "Gather context logits is not support with draft len > 0. "
+            "If want to get the accepted tokens' logits from target model, please just enable gather_generation_logits"
+        )
+
     logger.set_level(args.log_level)
     tik = time.time()
 

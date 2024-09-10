@@ -2,3 +2,4 @@ fastapi
 uvicorn
 colorama
 httpx
+pytest-asyncio

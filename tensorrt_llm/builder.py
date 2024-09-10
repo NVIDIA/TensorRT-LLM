@@ -247,9 +247,7 @@ class Builder():
             logger.warning("There are no inputs in the network!")
             return
         num_profiles = len(list(input_tensors.values())[0].profiles)
-        force_num_profiles = getattr(
-            builder_config, "force_num_profiles") if hasattr(
-                builder_config, "force_num_profiles") else None
+        force_num_profiles = getattr(builder_config, "force_num_profiles", None)
         for i in range(num_profiles):
             logger.debug(f'Adding optimization profile {i+1}/{num_profiles}')
             profile = self.trt_builder.create_optimization_profile()
@@ -370,7 +368,7 @@ class Builder():
     def build_engine(self,
                      network: Network,
                      builder_config: BuilderConfig,
-                     managed_weights: list = None) -> trt.IHostMemory:
+                     managed_weights: dict = None) -> trt.IHostMemory:
         '''
             @brief: Build one TensorRT engine from the network.
             @param network: Network object.
@@ -387,6 +385,7 @@ class Builder():
         )
         engine = None
 
+        tik = time.time()
         # Rename weights
         if network.named_parameters is not None:
             managed_parameters = []
@@ -409,6 +408,11 @@ class Builder():
                 network.trt_network.mark_weights_refittable(name)
 
         network._fill_weights()
+        tok = time.time()
+        t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+        logger.info(
+            f'Total time to initialize the weights in network {network.trt_network.name}: {t}'
+        )
 
         # Build engine
         logger.info(f'Build TensorRT engine {network.trt_network.name}')
@@ -431,7 +435,7 @@ class Builder():
                 if value.dtype == np.float16 and value.ndim == 2 and network.plugin_config.gemm_plugin is None and network.plugin_config.low_latency_gemm_plugin is None:
                     # MOE has ndim=3 and uses plugin, no need to transpose
                     value = value.transpose(1, 0)  # WAR for bug 4641821
-                managed_weights.append((name, value))
+                managed_weights[name] = value
 
         return engine
 
@@ -545,6 +549,9 @@ class BuildConfig:
 
     @classmethod
     def from_dict(cls, config, plugin_config=None):
+        config = copy.deepcopy(
+            config
+        )  # it just does not make sense to change the input arg `config`
         max_input_len = config.pop('max_input_len')
         max_seq_len = config.pop('max_seq_len')
         max_batch_size = config.pop('max_batch_size')
@@ -628,6 +635,9 @@ class BuildConfig:
 
     def to_dict(self):
         output = copy.deepcopy(self.__dict__)
+        # the enum KVCacheType cannot be converted automatically
+        if output.get('kv_cache_type', None) is not None:
+            output['kv_cache_type'] = str(output['kv_cache_type'].name)
         output['plugin_config'] = output['plugin_config'].to_dict()
         output['lora_config'] = output['lora_config'].to_dict()
         output['auto_parallel_config'] = output['auto_parallel_config'].to_dict(
@@ -679,11 +689,18 @@ class Engine:
         self,
         config: EngineConfig,
         engine: Union[trt.IHostMemory, None],
-        managed_weights: list[tuple[str, np.ndarray]] = None,
+        managed_weights: dict[str, np.ndarray] = None,
     ):
         self.config = config
         self.engine = engine
         self.managed_weights = managed_weights
+
+    def regularize_managed_weights(self):
+        if self.managed_weights is None:
+            self.managed_weights = {}
+        for name, value in self.managed_weights.items():
+            if not value.flags['C_CONTIGUOUS']:
+                self.managed_weights[name] = np.ascontiguousarray(value)
 
     def save(self, engine_dir: str):
         os.makedirs(engine_dir, exist_ok=True)
@@ -736,11 +753,16 @@ class Engine:
         with open(os.path.join(engine_dir, f'rank{rank}.engine'), 'rb') as f:
             engine_buffer = f.read()
 
+        mw_path = os.path.join(engine_dir,
+                               f'rank{rank}_managed_weights.safetensors')
+        managed_weights = deserialize_managed_weights(
+            mw_path) if os.path.exists(mw_path) else None
+
         config = EngineConfig.from_json_file(
             os.path.join(engine_dir, 'config.json'))
         config.pretrained_config.set_rank(rank)
 
-        return cls(config, engine_buffer)
+        return cls(config, engine_buffer, managed_weights)
 
 
 def get_engine_version(engine_dir: str) -> Union[None, str]:
@@ -875,14 +897,14 @@ def _init_max_seq_len(model_config, build_config):
             assert build_config.max_input_len <= build_config.max_seq_len, 'max_input_len should not be larger than max_seq_len'
 
 
-def serialize_managed_weights(managed_weights: list[tuple[str, np.ndarray]],
+def serialize_managed_weights(managed_weights: dict[str, np.ndarray],
                               path: str | Path,
                               metadata=None) -> None:
     header = {}
     if metadata is not None:
         header["__metadata__"] = metadata
     begin = 0
-    for name, value in managed_weights:
+    for name, value in managed_weights.items():
         size = value.size * value.itemsize
         if value.dtype == np.float32:
             dtype = "F32"
@@ -912,10 +934,44 @@ def serialize_managed_weights(managed_weights: list[tuple[str, np.ndarray]],
             f"Serializing {len(managed_weights)} managed weights to {path}...")
         f.write(header_json_len.to_bytes(8, byteorder="little"))
         f.write(header_json.encode())
-        for name, value in managed_weights:
+        for name, value in managed_weights.items():
             logger.debug(f"Serializing managed weight: {name}")
             buf = value.tobytes()
             f.write(buf)
+
+
+def deserialize_managed_weights(path: str | Path) -> dict[str, np.ndarray]:
+    with open(path, "rb") as f:
+        header_json_len = int.from_bytes(f.read(8), byteorder="little")
+        header_json = f.read(header_json_len).decode()
+        header = json.loads(header_json)
+
+        managed_weights = {}
+        for name, info in header.items():
+            dtype = info["dtype"]
+            shape = info["shape"]
+            data_offsets = info["data_offsets"]
+            if dtype == "F32":
+                dtype = np.float32
+            elif dtype == "F16":
+                dtype = np.float16
+            elif dtype == "BF16":
+                dtype = np_bfloat16
+            elif dtype == "F8_E4M3":
+                dtype = np_float8
+            elif dtype == "I64":
+                dtype = np.int64
+            elif dtype == "I32":
+                dtype = np.int32
+            else:
+                raise RuntimeError(f"Unsupported dtype: {dtype}")
+
+            f.seek(data_offsets[0] + header_json_len + 8)
+            buf = f.read(data_offsets[1] - data_offsets[0])
+            value = np.frombuffer(buf, dtype=dtype).reshape(shape)
+            managed_weights[name] = value
+
+    return managed_weights
 
 
 def build(model: PretrainedModel,
@@ -927,6 +983,7 @@ def build(model: PretrainedModel,
        Create a new fresh model object if you need to build with different options.
 
     '''
+    tic = time.time()
     # avoid changing the input config
     build_config = copy.deepcopy(build_config)
     build_config.plugin_config.dtype = model.config.dtype
@@ -1117,7 +1174,10 @@ def build(model: PretrainedModel,
             network.to_dot(f'rank{model.config.mapping.rank}.dot')
 
     # Network -> Engine
-    managed_weights = [] if network.plugin_config.manage_weights else None
+    logger.info(
+        f"Total time of constructing network from module object {time.time()-tic} seconds"
+    )
+    managed_weights = {} if network.plugin_config.manage_weights else None
     engine = None if build_config.dry_run else builder.build_engine(
         network, builder_config, managed_weights)
     engine_config = EngineConfig(model.config, build_config, __version__)

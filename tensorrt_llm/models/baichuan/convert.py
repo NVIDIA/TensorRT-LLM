@@ -17,7 +17,7 @@ import functools
 import os
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import safetensors
@@ -30,7 +30,8 @@ from transformers.pytorch_utils import Conv1D
 
 from ...logger import logger
 from ...quantization import QuantAlgo, QuantMode
-from ..convert_utils import load_calib_dataset, weight_only_quantize_dict
+from ..convert_utils import (load_calib_dataset, smooth_gemm,
+                             smooth_gemm_fc1_gate, weight_only_quantize_dict)
 from .config import BaichuanConfig
 
 
@@ -141,104 +142,6 @@ def generate_int8(
         "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
         "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
     }
-
-
-@torch.no_grad()
-def apply_smoothing(
-    scales: torch.Tensor,
-    gemm_weights: Union[torch.Tensor, List[torch.Tensor]],
-    layernorm_weights: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    layernorm_bias: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    dtype: torch.dtype = torch.float32,
-    layernorm_1p: bool = False,
-):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-
-    if layernorm_weights is not None:
-        assert layernorm_weights.numel() == scales.numel()
-        layernorm_weights.div_(scales).to(dtype)
-    if layernorm_bias is not None:
-        assert layernorm_bias.numel() == scales.numel()
-        layernorm_bias.div_(scales).to(dtype)
-    if layernorm_1p:
-        layernorm_weights += (1 / scales) - 1
-
-    for gemm in gemm_weights:
-        gemm.mul_(scales.view(1, -1)).to(dtype)
-
-
-@torch.no_grad()
-def smooth_gemm(
-    gemm_weights: Union[torch.Tensor, List[torch.Tensor]],
-    act_scales: torch.Tensor,
-    layernorm_weights: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    layernorm_bias: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    alpha: float = 0.5,
-    weight_scales: Optional[torch.Tensor] = None,
-):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, gemm_weights, layernorm_weights, layernorm_bias,
-                    orig_dtype)
-
-    return scales
-
-
-@torch.no_grad()
-def smooth_gemm_fc1_gate(
-    fc1_weights: Union[torch.Tensor, List[torch.Tensor]],
-    gate_weights: Union[torch.Tensor, List[torch.Tensor]],
-    act_scales: torch.Tensor,
-    layernorm_weights: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    layernorm_bias: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-    alpha: float = 0.5,
-    weight_scales: Optional[torch.Tensor] = None,
-):
-    gemm_weights = []
-    if not isinstance(fc1_weights, list):
-        fc1_weights = [fc1_weights]
-    if not isinstance(gate_weights, list):
-        gate_weights = [gate_weights]
-
-    for i in range(len(fc1_weights)):
-        gemm_weight = torch.cat([fc1_weights[i], gate_weights[i]], dim=0)
-        gemm_weights.append(gemm_weight)
-
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, fc1_weights + gate_weights, layernorm_weights,
-                    layernorm_bias, orig_dtype)
-
-    return scales
 
 
 @torch.no_grad()

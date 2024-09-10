@@ -4,7 +4,7 @@ import tarfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -16,6 +16,9 @@ from .layers.linear import ColumnLinear
 from .mapping import Mapping
 from .models.convert_utils import (get_model_path, load_state_dict,
                                    split_matrix_tp)
+
+if TYPE_CHECKING:
+    from .runtime import ModelConfig
 
 
 def get_all_nemo_lora_weights(lora_weights):
@@ -125,6 +128,10 @@ class LoraConfig(DictConversion):
         assert self.lora_ckpt_source in [
             'hf', 'nemo'
         ], f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
+
+    @property
+    def missing_qkv_modules(self) -> List[str]:
+        return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
 
 
 class HfLoraLoader:
@@ -381,13 +388,17 @@ class LoraManager(object):
         }
 
         '''
-        self._lora_uid_to_low_ranks = {}
-        self._lora_weights = []
-        self._lora_weights_pointers_list = {}
-        self._lora_cpp_weights = {}
-        self._lora_weight_config = {}
-        self.missing_qkv_modules = []
-        self.lora_target_modules = []
+        self._lora_uid_counter = 0
+        self._lora_uid_to_low_ranks: Dict[str, Dict[int, Dict[str, int]]] = {}
+        # hold the torch tensors and prevent them from being freed
+        # TODO(enweiz): free device tensors if it's used for c++ runtime only
+        self._lora_weights: List[torch.Tensor] = []
+        self._lora_weights_pointers_list: Dict[str, Dict[int,
+                                                         Dict[str,
+                                                              List[int]]]] = {}
+        self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
+        self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
+        self.lora_target_modules: List[str] = []
 
     @staticmethod
     def get_missing_qkv_modules(lora_target_modules):
@@ -406,30 +417,60 @@ class LoraManager(object):
                     missing_qkv_modules.append(lora_module)
         return missing_qkv_modules
 
-    def load_from_ckpt(self, model_dir, model_config, runtime_mapping,
-                       ckpt_source):
-        if ckpt_source == "hf":
-            self.load_from_hf(model_dir, model_config, runtime_mapping)
-        elif ckpt_source == "nemo":
-            self.load_from_nemo(model_dir, model_config, runtime_mapping)
-        else:
-            assert False, f"LoraManager does not support source {ckpt_source}"
+    @property
+    def missing_qkv_modules(self) -> List[str]:
+        return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
 
-    def load_from_nemo(self, model_files, model_config, runtime_mapping):
+    def load_from_ckpt(self,
+                       model_dirs_or_files: List[str],
+                       model_config: 'ModelConfig',
+                       runtime_mapping: Optional[Mapping] = None,
+                       uids: Optional[List[str]] = None,
+                       ckpt_source: str = 'hf'):
+        if ckpt_source == 'hf':
+            self.load_from_hf(model_dirs=model_dirs_or_files,
+                              model_config=model_config,
+                              runtime_mapping=runtime_mapping,
+                              uids=uids)
+        elif ckpt_source == 'nemo':
+            self.load_from_nemo(model_files=model_dirs_or_files,
+                                model_config=model_config,
+                                runtime_mapping=runtime_mapping,
+                                uids=uids)
+        else:
+            assert False, f"{self.__class__.__name__} does not support source {ckpt_source}"
+
+    def load_from_nemo(self,
+                       model_files: List[str],
+                       model_config: 'ModelConfig',
+                       runtime_mapping: Optional[Mapping] = None,
+                       uids: Optional[List[str]] = None):
+        if runtime_mapping is None:
+            runtime_mapping = Mapping()
         tp_size = runtime_mapping.tp_size
         tp_rank = runtime_mapping.tp_rank
-        lora_target_modules = model_config.lora_target_modules
-        dtype = model_config.dtype
-        uids = list(map(str, range(len(model_files))))
-        self.lora_target_modules = lora_target_modules
-        self.missing_qkv_modules = self.get_missing_qkv_modules(
-            lora_target_modules)
+
+        if uids is None:
+            uids = [self._generate_uid() for _ in range(len(model_files))]
+        assert len(uids) == len(model_files)
+
+        new_uids, new_model_files = [], []
+        for uid, model_file in zip(uids, model_files):
+            if uid in self._lora_uid_to_low_ranks:
+                continue
+            new_uids.append(uid)
+            new_model_files.append(model_file)
+
+        if len(new_uids) == 0:
+            return
+
+        self.lora_target_modules = model_config.lora_target_modules
 
         def load_from_model_file(uid, model_file):
-            if uid not in self._lora_cpp_weights:
-                self._lora_cpp_weights[uid] = []
-            if uid not in self._lora_weight_config:
-                self._lora_weight_config[uid] = []
+            if uid not in self._cpp_lora_weights:
+                self._cpp_lora_weights[uid] = []
+            if uid not in self._cpp_lora_config:
+                self._cpp_lora_config[uid] = []
 
             _, nemo_weights = unpack_nemo_weights(model_file)
             all_lora_weights = get_all_nemo_lora_weights(nemo_weights)
@@ -440,7 +481,7 @@ class LoraManager(object):
                 self._lora_uid_to_low_ranks[uid][layer_idx] = {}
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
-                for lora_module in lora_target_modules:
+                for lora_module in self.lora_target_modules:
                     if lora_module != "attn_qkv":
                         self._lora_uid_to_low_ranks[uid][layer_idx][
                             lora_module] = 0
@@ -459,9 +500,11 @@ class LoraManager(object):
 
                     if t_in is not None and t_out is not None:
                         t_in = t_in.cuda().to(
-                            str_dtype_to_torch(dtype)).contiguous()
+                            str_dtype_to_torch(
+                                model_config.dtype)).contiguous()
                         t_out = t_out.cuda().to(
-                            str_dtype_to_torch(dtype)).contiguous()
+                            str_dtype_to_torch(
+                                model_config.dtype)).contiguous()
                         rank = t_in.shape[0]
                         self._lora_uid_to_low_ranks[uid][layer_idx][
                             lora_module] = int(rank)
@@ -472,25 +515,36 @@ class LoraManager(object):
                         # prevent torch free this buffer
                         self._lora_weights.append(t_in)
                         self._lora_weights.append(t_out)
-                        self._lora_cpp_weights[uid].append(
-                            torch.concatenate([t_in.flatten(),
-                                               t_out.flatten()]))
-                        self._lora_weight_config[uid].append(
-                            np.array([
+                        self._cpp_lora_weights[uid].append(
+                            torch.concatenate(
+                                [t_in.flatten().cpu(),
+                                 t_out.flatten().cpu()]))
+                        self._cpp_lora_config[uid].append(
+                            torch.tensor([
                                 self.LORA_MODULE_IDS[lora_module], layer_idx,
                                 int(rank)
                             ],
-                                     dtype=np.int32))
+                                         dtype=torch.int32))
 
-        for uid, model_file in zip(uids, model_files):
+            max_weight_size = max(
+                w.size(0) for w in self._cpp_lora_weights[uid])
+            self._cpp_lora_weights[uid] = torch.stack([
+                torch.nn.functional.pad(w, (0, max_weight_size - w.size(0)))
+                for w in self._cpp_lora_weights[uid]
+            ])
+            self._cpp_lora_config[uid] = torch.stack(
+                [c for c in self._cpp_lora_config[uid]])
+
+        for uid, model_file in zip(new_uids, new_model_files):
             load_from_model_file(uid, model_file)
             release_gc()
 
     def load_from_hf(self,
-                     model_dirs,
-                     model_config,
-                     runtime_mapping,
-                     component=None):
+                     model_dirs: List[str],
+                     model_config: 'ModelConfig',
+                     runtime_mapping: Optional[Mapping] = None,
+                     uids: Optional[List[str]] = None,
+                     component: Optional[str] = None):
         '''
         lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b
         {
@@ -539,25 +593,35 @@ class LoraManager(object):
             ...
 
         '''
+        if runtime_mapping is None:
+            runtime_mapping = Mapping()
         tp_size = runtime_mapping.tp_size
         tp_rank = runtime_mapping.tp_rank
 
+        if uids is None:
+            uids = [self._generate_uid() for _ in range(len(model_dirs))]
+        assert len(uids) == len(model_dirs)
+
+        new_uids, new_model_dirs = [], []
+        for uid, model_dir in zip(uids, model_dirs):
+            if uid in self._lora_uid_to_low_ranks:
+                continue
+            new_uids.append(uid)
+            new_model_dirs.append(model_dir)
+
+        if len(new_uids) == 0:
+            return
+
         lora_hf_configs = []
-        uids = []
-        for i, model_dir in enumerate(model_dirs):
+        for model_dir in new_model_dirs:
             with open(f"{model_dir}/adapter_config.json", 'r') as f:
                 config = json.load(f)
                 lora_hf_configs.append(config)
-                uids.append(str(i))
 
-        lora_target_modules = model_config.lora_target_modules
-        dtype = model_config.dtype
+        self.lora_target_modules = model_config.lora_target_modules
         hf_modules_to_trtllm_modules = invert_module_mapping(
             model_config.trtllm_modules_to_hf_modules)
         hf_modules = set(hf_modules_to_trtllm_modules.keys())
-        missing_qkv_modules = self.get_missing_qkv_modules(lora_target_modules)
-        self.lora_target_modules = lora_target_modules
-        self.missing_qkv_modules = missing_qkv_modules
 
         def preprocess_lora_weights(lora_model):
             # Swap weights of gate_up_proj
@@ -572,10 +636,10 @@ class LoraManager(object):
             return lora_model
 
         def load_from_model_dir(uid, model_dir, hf_config):
-            if uid not in self._lora_cpp_weights:
-                self._lora_cpp_weights[uid] = []
-            if uid not in self._lora_weight_config:
-                self._lora_weight_config[uid] = []
+            if uid not in self._cpp_lora_weights:
+                self._cpp_lora_weights[uid] = []
+            if uid not in self._cpp_lora_config:
+                self._cpp_lora_config[uid] = []
 
             lora_model = load_state_dict(
                 get_model_path(model_dir, "adapter_model"))
@@ -592,7 +656,7 @@ class LoraManager(object):
                 self._lora_uid_to_low_ranks[uid][layer_idx] = {}
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
-                for lora_module in missing_qkv_modules:
+                for lora_module in self.missing_qkv_modules:
                     hf_module = model_config.trtllm_modules_to_hf_modules[
                         lora_module]
                     if isinstance(hf_module, list):
@@ -604,7 +668,7 @@ class LoraManager(object):
 
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
-                    if lora_module not in lora_target_modules:
+                    if lora_module not in self.lora_target_modules:
                         self._lora_uid_to_low_ranks[uid][layer_idx][
                             lora_module] = 0
                         continue
@@ -653,8 +717,8 @@ class LoraManager(object):
                     else:
                         scale = float(hf_config["lora_alpha"]) / rank
                     t_out = t_out * scale
-                    t_in = t_in.to(str_dtype_to_torch(dtype))
-                    t_out = t_out.to(str_dtype_to_torch(dtype))
+                    t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
+                    t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
 
                     rank_dim = 1 if is_moe else 0
                     assert t_in.shape[rank_dim] == rank
@@ -667,19 +731,61 @@ class LoraManager(object):
                     # prevent torch free this buffer
                     self._lora_weights.append(t_in)
                     self._lora_weights.append(t_out)
-                    self._lora_cpp_weights[uid].append(
-                        torch.concatenate([t_in.flatten(),
-                                           t_out.flatten()]))
-                    self._lora_weight_config[uid].append(
-                        np.array([
+                    self._cpp_lora_weights[uid].append(
+                        torch.concatenate(
+                            [t_in.flatten().cpu(),
+                             t_out.flatten().cpu()]))
+                    self._cpp_lora_config[uid].append(
+                        torch.tensor([
                             self.LORA_MODULE_IDS[lora_module], layer_idx,
                             int(hf_config['r'])
                         ],
-                                 dtype=np.int32))
+                                     dtype=torch.int32))
 
-        for uid, model_dir, hf_config in zip(uids, model_dirs, lora_hf_configs):
+            max_weight_size = max(
+                w.size(0) for w in self._cpp_lora_weights[uid])
+            self._cpp_lora_weights[uid] = torch.stack([
+                torch.nn.functional.pad(w, (0, max_weight_size - w.size(0)))
+                for w in self._cpp_lora_weights[uid]
+            ])
+            self._cpp_lora_config[uid] = torch.stack(
+                [c for c in self._cpp_lora_config[uid]])
+
+        for uid, model_dir, hf_config in zip(new_uids, new_model_dirs,
+                                             lora_hf_configs):
             load_from_model_dir(uid, model_dir, hf_config)
             release_gc()
+
+    @property
+    def lora_weights(self):
+        return self._lora_weights
+
+    @property
+    def lora_weights_pointers_list(self):
+        return self._lora_weights_pointers_list
+
+    @property
+    def cpp_lora_weights(self):
+        return self._cpp_lora_weights
+
+    @property
+    def cpp_lora_config(self):
+        return self._cpp_lora_config
+
+    def uid_to_low_ranks(self, uid: str):
+        assert isinstance(uid, str)
+        return self._lora_uid_to_low_ranks[uid]
+
+    def _generate_uid(self):
+        while str(self._lora_uid_counter) in self._lora_uid_to_low_ranks:
+            self._lora_uid_counter += 1
+        uid = str(self._lora_uid_counter)
+        self._lora_uid_counter += 1
+        return uid
+
+    @property
+    def num_lora_adapters(self):
+        return len([uid for uid in self._lora_uid_to_low_ranks if uid != '-1'])
 
     def save_lora_weights_to_bin(self, out_dir):
 
@@ -697,17 +803,14 @@ class LoraManager(object):
             out_dir_path = out_dir
         else:
             assert False
-        for uid in self._lora_cpp_weights:
+        for uid in self.cpp_lora_weights:
             if uid == '-1':
                 continue
 
             all_weights = np.expand_dims(
-                np.stack([
-                    torch_to_numpy(w.flatten().contiguous())
-                    for w in self._lora_cpp_weights[uid]
-                ]), 0)
+                torch_to_numpy(self.cpp_lora_weights[uid]), 0)
             all_configs = np.expand_dims(
-                np.stack(self._lora_weight_config[uid]), 0)
+                torch_to_numpy(self.cpp_lora_config[uid]), 0)
 
             uid_path = out_dir_path / f"{uid}"
             uid_path.mkdir(parents=True, exist_ok=True)
@@ -721,18 +824,6 @@ class LoraManager(object):
                      "lora_config",
                      tp_num=None,
                      write_npy=True)
-
-    def uid_to_low_ranks(self, uid: str):
-        assert isinstance(uid, str)
-        return self._lora_uid_to_low_ranks[uid]
-
-    @property
-    def lora_weights(self):
-        return self._lora_weights
-
-    @property
-    def lora_weights_pointers_list(self):
-        return self._lora_weights_pointers_list
 
     def input_buffers(self, lora_uids, mapping: Mapping, num_layers: int):
         inputs = {}

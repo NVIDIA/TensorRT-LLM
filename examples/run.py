@@ -509,6 +509,7 @@ def main(args):
                     output_log_probs=(args.output_log_probs_npy != None),
                     random_seed=args.random_seed,
                     lora_uids=args.lora_task_uids,
+                    lookahead_config=args.lookahead_config,
                     prompt_table=args.prompt_table_path,
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,

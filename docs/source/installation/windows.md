@@ -52,7 +52,7 @@ We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.12.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/cu121/torch/
+  pip install tensorrt_llm==0.12.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/cu121/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.
