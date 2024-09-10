@@ -3,7 +3,7 @@
 # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
 # "jax[cuda12_pip]~=0.4.19" specifies "nvidia-cudnn-cu12>=8.9" but actually requires "nvidia-cudnn-cu12~=8.9".
 nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
-tensorrt_llm==0.13.0.dev2024090300
+tensorrt_llm==0.14.0.dev2024091000
 flax~=0.8.0
 # jax[cuda12_pip]~=0.4.19; platform_system != "Windows"
 jax~=0.4.19; platform_system == "Windows"

@@ -1687,7 +1687,7 @@ __global__ void transpose4dBatchMajorKVCache(T const* kSrc, T const* vSrc, KVCac
         T_scale scaleOrigQuant;
         mmha::convert_from_float(&scaleOrigQuant, kvScaleOrigQuant[0]);
         // Store 8bits kv cache.
-        mmha::store_8bits_kv_cache_vec(valDst, val, inBlockIdx, scaleOrigQuant);
+        mmha::store_8bits_vec(valDst, val, inBlockIdx, scaleOrigQuant);
     }
     else
     {

@@ -1,5 +1,5 @@
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.13.0.dev2024090300
+tensorrt_llm==0.14.0.dev2024091000
 nemo-toolkit[all]==2.0.0rc1
 megatron-core==0.8.0
 datasets~=2.14.5

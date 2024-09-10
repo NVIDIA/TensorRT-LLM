@@ -120,7 +120,7 @@ public:
     bool hasLayerProfiler(SizeType32 contextId) const;
     std::string getLayerProfileInfo() const;
     void reportToProfiler(SizeType32 contextId);
-    void loadManagedWeights(std::string const& weightsPath);
+    void loadManagedWeights(RawEngine const& rawEngine, int localRank);
 
 private:
     BufferManager::CudaStreamPtr mStream;

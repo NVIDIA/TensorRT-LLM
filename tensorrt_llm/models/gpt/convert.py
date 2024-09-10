@@ -37,9 +37,9 @@ from transformers.pytorch_utils import Conv1D
 from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
 from ...quantization import QuantAlgo
-from ..convert_utils import (get_weight, get_weight_and_bias,
+from ..convert_utils import (generate_int8, get_weight, get_weight_and_bias,
                              load_calib_dataset,
-                             retrieved_layer_index_from_name)
+                             retrieved_layer_index_from_name, smooth_gemm)
 from .config import GPTConfig
 
 
@@ -176,125 +176,6 @@ def get_tllm_linear_weight(
         results[f'{prefix}.bias'] = bias
 
     return results
-
-
-def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
-    """
-     This function has two purposes:
-      - compute quantized weights, scaled either per-tensor or per-column
-      - compute scaling factors
-
-      Depending on the GEMM API (CUTLASS/CUBLAS) the required scaling factors differ.
-      CUTLASS uses two sets of scaling factors. One for the activation X, one for the weight W.
-      CUBLAS only has one (we can't do per-row scaling). So we must provide pre-multiplied scaling factor.
-
-      Here is the list of what we need (T means per-tensor, C per-column):
-        - scale_x_orig_quant puts fp activation into the quantized range (i.e. [-128, 127], for int8). Used before the GEMM. (T)
-        - scale_y_quant_orig puts quantized activation into the fp range. Used if the GEMM outputs int8. (T)
-        - scale_w_quant_orig puts weights from quant range to fp range (used with CUTLASS) (T, C)
-        - scale_y_accum_quant puts the GEMM result (XW) from accumulation range (int32)
-          to quant range (int8) (used for CUBLAS) (T, C)
-
-      Note that we don't do anything special about row-parallel GEMM. Theoretically, we could have per-GPU scaling factors too,
-      but then the model would change depending on the number of GPUs used.
-
-      For QKV projection, the behavior is special. Even if we have a single matrix to perform QKV projection, we consider it
-      as three different matrices: Q, K, and V. So per-tensor actually means one scaling factor for each Q, K and V.
-    """
-
-    # compute weight scaling factors for fp->int8 and int8->fp
-    if is_qkv and not multi_query_mode:
-        scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
-            dim=-1, keepdims=True)[0].cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
-                                                             -1).cpu().numpy()
-    elif is_qkv and multi_query_mode:
-        raise ValueError(
-            f"Multi-query w/ int8 quant has not been supported yet")
-    else:
-        scale_w_orig_quant_t = 127. / act_range["w"].max().cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
-    scale_w_quant_orig_t = 1.0 / scale_w_orig_quant_t
-    scale_w_quant_orig_c = 1.0 / scale_w_orig_quant_c
-
-    # compute the rest of needed scaling factors
-    scale_x_orig_quant_t = np.array(127. / act_range["x"].max().item())
-    scale_y_orig_quant_t = np.array(127. / act_range["y"].max().item())
-    scale_y_quant_orig_t = np.array(act_range["y"].max().item() / 127.)
-    scale_y_accum_quant_t = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_t)
-    scale_y_accum_quant_c = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_c)
-    if is_qkv:
-        scale_y_accum_quant_t = np.broadcast_to(scale_y_accum_quant_t,
-                                                scale_w_orig_quant_c.shape)
-        scale_w_quant_orig_t = np.broadcast_to(scale_w_quant_orig_t,
-                                               scale_w_orig_quant_c.shape)
-
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
-    return {
-        "weight.int8": to_i8(weights * scale_w_orig_quant_t),
-        "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
-        "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
-        "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
-        "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
-        "scale_y_accum_quant": scale_y_accum_quant_t.astype(np.float32),
-        "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
-        "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
-    }
-
-
-@torch.no_grad()
-def apply_smoothing(scales,
-                    gemm_weights,
-                    layernorm_weights=None,
-                    layernorm_bias=None,
-                    dtype=torch.float32,
-                    layernorm_1p=False):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-
-    if layernorm_weights is not None:
-        assert layernorm_weights.numel() == scales.numel()
-        layernorm_weights.div_(scales).to(dtype)
-    if layernorm_bias is not None:
-        assert layernorm_bias.numel() == scales.numel()
-        layernorm_bias.div_(scales).to(dtype)
-    if layernorm_1p:
-        layernorm_weights += (1 / scales) - 1
-
-    for gemm in gemm_weights:
-        gemm.mul_(scales.view(1, -1)).to(dtype)
-
-
-@torch.no_grad()
-def smooth_gemm(gemm_weights,
-                act_scales,
-                layernorm_weights=None,
-                layernorm_bias=None,
-                alpha=0.5,
-                weight_scales=None):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, gemm_weights, layernorm_weights, layernorm_bias,
-                    orig_dtype)
-
-    return scales
 
 
 @torch.no_grad()

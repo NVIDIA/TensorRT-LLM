@@ -17,11 +17,13 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import tensorrt as trt
 import torch
+import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
 from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
                           constant, matmul, repeat_interleave, round)
+from ..layers.linear import ColumnLinear
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .mode import QuantMode
 
@@ -638,22 +640,45 @@ def change_qkv_leading_dim(w, num_heads):
     return w
 
 
-def postprocess_weight_only(tllm_key, weights, quant_mode):
+def pad_like(w, target_shape, value=0):
+    if w.shape != target_shape:
+        pad_dim = []
+        for dim in range(len(target_shape)):
+            current_dim = -1 - dim
+            pad_dim.append(0)
+            pad_dim.append(
+                max(0, target_shape[current_dim] - w.shape[current_dim]))
+        res = F.pad(w, pad_dim, value=value)
+        return res
+    else:
+        return w
+
+
+def postprocess_weight_only(tllm_key, weights, quant_mode, layer):
     if weights.dim() > 2:
         v = weights.transpose(-1, -2)
     else:
         v = weights.t()
 
+    tp_dim = 1 if isinstance(layer, ColumnLinear) else 0
     if "weight" in tllm_key:
+        if layer.is_padded:
+            split_size = layer.out_features if tp_dim == 1 else layer.in_features
+            v = torch.split(v, split_size, tp_dim)[layer.tp_rank]
+            v = pad_like(v, (layer.in_features, layer.out_features))
         processed_torch_weights, torch_weight_scales = \
             torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
-                v.contiguous(), torch.int8 if quant_mode == 1 else torch.quint4x2)
+                v.contiguous(), quant_mode)
         return {
             tllm_key: processed_torch_weights,
             tllm_key.replace("weight", "per_channel_scale"):
             torch_weight_scales,
         }
     else:
+        if layer.is_padded and tp_dim == 1:
+            weights = torch.split(weights, layer.out_features,
+                                  tp_dim)[layer.tp_rank]
+            weights = pad_like(weights, (layer.out_features, ))
         return {tllm_key: weights}  # Bias
 
 

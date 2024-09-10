@@ -20,6 +20,7 @@ from typing import List, Tuple
 import tensorrt as trt
 import torch
 from transformers import AutoConfig, AutoTokenizer
+from vit_onnx_trt import Preprocss
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -30,7 +31,7 @@ from tensorrt_llm.runtime import (ModelConfig, SamplingConfig, Session,
 
 
 def get_engine_name(rank):
-    return 'rank{}.engine'.format(rank)
+    return "rank{}.engine".format(rank)
 
 
 def trt_dtype_to_torch(dtype):
@@ -46,8 +47,15 @@ def trt_dtype_to_torch(dtype):
 
 class QWenInfer(object):
 
-    def __init__(self, tokenizer_dir, qwen_engine_dir, log_level, output_csv,
-                 output_npy, num_beams):
+    def __init__(
+        self,
+        tokenizer_dir,
+        qwen_engine_dir,
+        log_level,
+        output_csv,
+        output_npy,
+        num_beams,
+    ):
         self.tokenizer_dir = tokenizer_dir
         self.qwen_engine_dir = qwen_engine_dir
         self.log_level = log_level
@@ -68,52 +76,54 @@ class QWenInfer(object):
             legacy=False,
             trust_remote_code=True,
         )
-        config_path = os.path.join(self.qwen_engine_dir, 'config.json')
-        with open(config_path, 'r') as f:
+        config_path = os.path.join(self.qwen_engine_dir, "config.json")
+        with open(config_path, "r") as f:
             config = json.load(f)
         gen_config_path = os.path.join(self.tokenizer_dir,
-                                       'generation_config.json')
-        with open(gen_config_path, 'r') as f:
+                                       "generation_config.json")
+        with open(gen_config_path, "r") as f:
             gen_config = json.load(f)
-        top_k = gen_config['top_k']
-        top_p = gen_config['top_p']
-        chat_format = gen_config['chat_format']
+        top_k = gen_config["top_k"]
+        top_p = gen_config["top_p"]
+        chat_format = gen_config["chat_format"]
         if chat_format == "raw":
-            eos_token_id = gen_config['eos_token_id']
-            pad_token_id = gen_config['pad_token_id']
+            eos_token_id = gen_config["eos_token_id"]
+            pad_token_id = gen_config["pad_token_id"]
         elif chat_format == "chatml":
             pad_token_id = eos_token_id = tokenizer.im_end_id
         else:
             raise Exception("unknown chat format ", chat_format)
 
-        use_gpt_attention_plugin = config['build_config']['plugin_config'][
-            'gpt_attention_plugin']
-        remove_input_padding = config['build_config']['plugin_config'][
-            'remove_input_padding']
-        dtype = config['pretrained_config']['dtype']
-        tp_size = config['pretrained_config']['mapping']['tp_size']
-        pp_size = config['pretrained_config']['mapping']['pp_size']
+        use_gpt_attention_plugin = config["build_config"]["plugin_config"][
+            "gpt_attention_plugin"]
+        remove_input_padding = config["build_config"]["plugin_config"][
+            "remove_input_padding"]
+        dtype = config["pretrained_config"]["dtype"]
+        tp_size = config["pretrained_config"]["mapping"]["tp_size"]
+        pp_size = config["pretrained_config"]["mapping"]["pp_size"]
         world_size = tp_size * pp_size
-        assert world_size == tensorrt_llm.mpi_world_size(), \
-            f'Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})'
-        num_heads = config['pretrained_config'][
-            'num_attention_heads'] // world_size
-        max_batch_size = config['build_config']['max_batch_size']
-        hidden_size = config['pretrained_config']['hidden_size'] // world_size
-        vocab_size = config['pretrained_config']['vocab_size']
-        num_layers = config['pretrained_config']['num_hidden_layers']
-        num_kv_heads = config['pretrained_config'].get('num_key_value_heads',
+        assert (
+            world_size == tensorrt_llm.mpi_world_size()
+        ), f"Engine world size ({world_size}) != Runtime world size ({tensorrt_llm.mpi_world_size()})"
+        num_heads = config["pretrained_config"][
+            "num_attention_heads"] // world_size
+        max_batch_size = config["build_config"]["max_batch_size"]
+        hidden_size = config["pretrained_config"]["hidden_size"] // world_size
+        vocab_size = config["pretrained_config"]["vocab_size"]
+        num_layers = config["pretrained_config"]["num_hidden_layers"]
+        num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
-        paged_kv_cache = config['build_config']['plugin_config'][
-            'paged_kv_cache']
-        tokens_per_block = config['build_config']['plugin_config'][
-            'tokens_per_block']
-        max_prompt_embedding_table_size = config['build_config'].get(
-            'max_prompt_embedding_table_size', 0)
+        paged_kv_cache = config["build_config"]["plugin_config"][
+            "paged_kv_cache"]
+        tokens_per_block = config["build_config"]["plugin_config"][
+            "tokens_per_block"]
+        max_prompt_embedding_table_size = config["build_config"].get(
+            "max_prompt_embedding_table_size", 0)
         quant_mode = QuantMode.from_quant_algo(
-            config['pretrained_config']['quantization']['quant_algo'],
-            config['pretrained_config']['quantization']['kv_cache_quant_algo'])
-        if config['pretrained_config'].get('multi_query_mode', False):
+            config["pretrained_config"]["quantization"]["quant_algo"],
+            config["pretrained_config"]["quantization"]["kv_cache_quant_algo"],
+        )
+        if config["pretrained_config"].get("multi_query_mode", False):
             tensorrt_llm.logger.warning(
                 "`multi_query_mode` config is deprecated. Please rebuild the engine."
             )
@@ -140,7 +150,8 @@ class QWenInfer(object):
             dtype=dtype,
             quant_mode=quant_mode,
             max_prompt_embedding_table_size=max_prompt_embedding_table_size,
-            max_beam_width=self.num_beams)
+            max_beam_width=self.num_beams,
+        )
         sampling_config = SamplingConfig(
             end_id=eos_token_id,
             pad_id=pad_token_id,
@@ -152,15 +163,30 @@ class QWenInfer(object):
 
         engine_name = get_engine_name(runtime_rank)
         serialize_path = os.path.join(self.qwen_engine_dir, engine_name)
-        print(f'Loading engine from {serialize_path}')
-        return (model_config, sampling_config, runtime_mapping, runtime_rank,
-                serialize_path, tokenizer, eos_token_id, pad_token_id)
+        print(f"Loading engine from {serialize_path}")
+        return (
+            model_config,
+            sampling_config,
+            runtime_mapping,
+            runtime_rank,
+            serialize_path,
+            tokenizer,
+            eos_token_id,
+            pad_token_id,
+        )
 
     def qwen_model_init(self):
-        (model_config, sampling_config, runtime_mapping, runtime_rank,
-         serialize_path, tokenizer, eos_token_id,
-         pad_token_id) = self.get_model()
-        with open(serialize_path, 'rb') as f:
+        (
+            model_config,
+            sampling_config,
+            runtime_mapping,
+            runtime_rank,
+            serialize_path,
+            tokenizer,
+            eos_token_id,
+            pad_token_id,
+        ) = self.get_model()
+        with open(serialize_path, "rb") as f:
             engine_buffer = f.read()
         self.decoder = tensorrt_llm.runtime.GenerationSession(
             model_config,
@@ -191,11 +217,11 @@ class QWenInfer(object):
             task_vocab_size = torch.zeros([1]).cuda()
 
         if tasks is not None:
-            tasks = torch.tensor([int(t) for t in tasks.split(',')],
+            tasks = torch.tensor([int(t) for t in tasks.split(",")],
                                  dtype=torch.int32,
                                  device="cuda")
-            assert tasks.shape[0] == input_ids.shape[
-                0], "Number of supplied tasks must match input batch size"
+            assert (tasks.shape[0] == input_ids.shape[0]
+                    ), "Number of supplied tasks must match input batch size"
         else:
             tasks = torch.zeros([input_ids.size(0)], dtype=torch.int32).cuda()
 
@@ -236,10 +262,9 @@ class QWenInfer(object):
                     "assistant", turn_response)
                 response_tokens = im_start_tokens + response_tokens_part + im_end_tokens
 
-                next_context_tokens = nl_tokens + query_tokens + nl_tokens + response_tokens
-                prev_chat = (
-                    f"\n{im_start}{query_text}{im_end}\n{im_start}{response_text}{im_end}"
-                )
+                next_context_tokens = (nl_tokens + query_tokens + nl_tokens +
+                                       response_tokens)
+                prev_chat = f"\n{im_start}{query_text}{im_end}\n{im_start}{response_text}{im_end}"
             else:
                 next_context_tokens = nl_tokens + query_tokens + nl_tokens
                 prev_chat = f"\n{im_start}{query_text}{im_end}\n"
@@ -290,45 +315,53 @@ class QWenInfer(object):
             beam_width=num_beams,
         )
         profiler.start("QWen")
-        run_time = 1
+        run_time = 10
         for _ in range(run_time):
-            output_ids = self.decoder.decode(input_ids, input_lengths,
-                                             self.sampling_config, prompt_table,
-                                             tasks, task_vocab_size)
+            output_ids = self.decoder.decode(
+                input_ids,
+                input_lengths,
+                self.sampling_config,
+                prompt_table,
+                tasks,
+                task_vocab_size,
+            )
             torch.cuda.synchronize()
         profiler.stop("QWen")
         Qwen_time = profiler.elapsed_time_in_sec("QWen") / run_time
 
         return output_ids, Qwen_time
 
-    def qwen_infer(self,
-                   input_vit,
-                   images_path,
-                   input_text,
-                   max_new_tokens,
-                   num_beams=1,
-                   history=None):
+    def qwen_infer(
+        self,
+        input_vit,
+        images_path,
+        input_text,
+        max_new_tokens,
+        num_beams=1,
+        history=None,
+    ):
         if images_path is None:
             content_list = []
         else:
             content_list = images_path
         if history is None:
             history = []
-        content_list.append({'text': input_text})
+        content_list.append({"text": input_text})
         query = self.tokenizer.from_list_format(content_list)
         raw_text, context_tokens = self.make_context(query, history=history)
         # context_tokens = self.tokenizer.encode(query)
-        input_ids = torch.tensor([context_tokens]).to('cuda')
-        bos_pos = torch.where(input_ids == self.config.visual['image_start_id'])
+        input_ids = torch.tensor([context_tokens]).to("cuda")
+        bos_pos = torch.where(input_ids == self.config.visual["image_start_id"])
         eos_pos = torch.where(
-            input_ids == self.config.visual['image_start_id'] + 1)
+            input_ids == self.config.visual["image_start_id"] + 1)
         assert (bos_pos[0] == eos_pos[0]).all()
         img_pos = torch.stack((bos_pos[0], bos_pos[1], eos_pos[1]), dim=1)
         vocab_size = self.config.vocab_size
-        fake_prompt_id = torch.arange(vocab_size,
-                                      vocab_size +
-                                      input_vit.shape[0] * input_vit.shape[1],
-                                      device='cuda')
+        fake_prompt_id = torch.arange(
+            vocab_size,
+            vocab_size + input_vit.shape[0] * input_vit.shape[1],
+            device="cuda",
+        )
         fake_prompt_id = fake_prompt_id.reshape(input_vit.shape[0],
                                                 input_vit.shape[1])
         for idx, (i, a, b) in enumerate(img_pos):
@@ -354,144 +387,144 @@ class QWenInfer(object):
                 for b in range(input_lengths.size(0)):
                     inputs = input_ids[b]
                     if content_list is not None:
-                        print(f'Input: \"{content_list}\"')
+                        print(f'Input: "{content_list}"')
                         print("\n")
                     if self.num_beams <= 1:
                         outputs = output_ids[b][0, len(inputs):].tolist()
                         try:
-                            effective_output_token = effective_output_token + \
-                                outputs.index(151643)
+                            effective_output_token = (effective_output_token +
+                                                      outputs.index(151643))
                         except:
                             effective_output_token = 1
                         output_text = self.tokenizer.decode(
                             outputs, skip_special_tokens=True)
-                        print(f'Output: \"{output_text}\"')
+                        print(f'Output: "{output_text}"')
                         print("\n")
                     else:
                         for beam in range(self.num_beams):
                             outputs = output_ids[b][beam, len(inputs):].tolist()
                             output_text = self.tokenizer.decode(
                                 outputs, skip_special_tokens=True)
-                            print(f'Output(beam: {beam}): \"{output_text}\"')
-
-        logger.info(f'TensorRT-LLM QWen time: {Qwen_time} sec ')
+                            print(f'Output(beam: {beam}): "{output_text}"')
+        logger.info(f"Input length={input_lengths[b]}")
+        logger.info(f"Output length={output_ids.shape}")
+        logger.info(f"TensorRT-LLM QWen time: {Qwen_time:3f} sec ")
         history.append((query, output_text))
         return output_text
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--max_new_tokens', type=int, default=200)
-    parser.add_argument('--log_level', type=str, default='info')
+    parser.add_argument("--max_new_tokens", type=int, default=200)
+    parser.add_argument("--log_level", type=str, default="info")
     parser.add_argument(
-        '--vit_engine_dir',
+        "--vit_engine_dir",
         type=str,
-        default='qwen_outputs',
+        default="qwen_outputs",
     )
     parser.add_argument(
-        '--qwen_engine_dir',
+        "--qwen_engine_dir",
         type=str,
-        default='qwen_outputs',
+        default="qwen_outputs",
     )
-    parser.add_argument('--tokenizer_dir',
-                        type=str,
-                        default=".",
-                        help="Directory containing the tokenizer.model.")
-    parser.add_argument('--input_text',
+    parser.add_argument(
+        "--tokenizer_dir",
+        type=str,
+        default=".",
+        help="Directory containing the tokenizer.model.",
+    )
+    parser.add_argument("--input_text",
                         type=str,
                         default="Describe the picture")
-    parser.add_argument('--images_path',
-                        nargs='+',
-                        type=json.loads,
-                        default=[{
-                            'image': './pics/demo.jpeg'
-                        }])
-    parser.add_argument('--input_dir',
-                        nargs='+',
-                        type=json.loads,
-                        default=[{
-                            'image': 'image.pt'
-                        }])
-
     parser.add_argument(
-        '--input_tokens',
-        dest='input_file',
+        "--images_path",
+        nargs="+",
+        type=json.loads,
+        default=[{
+            "image": "./pics/demo.jpeg"
+        }],
+    )
+    parser.add_argument(
+        "--input_tokens",
+        dest="input_file",
         type=str,
         help=
-        'CSV or Numpy file containing tokenized input. Alternative to text input.',
-        default=None)
-    parser.add_argument('--output_csv',
-                        type=str,
-                        help='CSV file where the tokenized output is stored.',
-                        default=None)
-    parser.add_argument('--output_npy',
-                        type=str,
-                        help='Numpy file where the tokenized output is stored.',
-                        default=None)
-    parser.add_argument('--num_beams',
+        "CSV or Numpy file containing tokenized input. Alternative to text input.",
+        default=None,
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=str,
+        help="CSV file where the tokenized output is stored.",
+        default=None,
+    )
+    parser.add_argument(
+        "--output_npy",
+        type=str,
+        help="Numpy file where the tokenized output is stored.",
+        default=None,
+    )
+    parser.add_argument("--num_beams",
                         type=int,
                         help="Use beam search if num_beams >1",
                         default=1)
-    parser.add_argument("--display", default=False, action='store_true')
-    parser.add_argument('--port', type=str, default='8006')
-    parser.add_argument("--local_machine", default=False, action='store_true')
     return parser.parse_args()
 
 
-def vit_process(image_path, engine_dir, stream):
-    vit_path = os.path.join(engine_dir,
-                            'visual_encoder/visual_encoder_fp16.plan')
-    logger.info(f'Loading engine from {vit_path}')
-    with open(vit_path, 'rb') as f:
+def vit_process(image_path, vit_engine_dir, stream):
+    img_processor = Preprocss(448)
+    logger.info(f"Loading engine from {vit_engine_dir}")
+    with open(vit_engine_dir, "rb") as f:
         engine_buffer = f.read()
-    logger.info(f'Creating session from engine {vit_path}')
+    logger.info(f"Creating session from engine {vit_engine_dir}")
     session_vit = Session.from_serialized_engine(engine_buffer)
     device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-    images_list = []
-    for img in image_path:
-        for v in img.values():
-            image = torch.load(v)
-            if image.device.type == 'cpu':
-                image = image.to(device)
-            images_list.append(image)
-    images = torch.cat(images_list)
+    images = img_processor.encode(image_path).to(device)
     batch_size = images.size(0)
     images = images.expand(batch_size, -1, -1, -1).contiguous()
-    visual_inputs = {'input': images.float()}
+    visual_inputs = {"input": images.float()}
     visual_output_info = session_vit.infer_shapes(
-        [TensorInfo('input', trt.DataType.FLOAT, images.shape)])
+        [TensorInfo("input", trt.DataType.FLOAT, images.shape)])
     visual_outputs = {
         t.name: torch.empty(tuple(t.shape),
                             dtype=trt_dtype_to_torch(t.dtype),
-                            device='cuda')
+                            device="cuda")
         for t in visual_output_info
     }
     profiler.start("ViT")
 
-    run_time = 1
+    run_time = 10
     for _ in range(run_time):
         ok = session_vit.run(visual_inputs, visual_outputs, stream)
     profiler.stop("ViT")
     Vit_time = profiler.elapsed_time_in_sec("ViT") / run_time
-    logger.info(f'TensorRT-LLM ViT latency: {Vit_time} sec ')
+    logger.info(f"TensorRT-LLM ViT latency: {Vit_time:3f} sec ")
 
     assert ok, "Runtime execution failed for vit session"
 
-    image_embeds = visual_outputs['output']
+    image_embeds = visual_outputs["output"]
     return image_embeds
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = parse_arguments()
     stream = torch.cuda.current_stream().cuda_stream
     tensorrt_llm.logger.set_level(args.log_level)
-    image_embeds = vit_process(args.input_dir, args.vit_engine_dir, stream)
-    qinfer = QWenInfer(args.tokenizer_dir, args.qwen_engine_dir, args.log_level,
-                       args.output_csv, args.output_npy, args.num_beams)
+    image_embeds = vit_process(args.images_path, args.vit_engine_dir, stream)
+    qinfer = QWenInfer(
+        args.tokenizer_dir,
+        args.qwen_engine_dir,
+        args.log_level,
+        args.output_csv,
+        args.output_npy,
+        args.num_beams,
+    )
     qinfer.qwen_model_init()
-    qinfer.qwen_infer(image_embeds,
-                      args.images_path,
-                      args.input_text,
-                      args.max_new_tokens,
-                      args.num_beams,
-                      history=[])
+    qinfer.qwen_infer(
+        image_embeds,
+        args.images_path,
+        args.input_text,
+        args.max_new_tokens,
+        args.num_beams,
+        history=[],
+    )

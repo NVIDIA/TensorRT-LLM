@@ -25,6 +25,13 @@
 namespace tensorrt_llm::executor
 {
 
+namespace kv_cache
+{
+class CommState;
+class CacheState;
+class SocketState;
+} // namespace kv_cache
+
 class Serialization
 {
 public:
@@ -52,6 +59,21 @@ public:
     [[nodiscard]] static LoraConfig deserializeLoraConfig(std::istream& is);
     static void serialize(LoraConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(LoraConfig const& config);
+
+    // CommState
+    [[nodiscard]] static kv_cache::CommState deserializeCommState(std::istream& is);
+    static void serialize(kv_cache::CommState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::CommState const& state);
+
+    // SocketState
+    [[nodiscard]] static kv_cache::SocketState deserializeSocketState(std::istream& is);
+    static void serialize(kv_cache::SocketState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::SocketState const& state);
+
+    // CacheState
+    [[nodiscard]] static kv_cache::CacheState deserializeCacheState(std::istream& is);
+    static void serialize(kv_cache::CacheState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::CacheState const& state);
 
     // ContextPhaseState
     [[nodiscard]] static ContextPhaseState deserializeContextPhaseState(std::istream& is);

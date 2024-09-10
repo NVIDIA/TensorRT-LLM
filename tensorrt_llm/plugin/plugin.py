@@ -336,19 +336,20 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
                 type=str,
                 default=field.default if field.default else "disable",
                 choices=[x if x else "disable" for x in plugin_dtype_options],
-                help=f"Whether to enable/disable {field_name} and the dtype.")
+                help=f"Whether to enable/disable ``{field_name}`` and the dtype."
+            )
         elif field.type == bool:
             parser.add_argument(
                 "--" + field_name,
                 type=str,
                 default="enable" if field.default else "disable",
                 choices=["enable", "disable"],
-                help=f"Whether to enable/disable {field_name}.")
+                help=f"Whether to enable/disable ``{field_name}``.")
         else:
             parser.add_argument("--" + field_name,
                                 type=field.type,
                                 default=field.default,
-                                help=f"{field_name}.")
+                                help=f"``{field_name}``.")
     return parser
 
 

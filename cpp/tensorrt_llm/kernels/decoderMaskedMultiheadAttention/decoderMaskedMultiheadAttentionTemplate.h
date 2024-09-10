@@ -2131,7 +2131,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
         if constexpr (ENABLE_8BITS_KV_CACHE)
         {
-            store_8bits_kv_cache_vec(reinterpret_cast<Tcache*>(k_cache), k_vec, inBlockIdx, kv_scale_orig_quant);
+            store_8bits_vec(reinterpret_cast<Tcache*>(k_cache), k_vec, inBlockIdx, kv_scale_orig_quant);
         }
         else
         {
@@ -2386,7 +2386,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         {
             if (ENABLE_8BITS_KV_CACHE)
             {
-                store_8bits_kv_cache_vec(v_cache_base, v, inBlockIdx, kv_scale_orig_quant);
+                store_8bits_vec(v_cache_base, v, inBlockIdx, kv_scale_orig_quant);
             }
             else
             {

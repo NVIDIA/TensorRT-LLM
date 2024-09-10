@@ -33,6 +33,7 @@ extensions = [
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
+    'sphinxarg.ext',
 ]
 
 myst_url_schemes = {

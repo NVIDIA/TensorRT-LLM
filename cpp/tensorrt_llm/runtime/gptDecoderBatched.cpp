@@ -257,7 +257,7 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     dInput.stopWordsLists.resize(maxBatchSize);
     dInput.badWordsLists.resize(maxBatchSize);
 
-    const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeXmaxBeamWidth);
+    const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeShape);
     const_cast<ITensor&>(*dInput.batchSlots).reshape(maxBatchSizeShape);
     auto& sequenceLimitLength = const_cast<ITensor&>(*dInput.sequenceLimitLength);
     sequenceLimitLength.reshape(maxBatchSizeShape);

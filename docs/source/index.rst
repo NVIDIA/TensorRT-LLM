@@ -13,6 +13,7 @@ Welcome to TensorRT-LLM's Documentation!
 
    overview.md
    quick-start-guide.md
+   key-features.md
    release-notes.md
 
 
@@ -67,6 +68,14 @@ Welcome to TensorRT-LLM's Documentation!
 
    _cpp_gen/executor.rst
    _cpp_gen/runtime.rst
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Command-Line Reference
+   :hidden:
+
+   commands/trtllm-build.rst
 
 
 .. toctree::

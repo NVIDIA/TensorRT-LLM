@@ -319,6 +319,7 @@ class MOEWeightWrapper(Module):
         self.tllm_to_externel_key_dict = wrapper_tllm_to_externel_key_dict
         self.tp_size = tp_size
         self.tp_dim = tp_dim
+        self.is_padded = False
 
         if quant_mode.is_weight_only():
             bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
@@ -371,8 +372,8 @@ class MOEWeightWrapper(Module):
                 return {}
             weights = weights.to(str_dtype_to_torch(self.dtype))
             return postprocess_weight_only(
-                tllm_key, weights,
-                1 if self.quant_mode.is_int8_weight_only() else 2)
+                tllm_key, weights, torch.int8 if
+                self.quant_mode.is_int8_weight_only() else torch.quint4x2, self)
         elif self.quant_mode.has_fp8_qdq():
             if tllm_key.endswith("activation_scaling_factor"):
                 return 448.0 / weights

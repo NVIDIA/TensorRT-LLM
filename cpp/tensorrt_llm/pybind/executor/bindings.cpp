@@ -153,6 +153,11 @@ void InitBindings(pybind11::module_& m)
             [](tle::IterationStats const& iterationStats)
             { return tle::JsonSerialization::toJsonStr(iterationStats); });
 
+    py::class_<tle::DebugTensorsPerIteration>(m, "DebugTensorsPerIteration")
+        .def(py::init<>())
+        .def_readwrite("iter", &tle::DebugTensorsPerIteration::iter)
+        .def_readwrite("debug_tensors", &tle::DebugTensorsPerIteration::debugTensors);
+
     py::enum_<tle::RequestStage>(m, "RequestStage")
         .value("QUEUED", tle::RequestStage::kQUEUED)
         .value("ENCODER_IN_PROGRESS", tle::RequestStage::kENCODER_IN_PROGRESS)
@@ -295,40 +300,40 @@ void InitBindings(pybind11::module_& m)
     request
         // A modified version of constructor to accpect deprecated args maxNewTokens
         // TODO(enweiz): use the original constructor after the deprecated args are removed
-        .def(
-            py::init(
-                [](tle::VecTokens inputTokenIds, std::optional<tle::SizeType32> maxTokens,
-                    std::optional<tle::SizeType32> maxNewTokens, bool streaming,
-                    tle::SamplingConfig const& samplingConfig, tle::OutputConfig const& outputConfig,
-                    std::optional<tle::SizeType32> const& endId, std::optional<tle::SizeType32> const& padId,
-                    std::optional<std::vector<SizeType32>> positionIds,
-                    std::optional<std::list<tle::VecTokens>> badWords,
-                    std::optional<std::list<tle::VecTokens>> stopWords, std::optional<tle::Tensor> embeddingBias,
-                    std::optional<tle::ExternalDraftTokensConfig> externalDraftTokensConfig,
-                    std::optional<tle::PromptTuningConfig> pTuningConfig, std::optional<tle::LoraConfig> loraConfig,
-                    std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
-                    std::optional<std::string> logitsPostProcessorName,
-                    std::optional<tle::VecTokens> encoderInputTokenIds, std::optional<tle::IdType> clientId,
-                    bool returnAllGeneratedTokens, tle::PriorityType priority, tle::RequestType type,
-                    std::optional<tle::ContextPhaseParams> contextPhaseParams,
-                    std::optional<tle::Tensor> encoderInputFeatures, std::optional<tle::SizeType32> encoderOutputLength)
-                {
-                    if (maxNewTokens.has_value())
-                    {
-                        TLLM_LOG_WARNING("max_new_tokens is being deprecated; please use max_tokens instead.");
-                        if (!maxTokens.has_value())
-                        {
-                            maxTokens = maxNewTokens;
-                        }
-                    }
-                    TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
+        .def(py::init(
+                 [](tle::VecTokens inputTokenIds, std::optional<tle::SizeType32> maxTokens,
+                     std::optional<tle::SizeType32> maxNewTokens, bool streaming,
+                     tle::SamplingConfig const& samplingConfig, tle::OutputConfig const& outputConfig,
+                     std::optional<tle::SizeType32> const& endId, std::optional<tle::SizeType32> const& padId,
+                     std::optional<std::vector<SizeType32>> positionIds,
+                     std::optional<std::list<tle::VecTokens>> badWords,
+                     std::optional<std::list<tle::VecTokens>> stopWords, std::optional<tle::Tensor> embeddingBias,
+                     std::optional<tle::ExternalDraftTokensConfig> externalDraftTokensConfig,
+                     std::optional<tle::PromptTuningConfig> pTuningConfig, std::optional<tle::LoraConfig> loraConfig,
+                     std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
+                     std::optional<std::string> logitsPostProcessorName,
+                     std::optional<tle::VecTokens> encoderInputTokenIds, std::optional<tle::IdType> clientId,
+                     bool returnAllGeneratedTokens, tle::PriorityType priority, tle::RequestType type,
+                     std::optional<tle::ContextPhaseParams> contextPhaseParams,
+                     std::optional<tle::Tensor> encoderInputFeatures,
+                     std::optional<tle::SizeType32> encoderOutputLength, SizeType32 numReturnSequences)
+                 {
+                     if (maxNewTokens.has_value())
+                     {
+                         TLLM_LOG_WARNING("max_new_tokens is being deprecated; please use max_tokens instead.");
+                         if (!maxTokens.has_value())
+                         {
+                             maxTokens = maxNewTokens;
+                         }
+                     }
+                     TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
 
-                    return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
-                        outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
-                        externalDraftTokensConfig, pTuningConfig, loraConfig, lookaheadConfig, logitsPostProcessorName,
-                        encoderInputTokenIds, clientId, returnAllGeneratedTokens, priority, type, contextPhaseParams,
-                        encoderInputFeatures, encoderOutputLength);
-                }),
+                     return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
+                         outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
+                         externalDraftTokensConfig, pTuningConfig, loraConfig, lookaheadConfig, logitsPostProcessorName,
+                         encoderInputTokenIds, clientId, returnAllGeneratedTokens, priority, type, contextPhaseParams,
+                         encoderInputFeatures, encoderOutputLength, numReturnSequences);
+                 }),
             py::arg("input_token_ids"), py::kw_only(), py::arg("max_tokens") = py::none(),
             py::arg("max_new_tokens") = py::none(), py::arg("streaming") = false,
             py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
@@ -343,7 +348,7 @@ void InitBindings(pybind11::module_& m)
             py::arg_v("type", tle::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
                 "RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION"),
             py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
-            py::arg("encoder_output_length") = py::none())
+            py::arg("encoder_output_length") = py::none(), py::arg("num_return_sequences") = 1)
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)
@@ -371,7 +376,9 @@ void InitBindings(pybind11::module_& m)
             &tle::Request::setReturnAllGeneratedTokens)
         .def_property("request_type", &tle::Request::getRequestType, &tle::Request::setRequestType)
         .def_property(
-            "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures);
+            "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
+        .def_property(
+            "num_return_sequences", &tle::Request::getNumReturnSequences, &tle::Request::setNumReturnSequences);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 
     py::enum_<tle::FinishReason>(m, "FinishReason")
@@ -389,7 +396,9 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("context_logits", &tle::Result::contextLogits)
         .def_readwrite("generation_logits", &tle::Result::generationLogits)
         .def_readwrite("encoder_output", &tle::Result::encoderOutput)
-        .def_readwrite("finish_reasons", &tle::Result::finishReasons);
+        .def_readwrite("finish_reasons", &tle::Result::finishReasons)
+        .def_readwrite("sequence_index", &tle::Result::sequenceIndex)
+        .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal);
 
     py::class_<tle::Response>(m, "Response")
         .def(py::init<IdType, std::string>(), py::arg("request_id"), py::arg("error_msg"))
@@ -563,25 +572,31 @@ void InitBindings(pybind11::module_& m)
         .def(py::pickle(decodingConfigGetstate, decodingConfigSetstate));
 
     auto debugConfigGetstate = [](tle::DebugConfig const& self)
-    { return py::make_tuple(self.getDumpInputTensors(), self.getDumpOutputTensors(), self.getDebugTensorNames()); };
+    {
+        return py::make_tuple(self.getDebugInputTensors(), self.getDebugOutputTensors(), self.getDebugTensorNames(),
+            self.getDebugTensorsMaxIterations());
+    };
     auto debugConfigSetstate = [](py::tuple state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::DebugConfig(
-            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<std::vector<std::string>>());
+        return tle::DebugConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<std::vector<std::string>>(),
+            state[3].cast<SizeType32>());
     };
     py::class_<tle::DebugConfig>(m, "DebugConfig")
-        .def(py::init<bool, bool, std::vector<std::string>>(), py::arg("dump_input_tensors") = false,
-            py::arg("dump_output_tensors") = false, py::arg("debug_tensor_names") = py::none())
+        .def(py::init<bool, bool, std::vector<std::string>, SizeType32>(), py::arg("debug_input_tensors") = false,
+            py::arg("debug_output_tensors") = false, py::arg("debug_tensor_names") = py::none(),
+            py::arg("debug_tensors_max_iterations") = false)
         .def_property(
-            "dump_input_tensors", &tle::DebugConfig::getDumpInputTensors, &tle::DebugConfig::setDumpInputTensors)
+            "debug_input_tensors", &tle::DebugConfig::getDebugInputTensors, &tle::DebugConfig::setDebugInputTensors)
         .def_property(
-            "dump_output_tensors", &tle::DebugConfig::getDumpOutputTensors, &tle::DebugConfig::setDumpOuputTensors)
+            "debug_output_tensors", &tle::DebugConfig::getDebugOutputTensors, &tle::DebugConfig::setDebugOutputTensors)
         .def_property(
             "debug_tensor_names", &tle::DebugConfig::getDebugTensorNames, &tle::DebugConfig::setDebugTensorNames)
+        .def_property("debug_tensors_max_iterations", &tle::DebugConfig::getDebugTensorsMaxIterations,
+            &tle::DebugConfig::setDebugTensorsMaxIterations)
         .def(py::pickle(debugConfigGetstate, debugConfigSetstate));
 
     auto logitsPostProcessorConfigGetstate = [](tle::LogitsPostProcessorConfig const& self)
@@ -620,8 +635,8 @@ void InitBindings(pybind11::module_& m)
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
     { return py::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc()); };
     py::class_<tle::ExtendedRuntimePerfKnobConfig>(m, "ExtendedRuntimePerfKnobConfig")
-        .def(py::init<bool, bool>(), py::arg("multi_block_mode") = false,
-            py::arg("enable_context_fmha_fp32_acc") = false)
+        .def(
+            py::init<bool, bool>(), py::arg("multi_block_mode") = true, py::arg("enable_context_fmha_fp32_acc") = false)
         .def_property("multi_block_mode", &tle::ExtendedRuntimePerfKnobConfig::getMultiBlockMode,
             &tle::ExtendedRuntimePerfKnobConfig::setMultiBlockMode)
         .def_property("enable_context_fmha_fp32_acc", &tle::ExtendedRuntimePerfKnobConfig::getEnableContextFMHAFP32Acc,

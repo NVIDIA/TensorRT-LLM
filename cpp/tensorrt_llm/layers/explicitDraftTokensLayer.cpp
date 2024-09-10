@@ -207,7 +207,7 @@ void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(ExplicitDraftTokens
     params.outputBestPathIndices = bufferCast<SizeType32>(*mBestPathIndicesSlots);
     params.outputLastDraftIndices = bufferCast<SizeType32>(*mLastDraftIndicesSlots);
 
-    params.batchSlots = workspace->getDeviceBatchSlotsPtr();
+    params.batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
     params.nextDraftTokens = bufferCast<TokenIdType>(*inputs.nextDraftTokens);
     params.lastDraftTokens = bufferCast<TokenIdType>(*inputs.lastDraftTokens);
     params.inputUnpackedNextDraftIndices = bufferCast<SizeType32>(*inputs.nextDraftIndices);

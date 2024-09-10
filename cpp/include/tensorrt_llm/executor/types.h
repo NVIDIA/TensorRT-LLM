@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -359,6 +360,15 @@ struct RequestStatsPerIteration
     IterationType iter;
     /// @brief The stats of all active requests for this iteration
     std::vector<RequestStats> requestStats;
+};
+
+/// @brief Struct that holds the debug tensors in an iteration
+struct DebugTensorsPerIteration
+{
+    /// @brief The iteration id for these tensors
+    IterationType iter;
+    /// @brief The debug tensors for this iteration
+    std::map<std::string, Tensor> debugTensors;
 };
 
 /// @brief The reason why the model stopped generating tokens for a request.

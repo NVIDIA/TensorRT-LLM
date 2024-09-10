@@ -59,6 +59,10 @@ All published functionality in the Release Notes has been fully tested and verif
   - The dependent PyTorch version is updated to 2.4.0.
   - The dependent ModelOpt version is updated to v0.15.0.
 
+### Known Issues
+
+- On Windows, installation of TensorRT-LLM may succeed, but you might hit `OSError: exception: access violation reading 0x0000000000000000` when importing the library in Python. See [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) for workarounds.
+
 
 ## TensorRT-LLM Release 0.11.0
 

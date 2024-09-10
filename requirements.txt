@@ -8,6 +8,7 @@ lark
 mpi4py
 numpy<2
 onnx>=1.12.0
+openai
 polygraphy
 psutil
 pynvml>=11.5.0

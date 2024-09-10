@@ -85,6 +85,7 @@ public:
     using TensorPtr = TTensor;
     using LogitsPostProcessor = std::function<void(
         RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
+    using RequestPtr = std::shared_ptr<GenericLlmRequest>;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -107,7 +108,8 @@ public:
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt)
+        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
+        SizeType32 numReturnSequences = 1)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -152,11 +154,14 @@ public:
         , mEncoderOutputLength(encoderOutputLength)
         , mLlmRequestType(llmRequestType)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
+        , mNumReturnSequences(numReturnSequences)
+        , mSequenceIndex(0)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
             mState = REQUEST_STATE_ENCODER_INIT;
         }
+
         initialize(*inputTokens, returnLogProbs);
     }
 
@@ -202,6 +207,8 @@ public:
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mInputTokenExtraIds(std::nullopt)
+        , mNumReturnSequences(req.getNumReturnSequences())
+        , mSequenceIndex(0)
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
@@ -217,6 +224,7 @@ public:
                 "length).");
             mReturnAllGeneratedTokens = true;
         }
+
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits == true)
         {
             TLLM_LOG_WARNING(
@@ -276,13 +284,15 @@ public:
             mLoraTaskId = loraConfig->getTaskId();
             if (loraConfig.value().getWeights())
             {
-                mLoraWeights = executor::detail::toITensor(loraConfig.value().getWeights().value());
+                mLoraWeights = tensorrt_llm::runtime::ITensor::view(
+                    executor::detail::toITensor(loraConfig.value().getWeights().value()));
                 mLoraWeights.value()->unsqueeze(0);
             }
 
             if (loraConfig.value().getConfig())
             {
-                mLoraConfig = executor::detail::toITensor(loraConfig.value().getConfig().value());
+                mLoraConfig = tensorrt_llm::runtime::ITensor::view(
+                    executor::detail::toITensor(loraConfig.value().getConfig().value()));
                 mLoraConfig.value()->unsqueeze(0);
             }
         }
@@ -427,6 +437,20 @@ public:
     [[nodiscard]] SizeType32 getNumTokens(SizeType32 beam) const
     {
         return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
+    }
+
+    /// @brief Get number of return sequences for this req.
+    /// @return  The number of sequences to return.
+    [[nodiscard]] SizeType32 getNumReturnSequences() const
+    {
+        return mNumReturnSequences;
+    }
+
+    /// @brief Get child requests spawned by this req.
+    /// @return A vector of child requests.
+    [[nodiscard]] std::vector<RequestPtr> const& getChildRequests() const
+    {
+        return mChildRequests;
     }
 
     /// @brief Get max number of tokens across all beams
@@ -616,6 +640,25 @@ public:
                 beamUniqueTokens.push_back({generatedBeamTokens[beam][i], 0});
             }
         }
+    }
+
+    /// @brief Sets the number of return sequences.
+    /// @param numReturnSequences The number of return sequences.
+    void setNumReturnSequences(SizeType32 const& numReturnSequences)
+    {
+        TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot change numReturnSequences.");
+        TLLM_CHECK_WITH_INFO(
+            numReturnSequences > 0, "numReturnSequences should be a positive integer, got %d.", numReturnSequences);
+        TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
+            "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
+            numReturnSequences, mChildRequests.size());
+        mNumReturnSequences = numReturnSequences;
+        mSequenceFinalVec->resize(mNumReturnSequences);
+    }
+
+    [[nodiscard]] bool constexpr isChild() const noexcept
+    {
+        return mSequenceIndex > 0;
     }
 
     /// @brief Return a vector of the last-generated tokens of shape [num_beams]
@@ -884,6 +927,11 @@ public:
     void setEncoderOutputHost(TensorPtr encoderOutputHost)
     {
         mEncoderOutputHost = std::move(encoderOutputHost);
+    }
+
+    void setEncoderOutput(TensorPtr encoderOutput)
+    {
+        mEncoderOutput = std::move(encoderOutput);
     }
 
     void allocEncoderOutputHost(SizeType32 encoderHiddenSize, nvinfer1::DataType dataType)
@@ -1204,7 +1252,14 @@ public:
             TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
 
             executor::Result result;
-            result.isFinal = isGenerationCompleteState() || isDisaggContextTransmissionState();
+            result.sequenceIndex = mSequenceIndex;
+
+            result.isSequenceFinal = isGenerationCompleteState() || isDisaggContextTransmissionState();
+            mSequenceFinalVec->at(mSequenceIndex) = result.isSequenceFinal;
+
+            result.isFinal = std::all_of(mSequenceFinalVec->begin(), mSequenceFinalVec->end(),
+                [](bool isSequenceFinal) { return isSequenceFinal; });
+
             auto const nbBeams = mSamplingConfig.beamWidth;
             auto const maxNbTokens = getMaxBeamNumTokens();
 
@@ -1295,7 +1350,9 @@ public:
                 // Update position of last sent response
                 setMaxSentTokenLen(maxNbTokens);
 
-                auto response = executor::Response(mRequestId, std::move(result));
+                auto requestId = isChild() ? mParentRequestId : mRequestId;
+                auto response = executor::Response(requestId, std::move(result));
+
                 return response;
             }
         }
@@ -1413,6 +1470,12 @@ protected:
     // TODO: add real extra id for encoder tokens
     std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens;
 
+    SizeType32 mNumReturnSequences;
+    SizeType32 mSequenceIndex;
+    std::vector<RequestPtr> mChildRequests;
+    RequestIdType mParentRequestId;
+    std::shared_ptr<std::vector<bool>> mSequenceFinalVec; // Indicators whether each sibling completes generation.
+
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
@@ -1475,6 +1538,12 @@ private:
         }
 
         setReturnLogProbs(outputLogProbs);
+
+        if (!isChild())
+        {
+            // Initialize result states unless it is a child and a child request should share parent's one.
+            mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumReturnSequences(), false);
+        }
     }
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
@@ -1540,7 +1609,8 @@ public:
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt)
+        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
+        SizeType32 numReturnSequences = 1)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
@@ -1548,18 +1618,49 @@ public:
             std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
             std::move(encoderInputFeatures), std::move(encoderOutputLength), llmRequestType,
-            std::move(inputTokenExtraIds))
+            std::move(inputTokenExtraIds), numReturnSequences)
     {
     }
 
-    LlmRequest(RequestIdType requestId, executor::Request const& Request,
+    LlmRequest(RequestIdType requestId, executor::Request const& request,
         std::optional<Base::LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false)
-        : Base(requestId, Request)
+        : Base(requestId, request)
     {
         mLogitsPostProcessor = std::move(logitsPostProcessor);
         mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
-        mLookaheadConfig = Request.getLookaheadConfig();
+        mLookaheadConfig = request.getLookaheadConfig();
+    }
+
+    std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId)
+    {
+        TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
+        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumReturnSequences()),
+            "Cannot create child requests more than the number of return sequences (%d)", getNumReturnSequences());
+        auto childReq = std::make_shared<LlmRequest>(*this);
+        childReq->mRequestId = requestId;
+        childReq->mSequenceIndex = mChildRequests.size() + 1;
+        childReq->mParentRequestId = this->mRequestId;
+        childReq->mSequenceFinalVec = this->mSequenceFinalVec;
+        childReq->mSeqSlot.reset();
+
+        // To ensure different randomness across children, assign a unique random seed to each child
+        // by adding its sequence index to the base seed. If no seed is provided, the parent's seed defaults to 0.
+        using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
+        if (childReq->mSamplingConfig.randomSeed.has_value())
+        {
+            childReq->mSamplingConfig.randomSeed->at(0) += static_cast<RandomSeedType>(childReq->mSequenceIndex);
+        }
+        else
+        {
+            RandomSeedType defaultSeed{0};
+            mSamplingConfig.randomSeed = std::vector<RandomSeedType>(1, defaultSeed);
+            childReq->mSamplingConfig.randomSeed
+                = std::vector<RandomSeedType>(1, defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
+        }
+
+        mChildRequests.push_back(childReq);
+        return childReq;
     }
 
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)

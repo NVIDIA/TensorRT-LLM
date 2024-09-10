@@ -186,6 +186,16 @@ find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
+if(ENABLE_UCX)
+  find_package(ucx REQUIRED)
+  find_package(ucxx REQUIRED)
+  if(BUILD_BATCH_MANAGER)
+    target_include_directories(
+      ${BATCH_MANAGER_TARGET}
+      PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
+  endif()
+endif()
+
 if(NOT WIN32)
   if(USE_CXX11_ABI)
     add_custom_command(
@@ -331,6 +341,10 @@ if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 
+if(ENABLE_UCX)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ucxx::ucxx ucx::ucs)
+endif()
+
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")
   set(AS_NEEDED_FLAG "-Wl,--as-needed")
@@ -366,6 +380,9 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
 link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
 link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
+if(ENABLE_UCX)
+  link_whole_archive(${SHARED_TARGET} ucxx::ucxx)
+endif()
 
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})

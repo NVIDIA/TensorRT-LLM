@@ -23,10 +23,12 @@ from .. import profiler
 from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
                         WorldConfig)
 from ..bindings import executor as trtllm
+from ..builder import EngineConfig
 from ..logger import logger
 from ..mapping import Mapping
-from .generation import LogitsProcessor, SamplingConfig, StoppingCriteria
-from .model_runner import ModelRunnerMixin
+from .generation import (LogitsProcessor, LoraManager, SamplingConfig,
+                         StoppingCriteria)
+from .model_runner import ModelRunnerMixin, _engine_config_to_model_config
 
 _bindings_dtype_to_torch_dtype_dict = {
     DataType.FLOAT: torch.float,
@@ -45,24 +47,30 @@ class ModelRunnerCpp(ModelRunnerMixin):
     An interface class that wraps Executor and provides generation methods.
     """
 
-    def __init__(self, executor: trtllm.Executor, max_batch_size: int,
-                 max_input_len: int, max_seq_len: int, max_beam_width: int,
-                 model_config: ModelConfig, world_config: WorldConfig,
-                 use_kv_cache: bool) -> None:
+    def __init__(self,
+                 executor: trtllm.Executor,
+                 max_batch_size: int,
+                 max_input_len: int,
+                 max_seq_len: int,
+                 max_beam_width: int,
+                 model_config: ModelConfig,
+                 world_config: WorldConfig,
+                 use_kv_cache: bool,
+                 lora_manager: Optional[LoraManager] = None) -> None:
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.model_config = model_config
-        self.mapping = Mapping(world_size=world_config.tensor_parallelism *
-                               world_config.pipeline_parallelism,
+        self.mapping = Mapping(world_size=world_config.size,
                                rank=world_config.rank,
                                gpus_per_node=world_config.gpus_per_node,
                                tp_size=world_config.tensor_parallelism,
                                pp_size=world_config.pipeline_parallelism)
         self.world_config = world_config
         self.use_kv_cache = use_kv_cache
+        self.lora_manager = lora_manager
 
     @classmethod
     def from_dir(
@@ -87,7 +95,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         kv_cache_enable_block_reuse: bool = False,
         enable_chunked_context: bool = False,
         is_enc_dec: bool = False,
-        multi_block_mode: Optional[bool] = None,
+        multi_block_mode: bool = True,
         enable_context_fmha_fp32_acc: Optional[bool] = None
     ) -> 'ModelRunnerCpp':
         """
@@ -221,6 +229,45 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                        gpus_per_node=gpus_per_node)
         assert rank == world_config.rank
 
+        if model_config.use_lora_plugin and rank == 0:
+            engine_config = EngineConfig.from_json_file(
+                f"{engine_dir}/config.json")
+            lora_manager = LoraManager()
+            if lora_dir is None:
+                config_lora_dir = engine_config.build_config.lora_config.lora_dir
+                if len(config_lora_dir) > 0:
+                    lora_dir = [
+                        f"{engine_dir}/{dir}" for dir in config_lora_dir
+                    ]
+                    lora_ckpt_source = engine_config.build_config.lora_config.lora_ckpt_source
+
+            if lora_dir is not None:
+                runtime_model_config = _engine_config_to_model_config(
+                    engine_config, gpu_weights_percent=gpu_weights_percent)
+                # For Executor, only rank 0 can enqueue requests, and should hold all lora weights
+                lora_manager.load_from_ckpt(lora_dir,
+                                            model_config=runtime_model_config,
+                                            runtime_mapping=None,
+                                            ckpt_source=lora_ckpt_source)
+            else:
+                raise RuntimeError(
+                    f"LoRA weights are unspecified and also unavailable in the engine_dir ({engine_dir})."
+                )
+
+            max_lora_rank = engine_config.build_config.lora_config.max_lora_rank
+            num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
+                len(lora_manager.lora_target_modules + lora_manager.missing_qkv_modules)
+            num_lora_adapters = min(lora_manager.num_lora_adapters, 8)
+            peft_cache_config = trtllm.PeftCacheConfig(
+                num_device_module_layer=max_lora_rank * num_lora_modules *
+                num_lora_adapters,
+                num_host_module_layer=max_lora_rank * num_lora_modules *
+                num_lora_adapters,
+            )
+        else:
+            lora_manager = None
+            peft_cache_config = trtllm.PeftCacheConfig()
+
         profiler.start('load tensorrt_llm engine')
 
         kv_cache_config = trtllm.KvCacheConfig(
@@ -261,10 +308,24 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             assert max_beam_width <= model_config.max_beam_width
 
+        debug_config = None
+        if debug_mode:
+            # To debug specific tensors, add tensor names in the following list
+            #   if none provided, all input and output tensors will be dumped
+            #   if not none, it will disable all input/output dump
+            debug_tensor_names: List[
+                str] = None  # modify this list for specific tensor dump
+            debug_config = trtllm.DebugConfig(
+                debug_input_tensors=True,
+                debug_output_tensors=True,
+                debug_tensor_names=debug_tensor_names)
+
         trtllm_config = trtllm.ExecutorConfig(
             max_beam_width=max_beam_width,
             kv_cache_config=kv_cache_config,
             decoding_config=decoding_config,
+            peft_cache_config=peft_cache_config,
+            debug_config=debug_config,
             gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
@@ -284,7 +345,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                    max_beam_width=max_beam_width,
                    model_config=model_config,
                    world_config=world_config,
-                   use_kv_cache=use_kv_cache)
+                   use_kv_cache=use_kv_cache,
+                   lora_manager=lora_manager)
 
     def _check_inputs(self, batch_input_ids: List[List[int]],
                       sampling_config: trtllm.SamplingConfig, max_new_tokens):
@@ -365,6 +427,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             encoder_output_lengths: List[int] = None,
             sampling_config: Optional[SamplingConfig] = None,
             lora_uids: Optional[list] = None,
+            lookahead_config: list[int] | None = None,
             streaming: bool = False,
             stopping_criteria: Optional[StoppingCriteria] = None,
             logits_processor: Optional[LogitsProcessor] = None,
@@ -427,8 +490,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 self.gather_generation_logits=True, respectively).
         """
         # TODO: Check if these can be supported now and support them
-        if lora_uids is not None:
-            raise RuntimeError("LoRA is not supported in C++ session.")
         if stopping_criteria is not None:
             raise RuntimeError(
                 "Stopping criteria is not supported in C++ session.")
@@ -457,7 +518,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 "top_p_decay", "temperature", "min_tokens",
                 "beam_search_diversity_rate", "repetition_penalty",
                 "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping", "no_repeat_ngram_size"
+                "early_stopping", "no_repeat_ngram_size", "random_seed"
             ]
             rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
             sampling_params = {
@@ -492,6 +553,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
         bad_words_list = self._prepare_words_list(bad_words_list,
                                                   len(batch_input_ids_list))
 
+        lora_configs = self._prepare_lora_configs(lora_uids,
+                                                  len(batch_input_ids_list))
+        request_lookahead_config = None
+        if lookahead_config is not None:
+            [w, n, g] = lookahead_config
+            request_lookahead_config = trtllm.LookaheadDecodingConfig(w, n, g)
+
         requests = [
             trtllm.Request(
                 input_token_ids=input_ids,
@@ -509,14 +577,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 stop_words=stop_words,
                 bad_words=bad_words,
                 sampling_config=sampling_config,
+                lookahead_config=request_lookahead_config,
                 streaming=streaming,
                 output_config=output_config,
                 prompt_tuning_config=prompt_tuning_config,
-                return_all_generated_tokens=return_all_generated_tokens)
-            for i, (input_ids, stop_words, bad_words,
-                    prompt_tuning_config) in enumerate(
-                        zip(batch_input_ids_list, stop_words_list,
-                            bad_words_list, prompt_tuning_configs))
+                lora_config=lora_config,
+                return_all_generated_tokens=return_all_generated_tokens) for i,
+            (input_ids, stop_words, bad_words, prompt_tuning_config,
+             lora_config) in enumerate(
+                 zip(batch_input_ids_list, stop_words_list, bad_words_list,
+                     prompt_tuning_configs, lora_configs))
         ]
 
         request_ids = self.session.enqueue_requests(requests)
@@ -562,6 +632,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     for _ in range(len(batch_input_ids_list))
                 ]
         return prompt_tuning_configs
+
+    def _prepare_lora_configs(self, lora_uids, batch_size):
+        if lora_uids is None:
+            return [None] * batch_size
+        assert len(lora_uids) == batch_size
+        return [
+            trtllm.LoraConfig(task_id=int(uid),
+                              weights=self.lora_manager.cpp_lora_weights[uid],
+                              config=self.lora_manager.cpp_lora_config[uid])
+            if int(uid) >= 0 else None for uid in lora_uids
+        ]
 
     def _initialize_and_fill_output(self, request_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,

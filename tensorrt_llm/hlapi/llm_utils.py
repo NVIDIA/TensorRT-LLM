@@ -30,7 +30,7 @@ from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import tensorrt as trt
 import torch
@@ -55,7 +55,6 @@ from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (GpuArch, download_hf_model, download_hf_pretrained_config,
-                    file_with_glob_exists, file_with_suffix_exists,
                     print_colored, print_traceback_on_error, set_docstring)
 
 
@@ -179,6 +178,18 @@ LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
 
     revision (str, optional): The revision of the model to use.
         Default is None.
+
+    load_format (Literal['auto', 'dummy'], default='auto'): The format of the model weights to load.
+        * 'auto' will try to load the weights from the provided checkpoint.
+        * 'dummy' will initialize the weights with random values, which is mainly for profiling.
+
+    enable_lora (bool, default=False): Enable LoRA adapters.
+
+    max_lora_rank (int, default=None): Maximum LoRA rank. If specified, it overrides `build_config.lora_config.max_lora_rank`.
+
+    max_loras (int, default=4): Maximum number of LoRA adapters to be stored in GPU memory.
+
+    max_cpu_loras (int, default=4): Maximum number of LoRA adapters to be stored in CPU memory.
 """
 
 LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
@@ -244,6 +255,17 @@ class LlmArgs:
     dtype: str = "auto"
 
     revision: Optional[str] = None
+
+    load_format: Literal['auto', 'dummy'] = 'auto'
+
+    # LoRA arguments
+    enable_lora: bool = False
+
+    max_lora_rank: Optional[int] = None
+
+    max_loras: int = 4
+
+    max_cpu_loras: int = 4
 
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
     build_config: Optional[BuildConfig] = None
@@ -394,6 +416,11 @@ class LlmArgs:
             self.model_format = _ModelFormatKind.HF
 
         self.build_config = self.build_config or BuildConfig()
+
+        if self.enable_lora:
+            self.build_config.plugin_config.lora_plugin = 'auto'
+            if self.max_lora_rank is not None:
+                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
 
         if self.perform_config_arbitration:
             self._perform_config_arbitration()
@@ -919,9 +946,6 @@ class ModelLoader:
         if self.llm_args.parallel_config.is_multi_gpu:
             torch.cuda.set_device(self.rank)
 
-        len(self._build_pipeline)
-        to_log = self.rank == 0
-
         pipeline = ModelLoader.BuildPipeline(
             self.llm_args.enable_tqdm,
             [label for label, _ in self._build_pipeline],
@@ -999,20 +1023,30 @@ class ModelLoader:
     @staticmethod
     def get_model_format(model_dir: str) -> _ModelFormatKind:
         ''' Get the format of the model.  '''
-        # TODO: migrate to detect version field in config.json after TRTLLM-256 finished
-        if Path.exists(
-                Path(model_dir) / 'config.json') and file_with_glob_exists(
-                    model_dir, 'rank*.safetensors'):
-            return _ModelFormatKind.TLLM_CKPT
-        if (Path.exists(Path(model_dir) / 'config.json')
-                and (file_with_suffix_exists(model_dir, '.bin')
-                     or file_with_suffix_exists(model_dir, '.safetensors'))):
-            return _ModelFormatKind.HF
-        if Path.exists(
-                Path(model_dir) / 'config.json') and file_with_suffix_exists(
-                    model_dir, '.engine'):
-            return _ModelFormatKind.TLLM_ENGINE
-        raise ValueError(f"Unknown model format for {model_dir}")
+        if not (Path(model_dir) / 'config.json').exists():
+            raise ValueError(
+                f"Failed to infer model format because no config.json exists in {model_dir}"
+            )
+
+        with open(Path(model_dir) / 'config.json') as f:
+            config = json.load(f)
+
+        try:
+            if 'pretrained_config' in config and 'build_config' in config:
+                model_format = _ModelFormatKind.TLLM_ENGINE
+                EngineConfig.from_json_file(Path(model_dir) / 'config.json')
+            elif 'architecture' in config and 'dtype' in config:
+                model_format = _ModelFormatKind.TLLM_CKPT
+                PretrainedConfig.from_checkpoint(model_dir)
+            else:
+                model_format = _ModelFormatKind.HF
+                AutoConfig.from_hugging_face(model_dir)
+        except Exception as e:
+            raise ValueError(
+                f"Inferred model format {model_format}, but failed to load config.json: {e}"
+            )
+        else:
+            return model_format
 
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
@@ -1034,7 +1068,16 @@ class ModelLoader:
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(self._model_dir)
-        if self.llm_args.quant_config.requires_calibration:
+        if self.llm_args.load_format == 'dummy':
+            config = model_cls.config_class.from_hugging_face(
+                str(self._model_dir),
+                dtype=self.llm_args.dtype,
+                mapping=self.mapping,
+                quant_config=self.llm_args.quant_config,
+                **self.convert_checkpoint_options,
+            )
+            self.model = model_cls(config)
+        elif self.llm_args.quant_config.requires_calibration:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1075,8 +1118,11 @@ class ModelLoader:
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
         model_cls = MODEL_MAP[architecture]
-        self.model = model_cls.from_checkpoint(self._model_dir,
-                                               config=self.pretrained_config)
+        if self.llm_args.load_format == 'dummy':
+            self.model = model_cls(self.pretrained_config)
+        else:
+            self.model = model_cls.from_checkpoint(
+                self._model_dir, config=self.pretrained_config)
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
@@ -1091,16 +1137,15 @@ class ModelLoader:
         self._model_info = _ModelInfo.from_module(self.model)
 
     def _build_engine(self):
+        assert isinstance(
+            self.build_config,
+            BuildConfig), f"build_config is not set yet: {self.build_config}"
 
         self.build_config.update(auto_parallel_config=self.auto_parallel_config)
         self.build_config.update_kv_cache_type(self._model_info.architecture)
         if self.auto_parallel_config.enabled:
             self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
-
-        assert isinstance(
-            self.build_config,
-            BuildConfig), f"build_config is not set yet: {self.build_config}"
 
         engine = build(self.model, self.build_config)
 

@@ -17,9 +17,11 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/tensor.h"
 
 #include <NvInferRuntime.h>
 #include <filesystem>
+#include <map>
 #include <optional>
 
 namespace tensorrt_llm::runtime
@@ -75,6 +77,17 @@ public:
         mEnginePath = std::move(enginePath);
     }
 
+    [[nodiscard]] std::optional<std::map<std::string, tensorrt_llm::executor::Tensor>> const&
+    getManagedWeightsMapOpt() const
+    {
+        return mManagedWeightsMap;
+    }
+
+    void setManagedWeightsMap(std::map<std::string, tensorrt_llm::executor::Tensor> managedWeightsMap)
+    {
+        mManagedWeightsMap = std::move(managedWeightsMap);
+    }
+
     [[nodiscard]] void const* getAddress() const
     {
         TLLM_CHECK(mType == AddressWithSize);
@@ -104,6 +117,7 @@ private:
     };
 
     nvinfer1::IHostMemory const* mEngineBuffer{};
+    std::optional<std::map<std::string, tensorrt_llm::executor::Tensor>> mManagedWeightsMap;
 };
 
 } // namespace tensorrt_llm::runtime

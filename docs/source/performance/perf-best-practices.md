@@ -138,30 +138,6 @@ In-flight sequence batching schedules sequences in context phase together with
 sequences in generation phase to increase efficiency and reduce latency, see
 this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#in-flight-batching) for more details.
 
-### Multi-Block Mode
-
-When the following conditions are met, it is recommended to try the
-`--multi_block_mode` argument with `gptManagerBenchmark` and evaluate the impact on
-performance:
-
- 1. `input_seq_len` > 1024 (An empirically derived value that indicates that the
-    context length is long enough),
- 2. `sequence_count` * `num_head` < `multiprocessor_count` / 2
-
-Multi-block mode can be beneficial when `batch_size * num_heads` is not large
-enough to fully utilize the GPU (the number of CUDA thread blocks is low
-compared to the number of streaming multiprocessors). Hence, the multi-block
-mode is expected to reduce the latency of the multi-head attention kernel in
-the generation phase. However, it requires the context length to be long enough
-for the work performed by each CUDA thread block to remain sufficient for
-efficiency.
-
-Note that, the `--multi_block_mode` argument works more like a suggestion to the
-runtime, hence it's possible that multi-block is not used even when
-`--multi_block_mode` argument is specified due to no performance gain, and it's
-also possible that multi-block is automatically used even when `--multi_block_mode`
-argument is disabled.
-
 ### Reduce Norm Fusion
 
 There is an experimental feature called "Reduce Norm Fusion"

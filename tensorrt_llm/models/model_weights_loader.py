@@ -156,7 +156,7 @@ class ModelWeightsLoader:
             ]
         elif self.format == ModelWeightsFormat.BINARY or self.format == ModelWeightsFormat.PYTORCH:
             self.shards = [
-                torch.load(f, weights_only=True, map_location="cpu")
+                torch.load(f, weights_only=True, map_location="cpu", mmap=True)
                 for f in shard_files
             ]
         else:
@@ -165,7 +165,7 @@ class ModelWeightsLoader:
         for idx, shard in enumerate(self.shards):
             self.shard_map.update({k: idx for k in shard.keys()})
 
-    def load_tensor(self, key, tp_size, tp_dim, tp_rank):
+    def load_tensor(self, key, tp_size=1, tp_dim=-1, tp_rank=0):
         # Retrieve shard index
         if key in self.shard_map:
             ptr_idx = self.shard_map[key]
@@ -283,6 +283,24 @@ class ModelWeightsLoader:
 
         return weight_dict
 
+    def check_share_embedding(self):
+        lm_head_weights = self.load_tensor(
+            self.translate_to_external_key("lm_head.weight",
+                                           self.tllm_to_externel_key_dict))
+        vocab_embed_weights = self.load_tensor(
+            self.translate_to_external_key("transformer.vocab_embedding.weight",
+                                           self.tllm_to_externel_key_dict))
+        if lm_head_weights is not None and vocab_embed_weights is not None:
+            if lm_head_weights.shape == vocab_embed_weights.shape:
+                if not (lm_head_weights - vocab_embed_weights).any():
+                    return True
+        from ..logger import logger
+        logger.warning(
+            "lm_head.weight and transformer.vocab_embedding.weight are not identical, "
+            "share_embedding_table cannot be enabled; setting share_embedding_table=False."
+        )
+        return False
+
     def update_key_mapping(self, model):
         self.model = weakref.ref(model)()
         # Auto PP
@@ -295,7 +313,7 @@ class ModelWeightsLoader:
                     pp_layers)
             })
 
-    def check(self, weights):
+    def fill(self, weights):
         for tllm_key, param in self.model.named_parameters():
             if param.is_buffer:
                 continue
@@ -324,10 +342,14 @@ class ModelWeightsLoader:
                     )
             param.value = weights[tllm_key]
 
-    def generate_tllm_weights(self, model):
+    def generate_tllm_weights(self,
+                              model,
+                              custom_postprocess_kwargs: dict = {}):
         # For customization, please copy this function and make changes inside the for loop.
         self.update_key_mapping(model)
         tllm_weights = {}
         for tllm_key, _ in tqdm(model.named_parameters()):
-            tllm_weights.update(self.load(tllm_key))
-        self.check(tllm_weights)
+            tllm_weights.update(
+                self.load(tllm_key,
+                          custom_postprocess_kwargs=custom_postprocess_kwargs))
+        self.fill(tllm_weights)

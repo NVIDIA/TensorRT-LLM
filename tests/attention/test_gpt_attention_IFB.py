@@ -38,6 +38,7 @@ from transformers.models.gptj.modeling_gptj import GPTJAttention
 from transformers.models.llama.modeling_llama import LlamaAttention
 
 import tensorrt_llm
+import tensorrt_llm.quantization.layers
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_np, torch_to_numpy
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -48,7 +49,8 @@ from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import (skip_bf16_fp32_accum, skip_bf16_pre_ampere,
-                        skip_fp32_accum_pre_ampere, unittest_name_func)
+                        skip_fp8_pre_ada, skip_fp32_accum_pre_ampere,
+                        unittest_name_func)
 
 
 class TestFunctional(unittest.TestCase):
@@ -78,60 +80,59 @@ class TestFunctional(unittest.TestCase):
         test_cases = []
         test_cases += list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
-                    [ContextFMHAType.disabled], ['float16'], [2], [128], [8],
-                    [4], [64], [0], [False], [False], [1], [True, False]))
+                    [ContextFMHAType.disabled], ['float16'], ['float16'], [2],
+                    [128], [8], [4], [64], [0], [1], [True, False], [False]))
 
         # TODO: add more unit tests
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16'], [2], [90], [8], [4], [32], [0], [False], [False],
-                    [1], [False]))
+            ], ['float16'], ['float16'], [2], [90], [8], [4], [32], [0], [1],
+                    [False], [False]))
 
         # Test cases for the multi-block MMHA.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'float32'], [2], [2048], [8], [4], [64], [0], [True],
-                    [False], [1], [True, False]))
+            ], ['float16', 'float32'], [''], [2], [2048], [8], [4], [64], [0],
+                    [1], [True, False], [False]))
         test_cases += list(
             product(['llama_attention'],
-                    [ContextFMHAType.enabled_with_fp32_acc], ['float16'], [16],
-                    [2048], [32], [4], [64], [0], [True], [False], [1],
-                    [False]))
+                    [ContextFMHAType.enabled_with_fp32_acc], ['float16'], [''],
+                    [16], [2048], [32], [4], [64], [0], [1], [False], [False]))
 
-        # Test cases for the int8 K/V cache.
+        # Test cases for the int8/fp8 K/V cache.
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled],
-                    ['float16', 'float32'], [2], [128], [8], [4], [64], [0],
-                    [False], [True], [1], [False]))
+                    ['float16', 'float32'], ['int8', 'fp8'], [2], [128], [8],
+                    [4], [64], [0], [1], [False], [False]))
 
         # test cases for multi-query attention
         test_cases += list(
             product(['gpt_bigcode_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16'], [2], [128], [8], [4], [64], [1], [False], [False],
-                    [1], [False]))
+            ], ['float16'], [''], [2], [128], [8], [4], [64], [1], [1], [False],
+                    [False]))
 
         # test cases for beam search
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled], ['float16'],
-                    [2], [128], [8], [4], [64], [0], [False], [False], [4],
+                    [''], [2], [128], [8], [4], [64], [0], [4], [False],
                     [False]))
 
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['float16'], [2], [128], [8], [8], [32], [2, 4], [False],
-                    [False], [1], [False]))
+                    ['float16'], [''], [2], [128], [8], [8], [32], [2, 4], [1],
+                    [False], [False]))
 
         # test cases for rotary scaling
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['float32'], [2], [128], [8], [8], [32], [2, 8], [False],
-                    [False], [1], [False], [10000.0, 1000000.0], [
+                    ['float32'], [''], [2], [128], [8], [8], [32], [2, 8], [1],
+                    [False], [False], [10000.0, 1000000.0], [
                         {
                             "type": "linear",
                             "factor": 3.0
@@ -145,8 +146,15 @@ class TestFunctional(unittest.TestCase):
         # test cases for StreamingLLM
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['float16'], [2], [128], [8], [4], [64], [0], [False],
-                    [False], [1], [False], [10000.0], [None], [4]))
+                    ['float16'], [''], [2], [128], [8], [4], [64], [0], [1],
+                    [False], [False], [10000.0], [None], [4]))
+
+        # test cases for fp8_context_fmha
+        test_cases += list(
+            product(['gpt2_attention'], [ContextFMHAType.enabled], ['float16'],
+                    ['fp8'], [2], [128], [8], [4], [64], [0], [1], [True],
+                    [True]))
+
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
@@ -154,30 +162,45 @@ class TestFunctional(unittest.TestCase):
                                attention_type,
                                context_fmha_type,
                                dtype,
+                               kv_cache_dtype,
                                batch_size,
                                in_len,
                                out_len,
                                num_heads,
                                head_size,
                                num_kv_heads,
-                               enable_multi_block_mmha,
-                               use_int8_kv_cache,
                                beam_width,
                                fuse_bias,
+                               use_fp8_context_fmha,
                                rope_base=10000.0,
                                rope_scaling=None,
                                sink_token_len=0):
+        use_int8_kv_cache = True if kv_cache_dtype == 'int8' else False
+        use_fp8_kv_cache = True if kv_cache_dtype == 'fp8' else False
 
+        if not (use_int8_kv_cache or use_fp8_kv_cache):
+            kv_cache_dtype = dtype
+
+        if use_fp8_kv_cache == False or context_fmha_type == ContextFMHAType.disabled:
+            use_fp8_context_fmha = False
+
+        skip_fp8_pre_ada(use_fp8_kv_cache or use_fp8_context_fmha)
         skip_bf16_pre_ampere(dtype)
         skip_fp32_accum_pre_ampere(context_fmha_type)
         skip_bf16_fp32_accum(dtype, context_fmha_type)
+
+        tolerances = {
+            'float32': 2e-3,
+            'float16': 2e-3,
+            'bfloat16': 2e-3,
+            'fp8': 3e-3,
+        }
 
         if num_kv_heads == 0:
             num_kv_heads = num_heads
 
         session = None
-        kv_cache_dtype = 'int8' if use_int8_kv_cache else dtype
-        if use_int8_kv_cache:
+        if use_int8_kv_cache or use_fp8_kv_cache:
             # Fixing seed to avoid flakiness in tests with quantization
             torch.manual_seed(42)
 
@@ -188,16 +211,31 @@ class TestFunctional(unittest.TestCase):
 
         remove_input_padding = True
 
-        def _construct_execution(
-                session, input_tensor, weight, bias,
-                host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
-                sequence_length, host_past_key_value_lengths,
-                host_max_attention_window_sizes, host_sink_token_length,
-                context_lengths, max_context_length, cache_indirection,
-                num_heads, hidden_size, num_kv_heads, output, dtype,
-                kv_int8_quant_scale, kv_int8_dequant_scale,
-                host_context_lengths, host_request_types,
-                host_runtime_perf_knobs):
+        def _construct_execution(session,
+                                 input_tensor,
+                                 weight,
+                                 bias,
+                                 host_kv_cache_block_offsets,
+                                 host_kv_cache_pool_pointers,
+                                 sequence_length,
+                                 host_past_key_value_lengths,
+                                 host_max_attention_window_sizes,
+                                 host_sink_token_length,
+                                 context_lengths,
+                                 max_context_length,
+                                 cache_indirection,
+                                 num_heads,
+                                 hidden_size,
+                                 num_kv_heads,
+                                 output,
+                                 dtype,
+                                 kv_quant_scale,
+                                 kv_dequant_scale,
+                                 host_context_lengths,
+                                 host_request_types,
+                                 host_runtime_perf_knobs,
+                                 use_fp8_context_fmha=False,
+                                 atten_output_quant_scale=None):
             kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
             head_size = hidden_size // num_heads
             # construct trt network
@@ -207,6 +245,9 @@ class TestFunctional(unittest.TestCase):
             net.plugin_config.set_context_fmha(context_fmha_type)
             net.plugin_config.remove_input_padding = True
             net.plugin_config.enable_paged_kv_cache(tokens_per_block)
+
+            if use_fp8_context_fmha:
+                net.plugin_config.use_fp8_context_fmha = True
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',
@@ -256,15 +297,22 @@ class TestFunctional(unittest.TestCase):
                     name='host_runtime_perf_knobs',
                     shape=[16],
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
-                kv_int8_quant_scale_tensor = None
-                kv_int8_dequant_scale_tensor = None
-                if use_int8_kv_cache:
-                    kv_int8_quant_scale_tensor = Tensor(
-                        name='kv_int8_quant_scale',
+                kv_quant_scale_tensor = None
+                kv_dequant_scale_tensor = None
+                if use_int8_kv_cache or use_fp8_kv_cache:
+                    kv_quant_scale_tensor = Tensor(
+                        name='kv_quant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
-                    kv_int8_dequant_scale_tensor = Tensor(
-                        name='kv_int8_dequant_scale',
+                    kv_dequant_scale_tensor = Tensor(
+                        name='kv_dequant_scale',
+                        shape=(1, ),
+                        dtype=tensorrt_llm.str_dtype_to_trt('float32'))
+
+                atten_output_quant_scale_tensor = None
+                if use_fp8_context_fmha:
+                    atten_output_quant_scale_tensor = Tensor(
+                        name='atten_output_quant_scale',
                         shape=(1, ),
                         dtype=tensorrt_llm.str_dtype_to_trt('float32'))
 
@@ -357,10 +405,14 @@ class TestFunctional(unittest.TestCase):
                     position_embedding_type=position_embedding_type,
                     rotary_inv_freq=rotary_inv_freq_cache,
                     rotary_cos_sin=rotary_cos_sin,
-                    kv_orig_quant_scale=kv_int8_quant_scale_tensor,
-                    kv_quant_orig_scale=kv_int8_dequant_scale_tensor,
+                    kv_orig_quant_scale=kv_quant_scale_tensor,
+                    kv_quant_orig_scale=kv_dequant_scale_tensor,
                     kv_cache_quant_mode=QuantMode.from_description(
-                        use_int8_kv_cache=use_int8_kv_cache),
+                        use_int8_kv_cache=use_int8_kv_cache,
+                        use_fp8_kv_cache=use_fp8_kv_cache,
+                        use_fp8_qdq=use_fp8_context_fmha),
+                    attention_output_orig_quant_scale=
+                    atten_output_quant_scale_tensor,
                     max_context_length=max_context_length,
                     kv_cache_block_offsets=kv_cache_block_offsets_tensor,
                     host_kv_cache_block_offsets=
@@ -371,9 +423,12 @@ class TestFunctional(unittest.TestCase):
                     qkv_bias=qkv_bias,
                     host_runtime_perf_knobs=host_runtime_perf_knobs_tensor)
 
-                net._mark_output(outputs[0],
-                                 'output',
-                                 dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+                output_dtype = 'fp8' if use_fp8_context_fmha else dtype
+
+                net._mark_output(
+                    outputs[0],
+                    'output',
+                    dtype=tensorrt_llm.str_dtype_to_trt(output_dtype))
 
             inputs = {
                 'input': input_tensor,
@@ -390,9 +445,12 @@ class TestFunctional(unittest.TestCase):
                 'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers,
                 'host_runtime_perf_knobs': host_runtime_perf_knobs
             }
-            if use_int8_kv_cache:
-                inputs['kv_int8_quant_scale'] = kv_int8_quant_scale
-                inputs['kv_int8_dequant_scale'] = kv_int8_dequant_scale
+            if use_int8_kv_cache or use_fp8_kv_cache:
+                inputs['kv_quant_scale'] = kv_quant_scale
+                inputs['kv_dequant_scale'] = kv_dequant_scale
+
+            if use_fp8_context_fmha:
+                inputs['atten_output_quant_scale'] = atten_output_quant_scale
 
             if remove_input_padding:
                 inputs['host_context_lengths'] = host_context_lengths
@@ -401,13 +459,15 @@ class TestFunctional(unittest.TestCase):
                 'output': output,
             }
 
-            stream = torch.cuda.current_stream()
+            stream = torch.cuda.Stream()
             # NOTE: since we use int8 only for paged_kv_cache no int8 tensors are visible to TRT
             int8_trt_flag = False
-            builder_config = builder.create_builder_config(name=attention_type,
-                                                           precision=dtype,
-                                                           opt_level=0,
-                                                           int8=int8_trt_flag)
+            builder_config = builder.create_builder_config(
+                name=attention_type,
+                precision=dtype,
+                opt_level=0,
+                fp8=use_fp8_context_fmha,
+                int8=int8_trt_flag)
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -439,8 +499,6 @@ class TestFunctional(unittest.TestCase):
         shape_dict = {
             'weight': (hidden_size, qkv_hidden_size),
             'bias': (qkv_hidden_size, ),
-            'kv_int8_quant_scale': (1, ),
-            'kv_int8_dequant_scale': (1, ),
             'cache_indirection': (num_req, beam_width, max_seq_len),
             'past_key_value':
             (num_blocks, 2, plugin_kv_num_heads, tokens_per_block, head_size)
@@ -471,14 +529,6 @@ class TestFunctional(unittest.TestCase):
             in_len_req = in_lens[req_idx]
             for iteration in range(1, beam_width):
                 cache_indirection[req_idx, iteration, in_len_req:] = iteration
-
-        kv_int8_dequant_scale = torch.randint(
-            1,
-            10,
-            shape_dict['kv_int8_dequant_scale'],
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(kv_cache_dtype),
-            device='cuda') * 0.0001
-        kv_int8_quant_scale = 1.0 / kv_int8_dequant_scale
 
         ConfigCls = None
         AttentionCls = None
@@ -802,12 +852,7 @@ class TestFunctional(unittest.TestCase):
 
             # Get arrays of pointers to the "pages" of KV values
             offset_array = kv_cache_manager.get_block_offsets(beam_width)
-
-            print("offset_array", offset_array)
-
             dense_offset_array = offset_array[sequence_selection]
-
-            print("dense_offset_array", dense_offset_array)
 
             host_input_lengths = np.concatenate(input_length_list)
             host_input_lengths = torch.tensor(host_input_lengths,
@@ -841,8 +886,8 @@ class TestFunctional(unittest.TestCase):
             generation_host_runtime_perf_knobs = torch.tensor(
                 [-1] * perf_knob_tensor_size, dtype=torch.int64, device='cpu')
 
-            if enable_multi_block_mmha:
-                generation_host_runtime_perf_knobs[0] = 1  # multi_block_mode
+            generation_host_runtime_perf_knobs[
+                0] = 1  # multi_block_mode is default on
             if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 generation_host_runtime_perf_knobs[
                     1] = 1  # enable_context_fmha_fp32_acc
@@ -859,8 +904,6 @@ class TestFunctional(unittest.TestCase):
                 'cache_indir': (num_req, beam_width, max_seq_len),
                 'block_pointers': (num_req, beam_width, 2, max_blocks_per_seq),
                 'host_request_type': (num_seq),
-                'kv_int8_quant_scale': (1, ),
-                'kv_int8_dequant_scale': (1, )
             }
 
             input_tensor = torch.randn(
@@ -868,24 +911,16 @@ class TestFunctional(unittest.TestCase):
                 dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                 device='cuda') * 1e-3
 
+            output_dtype = 'fp8' if use_fp8_context_fmha else dtype
             output = torch.zeros(
+                local_shape_dict['output'],
+                dtype=tensorrt_llm._utils.str_dtype_to_torch(output_dtype),
+                device='cuda')
+
+            output_ref = torch.zeros(
                 local_shape_dict['output'],
                 dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                 device='cuda')
-
-            session, output = _construct_execution(
-                session, input_tensor, weight_plugin, bias_plugin,
-                dense_offset_array, host_kv_cache_pool_pointers,
-                sequence_lengths, host_past_key_value_lengths,
-                host_max_attention_window_sizes, host_sink_token_length,
-                context_lengths, max_context_length, cache_indirection,
-                num_heads, hidden_size, num_kv_heads, output, dtype,
-                kv_int8_quant_scale, kv_int8_dequant_scale,
-                host_context_lengths, host_request_types,
-                generation_host_runtime_perf_knobs)
-
-            del session
-            session = None
 
             for req_idx in batch_req_ids:
                 step = get_step(req_idx)
@@ -907,6 +942,8 @@ class TestFunctional(unittest.TestCase):
                         dim=-1).contiguous()
 
             offset = 0
+            max_kv_cache = 0
+            max_output = 0
             for i, req_idx in enumerate(batch_req_ids):
                 step = get_step(req_idx)
                 assert is_valid_step(step)
@@ -945,17 +982,68 @@ class TestFunctional(unittest.TestCase):
                 if attention_type == 'llama_attention':
                     torch_cache_list[req_idx] = past_key_values.to_legacy_cache(
                     )
+                    past_key_values = torch_cache_list[req_idx][0]
                 else:
                     torch_cache_list[req_idx] = past_key_values
 
-                np.testing.assert_allclose(
-                    (output[offset:offset_next, :] if remove_input_padding else
-                     output[:, offset:offset_next, :]).reshape(
-                         (local_beam_width, input_length,
-                          hidden_size)).cpu().numpy(),
-                    torch_out.cpu().numpy(),
-                    atol=1e-3 if step == 0 else 2E-3)
+                if use_fp8_kv_cache or use_int8_kv_cache:
+                    max_kv_cache = max(
+                        max_kv_cache,
+                        torch.concat((past_key_values[0],
+                                      past_key_values[1])).abs().max().item())
+
+                if use_fp8_context_fmha:
+                    max_output = max(max_output, torch_out.abs().max().item())
+
+                output_ref[offset:offset_next, :] = torch_out.reshape(
+                    (offset_next - offset, -1))
                 offset = offset_next
+
+            kv_dequant_scale = None
+            kv_quant_scale = None
+
+            if use_fp8_kv_cache:
+                kv_dequant_scale = torch.tensor([max_kv_cache],
+                                                device='cuda').float() / 440.
+                kv_quant_scale = 1.0 / kv_dequant_scale
+            elif use_int8_kv_cache:
+                kv_dequant_scale = torch.tensor([max_kv_cache],
+                                                device='cuda').float() / 127.
+                kv_quant_scale = 1.0 / kv_dequant_scale
+
+            atten_output_dequant_scale = None
+            atten_output_quant_scale = None
+
+            if use_fp8_context_fmha:
+                atten_output_dequant_scale = torch.tensor(
+                    [max_output], device='cuda').float() / 440.
+                atten_output_quant_scale = 1.0 / atten_output_dequant_scale
+
+            session, output = _construct_execution(
+                session, input_tensor, weight_plugin, bias_plugin,
+                dense_offset_array, host_kv_cache_pool_pointers,
+                sequence_lengths, host_past_key_value_lengths,
+                host_max_attention_window_sizes, host_sink_token_length,
+                context_lengths, max_context_length, cache_indirection,
+                num_heads, hidden_size, num_kv_heads, output, dtype,
+                kv_quant_scale, kv_dequant_scale, host_context_lengths,
+                host_request_types, generation_host_runtime_perf_knobs,
+                use_fp8_context_fmha, atten_output_quant_scale)
+
+            del session
+            session = None
+
+            if use_fp8_context_fmha:
+                output = output.to(
+                    output_ref.dtype) * atten_output_dequant_scale
+                output = output.to(output_ref.dtype)
+
+            torch.testing.assert_close(
+                output,
+                output_ref,
+                rtol=tolerances[output_dtype],
+                atol=tolerances[output_dtype],
+            )
 
             # Due to the design of the test we do not remove finished sequences, but keep them as "none" instead
             cache_num_req = min(iteration + 1, num_req)

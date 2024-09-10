@@ -10,6 +10,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
+from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import TensorInfo
@@ -120,6 +121,23 @@ def skip_bf16_fp32_accum(dtype, context_fmha_type):
         pytest.skip(
             "bfloat16 Context FMHA will always accumulate on FP32, so it has been tested with ContextFMHAType.enabled"
         )
+
+
+skip_single_gpu = pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="The test needs at least 2 GPUs, skipping")
+
+
+def skip_less_than_memory(required_memory: int):
+    memory = get_total_gpu_memory(0)
+    return pytest.mark.skipif(
+        required_memory > memory,
+        reason=
+        f'Not enough GPU memory for this test (wanted {required_memory}, have {memory})'
+    )
+
+
+skip_less_than_40gb_memory = skip_less_than_memory(40 * 1024 * 1024 * 1024)
 
 
 def modelopt_installed():

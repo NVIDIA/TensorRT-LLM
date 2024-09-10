@@ -75,7 +75,10 @@ def parse_args():
     )
     parser.add_argument(
         '--multi_block_mode',
-        action='store_true',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )

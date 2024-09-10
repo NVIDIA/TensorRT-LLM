@@ -275,7 +275,10 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--multi_block_mode',
-        action='store_true',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
@@ -344,10 +347,10 @@ def add_common_args(parser):
         '--lookahead_config',
         type=str,
         default=None,
-        help="lookahead config to use, if not none, will use lookahead decoding."
+        help=
+        "executor and request lookahead config to use, if not none, will use lookahead decoding."
         "   E.g.: [5, 6, 7] for [max_window_size, max_ngram_size, max_verification_set_size]."
     )
-
     # model arguments
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument(

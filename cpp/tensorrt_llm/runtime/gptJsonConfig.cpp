@@ -165,6 +165,14 @@ ModelConfig createModelConfig(
     // only enable cross attention for the decoder in encoder-decoder model
     // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
     auto const useCrossAttention = arch == std::string("DecoderModel") ? true : false;
+    if (useCrossAttention)
+    {
+        // For an encoder-decoder model, this would be overwritten in executorImpl.cpp with correct encoder config
+        // The parameters set here will only be used when encoder model is skipped for enc-dec models
+        TLLM_LOG_INFO("Setting encoder max input length and hidden size for accepting visual features.");
+        modelConfig.setMaxEncoderLen(json.at("build_config").at("max_encoder_input_len").template get<SizeType32>());
+        modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
+    }
     auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
     auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
     modelConfig.setUseCrossAttention(useCrossAttention);

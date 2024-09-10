@@ -311,3 +311,85 @@ However, similar to any new model, you can follow the same approach to define yo
 This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read [the ReDrafter paper](https://arxiv.org/html/2403.09919v1).
 
 TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as `explicit_draft_tokens`. Please, visit the [ReDrafter README](../../examples/redrafter/README.md) for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.
+
+# Lookahead decoding
+
+## Overview
+
+Lookahead is a general feature of all LLM models. This tutorial uses vicuna-7b-v1.3 as an example. Some models may have limitations to apply this Lookahead feature, known as specific XQA support.
+
+Lookahead algorithm depends on a tuple of `(windows_size, ngram_size, verification_set_size)`. TensorRT-LLM needs to specify the Lookahead configurations in three places:
+
+1. *The built model engine*.
+
+To build an engine with Lookahead support, `--specualtive_decoding_mode lookahead_decoding` must be specified.
+
+When building the engine for speculative decoding, including Lookahead, `--max_draft_len` must be provided. For Lookahead, the `max_draft_len` is defined as:
+```python
+def max_draft_len(windows_size, ngram_size, verification_set_size):
+    return (0 if (ngran_size==1) else ngram_size - 2)
+        + (windows_size - 1 + verification_set_size) * (ngram_size - 1)
+```
+
+2. *The TensorRT-LLM runtime program*.
+When TensorRT-LLM starts, it needs to reserve resources according to an `executor_lookahead_config`. The configuration should be equal to the config in the engine-building phase. The executor lookahead configuration is noted as `(W, N, G)`.
+
+3. *The request*.
+Each request can be assigned a specific lookahead configuration when input to the execution engine, noted as `(w, n, g)`. If none is assigned, the executor config is used. The request lookahead config is valid and fixed along the request lifecycle. The minimum Lookahead config is `(1, 1, 0)`, meaning only one Jacobi window, ngram size one, and no verification candidates, which is automatically degenerated to normal mode. The meaningful minimum configuration is `(2, 2, 1)`. It is required that the request lookahead config and executor config satisfy `w <= W, n <= N, g <= G`.
+
+## Build and execute an engine from a model
+
+Vicuna models re-use Llmama Python scripts located in [examples/llama](../../examples/llama).
+
+### Convert a model to checkpoint
+```bash
+MODEL_DIR=/path/to/vicuna-7b-v1.3
+ENGINE_DIR=tmp/engine
+CKPT_DIR=tmp/engine/ckpt
+
+python3 examples/llama/convert_checkpoint.py \
+--model_dir=$MODEL_DIR                       \
+--output_dir=$CKPT_DIR                       \
+--dtype=float16                              \
+--tp_size=1                                  \
+--pp_size=1
+```
+
+### Build checkpoints for an engine
+```bash
+trtllm-build                   \
+--checkpoint_dir=$CKPT_DIR     \
+--output_dir=$ENGINE_DIR       \
+--gpt_attention_plugin=float16 \
+--gemm_plugin=float16          \
+--max_batch_size=32            \
+--max_input_len=1024           \
+--max_seq_len=2048             \
+--max_beam_width=1             \
+--log_level=error              \
+--max_draft_len=83             \
+--speculative_decoding_mode=lookahead_decoding
+```
+
+### Execute an engine
+
+Run `examples/run.py` to generate sequences.
+```bash
+python examples/run.py              \
+--max_output_len=32                 \
+--lookahead_config=[7,7,7]          \
+--tokenizer_dir=$MODEL_DIR          \
+--engine_dir= $ENGINE_DIR           \
+--log_levelverbose--input_text 'Once upon' 'To be, or not' 'Be not afraid of greatness'
+```
+
+Run `examples/summarize.py` to summarize the CNN daily dataset.
+```bash
+python examples/summarize.py         \
+--test_trt_llm                       \
+--hf_model_dir$MODEL_DIR             \
+--data_type fp16                     \
+--engine_dir$ENGINE_DIR              \
+--lookahead_config= [7,7,7]          \
+--test_hf
+```

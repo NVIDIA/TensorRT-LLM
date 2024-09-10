@@ -5,14 +5,13 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import List, Union
 
 import safetensors.torch
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
-from transformers.utils import CONFIG_NAME
-from transformers.utils.hub import cached_file
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -20,8 +19,19 @@ from tensorrt_llm.models.convert_utils import (iterate_shard_files,
                                                load_state_dict)
 
 
+class CheckpointType(str, Enum):
+    mistral_inference = "mistral_inference"
+    state_spaces = "state_spaces"
+    hf = "hf"
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt_type",
+                        type=CheckpointType,
+                        choices=list(CheckpointType),
+                        default=CheckpointType.hf,
+                        help='Checkpoint type')
     parser.add_argument('--model_dir', type=Path, default=None)
     parser.add_argument("--world_size",
                         type=int,
@@ -305,8 +315,8 @@ class MambaConfig:
     state_size: int = 128
     conv_kernel: int = 4
     use_bias: bool = False
-    headdim: int = 64
-    ngroups: int = 1
+    head_dim: int = 64
+    n_groups: int = 1
     chunk_size: int = 256
     ssm_rmsnorm: bool = True
 
@@ -314,18 +324,13 @@ class MambaConfig:
         self.__dict__.update(data_dict)
 
 
-def load_config_hf(model_name):
-    resolved_archive_file = cached_file(
-        model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
-    if resolved_archive_file is None:
-        resolved_archive_file = os.path.join(model_name, 'params.json')
-    config = json.load(open(resolved_archive_file))
-    if 'transformers_version' in config:  # transformer compatible models
+def load_config_hf(model_name, ckpt_type):
+    if ckpt_type == CheckpointType.hf:  # transformer compatible models
         hf_config = AutoConfig.from_pretrained(model_name,
                                                trust_remote_code=True)
-        # TODO: change mamba_version when transformers can support Mamba2 models
-        mamba_version = 'Mamba1'
-    elif 'ssm_cfg' in config:  # state-spaces/mamba models
+        mamba_version = 'Mamba2' if hf_config.model_type == 'mamba2' else 'Mamba1'
+    elif ckpt_type == CheckpointType.state_spaces:  # state-spaces/mamba models
+        config = json.load(open(os.path.join(model_name, 'config.json')))
         ssm_cfg = config.pop('ssm_cfg')
         cfg_to_mamba_cfg = {
             'd_model': 'hidden_size',
@@ -337,8 +342,8 @@ def load_config_hf(model_name):
             'd_state': 'state_size',
             'd_conv': 'conv_kernel',
             'bias': 'use_bias',
-            'headdim': 'headdim',
-            'ngroups': 'ngroups',
+            'headdim': 'head_dim',
+            'ngroups': 'n_groups',
             'chunk_size': 'chunk_size',
             'rmsnorm': 'ssm_rmsnorm',
         }
@@ -357,11 +362,12 @@ def load_config_hf(model_name):
         else:
             hf_config.intermediate_size = 2 * hf_config.hidden_size
         mamba_version = ssm_cfg.pop("layer", "Mamba1")
-    else:  # mistral format
+    elif ckpt_type == CheckpointType.mistral_inference:  # mistral inference format
+        config = json.load(open(os.path.join(model_name, 'params.json')))
         cfg_to_mamba_cfg = {
             'dim': 'hidden_size',
             'n_layers': 'num_hidden_layers',
-            'n_groups': 'ngroups',
+            'n_groups': 'n_groups',
             'fused_add_norm': None,
             'tie_embeddings': None,
             'model_type': None,
@@ -390,16 +396,16 @@ def main():
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
 
-    hf_config, mamba_version = load_config_hf(args.model_dir)
+    hf_config, mamba_version = load_config_hf(args.model_dir, args.ckpt_type)
 
     vocab_size = hf_config.vocab_size
-    pad_vocab_size_multiple = hf_config.pad_vocab_size_multiple
+    pad_vocab_size_multiple = getattr(hf_config, "pad_vocab_size_multiple", 1)
     if vocab_size % pad_vocab_size_multiple != 0:
         vocab_size += pad_vocab_size_multiple - (vocab_size %
                                                  pad_vocab_size_multiple)
 
     config = {
-        'architecture': hf_config.architectures[0],
+        'architecture': 'MambaForCausalLM',
         'dtype': args.dtype,
         'logits_dtype': 'float32',
         'hidden_size': hf_config.hidden_size,
@@ -408,7 +414,7 @@ def main():
         'vocab_size': vocab_size,
         'rms_norm': hf_config.rms_norm,
         'residual_in_fp32': hf_config.residual_in_fp32,
-        'pad_vocab_size_multiple': hf_config.pad_vocab_size_multiple,
+        'pad_vocab_size_multiple': pad_vocab_size_multiple,
         'hidden_act': 'silu',
         'num_attention_heads': args.world_size,
         'rnn_hidden_size': hf_config.intermediate_size,
@@ -424,13 +430,14 @@ def main():
         },
     }
     if mamba_version == 'Mamba2':
-        conv_dim = hf_config.intermediate_size + 2 * hf_config.ngroups * hf_config.state_size
+        conv_dim = hf_config.intermediate_size + 2 * hf_config.n_groups * hf_config.state_size
+        ssm_rmsnorm = getattr(hf_config, "ssm_rmsnorm", hf_config.rms_norm)
         mamba2_cfg = {
-            'rnn_head_size': hf_config.headdim,
+            'rnn_head_size': hf_config.head_dim,
             'rnn_conv_dim_size': conv_dim,
-            'ngroups': hf_config.ngroups,
+            'ngroups': hf_config.n_groups,
             'chunk_size': hf_config.chunk_size,
-            'ssm_rmsnorm': hf_config.ssm_rmsnorm,
+            'ssm_rmsnorm': ssm_rmsnorm,
         }
         config.update(mamba2_cfg)
 
