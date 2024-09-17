@@ -711,4 +711,95 @@ void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, 
 }
 
 } // namespace kernels
+
+namespace runtime::kernels
+{
+// Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
+void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput, BufferManager const& manager,
+    SamplingConfig const& samplingConfig)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto& finalOutputIds = *decodingOutput.gatheredIds;
+    auto const& finalOutputIdsShape = finalOutputIds.getShape();
+    auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
+    auto const batchSize = finalOutputIdsShape.d[0];
+    auto const beamWidth = finalOutputIdsShape.d[1];
+    auto const maxSeqLength = finalOutputIdsShape.d[2];
+
+    TLLM_CHECK_WITH_INFO(beamWidth > 1, "gatherTree is only needed for beam search.");
+
+    TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[0] == batchSize,
+        common::fmtstr("Decoder batch size (" FMT_DIM ") does not match final batch size (" FMT_DIM ")",
+            decodingOutputIdsShape.d[0], batchSize));
+    TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[1] == beamWidth,
+        common::fmtstr("Decoder beam width (" FMT_DIM ") does not match final beam width (" FMT_DIM ")",
+            decodingOutputIdsShape.d[1], beamWidth));
+    TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[2] <= maxSeqLength,
+        common::fmtstr("Decoder seq length size (" FMT_DIM ") is too large for final seq length (" FMT_DIM ")",
+            decodingOutputIdsShape.d[2], maxSeqLength));
+
+    auto const& stream = manager.getStream().get();
+
+    // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
+    tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
+        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
+    sync_check_cuda_error();
+
+    std::vector<float> lengthPenaltyVec;
+    auto lengthPenaltyPtr = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
+    if (!samplingConfig.lengthPenalty.has_value() || samplingConfig.lengthPenalty.value().size() == 0)
+    {
+        lengthPenaltyVec = std::vector<float>(batchSize, 1.0f);
+    }
+    else if (long int const size = samplingConfig.lengthPenalty.value().size(); size == 1)
+    {
+        lengthPenaltyVec = std::vector<float>(batchSize, samplingConfig.lengthPenalty.value()[0]);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(size == batchSize,
+            common::fmtstr("Size of lengthPenalty in SamplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
+                           ")",
+                size, batchSize));
+        lengthPenaltyVec = samplingConfig.lengthPenalty.value();
+    }
+
+    lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);
+
+    tensorrt_llm::kernels::BeamHypotheses bh;
+    bh.nMaxBatchSize = batchSize;
+    bh.nBatchSize = batchSize;
+    bh.nBeamWidth = beamWidth;
+    bh.nMaxSeqLen = maxSeqLength;
+    bh.lengthPenalties = bufferCast<float>(*lengthPenaltyPtr);
+    bh.inputLengths = bufferCast<SizeType32>(*decodingInput.lengths);
+    bh.outputIds = bufferCast<TokenIdType>(finalOutputIds);
+    bh.logProbs = bufferCastOrNull<float>(decodingOutput.logProbs);
+    bh.logProbsTiled = bufferCast<float>(*decodingOutput.logProbsTiled);
+    bh.sequenceLengths = bufferCast<SizeType32>(*decodingOutput.lengths);
+    bh.cumLogProbs = bufferCast<float>(*decodingOutput.cumLogProbs);
+    bh.outputIdsCBA = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsCBA);
+    bh.logProbsCBA = bufferCast<float>(*decodingOutput.beamHypotheses.logProbsCBA);
+    bh.sequenceLengthsCBA = bufferCast<SizeType32>(*decodingOutput.beamHypotheses.sequenceLengthsCBA);
+    bh.cumLogProbsCBA = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbsCBA);
+    bh.normedScoresCBA = bufferCast<float>(*decodingOutput.beamHypotheses.normedScoresCBA);
+    bh.numBeamsCBA = bufferCast<SizeType32>(*decodingOutput.beamHypotheses.numBeamsCBA);
+    bh.minNormedScoresCBA = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScoresCBA);
+    bh.batchDones = bufferCast<bool>(*decodingOutput.beamHypotheses.batchDones);
+    bh.finished = bufferCast<tensorrt_llm::kernels::FinishedState>(*decodingOutput.finishReasons);
+    bh.outputIdsUnfinish = bufferCast<TokenIdType>(*decodingOutput.ids);
+    bh.parentIdsUnfinish = bufferCast<TokenIdType>(*decodingOutput.parentIds);
+
+    // This is where transpose is done
+    tensorrt_llm::kernels::invokeInsertUnfinishedPath(bh, stream);
+    sync_check_cuda_error();
+
+    tensorrt_llm::kernels::invokeFinalize(bh, stream);
+    sync_check_cuda_error();
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+} // namespace runtime::kernels
+
 } // namespace tensorrt_llm

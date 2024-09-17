@@ -1458,6 +1458,7 @@ def test_request_stats():
         "avgNumDecodedTokensPerIter"] == stats.avg_num_decoded_tokens_per_iter
     assert stats_json["scheduled"] == stats.scheduled
     assert stats_json["paused"] == stats.paused
+    assert stats_json["disServingStats"] is None
 
 
 def test_request_stats_per_iteration():

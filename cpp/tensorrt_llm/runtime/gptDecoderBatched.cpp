@@ -127,6 +127,8 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
     dOutput->finishReasons
         = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
+    dOutput->logProbsTiled = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<float>::value);
+
     mNumDraftTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     mCurandStates = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT8);
     mDraftTokenIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
@@ -322,6 +324,9 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     {
         dOutput.beamHypotheses.reshape(maxBatchSize, maxBeamWidth, mMaxSequenceLength);
     }
+
+    dOutput.logProbsTiled->reshape(ITensor::makeShape({maxSequenceLength, maxBatchSize, maxBeamWidth}));
+    mBufferManager.setZero(*dOutput.logProbsTiled);
 
     // speculative decoding only works for beam width == 1
     mDraftTokenIds->reshape(maxBatchSizeXmaxTokensPerStep);
@@ -1060,7 +1065,6 @@ CudaEvent GptDecoderBatched::postProcessRequest(
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto& stream = mRuntimeStream;
-    auto& decoder = *mDecoder;
     auto manager = BufferManager{stream};
 
     auto& dJointInput = *mJointDecodingInput;
@@ -1093,7 +1097,7 @@ CudaEvent GptDecoderBatched::postProcessRequest(
     TLLM_CHECK(dOutput.newTokens->getShape().d[0] == 1);
     dOutput.newTokens->squeeze(0);
     dOutput.newTokens = ITensor::slice(dOutput.newTokens, batchSlot, 1);
-
+    dOutput.logProbsTiled = dJointOutput.logProbsTiled;
     if (streaming)
     {
         // in case of streaming we shouldn't overwrite the data in beamHypotheses, since the beam search kernels expect
@@ -1105,7 +1109,7 @@ CudaEvent GptDecoderBatched::postProcessRequest(
         dOutput.cumLogProbs = mCumLogProbsTmp;
     }
 
-    decoder.gatherTree(dOutput, dInput, manager, samplingConfig);
+    kernels::gatherTree(dOutput, dInput, manager, samplingConfig);
 
     CudaEvent event{};
     stream->record(event);

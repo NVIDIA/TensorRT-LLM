@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -1152,6 +1153,11 @@ public:
         return mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY;
     }
 
+    [[nodiscard]] bool isGenerationOnlyRequest() const noexcept
+    {
+        return mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY;
+    }
+
     void setContextCurrentPosition(SizeType32 contextCurrentPosition)
     {
         mContextCurrentPosition = contextCurrentPosition;
@@ -1372,6 +1378,23 @@ public:
         mDecodingIter = iter;
     }
 
+    void setKvCacheTransferStart(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    {
+        mKvCacheTransferStart = time;
+    }
+
+    void setKvCacheTransferEnd(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    {
+        mKvCacheTransferEnd = time;
+    }
+
+    [[nodiscard]] double getKvCacheTransferTimeMS() const
+    {
+        // get max with 0 in case this function is called while end time is not recorded
+        return std::max(
+            0.0, std::chrono::duration<double, std::milli>(mKvCacheTransferEnd - mKvCacheTransferStart).count());
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1475,6 +1498,9 @@ protected:
     std::vector<RequestPtr> mChildRequests;
     RequestIdType mParentRequestId;
     std::shared_ptr<std::vector<bool>> mSequenceFinalVec; // Indicators whether each sibling completes generation.
+
+    std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferStart;
+    std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferEnd;
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)

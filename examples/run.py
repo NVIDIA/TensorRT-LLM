@@ -54,6 +54,19 @@ def parse_arguments(args=None):
     parser.add_argument('--multimodal_input_file',
                         type=str,
                         help='Path to multimodal input file.')
+    parser.add_argument(
+        '--input_token_extra_ids',
+        type=int,
+        nargs='+',
+        help=
+        'Input token extra ids for using p-tuning and KV Cache reuse together (only available with cpp session).',
+        default=None)
+    parser.add_argument(
+        '--input_token_extra_ids_file',
+        type=str,
+        help=
+        'CSV or Numpy file containing input token extra ids file. Alternative to text input (only available with cpp session).',
+        default=None)
     parser.add_argument('--output_csv',
                         type=str,
                         help='CSV file where the tokenized output is stored.',
@@ -155,6 +168,33 @@ def parse_input(tokenizer,
         torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
     ]
     return batch_input_ids
+
+
+def parse_input_token_extra_ids(prompt_table_path, kv_cache_enable_block_reuse,
+                                input_token_extra_ids,
+                                input_token_extra_ids_file, max_input_length):
+    batch_extra_ids = None
+    if prompt_table_path and kv_cache_enable_block_reuse:
+        assert input_token_extra_ids or input_token_extra_ids_file, \
+            "Input token extra ids must be provided when p-tuning and KV Cache reuse are both enabled"
+        batch_extra_ids = []
+        if input_token_extra_ids_file:
+            if input_token_extra_ids_file.endswith('.csv'):
+                with open(input_token_extra_ids_file, 'r') as csv_file:
+                    csv_reader = csv.reader(csv_file, delimiter=',')
+                    for line in csv_reader:
+                        extra_ids = [int(num) for num in line]
+                        batch_extra_ids.append(extra_ids[-max_input_length:])
+            elif input_token_extra_ids_file.endswith('.npy'):
+                inputs = np.load(input_token_extra_ids_file)
+                for extra_ids in inputs:
+                    batch_extra_ids.append(extra_ids[-max_input_length:])
+            else:
+                print('Input file format not supported.')
+                raise SystemExit
+        else:
+            batch_extra_ids.append(input_token_extra_ids)
+    return batch_extra_ids
 
 
 def print_output(tokenizer,
@@ -312,6 +352,11 @@ def main(args):
             batch_input_ids, model_name, args.engine_dir,
             args.multimodal_input_file)
 
+    input_token_extra_ids = parse_input_token_extra_ids(
+        args.prompt_table_path, args.kv_cache_enable_block_reuse,
+        args.input_token_extra_ids, args.input_token_extra_ids_file,
+        args.max_input_length)
+
     input_lengths = [x.size(0) for x in decoder_input_ids
                      ] if is_enc_dec else [x.size(0) for x in batch_input_ids]
 
@@ -426,7 +471,8 @@ def main(args):
             no_repeat_ngram_size=args.no_repeat_ngram_size,
             return_dict=True,
             medusa_choices=args.medusa_choices,
-            return_all_generated_tokens=args.return_all_generated_tokens)
+            return_all_generated_tokens=args.return_all_generated_tokens,
+            input_token_extra_ids=input_token_extra_ids)
         torch.cuda.synchronize()
 
     if args.streaming:
@@ -515,8 +561,9 @@ def main(args):
                     streaming=args.streaming,
                     output_sequence_lengths=True,
                     return_dict=True,
-                    return_all_generated_tokens=args.return_all_generated_tokens
-                )
+                    return_all_generated_tokens=args.
+                    return_all_generated_tokens,
+                    input_token_extra_ids=input_token_extra_ids)
                 torch.cuda.synchronize()
 
         tensorrt_llm.profiler.start("tmp")
@@ -549,8 +596,9 @@ def main(args):
                     streaming=args.streaming,
                     output_sequence_lengths=True,
                     return_dict=True,
-                    return_all_generated_tokens=args.return_all_generated_tokens
-                )
+                    return_all_generated_tokens=args.
+                    return_all_generated_tokens,
+                    input_token_extra_ids=input_token_extra_ids)
                 torch.cuda.synchronize()
         tensorrt_llm.profiler.stop("tmp")
 

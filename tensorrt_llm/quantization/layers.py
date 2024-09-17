@@ -1435,14 +1435,16 @@ class FP8RowLinear(RowLinear):
                  dtype=None,
                  tp_group=None,
                  tp_size=1,
-                 prefer_managed_weight=True):
+                 prefer_managed_weight=True,
+                 is_expert=False):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         prefer_managed_weight=prefer_managed_weight)
+                         prefer_managed_weight=prefer_managed_weight,
+                         is_expert=is_expert)
         self.weight = Parameter(
             shape=(self.out_features, self.in_features),
             dtype="fp8",

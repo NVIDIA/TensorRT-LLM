@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send, sigmoid
+from ...functional import Tensor, allreduce, recv, send, sigmoid
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, RowLinear)
 from ...layers.moe import MOEWeightWrapper
@@ -45,7 +45,7 @@ class QWenDecoderLayer(Module):
         self.config = config
 
         dtype = config.dtype
-        tp_group = config.mapping.tp_group
+        self.tp_group = config.mapping.tp_group
         tp_size = config.mapping.tp_size
 
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
@@ -67,7 +67,7 @@ class QWenDecoderLayer(Module):
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
-            tp_group=tp_group,
+            tp_group=self.tp_group,
             tp_size=tp_size,
             quant_mode=config.quant_mode,
             dense_bias=False)
@@ -88,15 +88,17 @@ class QWenDecoderLayer(Module):
                 hidden_act=config.hidden_act,
                 dtype=dtype,
                 bias=False,
-                tp_group=tp_group,
+                tp_group=self.tp_group,
                 tp_size=tp_size,
-                quant_mode=config.quant_mode)
+                quant_mode=config.quant_mode,
+                is_expert=True)
             self.shared_expert_gate = RowLinear(config.hidden_size,
                                                 1,
                                                 bias=False,
                                                 dtype=dtype,
                                                 tp_group=None,
                                                 tp_size=1)
+            mlp_kwargs['use_all_reduce'] = False
 
         # Qwen's real inter_size depends on qwen_type
         if self.config.qwen_type == 'qwen':
@@ -111,7 +113,7 @@ class QWenDecoderLayer(Module):
                           hidden_act=config.hidden_act,
                           dtype=dtype,
                           bias=config.mlp_bias,
-                          tp_group=tp_group,
+                          tp_group=self.tp_group,
                           tp_size=tp_size,
                           quant_mode=config.quant_mode,
                           **mlp_kwargs)
@@ -165,6 +167,7 @@ class QWenDecoderLayer(Module):
 
         if shared_output is not None:
             hidden_states = hidden_states + shared_output
+            hidden_states = allreduce(hidden_states, self.tp_group)
 
         hidden_states = residual + hidden_states
         if use_cache:

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import numpy as np
-import tensorrt as trt
 
 # isort: off
 import torch

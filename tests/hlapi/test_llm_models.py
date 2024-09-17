@@ -3,12 +3,12 @@ import subprocess
 import pytest
 
 from tensorrt_llm import BuildConfig, SamplingParams
-from tensorrt_llm.hlapi import QuantAlgo, QuantConfig
+from tensorrt_llm.hlapi import CalibConfig, QuantAlgo, QuantConfig
 
 try:
-    from .test_llm import get_model_path, llm_test_harness
+    from .test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
 except ImportError:
-    from test_llm import get_model_path, llm_test_harness
+    from test_llm import get_model_path, llm_test_harness, cnn_dailymail_path
 
 import os
 import sys
@@ -51,11 +51,13 @@ def test_llm_gptj():
 @force_ampere
 def test_llm_gptj_int4_weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(gptj_model_path,
                      inputs=["A B C"],
                      references=["D E F G H I J K L M"],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @force_ampere
@@ -71,32 +73,38 @@ def test_llm_gpt2_sq():
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
         kv_cache_quant_algo=QuantAlgo.INT8)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(gpt2_model_path,
                      inputs=["A B C"],
                      references=["D E F G H I J K L M"],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @force_ampere
 def test_llm_gpt2_int8_weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16,
                                kv_cache_quant_algo=QuantAlgo.INT8)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(gpt2_model_path,
                      inputs=["A B C"],
                      references=["D E F G H I J K L M"],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @skip_pre_hopper
 def test_llm_gpt2_fp8():
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(gpt2_model_path,
                      inputs=["A B C"],
                      references=["D E F G H I J K L M"],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @force_ampere
@@ -110,11 +118,13 @@ def test_llm_starcoder2():
 @skip_pre_hopper
 def test_llm_starcoder2_fp8():
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(starcoder2_model_path,
                      inputs=["def print_hello_world():"],
                      references=['\n    print("Hello World")\n\ndef print'],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 def test_llm_phi_1_5():
@@ -172,12 +182,14 @@ def test_llm_falcon():
 @force_ampere
 def test_llm_falcon_int4_weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(falcon_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
                      quant_config=quant_config,
-                     build_config=BuildConfig(strongly_typed=False))
+                     build_config=BuildConfig(strongly_typed=False),
+                     calib_config=calib_config)
 
 
 @force_ampere
@@ -191,11 +203,13 @@ def test_llm_gemma_2b():
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4575937")
 def test_llm_gemma_2b_int4weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(gemma_2b_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @force_ampere
@@ -251,11 +265,13 @@ def test_llm_baichuan2_13b():
 @force_ampere
 def test_llm_baichuan2_7b_int4weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(baichuan2_7b_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @skip_pre_ampere
@@ -290,21 +306,25 @@ def test_llm_qwen2():
 @skip_pre_ampere
 def test_llm_qwen2_int4_weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(qwen2_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 @skip_pre_hopper
 def test_llm_qwen2_fp8():
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
     llm_test_harness(qwen2_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
-                     quant_config=quant_config)
+                     quant_config=quant_config,
+                     calib_config=calib_config)
 
 
 if __name__ == '__main__':

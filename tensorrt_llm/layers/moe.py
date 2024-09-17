@@ -395,7 +395,8 @@ class MixtureOfExperts(Module):
                  dtype=None,
                  tp_group: List[int] = None,
                  tp_size: int = 1,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 use_all_reduce=True):
         super().__init__()
 
         self.moe_config = moe_config
@@ -413,6 +414,7 @@ class MixtureOfExperts(Module):
         self.mapping = mapping
         self.quant_mode = quant_mode
         self.bias = bias
+        self.use_all_reduce = use_all_reduce
 
         self.experts_per_node = self.num_experts
         if self.mapping.has_moe_ep():
@@ -501,12 +503,14 @@ class MixtureOfExperts(Module):
                 0, "moe_router")
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
-        return self.forward_experts(hidden_states, routing, finished,
-                                    lora_layer_params, reduce_fusion_params)
+        output = self.forward_experts(hidden_states, routing, finished,
+                                      lora_layer_params)
+        if self.use_all_reduce:
+            output = self.forward_allreduce(output, reduce_fusion_params)
+        return output
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params,
-                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+                        lora_layer_params):
 
         if self.quant_mode.has_fp8_qdq():
             assert self.fc.weight.value.dtype == trt.fp8, (
@@ -580,11 +584,15 @@ class MixtureOfExperts(Module):
                              ep_size=self.mapping.moe_ep_size,
                              ep_rank=self.mapping.moe_ep_rank)
 
+        return output
+
+    def forward_allreduce(
+            self, output,
+            reduce_fusion_params: Optional[AllReduceFusionParams]):
         if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
                                self.tp_group,
                                reduce_fusion_params=reduce_fusion_params)
-
         return output
 
     def load_weights(self, moe: "MixtureOfExperts"):
@@ -672,8 +680,7 @@ class MoeOOTB(MOE):
         )
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params,
-                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+                        lora_layer_params):
         # TODO: https://nvbugspro.nvidia.com/bug/4781396 after this nvbug is fixed, we will remove this check.
         if lora_layer_params is not None:
             for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
@@ -768,11 +775,6 @@ class MoeOOTB(MOE):
             output += expert_finialized_output
 
         output = output.view(shape(hidden_states))
-
-        if self.tp_size > 1 and self.tp_group is not None:
-            output = allreduce(output,
-                               self.mapping.tp_group,
-                               reduce_fusion_params=reduce_fusion_params)
 
         return output
 

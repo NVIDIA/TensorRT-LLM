@@ -97,6 +97,9 @@ mixtral_model_name = "Mixtral-8x7B-v0.1"
 
 llama_model_path = get_model_path(default_model_name)
 llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
+
+cnn_dailymail_path = str(llm_models_root() / "datasets" / "cnn_dailymail")
+
 prompts = ["A B C"]
 
 

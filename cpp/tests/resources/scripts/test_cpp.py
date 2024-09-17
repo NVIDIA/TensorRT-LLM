@@ -16,6 +16,7 @@
 
 import argparse as _arg
 import copy
+import glob
 import logging as _log
 import os as _os
 import pathlib as _pl
@@ -66,6 +67,98 @@ def run_command(command: _tp.Sequence[str],
                   timeout, override_timeout)
         timeout = override_timeout
     _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+
+
+def merge_report(parallel, retry, output):
+    import xml.etree.ElementTree as ElementTree
+    base = ElementTree.parse(parallel)
+    extra = ElementTree.parse(retry)
+
+    base_suite = base.getroot()
+    extra_suite = extra.getroot()
+
+    base_suite.attrib['failures'] = extra_suite.attrib['failures']
+    base_suite.attrib['time'] = str(
+        int(base_suite.attrib['time']) + int(extra_suite.attrib['time']))
+
+    case_names = {element.attrib['name'] for element in extra_suite}
+    base_suite[:] = [
+        element
+        for element in base_suite if element.attrib['name'] not in case_names
+    ] + list(extra_suite)
+
+    base.write(output, encoding="UTF-8", xml_declaration=True)
+
+
+def add_parallel_info(report, parallel):
+    import xml.etree.ElementTree as ElementTree
+    try:
+        document = ElementTree.parse(report)
+    except FileNotFoundError:
+        return
+    root = document.getroot()
+    root.attrib['parallel'] = str(parallel)
+    document.write(report, encoding="UTF-8", xml_declaration=True)
+
+
+def parallel_run_ctest(
+    command: _tp.Sequence[str],
+    cwd: _pl.Path,
+    *,
+    shell=False,
+    env=None,
+    timeout=None,
+    parallel=2,
+) -> None:
+    if parallel == 1:
+        return run_command(command,
+                           cwd=cwd,
+                           shell=shell,
+                           env=env,
+                           timeout=timeout)
+
+    env = {} if env is None else env
+    env['CTEST_PARALLEL_LEVEL'] = str(parallel)
+
+    def get_report():
+        reports = glob.glob("results-*.xml", root_dir=cwd)
+        if not reports:
+            return ''
+
+        return reports[0]
+
+    report = None
+    try:
+        run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+    except _sp.CalledProcessError:
+        report = get_report()
+        if report == '':
+            # Some catastrophic fail happened that there's no report generated
+            raise
+
+        parallel_report = 'parallel-' + report
+        _os.rename(cwd / report, cwd / parallel_report)
+
+        try:
+            _log.info("Parallel test failed, retry serial on failed tests")
+            del env['CTEST_PARALLEL_LEVEL']
+            command = [*command, "--rerun-failed"]
+            run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+        finally:
+            if not _os.path.exists(cwd / report):
+                # Some catastrophic fail happened that there's no report generated
+                # Use parallel result as final report
+                _os.rename(cwd / parallel_report, cwd / report)
+            else:
+                retry_report = 'retry-' + report
+                _os.rename(cwd / report, cwd / retry_report)
+                merge_report(cwd / parallel_report, cwd / retry_report,
+                             cwd / report)
+    finally:
+        if report is None:
+            report = get_report()
+        if report:
+            add_parallel_info(cwd / report, parallel)
 
 
 def run_tests(build_dir: _pl.Path,
@@ -483,7 +576,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Encoder")
     excluded_tests.append("EncDec")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+    parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path,
@@ -541,7 +634,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+        parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
 def produce_mpirun_command(*, global_commands, nranks, local_commands,

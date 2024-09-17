@@ -99,6 +99,9 @@ public:
     TensorPtr lengths;          // [BS, BM], total sequence lengths including padding
     TensorPtr cacheIndirection; // [BS, BM, MSL], k/v indirection for next generation step
 
+    TensorPtr logProbsTiled;    // [MSL, BS, BM] Buffer used to store the transpose of the logProbs.
+                                // Needed because the kernels have been written to use that shape.
+
     BeamHypotheses beamHypotheses;
 
     // Speculative decoding
