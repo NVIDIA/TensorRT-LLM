@@ -20,7 +20,9 @@
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/samplingConfig.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -116,4 +118,11 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
     cudaStream_t stream);
 
 } // namespace kernels
+
+namespace runtime::kernels
+{
+void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput, BufferManager const& manager,
+    SamplingConfig const& samplingConfig);
+} // namespace runtime::kernels
+
 } // namespace tensorrt_llm

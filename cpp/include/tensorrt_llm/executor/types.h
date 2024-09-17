@@ -333,6 +333,13 @@ enum class RequestStage
     kGENERATION_COMPLETE,
 };
 
+/// @brief Struct that holds the request stats in the case of disaggregated serving
+struct DisServingRequestStats
+{
+    /// @brief The total time spent on transferring KV cache from context phase to generation phase (ms)
+    double kvCacheTransferMS;
+};
+
 /// @brief Struct that holds the stats of a single request
 struct RequestStats
 {
@@ -351,6 +358,8 @@ struct RequestStats
     /// @brief Whether the request is being paused at the current iteration due to lack of resources (KV cache blocks
     /// exhaustion for example)
     bool paused;
+    /// @brief Stats specific to disaggregated serving
+    std::optional<DisServingRequestStats> disServingStats;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration

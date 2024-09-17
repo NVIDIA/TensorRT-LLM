@@ -267,10 +267,10 @@ for nloras in ${NUM_LORAS[@]}; do
         --input-mean 256 --input-stdev 16 --output-mean 128 --output-stdev 24
 done
 
-# Generate random lora weights for 256 adapters
+# Generate random lora weights for 16 adapters
 python benchmarks/cpp/utils/generate_rand_loras.py ${CPP_LORA} ${EG_DIR}/loras 16
 
-# perform benchmarking
+# Perform benchmarking
 
 # First run inference without LoRAs
 mkdir -p ${EG_DIR}/log-base-lora

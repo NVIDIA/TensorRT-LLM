@@ -408,6 +408,7 @@ class RowLinear(LinearBase):
         strict_dtype: bool = False,
         pad_lda=0,
         prefer_managed_weight=True,
+        is_expert=False,
     ):
         super().__init__(
             local_in_features=in_features // tp_size,
@@ -422,6 +423,8 @@ class RowLinear(LinearBase):
         )
 
         self.tp_dim = 1
+        self.tp_size = tp_size
+        self.is_expert = is_expert
 
     @classmethod
     def tp_split_dim(cls) -> int:
@@ -438,12 +441,17 @@ class RowLinear(LinearBase):
                      == AllReduceFusionOp.RESIDUAL_RMS_NORM))
             if fuse_bias_into_all_reduce:
                 reduce_fusion_params.bias = self.bias.value
-            x = allreduce(x,
-                          self.tp_group,
-                          reduce_fusion_params=reduce_fusion_params)
-            if need_bias and not fuse_bias_into_all_reduce:
-                bias = cast(self.bias.value, x.dtype)
-                x = x + bias
+            if not self.is_expert:
+                x = allreduce(x,
+                              self.tp_group,
+                              reduce_fusion_params=reduce_fusion_params)
+                if need_bias and not fuse_bias_into_all_reduce:
+                    bias = cast(self.bias.value, x.dtype)
+                    x = x + bias
+            else:
+                if need_bias and not fuse_bias_into_all_reduce:
+                    bias = cast(self.bias.value, x.dtype)
+                    x = x + bias / self.tp_size
             return x
 
         if self.bias is not None:

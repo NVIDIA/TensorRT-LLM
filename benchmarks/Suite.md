@@ -20,7 +20,7 @@ TensorRT-LLM provides a packaged benchmarking utility that is accessible via the
 #### Support Quantization Modes
 
 TensorRT-LLM supports a number of quanization modes. For more information about quantization, see the
-[documentation](https://nvidia.github.io/TensorRT-LLM/precision.html).
+[documentation](https://nvidia.github.io/TensorRT-LLM/reference/precision.html).
 
 - None (no quantization applied)
 - W8A16
@@ -31,7 +31,7 @@ TensorRT-LLM supports a number of quanization modes. For more information about 
 - FP8
 - INT8
 
-> [!NOTE] Please see the supported quantization methods for each network [here](https://nvidia.github.io/TensorRT-LLM/precision.html#support-matrix)
+> [!NOTE] Please see the supported quantization methods for each network [here](https://nvidia.github.io/TensorRT-LLM/reference/precision.html#support-matrix)
 
 
 ## Inflight Benchmarking with a Dataset

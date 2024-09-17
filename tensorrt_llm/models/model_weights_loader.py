@@ -308,8 +308,8 @@ class ModelWeightsLoader:
         if config.mapping.has_pp():
             pp_layers = config.mapping.pp_layers(config.num_hidden_layers)
             self.tllm_to_externel_key_dict.update({
-                str(tllm_locl_layer_idx): str(hf_global_layer_idx)
-                for tllm_locl_layer_idx, hf_global_layer_idx in enumerate(
+                str(tllm_local_layer_idx): str(hf_global_layer_idx)
+                for tllm_local_layer_idx, hf_global_layer_idx in enumerate(
                     pp_layers)
             })
 

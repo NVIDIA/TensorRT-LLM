@@ -442,6 +442,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             output_cum_log_probs: bool = False,
             prompt_table: Optional[Union[str, torch.Tensor]] = None,
             prompt_tasks: Optional[str] = None,
+            input_token_extra_ids: List[List[int]] = None,
             return_all_generated_tokens: bool = False,
             **kwargs) -> Union[torch.Tensor, dict]:
         """
@@ -468,6 +469,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The file path of prompt table (.npy format, exported by nemo_prompt_convert.py) or the prompt table itself.
             prompt_tasks (str):
                 The prompt tuning task ids for the input batch, in format of comma-separated list (e.g., 0,3,1,0).
+            input_token_extra_ids (List[List[int]]):
+                Input token extra ids for using p-tuning and KV Cache reuse together
             lora_uids (list):
                 The uids of LoRA weights for the input batch. Use -1 to disable the LoRA module.
             streaming (bool):
@@ -546,7 +549,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         )
 
         prompt_tuning_configs = self._prepare_ptuning_executor(
-            batch_input_ids_list, prompt_table, prompt_tasks)
+            batch_input_ids_list, prompt_table, prompt_tasks,
+            input_token_extra_ids)
 
         stop_words_list = self._prepare_words_list(stop_words_list,
                                                    len(batch_input_ids_list))
@@ -611,7 +615,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return words_list
 
     def _prepare_ptuning_executor(self, batch_input_ids_list, prompt_table,
-                                  prompt_tasks):
+                                  prompt_tasks, input_token_extra_ids):
+        if input_token_extra_ids:
+            assert len(batch_input_ids_list) == len(input_token_extra_ids), \
+                f"Batch size of input_token_extra_ids ({len(input_token_extra_ids)}) must be the same as input batch size ({len(batch_input_ids_list)})"
         prompt_tuning_configs = len(batch_input_ids_list) * [None]
         if prompt_table is not None:
             prompt_table_data = self._prepare_embedding_table(
@@ -622,14 +629,18 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     f"Number of supplied tasks ({len(task_indices)}) must match input batch size ({len(batch_input_ids_list)})"
                 prompt_tuning_configs = [
                     trtllm.PromptTuningConfig(
-                        embedding_table=prompt_table_data[task_indices[i]])
+                        embedding_table=prompt_table_data[task_indices[i]],
+                        input_token_extra_ids=input_token_extra_ids[i]
+                        if input_token_extra_ids else None)
                     for i in range(len(batch_input_ids_list))
                 ]
             else:
                 prompt_tuning_configs = [
                     trtllm.PromptTuningConfig(
-                        embedding_table=prompt_table_data[0])
-                    for _ in range(len(batch_input_ids_list))
+                        embedding_table=prompt_table_data[0],
+                        input_token_extra_ids=input_token_extra_ids[i]
+                        if input_token_extra_ids else None)
+                    for i in range(len(batch_input_ids_list))
                 ]
         return prompt_tuning_configs
 

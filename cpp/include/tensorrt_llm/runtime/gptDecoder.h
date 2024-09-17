@@ -62,11 +62,6 @@ public:
 
     virtual void forwardSync(DecodingOutput& output, DecodingInput const& input) = 0;
 
-    virtual void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-        BufferManager const& manager,
-        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt)
-        = 0;
-
     virtual SamplingConfig const& getSamplingConfig() = 0;
 
     static void acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor const& draftTokenIds,
@@ -105,10 +100,6 @@ public:
 
     void forwardSync(DecodingOutput& output, DecodingInput const& input) override;
 
-    void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-        BufferManager const& manager,
-        std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig = std::nullopt) override;
-
     SamplingConfig const& getSamplingConfig() override
     {
         return mSamplingConfig;
@@ -119,8 +110,6 @@ private:
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
     std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingLayerWorkspace;
 
-    TensorPtr mLogProbsTiled; // Buffer used to store the transpose of the logProbs. Needed because the kernels have
-                              // been written to use that shape.
     SamplingConfig mSamplingConfig;
 
     size_t mMaxBatchSize;

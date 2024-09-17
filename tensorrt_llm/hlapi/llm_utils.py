@@ -15,6 +15,7 @@ __all__ = [
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
+    'CalibConfig',
     'CachedModelLoader',
     'ConfigArbitrateError',
     '_ConfigArbitrator',
@@ -113,6 +114,36 @@ class _ParallelConfig:
         return self.world_size > 1
 
 
+@dataclass(slots=True)
+class CalibConfig:
+    """
+    Calibration configuration.
+
+    Args:
+        device (Literal['cuda', 'cpu'], default='cuda'): The device to run calibration.
+        calib_dataset (str, default='cnn_dailymail'): The name or local path of calibration dataset.
+        calib_batches (int, default=512): The number of batches that the calibration runs.
+        calib_batch_size (int, default=1): The batch size that the calibration runs.
+        calib_max_seq_length (int, default=512): The maximum sequence length that the calibration runs.
+        random_seed (int, default=1234): The random seed used for calibration.
+        tokenizer_max_seq_length (int, default=2048): The maximum sequence length to initialize tokenizer for calibration.
+    """
+    device: Literal['cuda', 'cpu'] = 'cuda'
+    calib_dataset: str = 'cnn_dailymail'
+    calib_batches: int = 512
+    calib_batch_size: int = 1
+    calib_max_seq_length: int = 512
+    random_seed: int = 1234
+    tokenizer_max_seq_length: int = 2048
+
+    @classmethod
+    def from_dict(cls, config: dict):
+        return cls(**config)
+
+    def to_dict(self):
+        return asdict(self)
+
+
 class _ModelFormatKind(Enum):
     HF = 0
     TLLM_CKPT = 1
@@ -199,6 +230,8 @@ LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
     quant_config (QuantConfig, default=QuantConfig()): The quantization configuration for the model.
         Default is an empty QuantConfig instance.
 
+    calib_config (CalibConfig, default=CalibConfig()): The calibration configuration for the model.
+
     embedding_parallel_mode (str, default="SHARDING_ALONG_VOCAB"): The parallel mode for embeddings.
 
     share_embedding_table (bool, default=False): Whether to share the embedding table.
@@ -271,6 +304,8 @@ class LlmArgs:
     build_config: Optional[BuildConfig] = None
 
     quant_config: QuantConfig = field(default_factory=QuantConfig)
+
+    calib_config: CalibConfig = field(default_factory=CalibConfig)
 
     # A handful of options from PretrainedConfig
     embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
@@ -1087,6 +1122,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
+                    **self.llm_args.calib_config.to_dict(),
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
                 mpi_barrier()

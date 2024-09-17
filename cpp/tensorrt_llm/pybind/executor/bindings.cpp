@@ -165,6 +165,10 @@ void InitBindings(pybind11::module_& m)
         .value("GENERATION_IN_PROGRESS", tle::RequestStage::kGENERATION_IN_PROGRESS)
         .value("GENERATION_COMPLETE", tle::RequestStage::kGENERATION_COMPLETE);
 
+    py::class_<tle::DisServingRequestStats>(m, "DisServingRequestStats")
+        .def(py::init<>())
+        .def_readwrite("kv_cache_transfer_ms", &tle::DisServingRequestStats::kvCacheTransferMS);
+
     py::class_<tle::RequestStats>(m, "RequestStats")
         .def(py::init<>())
         .def_readwrite("id", &tle::RequestStats::id)
@@ -174,6 +178,7 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("avg_num_decoded_tokens_per_iter", &tle::RequestStats::avgNumDecodedTokensPerIter)
         .def_readwrite("scheduled", &tle::RequestStats::scheduled)
         .def_readwrite("paused", &tle::RequestStats::paused)
+        .def_readwrite("dis_serving_stats", &tle::RequestStats::disServingStats)
         .def("to_json_str",
             [](tle::RequestStats const& iterationStats) { return tle::JsonSerialization::toJsonStr(iterationStats); });
 

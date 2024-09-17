@@ -114,6 +114,11 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
         LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, 0),
     };
     modelConfig.setLoraModules(modules);
+    EXPECT_THAT([&]()
+        { loraValidateRequestTensors(12345, optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig); },
+        testing::Throws<std::runtime_error>());
+
+    modelConfig.setMaxLoraRank(4);
 
     loraValidateRequestTensors(12345, optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig);
 

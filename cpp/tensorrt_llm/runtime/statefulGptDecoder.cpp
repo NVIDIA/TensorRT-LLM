@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <algorithm>
@@ -61,6 +62,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dOutput->cumLogProbs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(mBufferManager);
+    dOutput->logProbsTiled = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<float>::value);
 
     dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
     dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<SizeType32>::value);
@@ -147,6 +149,8 @@ void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWid
         mBufferManager.setZero(*dOutput.cumLogProbs);
         dOutput.beamHypotheses.reshape(batchSize, beamWidth, mMaxSequenceLength);
     }
+    dOutput.logProbsTiled->reshape(ITensor::makeShape({maxSequenceLength, batchSize, beamWidth}));
+    mBufferManager.setZero(*dOutput.logProbsTiled);
 
     mNbSteps = 0;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -299,6 +303,7 @@ void StatefulGptDecoder::newBatch(
     {
         // manager.setZero(*dOutput.cumLogProbs);
     }
+    mBufferManager.setZero(*dOutput.logProbsTiled);
 
     // copy the request ids into dOutput.ids (with tiling)
     kernels::initOutputIds(
@@ -355,12 +360,12 @@ void StatefulGptDecoder::forwardSync()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::finalize(SamplingConfig const&) const
+void StatefulGptDecoder::finalize(SamplingConfig const& samplingConfig) const
 {
     // TODO (rkobus) can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
-    mDecoder->gatherTree(*mDecodingOutput, *mDecodingInput, mBufferManager);
+    kernels::gatherTree(*mDecodingOutput, *mDecodingInput, mBufferManager, samplingConfig);
     mBufferManager.copy(*(mDecodingOutput->gatheredIds), *outputIds);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return;
