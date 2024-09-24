@@ -61,6 +61,9 @@ class MoeConfig:
         SPARSE_MIXER = 2
 
     num_experts: int = 0
+    moe_intermediate_size: int = 0  # Add moe inter size (shanshan)
+    num_shared_experts: int = 0  # Add number of shared experts (shanshan)
+
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
     sparse_mixer_epsilon: float = 0.01
@@ -832,3 +835,51 @@ class MoeOOTB(MOE):
                 if is_gated_act:
                     expert.gate.bias.value = experts_bias_1_raw[
                         i, :self.expert_inter_size]
+
+
+# Add SharedMoE class (shanshan)
+class SharedMoE(Module):
+
+    def __init__(self,
+                 moe_config: MoeConfig,
+                 hidden_size: int,
+                 ffn_hidden_size: int,
+                 hidden_act: str,
+                 mapping: Mapping = Mapping(),
+                 bias: bool = True,
+                 dtype=None,
+                 **kwargs):
+        super().__init__()
+
+        self.moe_config = moe_config
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.hidden_act = hidden_act
+        self.mapping = mapping
+        self.bias = bias
+        self.dtype = dtype
+
+        self.moe = MOE(hidden_size=self.hidden_size,
+                       moe_config=self.moe_config,
+                       mapping=self.mapping,
+                       ffn_hidden_size=self.moe_config.moe_intermediate_size,
+                       hidden_act=self.hidden_act,
+                       dtype=self.dtype,
+                       bias=False,
+                       tp_group=self.mapping.tp_group,
+                       tp_size=self.mapping.tp_size)
+        ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
+        self.shared_experts = ClsMLP(
+            hidden_size=self.hidden_size,
+            ffn_hidden_size=self.ffn_hidden_size,
+            hidden_act=non_gated_version(self.hidden_act),  # deepseek use SiLU
+            bias=False,
+            dtype=self.dtype,
+            tp_group=self.mapping.tp_group,
+            tp_size=self.mapping.tp_size)
+
+    def forward(self, hidden_states):
+        if self.moe_config.num_shared_experts > 0:
+            return self.moe(hidden_states) + self.shared_experts(hidden_states)
+        else:
+            return self.moe(hidden_states)

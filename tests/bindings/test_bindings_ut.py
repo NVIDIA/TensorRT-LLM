@@ -314,7 +314,7 @@ def test_llm_request():
     assert llm_request.max_num_generated_tokens == 2
 
     llm_request.pause(0)
-    assert llm_request.state == _tb.LlmRequestState.REQUEST_STATE_CONTEXT_INIT
+    assert llm_request.state == _tb.LlmRequestState.CONTEXT_INIT
 
     llm_request.max_sent_token_len = 1
     assert llm_request.max_sent_token_len == 1

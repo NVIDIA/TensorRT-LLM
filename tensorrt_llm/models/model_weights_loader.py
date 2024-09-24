@@ -283,23 +283,49 @@ class ModelWeightsLoader:
 
         return weight_dict
 
-    def check_share_embedding(self):
+    def check_share_embedding(self, config):
+        # TODO: Remove after --use_share_embedding is removed
+        if not config.share_embedding_table:
+            return
+
+        from ..logger import logger
         lm_head_weights = self.load_tensor(
             self.translate_to_external_key("lm_head.weight",
                                            self.tllm_to_externel_key_dict))
         vocab_embed_weights = self.load_tensor(
             self.translate_to_external_key("transformer.vocab_embedding.weight",
                                            self.tllm_to_externel_key_dict))
+        share_embedding_table = False
         if lm_head_weights is not None and vocab_embed_weights is not None:
             if lm_head_weights.shape == vocab_embed_weights.shape:
                 if not (lm_head_weights - vocab_embed_weights).any():
-                    return True
-        from ..logger import logger
-        logger.warning(
-            "lm_head.weight and transformer.vocab_embedding.weight are not identical, "
-            "share_embedding_table cannot be enabled; setting share_embedding_table=False."
-        )
-        return False
+                    share_embedding_table = True
+        elif lm_head_weights is None and vocab_embed_weights is not None:
+            self.tllm_to_externel_key_dict[
+                'lm_head'] = self.tllm_to_externel_key_dict[
+                    'transformer'] + '.' + self.tllm_to_externel_key_dict[
+                        'vocab_embedding']
+            share_embedding_table = True
+        elif lm_head_weights is not None and vocab_embed_weights is None:
+            self.tllm_to_externel_key_dict[
+                'vocab_embedding'] = self.tllm_to_externel_key_dict['lm_head']
+            share_embedding_table = True
+
+        # Validation
+        mapping = config.mapping
+        if mapping.tp_size > 1:
+            if (not config.use_parallel_embedding) or (
+                    config.use_parallel_embedding
+                    and config.embedding_sharding_dim == 1):
+                share_embedding_table = False
+        if mapping.pp_size > 1:
+            share_embedding_table = False
+        if mapping.cp_size > 1:
+            share_embedding_table = False
+        config.share_embedding_table = share_embedding_table
+
+        if config.share_embedding_table:
+            logger.info("share_embedding_table enabled.")
 
     def update_key_mapping(self, model):
         self.model = weakref.ref(model)()
@@ -312,6 +338,13 @@ class ModelWeightsLoader:
                 for tllm_local_layer_idx, hf_global_layer_idx in enumerate(
                     pp_layers)
             })
+
+        # Share embedding
+        if self.tllm_to_externel_key_dict[
+                'vocab_embedding'] == self.tllm_to_externel_key_dict['lm_head']:
+            self.model.transformer.vocab_embedding.tllm_to_externel_key_dict = {
+                self.tllm_to_externel_key_dict['transformer']: '',
+            }
 
     def fill(self, weights):
         for tllm_key, param in self.model.named_parameters():

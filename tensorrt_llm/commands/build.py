@@ -74,7 +74,7 @@ def parse_arguments():
     parser.add_argument(
         '--max_batch_size',
         type=int,
-        default=256,
+        default=2048,
         help="Maximum number of requests that the engine can schedule.")
     parser.add_argument('--max_input_len',
                         type=int,

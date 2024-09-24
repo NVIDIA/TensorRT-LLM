@@ -16,13 +16,16 @@
 
 import argparse as _arg
 import copy
+import functools
 import glob
 import logging as _log
 import os as _os
 import pathlib as _pl
 import platform
+import signal
 import subprocess as _sp
 import sys as _sys
+import time as _time
 import typing as _tp
 
 build_script_dir = _pl.Path(
@@ -556,6 +559,31 @@ def build_tests(build_dir: _pl.Path):
     run_command(make_google_tests, cwd=build_dir, timeout=300)
 
 
+def with_memory_monitor(func):
+    if not _os.environ.get('LLM_MEMORY_PROFILING', False):
+        return func
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        memory_collector = _sp.Popen([
+            "/usr/bin/python3",
+            find_root_dir() /
+            "tests/llm-test-defs/turtle/defs/memory_collector.py",
+            "-p",
+            str(_os.getpid()),
+            "-i",
+            "0.2",
+        ])
+        try:
+            func(*args, **kwargs)
+        finally:
+            memory_collector.send_signal(signal.SIGINT)
+            memory_collector.wait()
+
+    return wrapper
+
+
+@with_memory_monitor
 def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     build_tests(build_dir=build_dir)
 
@@ -579,6 +607,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
+@with_memory_monitor
 def run_single_gpu_tests(build_dir: _pl.Path,
                          run_gpt,
                          run_gptj,
@@ -646,6 +675,7 @@ def produce_mpirun_command(*, global_commands, nranks, local_commands,
     return l[:-1]
 
 
+@with_memory_monitor
 def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     build_tests(build_dir=build_dir)
 
@@ -1068,4 +1098,24 @@ if __name__ == "__main__":
 
     del test_args.run_all_models
 
-    run_tests(**vars(test_args))
+    do_memory_profiling = _os.environ.get('LLM_MEMORY_PROFILING', False)
+    if do_memory_profiling:
+        unix_socket = "/tmp/profiling_scribe.unix"
+
+        scribe = _sp.Popen([
+            "/usr/bin/python3",
+            find_root_dir() /
+            "tests/llm-test-defs/turtle/defs/profiling_scribe.py", "-l",
+            unix_socket
+        ])
+
+        while not _os.path.exists(unix_socket):
+            _time.sleep(0.1)
+
+    try:
+        run_tests(**vars(test_args))
+    finally:
+        if do_memory_profiling:
+            scribe.send_signal(signal.SIGINT)
+            scribe.wait(timeout=10)
+            scribe.kill()

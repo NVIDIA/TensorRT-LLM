@@ -96,11 +96,14 @@ Welcome to TensorRT-LLM's Documentation!
 
    advanced/gpt-attention.md
    advanced/gpt-runtime.md
+   advanced/executor.md
    advanced/graph-rewriting.md
    advanced/batch-manager.md
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md
+   advanced/kv-cache-reuse.md
+   advanced/speculative-decoding.md
 
 .. toctree::
    :maxdepth: 2

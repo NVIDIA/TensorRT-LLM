@@ -40,24 +40,21 @@ namespace tensorrt_llm::batch_manager
  * @brief The state of the request.
  *
  * Enum order must follow chronological order for state dependency check, @see hasReachedState().
- *
- * @todo(rkobus): refactor
  */
-enum LlmRequestState_t
+enum class LlmRequestState : int32_t
 {
-    REQUEST_STATE_UNKNOWN = 0,                          ///< Unknown state
-    REQUEST_STATE_ENCODER_INIT = 1,                     ///< Encoder phase starts (for encoder-decoder models)
-    REQUEST_STATE_CONTEXT_INIT = 2,                     ///< Context phase starts
-    REQUEST_STATE_GENERATION_IN_PROGRESS = 3,           ///< Generation phase is in progress
-    REQUEST_STATE_GENERATION_TO_COMPLETE = 4,           ///< Generation phase is to be completed
-    REQUEST_STATE_GENERATION_COMPLETE = 5,              ///< Generation phase completed
-    REQUEST_STATE_DISAGG_GENERATION_INIT = 6,           ///< For disaggregated serving only:
-                                                        /// new Generation request arrived at generation model
-    REQUEST_STATE_DISAGG_CONTEXT_TRANS_IN_PROGRESS = 7, ///< For disaggregated serving only:
-                                                        /// Waiting context-only request transmitting the kv cache
-    REQUEST_STATE_DISAGG_CONTEXT_COMPLETE = 8,          ///< Context-only request finished kv cache transmission.
-    REQUEST_STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS
-    = 9,                                                ///< For disaggregated serving only: transmitting the kv cache
+    kUNKNOWN = 0,                             ///< Unknown state
+    kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
+    kCONTEXT_INIT = 2,                        ///< Context phase starts
+    kGENERATION_IN_PROGRESS = 3,              ///< Generation phase is in progress
+    kGENERATION_TO_COMPLETE = 4,              ///< Generation phase is to be completed
+    kGENERATION_COMPLETE = 5,                 ///< Generation phase completed
+    kDISAGG_GENERATION_INIT = 6,              ///< For disaggregated serving only:
+                                              /// new Generation request arrived at generation model
+    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 7,    ///< For disaggregated serving only:
+                                              /// Waiting context-only request transmitting the kv cache
+    kDISAGG_CONTEXT_COMPLETE = 8,             ///< Context-only request finished kv cache transmission.
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< For disaggregated serving only: transmitting the kv cache
 };
 
 enum LlmRequestType
@@ -115,7 +112,7 @@ public:
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mState(REQUEST_STATE_CONTEXT_INIT)
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(endId)
         , mPadId(padId)
         , mLogitsPostProcessor(logitsPostProcessor)
@@ -160,7 +157,7 @@ public:
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
-            mState = REQUEST_STATE_ENCODER_INIT;
+            mState = LlmRequestState::kENCODER_INIT;
         }
 
         initialize(*inputTokens, returnLogProbs);
@@ -171,7 +168,7 @@ public:
         , mPromptLen(req.getInputTokenIds().size())
         , mMaxNewTokens(req.getMaxTokens())
         , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
-        , mState(REQUEST_STATE_CONTEXT_INIT)
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(req.getEndId())
         , mPadId(req.getPadId())
         , mClientId(req.getClientId())
@@ -213,7 +210,7 @@ public:
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
-            mState = REQUEST_STATE_DISAGG_GENERATION_INIT;
+            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
         }
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && !mReturnAllGeneratedTokens)
         {
@@ -237,7 +234,7 @@ public:
 
         if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
         {
-            mState = REQUEST_STATE_ENCODER_INIT;
+            mState = LlmRequestState::kENCODER_INIT;
             if (req.getEncoderInputTokenIds().has_value())
             {
                 mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
@@ -716,8 +713,8 @@ public:
         }
 
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
-        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? REQUEST_STATE_ENCODER_INIT
-                                                                     : REQUEST_STATE_CONTEXT_INIT;
+        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
+                                                                     : LlmRequestState::kCONTEXT_INIT;
         mContextCurrentPosition = 0;
         mContextChunkSize = std::nullopt;
         mSeqSlot.reset();
@@ -1101,44 +1098,44 @@ public:
         mGenerationLogitsFragments.clear();
     }
 
-    [[nodiscard]] bool hasReachedState(LlmRequestState_t state) const noexcept
+    [[nodiscard]] bool hasReachedState(LlmRequestState state) const noexcept
     {
         return mState >= state;
     }
 
     [[nodiscard]] bool isEncoderInitState() const noexcept
     {
-        return mState == REQUEST_STATE_ENCODER_INIT;
+        return mState == LlmRequestState::kENCODER_INIT;
     }
 
     [[nodiscard]] bool isContextInitState() const noexcept
     {
-        return mState == REQUEST_STATE_CONTEXT_INIT;
+        return mState == LlmRequestState::kCONTEXT_INIT;
     }
 
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
-        return mState == REQUEST_STATE_GENERATION_IN_PROGRESS || mState == REQUEST_STATE_GENERATION_TO_COMPLETE;
+        return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE;
     }
 
     [[nodiscard]] bool isGenerationCompleteState() const noexcept
     {
-        return mState == REQUEST_STATE_GENERATION_COMPLETE;
+        return mState == LlmRequestState::kGENERATION_COMPLETE;
     }
 
     [[nodiscard]] bool isDisaggGenerationInitState() const noexcept
     {
-        return mState == REQUEST_STATE_DISAGG_GENERATION_INIT;
+        return mState == LlmRequestState::kDISAGG_GENERATION_INIT;
     }
 
     [[nodiscard]] bool isDisaggContextTransmissionState() const noexcept
     {
-        return mState == REQUEST_STATE_DISAGG_CONTEXT_TRANS_IN_PROGRESS;
+        return mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
     }
 
     [[nodiscard]] bool isDisaggContextCompleteState() const noexcept
     {
-        return mState == REQUEST_STATE_DISAGG_CONTEXT_COMPLETE;
+        return mState == LlmRequestState::kDISAGG_CONTEXT_COMPLETE;
     }
 
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
@@ -1252,7 +1249,7 @@ public:
     std::optional<executor::Response> createResponse()
     {
         TLLM_CHECK(!isDisaggContextCompleteState());
-        if (isGenerationCompleteState() || (mIsStreaming && isGenerationInProgressState())
+        if (isGenerationCompleteState() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)
             || isDisaggContextTransmissionState())
         {
             TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
@@ -1400,7 +1397,7 @@ public:
     SizeType32 mMaxNewTokens;
     // Tokens [beam_size, mPromptLen + getMaxNumGeneratedTokens()]
     runtime::SamplingConfig mSamplingConfig;
-    LlmRequestState_t mState;
+    LlmRequestState mState;
     std::optional<TokenIdType> mEndId;
     std::optional<TokenIdType> mPadId;
     std::optional<SizeType32> mSeqSlot;

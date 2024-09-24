@@ -96,7 +96,7 @@ void MedusaModule::initMedusaTensorsFromChoices(MedusaChoices const& choices, st
         if (curDepth != depth)
         {
             TLLM_CHECK(depth + 1 == curDepth);
-            TLLM_CHECK_WITH_INFO(depth <= getMaxDraftPathLen(),
+            TLLM_CHECK_WITH_INFO(curDepth <= getMaxDraftPathLen(),
                 "Medusa choices require more Medusa heads than the engine was built with.");
             // Save TopK
             topKs[depth - 1] = maxTopK;

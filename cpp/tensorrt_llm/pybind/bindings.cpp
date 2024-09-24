@@ -317,13 +317,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::overload_cast<tr::WorldConfig const&>(&tr::GptJsonConfig::engineFilename, py::const_),
             py::arg("world_config"));
 
-    py::enum_<tb::LlmRequestState_t>(m, "LlmRequestState")
-        .value("REQUEST_STATE_UNKNOWN", tb::LlmRequestState_t::REQUEST_STATE_UNKNOWN)
-        .value("REQUEST_STATE_ENCODER_INIT", tb::LlmRequestState_t::REQUEST_STATE_ENCODER_INIT)
-        .value("REQUEST_STATE_CONTEXT_INIT", tb::LlmRequestState_t::REQUEST_STATE_CONTEXT_INIT)
-        .value("REQUEST_STATE_GENERATION_IN_PROGRESS", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_IN_PROGRESS)
-        .value("REQUEST_STATE_GENERATION_TO_COMPLETE", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_TO_COMPLETE)
-        .value("REQUEST_STATE_GENERATION_COMPLETE", tb::LlmRequestState_t::REQUEST_STATE_GENERATION_COMPLETE);
+    py::enum_<tb::LlmRequestState>(m, "LlmRequestState")
+        .value("UNKNOWN", tb::LlmRequestState::kUNKNOWN)
+        .value("ENCODER_INIT", tb::LlmRequestState::kENCODER_INIT)
+        .value("CONTEXT_INIT", tb::LlmRequestState::kCONTEXT_INIT)
+        .value("GENERATION_IN_PROGRESS", tb::LlmRequestState::kGENERATION_IN_PROGRESS)
+        .value("GENERATION_TO_COMPLETE", tb::LlmRequestState::kGENERATION_TO_COMPLETE)
+        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE);
 
     tpb::NamedTensor::initBindings(m);
     tpb::LlmRequest::initBindings(m);

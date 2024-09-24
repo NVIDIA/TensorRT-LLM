@@ -90,15 +90,10 @@ class Embedding(Module):
         param.value = loaded_weight
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        config = kwargs.get("config", None)
         if weights is None:
             return {}
         weights = weights.to(str_dtype_to_torch(self.dtype))
-        if config.share_embedding_table:
-            return {}
-        else:
-            weights = weights.clone()
-            return {tllm_key: weights}
+        return {tllm_key: weights}
 
 
 class PromptTuningEmbedding(Embedding):

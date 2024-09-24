@@ -205,7 +205,7 @@ void invokeQuantization(...) {
 ```
 
 For more details on how TensorRT-LLM implements the GPT Attention operator, see
-the [Multi-head, Multi-query and Group-query Attention](gpt_attention.md) document.
+the [Multi-head, Multi-query and Group-query Attention](../advanced/gpt-attention.md) document.
 
 # Runtime
 
@@ -214,7 +214,7 @@ the runtime components is to load the TensorRT engines and drive their
 execution. Typically, for an auto-regressive model like GPT, the runtime is in
 charge of loading the engine that implements both the processing of the input
 sequence as well as the body of the generation loop. See the [GPT C++
-Runtime](gpt_runtime.md) document for details on the C++ Runtime.
+Runtime](../advanced/gpt-runtime.md) document for details on the C++ Runtime.
 
 (multi-gpu-multi-node)=
 
