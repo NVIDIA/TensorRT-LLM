@@ -1,3 +1,5 @@
+(kv-cache-reuse)=
+
 # KV cache reuse
 
 This document describes how kv cache pages can be shared and reused by requests that start with the same prompt. This can greatly lower first token latency, the time it takes before the first output token is generated. Many use cases can benefit from this, including multi-turn requests and system prompts.

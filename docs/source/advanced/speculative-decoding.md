@@ -1,3 +1,5 @@
+(speculative-decoding)=
+
 # Speculative Sampling
 
 Speculative Sampling (also referred to as Speculative Decoding) is a set of techniques designed to allow generation of more than one token per forward pass iteration. This can lead to a reduction in the average per-token latency **in situations where the GPU
@@ -30,7 +32,7 @@ may prove simpler than generating a summary for an article.
 Furthermore, when integrating Medusa with a standard PyTorch model implementation which may not be as finely
 tuned as TensorRT-LLM, the potential time savings are more pronounced.
 
-# Draft Model Approach
+## Draft Model Approach
 
 The Draft model approach involves the use of two distinct models trained independently
 but sharing the same vocabulary: a smaller Draft model and a larger Target model.
@@ -58,7 +60,7 @@ it is advisable to enable KV cache reuse for both models.
 This can be achieved by adding the `--use_paged_context_fmha=enable` flag to the `trtllm-build` command
 and setting `enableBlockReuse=true` in the `KVCacheConfig`.
 
-## Using Draft model approach with Triton Inference Server
+### Using Draft model approach with Triton Inference Server
 
 + Draft model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with [Business Logic Scripting](https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting), BLS).
 + The source file of Draft model with BLS can be found [here](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/lib/decode.py).
@@ -218,7 +220,7 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
     pkill -9 -f tritonserver
     ```
 
-# Medusa
+## Medusa
 
 This approach leverages a single model to both generate and verify draft tokens.
 It enhances the existing model by adding multiple extra language model heads, known as Medusa heads.
@@ -249,7 +251,7 @@ In the TensorRT-LLM implementation of Medusa, the configuration of the tree is a
 This flexibility allows you to experiment and identify the optimal tree structure for your use case,
 which can then be utilized in a production environment.
 
-## Medusa Tree
+### Medusa Tree
 
 Consider the following diagram, which illustrates how the hidden states from the last layer of the base model
 are passed to the base model's language model (LM) head and to four Medusa heads (MHs).
@@ -294,11 +296,11 @@ So, only `9` candidates are specified.
 
 **Specifying paths-only instead of all choices is currently supported only in the Python runtime.**
 
-## Using Medusa with TensorRT-LLM
+### Using Medusa with TensorRT-LLM
 
 For guidance on constructing and executing Medusa with the Python runtime, consult the [Medusa README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/medusa/README.md). When utilizing the Inflight Fused Batching (IFB) with the C++ API, it is necessary to define the `medusa_choices` explicitly within the model configuration. For detailed instructions, refer to the [model configuration in TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend?tab=readme-ov-file#modify-the-model-configuration) for more details.
 
-### Limitations
+#### Limitations
 
 - TensorRT-LLM supports Medusa only for Vicuna (fine tuned LLaMA).
 However, similar to any new model, you can follow the same approach to define your own Medusa model and deploy with TensorRT-LLM.
@@ -306,7 +308,7 @@ However, similar to any new model, you can follow the same approach to define yo
 - Beam search is **not** compatible with Medusa.
 
 
-# ReDrafter
+## ReDrafter
 
 This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read [the ReDrafter paper](https://arxiv.org/html/2403.09919v1).
 

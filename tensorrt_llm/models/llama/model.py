@@ -352,8 +352,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 hf_model_dir = quant_ckpt_path
 
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            if config.share_embedding_table:
-                config.share_embedding_table = loader.check_share_embedding()
+            loader.check_share_embedding(config)
             model = cls(config)
             loader.generate_tllm_weights(model)
         else:

@@ -23,6 +23,7 @@ from .cogvlm.model import CogVLMForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .deci.model import DeciLMForCausalLM
+from .deepseek_v1.model import DeepseekForCausalLM
 from .dit.model import DiT
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
@@ -57,6 +58,7 @@ __all__ = [
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
+    'DeepseekForCausalLM',
     'FalconConfig',
     'FalconForCausalLM',
     'FalconModel',
@@ -158,5 +160,6 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
 }

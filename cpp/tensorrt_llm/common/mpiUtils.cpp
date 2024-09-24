@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 #include "tensorrt_llm/common/mpiUtils.h"
 
@@ -127,7 +128,6 @@ std::vector<int> getWorldRanks(MpiComm const& comm)
     MPICHECK(MPI_Group_translate_ranks(group, groupSize, ranks.data(), worldGroup, worldRanks.data()));
     MPICHECK(MPI_Group_free(&group));
     MPICHECK(MPI_Group_free(&worldGroup));
-    std::sort(worldRanks.begin(), worldRanks.end());
 #else
     std::vector<int> worldRanks{0};
 #endif
@@ -391,31 +391,30 @@ MpiComm& MpiComm::mutableLocalSession()
 void MpiComm::refreshLocalSession()
 {
 #if ENABLE_MULTI_DEVICE
-    static std::vector<int> initSessionRanks;
     static std::mutex mutex;
     std::unique_lock lock(mutex);
-    if (initSessionRanks.empty())
-    {
-        auto initSessionRanks = getWorldRanks(MpiComm::session());
-        auto localSessionRanks = getWorldRanks(MpiComm::localSession());
-        std::vector<int> intersectionRanks;
-        std::set_intersection(initSessionRanks.begin(), initSessionRanks.end(), localSessionRanks.begin(),
-            localSessionRanks.end(), std::back_inserter(intersectionRanks));
+    auto initSessionRanks = getWorldRanks(MpiComm::session());
+    auto localSessionRanks = getWorldRanks(MpiComm::localSession());
 
-        MPI_Group worldGroup;
-        MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
-        MPI_Group localGroup;
-        MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
-        MPI_Comm localComm;
-        MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
-        MpiComm::mutableLocalSession().mFreeComm = true;
-        MpiComm::mutableLocalSession() = MpiComm{localComm, false};
-    }
-    else
+    // Add to intersectionRanks in order of initSessionRanks
+    std::vector<int> intersectionRanks;
+    std::unordered_set<int> localSessionRanksSet(localSessionRanks.begin(), localSessionRanks.end());
+    for (auto rank : initSessionRanks)
     {
-        TLLM_CHECK_WITH_INFO(getWorldRanks(MpiComm::session()) == initSessionRanks,
-            "Executors in the same process must use the same participant IDs.");
+        if (localSessionRanksSet.find(rank) != localSessionRanksSet.end())
+        {
+            intersectionRanks.push_back(rank);
+        }
     }
+
+    MPI_Group worldGroup;
+    MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
+    MPI_Group localGroup;
+    MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
+    MPI_Comm localComm;
+    MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
+    MpiComm::mutableLocalSession().mFreeComm = true;
+    MpiComm::mutableLocalSession() = MpiComm{localComm, false};
     TLLM_LOG_INFO("Refreshed the MPI local session");
 #endif // ENABLE_MULTI_DEVICE
 }

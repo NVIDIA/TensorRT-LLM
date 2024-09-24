@@ -4063,7 +4063,7 @@ def bert_attention(tensor: Tensor,
             The maximum distance of relative position in attention, for implicit mode.
             Default value is 0, meaning to use the regular mode of relative attention bias.
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
-            See relative attention bias in docs/gpt_attention.md
+            See relative attention bias in docs/source/advanced/gpt-attention.md
 
         max_input_length: Tensor = None
             The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
@@ -4619,19 +4619,19 @@ def gpt_attention(
     arguments that are likely to be removed or merged with others in the future
     release.
 
-    See docs/gpt_attention.md for the documentation of that function.
+    See docs/source/advanced/gpt-attention.md for the documentation of that function.
 
     Parameters:
         qkv: Tensor (On GPU)
             The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
-            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/gpt_attention.md,
+            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         past_key_value: Tensor (On GPU)
             The tensor that stores KV cache data. Its shape is
             [max_batch_size * max_beam_width, 2, num_kv_heads, max_seqlen, hidden_dim_per_head]
             in contiguous mode and
             [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
-            in paged mode. See KV Cache in docs/gpt_attention.md,
+            in paged mode. See KV Cache in docs/source/advanced/gpt-attention.md,
 
         context_fmha_custom_mask: Tensor (On GPU)
             The tensor that stores the packed custom mask for fmha.
@@ -4639,7 +4639,7 @@ def gpt_attention(
 
         sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
-            [batch_size]. See QKV Input in docs/gpt_attention.md,
+            [batch_size]. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         host_past_key_value_lengths: Tensor (On CPU)
             An INT32 tensor of shape [batch_size],
@@ -4657,12 +4657,12 @@ def gpt_attention(
         cache_indirection: Tensor (On GPU)
             The tensor to reconstruct the paths when using beam-search. Its
             shape is [batch_size, beam_width, max_seqlen]. See Beam-Search in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         host_request_types: Tensor = None (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         layer_idx: int
             The index of this attention layer, used to access kv_cache_block_offsets,
@@ -4678,7 +4678,7 @@ def gpt_attention(
 
         q_scaling: float
             The value used to compute the scaling factor applied to the output
-            of the Q*K^T product. See Scaling Factors in docs/gpt_attention.md,
+            of the Q*K^T product. See Scaling Factors in docs/source/advanced/gpt-attention.md,
 
         qk_tanh_scale: float
             The scale * tanh(value / scale) used to compute the scaling factor applied to the output
@@ -4726,12 +4726,12 @@ def gpt_attention(
         kv_orig_quant_scale: Tensor
             The tensor to store the scaling factor for quantization to INT8/FP8
             in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         kv_quant_orig_scale: Tensor
             The tensor to store the scaling factor for dequantization from
             INT8/FP8 in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         attention_output_orig_quant_scale: Tensor
             The tensor to store the scaling factor for quantization to FP8
@@ -4742,7 +4742,7 @@ def gpt_attention(
 
         max_context_length: int32_t
             The length of the longest input sequence. See QKV Input in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         mask_type: int = 1
             The type of mask:
@@ -4779,14 +4779,14 @@ def gpt_attention(
         kv_cache_block_offsets:
             The tensor of block offsets for the KV cache. Its shape is
             [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2],
-            See KV cache section in docs/gpt_attention.md, on gpu,
+            See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         host_kv_cache_block_offsets:
             The same as kv_cache_block_offsets, but on cpu,
 
         host_kv_cache_pool_pointers:
             The tensor of pool pointers for the KV cache. Its shape is [2],
-            See KV cache section in docs/gpt_attention.md, on gpu,
+            See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -4809,7 +4809,7 @@ def gpt_attention(
             The maximum distance of relative position in attention, for implicit mode.
             Default value is 0, meaning to use the regular mode of relative attention bias.
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
-            See relative attention bias in docs/gpt_attention.md
+            See relative attention bias in docs/source/advanced/gpt-attention.md
 
         host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
@@ -5609,7 +5609,7 @@ def lora_plugin(
         host_request_types : Tensor = None
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         transa : bool
             Is the first input transposed? Set to 'True' if you want the first
@@ -5736,7 +5736,7 @@ def mamba_conv1d(input: Tensor,
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
@@ -5883,7 +5883,7 @@ def selective_scan(input: Tensor,
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md
+            in docs/source/advanced/gpt-attention.md
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
@@ -6029,7 +6029,7 @@ def rg_lru(input: Tensor,
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
