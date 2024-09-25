@@ -31,7 +31,7 @@ __global__ void ban_bad_words(T* logits, TokenIdType const** output_ids_ptr, Siz
     SizeType32 const* bad_words_lens, SizeType32 vocab_size_padded, SizeType32 const* sequence_lengths,
     SizeType32 max_seq_len)
 {
-    auto const id = blockIdx.x * blockDim.x + threadIdx.x;
+    auto const id = blockIdx.x * blockDim.x + threadIdx.x + 1;
     auto const batch_idx = blockIdx.y / beam_width;
     auto const beam_idx = blockIdx.y % beam_width;
     auto const batch_slot = batch_slots != nullptr ? batch_slots[batch_idx] : batch_idx;

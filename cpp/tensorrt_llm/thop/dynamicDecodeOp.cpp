@@ -179,7 +179,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
 template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int const maxInputLength,
     int const maxAttentionWindow, int const sinkTokenLength, uint64_t const ite, int const localBatchSize,
-    th::Tensor endId, th::optional<th::Tensor> embeddingBiasOpt, th::optional<th::Tensor> inputLengthsOpt,
+    th::Tensor endId, th::Tensor minP, th::optional<th::Tensor> embeddingBiasOpt, th::optional<th::Tensor> inputLengthsOpt,
     th::optional<th::Tensor> sequenceLimitLengthOpt, th::optional<th::Tensor> stopWordsListPtrsOpt,
     th::optional<th::Tensor> stopWordsLensOpt, int32_t const maxStopWordsLen,
     th::optional<th::Tensor> badWordsListPtrsOpt, th::optional<th::Tensor> badWordsLensOpt,
@@ -201,13 +201,13 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     tr::ITensor::SharedConstPtr batchSlotsSlice = tr::ITensor::slice(mBatchSlots, 0, localBatchSize);
     if (isBeamSearch)
     {
-        forwardParams = std::make_shared<tl::DecodingInputs>(convert_tensor<int>(endId), batchSlotsSlice, step,
+        forwardParams = std::make_shared<tl::DecodingInputs>(convert_tensor<int>(endId), convert_tensor<float>(minP), batchSlotsSlice, step,
             static_cast<int>(ite), localBatchSize, maxAttentionWindow, sinkTokenLength);
     }
     else
     {
         forwardParams = std::make_shared<tl::SamplingInputs>(
-            convert_tensor<int>(endId), batchSlotsSlice, step, static_cast<int>(ite), localBatchSize);
+            convert_tensor<int>(endId), convert_tensor<float>(minP), batchSlotsSlice, step, static_cast<int>(ite), localBatchSize);
     }
 
     forwardParams->logits = convert_tensor<T>(logits);
@@ -369,6 +369,7 @@ th::Tensor DynamicDecodeOp::forward(
     int64_t const ite,                               //
     int64_t const localBatchSize,                    //
     th::Tensor const endId,                          // [BS*BM], int
+    th::Tensor const minP,                           // [BS*BM], float
     th::optional<th::Tensor> embeddingBiasOpt,       // [VP], T
     th::optional<th::Tensor> inputLengthsOpt,        // [BS*BM], int, length of input contexts
     th::optional<th::Tensor> sequenceLimitLengthOpt, // [BS, 1], int
@@ -409,6 +410,7 @@ th::Tensor DynamicDecodeOp::forward(
         "logits is of shape (batchSize, beamWidth, vocabSize(%ld)), but got the last dim=%ld.", vocabSizePadded_,
         static_cast<size_t>(logits.size(2)));
     CHECK_INPUT(endId, torch::kInt32);
+    CHECK_INPUT(minP, torch::kFloat32);
     CHECK_OPTIONAL_INPUT(embeddingBiasOpt, scalarType_);
     CHECK_OPTIONAL_INPUT(inputLengthsOpt, torch::kInt32);
     CHECK_OPTIONAL_INPUT(sequenceLimitLengthOpt, torch::kInt32);
@@ -433,7 +435,7 @@ th::Tensor DynamicDecodeOp::forward(
     dynamicDecode_->forward(
         // Inputs
         logits, static_cast<int>(step), static_cast<int>(maxInputLength), static_cast<int>(maxAttentionWindow),
-        static_cast<int>(sinkTokenLength), static_cast<uint32_t>(ite), static_cast<int>(localBatchSize), endId,
+        static_cast<int>(sinkTokenLength), static_cast<uint32_t>(ite), static_cast<int>(localBatchSize), endId, minP,
         embeddingBiasOpt, inputLengthsOpt, sequenceLimitLengthOpt, stopWordsListPtrsOpt, stopWordsLensOpt,
         static_cast<int32_t>(maxStopWordsLen), badWordsListPtrsOpt, badWordsLensOpt,
         static_cast<int32_t>(maxBadWordsLen), srcCacheIndirectionOpt,
