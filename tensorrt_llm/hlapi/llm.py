@@ -234,7 +234,7 @@ class LLM:
             prompt = inputs
         elif isinstance(inputs, list) and isinstance(inputs[0], int):
             prompt_token_ids = inputs
-            prompt = None
+            prompt = self.tokenizer.decode(prompt_token_ids)
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
