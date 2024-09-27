@@ -27,12 +27,12 @@ import model_spec
 import tensorrt_llm.bindings as _tb
 
 
-def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
+def build_engine(base_model_dir: _pl.Path, medusa_model_dir: _pl.Path,
                  engine_dir: _pl.Path, *args):
 
     covert_cmd = [_sys.executable, "examples/medusa/convert_checkpoint.py"] + (
-        ['--model_dir', str(weight_dir)] if weight_dir else []) + [
-            '--medusa_model_dir', str(medusa_dir), \
+        ['--model_dir', str(base_model_dir)] if base_model_dir else []) + [
+            '--medusa_model_dir', str(medusa_model_dir), \
             '--output_dir', str(engine_dir), '--dtype=float16', '--num_medusa_heads=4'
         ] + list(args)
 
@@ -58,37 +58,38 @@ def build_engine(weight_dir: _pl.Path, medusa_dir: _pl.Path,
 def build_engines(model_cache: str):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    model_name = 'vicuna-7b-v1.3'
-    medusa_name = 'medusa-vicuna-7b-v1.3'
+    model_name = 'vicuna-7b-medusa'
+    base_model_name = 'vicuna-7b-v1.3'
+    medusa_model_name = 'medusa-vicuna-7b-v1.3'
 
     if model_cache:
-        print("Copy model from model_cache")
-        model_cache_dir = _pl.Path(model_cache) / model_name
-        medusa_cache_dir = _pl.Path(model_cache) / medusa_name
-        assert model_cache_dir.is_dir(), model_cache_dir
-        assert medusa_cache_dir.is_dir(), model_cache_dir
+        print(f"Copy model from {model_cache}")
+        base_model_cache_dir = _pl.Path(model_cache) / base_model_name
+        medusa_head_cache_dir = _pl.Path(model_cache) / medusa_model_name
+        assert base_model_cache_dir.is_dir(), base_model_cache_dir
+        assert medusa_head_cache_dir.is_dir(), medusa_head_cache_dir
 
         if _pf.system() == "Windows":
-            wincopy(source=str(model_cache_dir),
-                    dest=model_name,
+            wincopy(source=str(base_model_cache_dir),
+                    dest=base_model_name,
                     isdir=True,
                     cwd=models_dir)
-            wincopy(source=str(medusa_cache_dir),
-                    dest=medusa_name,
+            wincopy(source=str(medusa_head_cache_dir),
+                    dest=medusa_model_name,
                     isdir=True,
                     cwd=models_dir)
         else:
             run_command(["rsync", "-rlptD",
-                         str(model_cache_dir), "."],
+                         str(base_model_cache_dir), "."],
                         cwd=models_dir)
             run_command(["rsync", "-rlptD",
-                         str(medusa_cache_dir), "."],
+                         str(medusa_head_cache_dir), "."],
                         cwd=models_dir)
 
-    model_dir = models_dir / model_name
-    medusa_dir = models_dir / medusa_name
-    assert model_dir.is_dir()
-    assert medusa_dir.is_dir()
+    base_model_dir = models_dir / base_model_name
+    medusa_model_dir = models_dir / medusa_model_name
+    assert base_model_dir.is_dir()
+    assert medusa_model_dir.is_dir()
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
@@ -98,9 +99,10 @@ def build_engines(model_cache: str):
     model_spec_obj.use_packed_input()
     model_spec_obj.use_medusa()
 
-    print(f"\nBuilding fp16 engine")
-    build_engine(model_dir, medusa_dir,
-                 engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-gpu')
+    full_engine_path = engine_dir / model_spec_obj.get_model_path(
+    ) / 'tp1-pp1-gpu'
+    print(f"\nBuilding fp16 engine at {str(full_engine_path)}")
+    build_engine(base_model_dir, medusa_model_dir, full_engine_path)
 
     print("Done.")
 

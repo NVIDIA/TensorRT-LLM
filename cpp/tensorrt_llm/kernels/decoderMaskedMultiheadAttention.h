@@ -171,7 +171,7 @@ struct Multihead_attention_params_base
     bool fp8_kv_cache = false;
 
     // Multi-block setups
-    mutable bool multi_block_mode = false;
+    mutable bool multi_block_mode = true;
 
     // Number of streaming processors on the device.
     // Tune block size to maximum occupancy.

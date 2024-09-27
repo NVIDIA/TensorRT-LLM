@@ -49,11 +49,6 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
         maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
-    auto constexpr nvFloatType = TRTDataType<float>::value;
-    mLogProbsTiled = mManager->gpu(ITensor::makeShape({static_cast<SizeType32>(maxSequenceLength),
-                                       static_cast<SizeType32>(maxBatchSize), static_cast<SizeType32>(maxBeamWidth)}),
-        nvFloatType);
-    mManager->setZero(*mLogProbsTiled);
 
     mDecodingLayerWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
         mManager, decodingDomain, TRTDataType<T>::value, mDynamicDecodeLayer->getWorkspaceSize());
@@ -491,8 +486,7 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(
-    DecodingOutput& output, DecodingOutput::TensorPtr& logProbsTiled, tle::DecodingMode const& decodingMode)
+std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(DecodingOutput& output, tle::DecodingMode const& decodingMode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     std::shared_ptr<tl::BaseDecodingOutputs> outputParams;
@@ -549,7 +543,7 @@ std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(
     if (output.logProbs)
     {
         outputParams->outputLogProbs = output.logProbs;
-        outputParams->outputLogProbsTiled = logProbsTiled;
+        outputParams->outputLogProbsTiled = output.logProbsTiled;
     }
 
     // Beam search outputs
@@ -575,7 +569,7 @@ void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& in
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
-    auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
+    auto outputParams = prepareOutputs(output, mDecodingMode);
 
     mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams, mDecodingLayerWorkspace);
 
@@ -587,99 +581,9 @@ void GptDecoder<T>::forwardSync(DecodingOutput& output, DecodingInput const& inp
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
-    auto outputParams = prepareOutputs(output, mLogProbsTiled, mDecodingMode);
+    auto outputParams = prepareOutputs(output, mDecodingMode);
 
     mDynamicDecodeLayer->forwardSync(outputParams, forwardParams, mDecodingLayerWorkspace);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-// Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
-template <typename T>
-void GptDecoder<T>::gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-    BufferManager const& manager, std::optional<std::reference_wrapper<SamplingConfig const>> samplingConfig)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto& finalOutputIds = *decodingOutput.gatheredIds;
-    auto const& finalOutputIdsShape = finalOutputIds.getShape();
-    auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
-    auto const batchSize = finalOutputIdsShape.d[0];
-    auto const beamWidth = finalOutputIdsShape.d[1];
-    auto const maxSeqLength = finalOutputIdsShape.d[2];
-
-    TLLM_CHECK_WITH_INFO(beamWidth > 1, "gatherTree is only needed for beam search.");
-
-    TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[0] == batchSize,
-        common::fmtstr("Decoder batch size (" FMT_DIM ") does not match final batch size (" FMT_DIM ")",
-            decodingOutputIdsShape.d[0], batchSize));
-    TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[1] == beamWidth,
-        common::fmtstr("Decoder beam width (" FMT_DIM ") does not match final beam width (" FMT_DIM ")",
-            decodingOutputIdsShape.d[1], beamWidth));
-    TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[2] <= maxSeqLength,
-        common::fmtstr("Decoder seq length size (" FMT_DIM ") is too large for final seq length (" FMT_DIM ")",
-            decodingOutputIdsShape.d[2], maxSeqLength));
-
-    auto const& stream = manager.getStream().get();
-
-    // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
-    tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
-        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
-    sync_check_cuda_error();
-
-    // Prepare length penalty, use the value from samplingConfig or 1.0f by default
-    SamplingConfig const& samplingConf = samplingConfig ? (*samplingConfig).get() : mSamplingConfig;
-    std::vector<float> lengthPenaltyVec;
-    TensorPtr lengthPenaltyPtr
-        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
-    if (!samplingConf.lengthPenalty.has_value() || samplingConf.lengthPenalty.value().size() == 0)
-    {
-        lengthPenaltyVec = std::vector<float>(batchSize, 1.0f);
-    }
-    else if (long int const size = samplingConf.lengthPenalty.value().size(); size == 1)
-    {
-        lengthPenaltyVec = std::vector<float>(batchSize, samplingConf.lengthPenalty.value()[0]);
-    }
-    else
-    {
-        TLLM_CHECK_WITH_INFO(size == batchSize,
-            common::fmtstr("Size of lengthPenalty in SamplingConfig (" FMT_DIM ") is different from batchSize (" FMT_DIM
-                           ")",
-                size, batchSize));
-        lengthPenaltyVec = samplingConf.lengthPenalty.value();
-    }
-
-    lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);
-
-    tensorrt_llm::kernels::BeamHypotheses bh;
-    bh.nMaxBatchSize = batchSize;
-    bh.nBatchSize = batchSize;
-    bh.nBeamWidth = beamWidth;
-    bh.nMaxSeqLen = maxSeqLength;
-    bh.lengthPenalties = bufferCast<float>(*lengthPenaltyPtr);
-    bh.inputLengths = bufferCast<SizeType32>(*decodingInput.lengths);
-    bh.outputIds = bufferCast<TokenIdType>(finalOutputIds);
-    bh.logProbs = bufferCastOrNull<float>(decodingOutput.logProbs);
-    bh.logProbsTiled = bufferCast<float>(*mLogProbsTiled);
-    bh.sequenceLengths = bufferCast<SizeType32>(*decodingOutput.lengths);
-    bh.cumLogProbs = bufferCast<float>(*decodingOutput.cumLogProbs);
-    bh.outputIdsCBA = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsCBA);
-    bh.logProbsCBA = bufferCast<float>(*decodingOutput.beamHypotheses.logProbsCBA);
-    bh.sequenceLengthsCBA = bufferCast<SizeType32>(*decodingOutput.beamHypotheses.sequenceLengthsCBA);
-    bh.cumLogProbsCBA = bufferCast<float>(*decodingOutput.beamHypotheses.cumLogProbsCBA);
-    bh.normedScoresCBA = bufferCast<float>(*decodingOutput.beamHypotheses.normedScoresCBA);
-    bh.numBeamsCBA = bufferCast<SizeType32>(*decodingOutput.beamHypotheses.numBeamsCBA);
-    bh.minNormedScoresCBA = bufferCast<float>(*decodingOutput.beamHypotheses.minNormedScoresCBA);
-    bh.batchDones = bufferCast<bool>(*decodingOutput.beamHypotheses.batchDones);
-    bh.finished = bufferCast<tensorrt_llm::kernels::FinishedState>(*decodingOutput.finishReasons);
-    bh.outputIdsUnfinish = bufferCast<TokenIdType>(*decodingOutput.ids);
-    bh.parentIdsUnfinish = bufferCast<TokenIdType>(*decodingOutput.parentIds);
-
-    // This is where transpose is done
-    tensorrt_llm::kernels::invokeInsertUnfinishedPath(bh, stream);
-    sync_check_cuda_error();
-
-    tensorrt_llm::kernels::invokeFinalize(bh, stream);
-    sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

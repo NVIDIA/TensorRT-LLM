@@ -41,6 +41,7 @@ auto constexpr kDraftInputIdsTensorName = "draft_input_ids";
 auto constexpr kDraftLogitsTensorName = "draft_logits";
 auto constexpr kMaxNewTokensTensorName = "request_output_len";
 auto constexpr kBeamWidthTensorName = "beam_width";
+auto constexpr kNumReturnSequencesTensorName = "num_return_sequences";
 auto constexpr kEndIdTensorName = "end_id";
 auto constexpr kPadIdTensorName = "pad_id";
 auto constexpr kBadWordsListTensorName = "bad_words_list";
@@ -194,6 +195,7 @@ public:
         inference_request::kDraftLogitsTensorName,
         inference_request::kMaxNewTokensTensorName,
         inference_request::kBeamWidthTensorName,
+        inference_request::kNumReturnSequencesTensorName,
         inference_request::kEndIdTensorName,
         inference_request::kPadIdTensorName,
         inference_request::kBadWordsListTensorName,
@@ -263,6 +265,7 @@ public:
     TENSOR_GETTER_SETTER(DraftLogits, inference_request::kDraftLogitsTensorName)
     TENSOR_GETTER_SETTER(MaxNewTokens, inference_request::kMaxNewTokensTensorName)
     TENSOR_GETTER_SETTER(BeamWidth, inference_request::kBeamWidthTensorName)
+    TENSOR_GETTER_SETTER(NumReturnSequences, inference_request::kNumReturnSequencesTensorName)
     TENSOR_GETTER_SETTER(EndId, inference_request::kEndIdTensorName)
     TENSOR_GETTER_SETTER(PadId, inference_request::kPadIdTensorName)
     TENSOR_GETTER_SETTER(BadWordsList, inference_request::kBadWordsListTensorName)

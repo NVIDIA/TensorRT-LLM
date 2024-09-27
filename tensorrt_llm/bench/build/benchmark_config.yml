@@ -45,6 +45,17 @@ meta-llama/Meta-Llama-3-8B:
       max_batch_size: 2048
       max_num_tokens: 8192
 meta-llama/Meta-Llama-3-70B:
+  tp1_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 2048
+  tp2_pp1:
+    general:
+      max_batch_size: 256
+      max_num_tokens: 1024
+    4096:
+      max_batch_size: 2048
+      max_num_tokens: 1024
   tp4_pp1:
     general:
       max_batch_size: 2048

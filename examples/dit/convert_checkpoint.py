@@ -15,6 +15,69 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (split, split_matrix_tp,
                                                split_qkv_bias_tp, split_qkv_tp)
 
+FACEBOOK_DIT_NAME_MAPPING = {
+    '^t_embedder.mlp.0.weight$':
+    't_embedder.mlp1.weight',
+    '^t_embedder.mlp.0.bias$':
+    't_embedder.mlp1.bias',
+    '^t_embedder.mlp.2.weight$':
+    't_embedder.mlp2.weight',
+    '^t_embedder.mlp.2.bias$':
+    't_embedder.mlp2.bias',
+    '^t_embedder.mlp.0.weights_scaling_factor$':
+    't_embedder.mlp1.weights_scaling_factor',
+    '^t_embedder.mlp.0.activation_scaling_factor$':
+    't_embedder.mlp1.activation_scaling_factor',
+    '^t_embedder.mlp.2.weights_scaling_factor$':
+    't_embedder.mlp2.weights_scaling_factor',
+    '^t_embedder.mlp.2.activation_scaling_factor$':
+    't_embedder.mlp2.activation_scaling_factor',
+
+    # Add negative lookhead for scaling matching.
+    '^blocks.(\d+).mlp.fc1.weight$':
+    'blocks.*.mlp.fc.weight',
+    '^blocks.(\d+).mlp.fc1.bias$':
+    'blocks.*.mlp.fc.bias',
+    '^blocks.(\d+).mlp.fc2.weight$':
+    'blocks.*.mlp.proj.weight',
+    '^blocks.(\d+).mlp.fc2.bias$':
+    'blocks.*.mlp.proj.bias',
+    '^blocks.(\d+).mlp.fc1.weights_scaling_factor$':
+    'blocks.*.mlp.fc.weights_scaling_factor',
+    '^blocks.(\d+).mlp.fc1.activation_scaling_factor$':
+    'blocks.*.mlp.fc.activation_scaling_factor',
+    '^blocks.(\d+).mlp.fc2.weights_scaling_factor$':
+    'blocks.*.mlp.proj.weights_scaling_factor',
+    '^blocks.(\d+).mlp.fc2.activation_scaling_factor$':
+    'blocks.*.mlp.proj.activation_scaling_factor',
+
+    # Add negative lookhead for scaling matching.
+    '^blocks.(\d+).attn.proj.weight$':
+    'blocks.*.attn.dense.weight',
+    '^blocks.(\d+).attn.proj.bias$':
+    'blocks.*.attn.dense.bias',
+    '^blocks.(\d+).attn.proj.weights_scaling_factor$':
+    'blocks.*.attn.dense.weights_scaling_factor',
+    '^blocks.(\d+).attn.proj.activation_scaling_factor$':
+    'blocks.*.attn.dense.activation_scaling_factor',
+    '^blocks.(\d+).adaLN_modulation.1.weight$':
+    'blocks.*.adaLN_modulation.weight',
+    '^blocks.(\d+).adaLN_modulation.1.bias$':
+    'blocks.*.adaLN_modulation.bias',
+    '^blocks.(\d+).adaLN_modulation.1.weights_scaling_factor$':
+    'blocks.*.adaLN_modulation.weights_scaling_factor',
+    '^blocks.(\d+).adaLN_modulation.1.activation_scaling_factor$':
+    'blocks.*.adaLN_modulation.activation_scaling_factor',
+    '^final_layer.adaLN_modulation.1.weight$':
+    'final_layer.adaLN_modulation.weight',
+    '^final_layer.adaLN_modulation.1.bias$':
+    'final_layer.adaLN_modulation.bias',
+    '^final_layer.adaLN_modulation.1.weights_scaling_factor$':
+    'final_layer.adaLN_modulation.weights_scaling_factor',
+    '^final_layer.adaLN_modulation.1.activation_scaling_factor$':
+    'final_layer.adaLN_modulation.activation_scaling_factor',
+}
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -85,6 +148,13 @@ def parse_arguments():
                         type=str,
                         default='float16',
                         choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument('--fp8_linear',
+                        action='store_true',
+                        help='Whether use FP8 for linear layers')
+    parser.add_argument(
+        '--diffusers_dit',
+        action='store_true',
+        help='Convert checkpoint provided by `HuggingFace/diffusers`')
     parser.add_argument(
         '--workers',
         type=int,
@@ -100,27 +170,14 @@ def convert_timm_dit(args, mapping, dtype='float32'):
     tik = time.time()
     torch_dtype = str_dtype_to_torch(dtype)
     tensor_parallel = mapping.tp_size
-    model_params = dict(torch.load(args.timm_ckpt))
-    timm_to_trtllm_name = {
-        't_embedder.mlp.0.weight': 't_embedder.mlp1.weight',
-        't_embedder.mlp.0.bias': 't_embedder.mlp1.bias',
-        't_embedder.mlp.2.weight': 't_embedder.mlp2.weight',
-        't_embedder.mlp.2.bias': 't_embedder.mlp2.bias',
-        'blocks.(\d+).mlp.fc1.weight': 'blocks.*.mlp.fc.weight',
-        'blocks.(\d+).mlp.fc1.bias': 'blocks.*.mlp.fc.bias',
-        'blocks.(\d+).mlp.fc2.weight': 'blocks.*.mlp.proj.weight',
-        'blocks.(\d+).mlp.fc2.bias': 'blocks.*.mlp.proj.bias',
-        'blocks.(\d+).attn.proj.weight': 'blocks.*.attn.dense.weight',
-        'blocks.(\d+).attn.proj.bias': 'blocks.*.attn.dense.bias',
-        'blocks.(\d+).adaLN_modulation.1.weight':
-        'blocks.*.adaLN_modulation.weight',
-        'blocks.(\d+).adaLN_modulation.1.bias':
-        'blocks.*.adaLN_modulation.bias',
-        'final_layer.adaLN_modulation.1.weight':
-        'final_layer.adaLN_modulation.weight',
-        'final_layer.adaLN_modulation.1.bias':
-        'final_layer.adaLN_modulation.bias'
-    }
+    if args.diffusers_dit and args.fp8_linear:
+        from utils_modelopt import remap_model
+        converted_ckpt = "transformer.fp8.converted.state_dict.pt"
+        remap_model(quantized_ckpt=args.timm_ckpt, output_ckpt=converted_ckpt)
+        model_params = dict(torch.load(converted_ckpt))
+    else:
+        model_params = dict(torch.load(args.timm_ckpt))
+    timm_to_trtllm_name = FACEBOOK_DIT_NAME_MAPPING
 
     def get_trtllm_name(timm_name):
         for k, v in timm_to_trtllm_name.items():
@@ -133,40 +190,45 @@ def convert_timm_dit(args, mapping, dtype='float32'):
 
     weights = dict()
     for name, param in model_params.items():
-        weights[get_trtllm_name(name)] = param.contiguous().to(torch_dtype)
+        if param.dtype == torch.int8 or 'scaling_factor' in name:
+            if 'scaling_factor' in name:
+                assert param.dtype == torch.float32
+            weights[get_trtllm_name(name)] = param.contiguous()
+        else:
+            weights[get_trtllm_name(name)] = param.contiguous().to(torch_dtype)
 
     assert len(weights) == len(model_params)
 
     for k, v in weights.items():
-        if re.match('blocks.*.attn.qkv.weight', k):
+        if re.match('^blocks.*.attn.qkv.weight$', k):
             weights[k] = split_qkv_tp(v, args.num_heads, args.hidden_size,
                                       tensor_parallel, mapping.tp_rank)
-        elif re.match('blocks.*.attn.qkv.bias', k):
+        elif re.match('^blocks.*.attn.qkv.bias$', k):
             weights[k] = split_qkv_bias_tp(v, args.num_heads, args.hidden_size,
                                            tensor_parallel, mapping.tp_rank)
-        elif re.match('blocks.*.attn.dense.weight', k):
+        elif re.match('^blocks.*.attn.dense.weight$', k):
             weights[k] = split_matrix_tp(v,
                                          tensor_parallel,
                                          mapping.tp_rank,
                                          dim=1)
-        elif re.match('blocks.*.mlp.fc.weight', k):
+        elif re.match('^blocks.*.mlp.fc.weight$', k):
             weights[k] = split_matrix_tp(v,
                                          tensor_parallel,
                                          mapping.tp_rank,
                                          dim=0)
-        elif re.match('blocks.*.mlp.fc.bias', k):
+        elif re.match('^blocks.*.mlp.fc.bias$', k):
             weights[k] = split(v, tensor_parallel, mapping.tp_rank)
-        elif re.match('blocks.*.mlp.proj.weight', k):
+        elif re.match('^blocks.*.mlp.proj.weight$', k):
             weights[k] = split_matrix_tp(v,
                                          tensor_parallel,
                                          mapping.tp_rank,
                                          dim=1)
-        elif re.match(r'.*adaLN_modulation.weight', k):
+        elif re.match(r'.*adaLN_modulation.weight$', k):
             weights[k] = split_matrix_tp(v,
                                          tensor_parallel,
                                          mapping.tp_rank,
                                          dim=0)
-        elif re.match(r'.*adaLN_modulation.bias', k):
+        elif re.match(r'.*adaLN_modulation.bias$', k):
             weights[k] = split(v, tensor_parallel, mapping.tp_rank)
 
     tok = time.time()
@@ -200,6 +262,12 @@ def save_config(args):
             'pp_size': args.pp_size,
         }
     }
+    if args.fp8_linear:
+        config['quantization'] = {
+            'quant_algo': "FP8",
+            # TODO: add support for exclude modules.
+            # 'exclude_modules': "*final_layer*",
+        }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)

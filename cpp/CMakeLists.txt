@@ -538,6 +538,31 @@ elseif(NOT WIN32)
   message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
 endif()
 
+# Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
+# need to be built to have aligned symbols
+set_ifndef(ENABLE_UCX 0)
+if(ENABLE_UCX)
+  # Only enable UCX related features if the system has UCX library
+  find_package(ucx)
+  if(NOT ${ucx_FOUND})
+    set(ENABLE_UCX 0)
+  else()
+    # installing ucxx via add_subdirectory results in strange cudart linking
+    # error, thus using their installation script to isolate the installation
+    # process until the issue is understood. And always trigger the build so
+    # that change in USE_CXX11_ABI will not be ignored.
+    execute_process(
+      COMMAND
+        ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
+        --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
+        -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
+        COMMAND_ECHO STDOUT)
+    find_package(ucxx REQUIRED PATHS ${3RDPARTY_DIR}/ucxx/cpp/build
+                 NO_DEFAULT_PATH)
+  endif()
+endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=${ENABLE_UCX}")
+
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")
 foreach(TYPE MAJOR MINOR PATCH BUILD)

@@ -16,14 +16,17 @@ if __name__ == "__main__":
                         type=str,
                         required=True,
                         help="Directory containing model engine")
+    parser.add_argument("--dump_tensors",
+                        action="store_true",
+                        help="Dump debug tensors to files")
     args = parser.parse_args()
 
-    # debug_config = trtllm.DebugConfig(dump_input_tensors=True,
-    #                                   dump_output_tensors=True,
-    #                                   debug_tensor_names=["test"])
+    max_tokens = 2
 
-    # Select which tensors should be dumped
-    debug_config = trtllm.DebugConfig(debug_tensor_names=["host_request_types"])
+    # Select which tensors should be kept or dumped
+    debug_config = trtllm.DebugConfig(
+        debug_tensor_names=["sequence_length"],
+        debug_tensors_max_iterations=0 if args.dump_tensors else max_tokens)
 
     # Create the executor.
     executor = trtllm.Executor(
@@ -32,7 +35,8 @@ if __name__ == "__main__":
 
     if executor.can_enqueue_requests():
         # Create the request.
-        request = trtllm.Request(input_token_ids=[1, 2, 3, 4], max_tokens=2)
+        request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                                 max_tokens=max_tokens)
 
         # Enqueue the request.
         request_id = executor.enqueue_request(request)
@@ -44,9 +48,20 @@ if __name__ == "__main__":
         # Print tokens.
         print(output_tokens)
 
-    print("debug tensors:")
-    debug_dir = pl.Path("/tmp/tllm_debug/PP_1/TP_1")
-    for iter_dir in [x for x in debug_dir.iterdir() if x.is_dir()]:
-        print(iter_dir.name)
-        for file in [x for x in iter_dir.iterdir() if x.is_file()]:
-            print(file.name, np.load(file))
+    if args.dump_tensors:
+        print("debug tensors from files:")
+        debug_dir = pl.Path("/tmp/tllm_debug/PP_1/TP_1")
+        if debug_dir.is_dir():
+            for iter_dir in [x for x in debug_dir.iterdir() if x.is_dir()]:
+                print(iter_dir.name)
+                for file in [x for x in iter_dir.iterdir() if x.is_file()]:
+                    print(file.name, np.load(file))
+        else:
+            print("debug dir not found")
+    else:
+        print("debug tensors from queue:")
+        debug_tensors = executor.get_latest_debug_tensors()
+        for debug_iter in debug_tensors:
+            print(f"iteration {debug_iter.iter}")
+            for [name, tensor] in debug_iter.debug_tensors.items():
+                print(name, tensor)

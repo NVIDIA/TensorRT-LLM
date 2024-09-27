@@ -8,7 +8,6 @@ import requests
 # isort: off
 import torch
 import numpy as np
-import tensorrt as trt
 # isort: on
 from huggingface_hub import hf_hub_download
 from PIL import Image
@@ -370,8 +369,7 @@ class MultimodalModelRunner:
             self.vision_precision))  # [num_frames, 3, H, W]
         return media_tensors.unsqueeze(0)  #[1, num_frames, 3, H, W]
 
-    def preprocess(self, warmup, pre_prompt, post_prompt, image,
-                   attention_mask):
+    def preprocess(self, warmup, pre_prompt, post_prompt, image):
         if self.model_type == 'kosmos-2':
             input_ids = image['input_ids'].clone()
             image_mask = image["image_embeds_position_mask"]
@@ -396,8 +394,8 @@ class MultimodalModelRunner:
             profiler.start("Vision")
 
         visual_features, visual_atts = self.get_visual_features(
-            torch.stack(image['image_patches'], dim=0)
-            if self.model_type == 'fuyu' else image, attention_mask)
+            torch.stack(image['image_patches'], dim=0) if self.model_type ==
+            'fuyu' else image)
 
         if not warmup:
             profiler.stop("Vision")
@@ -590,13 +588,12 @@ class MultimodalModelRunner:
                  image,
                  decoder_input_ids,
                  max_new_tokens,
-                 attention_mask,
                  warmup=False):
         if not warmup:
             profiler.start("Generate")
 
         input_ids, input_lengths, ptuning_args, visual_features = self.preprocess(
-            warmup, pre_prompt, post_prompt, image, attention_mask)
+            warmup, pre_prompt, post_prompt, image)
         if warmup: return None
 
         profiler.start("LLM")
@@ -657,8 +654,7 @@ class MultimodalModelRunner:
                 debug_mode=False,
                 prompt_embedding_table=ptuning_args[0],
                 prompt_tasks=ptuning_args[1],
-                prompt_vocab_size=ptuning_args[2],
-                attention_mask=attention_mask)
+                prompt_vocab_size=ptuning_args[2])
 
             # Reset input_lengths to match decoder_input_ids
             input_lengths = torch.ones(input_lengths.shape,
@@ -684,20 +680,14 @@ class MultimodalModelRunner:
             profiler.stop("Generate")
             return None
 
-    def get_visual_features(self, image, attention_mask):
+    def get_visual_features(self, image):
         visual_features = {
             'input': image.to(str_dtype_to_torch(self.vision_precision))
         }
-        if attention_mask is not None:
-            visual_features['attention_mask'] = attention_mask
         tensor_info = [
             TensorInfo('input', str_dtype_to_trt(self.vision_precision),
                        image.shape)
         ]
-        if attention_mask is not None:
-            tensor_info.append(
-                TensorInfo('attention_mask', trt.DataType.INT32,
-                           attention_mask.shape))
 
         visual_output_info = self.visual_encoder_session.infer_shapes(
             tensor_info)
@@ -961,7 +951,6 @@ class MultimodalModelRunner:
 
     def setup_inputs(self, input_text, raw_image):
         from torchvision import transforms
-        attention_mask = None
         if 'blip2' in self.model_type:
             from transformers import Blip2Processor
             processor = Blip2Processor.from_pretrained(self.args.hf_model_dir)
@@ -1024,10 +1013,6 @@ class MultimodalModelRunner:
             )
             image = inputs['flattened_patches']
             image = image.expand(self.args.batch_size, -1, -1).contiguous()
-            attention_mask = inputs['attention_mask'].to(self.device).to(
-                torch.int)
-            attention_mask = attention_mask.expand(self.args.batch_size,
-                                                   -1).contiguous()
             pre_prompt = ""
             post_prompt = None
         elif self.model_type == "neva":
@@ -1169,10 +1154,10 @@ class MultimodalModelRunner:
             decoder_input_ids = decoder_input_ids.repeat(
                 (self.args.batch_size, 1))
 
-        return input_text, pre_prompt, post_prompt, image, decoder_input_ids, attention_mask
+        return input_text, pre_prompt, post_prompt, image, decoder_input_ids
 
     def run(self, input_text, input_image, max_new_tokens):
-        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, attention_mask = self.setup_inputs(
+        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids = self.setup_inputs(
             input_text, input_image)
 
         output_text = self.generate(pre_prompt,
@@ -1180,7 +1165,6 @@ class MultimodalModelRunner:
                                     processed_image,
                                     decoder_input_ids,
                                     max_new_tokens,
-                                    attention_mask=attention_mask,
                                     warmup=False)
 
         return input_text, output_text

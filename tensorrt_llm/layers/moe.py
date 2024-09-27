@@ -61,6 +61,9 @@ class MoeConfig:
         SPARSE_MIXER = 2
 
     num_experts: int = 0
+    moe_intermediate_size: int = 0  # Add moe inter size (shanshan)
+    num_shared_experts: int = 0  # Add number of shared experts (shanshan)
+
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
     sparse_mixer_epsilon: float = 0.01
@@ -319,6 +322,7 @@ class MOEWeightWrapper(Module):
         self.tllm_to_externel_key_dict = wrapper_tllm_to_externel_key_dict
         self.tp_size = tp_size
         self.tp_dim = tp_dim
+        self.is_padded = False
 
         if quant_mode.is_weight_only():
             bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
@@ -371,8 +375,8 @@ class MOEWeightWrapper(Module):
                 return {}
             weights = weights.to(str_dtype_to_torch(self.dtype))
             return postprocess_weight_only(
-                tllm_key, weights,
-                1 if self.quant_mode.is_int8_weight_only() else 2)
+                tllm_key, weights, torch.int8 if
+                self.quant_mode.is_int8_weight_only() else torch.quint4x2, self)
         elif self.quant_mode.has_fp8_qdq():
             if tllm_key.endswith("activation_scaling_factor"):
                 return 448.0 / weights
@@ -394,7 +398,8 @@ class MixtureOfExperts(Module):
                  dtype=None,
                  tp_group: List[int] = None,
                  tp_size: int = 1,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 use_all_reduce=True):
         super().__init__()
 
         self.moe_config = moe_config
@@ -412,6 +417,7 @@ class MixtureOfExperts(Module):
         self.mapping = mapping
         self.quant_mode = quant_mode
         self.bias = bias
+        self.use_all_reduce = use_all_reduce
 
         self.experts_per_node = self.num_experts
         if self.mapping.has_moe_ep():
@@ -500,12 +506,14 @@ class MixtureOfExperts(Module):
                 0, "moe_router")
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
-        return self.forward_experts(hidden_states, routing, finished,
-                                    lora_layer_params, reduce_fusion_params)
+        output = self.forward_experts(hidden_states, routing, finished,
+                                      lora_layer_params)
+        if self.use_all_reduce:
+            output = self.forward_allreduce(output, reduce_fusion_params)
+        return output
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params,
-                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+                        lora_layer_params):
 
         if self.quant_mode.has_fp8_qdq():
             assert self.fc.weight.value.dtype == trt.fp8, (
@@ -579,11 +587,15 @@ class MixtureOfExperts(Module):
                              ep_size=self.mapping.moe_ep_size,
                              ep_rank=self.mapping.moe_ep_rank)
 
+        return output
+
+    def forward_allreduce(
+            self, output,
+            reduce_fusion_params: Optional[AllReduceFusionParams]):
         if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
                                self.tp_group,
                                reduce_fusion_params=reduce_fusion_params)
-
         return output
 
     def load_weights(self, moe: "MixtureOfExperts"):
@@ -671,8 +683,7 @@ class MoeOOTB(MOE):
         )
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params,
-                        reduce_fusion_params: Optional[AllReduceFusionParams]):
+                        lora_layer_params):
         # TODO: https://nvbugspro.nvidia.com/bug/4781396 after this nvbug is fixed, we will remove this check.
         if lora_layer_params is not None:
             for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
@@ -768,11 +779,6 @@ class MoeOOTB(MOE):
 
         output = output.view(shape(hidden_states))
 
-        if self.tp_size > 1 and self.tp_group is not None:
-            output = allreduce(output,
-                               self.mapping.tp_group,
-                               reduce_fusion_params=reduce_fusion_params)
-
         return output
 
     def load_weights(self, moe: MOE):
@@ -829,3 +835,51 @@ class MoeOOTB(MOE):
                 if is_gated_act:
                     expert.gate.bias.value = experts_bias_1_raw[
                         i, :self.expert_inter_size]
+
+
+# Add SharedMoE class (shanshan)
+class SharedMoE(Module):
+
+    def __init__(self,
+                 moe_config: MoeConfig,
+                 hidden_size: int,
+                 ffn_hidden_size: int,
+                 hidden_act: str,
+                 mapping: Mapping = Mapping(),
+                 bias: bool = True,
+                 dtype=None,
+                 **kwargs):
+        super().__init__()
+
+        self.moe_config = moe_config
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.hidden_act = hidden_act
+        self.mapping = mapping
+        self.bias = bias
+        self.dtype = dtype
+
+        self.moe = MOE(hidden_size=self.hidden_size,
+                       moe_config=self.moe_config,
+                       mapping=self.mapping,
+                       ffn_hidden_size=self.moe_config.moe_intermediate_size,
+                       hidden_act=self.hidden_act,
+                       dtype=self.dtype,
+                       bias=False,
+                       tp_group=self.mapping.tp_group,
+                       tp_size=self.mapping.tp_size)
+        ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
+        self.shared_experts = ClsMLP(
+            hidden_size=self.hidden_size,
+            ffn_hidden_size=self.ffn_hidden_size,
+            hidden_act=non_gated_version(self.hidden_act),  # deepseek use SiLU
+            bias=False,
+            dtype=self.dtype,
+            tp_group=self.mapping.tp_group,
+            tp_size=self.mapping.tp_size)
+
+    def forward(self, hidden_states):
+        if self.moe_config.num_shared_experts > 0:
+            return self.moe(hidden_states) + self.shared_experts(hidden_states)
+        else:
+            return self.moe(hidden_states)

@@ -1368,7 +1368,8 @@ class BertAttention(Module):
                  cp_size=1,
                  relative_attention=False,
                  max_distance=0,
-                 num_buckets=0):
+                 num_buckets=0,
+                 quant_mode=QuantMode(0)):
         super().__init__()
 
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
@@ -1395,6 +1396,8 @@ class BertAttention(Module):
             self.q_scaling *= self.num_layers
 
         self.dtype = dtype
+        # add quant mode to control quantization
+        self.quant_mode = quant_mode
 
         self.relative_attention = relative_attention
         self.max_distance = max_distance

@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -39,24 +40,21 @@ namespace tensorrt_llm::batch_manager
  * @brief The state of the request.
  *
  * Enum order must follow chronological order for state dependency check, @see hasReachedState().
- *
- * @todo(rkobus): refactor
  */
-enum LlmRequestState_t
+enum class LlmRequestState : int32_t
 {
-    REQUEST_STATE_UNKNOWN = 0,                          ///< Unknown state
-    REQUEST_STATE_ENCODER_INIT = 1,                     ///< Encoder phase starts (for encoder-decoder models)
-    REQUEST_STATE_CONTEXT_INIT = 2,                     ///< Context phase starts
-    REQUEST_STATE_GENERATION_IN_PROGRESS = 3,           ///< Generation phase is in progress
-    REQUEST_STATE_GENERATION_TO_COMPLETE = 4,           ///< Generation phase is to be completed
-    REQUEST_STATE_GENERATION_COMPLETE = 5,              ///< Generation phase completed
-    REQUEST_STATE_DISAGG_GENERATION_INIT = 6,           ///< For disaggregated serving only:
-                                                        /// new Generation request arrived at generation model
-    REQUEST_STATE_DISAGG_CONTEXT_TRANS_IN_PROGRESS = 7, ///< For disaggregated serving only:
-                                                        /// Waiting context-only request transmitting the kv cache
-    REQUEST_STATE_DISAGG_CONTEXT_COMPLETE = 8,          ///< Context-only request finished kv cache transmission.
-    REQUEST_STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS
-    = 9,                                                ///< For disaggregated serving only: transmitting the kv cache
+    kUNKNOWN = 0,                             ///< Unknown state
+    kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
+    kCONTEXT_INIT = 2,                        ///< Context phase starts
+    kGENERATION_IN_PROGRESS = 3,              ///< Generation phase is in progress
+    kGENERATION_TO_COMPLETE = 4,              ///< Generation phase is to be completed
+    kGENERATION_COMPLETE = 5,                 ///< Generation phase completed
+    kDISAGG_GENERATION_INIT = 6,              ///< For disaggregated serving only:
+                                              /// new Generation request arrived at generation model
+    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 7,    ///< For disaggregated serving only:
+                                              /// Waiting context-only request transmitting the kv cache
+    kDISAGG_CONTEXT_COMPLETE = 8,             ///< Context-only request finished kv cache transmission.
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< For disaggregated serving only: transmitting the kv cache
 };
 
 enum LlmRequestType
@@ -85,6 +83,7 @@ public:
     using TensorPtr = TTensor;
     using LogitsPostProcessor = std::function<void(
         RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
+    using RequestPtr = std::shared_ptr<GenericLlmRequest>;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -107,12 +106,13 @@ public:
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt)
+        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
+        SizeType32 numReturnSequences = 1)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mState(REQUEST_STATE_CONTEXT_INIT)
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(endId)
         , mPadId(padId)
         , mLogitsPostProcessor(logitsPostProcessor)
@@ -152,11 +152,14 @@ public:
         , mEncoderOutputLength(encoderOutputLength)
         , mLlmRequestType(llmRequestType)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
+        , mNumReturnSequences(numReturnSequences)
+        , mSequenceIndex(0)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
-            mState = REQUEST_STATE_ENCODER_INIT;
+            mState = LlmRequestState::kENCODER_INIT;
         }
+
         initialize(*inputTokens, returnLogProbs);
     }
 
@@ -165,7 +168,7 @@ public:
         , mPromptLen(req.getInputTokenIds().size())
         , mMaxNewTokens(req.getMaxTokens())
         , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
-        , mState(REQUEST_STATE_CONTEXT_INIT)
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(req.getEndId())
         , mPadId(req.getPadId())
         , mClientId(req.getClientId())
@@ -202,10 +205,12 @@ public:
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mInputTokenExtraIds(std::nullopt)
+        , mNumReturnSequences(req.getNumReturnSequences())
+        , mSequenceIndex(0)
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
-            mState = REQUEST_STATE_DISAGG_GENERATION_INIT;
+            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
         }
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && !mReturnAllGeneratedTokens)
         {
@@ -217,6 +222,7 @@ public:
                 "length).");
             mReturnAllGeneratedTokens = true;
         }
+
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits == true)
         {
             TLLM_LOG_WARNING(
@@ -228,7 +234,7 @@ public:
 
         if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
         {
-            mState = REQUEST_STATE_ENCODER_INIT;
+            mState = LlmRequestState::kENCODER_INIT;
             if (req.getEncoderInputTokenIds().has_value())
             {
                 mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
@@ -276,13 +282,15 @@ public:
             mLoraTaskId = loraConfig->getTaskId();
             if (loraConfig.value().getWeights())
             {
-                mLoraWeights = executor::detail::toITensor(loraConfig.value().getWeights().value());
+                mLoraWeights = tensorrt_llm::runtime::ITensor::view(
+                    executor::detail::toITensor(loraConfig.value().getWeights().value()));
                 mLoraWeights.value()->unsqueeze(0);
             }
 
             if (loraConfig.value().getConfig())
             {
-                mLoraConfig = executor::detail::toITensor(loraConfig.value().getConfig().value());
+                mLoraConfig = tensorrt_llm::runtime::ITensor::view(
+                    executor::detail::toITensor(loraConfig.value().getConfig().value()));
                 mLoraConfig.value()->unsqueeze(0);
             }
         }
@@ -427,6 +435,20 @@ public:
     [[nodiscard]] SizeType32 getNumTokens(SizeType32 beam) const
     {
         return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
+    }
+
+    /// @brief Get number of return sequences for this req.
+    /// @return  The number of sequences to return.
+    [[nodiscard]] SizeType32 getNumReturnSequences() const
+    {
+        return mNumReturnSequences;
+    }
+
+    /// @brief Get child requests spawned by this req.
+    /// @return A vector of child requests.
+    [[nodiscard]] std::vector<RequestPtr> const& getChildRequests() const
+    {
+        return mChildRequests;
     }
 
     /// @brief Get max number of tokens across all beams
@@ -618,6 +640,25 @@ public:
         }
     }
 
+    /// @brief Sets the number of return sequences.
+    /// @param numReturnSequences The number of return sequences.
+    void setNumReturnSequences(SizeType32 const& numReturnSequences)
+    {
+        TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot change numReturnSequences.");
+        TLLM_CHECK_WITH_INFO(
+            numReturnSequences > 0, "numReturnSequences should be a positive integer, got %d.", numReturnSequences);
+        TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
+            "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
+            numReturnSequences, mChildRequests.size());
+        mNumReturnSequences = numReturnSequences;
+        mSequenceFinalVec->resize(mNumReturnSequences);
+    }
+
+    [[nodiscard]] bool constexpr isChild() const noexcept
+    {
+        return mSequenceIndex > 0;
+    }
+
     /// @brief Return a vector of the last-generated tokens of shape [num_beams]
     [[nodiscard]] VecTokens const& getLastTokens()
     {
@@ -672,8 +713,8 @@ public:
         }
 
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
-        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? REQUEST_STATE_ENCODER_INIT
-                                                                     : REQUEST_STATE_CONTEXT_INIT;
+        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
+                                                                     : LlmRequestState::kCONTEXT_INIT;
         mContextCurrentPosition = 0;
         mContextChunkSize = std::nullopt;
         mSeqSlot.reset();
@@ -886,6 +927,11 @@ public:
         mEncoderOutputHost = std::move(encoderOutputHost);
     }
 
+    void setEncoderOutput(TensorPtr encoderOutput)
+    {
+        mEncoderOutput = std::move(encoderOutput);
+    }
+
     void allocEncoderOutputHost(SizeType32 encoderHiddenSize, nvinfer1::DataType dataType)
     {
         mEncoderOutputHost = runtime::BufferManager::pinned(
@@ -1052,44 +1098,44 @@ public:
         mGenerationLogitsFragments.clear();
     }
 
-    [[nodiscard]] bool hasReachedState(LlmRequestState_t state) const noexcept
+    [[nodiscard]] bool hasReachedState(LlmRequestState state) const noexcept
     {
         return mState >= state;
     }
 
     [[nodiscard]] bool isEncoderInitState() const noexcept
     {
-        return mState == REQUEST_STATE_ENCODER_INIT;
+        return mState == LlmRequestState::kENCODER_INIT;
     }
 
     [[nodiscard]] bool isContextInitState() const noexcept
     {
-        return mState == REQUEST_STATE_CONTEXT_INIT;
+        return mState == LlmRequestState::kCONTEXT_INIT;
     }
 
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
-        return mState == REQUEST_STATE_GENERATION_IN_PROGRESS || mState == REQUEST_STATE_GENERATION_TO_COMPLETE;
+        return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE;
     }
 
     [[nodiscard]] bool isGenerationCompleteState() const noexcept
     {
-        return mState == REQUEST_STATE_GENERATION_COMPLETE;
+        return mState == LlmRequestState::kGENERATION_COMPLETE;
     }
 
     [[nodiscard]] bool isDisaggGenerationInitState() const noexcept
     {
-        return mState == REQUEST_STATE_DISAGG_GENERATION_INIT;
+        return mState == LlmRequestState::kDISAGG_GENERATION_INIT;
     }
 
     [[nodiscard]] bool isDisaggContextTransmissionState() const noexcept
     {
-        return mState == REQUEST_STATE_DISAGG_CONTEXT_TRANS_IN_PROGRESS;
+        return mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
     }
 
     [[nodiscard]] bool isDisaggContextCompleteState() const noexcept
     {
-        return mState == REQUEST_STATE_DISAGG_CONTEXT_COMPLETE;
+        return mState == LlmRequestState::kDISAGG_CONTEXT_COMPLETE;
     }
 
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
@@ -1102,6 +1148,11 @@ public:
     [[nodiscard]] bool isContextOnlyRequest() const noexcept
     {
         return mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY;
+    }
+
+    [[nodiscard]] bool isGenerationOnlyRequest() const noexcept
+    {
+        return mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY;
     }
 
     void setContextCurrentPosition(SizeType32 contextCurrentPosition)
@@ -1198,13 +1249,20 @@ public:
     std::optional<executor::Response> createResponse()
     {
         TLLM_CHECK(!isDisaggContextCompleteState());
-        if (isGenerationCompleteState() || (mIsStreaming && isGenerationInProgressState())
+        if (isGenerationCompleteState() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)
             || isDisaggContextTransmissionState())
         {
             TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
 
             executor::Result result;
-            result.isFinal = isGenerationCompleteState() || isDisaggContextTransmissionState();
+            result.sequenceIndex = mSequenceIndex;
+
+            result.isSequenceFinal = isGenerationCompleteState() || isDisaggContextTransmissionState();
+            mSequenceFinalVec->at(mSequenceIndex) = result.isSequenceFinal;
+
+            result.isFinal = std::all_of(mSequenceFinalVec->begin(), mSequenceFinalVec->end(),
+                [](bool isSequenceFinal) { return isSequenceFinal; });
+
             auto const nbBeams = mSamplingConfig.beamWidth;
             auto const maxNbTokens = getMaxBeamNumTokens();
 
@@ -1295,7 +1353,9 @@ public:
                 // Update position of last sent response
                 setMaxSentTokenLen(maxNbTokens);
 
-                auto response = executor::Response(mRequestId, std::move(result));
+                auto requestId = isChild() ? mParentRequestId : mRequestId;
+                auto response = executor::Response(requestId, std::move(result));
+
                 return response;
             }
         }
@@ -1315,12 +1375,29 @@ public:
         mDecodingIter = iter;
     }
 
+    void setKvCacheTransferStart(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    {
+        mKvCacheTransferStart = time;
+    }
+
+    void setKvCacheTransferEnd(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    {
+        mKvCacheTransferEnd = time;
+    }
+
+    [[nodiscard]] double getKvCacheTransferTimeMS() const
+    {
+        // get max with 0 in case this function is called while end time is not recorded
+        return std::max(
+            0.0, std::chrono::duration<double, std::milli>(mKvCacheTransferEnd - mKvCacheTransferStart).count());
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
     // Tokens [beam_size, mPromptLen + getMaxNumGeneratedTokens()]
     runtime::SamplingConfig mSamplingConfig;
-    LlmRequestState_t mState;
+    LlmRequestState mState;
     std::optional<TokenIdType> mEndId;
     std::optional<TokenIdType> mPadId;
     std::optional<SizeType32> mSeqSlot;
@@ -1413,6 +1490,15 @@ protected:
     // TODO: add real extra id for encoder tokens
     std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens;
 
+    SizeType32 mNumReturnSequences;
+    SizeType32 mSequenceIndex;
+    std::vector<RequestPtr> mChildRequests;
+    RequestIdType mParentRequestId;
+    std::shared_ptr<std::vector<bool>> mSequenceFinalVec; // Indicators whether each sibling completes generation.
+
+    std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferStart;
+    std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferEnd;
+
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
@@ -1475,6 +1561,12 @@ private:
         }
 
         setReturnLogProbs(outputLogProbs);
+
+        if (!isChild())
+        {
+            // Initialize result states unless it is a child and a child request should share parent's one.
+            mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumReturnSequences(), false);
+        }
     }
 
     TensorPtr createListTensor(std::list<VecTokens> const& wordsList)
@@ -1540,7 +1632,8 @@ public:
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt)
+        std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
+        SizeType32 numReturnSequences = 1)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
@@ -1548,18 +1641,49 @@ public:
             std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
             std::move(encoderInputFeatures), std::move(encoderOutputLength), llmRequestType,
-            std::move(inputTokenExtraIds))
+            std::move(inputTokenExtraIds), numReturnSequences)
     {
     }
 
-    LlmRequest(RequestIdType requestId, executor::Request const& Request,
+    LlmRequest(RequestIdType requestId, executor::Request const& request,
         std::optional<Base::LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false)
-        : Base(requestId, Request)
+        : Base(requestId, request)
     {
         mLogitsPostProcessor = std::move(logitsPostProcessor);
         mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
-        mLookaheadConfig = Request.getLookaheadConfig();
+        mLookaheadConfig = request.getLookaheadConfig();
+    }
+
+    std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId)
+    {
+        TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
+        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumReturnSequences()),
+            "Cannot create child requests more than the number of return sequences (%d)", getNumReturnSequences());
+        auto childReq = std::make_shared<LlmRequest>(*this);
+        childReq->mRequestId = requestId;
+        childReq->mSequenceIndex = mChildRequests.size() + 1;
+        childReq->mParentRequestId = this->mRequestId;
+        childReq->mSequenceFinalVec = this->mSequenceFinalVec;
+        childReq->mSeqSlot.reset();
+
+        // To ensure different randomness across children, assign a unique random seed to each child
+        // by adding its sequence index to the base seed. If no seed is provided, the parent's seed defaults to 0.
+        using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
+        if (childReq->mSamplingConfig.randomSeed.has_value())
+        {
+            childReq->mSamplingConfig.randomSeed->at(0) += static_cast<RandomSeedType>(childReq->mSequenceIndex);
+        }
+        else
+        {
+            RandomSeedType defaultSeed{0};
+            mSamplingConfig.randomSeed = std::vector<RandomSeedType>(1, defaultSeed);
+            childReq->mSamplingConfig.randomSeed
+                = std::vector<RandomSeedType>(1, defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
+        }
+
+        mChildRequests.push_back(childReq);
+        return childReq;
     }
 
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)

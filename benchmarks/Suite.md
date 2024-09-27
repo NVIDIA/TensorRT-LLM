@@ -20,7 +20,7 @@ TensorRT-LLM provides a packaged benchmarking utility that is accessible via the
 #### Support Quantization Modes
 
 TensorRT-LLM supports a number of quanization modes. For more information about quantization, see the
-[documentation](https://nvidia.github.io/TensorRT-LLM/precision.html).
+[documentation](https://nvidia.github.io/TensorRT-LLM/reference/precision.html).
 
 - None (no quantization applied)
 - W8A16
@@ -31,7 +31,7 @@ TensorRT-LLM supports a number of quanization modes. For more information about 
 - FP8
 - INT8
 
-> [!NOTE] Please see the supported quantization methods for each network [here](https://nvidia.github.io/TensorRT-LLM/precision.html#support-matrix)
+> [!NOTE] Please see the supported quantization methods for each network [here](https://nvidia.github.io/TensorRT-LLM/reference/precision.html#support-matrix)
 
 
 ## Inflight Benchmarking with a Dataset
@@ -159,6 +159,10 @@ or manually set a max sequence length that you plan to run with specifically:
 ```shell
 trtllm-bench --model meta-llama/Llama-2-7b-hf build --max_seq_len 256 --quantization FP8
 ```
+
+> [!NOTE] `trtllm-bench build` reproduces benchmark engines for performance study. These engine
+configurations are not guaranteed to be optimal for all cases and should be viewed as reproducers
+for the benchmark data we provide on our [Performance Overview](../docs/source/performance/perf-overview.md).
 
 Looking a little closer, the `build` sub-command
 will perform a lookup and build an engine using those reference settings. The

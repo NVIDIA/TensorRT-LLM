@@ -27,7 +27,7 @@ from .. import profiler
 from .._utils import mpi_comm, mpi_world_size, numpy_to_torch
 from ..bindings import KVCacheType, MpiComm
 from ..bindings.executor import Executor
-from ..builder import Engine, get_engine_version
+from ..builder import Engine, EngineConfig, get_engine_version
 from ..logger import logger
 from ..mapping import Mapping
 from ..quantization import QuantMode
@@ -188,6 +188,90 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         'max_beam_width': builder_config['max_beam_width']
     }
     return model_config, other_config
+
+
+def _engine_config_to_model_config(engine_config: EngineConfig,
+                                   **kwargs) -> ModelConfig:
+    pretrained_config = engine_config.pretrained_config
+    build_config = engine_config.build_config
+
+    tp_size = pretrained_config.mapping.tp_size
+    num_heads = pretrained_config.num_attention_heads // tp_size
+    num_kv_heads = pretrained_config.num_key_value_heads
+    num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
+    hidden_size = pretrained_config.hidden_size // tp_size
+    head_size = pretrained_config.head_size
+
+    rnn_config_items = [
+        'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
+        'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
+    ]
+    rnn_configs_kwargs = {}
+    for item in rnn_config_items:
+        if hasattr(pretrained_config, item):
+            rnn_configs_kwargs[item] = getattr(pretrained_config, item)
+
+    if not hasattr(build_config, 'kv_cache_type'):
+        logger.Warning(
+            'Build config doesn\'t have kv_cache_type, you might need to rebuild your enigne.'
+        )
+
+    # TODO(oargov): this is a hack, make it prettier!
+    if hasattr(pretrained_config, "get_layer_num_kv_heads"):
+        # each layer has a different number of kv heads
+        attention_layers = [
+            layer_idx for layer_idx, layer_type in enumerate(
+                pretrained_config.layer_types) if layer_type == "attention"
+        ] if hasattr(pretrained_config, "layer_types") else list(
+            range(pretrained_config.num_hidden_layers))
+        num_kv_heads_per_layer = [
+            pretrained_config.get_layer_num_kv_heads(layer_idx)
+            if layer_idx in attention_layers else 0
+            for layer_idx in range(pretrained_config.num_hidden_layers)
+        ]
+    else:
+        num_kv_heads_per_layer = None
+
+    return ModelConfig(
+        max_batch_size=build_config.max_batch_size,
+        max_beam_width=build_config.max_beam_width,
+        vocab_size=pretrained_config.vocab_size,
+        num_layers=pretrained_config.num_hidden_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        hidden_size=hidden_size,
+        head_size=head_size,
+        gpt_attention_plugin=bool(
+            build_config.plugin_config.gpt_attention_plugin),
+        mamba_conv1d_plugin=bool(
+            build_config.plugin_config.mamba_conv1d_plugin),
+        remove_input_padding=build_config.plugin_config.remove_input_padding,
+        paged_state=build_config.plugin_config.paged_state,
+        tokens_per_block=build_config.plugin_config.tokens_per_block,
+        quant_mode=pretrained_config.quant_mode,
+        gather_context_logits=build_config.gather_context_logits,
+        gather_generation_logits=build_config.gather_generation_logits,
+        dtype=pretrained_config.dtype,
+        max_prompt_embedding_table_size=build_config.
+        max_prompt_embedding_table_size,
+        lora_plugin=build_config.plugin_config.lora_plugin,
+        lora_target_modules=build_config.lora_config.lora_target_modules,
+        trtllm_modules_to_hf_modules=build_config.lora_config.
+        trtllm_modules_to_hf_modules,
+        max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
+            pretrained_config, 'max_draft_len') else 0,
+        num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
+            pretrained_config, 'num_medusa_heads') else 0,
+        **rnn_configs_kwargs,
+        num_kv_heads_per_layer=num_kv_heads_per_layer,
+        redrafter_num_beams=pretrained_config.redrafter_num_beams if hasattr(
+            pretrained_config, 'redrafter_num_beams') else 0,
+        redrafter_draft_len_per_beam=pretrained_config.
+        redrafter_draft_len_per_beam
+        if hasattr(pretrained_config, 'redrafter_draft_len_per_beam') else 0,
+        kv_cache_type=getattr(build_config, 'kv_cache_type',
+                              KVCacheType.CONTINUOUS),
+        **kwargs)
 
 
 class ModelRunnerMixin:
@@ -441,91 +525,14 @@ class ModelRunner(ModelRunnerMixin):
             gpu_weights_percent: float = 1,
             enable_context_fmha_fp32_acc: Optional[bool] = None
     ) -> 'ModelRunner':
-        pretrained_config = engine.config.pretrained_config
-        build_config = engine.config.build_config
-
-        tp_size = pretrained_config.mapping.tp_size
-        num_heads = pretrained_config.num_attention_heads // tp_size
-        num_kv_heads = pretrained_config.num_key_value_heads
-        num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
-        hidden_size = pretrained_config.hidden_size // tp_size
-        head_size = pretrained_config.head_size
-
-        rnn_config_items = [
-            'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
-            'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
-        ]
-        rnn_configs_kwargs = {}
-        for item in rnn_config_items:
-            if hasattr(pretrained_config, item):
-                rnn_configs_kwargs[item] = getattr(pretrained_config, item)
-
-        if not hasattr(build_config, 'kv_cache_type'):
-            logger.Warning(
-                'Build config doesn\'t have kv_cache_type, you might need to rebuild your enigne.'
-            )
-
-        # TODO(oargov): this is a hack, make it prettier!
-        if hasattr(pretrained_config, "get_layer_num_kv_heads"):
-            # each layer has a different number of kv heads
-            attention_layers = [
-                layer_idx for layer_idx, layer_type in enumerate(
-                    pretrained_config.layer_types) if layer_type == "attention"
-            ] if hasattr(pretrained_config, "layer_types") else list(
-                range(pretrained_config.num_hidden_layers))
-            num_kv_heads_per_layer = [
-                pretrained_config.get_layer_num_kv_heads(layer_idx)
-                if layer_idx in attention_layers else 0
-                for layer_idx in range(pretrained_config.num_hidden_layers)
-            ]
-        else:
-            num_kv_heads_per_layer = None
-
-        model_config = ModelConfig(
-            max_batch_size=build_config.max_batch_size,
-            max_beam_width=build_config.max_beam_width,
-            vocab_size=pretrained_config.vocab_size,
-            num_layers=pretrained_config.num_hidden_layers,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            hidden_size=hidden_size,
-            head_size=head_size,
-            gpt_attention_plugin=bool(
-                build_config.plugin_config.gpt_attention_plugin),
-            mamba_conv1d_plugin=bool(
-                build_config.plugin_config.mamba_conv1d_plugin),
-            remove_input_padding=build_config.plugin_config.
-            remove_input_padding,
-            paged_state=build_config.plugin_config.paged_state,
-            tokens_per_block=build_config.plugin_config.tokens_per_block,
-            quant_mode=pretrained_config.quant_mode,
-            gather_context_logits=build_config.gather_context_logits,
-            gather_generation_logits=build_config.gather_generation_logits,
-            dtype=pretrained_config.dtype,
-            max_prompt_embedding_table_size=build_config.
-            max_prompt_embedding_table_size,
-            lora_plugin=build_config.plugin_config.lora_plugin,
-            lora_target_modules=build_config.lora_config.lora_target_modules,
-            trtllm_modules_to_hf_modules=build_config.lora_config.
-            trtllm_modules_to_hf_modules,
-            max_medusa_tokens=pretrained_config.max_draft_len if hasattr(
-                pretrained_config, 'max_draft_len') else 0,
-            num_medusa_heads=pretrained_config.num_medusa_heads if hasattr(
-                pretrained_config, 'num_medusa_heads') else 0,
-            **rnn_configs_kwargs,
-            gpu_weights_percent=gpu_weights_percent,
-            num_kv_heads_per_layer=num_kv_heads_per_layer,
-            redrafter_num_beams=pretrained_config.redrafter_num_beams
-            if hasattr(pretrained_config, 'redrafter_num_beams') else 0,
-            redrafter_draft_len_per_beam=pretrained_config.
-            redrafter_draft_len_per_beam if hasattr(
-                pretrained_config, 'redrafter_draft_len_per_beam') else 0,
-            kv_cache_type=getattr(build_config, 'kv_cache_type',
-                                  KVCacheType.CONTINUOUS))
+        model_config = _engine_config_to_model_config(
+            engine.config, gpu_weights_percent=gpu_weights_percent)
 
         if model_config.kv_cache_type == KVCacheType.DISABLED:
             assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
+        pretrained_config = engine.config.pretrained_config
+        build_config = engine.config.build_config
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
         max_seq_len = build_config.max_seq_len
@@ -559,7 +566,7 @@ class ModelRunner(ModelRunnerMixin):
         if session.use_lora_plugin:
             lora_manager = LoraManager()
             if lora_dir is not None:
-                lora_manager.load_from_ckpt(model_dir=lora_dir,
+                lora_manager.load_from_ckpt(lora_dir,
                                             model_config=model_config,
                                             runtime_mapping=runtime_mapping,
                                             ckpt_source=lora_ckpt_source)
@@ -658,7 +665,7 @@ class ModelRunner(ModelRunnerMixin):
             if session.use_lora_plugin:
                 lora_manager = LoraManager()
                 if lora_dir is not None:
-                    lora_manager.load_from_ckpt(model_dir=lora_dir,
+                    lora_manager.load_from_ckpt(lora_dir,
                                                 model_config=model_config,
                                                 runtime_mapping=runtime_mapping,
                                                 ckpt_source=lora_ckpt_source)

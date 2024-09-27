@@ -247,8 +247,8 @@ for tllm_key, param in tqdm(trtllm_model.named_parameters()):
 In this mode, every precision require user's own support.
 
 ## Trouble shooting
-The weights loader is an experimental feature fow now, and is enabled for LLaMA family models by default.
+The weights loader is an experimental feature for now, and is enabled for LLaMA family models and Qwen models by default.
 
 If users are encountered with failure caused by `ModelWeightsLoader`, a workaround is passing environmental variable `TRTLLM_DISABLE_UNIFIED_CONVERTER=1` to disable the model weights loader and fallback to the legacy path.
 
-This workaround will be removed in future version after the LLaMA weights conversion is stable.
+This workaround will be removed in future version after the LLaMA/Qwen weights conversion is stable.

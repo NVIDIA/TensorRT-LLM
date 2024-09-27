@@ -1286,6 +1286,9 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
 def check_share_embedding(weights: Dict[str, torch.Tensor],
                           model_config: PretrainedConfig):
     if model_config.share_embedding_table:
+        if "lm_head.weight" in weights:
+            if weights["lm_head.weight"] is None:
+                weights.pop("lm_head.weight")
         if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
             if (weights["lm_head.weight"] -
                     weights["transformer.vocab_embedding.weight"]).any():

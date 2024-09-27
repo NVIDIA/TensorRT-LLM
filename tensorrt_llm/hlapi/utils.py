@@ -3,12 +3,14 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import traceback
 import weakref
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Union
+from queue import Queue
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import filelock
 import huggingface_hub
@@ -17,7 +19,7 @@ from huggingface_hub import snapshot_download
 from tqdm.auto import tqdm
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.logger import Singleton
+from tensorrt_llm.logger import Singleton, logger
 
 
 def print_traceback_on_error(func):
@@ -51,7 +53,6 @@ class SamplingParams:
         embedding_bias (torch.Tensor): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size].
         external_draft_tokens_config (ExternalDraftTokensConfig): The speculative decoding configuration.
         prompt_tuning_config (PromptTuningConfig): The prompt tuning configuration.
-        lora_config (LoraConfig): The LoRA configuration.
         logits_post_processor_name (str): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig.
 
         beam_width (int): The beam width. Default is 1 which disables beam search.
@@ -78,6 +79,8 @@ class SamplingParams:
         return_generation_logits (bool): Controls if Result should contain the generation logits. Default is false.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
+
+        add_special_tokens (bool): Whether to add special tokens to the prompt.
     """
     # [TO DEVELOPER] This class provides an interface to HLAPI users.
     # Internally, it manages and dispatches fields to Python bindings of C++ objects, currently including:
@@ -109,7 +112,6 @@ class SamplingParams:
     external_draft_tokens_config: Optional[
         tllme.ExternalDraftTokensConfig] = None
     prompt_tuning_config: Optional[tllme.PromptTuningConfig] = None
-    lora_config: Optional[tllme.LoraConfig] = None
     logits_post_processor_name: Optional[str] = None
 
     # Keep the below fields in sync with tllme.SamplingConfig
@@ -138,6 +140,9 @@ class SamplingParams:
     return_generation_logits: bool = False
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
+
+    # Tokenizer-related configs
+    add_special_tokens: bool = True
 
     def __post_init__(self):
         if self.pad_id is None:
@@ -318,17 +323,20 @@ class ExceptionHandler(metaclass=Singleton):
 
     def __init__(self):
         self._sys_excepthook: Callable = sys.excepthook
-        self._obj_refs_to_shutdown: List[weakref.ReferenceType] = []
+        self._obj_refs_and_callbacks: List[Tuple[weakref.ReferenceType,
+                                                 str]] = []
 
     def __call__(self, exc_type, exc_value, traceback):
         self._sys_excepthook(exc_type, exc_value, traceback)
 
-        for obj_ref in self._obj_refs_to_shutdown:
+        for obj_ref, callback_name in self._obj_refs_and_callbacks:
             if (obj := obj_ref()) is not None:
-                obj.shutdown()
+                callback = getattr(obj, callback_name)
+                callback()
 
-    def register(self, obj: Any):
-        self._obj_refs_to_shutdown.append(weakref.ref(obj))
+    def register(self, obj: Any, callback_name: str):
+        assert callable(getattr(obj, callback_name, None))
+        self._obj_refs_and_callbacks.append((weakref.ref(obj), callback_name))
 
 
 exception_handler = ExceptionHandler()
@@ -397,3 +405,39 @@ def set_docstring(docstring: str):
         return fn
 
     return decorator
+
+
+class ManagedThread(threading.Thread):
+    """ A thread that will put exceptions into an external queue if the task fails.
+
+    There are two approaches to stop the thread:
+        1. Set stop_event to stop the loop
+        2. Let `task` return False
+
+    Args:
+        task (Callable[..., bool]): The task to run repeatedly in the thread, should return False if break the loop.
+        error_queue (Queue): The queue to put exceptions into if the task fails
+        **kwargs: The arguments to pass to the task
+    """
+
+    def __init__(self, task: Callable[..., bool], error_queue: Queue, **kwargs):
+        super().__init__()
+        self.task = task
+        self.error_queue = error_queue
+        self.kwargs = kwargs
+        self.daemon = True
+
+        self.stop_event = threading.Event()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                if not self.task(**self.kwargs):
+                    break
+            except Exception as e:
+                logger.error(f"Error in thread {self.name}: {e}")
+                self.error_queue.put(e)
+                break
+
+    def stop(self):
+        self.stop_event.set()

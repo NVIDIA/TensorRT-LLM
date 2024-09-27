@@ -78,15 +78,6 @@ public:
     {
     }
 
-    // Copy constructor
-    TrtGptModelOptionalParams(TrtGptModelOptionalParams const& other)
-        : TrtGptModelOptionalParams(other.kvCacheConfig, other.enableTrtOverlap, other.deviceIds,
-            other.normalizeLogProbs, other.enableChunkedContext, other.peftCacheManagerConfig, other.decodingConfig,
-            other.gpuWeightsPercent, other.maxBeamWidth, other.maxBatchSize, other.maxNumTokens, other.schedulerConfig,
-            other.extendedRuntimePerfKnobConfig, other.debugConfig, other.maxSeqIdleMicroseconds)
-    {
-    }
-
     bool operator==(TrtGptModelOptionalParams const& other) const
     {
         return kvCacheConfig == other.kvCacheConfig                                 //

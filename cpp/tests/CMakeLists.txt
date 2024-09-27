@@ -45,11 +45,19 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
 add_custom_target(google-tests)
 
+set(CASE_REPORT_WRAPPER
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/scripts/case_report_wrapper.py)
+
 function(add_gtest test_name test_src)
   set(options NO_GTEST_MAIN NO_TLLM_LINKAGE)
   cmake_parse_arguments(ARGS "${options}" "${oneValueArgs}" "${multiValueArgs}"
                         ${ARGN})
   add_executable(${test_name} ${test_src})
+
+  if($ENV{LLM_MEMORY_PROFILING})
+    set_property(TARGET ${test_name} PROPERTY TEST_LAUNCHER
+                                              ${CASE_REPORT_WRAPPER})
+  endif()
 
   target_link_libraries(${test_name} PUBLIC gmock_main nvonnxparser)
   if(NOT ARGS_NO_GTEST_MAIN)

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import numpy as np
-import tensorrt as trt
 
 # isort: off
 import torch
@@ -1535,7 +1534,7 @@ class GenerationSession(object):
               lora_manager: LoraManager = None,
               lora_uids: List[str] = None,
               medusa_choices: List[List[int]] = None,
-              multi_block_mode: bool = None,
+              multi_block_mode: bool = True,
               enable_context_fmha_fp32_acc: bool = None):
         # Store these params related to buffer size to check against
         # the input shape with the params given in decode()
@@ -3531,8 +3530,7 @@ class GenerationSession(object):
                     final_output_ids = self.output_ids.clone().unsqueeze(1)
                     final_output_ids = final_output_ids[:, :, :self.
                                                         max_seq_length -
-                                                        self._model_config.
-                                                        max_medusa_tokens]
+                                                        self.max_draft_tokens]
                 else:
                     final_output_ids = self.finalize_decoder(
                         context_lengths, batch_size, beam_width, scfg)

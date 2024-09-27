@@ -2,7 +2,7 @@
 
 ## Quantization
 
-By simply setting several flags in the `LLM`, TensorRT-LLM can quantize the Hugging Face model automatically. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization.
+TensorRT-LLM can quantize the Hugging Face model automatically. By setting the appropriate flags in the `LLM` instance. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization. Please refer to complete list of [supported flags](https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/quantization/mode.html#QuantAlgo) and acceptable values.
 
 ``` python
 from tensorrt_llm.hlapi import QuantConfig, QuantAlgo
@@ -12,13 +12,11 @@ quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
 llm = LLM(<model-dir>, quant_config=quant_config)
 ```
 
-## Customization
+## Sampling
 
-### Customizing Sampling with SamplingParams
+SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and [others](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/hlapi/utils.py#L55-L76).
 
-With SamplingParams, you can customize the sampling strategy, such as beam search, temperature, and so on.
-
-To enable beam search with a beam size of 4, set the `sampling_params` as follows:
+As an example, to enable beam search with a beam size of 4, set the `sampling_params` as follows:
 
 ```python
 from tensorrt_llm.hlapi import LLM, SamplingParams, BuildConfig
@@ -40,11 +38,11 @@ for output in llm.generate(<prompt>, sampling_params=sampling_params):
 * [SamplingConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE)
 * [OutputConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12OutputConfigE)
 
-Refer to the class documentation for more details.
+Refer to the [class documentation](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.hlapi.SamplingParams) for more details.
 
-### Build Configuration
+## Build Configuration
 
-Apart from the arguments mentioned above, you can also customize the build configuration with the `build_config` class and other arguments borrowed from the lower-level APIs. For example:
+Apart from the arguments mentioned above, you can also customize the build configuration with the `build_config` class and other arguments borrowed from the trtllm-build CLI. These build configuration options provide flexibility in building engines for the target hardware and use cases. Refer to the following example:
 
 ```python
 llm = LLM(<model-path>,
@@ -53,10 +51,11 @@ llm = LLM(<model-path>,
             max_batch_size=128,
             max_beam_width=4))
 ```
+Refer to the [buildconfig documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/builder.py#L470-L501) for more details.
 
-### Runtime Customization
+## Runtime Customization
 
-Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other arguments borrowed from the lower-level APIs. For example:
+Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other [arguments](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/hlapi/llm_utils.py#L186-L223) borrowed from the lower-level APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:
 
 
 ```python
@@ -67,9 +66,9 @@ llm = LLM(<llama_model_path>,
             free_gpu_memory_fraction=0.8))
 ```
 
-### Tokenizer Customization
+## Tokenizer Customization
 
-By default, the high-level API uses transformers’ `AutoTokenizer`. You can override it with your own tokenizer by passing it when creating the LLM object. For example:
+By default, the high-level API uses transformers’ `AutoTokenizer`. You can override it with your own tokenizer by passing it when creating the LLM object. Refer to the following example:
 
 ```python
 llm = LLM(<llama_model_path>, tokenizer=<my_faster_one>)
@@ -77,7 +76,7 @@ llm = LLM(<llama_model_path>, tokenizer=<my_faster_one>)
 
 The LLM() workflow should use your tokenizer instead.
 
-It is also possible to input token IDs directly without Tokenizers with the following code, note that the result will be also IDs without text since the tokenizer is not used.
+It is also possible to input token IDs directly without `Tokenizers` with the following code. The code produces token IDs without text because the tokenizer is not used.
 
 ``` python
 llm = LLM(<llama_model_path>)
@@ -88,7 +87,7 @@ for output in llm.generate([32, 12]):
 
 ### Disable Tokenizer
 
-For performance considerations, you can disable the tokenizer by passing `skip_tokenizer_init=True` when creating `LLM`. In this case, `LLM.generate` and `LLM.generate_async` will expect prompt token ids as input. For example:
+For performance considerations, you can disable the tokenizer by passing `skip_tokenizer_init=True` when creating `LLM`. In this case, `LLM.generate` and `LLM.generate_async` will expect prompt token ids as input. Refer to the following example:
 
 ```python
 llm = LLM(<llama_model_path>)
@@ -107,7 +106,7 @@ Note that the `text` field in `CompletionOutput` is empty since the tokenizer is
 
 ### Asyncio-Based Generation
 
-With the high-level API, you can also perform asynchronous generation with the `generate_async` method. For example:
+With the LLM API, you can also perform asynchronous generation with the `generate_async` method. Refer to the following example:
 
 ```python
 llm = LLM(model=<llama_model_path>)
@@ -116,11 +115,11 @@ async for output in llm.generate_async(<prompt>, streaming=True):
     print(output)
 ```
 
-When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields the token results as soon as they are available. Otherwise, it will return a generator that yields the final results only.
+When the `streaming` flag is set to `True`, the `generate_async` method will return a generator that yields each token as soon as it is available. Otherwise, it returns a generator that wait for and yields only the final results.
 
 ### Future-Style Generation
 
-The result of the `generate_async` method is a Future-like object, it doesn't block the thread unless the `.result()` is called.
+The result of the `generate_async` method is a [Future-like](https://docs.python.org/3/library/asyncio-future.html#asyncio.Future) object, it doesn't block the thread unless the `.result()` is called.
 
 ```python
 # This will not block the main thread

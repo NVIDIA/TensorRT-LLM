@@ -68,6 +68,7 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
 
         auto loraModules = modelConfig.getLoraModules();
         auto configPtr = bufferCast<SizeType32>(*config);
+        auto maxAdapterSize = modelConfig.getMaxLoraRank();
         for (SizeType32 row = 0; row < config->getShape().d[1]; ++row)
         {
             auto modId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_MODULE_OFF];
@@ -83,6 +84,9 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
             TLLM_CHECK_WITH_INFO(it != loraModules.end(), "lora module " + moduleName + " not enabled for this model");
             TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize) <= weights->getShape().d[2],
                 "lora_weights has to few values for " + moduleName);
+            TLLM_CHECK_WITH_INFO(adapterSize <= maxAdapterSize,
+                "Invalid low_rank (" + std::to_string(adapterSize) + "). low_rank must be smaller than mMaxLowRank ("
+                    + std::to_string(maxAdapterSize) + ")");
         }
     }
 }

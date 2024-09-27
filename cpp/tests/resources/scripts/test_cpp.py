@@ -16,12 +16,16 @@
 
 import argparse as _arg
 import copy
+import functools
+import glob
 import logging as _log
 import os as _os
 import pathlib as _pl
 import platform
+import signal
 import subprocess as _sp
 import sys as _sys
+import time as _time
 import typing as _tp
 
 build_script_dir = _pl.Path(
@@ -66,6 +70,98 @@ def run_command(command: _tp.Sequence[str],
                   timeout, override_timeout)
         timeout = override_timeout
     _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+
+
+def merge_report(parallel, retry, output):
+    import xml.etree.ElementTree as ElementTree
+    base = ElementTree.parse(parallel)
+    extra = ElementTree.parse(retry)
+
+    base_suite = base.getroot()
+    extra_suite = extra.getroot()
+
+    base_suite.attrib['failures'] = extra_suite.attrib['failures']
+    base_suite.attrib['time'] = str(
+        int(base_suite.attrib['time']) + int(extra_suite.attrib['time']))
+
+    case_names = {element.attrib['name'] for element in extra_suite}
+    base_suite[:] = [
+        element
+        for element in base_suite if element.attrib['name'] not in case_names
+    ] + list(extra_suite)
+
+    base.write(output, encoding="UTF-8", xml_declaration=True)
+
+
+def add_parallel_info(report, parallel):
+    import xml.etree.ElementTree as ElementTree
+    try:
+        document = ElementTree.parse(report)
+    except FileNotFoundError:
+        return
+    root = document.getroot()
+    root.attrib['parallel'] = str(parallel)
+    document.write(report, encoding="UTF-8", xml_declaration=True)
+
+
+def parallel_run_ctest(
+    command: _tp.Sequence[str],
+    cwd: _pl.Path,
+    *,
+    shell=False,
+    env=None,
+    timeout=None,
+    parallel=2,
+) -> None:
+    if parallel == 1:
+        return run_command(command,
+                           cwd=cwd,
+                           shell=shell,
+                           env=env,
+                           timeout=timeout)
+
+    env = {} if env is None else env
+    env['CTEST_PARALLEL_LEVEL'] = str(parallel)
+
+    def get_report():
+        reports = glob.glob("results-*.xml", root_dir=cwd)
+        if not reports:
+            return ''
+
+        return reports[0]
+
+    report = None
+    try:
+        run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+    except _sp.CalledProcessError:
+        report = get_report()
+        if report == '':
+            # Some catastrophic fail happened that there's no report generated
+            raise
+
+        parallel_report = 'parallel-' + report
+        _os.rename(cwd / report, cwd / parallel_report)
+
+        try:
+            _log.info("Parallel test failed, retry serial on failed tests")
+            del env['CTEST_PARALLEL_LEVEL']
+            command = [*command, "--rerun-failed"]
+            run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+        finally:
+            if not _os.path.exists(cwd / report):
+                # Some catastrophic fail happened that there's no report generated
+                # Use parallel result as final report
+                _os.rename(cwd / parallel_report, cwd / report)
+            else:
+                retry_report = 'retry-' + report
+                _os.rename(cwd / report, cwd / retry_report)
+                merge_report(cwd / parallel_report, cwd / retry_report,
+                             cwd / report)
+    finally:
+        if report is None:
+            report = get_report()
+        if report:
+            add_parallel_info(cwd / report, parallel)
 
 
 def run_tests(build_dir: _pl.Path,
@@ -463,6 +559,31 @@ def build_tests(build_dir: _pl.Path):
     run_command(make_google_tests, cwd=build_dir, timeout=300)
 
 
+def with_memory_monitor(func):
+    if not _os.environ.get('LLM_MEMORY_PROFILING', False):
+        return func
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        memory_collector = _sp.Popen([
+            "/usr/bin/python3",
+            find_root_dir() /
+            "tests/llm-test-defs/turtle/defs/memory_collector.py",
+            "-p",
+            str(_os.getpid()),
+            "-i",
+            "0.2",
+        ])
+        try:
+            func(*args, **kwargs)
+        finally:
+            memory_collector.send_signal(signal.SIGINT)
+            memory_collector.wait()
+
+    return wrapper
+
+
+@with_memory_monitor
 def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     build_tests(build_dir=build_dir)
 
@@ -477,14 +598,16 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
+    excluded_tests.append("ExplicitDraftTokensDecoding")
     excluded_tests.append("Mamba")
     excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
     excluded_tests.append("EncDec")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+    parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
+@with_memory_monitor
 def run_single_gpu_tests(build_dir: _pl.Path,
                          run_gpt,
                          run_gptj,
@@ -540,7 +663,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        run_command(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+        parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
 def produce_mpirun_command(*, global_commands, nranks, local_commands,
@@ -552,6 +675,7 @@ def produce_mpirun_command(*, global_commands, nranks, local_commands,
     return l[:-1]
 
 
+@with_memory_monitor
 def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     build_tests(build_dir=build_dir)
 
@@ -576,6 +700,18 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "batch_manager/cacheTransceiverTest",
     ]
     run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
+    if _os.path.exists(
+            _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
+        ucx_trans_test = [
+            "mpirun",
+            "-n",
+            "2",
+            "--allow-run-as-root",
+            "batch_manager/ucxDataTransceiverTest",
+        ]
+        run_command(ucx_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     trt_model_test = produce_mpirun_command(
@@ -957,7 +1093,29 @@ if __name__ == "__main__":
         test_args.run_encoder = True
         test_args.run_bart = True
         test_args.run_t5 = True
+        test_args.run_medusa = True
+        test_args.run_redrafter = True
 
     del test_args.run_all_models
 
-    run_tests(**vars(test_args))
+    do_memory_profiling = _os.environ.get('LLM_MEMORY_PROFILING', False)
+    if do_memory_profiling:
+        unix_socket = "/tmp/profiling_scribe.unix"
+
+        scribe = _sp.Popen([
+            "/usr/bin/python3",
+            find_root_dir() /
+            "tests/llm-test-defs/turtle/defs/profiling_scribe.py", "-l",
+            unix_socket
+        ])
+
+        while not _os.path.exists(unix_socket):
+            _time.sleep(0.1)
+
+    try:
+        run_tests(**vars(test_args))
+    finally:
+        if do_memory_profiling:
+            scribe.send_signal(signal.SIGINT)
+            scribe.wait(timeout=10)
+            scribe.kill()

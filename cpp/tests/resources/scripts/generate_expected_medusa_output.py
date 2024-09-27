@@ -32,10 +32,11 @@ def generate_output(engine: str,
                     model_spec_obj: model_spec.ModelSpec,
                     max_output_len: int = 8):
 
-    model = 'vicuna-7b-v1.3'
+    model = 'vicuna-7b-medusa'
+    hf_model = 'vicuna-7b-v1.3'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    hf_dir = models_dir / model
+    hf_dir = models_dir / hf_model
     tp_pp_dir = 'tp1-pp1-gpu/'
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
@@ -58,6 +59,7 @@ def generate_output(engine: str,
         '--temperature', '1.0'
     ])
     run.main(args)
+    print(f"Output saved at {str(output_dir / base_output_name)}.[npy|csv]")
 
 
 def generate_outputs():

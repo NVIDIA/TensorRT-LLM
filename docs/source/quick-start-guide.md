@@ -31,7 +31,7 @@ make -C docker release_run LOCAL_USER=1
 huggingface-cli login --token *****
 
 # Convert the model into TensorRT-LLM checkpoint format
-cd exammples/llama
+cd examples/llama
 pip install -r requirements.txt
 pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.
 python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt
@@ -125,17 +125,18 @@ curl -X POST localhost:8000/v2/models/ensemble/generate -d \
 ```
 
 ## LLM API
-We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
-Here we show you a preview of how it works and how to use it.
+The LLM API is a Python API to setup & infer with TensorRT-LLM directly in python.It allows for optimizing models by specifying a HuggingFace repo name or a model checkpoint. The LLM API handles checkpoint conversion, engine building, engine loading, and model inference, all from one python object.
 
-Note that the APIs are not stable and only support the [few models](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/index.html#supported-model). We appreciate your patience and understanding as we improve this API.
+Note that these APIs are in incubation, they may change and  supports the [following models](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/index.html#supported-model), which will increase in coming release. We appreciate your patience and understanding as we improve this API.
 
-Here is a simple example to show how to use the HLAPI with TinyLlama.
-```{eval-rst}
-.. literalinclude:: ../../examples/high-level-api/quickstart_example.py
+Here is a simple example to show how to use the LLM API with TinyLlama.
+
+```{literalinclude} ../../examples/llm-api/quickstart_example.py
     :language: python
     :linenos:
 ```
+
+To learn more about the LLM API, check out the [](llm-api-examples/index) and [](llm-api/index).
 
 ## Next Steps
 

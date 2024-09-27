@@ -102,6 +102,11 @@ GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConf
     // TODO compare expected and runtime tensor names?
 
     setup(sessionConfig);
+
+    if (mModelConfig.getManageWeightsType() != ModelConfig::ManageWeightsType::kDisabled)
+    {
+        mRuntime->loadManagedWeights(rawEngine, mWorldConfig.getLocalRank());
+    }
 }
 
 GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -382,13 +387,6 @@ void GptSession::setup(Config const& sessionConfig)
             sessionConfig.kvCacheConfig);
     }
 
-    if (mModelConfig.getManageWeightsType() != ModelConfig::ManageWeightsType::kDisabled)
-    {
-        TLLM_CHECK_WITH_INFO(sessionConfig.enginePath.has_value(), "Engine path is not set.");
-        auto weightPath = sessionConfig.enginePath->parent_path()
-            / ("rank" + std::to_string(mWorldConfig.getLocalRank()) + "_managed_weights.safetensors");
-        mRuntime->loadManagedWeights(weightPath.string());
-    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

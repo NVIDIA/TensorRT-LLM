@@ -36,7 +36,6 @@ class TestReDrafter(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('warning')
 
-    @unittest.skip("Enable after https://nvbugs/4697116 is fixed.")
     def test_beams2tree(self):
         # test data
         bs = 2

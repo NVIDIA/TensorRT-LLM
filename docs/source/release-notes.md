@@ -59,6 +59,10 @@ All published functionality in the Release Notes has been fully tested and verif
   - The dependent PyTorch version is updated to 2.4.0.
   - The dependent ModelOpt version is updated to v0.15.0.
 
+### Known Issues
+
+- On Windows, installation of TensorRT-LLM may succeed, but you might hit `OSError: exception: access violation reading 0x0000000000000000` when importing the library in Python. See [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) for workarounds.
+
 
 ## TensorRT-LLM Release 0.11.0
 
@@ -373,11 +377,11 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
 
-- Chunked context support (see docs/source/gpt_attention.md#chunked-context)
+- Chunked context support (see docs/source/advanced/gpt-attention.md#chunked-context)
 - LoRA support for C++ runtime (see docs/source/lora.md)
 - Medusa decoding support (see examples/medusa/README.md)
   - The support is limited to Python runtime for Ampere or newer GPUs with fp16 and bf16 accuracy, and the `temperature` parameter of sampling configuration should be 0
-- StreamingLLM support for LLaMA (see docs/source/gpt_attention.md#streamingllm)
+- StreamingLLM support for LLaMA (see docs/source/advanced/gpt-attention.md#streamingllm)
 - Support for batch manager to return logits from context and/or generation phases
   - Include support in the Triton backend
 - Support AWQ and GPTQ for QWEN

@@ -14,16 +14,23 @@
 # limitations under the License.
 
 import copy
+import os
 from typing import Optional, Union
 
+import torch
+from tqdm import tqdm
+
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send, sigmoid
+from ...functional import Tensor, allreduce, recv, send, sigmoid
 from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, RowLinear)
+from ...layers.moe import MOEWeightWrapper
+from ...logger import logger
 from ...lora_manager import (LoraConfig,
                              get_default_trtllm_modules_to_hf_modules, use_lora)
 from ...mapping import Mapping
 from ...module import Module
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig, check_share_embedding)
 from .config import QWenConfig
@@ -39,7 +46,7 @@ class QWenDecoderLayer(Module):
         self.config = config
 
         dtype = config.dtype
-        tp_group = config.mapping.tp_group
+        self.tp_group = config.mapping.tp_group
         tp_size = config.mapping.tp_size
 
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
@@ -61,7 +68,7 @@ class QWenDecoderLayer(Module):
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
-            tp_group=tp_group,
+            tp_group=self.tp_group,
             tp_size=tp_size,
             quant_mode=config.quant_mode,
             dense_bias=False)
@@ -82,15 +89,17 @@ class QWenDecoderLayer(Module):
                 hidden_act=config.hidden_act,
                 dtype=dtype,
                 bias=False,
-                tp_group=tp_group,
+                tp_group=self.tp_group,
                 tp_size=tp_size,
-                quant_mode=config.quant_mode)
+                quant_mode=config.quant_mode,
+                is_expert=True)
             self.shared_expert_gate = RowLinear(config.hidden_size,
                                                 1,
                                                 bias=False,
                                                 dtype=dtype,
                                                 tp_group=None,
                                                 tp_size=1)
+            mlp_kwargs['use_all_reduce'] = False
 
         # Qwen's real inter_size depends on qwen_type
         if self.config.qwen_type == 'qwen':
@@ -105,7 +114,7 @@ class QWenDecoderLayer(Module):
                           hidden_act=config.hidden_act,
                           dtype=dtype,
                           bias=config.mlp_bias,
-                          tp_group=tp_group,
+                          tp_group=self.tp_group,
                           tp_size=tp_size,
                           quant_mode=config.quant_mode,
                           **mlp_kwargs)
@@ -159,6 +168,7 @@ class QWenDecoderLayer(Module):
 
         if shared_output is not None:
             hidden_states = hidden_states + shared_output
+            hidden_states = allreduce(hidden_states, self.tp_group)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -307,16 +317,130 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               quant_config=quant_config,
                                               **kwargs)
 
-        if not use_preloading:
-            hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
-        if use_hf_gptq_checkpoint:
-            weights = load_weights_from_hf_gptq_model(hf_model, config)
-        else:
-            weights = load_weights_from_hf_model(hf_model, config)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            custom_dict = {}
+            if config.qwen_type == "qwen":
+                custom_dict = {
+                    "transformer": "transformer",
+                    "vocab_embedding": "wte",
+                    "ln_f": "ln_f",
+                    "layers": "h",
+                    "attention": "attn",
+                    "qkv": "c_attn",
+                    "dense": "c_proj",
+                    "gate": "w1",
+                    "proj": "c_proj",
+                    "fc": "w2",
+                    "input_layernorm": "ln_1",
+                    "post_layernorm": "ln_2",
+                }
+            elif config.qwen_type == "qwen2_moe":
+                custom_dict = {
+                    "shared_expert": "mlp.shared_expert",
+                    "shared_expert_gate": "mlp.shared_expert_gate",
+                    "fc": ["up_proj", "gate_proj"],
+                }
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            if config.share_embedding_table:
+                config.share_embedding_table = loader.check_share_embedding()
+            model = cls(config)
 
-        check_share_embedding(weights, config)
-        model = QWenForCausalLM(config)
-        model.load(weights)
+            if config.qwen_type == "qwen" and model.config.mapping.has_tp():
+
+                def reshape_qkv(weights):
+                    if weights is None:
+                        return weights
+                    mapping = model.config.mapping
+                    unsqueeze = False
+                    if isinstance(weights, torch.Tensor):
+                        unsqueeze = True
+                        weights = [weights]
+
+                    for idx, w in enumerate(weights):
+                        if use_hf_gptq_checkpoint:
+                            w = w.reshape(-1, 3, w.shape[-1] // 3)
+                            w = w.chunk(mapping.tp_size, 2)[mapping.tp_rank]
+                            if w.shape[0] == 1:
+                                weights[idx] = w.reshape(-1)
+                            else:
+                                weights[idx] = w.reshape(w.shape[0], -1)
+                        else:
+                            w = w.reshape(3, w.shape[0] // 3, -1)
+                            w = w.chunk(mapping.tp_size, 1)[mapping.tp_rank]
+                            if w.shape[-1] == 1:
+                                weights[idx] = w.reshape(-1)
+                            else:
+                                weights[idx] = w.reshape(-1, w.shape[-1])
+                    if unsqueeze:
+                        return weights[0]
+                    else:
+                        return weights
+
+                loader.update_key_mapping(model)
+                tllm_weights = {}
+                for tllm_key, _ in tqdm(model.named_parameters()):
+                    if "qkv" in tllm_key:
+                        tllm_weights.update(
+                            loader.load(tllm_key, reshape_qkv, skip_tp=True))
+                    else:
+                        tllm_weights.update(loader.load(tllm_key))
+                loader.fill(tllm_weights)
+            elif config.qwen_type == "qwen2_moe":
+                for tllm_key, _ in model.named_parameters():
+                    sub_module = model
+                    for attr in tllm_key.split(".")[:-1]:
+                        sub_module = getattr(sub_module, attr)
+                    if "router" in tllm_key or isinstance(
+                            sub_module, MOEWeightWrapper):
+                        sub_module_dic = sub_module.tllm_to_externel_key_dict
+                        sub_module_dic["mlp"] = "mlp"
+                        if "fc" in sub_module_dic.keys():
+                            sub_module_dic["fc"] = [
+                                hf_keyword.replace("w1", "gate_proj")
+                                for hf_keyword in sub_module_dic["fc"]
+                            ]
+                            sub_module_dic["fc"] = [
+                                hf_keyword.replace("w3", "up_proj")
+                                for hf_keyword in sub_module_dic["fc"]
+                            ]
+                        if "proj" in sub_module_dic.keys():
+                            sub_module_dic["proj"] = [
+                                hf_keyword.replace("w2", "down_proj")
+                                for hf_keyword in sub_module_dic["proj"]
+                            ]
+                        sub_module.tllm_to_externel_key_dict = sub_module_dic
+
+                def concat_gate_up_proj(weights):
+                    return torch.cat(weights, dim=-2)
+
+                loader.update_key_mapping(model)
+                tllm_weights = {}
+                for tllm_key, _ in tqdm(model.named_parameters()):
+                    if tllm_key.endswith("shared_expert.fc.weight"):
+                        tllm_weights.update(
+                            loader.load(tllm_key, concat_gate_up_proj))
+                    else:
+                        tllm_weights.update(loader.load(tllm_key))
+                loader.fill(tllm_weights)
+            else:
+                # For Qwen1 w/o TP, Qwen1.5 and Qwen2 w/o MoE
+                loader.generate_tllm_weights(model)
+        else:
+            if not use_preloading:
+                hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
+
+            logger.debug(f"HuggingFace model: {hf_model}")
+
+            model = QWenForCausalLM(config)
+
+            logger.debug(f"TensorRT-LLM model: {model}")
+
+            if use_hf_gptq_checkpoint:
+                weights = load_weights_from_hf_gptq_model(hf_model, config)
+            else:
+                weights = load_weights_from_hf_model(hf_model, config)
+            check_share_embedding(weights, config)
+            model.load(weights)
         return model
 
     def default_plugin_config(self, **kwargs):

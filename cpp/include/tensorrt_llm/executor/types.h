@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -332,6 +333,13 @@ enum class RequestStage
     kGENERATION_COMPLETE,
 };
 
+/// @brief Struct that holds the request stats in the case of disaggregated serving
+struct DisServingRequestStats
+{
+    /// @brief The total time spent on transferring KV cache from context phase to generation phase (ms)
+    double kvCacheTransferMS;
+};
+
 /// @brief Struct that holds the stats of a single request
 struct RequestStats
 {
@@ -350,6 +358,8 @@ struct RequestStats
     /// @brief Whether the request is being paused at the current iteration due to lack of resources (KV cache blocks
     /// exhaustion for example)
     bool paused;
+    /// @brief Stats specific to disaggregated serving
+    std::optional<DisServingRequestStats> disServingStats;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration
@@ -359,6 +369,15 @@ struct RequestStatsPerIteration
     IterationType iter;
     /// @brief The stats of all active requests for this iteration
     std::vector<RequestStats> requestStats;
+};
+
+/// @brief Struct that holds the debug tensors in an iteration
+struct DebugTensorsPerIteration
+{
+    /// @brief The iteration id for these tensors
+    IterationType iter;
+    /// @brief The debug tensors for this iteration
+    std::map<std::string, Tensor> debugTensors;
 };
 
 /// @brief The reason why the model stopped generating tokens for a request.
