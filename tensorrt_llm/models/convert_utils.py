@@ -458,6 +458,7 @@ def generate_int8(
         ])
 
     to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
+    np_weights = weights.cpu().detach().numpy()
 
     if is_qkv and multi_query_mode:
         scale_w_quant_orig_t_expand = np.ones([weights.shape[-1]])
@@ -465,12 +466,12 @@ def generate_int8(
         scale_w_quant_orig_t_expand[hidden_dim:hidden_dim +
                                     kv_dim] = scale_w_quant_orig_t[1]
         scale_w_quant_orig_t_expand[-kv_dim:] = scale_w_quant_orig_t[2]
-        weight_int8 = to_i8(weights * scale_w_quant_orig_t_expand)
+        weight_int8 = to_i8(np_weights * scale_w_quant_orig_t_expand)
     else:
-        weight_int8 = to_i8(weights * scale_w_orig_quant_t)
+        weight_int8 = to_i8(np_weights * scale_w_orig_quant_t)
     return {
         "weight.int8": weight_int8,
-        "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
+        "weight.int8.col": to_i8(np_weights * scale_w_orig_quant_c),
         "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
         "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
         "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
