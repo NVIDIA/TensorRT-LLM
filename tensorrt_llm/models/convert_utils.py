@@ -249,13 +249,14 @@ DEFAULT_HF_DATASET_META = {
     'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
     'cnn_dailymail': ('3.0.0', 'train', 'article'),
     'lambada': (None, 'validation', 'text'),
+    '': (None, 'train', 'text'),
 }
 
 
 def load_calib_dataset(dataset_name_or_dir: str,
                        config_name: Optional[str] = None,
-                       split: Optional[str] = "train", # default split value in hf datasets object
-                       key: Optional[str] = "text", # default key value in hf datasets object
+                       split: Optional[str] = None, # default split value will be 'train' in hf datasets object
+                       key: Optional[str] = None, # default key value will be 'text' in hf datasets object
                        trust_remote_code=True,
                        **kwargs):
     if config_name is None:
