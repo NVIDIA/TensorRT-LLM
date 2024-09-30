@@ -128,7 +128,7 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
     auto const batchSize = inputs->logits.value()->getDimension<0>();
 
     auto const* endIds = bufferCast<TokenIdType>(*inputs->endIds);
-    auto const* minPs = bufferCast<float>(*inputs->minPs);
+    auto const* minPs = bufferCast<const float*>(*inputs->minPs);
 
     FinishedState const* finishedInput = (inputs->finished)
         ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*inputs->finished.value()))

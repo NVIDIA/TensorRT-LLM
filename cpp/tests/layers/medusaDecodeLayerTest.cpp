@@ -199,7 +199,7 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     trk::invokeFill(*mFinishedDevice, uint8_t{0}, *mStream);
     trk::invokeFill(*mOutputIdsDevice, SizeType32{0}, *mStream);
     trk::invokeFill(*mEndIdsDevice, TokenIdType{endId}, *mStream);
-    trk::invokeFill(*mMinPsDevice, float{0.0f}, *mStream);
+    trk::invokeFill(*mMinPsDevice, float*{nullptr}, *mStream);
     trk::invokeFill(*mNextDraftTokensDevice, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mPathsDevice, SizeType32{-1}, *mStream);
     trk::invokeFill(*mTreeIdsDevice, SizeType32{0}, *mStream);

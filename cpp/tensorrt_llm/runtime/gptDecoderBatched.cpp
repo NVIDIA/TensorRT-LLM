@@ -96,7 +96,7 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
     { // prevent reusing these vars after std::move
         auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
         auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        auto minP = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
+        auto minP = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<float*>::value);
         auto batchSlots = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
         dInput = std::make_unique<DecodingInput>(
             0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(minP), std::move(batchSlots));
@@ -473,11 +473,9 @@ void GptDecoderBatched::newRequest(
 
     if (wordsLen > 0)
     {
-        TensorPtr badWordsMinPView = ITensor::slice(request.badWordsList, 0, 1);
-        // copying int bits to float: avoid the type check in ::copy(ITensor, ITensor)
-        manager.copy(*badWordsMinPView, minPTensorPtr->data(), minPTensorPtr->getMemoryType());
+        kernels::invokeFill(*minPTensorPtr, (int64_t)(intptr_t)bufferCast<TokenIdType>(*request.badWordsList), *stream);
     } else {
-        kernels::invokeFill(*minPTensorPtr, 0.0f, *stream);
+        kernels::invokeFill(*minPTensorPtr, (int64_t)0, *stream);
     }
 
     TensorPtr embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);

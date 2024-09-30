@@ -43,7 +43,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
     auto& dInput = mDecodingInput;
     auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    auto minPs = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    auto minPs = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<float*>::value);
     mSetupBatchSlots = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
     dInput = std::make_unique<DecodingInput>(0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(minPs), mSetupBatchSlots);
 

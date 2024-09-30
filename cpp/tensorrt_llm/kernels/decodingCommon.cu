@@ -69,7 +69,7 @@ template <typename T>
 __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
     FinishedState const* finished, int32_t const* batchSlots, int32_t maxBatchSize, int32_t beamWidth,
     int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
-    float const* minPs)
+    float const*const* minPs)
 {
     auto const batchIdx = blockIdx.x;
     auto const beamIdx = blockIdx.y;
@@ -115,9 +115,9 @@ __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bia
     }
 
     float minP = 0.0f;
-    if (minPs != nullptr)
+    if (minPs != nullptr && minPs[batchSlot] != nullptr)
     {
-        minP = minPs[batchSlot];
+        minP = *minPs[batchSlot];
     }
 
     if (!skipSoftMax)
@@ -165,7 +165,7 @@ template <typename T>
 void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
     FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize, int32_t maxBatchSize,
     int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
-    float const* minPs, cudaStream_t stream)
+    float const*const* minPs, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -181,12 +181,12 @@ void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, in
 template void invokeAddBiasSoftMax(float* logits, float** logitsPtrs, float* probs, float const* bias,
     int32_t const* endIds, FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize,
     int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax,
-    bool batchSlotsLogits, float const* minPs, cudaStream_t stream);
+    bool batchSlotsLogits, float const*const* minPs, cudaStream_t stream);
 
 template void invokeAddBiasSoftMax(half* logits, half** logitsPtrs, half* probs, half const* bias,
     int32_t const* endIds, FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize,
     int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax,
-    bool batchSlotsLogits, float const* minPs, cudaStream_t stream);
+    bool batchSlotsLogits, float const*const* minPs, cudaStream_t stream);
 
 template <typename T>
 __global__ void scatterDecodingParamsKernel(T const* src, T* dst, int const* batchSlots, int batchSize)
