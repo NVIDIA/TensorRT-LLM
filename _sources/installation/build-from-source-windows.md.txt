@@ -11,7 +11,7 @@ This section is for advanced users. Skip this section if you plan to use the pre
 1. Install prerequisites listed in our [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) document.
 2. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
 3. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/).
-4. Download and unzip [TensorRT 10.3.0.26](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.3.0/zip/TensorRT-10.3.0.26.Windows.win10.cuda-12.5.zip).
+4. Download and unzip [TensorRT 10.4.0.26](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.4.0/zip/TensorRT-10.4.0.26.Windows.win10.cuda-12.6.zip).
 
 ## Building a TensorRT-LLM Docker Image
 
@@ -65,7 +65,7 @@ git submodule update --init --recursive
 2. Build TensorRT-LLM. This command generates `build\tensorrt_llm-*.whl`.
 
 ```bash
-python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10.3.0.26\
+python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10.4.0.26\
 ```
 
 3. Copy or move `build\tensorrt_llm-*.whl` into your mounted folder so it can be accessed on your host machine. If you intend to use the C++ runtime, you'll also need to gather various DLLs from the build into your mounted folder. For more information, refer to [C++ Runtime Usage](#c-runtime-usage).
@@ -103,7 +103,7 @@ python .\scripts\build_wheel.py -a "89-real" --trt_root C:\workspace\TensorRT-10
 
         1. Install [CMake](https://cmake.org/download/), version 3.27.7 is recommended, and select the option to add it to the system path.
         2. Download and install [Visual Studio 2022](https://visualstudio.microsoft.com/). When prompted to select more Workloads, check **Desktop development with C++**.
-        3. Download and unzip [TensorRT 10.3.0.26](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.3.0/zip/TensorRT-10.3.0.26.Windows.win10.cuda-12.5.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
+        3. Download and unzip [TensorRT 10.4.0.26](https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.4.0/zip/TensorRT-10.4.0.26.Windows.win10.cuda-12.6.zip). Move the folder to a location you can reference later, such as `%USERPROFILE%\inference\TensorRT`.
 
             1. Add the libraries for TensorRT  to your system's `Path` environment variable. Your `Path` should include a line like this:
 

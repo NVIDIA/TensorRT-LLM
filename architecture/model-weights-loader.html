@@ -80,6 +80,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="overview.html">TensorRT-LLM Architecture</a></li>
@@ -372,7 +376,8 @@ The template of postprocessing function is:</p>
 <span class="n">loader</span><span class="o">.</span><span class="n">generate_tllm_weights</span><span class="p">(</span><span class="n">trtllm_model</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>Users need to specify the different part from the default <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code>. The loader still have support across different precisions.</p>
+<p>Users need to specify the different part from the default <code class="docutils literal notranslate"><span class="pre">tllm_to_externel_key_dict</span></code>. The loader still have support across different precisions.
+The support for LLaVA and Exaone is in <code class="docutils literal notranslate"><span class="pre">LLaMAForCausalLM.from_hugging_face()</span></code> of <a class="reference download internal" download="" href="../_downloads/408e9af6e2b04a79e78215bde246e8bc/model.py"><span class="xref download myst">model.py</span></a>, and can also be taken as examples.</p>
 </section>
 <section id="models-with-customized-weight-layout">
 <h3>Models with customized weight layout<a class="headerlink" href="#models-with-customized-weight-layout" title="Link to this heading"></a></h3>
@@ -403,10 +408,11 @@ The template of postprocessing function is:</p>
         <span class="n">tllm_weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">loader</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">tllm_key</span><span class="p">,</span> <span class="n">preprocess</span><span class="o">=</span><span class="n">customized_preprocess</span><span class="p">))</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">tllm_weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">loader</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">tllm_key</span><span class="p">))</span>
-<span class="n">loader</span><span class="o">.</span><span class="n">check</span><span class="p">(</span><span class="n">tllm_weights</span><span class="p">)</span>
+<span class="n">loader</span><span class="o">.</span><span class="n">fill</span><span class="p">(</span><span class="n">tllm_weights</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>This will apply <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> after <code class="docutils literal notranslate"><span class="pre">load_tensor()</span></code> and before <code class="docutils literal notranslate"><span class="pre">postprocess</span></code>, and demonstrates how to convert the loaded shard into default HF layout. The loader still have support for precisions quantized from FP16/BF16 (e.g. INT8-wo/INT4-wo), the other precisions may require special operations, and can be addressed inside the <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> function.</p>
+<p>This will apply <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> after <code class="docutils literal notranslate"><span class="pre">load_tensor()</span></code> and before <code class="docutils literal notranslate"><span class="pre">postprocess</span></code>, and demonstrates how to convert the loaded shard into default HF layout. The loader still have support for precisions quantized from FP16/BF16 (e.g. INT8-wo/INT4-wo), the other precisions may require special operations, and can be addressed inside the <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> function.
+The support for Qwen-1 is in <code class="docutils literal notranslate"><span class="pre">QWenForCausalLM.from_hugging_face()</span></code> of <a class="reference download internal" download="" href="../_downloads/b6815cf245cc7dc7a26a6f727fdc2dc4/model.py"><span class="xref download myst">model.py</span></a>, and can also be taken as example.</p>
 </section>
 <section id="fully-customized">
 <h3>Fully customized<a class="headerlink" href="#fully-customized" title="Link to this heading"></a></h3>
@@ -429,9 +435,9 @@ The template of postprocessing function is:</p>
 </section>
 <section id="trouble-shooting">
 <h2>Trouble shooting<a class="headerlink" href="#trouble-shooting" title="Link to this heading"></a></h2>
-<p>The weights loader is an experimental feature fow now, and is enabled for LLaMA family models by default.</p>
+<p>The weights loader is an experimental feature for now, and is enabled for LLaMA family models and Qwen models by default.</p>
 <p>If users are encountered with failure caused by <code class="docutils literal notranslate"><span class="pre">ModelWeightsLoader</span></code>, a workaround is passing environmental variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISABLE_UNIFIED_CONVERTER=1</span></code> to disable the model weights loader and fallback to the legacy path.</p>
-<p>This workaround will be removed in future version after the LLaMA weights conversion is stable.</p>
+<p>This workaround will be removed in future version after the LLaMA/Qwen weights conversion is stable.</p>
 </section>
 </section>
 
@@ -443,7 +449,7 @@ The template of postprocessing function is:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4254412080>
+<jinja2.runtime.BlockReference object at 0x7fb971daeb30>
 
 <div class="footer">
     <p>

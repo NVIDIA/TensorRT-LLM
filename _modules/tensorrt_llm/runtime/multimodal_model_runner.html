@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -158,7 +162,6 @@
 <span class="c1"># isort: off</span>
 <span class="kn">import</span> <span class="nn">torch</span>
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
-<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 <span class="c1"># isort: on</span>
 <span class="kn">from</span> <span class="nn">huggingface_hub</span> <span class="kn">import</span> <span class="n">hf_hub_download</span>
 <span class="kn">from</span> <span class="nn">PIL</span> <span class="kn">import</span> <span class="n">Image</span>
@@ -167,11 +170,20 @@
 
 <span class="kn">from</span> <span class="nn">..</span> <span class="kn">import</span> <span class="n">profiler</span>
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">mpi_rank</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
-                      <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
+                      <span class="n">supports_inflight_batching</span><span class="p">,</span> <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">.enc_dec_model_runner</span> <span class="kn">import</span> <span class="n">EncDecModelRunner</span>
 <span class="kn">from</span> <span class="nn">.model_runner</span> <span class="kn">import</span> <span class="n">ModelRunner</span>
 <span class="kn">from</span> <span class="nn">.session</span> <span class="kn">import</span> <span class="n">Session</span><span class="p">,</span> <span class="n">TensorInfo</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="kn">import</span> <span class="nn">tensorrt_llm.bindings</span>  <span class="c1"># NOQA</span>
+    <span class="n">PYTHON_BINDINGS</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+    <span class="n">PYTHON_BINDINGS</span> <span class="o">=</span> <span class="kc">False</span>
+
+<span class="k">if</span> <span class="n">PYTHON_BINDINGS</span><span class="p">:</span>
+    <span class="kn">from</span> <span class="nn">.model_runner_cpp</span> <span class="kn">import</span> <span class="n">ModelRunnerCpp</span>
 
 
 <span class="k">class</span> <span class="nc">LlavaNextUtils</span><span class="p">:</span>
@@ -332,6 +344,36 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">llm_name</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span><span class="o">.</span><span class="n">text_config</span><span class="o">.</span><span class="n">_name_or_path</span>
 
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">supports_inflight_batching</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;The given engine does not support in-flight batching, fallback to python session&quot;</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
+
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">PYTHON_BINDINGS</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;Python bindings of C++ session is unavailable, fallback to Python session.&quot;</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
+
+            <span class="n">args</span><span class="o">.</span><span class="n">debug_mode</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">debug_mode</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;Debug mode is not supported in C++ session for now, fallback to Python session.&quot;</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s1">&#39;cogvlm&#39;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;Only the cogvlm is supported in C++ session for now, fallback to Python session.&quot;</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
+
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">init_image_encoder</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">init_tokenizer</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">init_llm</span><span class="p">()</span>
@@ -422,14 +464,24 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_llm">[docs]</a>
     <span class="k">def</span> <span class="nf">init_llm</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">ModelRunner</span><span class="o">.</span><span class="n">from_dir</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">,</span>
-                                              <span class="n">rank</span><span class="o">=</span><span class="n">mpi_rank</span><span class="p">(),</span>
-                                              <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                                              <span class="n">stream</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">stream</span><span class="p">,</span>
-                                              <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
-                                              <span class="n">args</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">_model_config</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">mapping</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">ModelRunner</span><span class="o">.</span><span class="n">from_dir</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">,</span>
+                    <span class="n">rank</span><span class="o">=</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">mpi_rank</span><span class="p">(),</span>
+                    <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">stream</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">stream</span><span class="p">,</span>
+                    <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
+                    <span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">_model_config</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">ModelRunnerCpp</span><span class="o">.</span><span class="n">from_dir</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">,</span>
+                    <span class="n">rank</span><span class="o">=</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">mpi_rank</span><span class="p">(),</span>
+                    <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
+                    <span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">model_config</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">mapping</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">EncDecModelRunner</span><span class="o">.</span><span class="n">from_engine</span><span class="p">(</span>
                 <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">basename</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">),</span>
@@ -487,8 +539,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.preprocess">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">[docs]</a>
-    <span class="k">def</span> <span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span>
-                   <span class="n">attention_mask</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">:</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
             <span class="n">image_mask</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s2">&quot;image_embeds_position_mask&quot;</span><span class="p">]</span>
@@ -513,8 +564,8 @@
             <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;Vision&quot;</span><span class="p">)</span>
 
         <span class="n">visual_features</span><span class="p">,</span> <span class="n">visual_atts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_visual_features</span><span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">image</span><span class="p">[</span><span class="s1">&#39;image_patches&#39;</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;fuyu&#39;</span> <span class="k">else</span> <span class="n">image</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">)</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">image</span><span class="p">[</span><span class="s1">&#39;image_patches&#39;</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span>
+            <span class="s1">&#39;fuyu&#39;</span> <span class="k">else</span> <span class="n">image</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="n">warmup</span><span class="p">:</span>
             <span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">(</span><span class="s2">&quot;Vision&quot;</span><span class="p">)</span>
@@ -695,6 +746,22 @@
         <span class="k">return</span> <span class="n">batch_splits</span></div>
 
 
+<div class="viewcode-block" id="MultimodalModelRunner.prepare_position_ids_for_cogvlm">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.prepare_position_ids_for_cogvlm">[docs]</a>
+    <span class="k">def</span> <span class="nf">prepare_position_ids_for_cogvlm</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
+        <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+        <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+        <span class="n">position_ids</span><span class="p">[</span><span class="mi">2</span><span class="p">:</span><span class="mi">1227</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span>
+        <span class="n">position_ids</span><span class="p">[</span><span class="mi">1227</span><span class="p">:]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">-</span> <span class="mi">1225</span><span class="p">)</span>
+
+        <span class="n">position_ids</span> <span class="o">=</span> <span class="n">position_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
+        <span class="n">input_position_ids</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">batch_size</span><span class="p">):</span>
+            <span class="n">input_position_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">position_ids</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">input_position_ids</span></div>
+
+
 <div class="viewcode-block" id="MultimodalModelRunner.generate">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.generate">[docs]</a>
     <span class="k">def</span> <span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -703,13 +770,12 @@
                  <span class="n">image</span><span class="p">,</span>
                  <span class="n">decoder_input_ids</span><span class="p">,</span>
                  <span class="n">max_new_tokens</span><span class="p">,</span>
-                 <span class="n">attention_mask</span><span class="p">,</span>
                  <span class="n">warmup</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">warmup</span><span class="p">:</span>
             <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;Generate&quot;</span><span class="p">)</span>
 
         <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">ptuning_args</span><span class="p">,</span> <span class="n">visual_features</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">preprocess</span><span class="p">(</span>
-            <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">)</span>
+            <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">warmup</span><span class="p">:</span> <span class="k">return</span> <span class="kc">None</span>
 
         <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;LLM&quot;</span><span class="p">)</span>
@@ -722,10 +788,22 @@
                                                <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
 
             <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]])</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;cogvlm&#39;</span><span class="p">:</span>
+                <span class="n">input_position_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_position_ids_for_cogvlm</span><span class="p">(</span>
+                    <span class="n">input_ids</span><span class="p">)</span>
+                <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+                    <span class="n">prompt_tasks</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">str</span><span class="p">))</span>
+                    <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                        <span class="n">batch_size</span><span class="p">,</span> <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
             <span class="n">output_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
                 <span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">input_position_ids</span><span class="o">=</span><span class="n">input_position_ids</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;cogvlm&#39;</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">sampling_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">prompt_table</span><span class="o">=</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                <span class="n">prompt_tasks</span><span class="o">=</span><span class="n">prompt_tasks</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
                 <span class="n">end_id</span><span class="o">=</span><span class="n">end_id</span><span class="p">,</span>
                 <span class="n">pad_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span>
@@ -758,8 +836,7 @@
                 <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
                 <span class="n">prompt_tasks</span><span class="o">=</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
-                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">)</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span>
 
             <span class="c1"># Reset input_lengths to match decoder_input_ids</span>
             <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">input_lengths</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span>
@@ -788,20 +865,14 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_visual_features">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_visual_features">[docs]</a>
-    <span class="k">def</span> <span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">):</span>
         <span class="n">visual_features</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s1">&#39;input&#39;</span><span class="p">:</span> <span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">))</span>
         <span class="p">}</span>
-        <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">visual_features</span><span class="p">[</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">attention_mask</span>
         <span class="n">tensor_info</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">TensorInfo</span><span class="p">(</span><span class="s1">&#39;input&#39;</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">),</span>
                        <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
         <span class="p">]</span>
-        <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">tensor_info</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                <span class="n">TensorInfo</span><span class="p">(</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="o">.</span><span class="n">INT32</span><span class="p">,</span>
-                           <span class="n">attention_mask</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span>
 
         <span class="n">visual_output_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">visual_encoder_session</span><span class="o">.</span><span class="n">infer_shapes</span><span class="p">(</span>
             <span class="n">tensor_info</span><span class="p">)</span>
@@ -888,11 +959,22 @@
             <span class="n">visual_features</span> <span class="o">=</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
                                                    <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
 
-        <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">+</span>
-            <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
-        <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
-                                                <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+            <span class="c1"># Non-IFB Mode(used in python session): All requests in a batch have their prompt_table concatenated in</span>
+            <span class="c1"># a shape of (bs*vision_embedding_len, vision_hidden). So only one fake_prompt_id is needed for the</span>
+            <span class="c1"># entire batch, with values from 0 to bs * vision_embedding_len-1.</span>
+            <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">+</span>
+                <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+            <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                                                    <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># IFB Mode(used in c++ session): Each request&#39;s prompt_table is independent and requires a fake_prompt_id</span>
+            <span class="c1"># for each request, with values ranging from 0 to vision_embedding_len-1.</span>
+            <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">+</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+            <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">1</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="s1">&#39;cogvlm&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
@@ -984,13 +1066,19 @@
             <span class="k">assert</span> <span class="n">prompt_table</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
                 <span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="s2">&quot;Prompt table dimensions do not match hidden size&quot;</span>
 
-            <span class="n">prompt_table</span> <span class="o">=</span> <span class="n">prompt_table</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="p">,</span> <span class="s1">&#39;dtype&#39;</span><span class="p">):</span>
+                <span class="n">prompt_table</span> <span class="o">=</span> <span class="n">prompt_table</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">prompt_table</span> <span class="o">=</span> <span class="n">prompt_table</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">prompt_table</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
             <span class="n">task_vocab_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">remove_input_padding</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="p">,</span>
+            <span class="s1">&#39;remove_input_padding&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">use_packed_input</span>
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
             <span class="n">tasks</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">)],</span>
                                 <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span> <span class="n">tasks</span> <span class="o">=</span> <span class="n">tasks</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
@@ -1072,7 +1160,6 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_inputs">[docs]</a>
     <span class="k">def</span> <span class="nf">setup_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">raw_image</span><span class="p">):</span>
         <span class="kn">from</span> <span class="nn">torchvision</span> <span class="kn">import</span> <span class="n">transforms</span>
-        <span class="n">attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="s1">&#39;blip2&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">Blip2Processor</span>
             <span class="n">processor</span> <span class="o">=</span> <span class="n">Blip2Processor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
@@ -1135,10 +1222,6 @@
             <span class="p">)</span>
             <span class="n">image</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;flattened_patches&#39;</span><span class="p">]</span>
             <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-            <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
-                <span class="n">torch</span><span class="o">.</span><span class="n">int</span><span class="p">)</span>
-            <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">attention_mask</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span>
-                                                   <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
             <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
             <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;neva&quot;</span><span class="p">:</span>
@@ -1280,13 +1363,13 @@
             <span class="n">decoder_input_ids</span> <span class="o">=</span> <span class="n">decoder_input_ids</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span>
                 <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
 
-        <span class="k">return</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">attention_mask</span></div>
+        <span class="k">return</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">decoder_input_ids</span></div>
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.run">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.run">[docs]</a>
     <span class="k">def</span> <span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">):</span>
-        <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">processed_image</span><span class="p">,</span> <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">attention_mask</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_inputs</span><span class="p">(</span>
+        <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">processed_image</span><span class="p">,</span> <span class="n">decoder_input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_inputs</span><span class="p">(</span>
             <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">)</span>
 
         <span class="n">output_text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">pre_prompt</span><span class="p">,</span>
@@ -1294,7 +1377,6 @@
                                     <span class="n">processed_image</span><span class="p">,</span>
                                     <span class="n">decoder_input_ids</span><span class="p">,</span>
                                     <span class="n">max_new_tokens</span><span class="p">,</span>
-                                    <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
                                     <span class="n">warmup</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">output_text</span></div>
@@ -1309,7 +1391,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251db8ac0>
+<jinja2.runtime.BlockReference object at 0x7fb952da7bb0>
 
 <div class="footer">
     <p>

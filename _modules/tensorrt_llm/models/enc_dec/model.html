@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -1338,12 +1342,16 @@
                     <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
                     <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_kv_cache_pool_pointers</span><span class="p">,</span>
+                    <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_kv_cache_pool_mapping</span><span class="p">,</span>
                     <span class="n">cross_kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span>
                     <span class="n">host_cross_kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
                     <span class="n">host_cross_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
-                    <span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">),</span>
+                    <span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">,</span>
+                    <span class="n">host_cross_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_cross_kv_cache_pool_mapping</span><span class="p">),</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
                 <span class="n">cross_kv_cache_gen</span><span class="o">=</span><span class="n">cross_kv_cache_gen</span><span class="p">,</span>
@@ -1782,10 +1790,12 @@
         <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">host_kv_cache_pool_mapping</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="n">cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_cross_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">host_cross_kv_cache_pool_mapping</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">paged_kv_cache</span><span class="p">:</span>
@@ -1850,21 +1860,25 @@
                     <span class="n">x</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">max_cross_blocks_per_seq_range</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
                 <span class="p">]]</span>
 
-                <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;kv_cache_block_offsets&#39;</span><span class="p">,</span>
-                                                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
-                                                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                                                    <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span>
-                                                     <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
-                                                    <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
-                                                    <span class="p">(</span><span class="s1">&#39;max_blocks_per_seq&#39;</span><span class="p">,</span>
-                                                     <span class="n">max_blocks_per_seq_range</span><span class="p">),</span>
-                                                <span class="p">]))</span>
+                <span class="c1"># TODO(oargov): add support for vgqa, meanwhile assume a single kv cache pool</span>
+                <span class="n">num_kv_cache_pools</span> <span class="o">=</span> <span class="mi">1</span>
+
+                <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;kv_cache_block_offsets&#39;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;num_kv_cache_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s1">&#39;max_blocks_per_seq&#39;</span><span class="p">,</span> <span class="n">max_blocks_per_seq_range</span><span class="p">),</span>
+                    <span class="p">]))</span>
                 <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                     <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_block_offsets&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;num_kv_cache_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;max_blocks_per_seq&#39;</span><span class="p">,</span> <span class="n">max_blocks_per_seq_range</span><span class="p">),</span>
@@ -1872,17 +1886,26 @@
                 <span class="n">host_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                     <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
-                        <span class="p">(</span><span class="s1">&#39;num_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s1">&#39;num_pools_layers&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">]),</span>
+                        <span class="p">(</span><span class="s1">&#39;num_pools_kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
+                    <span class="p">]))</span>
+                <span class="n">host_kv_cache_pool_mapping</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;host_kv_cache_pool_mapping&quot;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_pp_layers</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;pools_mapping&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_pp_layers</span><span class="p">]),</span>
                     <span class="p">]))</span>
 
                 <span class="c1"># paged blocks for cross kv</span>
                 <span class="n">cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                     <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;cross_kv_cache_block_offsets&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;num_kv_cache_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;max_cross_blocks_per_seq&#39;</span><span class="p">,</span>
@@ -1891,8 +1914,9 @@
                 <span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                     <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_block_offsets&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;num_kv_cache_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;kv&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;max_cross_blocks_per_seq&#39;</span><span class="p">,</span>
@@ -1901,9 +1925,17 @@
                 <span class="n">host_cross_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                     <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;num_kv_cache_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_kv_cache_pools</span><span class="p">]),</span>
                         <span class="p">(</span><span class="s1">&#39;num_pools&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">]),</span>
+                    <span class="p">]))</span>
+                <span class="n">host_cross_kv_cache_pool_mapping</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;host_cross_kv_cache_pool_mapping&quot;</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                    <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="n">num_pp_layers</span><span class="p">],</span>
+                    <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                        <span class="p">(</span><span class="s1">&#39;pools_mapping&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_pp_layers</span><span class="p">]),</span>
                     <span class="p">]))</span>
 
                 <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
@@ -1918,11 +1950,14 @@
                 <span class="n">kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_kv_cache_block_offsets</span><span class="o">=</span><span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">host_kv_cache_pool_pointers</span><span class="p">,</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">host_kv_cache_pool_mapping</span><span class="p">,</span>
                 <span class="n">cross_kv_cache_block_offsets</span><span class="o">=</span><span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_cross_kv_cache_block_offsets</span><span class="o">=</span>
                 <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_cross_kv_cache_pool_pointers</span><span class="o">=</span>
                 <span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">,</span>
+                <span class="n">host_cross_kv_cache_pool_mapping</span><span class="o">=</span>
+                <span class="n">host_cross_kv_cache_pool_mapping</span><span class="p">,</span>
             <span class="p">)</span>
 
             <span class="n">attention_params</span> <span class="o">=</span> <span class="n">AttentionParams</span><span class="p">(</span>
@@ -2167,7 +2202,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f425170dea0>
+<jinja2.runtime.BlockReference object at 0x7fb9705fed70>
 
 <div class="footer">
     <p>

@@ -97,6 +97,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -208,7 +212,7 @@
 <p>Apart from the arguments mentioned above, you can also customize the build configuration with the <code class="docutils literal notranslate"><span class="pre">build_config</span></code> class and other arguments borrowed from the trtllm-build CLI. These build configuration options provide flexibility in building engines for the target hardware and use cases. Refer to the following example:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">model</span><span class="o">-</span><span class="n">path</span><span class="o">&gt;</span><span class="p">,</span>
           <span class="n">build_config</span><span class="o">=</span><span class="n">BuildConfig</span><span class="p">(</span>
-            <span class="n">max_new_tokens</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
             <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>
             <span class="n">max_beam_width</span><span class="o">=</span><span class="mi">4</span><span class="p">))</span>
 </pre></div>
@@ -222,7 +226,6 @@
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span>
           <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
-            <span class="n">max_new_tokens</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>
             <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">))</span>
 </pre></div>
 </div>
@@ -303,7 +306,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4253999ed0>
+<jinja2.runtime.BlockReference object at 0x7fb9726b32b0>
 
 <div class="footer">
     <p>

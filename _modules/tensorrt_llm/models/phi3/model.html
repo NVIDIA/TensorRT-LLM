@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -155,8 +159,9 @@
 
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
 <span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span>
-<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">BlockSparseAttnParams</span><span class="p">,</span>
-                       <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span>
+                       <span class="n">BlockSparseAttnParams</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span>
+                       <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">MoeConfig</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...lora_manager</span> <span class="kn">import</span> <span class="n">LoraConfig</span><span class="p">,</span> <span class="n">use_lora</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
@@ -181,6 +186,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">gegelu_limit</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;PhiMoEForCausalLM&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">gegelu_limit</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">gegelu_limit</span>
 
@@ -201,10 +207,14 @@
                 <span class="n">config</span><span class="o">.</span><span class="n">blocksparse_num_local_blocks</span><span class="p">,</span>
                 <span class="n">config</span><span class="o">.</span><span class="n">blocksparse_vertical_stride</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span>
-                <span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+                <span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                                            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                                            <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">RmsNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                                            <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
@@ -230,7 +240,7 @@
             <span class="n">original_max_position_embeddings</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">original_max_position_embeddings</span>
             <span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">long_rope</span>
 
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span><span class="p">:</span>
                 <span class="n">rope_scaling_short_mscale</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">longrope_short_mscale</span>
                 <span class="n">rope_scaling_long_mscale</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">longrope_long_mscale</span>
 
@@ -244,7 +254,7 @@
             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
             <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">attention_mask_type</span><span class="p">,</span>
-            <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span><span class="p">,</span>
             <span class="n">q_scaling</span><span class="o">=</span><span class="n">q_scaling</span><span class="p">,</span>
             <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
@@ -256,14 +266,27 @@
             <span class="n">original_max_position_embeddings</span><span class="o">=</span><span class="n">original_max_position_embeddings</span><span class="p">,</span>
             <span class="n">block_sparse_params</span><span class="o">=</span><span class="n">block_sparse_attn_params</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                       <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span><span class="p">,</span>
-                       <span class="n">hidden_act</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
-                       <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                       <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                       <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                       <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
-                       <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">)</span>
+        <span class="n">ClsMLP</span> <span class="o">=</span> <span class="n">MLP</span>
+        <span class="n">mlp_kwargs</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;moe&quot;</span><span class="p">):</span>
+            <span class="n">ClsMLP</span> <span class="o">=</span> <span class="n">MOE</span>
+            <span class="n">moe_config</span> <span class="o">=</span> <span class="n">MoeConfig</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">moe</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="n">moe_config</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+            <span class="n">mlp_kwargs</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;moe_config&quot;</span><span class="p">:</span> <span class="n">moe_config</span><span class="p">,</span>
+                <span class="s2">&quot;mapping&quot;</span><span class="p">:</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="p">}</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">ClsMLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                          <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span><span class="p">,</span>
+                          <span class="n">hidden_act</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
+                          <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                          <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                          <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                          <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
+                          <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">,</span>
+                          <span class="o">**</span><span class="n">mlp_kwargs</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -291,10 +314,14 @@
 
         <span class="n">post_attention_input</span> <span class="o">=</span> <span class="n">hidden_states</span> <span class="o">+</span> <span class="n">attention_output</span>
         <span class="n">post_attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">post_attention_input</span><span class="p">)</span>
-        <span class="n">feed_forward_hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span>
-            <span class="n">post_attention_output</span><span class="p">,</span>
-            <span class="n">gegelu_limit</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gegelu_limit</span><span class="p">,</span>
-            <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">:</span>
+            <span class="n">feed_forward_hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span>
+                <span class="n">post_attention_output</span><span class="p">,</span>
+                <span class="n">gegelu_limit</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gegelu_limit</span><span class="p">,</span>
+                <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">feed_forward_hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span>
+                <span class="n">post_attention_output</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">post_attention_input</span> <span class="o">+</span> <span class="n">feed_forward_hidden_states</span>
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span>
@@ -313,10 +340,13 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">DecoderLayerList</span><span class="p">(</span><span class="n">Phi3DecoderLayer</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;PhiMoEForCausalLM&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                  <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
                                   <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mup_embedding_multiplier</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mup_embedding_multiplier</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">mup_embedding_multiplier</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mup_embedding_multiplier</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">RmsNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                                 <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
@@ -374,9 +404,10 @@
         <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
                                            <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;PhiMoEForCausalLM&quot;</span>
         <span class="n">lm_head</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                                <span class="n">vocab_size_padded</span><span class="p">,</span>
-                               <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                               <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_variant</span><span class="p">,</span>
                                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
                                <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
                                <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
@@ -444,7 +475,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f425170c6a0>
+<jinja2.runtime.BlockReference object at 0x7fb957e920b0>
 
 <div class="footer">
     <p>

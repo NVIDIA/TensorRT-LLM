@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -228,8 +232,7 @@
             <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
             <span class="n">q_scaling</span><span class="o">=</span><span class="n">q_scaling</span><span class="p">,</span>
-            <span class="n">max_attn_value</span><span class="o">=</span><span class="n">max_attn_value</span><span class="p">,</span>
-        <span class="p">)</span>
+            <span class="n">max_attn_value</span><span class="o">=</span><span class="n">max_attn_value</span><span class="p">)</span>
 
         <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span>
 
@@ -475,7 +478,7 @@
         <span class="n">config</span> <span class="o">=</span> <span class="n">GemmaConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
                                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                                                <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
-                                               <span class="n">quantization</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+                                               <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
                                                <span class="o">**</span><span class="p">(</span><span class="n">gemma_config_kwargs</span> <span class="ow">or</span> <span class="p">{}))</span>
 
         <span class="n">quant_algo</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span>
@@ -483,12 +486,13 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="s2">&quot;There is no point in calling `quantize()` if both `quant_algo` and `kv_cache_quant_algo` are `None`&quot;</span>
             <span class="p">)</span>
-        <span class="k">elif</span> <span class="n">quant_algo</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">MODELOPT_FLOW_QUANTIZATIONS</span><span class="p">:</span>
+        <span class="k">elif</span> <span class="n">quant_algo</span> <span class="ow">in</span> <span class="n">MODELOPT_FLOW_QUANTIZATIONS</span><span class="p">:</span>
             <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">quantize</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">,</span>
                              <span class="n">output_dir</span><span class="p">,</span>
                              <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
                              <span class="n">mapping</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
-                             <span class="n">quant_config</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">**</span><span class="n">quantize_kwargs</span><span class="p">)</span>
+                             <span class="n">quant_config</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="p">,</span>
+                             <span class="o">**</span><span class="n">quantize_kwargs</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">quant_algo</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">NATIVE_QUANT_FLOW</span><span class="p">:</span>
             <span class="n">save_config</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">output_dir</span><span class="o">=</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">config</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">for_each_rank</span><span class="p">():</span>
@@ -518,7 +522,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f42517cbc10>
+<jinja2.runtime.BlockReference object at 0x7fb955b5fdc0>
 
 <div class="footer">
     <p>

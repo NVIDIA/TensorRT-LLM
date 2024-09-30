@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -213,17 +217,18 @@
 <span class="k">class</span> <span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">ffn_hidden_size</span><span class="p">,</span>
-            <span class="n">hidden_act</span><span class="p">,</span>
-            <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-            <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-            <span class="n">inner_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="n">eps</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="p">,</span>
+        <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">inner_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">eps</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+        <span class="n">is_expert</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">hidden_act</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">ACT2FN</span><span class="p">:</span>
@@ -247,7 +252,8 @@
                               <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                               <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                              <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
+                              <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                              <span class="n">is_expert</span><span class="o">=</span><span class="n">is_expert</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">=</span> <span class="n">ffn_hidden_size</span>
@@ -258,6 +264,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">eps</span> <span class="o">=</span> <span class="n">eps</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_expert</span> <span class="o">=</span> <span class="n">is_expert</span>
         <span class="c1"># see optimize_model&#39;s add_lora for LoRA initialization</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -299,17 +306,18 @@
 <span class="k">class</span> <span class="nc">GatedMLP</span><span class="p">(</span><span class="n">MLP</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">ffn_hidden_size</span><span class="p">,</span>
-            <span class="n">hidden_act</span><span class="p">,</span>
-            <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-            <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-            <span class="n">inner_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="n">eps</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="p">,</span>
+        <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">inner_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">eps</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+        <span class="n">is_expert</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
                          <span class="n">ffn_hidden_size</span><span class="p">,</span>
@@ -320,7 +328,8 @@
                          <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                          <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
                          <span class="n">inner_layernorm</span><span class="o">=</span><span class="n">inner_layernorm</span><span class="p">,</span>
-                         <span class="n">eps</span><span class="o">=</span><span class="n">eps</span><span class="p">)</span>
+                         <span class="n">eps</span><span class="o">=</span><span class="n">eps</span><span class="p">,</span>
+                         <span class="n">is_expert</span><span class="o">=</span><span class="n">is_expert</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">=</span> <span class="n">ffn_hidden_size</span>
@@ -376,17 +385,18 @@
 <span class="k">class</span> <span class="nc">FusedGatedMLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">ffn_hidden_size</span><span class="p">,</span>
-            <span class="n">hidden_act</span><span class="p">,</span>
-            <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-            <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
-            <span class="n">inner_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="n">eps</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">,</span>
+        <span class="n">ffn_hidden_size</span><span class="p">,</span>
+        <span class="n">hidden_act</span><span class="p">,</span>
+        <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+        <span class="n">inner_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">eps</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+        <span class="n">is_expert</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
@@ -414,7 +424,8 @@
                               <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                               <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                              <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
+                              <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                              <span class="n">is_expert</span><span class="o">=</span><span class="n">is_expert</span><span class="p">)</span>
 
         <span class="c1"># see optimize_model&#39;s add_lora for LoRA initialization</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora</span> <span class="o">=</span> <span class="kc">None</span>
@@ -516,7 +527,6 @@
                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">reduce_fusion_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceFusionParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_swiglu_plugin</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;float16&#39;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Currently limited support, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc_gate_plugin</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc_gate</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="p">)</span>
@@ -543,7 +553,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251b25d50>
+<jinja2.runtime.BlockReference object at 0x7fb9721e0c40>
 
 <div class="footer">
     <p>

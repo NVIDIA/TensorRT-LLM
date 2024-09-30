@@ -46,3 +46,8 @@ API Reference
     :undoc-members:
     :special-members: __init__
     :show-inheritance:
+.. autoclass:: tensorrt_llm.hlapi.BuildCacheConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:

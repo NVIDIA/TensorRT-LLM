@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -156,7 +160,8 @@
 <span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">IntFlag</span><span class="p">,</span> <span class="n">auto</span>
 <span class="kn">from</span> <span class="nn">functools</span> <span class="kn">import</span> <span class="n">cached_property</span>
 <span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span>
+                    <span class="n">Union</span><span class="p">)</span>
 
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
 <span class="kn">import</span> <span class="nn">safetensors</span>
@@ -558,7 +563,8 @@
                 <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">lora_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">vision_token_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
@@ -574,6 +580,8 @@
             <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{}</span>
             <span class="k">if</span> <span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
+            <span class="k">if</span> <span class="n">vision_token_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;vision_token_mask&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">vision_token_mask</span>
             <span class="k">if</span> <span class="n">lora_layer_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;lora_layer_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">lora_layer_params</span>
             <span class="k">if</span> <span class="n">spec_decoding_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -604,6 +612,8 @@
                     <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                     <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_kv_cache_pool_pointers</span><span class="p">,</span>
+                    <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_kv_cache_pool_mapping</span><span class="p">,</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
@@ -676,10 +686,14 @@
 <div class="viewcode-block" id="PretrainedModel.from_checkpoint">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.hlapi.PretrainedModel.from_checkpoint">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
-                        <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-                        <span class="n">rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                        <span class="n">config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PretrainedConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PretrainedConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">preprocess_weights_hook</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">[[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]],</span>
+                                                   <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span>
                 <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="s1">&#39;config.json&#39;</span><span class="p">))</span>
@@ -694,6 +708,10 @@
         <span class="n">weights</span> <span class="o">=</span> <span class="n">safetensors</span><span class="o">.</span><span class="n">torch</span><span class="o">.</span><span class="n">load_file</span><span class="p">(</span><span class="n">weights_path</span><span class="p">)</span>
 
         <span class="n">is_checkpoint_pruned</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s1">&#39;is_pruned&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">preprocess_weights_hook</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">weights</span> <span class="o">=</span> <span class="n">preprocess_weights_hook</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+
         <span class="n">preprocess_weights</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">from_pruned</span><span class="o">=</span><span class="n">is_checkpoint_pruned</span><span class="p">)</span>
         <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="n">model</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">from_pruned</span><span class="o">=</span><span class="n">is_checkpoint_pruned</span><span class="p">)</span>
@@ -852,6 +870,8 @@
                     <span class="s1">&#39;host_kv_cache_block_offsets&#39;</span><span class="p">],</span>
                 <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
                     <span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">],</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span>
+                    <span class="s1">&#39;host_kv_cache_pool_mapping&#39;</span><span class="p">],</span>
                 <span class="n">cache_indirection</span><span class="o">=</span><span class="n">model_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
             <span class="p">),</span>
             <span class="s1">&#39;attention_params&#39;</span><span class="p">:</span>
@@ -1514,6 +1534,9 @@
 <span class="k">def</span> <span class="nf">check_share_embedding</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
                           <span class="n">model_config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
     <span class="k">if</span> <span class="n">model_config</span><span class="o">.</span><span class="n">share_embedding_table</span><span class="p">:</span>
+        <span class="k">if</span> <span class="s2">&quot;lm_head.weight&quot;</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">weights</span><span class="p">[</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="s2">&quot;lm_head.weight&quot;</span> <span class="ow">in</span> <span class="n">weights</span> <span class="ow">and</span> <span class="s2">&quot;transformer.vocab_embedding.weight&quot;</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
             <span class="k">if</span> <span class="p">(</span><span class="n">weights</span><span class="p">[</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">]</span> <span class="o">-</span>
                     <span class="n">weights</span><span class="p">[</span><span class="s2">&quot;transformer.vocab_embedding.weight&quot;</span><span class="p">])</span><span class="o">.</span><span class="n">any</span><span class="p">():</span>
@@ -1559,7 +1582,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f42515b6650>
+<jinja2.runtime.BlockReference object at 0x7fb957c5b790>
 
 <div class="footer">
     <p>

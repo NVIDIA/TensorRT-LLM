@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -166,13 +170,13 @@
 <span class="kn">import</span> <span class="nn">copy</span>
 <span class="kn">import</span> <span class="nn">math</span>
 <span class="kn">import</span> <span class="nn">platform</span>
+<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">Counter</span>
 <span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span> <span class="nn">functools</span> <span class="kn">import</span> <span class="n">reduce</span><span class="p">,</span> <span class="n">wraps</span>
 <span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Set</span><span class="p">,</span> <span class="n">Union</span>
 
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
-<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
 <span class="c1"># isort: off</span>
 <span class="kn">import</span> <span class="nn">torch</span>
@@ -180,6 +184,10 @@
 <span class="c1"># isort: on</span>
 <span class="kn">from</span> <span class="nn">cuda</span> <span class="kn">import</span> <span class="n">cudart</span>
 
+<span class="kn">from</span> <span class="nn">tensorrt_llm.runtime.memory_pools.memory_pools_allocator</span> <span class="kn">import</span> \
+    <span class="n">MemoryPoolsAllocator</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager</span> <span class="kn">import</span> \
+    <span class="n">PoolsKVCacheManager</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.runtime.redrafter_utils</span> <span class="kn">import</span> <span class="o">*</span>
 
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">torch_to_numpy</span><span class="p">,</span>
@@ -190,7 +198,7 @@
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..plugin.plugin</span> <span class="kn">import</span> <span class="n">CustomAllReduceHelper</span>
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span> <span class="nn">.kv_cache_manager</span> <span class="kn">import</span> <span class="n">GenerationSequence</span><span class="p">,</span> <span class="n">KVCacheManager</span><span class="p">,</span> <span class="n">KVCacheUpdater</span>
+<span class="kn">from</span> <span class="nn">.kv_cache_manager</span> <span class="kn">import</span> <span class="n">GenerationSequence</span><span class="p">,</span> <span class="n">KVCacheUpdater</span>
 <span class="kn">from</span> <span class="nn">.session</span> <span class="kn">import</span> <span class="n">_scoped_stream</span>
 
 
@@ -986,10 +994,12 @@
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;kv_cache_block_offsets&#39;</span><span class="p">]</span>
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_block_offsets&#39;</span><span class="p">]</span>
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">]</span>
+            <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_mapping&#39;</span><span class="p">]</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                 <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;cross_kv_cache_block_offsets&#39;</span><span class="p">]</span>
                 <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_block_offsets&#39;</span><span class="p">]</span>
                 <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span><span class="p">]</span>
+                <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_mapping&#39;</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># Refer to gpt_attention() inside functional.py</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span><span class="p">:</span>
@@ -1719,7 +1729,7 @@
               <span class="n">lora_manager</span><span class="p">:</span> <span class="n">LoraManager</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
               <span class="n">lora_uids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
               <span class="n">medusa_choices</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-              <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+              <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
               <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Store these params related to buffer size to check against</span>
         <span class="c1"># the input shape with the params given in decode()</span>
@@ -1880,40 +1890,42 @@
                 <span class="n">num_blocks</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">)</span>
-                <span class="n">cache_shape</span> <span class="o">=</span> <span class="p">(</span>
-                    <span class="n">num_blocks</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">,</span>
-                    <span class="mi">2</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
-                <span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">cache_shape</span><span class="p">,</span>
-                                                 <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">,</span>
-                                                 <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="p">(</span>
+                    <span class="n">num_blocks</span><span class="o">=</span><span class="n">num_blocks</span><span class="p">,</span>
+                    <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                    <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_kv_heads_per_layer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="o">.</span><span class="n">prepare_num_kv_heads_per_layer</span><span class="p">(</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_kv_heads_per_layer</span>
+
+                <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">kv_cache_type</span><span class="p">,</span>
+                                                     <span class="n">num_kv_heads_per_layer</span><span class="p">)</span>
+
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>  <span class="c1"># As for now we enable cross paged kv and self paged kv to share the same tokens_per_block</span>
                     <span class="n">cross_num_blocks</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
                         <span class="n">sink_token_length</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                         <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-                    <span class="n">cross_cache_shape</span> <span class="o">=</span> <span class="p">(</span>
-                        <span class="n">cross_num_blocks</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
-                        <span class="mi">2</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
-                    <span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">cross_cache_shape</span><span class="p">,</span>
-                                                           <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">,</span>
-                                                           <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+                    <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="o">.</span><span class="n">prepare_num_kv_heads_per_layer</span><span class="p">(</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">)</span>
+
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="p">(</span>
+                        <span class="n">num_blocks</span><span class="o">=</span><span class="n">cross_num_blocks</span><span class="p">,</span>
+                        <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                        <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span>
+                        <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">num_kv_heads_per_layer</span><span class="p">)</span>
+
             <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">first_layer</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">last_layer</span><span class="p">):</span>
                     <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;attention&#39;</span><span class="p">:</span>
                         <span class="n">cache_shape</span> <span class="o">=</span> <span class="p">(</span>
                             <span class="n">batch_size</span><span class="p">,</span>
                             <span class="mi">2</span><span class="p">,</span>
-                            <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">general_to_attn_idx</span><span class="p">[</span><span class="n">i</span><span class="p">]),</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(</span><span class="n">i</span><span class="p">),</span>
                             <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
                             <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
                         <span class="p">)</span>
@@ -2029,6 +2041,43 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_medusa_mode</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_draft_tokens</span></div>
 
+
+    <span class="k">def</span> <span class="nf">_allocate_empty_kv_cache_pools</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">num_blocks</span><span class="p">):</span>
+        <span class="c1"># Layers are homogeneous, use old kv cache shape</span>
+        <span class="n">unique_cache_pools</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_kv_heads_per_layer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cache_shape</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">num_blocks</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">,</span>
+                <span class="mi">2</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">unique_cache_pools</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">cache_shape</span><span class="p">,</span>
+                            <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">,</span>
+                            <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">))</span>
+
+        <span class="c1"># Layers are not homogeneous, use new kv cache shape</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">kv_heads_unique_counter</span> <span class="o">=</span> <span class="n">Counter</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_kv_heads_per_layer</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">kv_head</span><span class="p">,</span> <span class="n">num_layers</span> <span class="ow">in</span> <span class="n">kv_heads_unique_counter</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">cache_shape</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="n">num_blocks</span><span class="p">,</span>
+                    <span class="n">num_layers</span><span class="p">,</span>
+                    <span class="mi">2</span><span class="p">,</span>
+                    <span class="n">kv_head</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="n">unique_cache_pools</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">cache_shape</span><span class="p">,</span>
+                                <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">,</span>
+                                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">))</span>
+
+        <span class="k">return</span> <span class="n">unique_cache_pools</span>
 
     <span class="k">def</span> <span class="nf">_get_context_shape_buffer</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -2148,17 +2197,20 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
             <span class="n">buffer</span> <span class="o">=</span> <span class="n">kv_cache_block_offsets</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
             <span class="n">shape</span> <span class="o">=</span> <span class="n">kv_cache_block_offsets</span><span class="o">.</span><span class="n">shape</span>
-            <span class="n">shape</span> <span class="o">=</span> <span class="p">[</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">*</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">:]]</span>
+            <span class="n">shape</span> <span class="o">=</span> <span class="p">[</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="o">*</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">:]]</span>
             <span class="n">add_tensor_with_shape</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;kv_cache_block_offsets&#39;</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">add_tensor_with_shape</span><span class="p">(</span><span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                                   <span class="sa">f</span><span class="s1">&#39;host_kv_cache_block_offsets&#39;</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">pool_pointers</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span>
+            <span class="n">pool_mapping</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_mapping&#39;</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">pool_pointers</span><span class="p">],</span> <span class="n">pool_pointers</span><span class="p">)</span>
+            <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">pool_mapping</span><span class="p">],</span> <span class="n">pool_mapping</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                 <span class="n">cross_buffer</span> <span class="o">=</span> <span class="n">cross_kv_cache_block_offsets</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
                 <span class="n">cross_shape</span> <span class="o">=</span> <span class="n">cross_kv_cache_block_offsets</span><span class="o">.</span><span class="n">shape</span>
                 <span class="n">cross_shape</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">cross_shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">cross_shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">*</span><span class="n">cross_shape</span><span class="p">[</span><span class="mi">2</span><span class="p">:]</span>
+                    <span class="n">cross_shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">cross_shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="n">cross_shape</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
+                    <span class="o">*</span><span class="n">cross_shape</span><span class="p">[</span><span class="mi">3</span><span class="p">:]</span>
                 <span class="p">]</span>
                 <span class="n">add_tensor_with_shape</span><span class="p">(</span><span class="n">cross_buffer</span><span class="p">,</span>
                                       <span class="sa">f</span><span class="s1">&#39;cross_kv_cache_block_offsets&#39;</span><span class="p">,</span>
@@ -2167,8 +2219,10 @@
                                       <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_block_offsets&#39;</span><span class="p">,</span>
                                       <span class="n">cross_shape</span><span class="p">)</span>
                 <span class="n">cross_pool_pointers</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span>
+                <span class="n">cross_pool_mapping</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_mapping&#39;</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">cross_pool_pointers</span><span class="p">],</span>
                            <span class="n">cross_pool_pointers</span><span class="p">)</span>
+                <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">cross_pool_mapping</span><span class="p">],</span> <span class="n">cross_pool_mapping</span><span class="p">)</span>
 
         <span class="n">batch_size</span> <span class="o">=</span> <span class="n">context_lengths</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span><span class="p">:</span>
@@ -2431,17 +2485,20 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
             <span class="n">shape</span> <span class="o">=</span> <span class="n">kv_cache_block_offsets</span><span class="o">.</span><span class="n">shape</span>
-            <span class="n">shape</span> <span class="o">=</span> <span class="p">[</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">*</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">:]]</span>
+            <span class="n">shape</span> <span class="o">=</span> <span class="p">[</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span> <span class="o">*</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">:]]</span>
             <span class="n">add_tensor_with_shape</span><span class="p">(</span><span class="n">kv_cache_block_offsets</span><span class="p">,</span>
                                   <span class="sa">f</span><span class="s1">&#39;kv_cache_block_offsets&#39;</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">add_tensor_with_shape</span><span class="p">(</span><span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                                   <span class="sa">f</span><span class="s1">&#39;host_kv_cache_block_offsets&#39;</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">pool_pointers</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span>
+            <span class="n">pool_mapping</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_mapping&#39;</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">pool_pointers</span><span class="p">],</span> <span class="n">pool_pointers</span><span class="p">)</span>
+            <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">pool_mapping</span><span class="p">],</span> <span class="n">pool_mapping</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                 <span class="n">cross_shape</span> <span class="o">=</span> <span class="n">cross_kv_cache_block_offsets</span><span class="o">.</span><span class="n">shape</span>
                 <span class="n">cross_shape</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">cross_shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">cross_shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">*</span><span class="n">cross_shape</span><span class="p">[</span><span class="mi">2</span><span class="p">:]</span>
+                    <span class="n">cross_shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">cross_shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="n">cross_shape</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
+                    <span class="o">*</span><span class="n">cross_shape</span><span class="p">[</span><span class="mi">3</span><span class="p">:]</span>
                 <span class="p">]</span>
                 <span class="n">add_tensor_with_shape</span><span class="p">(</span><span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span>
                                       <span class="sa">f</span><span class="s1">&#39;cross_kv_cache_block_offsets&#39;</span><span class="p">,</span>
@@ -2450,8 +2507,10 @@
                                       <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_block_offsets&#39;</span><span class="p">,</span>
                                       <span class="n">cross_shape</span><span class="p">)</span>
                 <span class="n">cross_pool_pointers</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span>
+                <span class="n">cross_pool_mapping</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_mapping&#39;</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">cross_pool_pointers</span><span class="p">],</span>
                            <span class="n">cross_pool_pointers</span><span class="p">)</span>
+                <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="n">cross_pool_mapping</span><span class="p">],</span> <span class="n">cross_pool_mapping</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">prompt_embedding_table</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="s1">&#39;prompt_embedding_table&#39;</span><span class="p">)</span>
@@ -3251,6 +3310,7 @@
             <span class="n">this_tgt_cache_indirection</span> <span class="o">=</span> <span class="n">cache_indirections</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
             <span class="n">next_src_cache_indirection</span> <span class="o">=</span> <span class="n">cache_indirections</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
 
+        <span class="n">position_ids_raw</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">model_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_context_inputs</span><span class="p">(</span>
                 <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
@@ -3263,18 +3323,28 @@
                 <span class="n">pad_id</span><span class="o">=</span><span class="n">scfg</span><span class="o">.</span><span class="n">pad_id</span><span class="p">,</span>
                 <span class="n">eos_id</span><span class="o">=</span><span class="n">scfg</span><span class="o">.</span><span class="n">end_id</span><span class="p">)</span>
 
-            <span class="n">position_ids</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">position_ids_raw</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># default iota position ids</span>
+                <span class="n">position_ids</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># user input position ids</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">position_ids_raw</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">padded_position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">rnn</span><span class="o">.</span><span class="n">pad_sequence</span><span class="p">(</span>
+                        <span class="n">position_ids_raw</span><span class="p">,</span> <span class="n">batch_first</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">padding_value</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">padded_position_ids</span>
             <span class="n">last_token_ids</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;last_token_ids&#39;</span><span class="p">)</span>
             <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">context_runtime_perf_knobs</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
                 <span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
-                <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
+                <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
                     <span class="n">beam_width</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
                 <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_kv_cache_block_offsets</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
-                    <span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
+                    <span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_pools_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
                         <span class="n">beam_width</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
                     <span class="n">cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_cross_kv_cache_block_offsets</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
                         <span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
@@ -3425,7 +3495,13 @@
                 <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
             <span class="p">)</span>
 
-            <span class="n">position_ids</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">position_ids_raw</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">position_ids</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
+                    <span class="p">[</span><span class="n">p</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:]</span> <span class="o">+</span> <span class="n">step</span> <span class="o">+</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">position_ids_raw</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+                    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="n">position_ids</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
             <span class="n">last_token_ids</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;last_token_ids&#39;</span><span class="p">)</span>
             <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">gen_runtime_perf_knobs</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">,</span>
@@ -3445,7 +3521,7 @@
                                            <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
                     <span class="k">assert</span> <span class="n">add_token_count</span> <span class="o">&gt;</span> <span class="mi">0</span>
                     <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">add_token_count</span><span class="p">):</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_medusa_mode</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_draft_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
                     <span class="c1"># Allocate kv cache token slots for next step.</span>
                     <span class="c1"># Make sure there are always &gt; (num_draft_tokens + 1) free token slots.</span>
@@ -3455,16 +3531,16 @@
                                            <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
                     <span class="k">assert</span> <span class="n">add_token_count</span> <span class="o">&gt;</span> <span class="mi">0</span>
                     <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">add_token_count</span><span class="p">):</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
                 <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
                 <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_push</span><span class="p">(</span><span class="s2">&quot;paged_kv_post_alloc&quot;</span><span class="p">)</span>
-                <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
+                <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
                     <span class="n">beam_width</span><span class="p">)</span>
                 <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_kv_cache_block_offsets</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
-                    <span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
+                    <span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_pools_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
                         <span class="n">beam_width</span><span class="p">)</span>
                     <span class="n">cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_cross_kv_cache_block_offsets</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
                         <span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
@@ -3595,9 +3671,9 @@
                                                      <span class="ow">and</span> <span class="n">should_stop</span><span class="o">.</span><span class="n">item</span><span class="p">()):</span>
                 <span class="c1"># Free all blocks in all sequences.</span>
                 <span class="c1"># With in-flight batching and while loop we&#39;ll free some sequences, when they are done</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">True</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">True</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">True</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_pools_kv_cache_manager</span><span class="o">.</span><span class="n">step</span><span class="p">([</span><span class="kc">True</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">dump_debug_buffers</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
@@ -3746,8 +3822,7 @@
                     <span class="n">final_output_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">output_ids</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
                     <span class="n">final_output_ids</span> <span class="o">=</span> <span class="n">final_output_ids</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="bp">self</span><span class="o">.</span>
                                                         <span class="n">max_seq_length</span> <span class="o">-</span>
-                                                        <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span>
-                                                        <span class="n">max_medusa_tokens</span><span class="p">]</span>
+                                                        <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_tokens</span><span class="p">]</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">final_output_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">finalize_decoder</span><span class="p">(</span>
                         <span class="n">context_lengths</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">,</span> <span class="n">scfg</span><span class="p">)</span>
@@ -3989,21 +4064,23 @@
             <span class="n">num_blocks</span><span class="p">,</span> <span class="n">max_blocks_per_seq</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
-                <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_pool</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="mi">0</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
 
-            <span class="n">block_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(</span>
-            <span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="n">KVCacheManager</span><span class="p">(</span>
-                <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">,</span>
-                <span class="n">num_blocks</span><span class="o">=</span><span class="n">num_blocks</span><span class="p">,</span>
-                <span class="n">block_size</span><span class="o">=</span><span class="n">block_size</span><span class="p">,</span>
-                <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
-                <span class="n">max_blocks_per_seq</span><span class="o">=</span><span class="n">max_blocks_per_seq</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
+                <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">get_kv_cache_pool_pointers</span><span class="p">(</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
+                <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_mapping&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">pool_mapping</span>
+
+            <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span> <span class="o">=</span> <span class="n">PoolsKVCacheManager</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">pools_metadata</span><span class="p">,</span>
+                <span class="n">max_blocks_per_seq</span><span class="p">,</span>
+                <span class="n">num_blocks</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
                 <span class="n">max_attention_window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
-                <span class="n">sink_token_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
                 <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
-                <span class="n">use_one_more_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">)</span>
+                <span class="n">use_one_more_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">,</span>
+                <span class="n">sink_token_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                 <span class="n">cross_num_blocks</span><span class="p">,</span> <span class="n">max_cross_blocks_per_seq</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
@@ -4011,33 +4088,32 @@
                     <span class="n">sink_token_length</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                     <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
-                    <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
-                        <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_pool</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="mi">0</span><span class="p">],</span>
-                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+                    <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">get_kv_cache_pool_pointers</span><span class="p">(</span>
+                    <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
+                    <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_mapping&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">pool_mapping</span>
 
-                <span class="n">cross_block_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(</span>
-                <span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_manager</span> <span class="o">=</span> <span class="n">KVCacheManager</span><span class="p">(</span>
-                    <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
-                    <span class="n">num_blocks</span><span class="o">=</span><span class="n">cross_num_blocks</span><span class="p">,</span>
-                    <span class="n">block_size</span><span class="o">=</span><span class="n">cross_block_size</span><span class="p">,</span>
-                    <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
-                    <span class="n">max_blocks_per_seq</span><span class="o">=</span><span class="n">max_cross_blocks_per_seq</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">cross_pools_kv_cache_manager</span> <span class="o">=</span> <span class="n">PoolsKVCacheManager</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">pools_metadata</span><span class="p">,</span>
+                    <span class="n">max_cross_blocks_per_seq</span><span class="p">,</span>
+                    <span class="n">cross_num_blocks</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
                     <span class="n">max_attention_window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
-                    <span class="n">sink_token_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
                     <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
-                    <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                    <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">sink_token_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">)</span>
 
             <span class="c1"># Add sequences to the manager</span>
             <span class="k">for</span> <span class="n">bi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">batch_size</span><span class="p">):</span>
                 <span class="n">generation_sequence</span> <span class="o">=</span> <span class="n">GenerationSequence</span><span class="p">(</span><span class="n">seq_idx</span><span class="o">=</span><span class="n">bi</span><span class="p">,</span>
                                                          <span class="n">batch_idx</span><span class="o">=</span><span class="n">bi</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">add_sequence</span><span class="p">(</span><span class="n">generation_sequence</span><span class="p">,</span>
-                                                   <span class="n">max_context_length</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">add_sequence</span><span class="p">(</span>
+                    <span class="n">generation_sequence</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                     <span class="n">cross_generation_sequence</span> <span class="o">=</span> <span class="n">GenerationSequence</span><span class="p">(</span><span class="n">seq_idx</span><span class="o">=</span><span class="n">bi</span><span class="p">,</span>
                                                                    <span class="n">batch_idx</span><span class="o">=</span><span class="n">bi</span><span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_manager</span><span class="o">.</span><span class="n">add_sequence</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_pools_kv_cache_manager</span><span class="o">.</span><span class="n">add_sequence</span><span class="p">(</span>
                         <span class="n">cross_generation_sequence</span><span class="p">,</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
                         <span class="n">always_share_across_beam</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -4059,7 +4135,7 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_updater</span><span class="o">.</span><span class="n">init_paged_kv_cache</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
-                    <span class="n">kv_cache_type</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="p">,</span>
+                    <span class="n">kv_cache_type</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">])</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">past_key_value_list</span> <span class="o">=</span> <span class="p">[</span>
@@ -4380,7 +4456,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f425170d540>
+<jinja2.runtime.BlockReference object at 0x7fb952d15d80>
 
 <div class="footer">
     <p>

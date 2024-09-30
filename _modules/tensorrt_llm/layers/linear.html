@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -173,7 +177,7 @@
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">set_obj_attrs</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AllReduceFusionOp</span><span class="p">,</span> <span class="n">AllReduceFusionParams</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
                           <span class="n">_add_plugin_info</span><span class="p">,</span> <span class="n">_create_tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span>
-                          <span class="n">allreduce</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">matmul</span><span class="p">)</span>
+                          <span class="n">allreduce</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">low_latency_gemm</span><span class="p">,</span> <span class="n">matmul</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
@@ -367,9 +371,12 @@
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">manage_weights</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefer_managed_weight</span><span class="p">:</span>
             <span class="n">use_gemm_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
             <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="n">use_low_latency_gemm_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
+            <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">low_latency_gemm_plugin</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">get_managed_tensor</span><span class="p">(</span>
                 <span class="n">network</span><span class="o">=</span><span class="n">default_net</span><span class="p">(),</span>
-                <span class="n">need_transpose</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">weight_is_kn</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_gemm_plugin</span><span class="p">)</span>
+                <span class="n">need_transpose</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">weight_is_kn</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_gemm_plugin</span>
+                <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_low_latency_gemm_plugin</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">get_constant_tensor</span><span class="p">(</span><span class="n">network</span><span class="o">=</span><span class="n">default_net</span><span class="p">())</span></div>
 
@@ -381,13 +388,18 @@
         <span class="n">x</span><span class="p">,</span>
         <span class="n">weight</span><span class="p">,</span>
         <span class="n">gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">use_fp8</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">alpha</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">lora_runtime_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraRuntimeParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">lora_hidden_state</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="n">hidden_state</span> <span class="o">=</span> <span class="n">x</span>
-        <span class="k">if</span> <span class="n">gemm_plugin</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">low_latency_gemm_plugin</span><span class="p">:</span>
+            <span class="n">strict_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">low_latency_gemm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">alpha</span><span class="p">,</span> <span class="n">strict_dtype</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">gemm_plugin</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">gemm_plugin</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span><span class="p">:</span>
                 <span class="n">strict_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
@@ -427,6 +439,7 @@
             <span class="n">x</span><span class="p">,</span>
             <span class="n">weight</span><span class="p">,</span>
             <span class="n">gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">use_fp8</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
             <span class="n">alpha</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">lora_runtime_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraRuntimeParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -436,6 +449,7 @@
             <span class="n">x</span><span class="p">,</span>
             <span class="n">weight</span><span class="p">,</span>
             <span class="n">gemm_plugin</span><span class="o">=</span><span class="n">gemm_plugin</span><span class="p">,</span>
+            <span class="n">low_latency_gemm_plugin</span><span class="o">=</span><span class="n">low_latency_gemm_plugin</span><span class="p">,</span>
             <span class="n">use_fp8</span><span class="o">=</span><span class="n">use_fp8</span><span class="p">,</span>
             <span class="n">alpha</span><span class="o">=</span><span class="n">alpha</span><span class="p">,</span>
             <span class="n">lora_runtime_params</span><span class="o">=</span><span class="n">lora_runtime_params</span><span class="p">,</span>
@@ -535,23 +549,24 @@
         <span class="n">config</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;config&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_qkv</span><span class="p">:</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
-                <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">remove_duplicated_kv_heads</span><span class="p">:</span>
-                    <span class="n">head_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">head_size</span>
-                    <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span>
-                    <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span>
-                        <span class="n">k</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">//</span> <span class="n">head_size</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">head_size</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span>
-                    <span class="p">])</span>
-                    <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span>
-                        <span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">//</span> <span class="n">head_size</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">head_size</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span>
-                    <span class="p">])</span>
-                    <span class="k">assert</span> <span class="p">(</span><span class="n">k</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">k</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span>
-                    <span class="k">assert</span> <span class="p">(</span><span class="n">v</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">v</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span>
-                    <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">])</span>
-                    <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">])</span>
-                    <span class="n">weights</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">k</span>
-                    <span class="n">weights</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span>
+                <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;remove_duplicated_kv_heads&quot;</span><span class="p">):</span>
+                    <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">remove_duplicated_kv_heads</span><span class="p">:</span>
+                        <span class="n">head_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">head_size</span>
+                        <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span>
+                        <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span>
+                            <span class="n">k</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">//</span> <span class="n">head_size</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">head_size</span><span class="p">,</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span>
+                        <span class="p">])</span>
+                        <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span>
+                            <span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">//</span> <span class="n">head_size</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">head_size</span><span class="p">,</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span>
+                        <span class="p">])</span>
+                        <span class="k">assert</span> <span class="p">(</span><span class="n">k</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">k</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span>
+                        <span class="k">assert</span> <span class="p">(</span><span class="n">v</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">v</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span>
+                        <span class="n">k</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">])</span>
+                        <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">([</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">])</span>
+                        <span class="n">weights</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">k</span>
+                        <span class="n">weights</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span>
                 <span class="n">weights</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">using_head_as_leading_dim</span><span class="p">:</span>
                 <span class="c1"># Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]</span>
@@ -588,6 +603,7 @@
         <span class="n">strict_dtype</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">pad_lda</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="n">prefer_managed_weight</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">is_expert</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
             <span class="n">local_in_features</span><span class="o">=</span><span class="n">in_features</span> <span class="o">//</span> <span class="n">tp_size</span><span class="p">,</span>
@@ -602,6 +618,8 @@
         <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">tp_dim</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_expert</span> <span class="o">=</span> <span class="n">is_expert</span>
 
 <div class="viewcode-block" id="RowLinear.tp_split_dim">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.tp_split_dim">[docs]</a>
@@ -623,12 +641,17 @@
                      <span class="o">==</span> <span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">RESIDUAL_RMS_NORM</span><span class="p">))</span>
             <span class="k">if</span> <span class="n">fuse_bias_into_all_reduce</span><span class="p">:</span>
                 <span class="n">reduce_fusion_params</span><span class="o">.</span><span class="n">bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="n">allreduce</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
-                          <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                          <span class="n">reduce_fusion_params</span><span class="o">=</span><span class="n">reduce_fusion_params</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">need_bias</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">fuse_bias_into_all_reduce</span><span class="p">:</span>
-                <span class="n">bias</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-                <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">bias</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_expert</span><span class="p">:</span>
+                <span class="n">x</span> <span class="o">=</span> <span class="n">allreduce</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
+                              <span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                              <span class="n">reduce_fusion_params</span><span class="o">=</span><span class="n">reduce_fusion_params</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">need_bias</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">fuse_bias_into_all_reduce</span><span class="p">:</span>
+                    <span class="n">bias</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+                    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">bias</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">need_bias</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">fuse_bias_into_all_reduce</span><span class="p">:</span>
+                    <span class="n">bias</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+                    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">bias</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span>
             <span class="k">return</span> <span class="n">x</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -647,7 +670,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251b25ed0>
+<jinja2.runtime.BlockReference object at 0x7fb95582f370>
 
 <div class="footer">
     <p>

@@ -82,6 +82,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -274,74 +278,239 @@ node).</p></li>
 <p>The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h"><code class="docutils literal notranslate"><span class="pre">SamplingConfig</span></code></a>
 class encapsulates parameters that control the
 <a class="reference external" href="https://huggingface.co/blog/how-to-generate">generation</a> of new tokens.
+A comparison of selecting decoding method is listed as the table below (<code class="docutils literal notranslate"><span class="pre">X</span></code> means it is not supported yet).
 Except for the <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter, all the fields are optional and the
 runtime will use a default value if no values are provided by the user. For
 vector fields, the TensorRT-LLM runtime supports one value per sequence (that is,
 the vector contains <code class="docutils literal notranslate"><span class="pre">batchSize</span></code> values). If all the sequences use the same
 value for a given parameter, the vector can be limited to a single element
 (that is, <code class="docutils literal notranslate"><span class="pre">size()</span> <span class="pre">==</span> <span class="pre">1</span></code>).</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Method name in HF</p></th>
+<th class="head text-center"><p>Condition in HF</p></th>
+<th class="head text-center"><p>Method name in TRT-LLM</p></th>
+<th class="head text-center"><p>Condition in TRT-LLM</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>assisted decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">assistant_model</span></code> or <code class="docutils literal notranslate"><span class="pre">prompt_lookup_num_tokens!=None</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>beam-search decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams&gt;1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=False</span></code></p></td>
+<td class="text-center"><p>beam search</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">&gt;</span> <span class="pre">1</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>beam-search multinomial sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams&gt;1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=True</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>constrained beam-search decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">constraints!=None</span></code> or <code class="docutils literal notranslate"><span class="pre">force_words_ids!=None</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>contrastive search</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">penalty_alpha&gt;0</span></code> and <code class="docutils literal notranslate"><span class="pre">top_k&gt;1</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>diverse beam-search decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams&gt;1</span></code> and <code class="docutils literal notranslate"><span class="pre">num_beam_groups&gt;1</span></code></p></td>
+<td class="text-center"><p>X</p></td>
+<td class="text-center"><p></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>greedy decoding</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams=1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=False</span></code></p></td>
+<td class="text-center"><p>sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">==</span> <span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">topK=0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP=0.0f</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>multinomial sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">num_beams=1</span></code> and <code class="docutils literal notranslate"><span class="pre">do_sample=True</span></code></p></td>
+<td class="text-center"><p>sampling</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span> <span class="pre">==</span> <span class="pre">1</span></code> and (<code class="docutils literal notranslate"><span class="pre">topK&gt;0</span></code> or <code class="docutils literal notranslate"><span class="pre">topP&gt;0.0f</span></code>)</p></td>
+</tr>
+</tbody>
+</table>
 <p><em><strong>General</strong></em></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name in TRT-LLM</p></th>
+<th class="head text-center"><p>Description</p></th>
+<th class="head text-center"><p>Data type</p></th>
+<th class="head text-center"><p>Range of value</p></th>
+<th class="head text-center"><p>Default value</p></th>
+<th class="head text-center"><p>Name in HF</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
+<td class="text-center"><p>modulation of logits in sampling workflow</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no modulation)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">minLength</span></code></p></td>
+<td class="text-center"><p>lower-bound on the number of tokens generated</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[0, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (no effect (the first generated token can be EOS)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">min_length</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code></p></td>
+<td class="text-center"><p>penalize repetitive tokens <br> multiplicative, irrespective of appearances count</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1.0f</span></code> encourages repetition <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1.0f</span></code> discourages it</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no effect)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code></p></td>
+<td class="text-center"><p>penalize existed tokens <br> additive, irrespective of appearances count</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>($-\infty$, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourages repetition <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourages it</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect)</p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code></p></td>
+<td class="text-center"><p>penalize existed tokens <br> additive, dependent on appearances count</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>($-\infty$, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourages repetition <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourages it</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect)</p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">noRepeatNgramSize</span></code></p></td>
+<td class="text-center"><p></p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[0, $+\infty$) <br> <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code> all ngrams of that size can only occur once</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (no effect)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">no_repeat_ngram_size</span></code></p></td>
+</tr>
+</tbody>
+</table>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code>, a vector of floating-point numbers to control the
-modulation of logits when sampling new tokens. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code>(no modulation).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">minLength</span></code>, a vector of integers to set a lower-bound on the number of tokens
-generated. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0</span></code>. Value <code class="docutils literal notranslate"><span class="pre">0</span></code> has no effect, the first generated token can be EOS. The default value is <code class="docutils literal notranslate"><span class="pre">1</span></code> (at least one non-EOS token is generated).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, a vector of float-point numbers to penalize tokens
-(irrespective of the number of appearances). It is multiplicative penalty. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code>. Repetition penalty <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">1.0f</span></code> encourages repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1.0f</span></code> discourages it. The default value is <code class="docutils literal notranslate"><span class="pre">1.0f</span></code> (no effect).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, a vector of float-point numbers to penalize tokens
-already present in the sequence (irrespective of the number of appearances). It is additive penalty.
-It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.f</span></code> discourage it. The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code> (no effect).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code>, a vector of float-point numbers to penalize tokens
-already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values <code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">0.0f</span></code> encourage repetition, <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0.0f</span></code> discourage it.
-The default value is <code class="docutils literal notranslate"><span class="pre">0.0f</span></code>(no effect).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">noRepeatNgramSize</span></code>, a vector of integers. It can have any value <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code>. If set to int <code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">0</span></code>, all ngrams of that size can only occur once.</p></li>
+<li><p>The tokens of input prompt are included during adopting <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> onto logits.</p></li>
+<li><p>The parameters <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> are not mutually exclusive.</p></li>
 </ul>
-<p>The parameters <code class="docutils literal notranslate"><span class="pre">repetitionPenalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presencePenalty</span></code>, and <code class="docutils literal notranslate"><span class="pre">frequencyPenalty</span></code> are not mutually
-exclusive.</p>
 <p><em><strong>Sampling</strong></em></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name in TRT-LLM</p></th>
+<th class="head text-center"><p>Description</p></th>
+<th class="head text-center"><p>Data type</p></th>
+<th class="head text-center"><p>Range of value</p></th>
+<th class="head text-center"><p>Default value</p></th>
+<th class="head text-center"><p>Name in HF</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">randomSeed</span></code></p></td>
+<td class="text-center"><p>random seed for random number generator</p></td>
+<td class="text-center"><p>Int64</p></td>
+<td class="text-center"><p>[0, 2^64-1]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topK</span></code></p></td>
+<td class="text-center"><p>the number of logits to sample from</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[0, 1024]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">top_k</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topP</span></code></p></td>
+<td class="text-center"><p>the top-P probability to sample from</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">top_p</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code></p></td>
+<td class="text-center"><p>the decay in the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>(0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0f</span></code></p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topPMin</span></code></p></td>
+<td class="text-center"><p>the decay in the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>(0.0f, 1.0f]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.0e-6,f</span></code></p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code></p></td>
+<td class="text-center"><p>the decay in the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>[-1, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">-1</span></code> (no effect)</p></td>
+<td class="text-center"><p>no</p></td>
+</tr>
+</tbody>
+</table>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">randomSeed</span></code>, a vector of 64-bit integers to control the random seed used by
-the random number generator in sampling. Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>,</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">topK</span></code>, a vector of integers to control the number of logits to sample from.
-Must be in range of <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1024]</span></code>. Its default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.
-Note that if different values are provided for the
-different sequences in the batch, the performance of the implementation will
-depend on the largest value. For efficiency reasons, we recommend to batch
-requests with similar <code class="docutils literal notranslate"><span class="pre">topK</span></code> values together,</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">topP</span></code>, a vector of floating-point values to control the top-P probability
-to sample from. Must be in range of <code class="docutils literal notranslate"><span class="pre">[0.f,</span> <span class="pre">1.f]</span></code>. Its default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code>, vectors to control the decay in
-the <code class="docutils literal notranslate"><span class="pre">topP</span></code> algorithm. The <code class="docutils literal notranslate"><span class="pre">topP</span></code> values are modulated by
-a decay that exponentially depends on the length of the sequence as explained in
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, greedy search is performed.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probilities will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopK</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, tokens will be sorted with probility descendly, then the tokens with highest probilities which the accumulated probility larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopP</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probilities will be selected, then those selected tokens will be sorted with probility descendly and their probility will be normalized, then the tokens with highest normalized probilities which the accumulated probility larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopKTopP</span> <span class="pre">sampling</span></code> in TRT-LLM)</p></li>
+<li><p>If different <code class="docutils literal notranslate"><span class="pre">topK</span></code> values are provided for the different sequences in the batch, the performance of the implementation will depend on the largest value. For efficiency reasons, we recommend to batch requests with similar <code class="docutils literal notranslate"><span class="pre">topK</span></code> values together.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code> are explained in
 <a class="reference external" href="https://arxiv.org/abs/2206.04624"><em>Factuality Enhanced Language Models for Open-Ended Text Generation</em></a>.
-<code class="docutils literal notranslate"><span class="pre">topPDecay</span></code> is the decay, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> is the lower-bound and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code>
-indicates where to reset the decay.
-<code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> must be in ranges of <code class="docutils literal notranslate"><span class="pre">(0.f,</span> <span class="pre">1.f]</span></code> and <code class="docutils literal notranslate"><span class="pre">(0.f,</span> <span class="pre">1.f]</span></code> respectively.
-Defaults are <code class="docutils literal notranslate"><span class="pre">1.f</span></code>, <code class="docutils literal notranslate"><span class="pre">1.0e-6,f</span></code> and <code class="docutils literal notranslate"><span class="pre">-1</span></code>,</p></li>
+<code class="docutils literal notranslate"><span class="pre">topPDecay</span></code> is the decay, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> is the lower-bound and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code> indicates where to reset the decay.</p></li>
 </ul>
-<p>If both <code class="docutils literal notranslate"><span class="pre">topK</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span></code> fields are set, the <code class="docutils literal notranslate"><span class="pre">topK</span></code> method will be run for
-sequences with a <code class="docutils literal notranslate"><span class="pre">topK</span></code> value greater than <code class="docutils literal notranslate"><span class="pre">0.f</span></code>. In that case, the <code class="docutils literal notranslate"><span class="pre">topP</span></code>
-value for that sequence also influences the result. If the <code class="docutils literal notranslate"><span class="pre">topK</span></code> values for
-some sequences are <code class="docutils literal notranslate"><span class="pre">0.f</span></code>, the <code class="docutils literal notranslate"><span class="pre">topP</span></code> method will be used for those remaining
-sequences. If both <code class="docutils literal notranslate"><span class="pre">topK</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span></code> are zero, greedy search is performed.</p>
 <p><em><strong>Beam-search</strong></em></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Name in TRT-LLM</p></th>
+<th class="head text-center"><p>Description</p></th>
+<th class="head text-center"><p>Data type</p></th>
+<th class="head text-center"><p>Range of value</p></th>
+<th class="head text-center"><p>Default value</p></th>
+<th class="head text-center"><p>Name in HF</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span></code></p></td>
+<td class="text-center"><p>width for beam-search algorithm</p></td>
+<td class="text-center"><p>Int</p></td>
+<td class="text-center"><p>[0, 64]</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code> (disable beam search)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beam_width</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">beamSearchDiversityRate</span></code></p></td>
+<td class="text-center"><p>diversity of generated tokens</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">diversity_penalty</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">lengthPenalty</span></code></p></td>
+<td class="text-center"><p>penalize longer sequences</p></td>
+<td class="text-center"><p>List[Float]</p></td>
+<td class="text-center"><p>[0, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.0f</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">length_penalty</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code></p></td>
+<td class="text-center"><p>see description below</p></td>
+<td class="text-center"><p>List[Int]</p></td>
+<td class="text-center"><p>($-\infty$, $+\infty$)</p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">early_stopping</span></code></p></td>
+</tr>
+</tbody>
+</table>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">beamWidth</span></code>, is the width used for the <a class="reference external" href="https://en.wikipedia.org/wiki/Beam_search">beam
-search</a> sampling algorithm. There
-is no explicit upper-bound on the beam width but increasing the beam width
-will likely increase the latency. Use <code class="docutils literal notranslate"><span class="pre">1</span></code> to disable beam-search,</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">beamSearchDiversityRate</span></code>, a floating-point value that controls the
-diversity in beam-search. It can have any value  <code class="docutils literal notranslate"><span class="pre">&gt;=</span> <span class="pre">0.0f</span></code>. The default value is <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">lengthPenalty</span></code>, a floating-point value that controls how to penalize the
-longer sequences in beam-search (the log-probability of a sequence will be
-penalized by a factor that depends on <code class="docutils literal notranslate"><span class="pre">1.f</span> <span class="pre">/</span> <span class="pre">(length</span> <span class="pre">^</span> <span class="pre">lengthPenalty)</span></code>). The
-default is value <code class="docutils literal notranslate"><span class="pre">0.f</span></code>,</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code>, an integer value that controls whether the generation process
-finishes once <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> sentences are generated (end up with <code class="docutils literal notranslate"><span class="pre">end_token</span></code>).
-Default value <code class="docutils literal notranslate"><span class="pre">1</span></code> means <code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code> is enabled, value <code class="docutils literal notranslate"><span class="pre">0</span></code> means <code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code>
-is disabled, other values means the generation process is dependent on
-<code class="docutils literal notranslate"><span class="pre">length_penalty</span></code>.
-The <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter is a scalar value. It means that in this release of
+<li><p>Beam-search algorithm: <a class="reference external" href="https://en.wikipedia.org/wiki/Beam_search">beam search</a>.</p></li>
+<li><p>Parameter <code class="docutils literal notranslate"><span class="pre">diversity_penalty</span></code> in HF is only used for <code class="docutils literal notranslate"><span class="pre">diverse</span> <span class="pre">beam-search</span> <span class="pre">decoding</span></code> (or named <code class="docutils literal notranslate"><span class="pre">Group-Beam-Search</span></code>), which is not supported by TRT-LLM yet.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">earlyStopping</span> <span class="pre">=</span> <span class="pre">1</span></code>, decoding will stop once <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> finished sentences are generated.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">earlyStopping</span> <span class="pre">=</span> <span class="pre">0</span></code>, decoding will keep going until no better sentences (with better score) can be generated.</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">earlyStopping</span></code> to other values, decoding will stop only depending on <code class="docutils literal notranslate"><span class="pre">lengthlengthPenalty</span></code>.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">beamWidth</span></code> parameter is a scalar value. It means that in this release of
 TensorRT-LLM, it is not possible to specify a different width for each input
 sequence. This limitation is likely to be removed in a future release.</p></li>
 </ul>
@@ -398,7 +567,7 @@ one.</p></li>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4261c85d50>
+<jinja2.runtime.BlockReference object at 0x7fb971b56fe0>
 
 <div class="footer">
     <p>

@@ -52,7 +52,6 @@
 <li class="toctree-l2"><a class="reference internal" href="#compile-the-model-into-a-tensorrt-engine">Compile the Model into a TensorRT Engine</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#run-the-model">Run the Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#deploy-with-triton-inference-server">Deploy with Triton Inference Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#send-requests">Send Requests</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#llm-api">LLM API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#next-steps">Next Steps</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#related-information">Related Information</a></li>
@@ -91,6 +90,10 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -211,68 +214,17 @@ The model definition is a minimal example that shows some of the optimizations a
 <section id="deploy-with-triton-inference-server">
 <h2>Deploy with Triton Inference Server<a class="headerlink" href="#deploy-with-triton-inference-server" title="Link to this heading"></a></h2>
 <p>To create a production-ready deployment of your LLM, use the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">Triton Inference Server backend for TensorRT-LLM</a> to leverage the TensorRT-LLM C++ runtime for rapid inference execution and include optimizations like in-flight batching and paged KV caching. Triton Inference Server with the TensorRT-LLM backend is available as a <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver/tags">pre-built container through NVIDIA NGC</a>.</p>
-<ol class="arabic">
-<li><p>Pull down the example model repository so that Triton Inference Server can read the model and any associated metadata.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># After exiting the TensorRT-LLM Docker container</span>
-<span class="nb">cd</span><span class="w"> </span>..
-git<span class="w"> </span>clone<span class="w"> </span>https://github.com/triton-inference-server/tensorrtllm_backend.git
-<span class="nb">cd</span><span class="w"> </span>tensorrtllm_backend
-cp<span class="w"> </span>../TensorRT-LLM/examples/llama/out/*<span class="w">   </span>all_models/inflight_batcher_llm/tensorrt_llm/1/
-</pre></div>
-</div>
-<p>The <code class="docutils literal notranslate"><span class="pre">tensorrtllm_backend</span></code> repository includes the skeleton of a model repository under <code class="docutils literal notranslate"><span class="pre">all_models/inflight_batcher_llm/</span></code> that you can use.</p>
-</li>
-<li><p>Copy the model you compiled (<a class="reference internal" href="#quick-start-guide-compile"><span class="std std-ref">Compile the Model into a TensorRT Engine</span></a>) to the example model repository.</p></li>
-<li><p>Modify the configuration files from the model repository. Specify the path to the compiled model engine, the tokenizer, and how to handle memory allocation for the KV cache when performing inference in batches.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>tools/fill_template.py<span class="w"> </span>--in_place<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>all_models/inflight_batcher_llm/tensorrt_llm/config.pbtxt<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>decoupled_mode:true,engine_dir:/all_models/inflight_batcher_llm/tensorrt_llm/1,<span class="se">\</span>
-max_tokens_in_paged_kv_cache:,batch_scheduler_policy:guaranteed_completion,kv_cache_free_gpu_mem_fraction:0.2,<span class="se">\</span>
-max_num_sequences:4
-
-python<span class="w"> </span>tools/fill_template.py<span class="w"> </span>--in_place<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>all_models/inflight_batcher_llm/preprocessing/config.pbtxt<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
-
-python<span class="w"> </span>tools/fill_template.py<span class="w"> </span>--in_place<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>all_models/inflight_batcher_llm/postprocessing/config.pbtxt<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
-</pre></div>
-</div>
-</li>
-<li><p>Start Triton Inference Server in the container. Specify <code class="docutils literal notranslate"><span class="pre">world_size</span></code>, which is the number of GPUs the model was built for, and point to the <code class="docutils literal notranslate"><span class="pre">model_repo</span></code> that was just set up.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>--rm<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--network<span class="w"> </span>host<span class="w"> </span>--shm-size<span class="o">=</span>1g<span class="w"> </span><span class="se">\</span>
--v<span class="w"> </span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span>/all_models:/all_models<span class="w"> </span><span class="se">\</span>
--v<span class="w"> </span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span>/scripts:/opt/scripts<span class="w"> </span><span class="se">\</span>
-nvcr.io/nvidia/tritonserver:23.10-trtllm-python-py3
-
-<span class="c1"># Log in to huggingface-cli to get tokenizer</span>
-huggingface-cli<span class="w"> </span>login<span class="w"> </span>--token<span class="w"> </span>*****
-
-<span class="c1"># Install python dependencies</span>
-pip<span class="w"> </span>install<span class="w"> </span>sentencepiece<span class="w"> </span>protobuf
-
-<span class="c1"># Launch Server</span>
-python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w"> </span>--model_repo<span class="w"> </span>/all_models/inflight_batcher_llm<span class="w"> </span>--world_size<span class="w"> </span><span class="m">1</span>
-</pre></div>
-</div>
-</li>
+<ol class="arabic simple">
+<li><p>Clone the TensorRT-LLM backend repository:</p></li>
 </ol>
-</section>
-<section id="send-requests">
-<h2>Send Requests<a class="headerlink" href="#send-requests" title="Link to this heading"></a></h2>
-<p>Use one of the Triton Inference Server client libraries or send HTTP requests to the generated endpoint. To get started, you can use the more fully featured client script or the following command:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>localhost:8000/v2/models/ensemble/generate<span class="w"> </span>-d<span class="w"> </span><span class="se">\</span>
-<span class="s1">&#39;{</span>
-<span class="s1">&quot;text_input&quot;: &quot;How do I count to nine in French?&quot;,</span>
-<span class="s1">&quot;parameters&quot;: {</span>
-<span class="s1">&quot;max_tokens&quot;: 100,</span>
-<span class="s1">&quot;bad_words&quot;:[&quot;&quot;],</span>
-<span class="s1">&quot;stop_words&quot;:[&quot;&quot;]</span>
-<span class="s1">}</span>
-<span class="s1">}&#39;</span>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">cd ..</span>
+<span class="go">git clone https://github.com/triton-inference-server/tensorrtllm_backend.git</span>
+<span class="go">cd tensorrtllm_backend</span>
 </pre></div>
 </div>
+<ol class="arabic simple" start="2">
+<li><p>Refer to <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md">End to end workflow to run llama 7b</a> in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.</p></li>
+</ol>
 </section>
 <section id="llm-api">
 <h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading"></a></h2>
@@ -310,7 +262,6 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
 <li><p>Retrieved the model weights</p></li>
 <li><p>Compiled and ran the model</p></li>
 <li><p>Deployed the model with Triton Inference Server</p></li>
-<li><p>Sent HTTP requests</p></li>
 </ul>
 <p>For more examples, refer to:</p>
 <ul class="simple">
@@ -337,7 +288,7 @@ python<span class="w"> </span>/opt/scripts/launch_triton_server.py<span class="w
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f425218dab0>
+<jinja2.runtime.BlockReference object at 0x7fb970692f20>
 
 <div class="footer">
     <p>

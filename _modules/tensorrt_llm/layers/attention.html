@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -427,11 +431,13 @@
                  <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_kv_cache_pool_pointers</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">host_kv_cache_pool_mapping</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">cache_indirection</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">past_key_value_length</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+                 <span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">host_cross_kv_cache_pool_mapping</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="n">past_key_value</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_past_key_value_lengths</span> <span class="o">=</span> <span class="n">host_past_key_value_lengths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_max_attention_window_sizes</span> <span class="o">=</span> <span class="n">host_max_attention_window_sizes</span>
@@ -439,9 +445,11 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">kv_cache_block_offsets</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_kv_cache_block_offsets</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="n">host_kv_cache_pool_pointers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_pool_mapping</span> <span class="o">=</span> <span class="n">host_kv_cache_pool_mapping</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">cross_kv_cache_block_offsets</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_cross_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_cross_kv_cache_block_offsets</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_cross_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="n">host_cross_kv_cache_pool_pointers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_cross_kv_cache_pool_mapping</span> <span class="o">=</span> <span class="n">host_cross_kv_cache_pool_mapping</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cache_indirection</span> <span class="o">=</span> <span class="n">cache_indirection</span>
         <span class="c1"># self.past_key_value_length = past_key_value_length</span>
 
@@ -540,7 +548,8 @@
                  <span class="n">max_attn_value</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
                  <span class="n">block_sparse_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                  <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">reorder</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                 <span class="n">reorder</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">local_layer_idx</span>
@@ -548,6 +557,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">attention_mask_type</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">attention_head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">attention_head_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">num_kv_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layer_idx_in_cache_pool</span> <span class="o">=</span> <span class="n">layer_idx_in_cache_pool</span> <span class="k">if</span> <span class="n">layer_idx_in_cache_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">local_layer_idx</span>
         <span class="k">assert</span> <span class="n">num_attention_heads</span> <span class="o">%</span> <span class="n">tp_size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> \
         <span class="s2">&quot;num_attention_heads must be divisible by tp_size&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
@@ -780,19 +790,10 @@
                 <span class="n">max_position_embeddings</span><span class="p">,</span>
                 <span class="n">rotary_embedding_dim</span><span class="p">,</span>
             <span class="p">)</span>
-            <span class="c1"># cogvlm attention.</span>
-            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s1">&#39;vision_start&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span>
-                    <span class="n">config</span><span class="p">,</span> <span class="s1">&#39;vision_length&#39;</span><span class="p">):</span>
-                <span class="n">rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions_for_cogvlm_attention_plugin</span><span class="p">(</span>
-                    <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">rotary_embedding_dim</span><span class="p">,</span>
-                    <span class="n">rotary_embedding_base</span><span class="p">,</span> <span class="n">rotary_embedding_scale</span><span class="p">,</span>
-                    <span class="n">rotary_embedding_scale_type</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span>
-                    <span class="n">config</span><span class="o">.</span><span class="n">vision_length</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions_for_attention_plugin</span><span class="p">(</span>
-                    <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">rotary_embedding_dim</span><span class="p">,</span>
-                    <span class="n">rotary_embedding_base</span><span class="p">,</span> <span class="n">rotary_embedding_scale</span><span class="p">,</span>
-                    <span class="n">rotary_embedding_scale_type</span><span class="p">,</span> <span class="n">rotary_embedding_scaling</span><span class="p">)</span>
+            <span class="n">rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions_for_attention_plugin</span><span class="p">(</span>
+                <span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">rotary_embedding_dim</span><span class="p">,</span>
+                <span class="n">rotary_embedding_base</span><span class="p">,</span> <span class="n">rotary_embedding_scale</span><span class="p">,</span>
+                <span class="n">rotary_embedding_scale_type</span><span class="p">,</span> <span class="n">rotary_embedding_scaling</span><span class="p">)</span>
             <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
                 <span class="s1">&#39;embed_positions&#39;</span><span class="p">,</span>
                 <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
@@ -1065,8 +1066,7 @@
                     <span class="n">embed_positions_short_factors_for_attention_plugin</span><span class="p">,</span>
                     <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]),</span>
                     <span class="n">concat</span><span class="p">([</span>
-                        <span class="nb">max</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span>
-                            <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">),</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span>
                     <span class="p">]))</span>
                 <span class="n">long</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
@@ -1074,8 +1074,7 @@
                     <span class="n">embed_positions_long_factors_for_attention_plugin</span><span class="p">,</span>
                     <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]),</span>
                     <span class="n">concat</span><span class="p">([</span>
-                        <span class="nb">max</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span>
-                            <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">),</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span>
                     <span class="p">]))</span>
                 <span class="n">short</span> <span class="o">=</span> <span class="n">short</span><span class="o">.</span><span class="n">view</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
@@ -1124,6 +1123,7 @@
                 <span class="n">layer_idx</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span><span class="p">,</span>
                 <span class="n">num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
                 <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
+                <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_idx_in_cache_pool</span><span class="p">,</span>
                 <span class="n">hidden_size_per_head</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
                 <span class="n">q_scaling</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_scaling</span><span class="p">,</span>
                 <span class="n">rotary_embedding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">,</span>
@@ -1164,6 +1164,9 @@
                 <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                 <span class="n">host_kv_cache_pool_pointers</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="k">else</span>
                 <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">,</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_kv_cache_pool_mapping</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="k">else</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_cross_kv_cache_pool_mapping</span><span class="p">,</span>
                 <span class="n">do_cross_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">,</span>
                 <span class="n">cross_qkv</span><span class="o">=</span><span class="n">cross_qkv</span><span class="p">,</span>
                 <span class="n">cross_qkv_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
@@ -1586,7 +1589,8 @@
                  <span class="n">cp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
                  <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+                 <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span> <span class="k">if</span> <span class="n">attention_head_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">attention_head_size</span>
@@ -1613,6 +1617,8 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">q_scaling</span> <span class="o">*=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="c1"># add quant mode to control quantization</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="o">=</span> <span class="n">relative_attention</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span> <span class="o">=</span> <span class="n">max_distance</span>
@@ -1793,14 +1799,12 @@
             <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
             <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">rope_gpt_neox</span><span class="p">,</span>
+            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
             <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="mf">10000.0</span><span class="p">,</span>
             <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
             <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
             <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-            <span class="n">vision_start</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-            <span class="n">vision_length</span><span class="o">=</span><span class="mi">1225</span><span class="p">,</span>
             <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
             <span class="n">dense_bias</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
@@ -1819,9 +1823,6 @@
                          <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                          <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">,</span>
                          <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">=</span> <span class="n">vision_length</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span> <span class="o">=</span> <span class="n">vision_start</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">vis_qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
             <span class="n">hidden_size</span><span class="p">,</span>
@@ -1848,29 +1849,22 @@
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">vision_token_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">position_embedding</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="p">(</span><span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
         <span class="k">assert</span> <span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">)</span>
 
-        <span class="n">bs</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">seq_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">bos</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-                    <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">vis_seq_length</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">vision_hidden_states</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-            <span class="n">hidden_states</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="n">vis_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">text_seq_length</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span>
-            <span class="mi">0</span><span class="p">,</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">))</span>
-        <span class="n">language_hidden_states</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-            <span class="n">hidden_states</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="n">text_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">bos_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">bos</span><span class="p">)</span>
-        <span class="n">language_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">language_hidden_states</span><span class="p">)</span>
-        <span class="n">vision_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_qkv</span><span class="p">(</span><span class="n">vision_hidden_states</span><span class="p">)</span>
-        <span class="n">qkv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">bos_qkv</span><span class="p">,</span> <span class="n">vision_qkv</span><span class="p">,</span> <span class="n">language_qkv</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">vision_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">language_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">qkv</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">vision_token_mask</span><span class="p">,</span> <span class="n">vision_qkv</span><span class="p">,</span> <span class="n">language_qkv</span><span class="p">)</span>
+
+        <span class="n">qkv</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">apply_rotary_pos_emb_cogvlm</span><span class="p">(</span>
+            <span class="n">qkv</span><span class="p">,</span> <span class="n">position_embedding</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span><span class="p">,</span>
+            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
 
         <span class="k">assert</span> <span class="n">attention_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">is_valid</span><span class="p">(</span>
             <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">,</span>
@@ -1903,8 +1897,6 @@
             <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
             <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
 
-            <span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">rotary_inv_freq</span>
-            <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span>
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
             <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
                 <span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
@@ -1923,14 +1915,7 @@
                 <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
                 <span class="n">hidden_size_per_head</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
                 <span class="n">q_scaling</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_scaling</span><span class="p">,</span>
-                <span class="n">rotary_embedding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">,</span>
-                <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span><span class="p">,</span>
-                <span class="n">rotary_embedding_scale_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span><span class="p">,</span>
-                <span class="n">rotary_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span><span class="p">,</span>
-                <span class="n">rotary_embedding_max_positions</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
                 <span class="n">position_embedding_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">,</span>
-                <span class="n">rotary_inv_freq</span><span class="o">=</span><span class="n">rotary_inv_freq</span><span class="p">,</span>
-                <span class="n">rotary_cos_sin</span><span class="o">=</span><span class="n">rotary_cos_sin</span><span class="p">,</span>
                 <span class="n">kv_orig_quant_scale</span><span class="o">=</span><span class="n">kv_orig_quant_scale</span><span class="p">,</span>
                 <span class="n">kv_quant_orig_scale</span><span class="o">=</span><span class="n">kv_quant_orig_scale</span><span class="p">,</span>
                 <span class="n">attention_output_orig_quant_scale</span><span class="o">=</span>
@@ -1941,13 +1926,13 @@
                 <span class="n">alibi_slopes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                 <span class="n">tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
-                <span class="n">vision_start</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span>
-                <span class="n">vision_length</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span><span class="p">,</span>
                 <span class="n">kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                 <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                 <span class="n">host_kv_cache_pool_pointers</span><span class="p">,</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="p">,</span>
                 <span class="n">do_cross_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">,</span>
                 <span class="n">cross_qkv</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">cross_qkv_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
@@ -1962,24 +1947,9 @@
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_runtime_perf_knobs</span>
             <span class="p">)</span>
 
-        <span class="n">bs</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">seq_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">bos</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-                    <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">vis_seq_length</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">vision_hidden_states</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-            <span class="n">context</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="n">vis_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">text_seq_length</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span>
-            <span class="mi">0</span><span class="p">,</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">))</span>
-        <span class="n">language_hidden_states</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-            <span class="n">context</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="n">text_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-
-        <span class="n">bos_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">bos</span><span class="p">)</span>
-        <span class="n">language_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">language_hidden_states</span><span class="p">)</span>
-        <span class="n">vision_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_dense</span><span class="p">(</span><span class="n">vision_hidden_states</span><span class="p">)</span>
-        <span class="n">context</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">bos_dense</span><span class="p">,</span> <span class="n">vision_dense</span><span class="p">,</span> <span class="n">language_dense</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">vision_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+        <span class="n">language_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+        <span class="n">context</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">vision_token_mask</span><span class="p">,</span> <span class="n">vision_dense</span><span class="p">,</span> <span class="n">language_dense</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span><span class="p">)</span>
@@ -1996,7 +1966,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251cafa30>
+<jinja2.runtime.BlockReference object at 0x7fb97106aa70>
 
 <div class="footer">
     <p>

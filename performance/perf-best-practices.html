@@ -82,6 +82,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -124,7 +128,6 @@
 <li class="toctree-l3"><a class="reference internal" href="#remove-input-padding">Remove Input Padding</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#paged-kv-cache">Paged KV Cache</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#in-flight-sequence-batching">In-flight Sequence Batching</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#multi-block-mode">Multi-Block Mode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#reduce-norm-fusion">Reduce Norm Fusion</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin">Embedding Parallelism, Embedding Sharing, and Look-Up Plugin</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#horizontal-fusion-in-gated-mlp">Horizontal Fusion in Gated-MLP</a></li>
@@ -258,9 +261,6 @@ built engines, it will benefits the performance especially when GEMM plugin is
 disabled, because more optimization profiles help TensorRT have more chances to
 select better kernels.</p>
 <p>However, this feature will increase the engine build time.</p>
-<p><strong>Known issue</strong>: We observed that enabling multiple profiles can lead to extra
-unexpected GPU memory usage on some cases starting from v0.11. The issue will be
-addressed in future releases.</p>
 </section>
 <section id="gpt-attention-plugin-and-context-fused-multi-head-attention">
 <h3>GPT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#gpt-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
@@ -306,29 +306,6 @@ cache are all enabled together.</p>
 sequences in generation phase to increase efficiency and reduce latency, see
 this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#in-flight-batching">Document</a> for more details.</p>
 </section>
-<section id="multi-block-mode">
-<h3>Multi-Block Mode<a class="headerlink" href="#multi-block-mode" title="Link to this heading"></a></h3>
-<p>When the following conditions are met, it is recommended to try the
-<code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code> argument with <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark</span></code> and evaluate the impact on
-performance:</p>
-<ol class="arabic simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">input_seq_len</span></code> &gt; 1024 (An empirically derived value that indicates that the
-context length is long enough),</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">sequence_count</span></code> * <code class="docutils literal notranslate"><span class="pre">num_head</span></code> &lt; <code class="docutils literal notranslate"><span class="pre">multiprocessor_count</span></code> / 2</p></li>
-</ol>
-<p>Multi-block mode can be beneficial when <code class="docutils literal notranslate"><span class="pre">batch_size</span> <span class="pre">*</span> <span class="pre">num_heads</span></code> is not large
-enough to fully utilize the GPU (the number of CUDA thread blocks is low
-compared to the number of streaming multiprocessors). Hence, the multi-block
-mode is expected to reduce the latency of the multi-head attention kernel in
-the generation phase. However, it requires the context length to be long enough
-for the work performed by each CUDA thread block to remain sufficient for
-efficiency.</p>
-<p>Note that, the <code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code> argument works more like a suggestion to the
-runtime, hence it’s possible that multi-block is not used even when
-<code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code> argument is specified due to no performance gain, and it’s
-also possible that multi-block is automatically used even when <code class="docutils literal notranslate"><span class="pre">--multi_block_mode</span></code>
-argument is disabled.</p>
-</section>
 <section id="reduce-norm-fusion">
 <h3>Reduce Norm Fusion<a class="headerlink" href="#reduce-norm-fusion" title="Link to this heading"></a></h3>
 <p>There is an experimental feature called “Reduce Norm Fusion”
@@ -355,23 +332,20 @@ improve throughput. However, the following conditions have to be satisfied:</p>
 <li><p>Both look_up plugin and gemm plugin are enabled,</p></li>
 <li><p>The sharding dimension of the embedding lookup table is set correctly.</p></li>
 </ol>
-<p>To enable the features, use the <code class="docutils literal notranslate"><span class="pre">--use_parallel_embedding</span></code>,
-<code class="docutils literal notranslate"><span class="pre">--use_embedding_sharing</span></code>, <code class="docutils literal notranslate"><span class="pre">--use_lookup_plugin</span></code>, <code class="docutils literal notranslate"><span class="pre">--use_gemm_plugin</span></code>
-arguments, and set correct dimension to <code class="docutils literal notranslate"><span class="pre">--embedding_sharding_dim</span></code> argument
-with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. See those
+<p>To enable the features, use the <code class="docutils literal notranslate"><span class="pre">--use_parallel_embedding</span></code>, <code class="docutils literal notranslate"><span class="pre">--embedding_sharding_dim</span></code> and
+<code class="docutils literal notranslate"><span class="pre">--use_embedding_sharing</span></code> arguments in <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code>, and use the
+<code class="docutils literal notranslate"><span class="pre">--lookup_plugin</span></code>, <code class="docutils literal notranslate"><span class="pre">--gemm_plugin</span></code> arguments in <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command. See those
 <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism-and-sharing">Examples</a>
 for details.</p>
 </section>
 <section id="horizontal-fusion-in-gated-mlp">
 <h3>Horizontal Fusion in Gated-MLP<a class="headerlink" href="#horizontal-fusion-in-gated-mlp" title="Link to this heading"></a></h3>
 <p>Horizontal fusion in Gated-MLP combines two Matmul operations into a single one
-followed by a separate SwiGLU kernel. However, for FP8 PTQ, the
-downside is slight reduction of accuracy because one of the quantization scaling
-factors are discarded.</p>
-<p>If both model and batch sizes are large, it is recommended to enable the feature
-by using the <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span></code> argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. When the workload
-is very small, or if you’re using FP8 PTQ and the accuracy after enabling it
-does not satisfy your requirement, it is not recommended to enable that feature.</p>
+followed by a separate SwiGLU kernel. It can effectively reduce latency.</p>
+<p>The feature is enabled by default. However, for FP8 PTQ, the downside is slight
+reduction of accuracy because one of the quantization scaling factors are discarded.
+If you’re using FP8 PTQ and the accuracy does not satisfy your requirement, you
+can try disable the feature by setting <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=disable</span></code> argument to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
 </section>
 <section id="gemm-swiglu-fusion-in-gated-mlp">
 <h3>GEMM + SwiGLU Fusion in Gated-MLP<a class="headerlink" href="#gemm-swiglu-fusion-in-gated-mlp" title="Link to this heading"></a></h3>
@@ -380,7 +354,7 @@ operation into a single kernel. It only supports FP8 on Hopper now. For FP8 PTQ,
 the downside is slight reduction of accuracy because one of the quantization
 scaling factors are discarded.</p>
 <p>If model is large and you are running it on Hopper with FP8 precision, it is
-recommended to enable the feature by using the <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code>
+recommended to enable the feature by using the <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code>
 argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. When the workload is very small, or the accuracy
 after enabling it does not satisfy your requirement, it is not recommended to
 enable that feature.</p>
@@ -518,7 +492,7 @@ recommended to start from <code class="docutils literal notranslate"><span class
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4253344f40>
+<jinja2.runtime.BlockReference object at 0x7fb972346740>
 
 <div class="footer">
     <p>

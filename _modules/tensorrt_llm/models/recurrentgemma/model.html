@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -207,6 +211,7 @@
             <span class="n">layer_types</span> <span class="o">=</span> <span class="n">layer_types</span> <span class="o">+</span> <span class="n">config</span><span class="o">.</span><span class="n">layer_types</span><span class="p">[</span><span class="mi">0</span><span class="p">:(</span>
                 <span class="p">(</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">layer_type_len</span><span class="p">)]</span>
             <span class="n">attention_layer_idx</span> <span class="o">=</span> <span class="n">layer_types</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="s1">&#39;attention&#39;</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
+
             <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
                 <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">attention_layer_idx</span><span class="p">,</span>
                 <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -359,6 +364,8 @@
                     <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                     <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_kv_cache_pool_pointers</span><span class="p">,</span>
+                    <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                    <span class="n">host_kv_cache_pool_mapping</span><span class="p">,</span>
                     <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">),</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
                 <span class="n">conv_state</span><span class="o">=</span><span class="n">past_conv</span><span class="p">,</span>
@@ -659,7 +666,6 @@
                 <span class="n">mapping</span><span class="p">,</span> <span class="n">num_profiles</span><span class="p">)</span>
 
         <span class="c1"># attention inputs</span>
-        <span class="n">num_attention_layers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="s1">&#39;attention&#39;</span><span class="p">)</span>
         <span class="n">attn_layer_idx</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;attention&#39;</span><span class="p">:</span>
@@ -671,7 +677,7 @@
             <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
             <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
-            <span class="n">num_layers</span><span class="o">=</span><span class="n">num_attention_layers</span><span class="p">,</span>
+            <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
             <span class="n">kv_dtype</span><span class="o">=</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">),</span>
             <span class="n">num_profiles</span><span class="o">=</span><span class="n">num_profiles</span><span class="p">,</span>
             <span class="n">enable_ctx_gen_opt_profiles</span><span class="o">=</span><span class="n">enable_ctx_gen_opt_profiles</span><span class="p">,</span>
@@ -682,17 +688,6 @@
             <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
             <span class="n">streamingllm</span><span class="o">=</span><span class="n">streamingllm</span><span class="p">,</span>
             <span class="n">attn_layer_idx</span><span class="o">=</span><span class="n">attn_layer_idx</span><span class="p">)</span>
-
-        <span class="n">kv_idx</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="n">past_key_value</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">):</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;attention&#39;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">paged_kv_cache</span><span class="p">:</span>
-                <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                    <span class="n">attention_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">][</span><span class="n">kv_idx</span><span class="p">])</span>
-                <span class="n">kv_idx</span> <span class="o">+=</span> <span class="mi">1</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">past_key_value</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
-        <span class="n">attention_inputs</span><span class="p">[</span><span class="s1">&#39;past_key_value&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">past_key_value</span>
 
         <span class="c1"># recurrent inputs</span>
         <span class="n">recurrent_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_recurrent_inputs</span><span class="p">(</span>
@@ -761,6 +756,8 @@
                     <span class="s1">&#39;host_kv_cache_block_offsets&#39;</span><span class="p">],</span>
                 <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">attention_inputs</span><span class="p">[</span>
                     <span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">],</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">attention_inputs</span><span class="p">[</span>
+                    <span class="s1">&#39;host_kv_cache_pool_mapping&#39;</span><span class="p">],</span>
                 <span class="n">cache_indirection</span><span class="o">=</span><span class="n">attention_inputs</span><span class="p">[</span><span class="s1">&#39;cache_indirection&#39;</span><span class="p">],</span>
             <span class="p">),</span>
             <span class="s1">&#39;attention_params&#39;</span><span class="p">:</span>
@@ -799,7 +796,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f425165a110>
+<jinja2.runtime.BlockReference object at 0x7fb957e914b0>
 
 <div class="footer">
     <p>

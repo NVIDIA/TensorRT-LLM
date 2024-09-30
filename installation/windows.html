@@ -82,6 +82,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -155,7 +159,7 @@
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.12.0">v0.12.0 tag</a> for the most stable experience.</p>
+We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.13.0">v0.13.0 tag</a> for the most stable experience.</p>
 </div>
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
@@ -164,7 +168,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <ol class="arabic">
 <li><p>Install all dependencies together.</p>
 <ol class="arabic simple">
-<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.4.1 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
+<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.5.1 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
 </ol>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span>
 </pre></div>
@@ -202,7 +206,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 </pre></div>
 </div>
 <p>before installing TensorRT-LLM with the following command.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.12.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/cu121/torch/
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.13.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
 </pre></div>
 </div>
 <p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
@@ -233,7 +237,7 @@ and retry. Check the system path to make sure the latest version installed in <c
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4253932350>
+<jinja2.runtime.BlockReference object at 0x7fb972517640>
 
 <div class="footer">
     <p>
