@@ -55,13 +55,13 @@ class BaichuanConfig(PretrainedConfig):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         import transformers
-
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
             hf_config_dir = str(hf_config_or_dir)
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
 
         model_version = kwargs.pop('model_version', None)
         if model_version is None:

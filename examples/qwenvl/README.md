@@ -50,18 +50,16 @@
     python3 run.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
-        --images_path='{"image": "./pics/demo.jpeg"}' \
-        --input_dir='{"image": "image.pt"}'
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
+        --images_path='{"image": "./pics/demo.jpeg"}'
     ```
     4.2 (Optional) For multiple rounds of dialogue, you can run:
     ```bash
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
-        --images_path='{"image": "./pics/demo.jpeg"}' \
-        --input_dir='{"image": "image.pt"}'
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
+        --images_path='{"image": "./pics/demo.jpeg"}'
     ```
     4.3 (Optional) To show the bounding box result in the demo picture, install OpenCV, ZMQ, and request:
     ```bash
@@ -85,7 +83,7 @@
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
         --display \
         --port=8006
     ```
@@ -98,7 +96,7 @@
     python3 run_chat.py \
         --tokenizer_dir=./Qwen-VL-Chat \
         --qwen_engine_dir=./trt_engines/Qwen-VL-7B-Chat \
-        --vit_engine_dir=./plan \
+        --vit_engine_path=./plan/visual_encoder/visual_encoder_fp16.plan \
         --display \
         --local_machine
     ```

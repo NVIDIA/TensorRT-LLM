@@ -17,8 +17,9 @@ import json
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, TypedDict, Union
+from typing import Any, Dict, Iterator, List, Optional, TypedDict, Union
 
 import safetensors
 import torch
@@ -26,10 +27,9 @@ import torch
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.convert_utils import dup_kv_weight, split
-from tensorrt_llm.models.deci.layer_config import (AttentionConfig,
-                                                   AttentionImplementation,
-                                                   DeciLayerConfig, FFNConfig,
-                                                   FFNImplementation)
+from tensorrt_llm.models.nemotron_nas.layer_config import (
+    AttentionConfig, AttentionImplementation, DeciLayerConfig, FFNConfig,
+    FFNImplementation)
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
@@ -45,40 +45,54 @@ def _find_multiple(n: int, k: int) -> int:
 
 
 # BlockConfig is a custom class defined inside deci huggingface checkpoints, we can't import it
-def hf_block_config_to_layer_config(block_config: "BlockConfig",
+def hf_block_config_to_layer_config(block_config: Union["BlockConfig", dict],
                                     num_attn_heads: int,
                                     hidden_size: int) -> DeciLayerConfig:
-    attn = block_config.attention
-    if attn.no_op:
+    """`block_config` (`Union[BlockConfig, dict]`): A `dict` when exported from `ModelOpt`; A `dataclass` at the HF phase
+    """
+    block_config = block_config if isinstance(block_config,
+                                              dict) else asdict(block_config)
+    attn = block_config["attention"]
+    if attn["no_op"]:
         attn_impl = AttentionImplementation.NO_OP
         num_key_value_heads = None
-    elif attn.replace_with_linear:
+    elif attn["replace_with_linear"]:
         attn_impl = AttentionImplementation.LINEAR
         num_key_value_heads = None
-    elif attn.sparsify:
+    elif attn.get("sparsify", None):
         raise NotImplementedError("Sparsification is not supported")
     else:
         attn_impl = AttentionImplementation.ATTENTION
-        num_key_value_heads = num_attn_heads // attn.n_heads_in_group
+        num_key_value_heads = num_attn_heads // attn["n_heads_in_group"]
 
-    ffn = block_config.ffn
-    if ffn.no_op:
+    ffn = block_config["ffn"]
+    if ffn["no_op"]:
         ffn_impl = FFNImplementation.NO_OP
         intermediate_size = None
-    elif ffn.replace_with_linear:
+    elif ffn["replace_with_linear"]:
         ffn_impl = FFNImplementation.LINEAR
         intermediate_size = None
-    elif ffn.sparsify:
+    elif ffn.get("sparsify", None):
         raise NotImplementedError("Sparsification is not supported")
     else:
         ffn_impl = FFNImplementation.MLP
         intermediate_size = _ffn_mult_to_intermediate_size(
-            ffn.ffn_mult, hidden_size)
+            ffn["ffn_mult"], hidden_size)
 
     return DeciLayerConfig(attention=AttentionConfig(
         impl=attn_impl, num_key_value_heads=num_key_value_heads),
                            ffn=FFNConfig(impl=ffn_impl,
                                          intermediate_size=intermediate_size))
+
+
+def hf_block_configs_to_layer_configs(
+        block_configs: Union["BlockConfig", dict], *, num_attention_heads: int,
+        hidden_size: int) -> List[DeciLayerConfig]:
+    return [
+        hf_block_config_to_layer_config(block_config, num_attention_heads,
+                                        hidden_size)
+        for block_config in block_configs
+    ]
 
 
 @contextmanager
@@ -105,12 +119,31 @@ class SafetensorsIndex(TypedDict):
 class WeightsLoader(ABC):
 
     @abstractmethod
+    def read_weight(self, name: str) -> torch.Tensor:
+        ...
+
     def get_weight(self,
                    name: str,
                    tp_dim: TpDim = TpDim.NO_TP,
                    tp_size: int = 1,
                    tp_rank: int = 0) -> torch.Tensor:
-        ...
+        weight = self.read_weight(name)
+        if tp_dim != TpDim.NO_TP:
+            weight = split(weight, tp_size, tp_rank, dim=tp_dim)
+        return weight
+
+    def get_kv_weight(self,
+                      name: str,
+                      num_heads: int,
+                      tp_size: int = 1,
+                      tp_rank: int = 0) -> torch.Tensor:
+        weight = self.read_weight(name)
+        if tp_size > num_heads:
+            weight = dup_kv_weight(weight, num_heads, tp_size)
+        if tp_size > 1:
+            weight = split(weight, tp_size, tp_rank, dim=0)
+
+        return weight
 
 
 class HFModelWeightsLoader(WeightsLoader):
@@ -120,18 +153,11 @@ class HFModelWeightsLoader(WeightsLoader):
         self.model_params = dict(hf_model.named_parameters())
         self.dtype = getattr(torch, dtype)
 
-    def get_weight(self,
-                   name: str,
-                   tp_dim: TpDim = TpDim.NO_TP,
-                   tp_size: int = 1,
-                   tp_rank: int = 0) -> torch.Tensor:
+    def read_weight(self, name: str) -> torch.Tensor:
         weight = self.model_params[name]
         if weight.dtype != self.dtype:
             weight = weight.to(self.dtype)
         weight = weight.detach()
-
-        if tp_dim != TpDim.NO_TP:
-            weight = split(weight, tp_size, tp_rank, dim=tp_dim)
         return weight
 
 
@@ -163,37 +189,10 @@ class SafetensorsWeightsLoader(WeightsLoader):
             for shard_file in shard_files
         }
 
-    def get_weight(self,
-                   name: str,
-                   tp_dim: TpDim = TpDim.NO_TP,
-                   tp_size: int = 1,
-                   tp_rank: int = 0) -> torch.Tensor:
+    def read_weight(self, name: str) -> torch.Tensor:
         shard_filename = self.sharding_map['weight_map'].get(
             name, self.shard_files[0])
-        if tp_dim == TpDim.NO_TP:
-            res = self.safetensors_files[shard_filename].get_tensor(name)
-        else:
-            tensor_slice = self.safetensors_files[shard_filename].get_slice(
-                name)
-            tensor_shape = tensor_slice.get_shape()
-            if len(tensor_shape) == 1:
-                if tp_dim == TpDim.COLWISE:
-                    slice_width = tensor_shape[0] // tp_size
-                    res = tensor_slice[slice_width * tp_rank:slice_width *
-                                       (tp_rank + 1)]
-                else:  # row-wise, but 1-dimensional ==> no tp
-                    res = tensor_slice[:]
-            else:
-                assert tensor_shape[
-                    tp_dim] % tp_size == 0, f"Current weight shape is invalid for tp_size={tp_size}"
-                slice_width = tensor_shape[tp_dim] // tp_size
-                if tp_dim == TpDim.COLWISE:
-                    res = tensor_slice[slice_width * tp_rank:slice_width *
-                                       (tp_rank + 1), :]
-                else:
-                    res = tensor_slice[:, slice_width * tp_rank:slice_width *
-                                       (tp_rank + 1)]
-
+        res = self.safetensors_files[shard_filename].get_tensor(name)
         return res.to(self.dtype).contiguous()
 
 
@@ -245,24 +244,20 @@ def load_model_weights(loader: WeightsLoader,
                     f"model.layers.{l}.input_layernorm.weight"
                 )  # input_layernorm
 
-                qkv = {}
-                for comp in ["q", "k", "v"]:
-                    weight_part = load_weight(
-                        f"model.layers.{l}.self_attn.{comp}_proj.weight",
-                        TpDim.COLWISE)
-                    qkv[comp] = weight_part
-
-                if layer_config.attention.num_key_value_heads < mapping.tp_size:
-                    # duplicate the KV heads up to tensor_parallel
-                    qkv["k"] = dup_kv_weight(
-                        qkv["k"], layer_config.attention.num_key_value_heads,
-                        mapping.tp_size)
-                    qkv["v"] = dup_kv_weight(
-                        qkv["v"], layer_config.attention.num_key_value_heads,
-                        mapping.tp_size)
-
+                q = load_weight(f"model.layers.{l}.self_attn.q_proj.weight",
+                                TpDim.COLWISE)
+                k = loader.get_kv_weight(
+                    f"model.layers.{l}.self_attn.k_proj.weight",
+                    num_heads=layer_config.attention.num_key_value_heads,
+                    tp_size=mapping.tp_size,
+                    tp_rank=mapping.tp_rank)
+                v = loader.get_kv_weight(
+                    f"model.layers.{l}.self_attn.v_proj.weight",
+                    num_heads=layer_config.attention.num_key_value_heads,
+                    tp_size=mapping.tp_size,
+                    tp_rank=mapping.tp_rank)
                 weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(
-                    [qkv["q"], qkv["k"], qkv["v"]], 0)
+                    [q, k, v], 0)
                 weights[f'{tllm_prex}.attention.dense.weight'] = load_weight(
                     f"model.layers.{l}.self_attn.o_proj.weight",
                     TpDim.ROWWISE)  # attention.dense
@@ -363,3 +358,23 @@ def load_weights_from_hf_safetensors(
     loader = SafetensorsWeightsLoader(model_dir=model_dir, dtype=config.dtype)
     logger.info('Loading weights from Huggingface safetensors...')
     return load_model_weights(loader=loader, config=config)
+
+
+def update_weights_following_modelopt_optimization(
+        weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    # Rename MLPs to FFNs to match TRTLLM implementation expectation
+    weights = {k.replace('.mlp.', '.ffn.'): v for k, v in weights.items()}
+
+    # Move all linear attentions to their expected locations
+    weights = {
+        k.replace('.attn_replacing_linear.', '.attention.'): v
+        for k, v in weights.items()
+    }
+
+    # Move all linear MLPs to their expected locations
+    weights = {
+        k.replace('.mlp_replacing_linear.', '.ffn.'): v
+        for k, v in weights.items()
+    }
+
+    return weights

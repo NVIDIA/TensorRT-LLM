@@ -18,6 +18,7 @@ import ast
 import csv
 import os
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -198,35 +199,43 @@ def parse_input_token_extra_ids(prompt_table_path, kv_cache_enable_block_reuse,
 
 
 def print_output(tokenizer,
-                 output_ids,
-                 input_lengths,
-                 sequence_lengths,
-                 output_csv=None,
-                 output_npy=None,
-                 context_logits=None,
-                 generation_logits=None,
-                 cum_log_probs=None,
-                 log_probs=None,
-                 output_logits_npy=None,
-                 output_cum_log_probs_npy=None,
-                 output_log_probs_npy=None):
-    batch_size, num_beams, _ = output_ids.size()
+                 output_ids: torch.Tensor,
+                 input_lengths: List[int],
+                 sequence_lengths: torch.Tensor,
+                 output_csv: Optional[str] = None,
+                 output_npy: Optional[str] = None,
+                 context_logits: Optional[torch.Tensor] = None,
+                 generation_logits: Optional[torch.Tensor] = None,
+                 cum_log_probs: Optional[torch.Tensor] = None,
+                 log_probs: Optional[torch.Tensor] = None,
+                 output_logits_npy: Optional[str] = None,
+                 output_cum_log_probs_npy: Optional[str] = None,
+                 output_log_probs_npy: Optional[str] = None):
+    num_output_sents, num_beams, _ = output_ids.size()
+    batch_size = len(input_lengths)
+    num_return_sequences = num_output_sents // batch_size
+
     if output_csv is None and output_npy is None:
-        for batch_idx in range(batch_size):
-            inputs = output_ids[batch_idx][0][:input_lengths[batch_idx]].tolist(
-            )
+        for i in range(batch_size * num_return_sequences):
+            batch_idx = i // num_return_sequences
+            seq_idx = i % num_return_sequences
+            inputs = output_ids[i][0][:input_lengths[batch_idx]].tolist()
             input_text = tokenizer.decode(inputs)
-            print(f'Input [Text {batch_idx}]: \"{input_text}\"')
+            if seq_idx == 0:
+                print(f'Input [Text {batch_idx}]: \"{input_text}\"')
+
             for beam in range(num_beams):
                 output_begin = input_lengths[batch_idx]
-                output_end = sequence_lengths[batch_idx][beam]
-                outputs = output_ids[batch_idx][beam][
-                    output_begin:output_end].tolist()
+                output_end = sequence_lengths[i][beam]
+                outputs = output_ids[i][beam][output_begin:output_end].tolist()
                 output_text = tokenizer.decode(outputs)
-                print(
-                    f'Output [Text {batch_idx} Beam {beam}]: \"{output_text}\"')
+                index_str = (f'Text {batch_idx} Seq {seq_idx} Beam {beam}'
+                             if num_return_sequences > 1 else
+                             f'Text {batch_idx} Beam {beam}')
+                print(f'Output [{index_str}]: \"{output_text}\"')
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
+
     if output_csv is not None:
         output_file = Path(output_csv)
         output_file.parent.mkdir(exist_ok=True, parents=True)
@@ -394,6 +403,7 @@ def main(args):
             "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
         )
         args.return_all_generated_tokens = True
+
     runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
     runner_kwargs = dict(
         engine_dir=args.engine_dir,
@@ -430,7 +440,8 @@ def main(args):
             kv_cache_free_gpu_memory_fraction=args.
             kv_cache_free_gpu_memory_fraction,
             enable_chunked_context=args.enable_chunked_context,
-            multi_block_mode=args.multi_block_mode)
+            multi_block_mode=args.multi_block_mode,
+            cuda_graph_mode=args.cuda_graph_mode)
     runner_kwargs.update(
         enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
     runner = runner_cls.from_dir(**runner_kwargs)
@@ -453,6 +464,7 @@ def main(args):
             top_k=args.top_k,
             top_p=args.top_p,
             num_beams=args.num_beams,
+            num_return_sequences=args.num_return_sequences,
             length_penalty=args.length_penalty,
             early_stopping=args.early_stopping,
             repetition_penalty=args.repetition_penalty,
@@ -483,10 +495,10 @@ def main(args):
                 sequence_lengths = curr_outputs['sequence_lengths']
                 cum_log_probs = None
                 log_probs = None
-                if args.output_cum_log_probs_npy != None:
-                    cum_log_probs = outputs['cum_log_probs']
-                if args.output_log_probs_npy != None:
-                    log_probs = outputs['log_probs']
+                if args.output_cum_log_probs_npy is not None:
+                    cum_log_probs = curr_outputs['cum_log_probs']
+                if args.output_log_probs_npy is not None:
+                    log_probs = curr_outputs['log_probs']
                 print_output(
                     tokenizer,
                     output_ids,
@@ -510,9 +522,9 @@ def main(args):
                 context_logits = outputs['context_logits']
             if runner.gather_generation_logits:
                 generation_logits = outputs['generation_logits']
-            if args.output_cum_log_probs_npy != None:
+            if args.output_cum_log_probs_npy is not None:
                 cum_log_probs = outputs['cum_log_probs']
-            if args.output_log_probs_npy != None:
+            if args.output_log_probs_npy is not None:
                 log_probs = outputs['log_probs']
             print_output(tokenizer,
                          output_ids,
@@ -550,9 +562,9 @@ def main(args):
                     frequency_penalty=args.frequency_penalty,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
-                    output_cum_log_probs=(args.output_cum_log_probs_npy !=
-                                          None),
-                    output_log_probs=(args.output_log_probs_npy != None),
+                    output_cum_log_probs=(args.output_cum_log_probs_npy
+                                          is not None),
+                    output_log_probs=(args.output_log_probs_npy is not None),
                     random_seed=args.random_seed,
                     lora_uids=args.lora_task_uids,
                     lookahead_config=args.lookahead_config,

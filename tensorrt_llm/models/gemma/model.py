@@ -78,8 +78,7 @@ class GemmaDecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
             q_scaling=q_scaling,
-            max_attn_value=max_attn_value,
-        )
+            max_attn_value=max_attn_value)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 

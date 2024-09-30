@@ -85,10 +85,6 @@ select better kernels.
 
 However, this feature will increase the engine build time.
 
-**Known issue**: We observed that enabling multiple profiles can lead to extra
-unexpected GPU memory usage on some cases starting from v0.11. The issue will be
-addressed in future releases.
-
 ### GPT Attention Plugin and Context Fused Multi-Head Attention
 
 The GPT attention plugin and fused  multi-head attention kernel are enabled by
@@ -166,24 +162,21 @@ improve throughput. However, the following conditions have to be satisfied:
 2. Both look_up plugin and gemm plugin are enabled,
 3. The sharding dimension of the embedding lookup table is set correctly.
 
-To enable the features, use the `--use_parallel_embedding`,
-`--use_embedding_sharing`, `--use_lookup_plugin`, `--use_gemm_plugin`
-arguments, and set correct dimension to `--embedding_sharding_dim` argument
-with `trtllm-build`. See those
+To enable the features, use the `--use_parallel_embedding`, `--embedding_sharding_dim` and
+`--use_embedding_sharing` arguments in `convert_checkpoint.py`, and use the
+`--lookup_plugin`, `--gemm_plugin` arguments in `trtllm-build` command. See those
 [Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism-and-sharing)
 for details.
 
 ### Horizontal Fusion in Gated-MLP
 
 Horizontal fusion in Gated-MLP combines two Matmul operations into a single one
-followed by a separate SwiGLU kernel. However, for FP8 PTQ, the
-downside is slight reduction of accuracy because one of the quantization scaling
-factors are discarded.
+followed by a separate SwiGLU kernel. It can effectively reduce latency.
 
-If both model and batch sizes are large, it is recommended to enable the feature
-by using the `--use_fused_mlp=enable` argument with `trtllm-build`. When the workload
-is very small, or if you're using FP8 PTQ and the accuracy after enabling it
-does not satisfy your requirement, it is not recommended to enable that feature.
+The feature is enabled by default. However, for FP8 PTQ, the downside is slight
+reduction of accuracy because one of the quantization scaling factors are discarded.
+If you're using FP8 PTQ and the accuracy does not satisfy your requirement, you
+can try disable the feature by setting `--use_fused_mlp=disable` argument to `trtllm-build`.
 
 ### GEMM + SwiGLU Fusion in Gated-MLP
 

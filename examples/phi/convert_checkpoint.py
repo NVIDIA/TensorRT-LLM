@@ -59,6 +59,20 @@ def parse_arguments():
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
+    parser.add_argument(
+        '--moe_tp_size',
+        type=int,
+        default=-1,
+        help=
+        'N-way tensor parallelism size for MOE, default is tp_size, which will do tp-only for MoE'
+    )
+    parser.add_argument(
+        '--moe_ep_size',
+        type=int,
+        default=-1,
+        help=
+        'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
+    )
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -110,6 +124,18 @@ if __name__ == '__main__':
     args = parse_arguments()
     assert args.pp_size == 1, "Pipeline parallelism is not supported."
 
+    world_size = args.tp_size * args.pp_size
+    if (args.moe_tp_size == -1 and args.moe_ep_size == -1):
+        # moe default to tp-only
+        args.moe_tp_size = args.tp_size
+        args.moe_ep_size = 1
+    elif (args.moe_tp_size == -1):
+        args.moe_tp_size = args.tp_size // args.moe_ep_size
+    elif (args.moe_ep_size == -1):
+        args.moe_ep_size = args.tp_size // args.moe_tp_size
+    assert (args.moe_tp_size * args.moe_ep_size == args.tp_size
+            ), "moe_tp_size * moe_ep_size must equal to tp_size"
+
     tik = time.time()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -119,39 +145,35 @@ if __name__ == '__main__':
     model_type = model_config.architectures[0]
     supported_models = [
         'PhiForCausalLM', 'Phi3ForCausalLM', 'Phi3VForCausalLM',
-        'Phi3SmallForCausalLM'
+        'Phi3SmallForCausalLM', 'PhiMoEForCausalLM'
     ]
 
     if model_type not in supported_models:
         assert False, "Invalid model type"
 
-    phi_model = Phi3ForCausalLM if model_type.find(
-        'Phi3') != -1 else PhiForCausalLM
+    is_phi3 = 'Phi3' in model_type or 'MoE' in model_type
+    phi_model = Phi3ForCausalLM if is_phi3 else PhiForCausalLM
 
-    hf_model = None
-
-    override_fields = {}
-    # override_fields.update(args_to_build_options(args))
     quant_config = args_to_quant_config(args)
 
     def convert_and_save_rank(args, rank):
-        mapping = Mapping(world_size=args.tp_size * args.pp_size,
+        mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
-                          pp_size=args.pp_size)
+                          pp_size=args.pp_size,
+                          moe_tp_size=args.moe_tp_size,
+                          moe_ep_size=args.moe_ep_size)
 
         phi = phi_model.from_hugging_face(
-            args.model_dir if hf_model is None else hf_model,
+            args.model_dir,
             args.dtype,
             mapping=mapping,
             quant_config=quant_config,
-            **override_fields,
         )
         phi.save_checkpoint(args.output_dir, save_config=(rank == 0))
         del phi
 
-    execute(args.workers, [convert_and_save_rank] * args.tp_size * args.pp_size,
-            args)
+    execute(args.workers, [convert_and_save_rank] * world_size, args)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

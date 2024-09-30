@@ -1,6 +1,7 @@
 import os
 import unittest
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import pytest
 import tensorrt as trt
@@ -13,7 +14,7 @@ from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from tensorrt_llm.hlapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime import TensorInfo
+from tensorrt_llm.runtime import Session, TensorInfo
 
 
 def ASSERT_DRV(err):
@@ -229,11 +230,11 @@ def create_session(builder,
     builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
     engine = builder.build_engine(network, builder_config)
     assert engine is not None, "Failed to build engine"
-    session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+    session = Session.from_serialized_engine(engine)
     return session
 
 
-def run_session(session, inputs, outputs={}, override_shapes={}):
+def run_session(session: Session, inputs, outputs={}, override_shapes={}):
     """
     The current session object needs to pass in both inputs and outputs bindings.
     For test convenience, create a function that infers output shapes automatically,
@@ -279,3 +280,8 @@ def similarity_score(a, b):
 def similar(a, b, threshold=0.8):
     "similar compare a and b "
     return similarity_score(a, b) >= threshold
+
+
+def get_project_root(test_file: str) -> Path:
+    return next(p for p in Path(test_file).resolve().parents
+                if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())

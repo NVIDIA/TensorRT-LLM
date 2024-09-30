@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/safetensors.h"
 #include "tensorrt_llm/executor/tensor.h"
+#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tllmLogger.h"
 
 #include <limits>
@@ -182,7 +183,9 @@ bool TllmRuntime::executeContext(SizeType32 contextIndex) const
 {
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
-    return context.enqueueV3(mStream->get());
+    auto res = context.enqueueV3(mStream->get());
+    sync_check_cuda_error();
+    return res;
 }
 
 void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap)

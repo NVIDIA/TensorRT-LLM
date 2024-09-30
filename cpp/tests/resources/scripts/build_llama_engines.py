@@ -90,7 +90,7 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
 
     tp_pp_sizes = [(1, 1)]
     if only_multi_gpu:
-        tp_pp_sizes = [(1, 4), (4, 1), (1, 2), (2, 2)]
+        tp_pp_sizes = [(1, 4), (4, 1), (1, 2), (2, 2), (2, 1)]
     for tp_size, pp_size in tp_pp_sizes:
         tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
         print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")

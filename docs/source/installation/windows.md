@@ -4,7 +4,7 @@
 
 ```{note}
 The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.12.0) for the most stable experience.
+We recommend checking out the [v0.13.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.13.0) for the most stable experience.
 ```
 
 **Prerequisites**
@@ -15,7 +15,7 @@ We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-L
 
     1. Install all dependencies together.
 
-       1. Run the provided PowerShell script `setup_env.ps1` located under the `/windows/` folder which installs Python and CUDA 12.4.1 automatically with default settings. Run PowerShell as Administrator to use the script.
+       1. Run the provided PowerShell script `setup_env.ps1` located under the `/windows/` folder which installs Python and CUDA 12.5.1 automatically with default settings. Run PowerShell as Administrator to use the script.
 
        ```bash
        ./setup_env.ps1 [-skipCUDA] [-skipPython]
@@ -52,7 +52,7 @@ We recommend checking out the [v0.12.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.12.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/cu121/
+  pip install tensorrt_llm==0.13.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.

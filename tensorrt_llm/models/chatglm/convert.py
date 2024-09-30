@@ -286,9 +286,8 @@ def get_tllm_linear_sq_weight(vals,
         else:
             cur_per_channel_value = vals["scale_w_quant_orig"]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix +
+                'per_channel_scale'] = cur_per_channel_value.reshape(col_shape)
     else:
         if per_channel:
             original_weights = np.array(vals["weight.int8.col"])
@@ -382,7 +381,7 @@ def load_weights_from_hf_model(hf_model: AutoModel,
         if use_smooth_quant:
             qkv_act_range = act_range.get(
                 f'{prefix}.{attention_attr_name}.query_key_value')
-            qkv_vals_int8 = generate_int8(qkv_weight.t().numpy(),
+            qkv_vals_int8 = generate_int8(qkv_weight.t(),
                                           qkv_act_range,
                                           is_qkv=True,
                                           multi_query_mode=True)
@@ -430,7 +429,7 @@ def load_weights_from_hf_model(hf_model: AutoModel,
         if int8_kv_cache:
             qkv_act_range = act_range.get(
                 f'{prefix}.{attention_attr_name}.query_key_value')
-            qkv_vals_int8 = generate_int8(qkv_weight.t().numpy(),
+            qkv_vals_int8 = generate_int8(qkv_weight.t(),
                                           qkv_act_range,
                                           is_qkv=True,
                                           multi_query_mode=True)
@@ -448,7 +447,7 @@ def load_weights_from_hf_model(hf_model: AutoModel,
                 f'{prefix}.{attention_attr_name}.dense')
             dense_smoother = smoother.get(
                 f'{prefix}.{attention_attr_name}.dense')
-            dense_vals_int8 = generate_int8(attn_dense_weight.t().numpy(),
+            dense_vals_int8 = generate_int8(attn_dense_weight.t(),
                                             dense_act_range,
                                             is_qkv=False,
                                             multi_query_mode=True)
@@ -483,7 +482,7 @@ def load_weights_from_hf_model(hf_model: AutoModel,
 
         if use_smooth_quant:
             fc_act_range = act_range.get(f'{prefix}.mlp.dense_h_to_4h')
-            fc_vals_int8 = generate_int8(mlp_fc_weight.t().numpy(),
+            fc_vals_int8 = generate_int8(mlp_fc_weight.t(),
                                          fc_act_range,
                                          is_qkv=False,
                                          multi_query_mode=True)
@@ -558,7 +557,7 @@ def load_weights_from_hf_model(hf_model: AutoModel,
         if use_smooth_quant:
             proj_act_range = act_range.get(f'{prefix}.mlp.dense_4h_to_h')
             proj_smoother = smoother.get(f'{prefix}.mlp.dense_4h_to_h')
-            proj_vals_int8 = generate_int8(mlp_proj_weight.t().numpy(),
+            proj_vals_int8 = generate_int8(mlp_proj_weight.t(),
                                            proj_act_range,
                                            is_qkv=False,
                                            multi_query_mode=True)
@@ -671,7 +670,8 @@ def quantize(hf_model_dir: str,
              output_dir: str,
              config: ChatGLMConfig,
              calib_dataset: str = 'cnn_dailymail',
-             device: str = 'auto'):
+             device: str = 'auto',
+             trust_remote_code: bool = True):
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
@@ -694,7 +694,7 @@ def quantize(hf_model_dir: str,
         device_map = 'auto' if device != "cpu" else 'cpu'
     hf_model = AutoModel.from_pretrained(
         hf_model_dir,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
         torch_dtype='auto' if config.chatglm_version != 'glm' else getattr(
             torch, config.dtype),
         device_map=device_map)
@@ -703,7 +703,7 @@ def quantize(hf_model_dir: str,
         "TOKENIZERS_PARALLELISM", "false")
     tokenizer = AutoTokenizer.from_pretrained(
         hf_model_dir,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
     )
     dataset = load_calib_dataset(calib_dataset)
 

@@ -470,7 +470,8 @@ def quantize(hf_model_dir: str,
              output_dir: str,
              config: BaichuanConfig,
              device: str = 'cuda',
-             calib_dataset: str = 'ccdv/cnn_dailymail'):
+             calib_dataset: str = 'ccdv/cnn_dailymail',
+             trust_remote_code: bool = True):
     os.makedirs(output_dir, exist_ok=True)
     config.to_json_file(os.path.join(output_dir, 'config.json'))
 
@@ -482,10 +483,9 @@ def quantize(hf_model_dir: str,
         device_map='auto' if device != 'cpu' else 'cpu',
         torch_dtype='auto'
         if not config.quantization.use_plugin_sq else torch.float16,
-        trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir,
-                                              use_fast=False,
-                                              trust_remote_code=True)
+        trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        hf_model_dir, use_fast=False, trust_remote_code=trust_remote_code)
     dataset = load_calib_dataset(calib_dataset)
 
     act_range = capture_activation_range(hf_model, tokenizer, dataset)

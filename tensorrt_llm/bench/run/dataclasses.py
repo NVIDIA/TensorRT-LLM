@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from pydantic import (BaseModel, Field, PositiveFloat, computed_field,
                       model_validator)
@@ -93,12 +93,59 @@ class ExecutorSettingsConfig(BaseModel):
         )
 
 
-class ResponseRecord(BaseModel):
-    request_id: int
-    timestamp: float
-    output_tokens: List[int]
-    is_final: bool
-    has_error: bool
+class RequestRecord(BaseModel):
+    id: int = -1
+    num_input_tokens: int = -1
+    tokens: List[int] = []
+    error_tokens: int = 0
+    start_timestamp: int = -1
+    first_token_timestamp: int = -1
+    end_timestamp: int = -1
+
+    def register_event(self, is_error: bool, is_final: bool, timestamp: int,
+                       tokens: List[int]) -> None:
+        if is_final:
+            self.end_timestamp = timestamp
+        elif self.first_token_timestamp == -1:
+            self.first_token_timestamp = timestamp
+
+        if is_error:
+            self.error_tokens += 1
+
+        self.tokens += tokens
+
+    @computed_field
+    def num_output_tokens(self) -> int:
+        return len(self.tokens)
+
+    @computed_field
+    def num_generated_tokens(self) -> int:
+        return self.num_output_tokens - 1
+
+    @computed_field
+    def generation_time(self) -> int:
+        return self.end_timestamp - self.time_to_first_token
+
+    @computed_field
+    def time_to_first_token(self) -> int:
+        return self.first_token_timestamp - self.start_timestamp
+
+    @computed_field
+    def intertoken_latency(self) -> float:
+        return (self.end_timestamp -
+                self.first_token_timestamp) / self.num_generated_tokens
+
+    @computed_field
+    def end_to_end_latency(self) -> int:
+        return self.end_timestamp - self.start_timestamp
+
+    @computed_field
+    def total_token_throughput(self) -> float:
+        return self.num_output_tokens / self.end_to_end_latency
+
+    @computed_field
+    def output_token_throughput(self) -> float:
+        return self.num_output_tokens / self.generation_time
 
 
 class PercentileStats(BaseModel):
@@ -112,41 +159,15 @@ class PercentileStats(BaseModel):
     @classmethod
     def from_iterable(cls, values: List[Any]) -> PercentileStats:
         length = len(values)
+        sorted_values = sorted(values)
         return cls(
-            p50=values[int(length * 0.50)],
-            p95=values[int(length * 0.95)],
-            p99=values[int(length * 0.99)],
+            p50=sorted_values[int(length * 0.50)],
+            p95=sorted_values[int(length * 0.95)],
+            p99=sorted_values[int(length * 0.99)],
             average=float(sum(values)) / length,
             minimum=min(values),
             maximum=max(values),
         )
-
-
-class RequestStats(BaseModel):
-    request_id: int
-    input_tokens: int
-    time_log: List[float] = Field(default_factory=list, init=False)
-    error_responses: int = Field(default=0, init=False)
-    num_responses: int = Field(default=0, init=False)
-    num_tokens: int = Field(default=0, init=False)
-
-    @computed_field
-    def first_token_latency(self) -> float:
-        try:
-            return self.time_log[1] - self.time_log[0]
-        except IndexError:
-            return 0
-
-    @computed_field
-    def request_latency(self) -> float:
-        return max(self.time_log) - min(self.time_log)
-
-    def register_event(self, is_error: bool, is_response: bool,
-                       timestamp: float, num_tokens: int) -> None:
-        self.time_log.append(timestamp)
-        self.error_responses += 1 if is_error else 0
-        self.num_responses += 1 if is_response else 0
-        self.num_tokens += num_tokens
 
 
 class BenchmarkStatistics(BaseModel):
@@ -156,8 +177,10 @@ class BenchmarkStatistics(BaseModel):
     num_requests: int
     issue_rate_ns: float
 
-    request_percentiles: PercentileStats = None
-    token_percentiles: PercentileStats = None
+    request_percentiles: Optional[PercentileStats] = None
+    token_percentiles: Optional[PercentileStats] = None
+    itl_percentiles: Optional[PercentileStats] = None
+    ttft_percentiles: Optional[PercentileStats] = None
 
     @computed_field
     def token_throughput_ns(self) -> float:

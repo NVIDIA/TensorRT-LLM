@@ -18,6 +18,7 @@ from typing import Optional, Union
 import torch
 
 from ..._utils import torch_dtype_to_str
+from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig, QuantConfig
@@ -54,6 +55,7 @@ class Phi3Config(PretrainedConfig):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         import transformers
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
@@ -61,7 +63,7 @@ class Phi3Config(PretrainedConfig):
             hf_config_dir = str(hf_config_or_dir)
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -102,9 +104,23 @@ class Phi3Config(PretrainedConfig):
                 hf_config, "blocksparse_vert_stride", None)
             kwargs['dense_attention_every_n_layers'] = getattr(
                 hf_config, "dense_attention_every_n_layers", None)
+            kwargs['norm_epsilon'] = hf_config.layer_norm_epsilon
         else:
             kwargs['rotary_base'] = hf_config.rope_theta
             kwargs['norm_epsilon'] = hf_config.rms_norm_eps
+        moe_variant = hf_config.architectures[0] == "PhiMoEForCausalLM"
+        if moe_variant:
+            kwargs.update({
+                'moe': {
+                    'num_experts': hf_config.num_local_experts,
+                    'top_k': hf_config.num_experts_per_tok,
+                    'normalization_mode':
+                    MoeConfig.ExpertScaleNormalizationMode.SPARSE_MIXER,
+                    'sparse_mixer_epsilon': hf_config.router_jitter_noise,
+                },
+                'attention_bias': hf_config.attention_bias
+            })
+
         kwargs['position_embedding_type'] = 'rope_gpt_neox'
         if hf_config.max_position_embeddings >= 128000:
             kwargs[
@@ -114,7 +130,7 @@ class Phi3Config(PretrainedConfig):
                 "short_factor"]
             kwargs['longrope_scaling_long_factors'] = hf_config.rope_scaling[
                 "long_factor"]
-            if small_variant:
+            if small_variant or moe_variant:
                 kwargs['longrope_long_mscale'] = hf_config.rope_scaling[
                     "long_mscale"]
                 kwargs['longrope_short_mscale'] = hf_config.rope_scaling[

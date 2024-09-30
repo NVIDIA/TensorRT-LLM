@@ -664,6 +664,17 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
         parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+    if run_gpt:
+        xml_output_file = build_dir / "results-single-gpu-disagg-executor_gpt.xml"
+        trt_model_test = produce_mpirun_command(
+            global_commands=["mpirun", "--allow-run-as-root"],
+            nranks=2,
+            local_commands=[
+                "tests/executor/executorTest",
+                "--gtest_filter=*GptSingleDeviceDisaggExecutorTest*"
+            ],
+            leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+        run_command(trt_model_test, cwd=build_dir, env=cpp_env, timeout=timeout)
 
 
 def produce_mpirun_command(*, global_commands, nranks, local_commands,
@@ -777,25 +788,37 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
     new_env = copy.copy(cpp_env)
-    xml_output_file = build_dir / "results-multi-gpu-dist-executor_gpt.xml"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=2,
         local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=DistExecutorTest.GPTTokenComparison"
+            "executor/executorTest", "--gtest_filter=*DisaggExecutorTest*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
     new_env = copy.copy(cpp_env)
-    xml_output_file = build_dir / "results-multi-gpu-dist-executor_chatglm.xml"
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=2,
+        nranks=4,
+        local_commands=[
+            "executor/executorTest", "--gtest_filter=*DisaggExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=8,
         local_commands=[
             "executor/executorTest",
-            "--gtest_filter=DistExecutorTest.ChatGLMTokenComparison"
+            "--gtest_filter=*LlamaTP2PP2DisaggExecutorTest*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)

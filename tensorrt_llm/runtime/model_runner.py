@@ -830,6 +830,12 @@ class ModelRunner(ModelRunnerMixin):
 
         self._check_inputs(batch_input_ids, sampling_config)
 
+        if kwargs.get('num_return_sequences', 1) > 1:
+            logger.warning(
+                'num_return_sequences will be ignored since '
+                'num_return_sequences > 1 is not supported on python runtime. '
+                'Please use C++ runtime.')
+
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)

@@ -3,7 +3,7 @@ import os
 
 import click
 
-from tensorrt_llm.hlapi import LLM, SamplingParams
+from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams
 
 
 @click.command()
@@ -11,7 +11,9 @@ from tensorrt_llm.hlapi import LLM, SamplingParams
 @click.option("--tp_size", type=int, required=True)
 @click.option("--engine_dir", type=str, default=None)
 def main(model_dir: str, tp_size: int, engine_dir: str):
-    llm = LLM(model_dir, tensor_parallel_size=tp_size)
+    llm = LLM(model_dir,
+              tensor_parallel_size=tp_size,
+              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
 
     if engine_dir is not None and os.path.abspath(
             engine_dir) != os.path.abspath(model_dir):

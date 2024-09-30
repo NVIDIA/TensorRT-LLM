@@ -56,7 +56,8 @@ from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (GpuArch, download_hf_model, download_hf_pretrained_config,
-                    print_colored, print_traceback_on_error, set_docstring)
+                    get_directory_size_in_gb, print_colored,
+                    print_traceback_on_error, set_docstring)
 
 
 @dataclass
@@ -182,7 +183,7 @@ class _ModelInfo:
 
 
 LLMARGS_STAET_DOCSTRING = "The arguments for constructing a LLM instance.\n\nParameters:\n"
-# The arguments locate in LLM class's explicit arg-list.
+# The arguments locate in LLM class's explicit arg-list, these will not be included in LLM class's apidocs.
 LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
     model (str or Path): The model name or a local model directory.
         Note that if the value could be both a model name or a local model directory,
@@ -213,6 +214,15 @@ LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
     load_format (Literal['auto', 'dummy'], default='auto'): The format of the model weights to load.
         * 'auto' will try to load the weights from the provided checkpoint.
         * 'dummy' will initialize the weights with random values, which is mainly for profiling.
+"""
+
+# The arguments locate in LLM class's kwargs, and will be concatenated to LLM class's apidocs.
+# The parallel_config is replaced by {auto_parallel, pipeline_parallel_size} arguments, the tensor_parallel_size is
+# already in the LLM class's apidocs, so it is not included here.
+LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
+    auto_parallel (bool, default=False): Enable auto parallel mode.
+
+    pipeline_parallel_size (int, default=1): The pipeline parallel size.
 
     enable_lora (bool, default=False): Enable LoRA adapters.
 
@@ -221,9 +231,7 @@ LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
     max_loras (int, default=4): Maximum number of LoRA adapters to be stored in GPU memory.
 
     max_cpu_loras (int, default=4): Maximum number of LoRA adapters to be stored in CPU memory.
-"""
 
-LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
     build_config (BuildConfig, default=BuildConfig()): The build configuration for the model.
         Default is an empty BuildConfig instance.
 
@@ -266,6 +274,8 @@ LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
         Default is None.
 
     enable_tqdm (bool, default=False): Whether to display a progress bar during model building.
+
+    trust_remote_code (bool, default=False): Whether to trust remote code when downloading model and tokenizer from Hugging Face.
 """
 
 
@@ -338,12 +348,13 @@ class LlmArgs:
     # Display the model building progress bar
     enable_tqdm: bool = False
 
+    trust_remote_code: bool = False
+
     def __post_init__(self):
         # NOTE: this is only for the compatibility with the old API, and will be removed in the future
         # chunked context is disabled by default, and it is recommended to keep it enabled.
         # The underlying implementation might disable it if it is not supported.
         self.enable_chunked_context: bool = False
-
         # TODO[chunweiy]: Enable this option in the future
         # Currently we want HLAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
         # magics.
@@ -381,7 +392,6 @@ class LlmArgs:
     @classmethod
     def from_kwargs(cls, **kwargs) -> "LlmArgs":
         LlmArgs._check_executor_config_options_consistency()
-
         parallel_config = _ParallelConfig(
             tp_size=kwargs.pop('tensor_parallel_size', 1),
             pp_size=kwargs.pop('pipeline_parallel_size', 1),
@@ -1040,6 +1050,7 @@ class ModelLoader:
             # supports end-to-end task.
             # This is only for HF model for now, not available for users' customized tokenizers.
             import shutil
+
             for name in os.listdir(model_dir):
                 src = os.path.join(model_dir, name)
                 dst = os.path.join(engine_dir, name)
@@ -1102,7 +1113,8 @@ class ModelLoader:
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
-        model_cls = AutoModelForCausalLM.get_trtllm_model_class(self._model_dir)
+        model_cls = AutoModelForCausalLM.get_trtllm_model_class(
+            self._model_dir, self.llm_args.trust_remote_code)
         if self.llm_args.load_format == 'dummy':
             config = model_cls.config_class.from_hugging_face(
                 str(self._model_dir),
@@ -1123,6 +1135,7 @@ class ModelLoader:
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
                     **self.llm_args.calib_config.to_dict(),
+                    trust_remote_code=self.llm_args.trust_remote_code,
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
                 mpi_barrier()
@@ -1136,6 +1149,7 @@ class ModelLoader:
                 quant_config=self.llm_args.quant_config,
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
+                trust_remote_code=self.llm_args.trust_remote_code,
                 **self.convert_checkpoint_options,
             )
 
@@ -1177,13 +1191,17 @@ class ModelLoader:
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
 
-        self.build_config.update(auto_parallel_config=self.auto_parallel_config)
-        self.build_config.update_kv_cache_type(self._model_info.architecture)
+        # avoid the original build_config is modified, avoid the side effect
+        copied_build_config = copy.deepcopy(self.build_config)
+
+        copied_build_config.update(
+            auto_parallel_config=self.auto_parallel_config)
+        copied_build_config.update_kv_cache_type(self._model_info.architecture)
         if self.auto_parallel_config.enabled:
             self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
 
-        engine = build(self.model, self.build_config)
+        engine = build(self.model, copied_build_config)
 
         self._engine_buffer = engine.engine
         self._engine_config = engine.config
@@ -1227,14 +1245,16 @@ class ModelLoader:
         return Namespace(**build_config)
 
     @staticmethod
-    def load_hf_tokenizer(model_dir) -> Optional[TransformersTokenizer]:
+    def load_hf_tokenizer(model_dir,
+                          trust_remote_code) -> Optional[TransformersTokenizer]:
         try:
-            return TransformersTokenizer.from_pretrained(model_dir,
-                                                         legacy=False,
-                                                         padding_side='left',
-                                                         truncation_side='left',
-                                                         trust_remote_code=True,
-                                                         use_fast=True)
+            return TransformersTokenizer.from_pretrained(
+                model_dir,
+                legacy=False,
+                padding_side='left',
+                truncation_side='left',
+                trust_remote_code=trust_remote_code,
+                use_fast=True)
         except Exception as e:
             logger.error(f"Failed to load tokenizer from {model_dir}: {e}")
             return None
@@ -1286,11 +1306,11 @@ class CachedModelLoader:
                 self._hf_model_dir = self.llm_args.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
 
             self.engine_cache_stage = self._get_engine_cache_stage()
-            if self.engine_cache_stage.cache_hitted():
+            if self.engine_cache_stage.is_cached():
+                self.llm_build_stats.cache_hitted = True
                 print_colored(
                     f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
                     'grey')
-                self.llm_build_stats.cache_hitted = True
                 self.llm_args.model = self.engine_cache_stage.get_engine_path()
                 self.llm_build_stats.engine_dir = self.llm_args.model_dir
                 return self.llm_build_stats.engine_dir
@@ -1317,68 +1337,51 @@ class CachedModelLoader:
         ) and not self.llm_args.parallel_config.auto_parallel
 
     def _get_engine_cache_stage(self) -> CachedStage:
-        '''
-        Get the cache stage for engine building.
-        '''
+        ''' Get the cache stage for engine building. '''
         build_cache = BuildCache(self.llm_args.enable_build_cache)
 
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
-        dummy_build_config = CachedModelLoader.get_final_build_config(
-            self.llm_args, self._hf_model_dir)
+
+        def serialize(d) -> str:
+            dic = asdict(d) if not isinstance(
+                d, PretrainedConfig) else d.to_dict()
+            return json.dumps(dic, sort_keys=True)
+
+        parallel_config = self.llm_args.parallel_config
+
+        force_rebuild = False
+        if parallel_config.auto_parallel:
+            force_rebuild = True
+        if self.llm_args.model_format is not _ModelFormatKind.HF:
+            force_rebuild = True
 
         return build_cache.get_engine_building_cache_stage(
-            build_config=dummy_build_config,
+            build_config=self.llm_args.build_config,
             model_path=self._hf_model_dir,
-            # for PretrainedConfig
-            parallel_config=self.llm_args.parallel_config,
+            force_rebuild=force_rebuild,
             # Other configs affecting the engine building
-            quant_config=self.llm_args.quant_config)
+            parallel_config=serialize(parallel_config),
+            pretrained_config=serialize(self.get_pretrained_config()),
+            quant_config=serialize(self.llm_args.quant_config),
+        )
 
-    @staticmethod
-    def get_final_build_config(llm_args: LlmArgs,
-                               model_dir: Path) -> BuildConfig:
-        '''
-        Get the build_config for cache key. The tricky part is that, the build_config will be altered in `build()`,
-        but we need a final version of build_config before `build()` is called for cache key.
-
-        Args:
-            llm_args: The LlmArgs for building the model.
-            model_dir: The path to the local HF model.
-        '''
-
-        # This is only needed by BuildCache for cache key
-        # The build() doesn't need the real model instance to get a updated BuildConig. What is really needed is the
-        # dtype. That's why the model will be downloaded from HF if necessary to get the accurate dtype.
-
-        pretrained_config = AutoConfig.from_hugging_face(
-            model_dir,
-            mapping=Mapping(world_size=llm_args.parallel_config.world_size,
-                            tp_size=llm_args.parallel_config.tp_size,
-                            pp_size=llm_args.parallel_config.pp_size),
-            quant_config=llm_args.quant_config,
-            dtype=llm_args.dtype)
-
-        @dataclass
-        class DummyModel:
-            # This is only used for getting the updated BuildConfig from build() without actually loading the whole
-            # pretrained model to save overhead and memory.
-            config: PretrainedConfig
-
-        # dry_run to get the updated build_config for cache key.  The build_config is modified within build(), so using
-        # a build_config before build() is not correct for cache key, so we need to get the build_config after build()
-        # in dry_run mode.
-        dummy_model = DummyModel(pretrained_config)
-        dummy_build_config = copy.copy(llm_args.build_config)
-        dummy_build_config.dry_run = True
-        updated_build_config = build(dummy_model,
-                                     dummy_build_config,
-                                     return_build_config=True)
-        return updated_build_config
+    def get_pretrained_config(self) -> PretrainedConfig:
+        ''' Get the PretrainedConfig for cache key.
+        NOTE, this is not the HF model's config, but the TRT-LLM's config. We use this as a generic information for
+        HF and other models. '''
+        assert self._hf_model_dir is not None
+        return AutoConfig.from_hugging_face(
+            self._hf_model_dir,
+            mapping=Mapping(world_size=self.llm_args.parallel_config.world_size,
+                            tp_size=self.llm_args.parallel_config.tp_size,
+                            pp_size=self.llm_args.parallel_config.pp_size),
+            quant_config=self.llm_args.quant_config,
+            dtype=self.llm_args.dtype)
 
     def _build_model(self) -> Path:
         model_format = self.llm_args.model_format
 
-        def build_task():
+        def build_task(engine_dir: Path):
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
                 model_loader_kwargs = {
                     'llm_args': self.llm_args,
@@ -1391,22 +1394,44 @@ class CachedModelLoader:
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
-                        engine_dir=self.get_engine_dir(),
+                        engine_dir=engine_dir,
                         **model_loader_kwargs)
                     self.llm_build_stats.build_steps_info = build_infos[0]
 
                 else:  # single-gpu
                     with ModelLoader(**model_loader_kwargs) as model_loader:
-                        model_loader(self.get_engine_dir())
+                        model_loader(engine_dir=engine_dir)
 
                 release_gc()
 
+        has_storage = True
         if self.build_cache_enabled:
-            with self.engine_cache_stage.write_guard():
-                build_task()
-                return self.get_engine_dir()
-        else:
-            build_task()
+            try:
+                # TODO[chunweiy]: Cover the case when the model is from HF model hub.
+                if self.llm_args.is_local_model:
+                    # This is not perfect, but will make build-cache much more robust.
+                    has_storage = self.engine_cache_stage.parent.free_storage_in_gb(
+                    ) >= get_directory_size_in_gb(self.llm_args.model_dir)
+            except ValueError:
+                has_storage = False
+            except Exception as e:
+                logger.error(e)
+                has_storage = False
+
+            if has_storage:
+                with self.engine_cache_stage.write_guard() as engine_dir:
+                    build_task(engine_dir)
+                    self.llm_build_stats.cache_hitted = True
+
+            else:
+                print_colored(
+                    "The cache directory is too small, build-cache is disabled.\n",
+                    'grey')
+                self.llm_build_stats.cache_hitted = False
+                self.llm_build_stats.cache_info = "The cache root directory is too small."
+
+        if not (has_storage and self.build_cache_enabled):
+            build_task(self.get_engine_dir())
 
         return self.get_engine_dir()
 
@@ -1437,6 +1462,7 @@ class LlmBuildStats:
     ''' LlmBuildStats is the statistics for the LLM model building. '''
     # Whether the cache is hitted for the engine
     cache_hitted: bool = False
+    cache_info: Optional[str] = None
 
     model_from_hf_hub: bool = False
 

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.run.dataclasses import (BenchmarkStatistics,
-                                                PercentileStats, RequestStats,
-                                                ResponseRecord)
+                                                PercentileStats, RequestRecord)
 from tensorrt_llm.bindings import InferenceRequest
+
+ResponseTuple = namedtuple(
+    "ResponseTuple", ["timestamp", "request_id", "final", "error", "tokens"])
 
 
 def get_executor_request(request: InferenceRequest,
@@ -66,10 +68,8 @@ def get_settings_from_engine(
 class StatsKeeper:
 
     def __init__(self) -> None:
-        self.requests: RequestStats = {}
+        self.requests: Dict[RequestRecord] = defaultdict(RequestRecord)
         self.num_complete: int = 0
-
-        self._unseen_cache = defaultdict(list)
 
     def register_request(
         self,
@@ -77,49 +77,42 @@ class StatsKeeper:
         timestamp: float,
         num_tokens: int,
     ) -> None:
-        request = RequestStats(request_id=request_id, input_tokens=num_tokens)
-        request.register_event(False, False, timestamp, 0)
-        self.requests[request_id] = request
+        record = self.requests[request_id]
+        record.num_input_tokens = num_tokens
+        record.start_timestamp = timestamp
 
-    def register_response(self, response: ResponseRecord) -> None:
-        request_id = response.request_id
-
-        if request_id not in self.requests:
-            self._unseen_cache[request_id].append(response)
-        else:
-            self.requests[request_id].register_event(
-                is_error=response.has_error,
-                is_response=True,
-                timestamp=response.timestamp,
-                num_tokens=len(response.output_tokens))
-
-            if response.is_final:
-                self.num_complete += 1
+    def register_response(self, request_id: int, timestamp: int, final: bool,
+                          error: bool, tokens: List[int]) -> None:
+        record = self.requests[request_id]
+        record.register_event(error, final, timestamp, tokens)
+        if final:
+            self.num_complete = self.num_complete + 1
 
     def generate_statistics_summary(self) -> None:
         total_output_tokens: int = 0
         total_input_tokens: int = 0
         num_requests = len(self.requests)
-        total_request_latency: float = 0.0
         start_time = float("inf")
         end_time = -1
 
         request_latencies = []
+        intertoken_avg_latencies = []
+        ttft_times = []
         last_queue_time = 0.0
         queue_time_total = 0.0
 
         for entry in self.requests.values():
-            entry.time_log.sort()
+            start_time = min(entry.start_timestamp, start_time)
+            end_time = max(entry.end_timestamp, end_time)
+            queue_time_total += entry.start_timestamp - last_queue_time
+            last_queue_time = entry.start_timestamp
 
-            queue_time_total += entry.time_log[0] - last_queue_time
-            last_queue_time = entry.time_log[0]
+            request_latencies.append(entry.end_to_end_latency)
+            ttft_times.append(entry.time_to_first_token)
+            intertoken_avg_latencies.append(entry.intertoken_latency)
 
-            request_latencies.append(entry.request_latency)
-            total_output_tokens += entry.num_tokens
-            total_input_tokens += entry.input_tokens
-            total_request_latency += entry.request_latency
-            start_time = min(start_time, entry.time_log[0])
-            end_time = max(end_time, entry.time_log[-1])
+            total_output_tokens += entry.num_output_tokens
+            total_input_tokens += entry.num_input_tokens
 
         stats = BenchmarkStatistics(
             num_requests=num_requests,
@@ -128,6 +121,9 @@ class StatsKeeper:
             total_input_tokens=total_input_tokens,
             request_percentiles=PercentileStats.from_iterable(
                 request_latencies),
+            itl_percentiles=PercentileStats.from_iterable(
+                intertoken_avg_latencies),
+            ttft_percentiles=PercentileStats.from_iterable(ttft_times),
             issue_rate_ns=queue_time_total / num_requests)
 
         return stats

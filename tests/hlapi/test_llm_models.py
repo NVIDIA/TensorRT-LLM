@@ -168,7 +168,8 @@ def test_llm_phi_3_small_8k():
         inputs=["where is France's capital?"],
         references=[' Paris is the capital of France. It is known'],
         sampling_params=sampling_params,
-        build_config=build_config)
+        build_config=build_config,
+        trust_remote_code=True)
 
 
 @force_ampere
@@ -225,7 +226,8 @@ def test_llm_glm():
     llm_test_harness(glm_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @force_ampere
@@ -233,7 +235,8 @@ def test_llm_baichuan_7b():
     llm_test_harness(baichuan_7b_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @force_ampere
@@ -241,7 +244,8 @@ def test_llm_baichuan2_7b():
     llm_test_harness(baichuan2_7b_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @force_ampere
@@ -250,7 +254,8 @@ def test_llm_baichuan_13b():
     llm_test_harness(baichuan_13b_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @force_ampere
@@ -259,7 +264,8 @@ def test_llm_baichuan2_13b():
     llm_test_harness(baichuan2_13b_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @force_ampere
@@ -271,7 +277,8 @@ def test_llm_baichuan2_7b_int4weight_only():
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
                      quant_config=quant_config,
-                     calib_config=calib_config)
+                     calib_config=calib_config,
+                     trust_remote_code=True)
 
 
 @skip_pre_ampere
@@ -283,7 +290,8 @@ def test_llm_qwen():
     llm_test_harness(qwen_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @skip_pre_ampere
@@ -292,7 +300,8 @@ def test_llm_qwen1_5():
     llm_test_harness(qwen1_5_model_path,
                      inputs=['1+1='],
                      references=['2'],
-                     sampling_params=qwen1_5_sampling_params)
+                     sampling_params=qwen1_5_sampling_params,
+                     trust_remote_code=True)
 
 
 @skip_pre_ampere
@@ -300,7 +309,8 @@ def test_llm_qwen2():
     llm_test_harness(qwen2_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params)
+                     sampling_params=sampling_params,
+                     trust_remote_code=True)
 
 
 @skip_pre_ampere
@@ -312,7 +322,8 @@ def test_llm_qwen2_int4_weight_only():
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
                      quant_config=quant_config,
-                     calib_config=calib_config)
+                     calib_config=calib_config,
+                     trust_remote_code=True)
 
 
 @skip_pre_hopper
@@ -324,7 +335,8 @@ def test_llm_qwen2_fp8():
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
                      quant_config=quant_config,
-                     calib_config=calib_config)
+                     calib_config=calib_config,
+                     trust_remote_code=True)
 
 
 if __name__ == '__main__':

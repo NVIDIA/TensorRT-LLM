@@ -26,6 +26,7 @@ class IdxEntry(Enum):
     KV_CACHE_BLOCK_OFFSETS = auto()
     HOST_KV_CACHE_BLOCK_OFFSETS = auto()
     HOST_KV_CACHE_POOL_POINTERS = auto()
+    HOST_KV_CACHE_POOL_MAPPING = auto()
     PAST_KEY_VALUE = auto()
     KV_CACHE_QUANTIZATION_SCALE = auto()
     KV_CACHE_DEQUANTIZATION_SCALE = auto()
@@ -100,6 +101,8 @@ class IdxEntryParser:
         elif entry == IdxEntry.HOST_KV_CACHE_BLOCK_OFFSETS:
             return self.use_cache and self.paged_kv_cache
         elif entry == IdxEntry.HOST_KV_CACHE_POOL_POINTERS:
+            return self.use_cache and self.paged_kv_cache
+        elif entry == IdxEntry.HOST_KV_CACHE_POOL_MAPPING:
             return self.use_cache and self.paged_kv_cache
         elif entry == IdxEntry.PAST_KEY_VALUE:
             return self.use_cache and not self.paged_kv_cache

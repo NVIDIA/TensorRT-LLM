@@ -25,6 +25,7 @@ from vit_onnx_trt import Preprocss
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ModelConfig, SamplingConfig, Session,
                                   TensorInfo)
@@ -113,8 +114,11 @@ class QWenInfer(object):
         num_layers = config["pretrained_config"]["num_hidden_layers"]
         num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
-        paged_kv_cache = config["build_config"]["plugin_config"][
-            "paged_kv_cache"]
+        if "kv_cache_type" in config["build_config"]:
+            kv_cache_type = KVCacheType(config["build_config"]["kv_cache_type"])
+        else:
+            kv_cache_type = KVCacheType.CONTINUOUS
+
         tokens_per_block = config["build_config"]["plugin_config"][
             "tokens_per_block"]
         max_prompt_embedding_table_size = config["build_config"].get(
@@ -144,7 +148,7 @@ class QWenInfer(object):
             vocab_size=vocab_size,
             num_layers=num_layers,
             gpt_attention_plugin=use_gpt_attention_plugin,
-            paged_kv_cache=paged_kv_cache,
+            kv_cache_type=kv_cache_type,
             tokens_per_block=tokens_per_block,
             remove_input_padding=remove_input_padding,
             dtype=dtype,
@@ -418,9 +422,9 @@ def parse_arguments():
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--log_level", type=str, default="info")
     parser.add_argument(
-        "--vit_engine_dir",
+        "--vit_engine_path",
         type=str,
-        default="qwen_outputs",
+        default="plan/visual_encoder/visual_encoder_fp16.plan",
     )
     parser.add_argument(
         "--qwen_engine_dir",
@@ -468,18 +472,25 @@ def parse_arguments():
                         type=int,
                         help="Use beam search if num_beams >1",
                         default=1)
+    parser.add_argument("--display", default=False, action='store_true')
+    parser.add_argument('--port', type=str, default='8006')
+    parser.add_argument("--local_machine", default=False, action='store_true')
+
     return parser.parse_args()
 
 
-def vit_process(image_path, vit_engine_dir, stream):
+def vit_process(image_path, vit_engine_path, stream):
     img_processor = Preprocss(448)
-    logger.info(f"Loading engine from {vit_engine_dir}")
-    with open(vit_engine_dir, "rb") as f:
+    logger.info(f"Loading engine from {vit_engine_path}")
+    with open(vit_engine_path, "rb") as f:
         engine_buffer = f.read()
-    logger.info(f"Creating session from engine {vit_engine_dir}")
+    logger.info(f"Creating session from engine {vit_engine_path}")
     session_vit = Session.from_serialized_engine(engine_buffer)
     device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-    images = img_processor.encode(image_path).to(device)
+    image_path_list = []
+    for item in image_path:
+        image_path_list.append(next(iter(item.values())))
+    images = img_processor.encode(image_path_list).to(device)
     batch_size = images.size(0)
     images = images.expand(batch_size, -1, -1, -1).contiguous()
     visual_inputs = {"input": images.float()}
@@ -510,7 +521,7 @@ if __name__ == "__main__":
     args = parse_arguments()
     stream = torch.cuda.current_stream().cuda_stream
     tensorrt_llm.logger.set_level(args.log_level)
-    image_embeds = vit_process(args.images_path, args.vit_engine_dir, stream)
+    image_embeds = vit_process(args.images_path, args.vit_engine_path, stream)
     qinfer = QWenInfer(
         args.tokenizer_dir,
         args.qwen_engine_dir,

@@ -1160,12 +1160,16 @@ class DecoderModel(PretrainedModel):
                     host_cross_kv_cache_block_offsets,
                     host_kv_cache_pool_pointers=kv_cache_params.
                     host_kv_cache_pool_pointers,
+                    host_kv_cache_pool_mapping=kv_cache_params.
+                    host_kv_cache_pool_mapping,
                     cross_kv_cache_block_offsets=kv_cache_params.
                     cross_kv_cache_block_offsets,
                     host_cross_kv_cache_block_offsets=kv_cache_params.
                     host_cross_kv_cache_block_offsets,
                     host_cross_kv_cache_pool_pointers=kv_cache_params.
-                    host_cross_kv_cache_pool_pointers),
+                    host_cross_kv_cache_pool_pointers,
+                    host_cross_kv_cache_pool_mapping=kv_cache_params.
+                    host_cross_kv_cache_pool_mapping),
                 attention_params=attention_params,
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
@@ -1601,10 +1605,12 @@ class DecoderModel(PretrainedModel):
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
         host_kv_cache_pool_pointers = None
+        host_kv_cache_pool_mapping = None
 
         cross_kv_cache_block_offsets = None
         host_cross_kv_cache_block_offsets = None
         host_cross_kv_cache_pool_pointers = None
+        host_cross_kv_cache_pool_mapping = None
 
         if use_cache:
             if not paged_kv_cache:
@@ -1669,21 +1675,25 @@ class DecoderModel(PretrainedModel):
                     x for x in max_cross_blocks_per_seq_range[0]
                 ]]
 
-                kv_cache_block_offsets = Tensor(name=f'kv_cache_block_offsets',
-                                                dtype=trt.int32,
-                                                shape=[-1, 2, -1],
-                                                dim_range=OrderedDict([
-                                                    ('batch_size_beam_width',
-                                                     [bb_range]),
-                                                    ('kv', [2]),
-                                                    ('max_blocks_per_seq',
-                                                     max_blocks_per_seq_range),
-                                                ]))
+                # TODO(oargov): add support for vgqa, meanwhile assume a single kv cache pool
+                num_kv_cache_pools = 1
+
+                kv_cache_block_offsets = Tensor(
+                    name=f'kv_cache_block_offsets',
+                    dtype=trt.int32,
+                    shape=[num_kv_cache_pools, -1, 2, -1],
+                    dim_range=OrderedDict([
+                        ('num_kv_cache_pools', [num_kv_cache_pools]),
+                        ('batch_size_beam_width', [bb_range]),
+                        ('kv', [2]),
+                        ('max_blocks_per_seq', max_blocks_per_seq_range),
+                    ]))
                 host_kv_cache_block_offsets = Tensor(
                     name=f'host_kv_cache_block_offsets',
                     dtype=trt.int32,
-                    shape=[-1, 2, -1],
+                    shape=[num_kv_cache_pools, -1, 2, -1],
                     dim_range=OrderedDict([
+                        ('num_kv_cache_pools', [num_kv_cache_pools]),
                         ('batch_size_beam_width', [bb_range]),
                         ('kv', [2]),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
@@ -1691,17 +1701,26 @@ class DecoderModel(PretrainedModel):
                 host_kv_cache_pool_pointers = Tensor(
                     name=f'host_kv_cache_pool_pointers',
                     dtype=trt.int64,
-                    shape=[2],
+                    shape=[num_kv_cache_pools, 2],
                     dim_range=OrderedDict([
-                        ('num_pools', [2]),
+                        ('num_pools_layers', [num_kv_cache_pools]),
+                        ('num_pools_kv', [2]),
+                    ]))
+                host_kv_cache_pool_mapping = Tensor(
+                    name=f"host_kv_cache_pool_mapping",
+                    dtype=trt.int32,
+                    shape=[num_pp_layers],
+                    dim_range=OrderedDict([
+                        ('pools_mapping', [num_pp_layers]),
                     ]))
 
                 # paged blocks for cross kv
                 cross_kv_cache_block_offsets = Tensor(
                     name=f'cross_kv_cache_block_offsets',
                     dtype=trt.int32,
-                    shape=[-1, 2, -1],
+                    shape=[num_kv_cache_pools, -1, 2, -1],
                     dim_range=OrderedDict([
+                        ('num_kv_cache_pools', [num_kv_cache_pools]),
                         ('batch_size_beam_width', [bb_range]),
                         ('kv', [2]),
                         ('max_cross_blocks_per_seq',
@@ -1710,8 +1729,9 @@ class DecoderModel(PretrainedModel):
                 host_cross_kv_cache_block_offsets = Tensor(
                     name=f'host_cross_kv_cache_block_offsets',
                     dtype=trt.int32,
-                    shape=[-1, 2, -1],
+                    shape=[num_kv_cache_pools, -1, 2, -1],
                     dim_range=OrderedDict([
+                        ('num_kv_cache_pools', [num_kv_cache_pools]),
                         ('batch_size_beam_width', [bb_range]),
                         ('kv', [2]),
                         ('max_cross_blocks_per_seq',
@@ -1720,9 +1740,17 @@ class DecoderModel(PretrainedModel):
                 host_cross_kv_cache_pool_pointers = Tensor(
                     name=f'host_cross_kv_cache_pool_pointers',
                     dtype=trt.int64,
-                    shape=[2],
+                    shape=[num_kv_cache_pools, 2],
                     dim_range=OrderedDict([
+                        ('num_kv_cache_pools', [num_kv_cache_pools]),
                         ('num_pools', [2]),
+                    ]))
+                host_cross_kv_cache_pool_mapping = Tensor(
+                    name=f"host_cross_kv_cache_pool_mapping",
+                    dtype=trt.int32,
+                    shape=[num_pp_layers],
+                    dim_range=OrderedDict([
+                        ('pools_mapping', [num_pp_layers]),
                     ]))
 
                 for i in layers_range:
@@ -1737,11 +1765,14 @@ class DecoderModel(PretrainedModel):
                 kv_cache_block_offsets=kv_cache_block_offsets,
                 host_kv_cache_block_offsets=host_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
                 cross_kv_cache_block_offsets=cross_kv_cache_block_offsets,
                 host_cross_kv_cache_block_offsets=
                 host_cross_kv_cache_block_offsets,
                 host_cross_kv_cache_pool_pointers=
                 host_cross_kv_cache_pool_pointers,
+                host_cross_kv_cache_pool_mapping=
+                host_cross_kv_cache_pool_mapping,
             )
 
             attention_params = AttentionParams(

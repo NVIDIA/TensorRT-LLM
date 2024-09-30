@@ -20,6 +20,7 @@ from typing import List, Optional, Union
 import torch
 
 from .. import profiler
+from .._utils import mpi_broadcast
 from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
                         WorldConfig)
 from ..bindings import executor as trtllm
@@ -73,31 +74,30 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.lora_manager = lora_manager
 
     @classmethod
-    def from_dir(
-        cls,
-        engine_dir: str,
-        *,
-        lora_dir: Optional[str] = None,
-        rank: int = 0,
-        max_batch_size: Optional[int] = None,
-        max_input_len: Optional[int] = None,
-        max_output_len: Optional[int] = None,
-        max_beam_width: Optional[int] = None,
-        max_attention_window_size: Optional[list[int]] = None,
-        sink_token_length: Optional[int] = None,
-        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-        medusa_choices: list[list[int]] | None = None,
-        lookahead_config: list[int] | None = None,
-        debug_mode: bool = False,
-        lora_ckpt_source: str = "hf",
-        gpu_weights_percent: float = 1,
-        max_tokens_in_paged_kv_cache: int | None = None,
-        kv_cache_enable_block_reuse: bool = False,
-        enable_chunked_context: bool = False,
-        is_enc_dec: bool = False,
-        multi_block_mode: bool = True,
-        enable_context_fmha_fp32_acc: Optional[bool] = None
-    ) -> 'ModelRunnerCpp':
+    def from_dir(cls,
+                 engine_dir: str,
+                 *,
+                 lora_dir: Optional[str] = None,
+                 rank: int = 0,
+                 max_batch_size: Optional[int] = None,
+                 max_input_len: Optional[int] = None,
+                 max_output_len: Optional[int] = None,
+                 max_beam_width: Optional[int] = None,
+                 max_attention_window_size: Optional[list[int]] = None,
+                 sink_token_length: Optional[int] = None,
+                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+                 medusa_choices: list[list[int]] | None = None,
+                 lookahead_config: list[int] | None = None,
+                 debug_mode: bool = False,
+                 lora_ckpt_source: str = "hf",
+                 gpu_weights_percent: float = 1,
+                 max_tokens_in_paged_kv_cache: int | None = None,
+                 kv_cache_enable_block_reuse: bool = False,
+                 enable_chunked_context: bool = False,
+                 is_enc_dec: bool = False,
+                 multi_block_mode: bool = True,
+                 enable_context_fmha_fp32_acc: Optional[bool] = None,
+                 cuda_graph_mode: Optional[bool] = None) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -148,6 +148,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
             enable_context_fmha_fp32_acc (bool):
                 Enable FMHA runner FP32 accumulation.
+            cuda_graph_mode (bool):
+                Whether to use cuda graph for inference.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
@@ -157,6 +159,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             extended_runtime_perf_knob_config.multi_block_mode = multi_block_mode
         if enable_context_fmha_fp32_acc is not None:
             extended_runtime_perf_knob_config.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+        if cuda_graph_mode is not None:
+            extended_runtime_perf_knob_config.cuda_graph_mode = cuda_graph_mode
 
         if is_enc_dec:
             encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
@@ -268,6 +272,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             lora_manager = None
             peft_cache_config = trtllm.PeftCacheConfig()
 
+        if world_config.size > 1:
+            peft_cache_config = mpi_broadcast(peft_cache_config, 0)
+
         profiler.start('load tensorrt_llm engine')
 
         kv_cache_config = trtllm.KvCacheConfig(
@@ -313,8 +320,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             # To debug specific tensors, add tensor names in the following list
             #   if none provided, all input and output tensors will be dumped
             #   if not none, it will disable all input/output dump
-            debug_tensor_names: List[
-                str] = None  # modify this list for specific tensor dump
+            debug_tensor_names: List[str] = [
+            ]  # modify this list for specific tensor dump
             debug_config = trtllm.DebugConfig(
                 debug_input_tensors=True,
                 debug_output_tensors=True,
@@ -432,6 +439,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             stopping_criteria: Optional[StoppingCriteria] = None,
             logits_processor: Optional[LogitsProcessor] = None,
             max_new_tokens: int = 1,
+            num_return_sequences: int = 1,
             end_id: int | None = None,
             pad_id: int | None = None,
             bad_words_list: list[list[int]] | None = None,
@@ -481,6 +489,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Custom logits processors.
             return_all_generated_tokens (bool):
                 Whether the full output is returned at each streaming step
+            num_return_sequences (int):
+                The number of sequences to generate for each input. It will
+                return (batch_size * num_return_sequences) sequences in total.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -576,6 +587,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 position_ids=position_ids[i].tolist()
                 if position_ids is not None else None,
                 max_tokens=max_new_tokens,
+                num_return_sequences=num_return_sequences,
                 pad_id=pad_id,
                 end_id=end_id,
                 stop_words=stop_words,
@@ -595,18 +607,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         request_ids = self.session.enqueue_requests(requests)
         if not streaming:
-            return self._initialize_and_fill_output(request_ids, end_id,
-                                                    return_dict,
-                                                    output_sequence_lengths,
-                                                    output_log_probs,
-                                                    output_cum_log_probs,
-                                                    batch_input_ids, streaming)
+            return self._initialize_and_fill_output(
+                request_ids, end_id, return_dict, output_sequence_lengths,
+                output_log_probs, output_cum_log_probs, batch_input_ids,
+                streaming, max_new_tokens, num_return_sequences)
         else:
             return self._stream(request_ids, end_id, return_dict,
                                 output_sequence_lengths, output_log_probs,
                                 output_cum_log_probs, batch_input_ids,
                                 batch_input_ids_list, streaming,
-                                return_all_generated_tokens)
+                                return_all_generated_tokens, max_new_tokens,
+                                num_return_sequences)
 
     def _prepare_words_list(self, words_list: List[List[List[int]]],
                             batch_size: int):
@@ -655,13 +666,19 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if int(uid) >= 0 else None for uid in lora_uids
         ]
 
-    def _initialize_and_fill_output(self, request_ids, end_id, return_dict,
-                                    output_sequence_lengths, output_log_probs,
-                                    output_cum_log_probs, batch_input_ids,
-                                    streaming):
-        output_ids = [[] for _ in range(len(request_ids))]
-        for reqid_pos in range(len(request_ids)):
-            output_ids[reqid_pos] = [[] for _ in range(self.max_beam_width)]
+    def _initialize_and_fill_output(self,
+                                    request_ids,
+                                    end_id,
+                                    return_dict,
+                                    output_sequence_lengths,
+                                    output_log_probs,
+                                    output_cum_log_probs,
+                                    batch_input_ids,
+                                    streaming,
+                                    max_new_tokens: int,
+                                    num_return_sequences: int = 1):
+        output_ids = [[[] for _ in range(self.max_beam_width)]
+                      for _ in range(len(request_ids) * num_return_sequences)]
 
         multi_responses = self.session.await_responses(request_ids)
         responses = [
@@ -671,121 +688,178 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return self._fill_output(responses, output_ids, end_id, return_dict,
                                  output_sequence_lengths, output_log_probs,
                                  output_cum_log_probs, batch_input_ids, [],
-                                 streaming, request_ids, False)
+                                 streaming, request_ids, False, max_new_tokens,
+                                 num_return_sequences)
 
-    def _stream(self, request_ids, end_id, return_dict, output_sequence_lengths,
-                output_log_probs, output_cum_log_probs, batch_input_ids,
-                batch_input_ids_list, streaming, return_all_generated_tokens):
-        output_ids = [[] for _ in range(len(request_ids))]
-        for reqid_pos in range(len(request_ids)):
+    def _stream(self,
+                request_ids,
+                end_id,
+                return_dict,
+                output_sequence_lengths,
+                output_log_probs,
+                output_cum_log_probs,
+                batch_input_ids,
+                batch_input_ids_list,
+                streaming,
+                return_all_generated_tokens,
+                max_new_tokens: int,
+                num_return_sequences: int = 1):
+
+        output_ids = [[]
+                      for _ in range(len(request_ids) * num_return_sequences)]
+        for reqid_pos in range(len(request_ids) * num_return_sequences):
+            batch_idx = reqid_pos // num_return_sequences
             output_ids[reqid_pos] = [
-                copy.deepcopy(batch_input_ids_list[reqid_pos])
+                copy.deepcopy(batch_input_ids_list[batch_idx])
                 for _ in range(self.max_beam_width)
             ]
 
-        finished_reqs = 0
-        while finished_reqs < len(request_ids):
+        finished_request_ids = set()
+        while finished_request_ids != set(request_ids):
             responses = self.session.await_responses()
-
             for response in responses:
                 if response.result.is_final:
-                    finished_reqs += 1
+                    finished_request_ids.add(response.request_id)
 
             yield self._fill_output(responses, output_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
                                     batch_input_ids_list, streaming,
-                                    request_ids, return_all_generated_tokens)
+                                    request_ids, return_all_generated_tokens,
+                                    max_new_tokens, num_return_sequences)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
                      output_cum_log_probs, batch_input_ids,
                      batch_input_ids_list, streaming, request_ids,
-                     return_all_generated_tokens):
+                     return_all_generated_tokens, max_new_tokens,
+                     num_return_sequences):
         cuda_device = torch.device("cuda")
+
+        # Total number of output sequences = batch_size * num_return_sequences.
+        batch_size = len(batch_input_ids)
+        num_output_sequences = len(output_ids)
+        num_beams = len(output_ids[0])
+        assert batch_size * num_return_sequences == num_output_sequences
+
+        def req_idx(response: trtllm.Response):
+            batch_idx = request_ids.index(response.request_id)
+            seq_idx = response.result.sequence_index
+            return batch_idx * num_return_sequences + seq_idx
 
         for response in responses:
             if response.has_error():
                 raise RuntimeError(response.error_msg)
 
-            reqid_pos = request_ids.index(response.request_id)
-            for beam, output_tokens in enumerate(
-                    response.result.output_token_ids):
-                if return_all_generated_tokens:
-                    output_ids[reqid_pos][
-                        beam] = batch_input_ids_list[reqid_pos] + output_tokens
-                else:
-                    output_ids[reqid_pos][beam] += output_tokens
+            result = response.result
+            batch_idx = request_ids.index(response.request_id)
 
-        sequence_lengths = []
-        for output in output_ids:
-            sequence_lengths.append([len(a) for a in output])
+            for beam, output_tokens in enumerate(result.output_token_ids):
+                # Return shape = (batch_size * num_return_seq, beam, seq_len)
+                if return_all_generated_tokens:
+                    output_ids[req_idx(response)][beam] = (
+                        batch_input_ids_list[batch_idx] + output_tokens)
+                else:
+                    output_ids[req_idx(response)][beam] += output_tokens
+
+        if output_sequence_lengths:
+            sequence_lengths = [[len(b) for b in beam] for beam in output_ids]
 
         if streaming:
             output_ids = copy.deepcopy(output_ids)
 
-        for beam in output_ids:
-            for output_tokens in beam:
-                output_tokens += (self.max_seq_len -
-                                  len(output_tokens)) * [end_id]
-
+        # Pad by end_id tokens (batch * n, num_beams, max_seq_len).
+        for beams in output_ids:
+            for token_ids in beams:
+                token_ids += [end_id] * (self.max_seq_len - len(token_ids))
         output_ids = torch.tensor(output_ids,
                                   dtype=torch.int32,
                                   device=cuda_device)
 
         if return_dict:
             outputs = {'output_ids': output_ids}
+
+            input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
+                                         dtype=torch.int32,
+                                         device=cuda_device)
+
             if output_sequence_lengths:
                 outputs['sequence_lengths'] = torch.tensor(sequence_lengths,
                                                            dtype=torch.int32,
                                                            device=cuda_device)
             if self.gather_context_logits:
-                outputs['context_logits'] = [
-                    a.result.context_logits.cuda() for a in responses
-                    if a.result.context_logits is not None
-                ]
-                # Pad context_logits into a rectangle
-                max_input_length = max(a.shape[0]
-                                       for a in outputs['context_logits'])
-                for i, a in enumerate(outputs['context_logits']):
-                    pad_length = max_input_length - a.shape[0]
-                    outputs['context_logits'][i] = torch.nn.functional.pad(
-                        a, [0, 0, 0, pad_length])
-                outputs['context_logits'] = torch.stack(
-                    outputs['context_logits'])
+                context_logits = None
+                max_input_len = input_lengths.max()
+                for response in responses:
+                    result = response.result
+                    logits = result.context_logits
+                    if logits is None:
+                        continue
+                    input_len, vocab_size = logits.shape
+                    if context_logits is None:
+                        context_logits = torch.zeros(
+                            (num_output_sequences, max_input_len, vocab_size),
+                            dtype=logits.dtype,
+                            device=cuda_device)
+                    context_logits[req_idx(response), :input_len, :] = logits
+                assert context_logits is not None
+                outputs['context_logits'] = context_logits
+
             if self.gather_generation_logits:
-                outputs['generation_logits'] = [
-                    a.result.generation_logits.cuda() for a in responses
-                    if a.result.generation_logits is not None
-                ]
-                outputs['generation_logits'] = torch.stack(
-                    outputs['generation_logits'])
+                if not streaming:
+                    gen_shape = (num_beams, max_new_tokens, vocab_size)
+                elif streaming and return_all_generated_tokens:
+                    gen_shape = (max_new_tokens, num_beams, vocab_size)
+                else:  # streaming and not return_all_generated_tokens
+                    gen_shape = (1, num_beams, vocab_size)
+
+                gen_logits = None
+                for response in responses:
+                    # gen logits shape: (beam, seq, vocab)
+                    logits = response.result.generation_logits
+                    if logits is None:
+                        continue
+                    num_beams, seq_len, vocab_size = logits.shape
+                    if gen_logits is None:
+                        gen_logits = torch.zeros(
+                            (num_output_sequences, *gen_shape),
+                            dtype=logits.dtype,
+                            device=cuda_device)
+                    batch_idx = request_ids.index(response.request_id)
+                    seq_idx = response.result.sequence_index
+                    reqid_pos = batch_idx * num_return_sequences + seq_idx
+                    if streaming:
+                        gen_logits[reqid_pos, :seq_len, ...] = logits[0]
+                    else:
+                        gen_logits[reqid_pos, :, :seq_len, ...] = logits[0]
+                outputs['generation_logits'] = gen_logits
+
             if output_log_probs:
-                outputs['log_probs'] = [
-                    a.result.log_probs for a in responses
-                    if a.result.log_probs is not None
-                ]
-                # Pad log_probs into a rectangle
-                max_seq_len = max(
-                    len(a) for beam_list in outputs['log_probs']
-                    for a in beam_list)
-                for i, a in enumerate(outputs['log_probs']):
-                    for j, b in enumerate(a):
-                        pad_length = max_seq_len - len(b)
-                        outputs['log_probs'][i][j] = b + [0.0] * pad_length
-                outputs['log_probs'] = torch.tensor(outputs['log_probs'],
-                                                    device=cuda_device)
+                log_probs = None
+                for response in responses:
+                    if log_probs is None:
+                        # TODO: Refactor not to allocate a buffer per step.
+                        output_len = len(response.result.log_probs[0])
+                        log_probs = torch.zeros(
+                            (num_output_sequences, num_beams, output_len),
+                            dtype=torch.float32)
+                    for i, lprobs in enumerate(response.result.log_probs):
+                        log_probs[req_idx(response), i, :len(lprobs)] = \
+                            torch.tensor(lprobs)
+                assert isinstance(log_probs, torch.Tensor)
+                outputs['log_probs'] = log_probs.to(cuda_device)
+
             if output_cum_log_probs:
-                outputs['cum_log_probs'] = [
-                    a.result.cum_log_probs for a in responses
-                    if a.result.cum_log_probs is not None
-                ]
-                outputs['cum_log_probs'] = torch.tensor(
-                    outputs['cum_log_probs'], device=cuda_device)
-            input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
-                                         dtype=torch.int32,
-                                         device=cuda_device)
+                cum_log_probs = torch.zeros((num_output_sequences, num_beams),
+                                            dtype=torch.float32)
+                for response in responses:
+                    if response.result.cum_log_probs is not None:
+                        cum_log_probs[req_idx(response), :] = \
+                            torch.tensor(response.result.cum_log_probs)
+                outputs['cum_log_probs'] = cum_log_probs.to(cuda_device)
+
             outputs = self._prepare_outputs(outputs, input_lengths)
         else:
             outputs = output_ids
+
         return outputs

@@ -380,6 +380,10 @@ public:
 
     void allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const;
     void allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const;
+
+    void allgatherv(void const* sendbuf, int sendcount, MpiType sendtype, void* recvbuf,
+        std::vector<int> const& recvcounts, std::vector<int> const& displs, MpiType recvtype) const;
+
     void barrier() const;
 
     void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;

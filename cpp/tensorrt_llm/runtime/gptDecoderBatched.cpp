@@ -803,7 +803,7 @@ void GptDecoderBatched::forwardDispatch(
     }
 }
 
-GptDecoderBatched::TokenPtr GptDecoderBatched::forwardAsync(
+GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
     decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -813,7 +813,7 @@ GptDecoderBatched::TokenPtr GptDecoderBatched::forwardAsync(
     CudaEvent eventStop{};
     mRuntimeStream->record(eventStop);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_unique<decoder_batch::Token>(std::move(eventStop), input.active);
+    return std::make_unique<decoder_batch::DecoderFinishedEvent>(std::move(eventStop), input.active);
 }
 
 void GptDecoderBatched::forwardDecoder(
@@ -1019,12 +1019,12 @@ void GptDecoderBatched::forwardDecoder(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::updateFinished(decoder_batch::Token const& token)
+void GptDecoderBatched::updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     for (std::int32_t i = 0; i < mActualBatchSize; ++i)
     {
-        if (token.active[i] && !mFinished[i])
+        if (decoderFinishEvent.active[i] && !mFinished[i])
         {
             auto finishedSum = ITensor::slice(mJointDecodingOutput->finishedSum, i, 1);
             mFinished[i] = mFinished[i]
@@ -1035,25 +1035,25 @@ void GptDecoderBatched::updateFinished(decoder_batch::Token const& token)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::forwardSync(decoder_batch::Token const& token)
+void GptDecoderBatched::forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    token.event.synchronize();
+    decoderFinishEvent.event.synchronize();
 
-    updateFinished(token);
+    updateFinished(decoderFinishEvent);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::forwardSync(
-    decoder_batch::Token const& token, decoder_batch::Output& output, decoder_batch::Input const& input)
+void GptDecoderBatched::forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent,
+    decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    token.event.synchronize();
+    decoderFinishEvent.event.synchronize();
 
     forwardDispatch(output, input, ForwardType::kSYNC);
 
-    updateFinished(token);
+    updateFinished(decoderFinishEvent);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -1231,7 +1231,7 @@ void GptDecoderBatched::forwardAsync(decoder::Output& output, decoder::Input con
     batchOutput.cacheIndirection = output.cacheIndirection;
     batchOutput.sequenceLengths = output.sequenceLengths;
 
-    mForwardToken = forwardAsync(batchOutput, batchInput);
+    mDecoderFinishEvent = forwardAsync(batchOutput, batchInput);
     mBufferManager.setZero(*mFinishedSum);
     kernels::reduce(
         *mFinishedSum, *ITensor::slice(mJointDecodingOutput->finishedSum, 0, mActualBatchSize), *mRuntimeStream);
@@ -1243,7 +1243,7 @@ void GptDecoderBatched::forwardAsync(decoder::Output& output, decoder::Input con
 void GptDecoderBatched::forwardSync()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    forwardSync(*mForwardToken);
+    forwardSync(*mDecoderFinishEvent);
     // wait for mFinishedSum to be updated
     mForwardEvent.synchronize();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

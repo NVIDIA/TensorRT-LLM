@@ -91,9 +91,9 @@ private:
 };
 
 [[nodiscard]] BlockIterator getBlockBeginIt(
-    KVCacheManager const& cacheManager, LlmRequest const& request, SizeType32 beam);
+    KVCacheManager const& cacheManager, LlmRequest const& request, SizeType32 beam, SizeType32 poolIdx);
 
 [[nodiscard]] BlockIterator getBlockEndIt(
-    KVCacheManager const& cacheManager, LlmRequest const& request, SizeType32 beam);
+    KVCacheManager const& cacheManager, LlmRequest const& request, SizeType32 beam, SizeType32 poolIdx);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

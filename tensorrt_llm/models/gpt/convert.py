@@ -270,12 +270,12 @@ def get_tllm_linear_sq_weight(vals,
     results = {}
 
     def multi_query_split(data, local_dim, head_size, tp_size, cur_rank):
-        q, k, v = np.split(data, [local_dim, local_dim + head_size], axis=-1)
-        q_split = np.split(q, tp_size, axis=-1)
-        k_split = np.split(k, tp_size, axis=-1)
-        v_split = np.split(v, tp_size, axis=-1)
+        q, k, v = torch.split(data, [local_dim, head_size, head_size], dim=-1)
+        q_split = torch.split(q, q.shape[-1] // tp_size, dim=-1)
+        k_split = torch.split(k, q.shape[-1] // tp_size, dim=-1)
+        v_split = torch.split(v, q.shape[-1] // tp_size, dim=-1)
         return [
-            np.concatenate((q_split[ii], k_split[ii], v_split[ii]), axis=-1)
+            torch.concat((q_split[ii], k_split[ii], v_split[ii]), dim=-1)
             for ii in range(tp_size)
         ][cur_rank]
 
@@ -283,9 +283,9 @@ def get_tllm_linear_sq_weight(vals,
 
     if per_token:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = vals["weight.int8.col"]
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = vals["weight.int8"]
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -299,8 +299,7 @@ def get_tllm_linear_sq_weight(vals,
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix +
-                'weight'] = torch.from_numpy(cur_weights).t().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
         if smoother_value is None:
             results[last_prefix] = torch.from_numpy(
                 np.array([1.0], dtype=np.float32))
@@ -329,9 +328,8 @@ def get_tllm_linear_sq_weight(vals,
                                                      tensor_parallel,
                                                      axis=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
     else:
         if per_channel:
             original_weights = np.array(vals["weight.int8.col"])
@@ -379,17 +377,12 @@ def get_tllm_linear_sq_weight(vals,
                         tensor_parallel,
                         axis=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array([cur_per_channel_value],
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
 
-        results[last_prefix] = torch.from_numpy(
-            np.array([vals['scale_x_orig_quant']],
-                     dtype=np.float32)).contiguous()
+        results[last_prefix] = vals['scale_x_orig_quant'].contiguous()
 
-        results[prefix + 'act_scale'] = torch.from_numpy(
-            np.array([[vals["scale_y_quant_orig"]]],
-                     dtype=np.float32)).contiguous()
+        results[prefix + 'act_scale'] = vals["scale_y_quant_orig"].contiguous()
 
     if smoother_value is not None:
         cur_smoother_value = np.split(smoother_value,
@@ -479,10 +472,10 @@ def load_weights_from_hf_model(hf_model,
 
         if use_smooth_quant:
             qkv_out_dim = qkv_w.shape[0]
-            qkv_w_numpy = qkv_w.t().numpy()
+            qkv_w_t = qkv_w.t()
             if not multi_query_mode:
-                qkv_w_numpy = qkv_w_numpy.reshape(hidden_size, 3, hidden_size)
-            int8_weights = generate_int8(qkv_w_numpy,
+                qkv_w_t = qkv_w_t.reshape(hidden_size, 3, hidden_size)
+            int8_weights = generate_int8(qkv_w_t,
                                          act_range.get(f'{prefix}.attn.c_attn'),
                                          is_qkv=True,
                                          multi_query_mode=multi_query_mode)
@@ -528,17 +521,16 @@ def load_weights_from_hf_model(hf_model,
                                        plugin_weight_only_quant_type))
 
         if int8_kv_cache:
-            qkv_w_numpy = qkv_w.t().numpy()
+            qkv_w_t = qkv_w.t()
             if not multi_query_mode:
-                qkv_w_numpy = qkv_w_numpy.reshape(hidden_size, 3, hidden_size)
-            int8_weights = generate_int8(qkv_w_numpy,
+                qkv_w_t = qkv_w_t.reshape(hidden_size, 3, hidden_size)
+            int8_weights = generate_int8(qkv_w_t,
                                          act_range.get(f'{prefix}.attn.c_attn'),
                                          is_qkv=True,
                                          multi_query_mode=multi_query_mode)
             weights[
-                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.from_numpy(
-                    np.array([int8_weights['scale_y_quant_orig']],
-                             dtype=np.float32)).contiguous()
+                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = int8_weights[
+                    'scale_y_quant_orig'].contiguous()
 
         # (2) Attention Dense Linear
         if gpt_variant == 'starcoder2':
@@ -557,8 +549,8 @@ def load_weights_from_hf_model(hf_model,
             attn_dense_w = attn_dense_w.t().contiguous()  # transpose for Conv1D
 
         if use_smooth_quant:
-            attn_dense_w_numpy = attn_dense_w.t().numpy()
-            int8_weights = generate_int8(attn_dense_w_numpy,
+            attn_dense_w_t = attn_dense_w.t()
+            int8_weights = generate_int8(attn_dense_w_t,
                                          act_range.get(f'{prefix}.attn.c_proj'))
             # change it to the real smoother if dense layer is applied smooth quant
             fake_smoother_value = torch.ones([1, hidden_size],
@@ -606,8 +598,8 @@ def load_weights_from_hf_model(hf_model,
             mlp_fc_w = pad_array_up_to(mlp_fc_w, 0, mapping.tp_size)
             mlp_fc_b = pad_array_up_to(mlp_fc_b, 0, mapping.tp_size)
         if use_smooth_quant:
-            mlp_fc_w_numpy = mlp_fc_w.t().numpy()
-            int8_weights = generate_int8(mlp_fc_w_numpy,
+            mlp_fc_w_t = mlp_fc_w.t()
+            int8_weights = generate_int8(mlp_fc_w_t,
                                          act_range.get(f'{prefix}.mlp.c_fc'))
             mlp_fc_b = split(mlp_fc_b,
                              mapping.tp_rank,
@@ -681,8 +673,8 @@ def load_weights_from_hf_model(hf_model,
         if gpt_variant in ['jais']:
             mlp_proj_w = pad_array_up_to(mlp_proj_w, 1, mapping.tp_size)
         if use_smooth_quant:
-            mlp_proj_w_numpy = mlp_proj_w.t().numpy()
-            int8_weights = generate_int8(mlp_proj_w_numpy,
+            mlp_proj_w_t = mlp_proj_w.t()
+            int8_weights = generate_int8(mlp_proj_w_t,
                                          act_range.get(f'{prefix}.mlp.c_proj'))
             # change it to the real smoother if proj layer is applied smooth quant
             fake_smoother_value = torch.ones([1, 4 * hidden_size],
@@ -857,7 +849,8 @@ def quantize(hf_model_dir: str,
              output_dir: str,
              config: GPTConfig,
              device: str = 'cuda',
-             calib_dataset: str = 'cnn_dailymail'):
+             calib_dataset: str = 'cnn_dailymail',
+             trust_remote_code: bool = True):
     os.makedirs(output_dir, exist_ok=True)
     config.to_json_file(os.path.join(output_dir, 'config.json'))
 
@@ -875,14 +868,15 @@ def quantize(hf_model_dir: str,
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
-        trust_remote_code=True)
+        trust_remote_code=trust_remote_code)
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
         "TOKENIZERS_PARALLELISM", "false")
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir,
-                                              trust_remote_code=True,
-                                              use_fast=False,
-                                              padding_side='left')
+    tokenizer = AutoTokenizer.from_pretrained(
+        hf_model_dir,
+        trust_remote_code=trust_remote_code,
+        use_fast=False,
+        padding_side='left')
 
     dataset = load_calib_dataset(calib_dataset)
     act_range = capture_activation_range(hf_model, tokenizer, dataset)

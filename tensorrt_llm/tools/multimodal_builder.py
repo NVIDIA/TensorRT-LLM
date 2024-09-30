@@ -18,7 +18,6 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           Pix2StructForConditionalGeneration,
                           VisionEncoderDecoderModel)
 # isort: on
-import json
 import math
 
 import torch.nn.functional as F
@@ -731,13 +730,6 @@ def build_phi_engine(args):
                       images=raw_image,
                       return_tensors="pt")['pixel_values'].to(
                           args.device, torch.float16)
-    try:
-        with open(f"{args.model_path}/preprocessor_config.json", "r") as file:
-            config = file.read()
-            config_dict = json.loads(config)
-            num_crops = config_dict.get("num_crops")
-    except:
-        num_crops = 16
 
     class Phi3VisionWrapper(torch.nn.Module):
 
@@ -792,7 +784,8 @@ def build_phi_engine(args):
     tensors = {"glb_GN": glb_GN, "sub_GN": sub_GN}
     save_file(tensors, args.output_dir + "/image_newlines.safetensors")
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
-    build_trt_engine(
-        args.model_type, [image.shape[1], image.shape[2], image.shape[3]],
-        f'{args.output_dir}/onnx', args.output_dir,
-        args.max_batch_size * (num_crops + 1))  #TODO: Take input from config
+    num_crops = processor.image_processor.num_crops
+    build_trt_engine(args.model_type,
+                     [image.shape[1], image.shape[2], image.shape[3]],
+                     f'{args.output_dir}/onnx', args.output_dir,
+                     args.max_batch_size * (num_crops + 1))

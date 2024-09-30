@@ -80,7 +80,7 @@ class GPTBenchmark(BaseBenchmark):
 
         kv_cache_type = KVCacheType.CONTINUOUS
         if hasattr(self, 'kv_cache_type'):
-            kv_cache_type = self.kv_cache_type
+            kv_cache_type = KVCacheType(self.kv_cache_type)
         else:
             if hasattr(self, 'paged_kv_cache'):
                 kv_cache_type = KVCacheType.PAGED if self.paged_kv_cache == True else KVCacheType.CONTINUOUS

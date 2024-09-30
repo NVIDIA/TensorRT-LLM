@@ -182,8 +182,12 @@ class BaichuanForCausalLM(DecoderModelForCausalLM):
             hf_model = hf_model_or_dir
             hf_config_or_dir = hf_model.config
         else:
+            trust_remote_code = kwargs.pop('trust_remote_code', True)
+
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-                hf_model_or_dir, trust_remote_code=True, torch_dtype='auto')
+                hf_model_or_dir,
+                trust_remote_code=trust_remote_code,
+                torch_dtype='auto')
             hf_config_or_dir = hf_model_or_dir
 
         config = BaichuanConfig.from_hugging_face(hf_config_or_dir,

@@ -22,7 +22,7 @@ from tensorrt_llm import logger
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
 from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict, \
      load_calib_dataset, split_matrix_tp, get_weight_and_bias, split, smooth_gemm, \
-     generate_int8
+     generate_int8,get_weight
 # isort: on
 
 
@@ -394,8 +394,7 @@ def get_tllm_linear_sq_weight(
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix +
-                'weight'] = torch.from_numpy(cur_weights).t().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
         if smoother_value is None:
             results[last_prefix] = torch.from_numpy(
                 np.array([1.0], dtype=np.float32))
@@ -406,33 +405,26 @@ def get_tllm_linear_sq_weight(
                                              axis=cat_dim)[rank]
         else:
             cur_per_channel_value = vals["scale_w_quant_orig.col"]
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
     else:
-        original_weights = np.array(vals["weight.int8"])
+        original_weights = vals["weight.int8"]
         cur_weights = np.split(original_weights, tensor_parallel,
                                axis=cat_dim)[rank]
 
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix +
-                'weight'] = torch.from_numpy(cur_weights).t().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
 
         cur_per_channel_value = vals["scale_y_accum_quant"]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array([cur_per_channel_value],
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
 
-        results[last_prefix] = torch.from_numpy(
-            np.array([vals['scale_x_orig_quant']],
-                     dtype=np.float32)).contiguous()
+        results[last_prefix] = vals['scale_x_orig_quant'].contiguous()
 
-        results[prefix + 'act_scale'] = torch.from_numpy(
-            np.array([[vals["scale_y_quant_orig"]]],
-                     dtype=np.float32)).contiguous()
+        results[prefix + 'act_scale'] = vals["scale_y_quant_orig"].contiguous()
 
     if smoother_value is not None:
         cur_smoother_value = np.split(smoother_value,

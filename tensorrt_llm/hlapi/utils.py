@@ -201,6 +201,24 @@ class SamplingParams:
                     "please call the setup method.")
             return words + self._stop_word_ids
 
+    def _get_stop_reasons_and_words(
+            self) -> List[Tuple[Union[str, int], List[int]]]:
+        stop_reasons = []
+        if self.stop_token_ids is not None:
+            stop_reasons.extend(self.stop_token_ids)
+        if self.stop is not None:
+            if isinstance(self.stop, str):
+                stop_reasons.append(self.stop)
+            else:
+                stop_reasons.extend(self.stop)
+        stop_words = self._get_stop_words()
+        if len(stop_reasons) != len(stop_words):
+            raise RuntimeError(
+                f"The number of {self.__class__.__name__}.stop_token_ids ({self.stop_token_ids}) "
+                f"and {self.__class__.__name__}.stop ({self.stop}) are inconsistent with the "
+                f"processed stop_words ({stop_words}).")
+        return list(zip(stop_reasons, stop_words))
+
     def _get_sampling_config(self) -> tllme.SamplingConfig:
         expected_fields = [
             "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
@@ -407,6 +425,18 @@ def set_docstring(docstring: str):
     return decorator
 
 
+def get_directory_size_in_gb(directory: Path) -> float:
+    """ Get the size of the directory. """
+    if not (directory.is_dir() and directory.exists()):
+        raise ValueError(f"{directory} is not a directory.")
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(directory):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            total_size += os.path.getsize(fp)
+    return total_size / 1024**3  # GB
+
+
 class ManagedThread(threading.Thread):
     """ A thread that will put exceptions into an external queue if the task fails.
 
@@ -420,8 +450,12 @@ class ManagedThread(threading.Thread):
         **kwargs: The arguments to pass to the task
     """
 
-    def __init__(self, task: Callable[..., bool], error_queue: Queue, **kwargs):
-        super().__init__()
+    def __init__(self,
+                 task: Callable[..., bool],
+                 error_queue: Queue,
+                 name: Optional[str] = None,
+                 **kwargs):
+        super().__init__(name=name)
         self.task = task
         self.error_queue = error_queue
         self.kwargs = kwargs
@@ -437,7 +471,8 @@ class ManagedThread(threading.Thread):
             except Exception as e:
                 logger.error(f"Error in thread {self.name}: {e}")
                 self.error_queue.put(e)
-                break
+
+        logger.info(f"Thread {self.name} stopped.")
 
     def stop(self):
         self.stop_event.set()

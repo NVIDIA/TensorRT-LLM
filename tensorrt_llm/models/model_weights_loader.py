@@ -8,16 +8,17 @@ from typing import Callable, List
 import torch
 from safetensors import safe_open
 from tqdm import tqdm
-
-from tensorrt_llm.layers.moe import MOEWeightWrapper
-from tensorrt_llm.quantization.layers import (
-    WeightOnlyGroupwiseQuantColumnLinear, WeightOnlyGroupwiseQuantRowLinear)
+from transformers import PreTrainedModel
 
 from .._utils import trt_dtype_to_torch
+from ..layers.moe import MOEWeightWrapper
 from ..logger import logger
+from ..quantization.layers import (WeightOnlyGroupwiseQuantColumnLinear,
+                                   WeightOnlyGroupwiseQuantRowLinear)
 
 
 class ModelWeightsFormat(Enum):
+    IN_MEMORY = "in_mem"
     SAFETENSORS = "safetensors"
     BINARY = "bin"
     PYTORCH = "pth"
@@ -136,9 +137,13 @@ class ModelWeightsLoader:
             else:
                 raise NotImplementedError(
                     "Only safetensors/pickle/binary directories are supported.")
+        elif isinstance(self.model_dir, dict) or isinstance(
+                self.model_dir, PreTrainedModel):
+            self.format = ModelWeightsFormat.IN_MEMORY
         else:
             raise NotImplementedError(
-                "args.model_dir is Neither a directory nor a file!")
+                "args.model_dir is not a directory, a file or an in-memory module!"
+            )
 
     def preload(self):
         # Initialize shards and load_func
@@ -146,9 +151,14 @@ class ModelWeightsLoader:
             shard_files = glob.glob(self.model_dir + "/*." + self.format.value)
         elif os.path.isfile(self.model_dir):
             shard_files = [self.model_dir]
+        elif isinstance(self.model_dir, dict):
+            shard_files = [self.model_dir]
+        elif isinstance(self.model_dir, PreTrainedModel):
+            shard_files = [dict(self.model_dir.named_parameters())]
         else:
             raise NotImplementedError(
-                "args.model_dir is Neither a directory nor a file!")
+                "args.model_dir is not a directory, a file or an in-memory module!"
+            )
         shard_files.sort()
         if self.format == ModelWeightsFormat.SAFETENSORS:
             self.shards = [
@@ -159,6 +169,8 @@ class ModelWeightsLoader:
                 torch.load(f, weights_only=True, map_location="cpu", mmap=True)
                 for f in shard_files
             ]
+        elif self.format == ModelWeightsFormat.IN_MEMORY:
+            self.shards = [shard_files[0]]
         else:
             raise NotImplementedError(
                 "Only *.safetensors/*.pth/*.bin files are supported.")
@@ -178,7 +190,7 @@ class ModelWeightsLoader:
             if tensor_shape == []:
                 tensor = self.shards[ptr_idx].get_tensor(key).unsqueeze(0)
                 tensor_shape = tensor.shape
-        elif self.format == ModelWeightsFormat.BINARY or self.format == ModelWeightsFormat.PYTORCH:
+        else:
             tensor = self.shards[ptr_idx][key]
             tensor_shape = tensor.shape
 
@@ -235,10 +247,15 @@ class ModelWeightsLoader:
         tp_dim = sub_module.tp_dim if hasattr(sub_module, "tp_dim") else -1
         require_weight_transpose = (
             isinstance(sub_module, WeightOnlyGroupwiseQuantColumnLinear)
-            or isinstance(sub_module, WeightOnlyGroupwiseQuantRowLinear)
-        ) and tllm_key.endswith("weight")
+            or isinstance(sub_module, WeightOnlyGroupwiseQuantRowLinear))
         if tp_dim >= 0 and require_weight_transpose:
-            tp_dim = 1 - tp_dim
+            if sub_module.prequant_scaling_factor is not None:
+                if tllm_key.endswith("prequant_scaling_factor"):
+                    tp_dim = 1 - tp_dim
+                elif tllm_key.endswith("weights_scaling_factor"):
+                    tp_dim = -1
+            elif tllm_key.endswith("weight"):
+                tp_dim = 1 - tp_dim
         tp_size = sub_module.tp_size if hasattr(sub_module, "tp_size") else 1
         if skip_tp:
             tp_dim = -1

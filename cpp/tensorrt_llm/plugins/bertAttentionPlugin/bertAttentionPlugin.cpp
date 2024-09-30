@@ -423,6 +423,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 request_seq_len, mNumHeads, mHeadSize, padding_offset, (float*) nullptr, 0, stream);
         }
     }
+    sync_check_cuda_error();
     return 0;
 }
 

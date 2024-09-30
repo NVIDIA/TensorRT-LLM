@@ -63,14 +63,14 @@ def main():
         engine.save(engine_dir)
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
-    executor = GenerationExecutor.create(engine_dir)
-    sampling_params = SamplingParams(max_tokens=5)
+    with GenerationExecutor.create(engine_dir) as executor:
+        sampling_params = SamplingParams(max_tokens=5)
 
-    input_str = "What should you say when someone gives you a gift? You should say:"
-    output = executor.generate(tokenizer.encode(input_str),
-                               sampling_params=sampling_params)
-    output_str = tokenizer.decode(output.outputs[0].token_ids)
-    print(f"{input_str} {output_str}")
+        input_str = "What should you say when someone gives you a gift? You should say:"
+        output = executor.generate(tokenizer.encode(input_str),
+                                   sampling_params=sampling_params)
+        output_str = tokenizer.decode(output.outputs[0].token_ids)
+        print(f"{input_str} {output_str}")
 
 
 if __name__ == "__main__":

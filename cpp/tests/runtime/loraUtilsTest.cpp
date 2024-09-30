@@ -86,7 +86,7 @@ TEST_F(LoraUtilsTest, dims_mem_type)
 
 TEST_F(LoraUtilsTest, loraValidateRequestTensors)
 {
-    auto modelConfig = ModelConfig(0, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
     auto worldConfig = WorldConfig();
 
     std::optional<TensorPtr> optReqLoraWeights

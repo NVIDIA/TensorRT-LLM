@@ -219,8 +219,13 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
     // tokens, when enabling cyclic kv cache.
     auto const useOneMoreBlock = maxBeamWidth > 1 && maxSequenceLength > maxAttentionWindow;
 
-    auto const localNbLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
-    auto const nbKvHeads = mModelConfig.getNbKvHeads();
+    auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
+        mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    TLLM_CHECK_WITH_INFO(std::all_of(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd,
+                             [firstNumKvHeads = *numKvHeadsPerLayerBegin](SizeType32 numKvHeads)
+                             { return numKvHeads == firstNumKvHeads; }),
+        "Deprecated session API does not support multiple cache pools, use the newer executor API instead");
+
     auto const sizePerHead = mModelConfig.getSizePerHead();
     bool constexpr enableBlockReuse{false};
     bool enableDiffMaxAttenWin = false;
@@ -235,7 +240,8 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1 || !enableDiffMaxAttenWin,
         "Can't support layer-wise max_attention_window with beam search. Please use a unified max_attention_window for "
         "all layers.");
-    mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(localNbLayers, nbKvHeads, sizePerHead, tokensPerBlock,
+    mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(
+        std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd), sizePerHead, tokensPerBlock,
         blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength,
         useOneMoreBlock, mRuntime->getStreamPtr(), enableBlockReuse, kvCacheConfig.onboardBlocks);
 
@@ -253,6 +259,7 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
     for (auto& buffers : mBuffers)
     {
         buffers->transformerBuffers->setKvPoolPointers(mKvCacheManager.get());
+        buffers->transformerBuffers->setKvPoolMapping(mKvCacheManager.get());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

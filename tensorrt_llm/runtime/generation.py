@@ -16,6 +16,7 @@
 import copy
 import math
 import platform
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import reduce, wraps
 from pathlib import Path
@@ -29,6 +30,10 @@ import tensorrt as trt
 # isort: on
 from cuda import cudart
 
+from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
+    MemoryPoolsAllocator
+from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
+    PoolsKVCacheManager
 from tensorrt_llm.runtime.redrafter_utils import *
 
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
@@ -39,7 +44,7 @@ from ..lora_manager import LoraManager
 from ..mapping import Mapping
 from ..plugin.plugin import CustomAllReduceHelper
 from ..quantization import QuantMode
-from .kv_cache_manager import GenerationSequence, KVCacheManager, KVCacheUpdater
+from .kv_cache_manager import GenerationSequence, KVCacheUpdater
 from .session import _scoped_stream
 
 
@@ -809,10 +814,12 @@ class GenerationSession(object):
             expected_tensor_names += [f'kv_cache_block_offsets']
             expected_tensor_names += [f'host_kv_cache_block_offsets']
             expected_tensor_names += [f'host_kv_cache_pool_pointers']
+            expected_tensor_names += [f'host_kv_cache_pool_mapping']
             if self.cross_attention:
                 expected_tensor_names += [f'cross_kv_cache_block_offsets']
                 expected_tensor_names += [f'host_cross_kv_cache_block_offsets']
                 expected_tensor_names += [f'host_cross_kv_cache_pool_pointers']
+                expected_tensor_names += [f'host_cross_kv_cache_pool_mapping']
         else:
             # Refer to gpt_attention() inside functional.py
             if self.use_kv_cache and not self.paged_kv_cache:
@@ -1695,40 +1702,42 @@ class GenerationSession(object):
                 num_blocks, _ = self._get_num_paged_blocks(
                     self.max_attention_window_size, self.sink_token_length,
                     self.use_one_more_block)
-                cache_shape = (
-                    num_blocks,
-                    self.num_attn_layers,
-                    2,
-                    self.get_num_heads_kv(),
-                    self.tokens_per_block,
-                    self.head_size,
-                )
-                self.kv_cache_pool = torch.empty(cache_shape,
-                                                 dtype=kv_cache_type,
-                                                 device=self.device)
+                self._memory_pool_allocator = MemoryPoolsAllocator(
+                    num_blocks=num_blocks,
+                    tokens_per_block=self.tokens_per_block,
+                    head_size=self.head_size)
+                if self._model_config.num_kv_heads_per_layer is None:
+                    num_kv_heads_per_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
+                        self.get_num_heads_kv(), self.num_attn_layers)
+                else:
+                    num_kv_heads_per_layer = self._model_config.num_kv_heads_per_layer
+
+                self._memory_pool_allocator.allocate(kv_cache_type,
+                                                     num_kv_heads_per_layer)
+
                 if self.cross_attention:  # As for now we enable cross paged kv and self paged kv to share the same tokens_per_block
                     cross_num_blocks, _ = self._get_num_paged_blocks(
                         self.encoder_max_input_length,
                         sink_token_length=0,
                         use_one_more_block=False)
-                    cross_cache_shape = (
-                        cross_num_blocks,
-                        self.num_layers,
-                        2,
-                        self.get_num_heads_kv(),
-                        self.tokens_per_block,
-                        self.head_size,
-                    )
-                    self.cross_kv_cache_pool = torch.empty(cross_cache_shape,
-                                                           dtype=kv_cache_type,
-                                                           device=self.device)
+
+                    num_kv_heads_per_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
+                        self.get_num_heads_kv(), self.num_layers)
+
+                    self._cross_memory_pool_allocator = MemoryPoolsAllocator(
+                        num_blocks=cross_num_blocks,
+                        tokens_per_block=self.tokens_per_block,
+                        head_size=self.head_size)
+                    self._cross_memory_pool_allocator.allocate(
+                        kv_cache_type, num_kv_heads_per_layer)
+
             elif self.has_attn_layers:
                 for i in range(self.first_layer, self.last_layer):
                     if self.layer_types[i] == 'attention':
                         cache_shape = (
                             batch_size,
                             2,
-                            self.get_num_heads_kv(self.general_to_attn_idx[i]),
+                            self.get_num_heads_kv(i),
                             self.max_attention_window_size,
                             self.head_size,
                         )
@@ -1843,6 +1852,43 @@ class GenerationSession(object):
         self.buffer_allocated = True
         if self.is_medusa_mode:
             return self.num_draft_tokens
+
+    def _allocate_empty_kv_cache_pools(self, kv_cache_type, num_blocks):
+        # Layers are homogeneous, use old kv cache shape
+        unique_cache_pools = []
+        if self._model_config.num_kv_heads_per_layer is None:
+            cache_shape = (
+                num_blocks,
+                self.num_attn_layers,
+                2,
+                self.get_num_heads_kv(),
+                self.tokens_per_block,
+                self.head_size,
+            )
+            unique_cache_pools.append(
+                torch.empty(cache_shape,
+                            dtype=kv_cache_type,
+                            device=self.device))
+
+        # Layers are not homogeneous, use new kv cache shape
+        else:
+            kv_heads_unique_counter = Counter(
+                self._model_config.num_kv_heads_per_layer)
+            for kv_head, num_layers in kv_heads_unique_counter.items():
+                cache_shape = (
+                    num_blocks,
+                    num_layers,
+                    2,
+                    kv_head,
+                    self.tokens_per_block,
+                    self.head_size,
+                )
+                unique_cache_pools.append(
+                    torch.empty(cache_shape,
+                                dtype=kv_cache_type,
+                                device=self.device))
+
+        return unique_cache_pools
 
     def _get_context_shape_buffer(
         self,
@@ -1962,17 +2008,20 @@ class GenerationSession(object):
         if self.paged_kv_cache and self.has_attn_layers:
             buffer = kv_cache_block_offsets.contiguous()
             shape = kv_cache_block_offsets.shape
-            shape = [shape[0] * shape[1], *shape[2:]]
+            shape = [shape[0], shape[1] * shape[2], *shape[3:]]
             add_tensor_with_shape(buffer, f'kv_cache_block_offsets', shape)
             add_tensor_with_shape(host_kv_cache_block_offsets,
                                   f'host_kv_cache_block_offsets', shape)
             pool_pointers = f'host_kv_cache_pool_pointers'
+            pool_mapping = f'host_kv_cache_pool_mapping'
             add_tensor(self.buffer[pool_pointers], pool_pointers)
+            add_tensor(self.buffer[pool_mapping], pool_mapping)
             if self.cross_attention:
                 cross_buffer = cross_kv_cache_block_offsets.contiguous()
                 cross_shape = cross_kv_cache_block_offsets.shape
                 cross_shape = [
-                    cross_shape[0] * cross_shape[1], *cross_shape[2:]
+                    cross_shape[0], cross_shape[1] * cross_shape[2],
+                    *cross_shape[3:]
                 ]
                 add_tensor_with_shape(cross_buffer,
                                       f'cross_kv_cache_block_offsets',
@@ -1981,8 +2030,10 @@ class GenerationSession(object):
                                       f'host_cross_kv_cache_block_offsets',
                                       cross_shape)
                 cross_pool_pointers = f'host_cross_kv_cache_pool_pointers'
+                cross_pool_mapping = f'host_cross_kv_cache_pool_mapping'
                 add_tensor(self.buffer[cross_pool_pointers],
                            cross_pool_pointers)
+                add_tensor(self.buffer[cross_pool_mapping], cross_pool_mapping)
 
         batch_size = context_lengths.shape[0]
         if self.use_kv_cache and not self.paged_kv_cache:
@@ -2245,17 +2296,20 @@ class GenerationSession(object):
 
         if self.paged_kv_cache and self.has_attn_layers:
             shape = kv_cache_block_offsets.shape
-            shape = [shape[0] * shape[1], *shape[2:]]
+            shape = [shape[0], shape[1] * shape[2], *shape[3:]]
             add_tensor_with_shape(kv_cache_block_offsets,
                                   f'kv_cache_block_offsets', shape)
             add_tensor_with_shape(host_kv_cache_block_offsets,
                                   f'host_kv_cache_block_offsets', shape)
             pool_pointers = f'host_kv_cache_pool_pointers'
+            pool_mapping = f'host_kv_cache_pool_mapping'
             add_tensor(self.buffer[pool_pointers], pool_pointers)
+            add_tensor(self.buffer[pool_mapping], pool_mapping)
             if self.cross_attention:
                 cross_shape = cross_kv_cache_block_offsets.shape
                 cross_shape = [
-                    cross_shape[0] * cross_shape[1], *cross_shape[2:]
+                    cross_shape[0], cross_shape[1] * cross_shape[2],
+                    *cross_shape[3:]
                 ]
                 add_tensor_with_shape(cross_kv_cache_block_offsets,
                                       f'cross_kv_cache_block_offsets',
@@ -2264,8 +2318,10 @@ class GenerationSession(object):
                                       f'host_cross_kv_cache_block_offsets',
                                       cross_shape)
                 cross_pool_pointers = f'host_cross_kv_cache_pool_pointers'
+                cross_pool_mapping = f'host_cross_kv_cache_pool_mapping'
                 add_tensor(self.buffer[cross_pool_pointers],
                            cross_pool_pointers)
+                add_tensor(self.buffer[cross_pool_mapping], cross_pool_mapping)
 
         if prompt_embedding_table is not None:
             add_tensor(prompt_embedding_table, 'prompt_embedding_table')
@@ -3054,11 +3110,11 @@ class GenerationSession(object):
                 'host_runtime_perf_knobs', None)
 
             if self.paged_kv_cache and self.has_attn_layers:
-                host_kv_cache_block_offsets = self.kv_cache_manager.get_block_offsets(
+                host_kv_cache_block_offsets = self.pools_kv_cache_manager.get_block_offsets(
                     beam_width=1)
                 kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
                 if self.cross_attention:
-                    host_cross_kv_cache_block_offsets = self.cross_kv_cache_manager.get_block_offsets(
+                    host_cross_kv_cache_block_offsets = self.cross_pools_kv_cache_manager.get_block_offsets(
                         beam_width=1)
                     cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets.to(
                         'cuda')
@@ -3235,7 +3291,7 @@ class GenerationSession(object):
                                            self.accept_lengths).item()
                     assert add_token_count > 0
                     for _ in range(add_token_count):
-                        self.kv_cache_manager.step([False] * batch_size)
+                        self.pools_kv_cache_manager.step([False] * batch_size)
                 if self.is_medusa_mode and self.num_draft_tokens > 0:
                     # Allocate kv cache token slots for next step.
                     # Make sure there are always > (num_draft_tokens + 1) free token slots.
@@ -3245,16 +3301,16 @@ class GenerationSession(object):
                                            self.accept_lengths).item()
                     assert add_token_count > 0
                     for _ in range(add_token_count):
-                        self.kv_cache_manager.step([False] * batch_size)
+                        self.pools_kv_cache_manager.step([False] * batch_size)
                 else:
-                    self.kv_cache_manager.step([False] * batch_size)
+                    self.pools_kv_cache_manager.step([False] * batch_size)
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("paged_kv_post_alloc")
-                host_kv_cache_block_offsets = self.kv_cache_manager.get_block_offsets(
+                host_kv_cache_block_offsets = self.pools_kv_cache_manager.get_block_offsets(
                     beam_width)
                 kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
                 if self.cross_attention:
-                    host_cross_kv_cache_block_offsets = self.cross_kv_cache_manager.get_block_offsets(
+                    host_cross_kv_cache_block_offsets = self.cross_pools_kv_cache_manager.get_block_offsets(
                         beam_width)
                     cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets.to(
                         'cuda')
@@ -3385,9 +3441,9 @@ class GenerationSession(object):
                                                      and should_stop.item()):
                 # Free all blocks in all sequences.
                 # With in-flight batching and while loop we'll free some sequences, when they are done
-                self.kv_cache_manager.step([True] * batch_size)
+                self.pools_kv_cache_manager.step([True] * batch_size)
                 if self.cross_attention:
-                    self.cross_kv_cache_manager.step([True] * batch_size)
+                    self.cross_pools_kv_cache_manager.step([True] * batch_size)
 
         if self.debug_mode:
             self.dump_debug_buffers(step)
@@ -3763,21 +3819,23 @@ class GenerationSession(object):
             num_blocks, max_blocks_per_seq = self._get_num_paged_blocks(
                 self.max_attention_window_size, self.sink_token_length,
                 self.use_one_more_block)
-            self.buffer[f'host_kv_cache_pool_pointers'] = torch.tensor(
-                [self.kv_cache_pool.data_ptr(), 0], dtype=torch.int64)
 
-            block_size = self.get_num_heads_kv(
-            ) * self.tokens_per_block * self.head_size
-            self.kv_cache_manager = KVCacheManager(
-                num_layers=self.num_attn_layers,
-                num_blocks=num_blocks,
-                block_size=block_size,
-                tokens_per_block=self.tokens_per_block,
-                max_blocks_per_seq=max_blocks_per_seq,
+            self.buffer[
+                f'host_kv_cache_pool_pointers'] = self._memory_pool_allocator.get_kv_cache_pool_pointers(
+                )
+            self.buffer[
+                f'host_kv_cache_pool_mapping'] = self._memory_pool_allocator.pool_mapping
+
+            self.pools_kv_cache_manager = PoolsKVCacheManager(
+                self._memory_pool_allocator.pools_metadata,
+                max_blocks_per_seq,
+                num_blocks,
+                self.tokens_per_block,
+                self.head_size,
                 max_attention_window_size=self.max_attention_window_size,
-                sink_token_len=self.sink_token_length,
                 beam_width=beam_width,
-                use_one_more_block=self.use_one_more_block)
+                use_one_more_block=self.use_one_more_block,
+                sink_token_len=self.sink_token_length)
 
             if self.cross_attention:
                 cross_num_blocks, max_cross_blocks_per_seq = self._get_num_paged_blocks(
@@ -3785,33 +3843,32 @@ class GenerationSession(object):
                     sink_token_length=0,
                     use_one_more_block=False)
                 self.buffer[
-                    f'host_cross_kv_cache_pool_pointers'] = torch.tensor(
-                        [self.cross_kv_cache_pool.data_ptr(), 0],
-                        dtype=torch.int64)
+                    f'host_cross_kv_cache_pool_pointers'] = self._cross_memory_pool_allocator.get_kv_cache_pool_pointers(
+                    )
+                self.buffer[
+                    f'host_cross_kv_cache_pool_mapping'] = self._cross_memory_pool_allocator.pool_mapping
 
-                cross_block_size = self.get_num_heads_kv(
-                ) * self.tokens_per_block * self.head_size
-                self.cross_kv_cache_manager = KVCacheManager(
-                    num_layers=self.num_layers,
-                    num_blocks=cross_num_blocks,
-                    block_size=cross_block_size,
-                    tokens_per_block=self.tokens_per_block,
-                    max_blocks_per_seq=max_cross_blocks_per_seq,
+                self.cross_pools_kv_cache_manager = PoolsKVCacheManager(
+                    self._memory_pool_allocator.pools_metadata,
+                    max_cross_blocks_per_seq,
+                    cross_num_blocks,
+                    self.tokens_per_block,
+                    self.head_size,
                     max_attention_window_size=self.encoder_max_input_length,
-                    sink_token_len=self.sink_token_length,
                     beam_width=beam_width,
-                    use_one_more_block=False)
+                    use_one_more_block=False,
+                    sink_token_len=self.sink_token_length)
 
             # Add sequences to the manager
             for bi in range(batch_size):
                 generation_sequence = GenerationSequence(seq_idx=bi,
                                                          batch_idx=bi)
-                self.kv_cache_manager.add_sequence(generation_sequence,
-                                                   max_context_length)
+                self.pools_kv_cache_manager.add_sequence(
+                    generation_sequence, max_context_length)
                 if self.cross_attention:
                     cross_generation_sequence = GenerationSequence(seq_idx=bi,
                                                                    batch_idx=bi)
-                    self.cross_kv_cache_manager.add_sequence(
+                    self.cross_pools_kv_cache_manager.add_sequence(
                         cross_generation_sequence,
                         self.encoder_max_input_length,
                         always_share_across_beam=True)
@@ -3833,7 +3890,7 @@ class GenerationSession(object):
             if self.paged_kv_cache:
                 self.kv_cache_updater.init_paged_kv_cache(
                     self.num_layers, self.get_num_heads_kv(), self.head_size,
-                    kv_cache_type, self.kv_cache_manager,
+                    kv_cache_type, self.pools_kv_cache_manager,
                     self.buffer[f'host_kv_cache_pool_pointers'])
             else:
                 past_key_value_list = [

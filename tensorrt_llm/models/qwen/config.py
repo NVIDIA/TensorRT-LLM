@@ -73,6 +73,7 @@ class QWenConfig(PretrainedConfig):
                           quant_config: Optional[QuantConfig] = None,
                           **kwargs) -> "QWenConfig":
         import transformers
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
@@ -80,7 +81,7 @@ class QWenConfig(PretrainedConfig):
             hf_config_dir = str(hf_config_or_dir)
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
 
         qwen_type = hf_config.model_type
         valid_types = ('qwen', 'qwen2', 'qwen2_moe')

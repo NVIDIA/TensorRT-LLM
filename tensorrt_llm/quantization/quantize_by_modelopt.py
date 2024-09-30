@@ -31,6 +31,7 @@ from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from .._utils import release_gc
 from ..logger import logger
 from ..mapping import Mapping
 from .mode import QuantAlgo
@@ -123,7 +124,9 @@ MODEL_NAME_PATTERN_MAP = {
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
+    "GPTBigCodeForCausalLM": "gptnext",
     "GLM": "glm",
+    "DeciLMForCausalLM": "deci",
 }
 
 
@@ -542,9 +545,6 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
-        torch.cuda.empty_cache(
-        )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
-
         # Workaround for combining medusa head
         # TODO: move these integration into modelopt to avoid redundant reading and writing
         if medusa_model_dir is not None:
@@ -556,6 +556,12 @@ def quantize_and_export(*,
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
                 export_path, end_time - start_time))
+
+        # Need to delete the model and release memory explicitly;
+        # otherwise torch may retain its GPU memory until a delayed GC running,
+        # which reduces the available GPU memory for subsequent stages.
+        del model
+        release_gc()
 
 
 def unwrap_model(model, module_instances=None):
@@ -823,11 +829,15 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         inference_pipeline_parallel=pp_size,
     )
 
-    torch.cuda.empty_cache(
-    )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
     end_time = time.time()
     print_rank_0(
         f"Model config exported to: {output_dir}. Total time used {end_time - start_time}s"
     )
     if torch.distributed.get_rank() == 0:
         save_artifacts(model, output_dir, use_abspath=True)
+
+    # Need to delete the model and release memory explicitly;
+    # otherwise torch may retain its GPU memory until a delayed GC running,
+    # which reduces the available GPU memory for subsequent stages.
+    del model
+    release_gc()

@@ -59,7 +59,7 @@ class LoraManagerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-t
 {
 protected:
     LoraManagerTest()
-        : mModelConfig(1, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT)
+        : mModelConfig(1, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT)
     {
     }
 
@@ -70,7 +70,7 @@ protected:
 
         mWorldConfig = WorldConfig(2);
 
-        mModelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2));
+        mModelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2, 0));
     }
 
     std::unique_ptr<BufferManager> mManager;
@@ -80,7 +80,7 @@ protected:
 
     PeftTable getPeftTable(SizeType32 tpRank = 0)
     {
-        auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+        auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         modelConfig.setMlpHiddenSize(32);
         auto worldConfig = WorldConfig(2, 2, 3);
         std::vector<LoraModule> modules{
@@ -292,7 +292,7 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
 TEST_F(LoraManagerTest, fillInputTensors)
 {
     LoraManager loraManager;
-    auto modelConfig = ModelConfig(0, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(1, 1, 0);
     std::vector<LoraModule> modules{

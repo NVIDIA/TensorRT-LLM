@@ -38,7 +38,7 @@ def run_chat(args: argparse.Namespace):
         api_key="tensorrt_llm",
     )
     prompt = args.prompt if args.prompt else "Where is New York?"
-    completion = client.chat.completions.create(
+    chat_completion = client.chat.completions.create(
         model="llama-v3-8b-instruct-hf",
         messages=[{
             "role": "user",
@@ -46,8 +46,10 @@ def run_chat(args: argparse.Namespace):
         }],
         top_p=args.top_p,
         temperature=args.temperature,
+        max_tokens=args.max_tokens,
         stream=args.stream,
         n=args.n,
+        logprobs=args.return_logprobs,
         extra_body={
             "top_k": args.top_k,
             "use_beam_search": args.use_beam_search,
@@ -55,11 +57,11 @@ def run_chat(args: argparse.Namespace):
         },
     )
     if args.stream:
-        for chunk in completion:
+        for chunk in chat_completion:
             print(chunk)
     else:
-        for choice in completion.choices:
-            print(choice.message)
+        for choice in chat_completion.choices:
+            print(choice)
 
 
 if __name__ == "__main__":
@@ -78,6 +80,7 @@ if __name__ == "__main__":
                         choices=["chat", "completions"],
                         default="chat")
     parser.add_argument("--prompt", type=str, default=None)
+    parser.add_argument("--return_logprobs", action="store_true", default=False)
     args = parser.parse_args()
     if args.api == "chat":
         run_chat(args)

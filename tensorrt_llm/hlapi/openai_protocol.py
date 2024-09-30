@@ -479,6 +479,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             stop_token_ids=self.stop_token_ids,
             stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            return_log_probs=self.logprobs,
         )
         if self.min_p > 0:
             sampling_params.top_p_min = self.min_p
@@ -517,8 +518,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if "top_logprobs" in data or "logprobs" in data:
-            raise ValueError("returning log probs is not supported")
+        top_logprobs = data.get("top_logprobs")
+        if top_logprobs is not None and top_logprobs > 0:
+            raise ValueError("top_logprobs is not supported")
         return data
 
     @model_validator(mode="before")

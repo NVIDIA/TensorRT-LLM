@@ -60,6 +60,9 @@ public:
     {
         kATTENTION,
         kRECURRENT,
+        // NOTE: Linear and noop are attention alternatives introduced in Nemotron-NAS. They do not use the KV cache.
+        kLINEAR,
+        kNOOP,
     };
 
     enum class KVCacheType : std::int32_t
@@ -97,13 +100,13 @@ public:
         kEnabled,
     };
 
-    explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbAttentionLayers, SizeType32 nbRnnLayers, SizeType32 nbHeads,
-        SizeType32 hiddenSize, nvinfer1::DataType dtype)
+    explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbLayers, SizeType32 nbAttentionLayers,
+        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
+        , mNbLayers(nbLayers)
         , mNbAttentionLayers(nbAttentionLayers)
         , mNbRnnLayers(nbRnnLayers)
         , mNbHeads(nbHeads)
-        , mNbKvHeads(nbHeads)
         , mHiddenSize(hiddenSize)
         , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
@@ -134,6 +137,10 @@ public:
         , mUseShapeInference(true)
         , mManageWeightsType(ManageWeightsType::kDisabled)
     {
+        TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
+            "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
+            mNbAttentionLayers, mNbRnnLayers);
+        setNbKvHeads(mNbHeads);
     }
 
     [[nodiscard]] static std::vector<SizeType32> getOptProfilesSplitPoints() noexcept
@@ -151,14 +158,55 @@ public:
         return (mVocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
-    [[nodiscard]] SizeType32 constexpr getNbAttentionLayers(SizeType32 pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 countLocalLayers(
+        LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        return mNbAttentionLayers / pipelineParallelism;
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+        auto const firstLocalLayerIt = mLayerTypes.cbegin() + (numLocalLayers * pipelineParallelismRank);
+        return std::count(firstLocalLayerIt, firstLocalLayerIt + numLocalLayers, layerType);
     }
 
-    [[nodiscard]] SizeType32 constexpr getNbRnnLayers(SizeType32 pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 countLowerRankLayers(
+        LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        return mNbRnnLayers / pipelineParallelism;
+        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+        auto const firstLocalLayer = numLocalLayers * pipelineParallelismRank;
+        // count number of previous non-local attention layers
+        return std::count(mLayerTypes.cbegin(), mLayerTypes.cbegin() + firstLocalLayer, layerType);
+    }
+
+    [[nodiscard]] SizeType32 getNbLayers(SizeType32 pipelineParallelism = 1) const
+    {
+        return mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+    }
+
+    [[nodiscard]] SizeType32 getNbAttentionLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        // TODO(oargov): get rid of this invalid state
+        if (mLayerTypes.empty())
+        {
+            // this assumption might be wrong in a few cases, for example:
+            // layer types: [attention, recurrent, recurrent], pp=2 ==> first rank has 1 attention layer, not 0
+            TLLM_LOG_DEBUG("Assuming uniform distribution of attention layers between ranks");
+            return mNbAttentionLayers / pipelineParallelism;
+        }
+        return countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+    }
+
+    [[nodiscard]] SizeType32 getNbRnnLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        // TODO(oargov): get rid of this invalid state
+        if (mLayerTypes.empty())
+        {
+            // this assumption might be wrong in a few cases, for example:
+            // layer types: [attention, attention, recurrent], pp=2 ==> second rank has 1 rnn layer, not 0
+            TLLM_LOG_DEBUG("Assuming uniform distribution of recurrent layers between ranks");
+            return mNbRnnLayers / pipelineParallelism;
+        }
+        return countLocalLayers(LayerType::kRECURRENT, pipelineParallelism, pipelineParallelismRank);
     }
 
     [[nodiscard]] SizeType32 constexpr getNbHeads() const noexcept
@@ -166,14 +214,16 @@ public:
         return mNbHeads;
     }
 
-    [[nodiscard]] SizeType32 constexpr getNbKvHeads() const noexcept
+    [[nodiscard]] SizeType32 getNbKvHeads(SizeType32 layerIdx) const
     {
-        return mNbKvHeads;
+        TLLM_CHECK_WITH_INFO(layerIdx < mNbAttentionLayers, "Layer index %d is out of bounds", layerIdx);
+        return mNumKvHeadsPerAttentionLayer[layerIdx];
     }
 
-    void constexpr setNbKvHeads(SizeType32 nbKvHeads) noexcept
+    // set the number of kv heads for all layers
+    void setNbKvHeads(SizeType32 nbKvHeads)
     {
-        mNbKvHeads = nbKvHeads;
+        mNumKvHeadsPerAttentionLayer = std::vector<SizeType32>(mNbAttentionLayers, nbKvHeads);
     }
 
     [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
@@ -645,12 +695,46 @@ public:
         mModelName = modelName;
     }
 
+    [[nodiscard]] std::vector<SizeType32> const& getNumKvHeadsPerLayer() const
+    {
+        return mNumKvHeadsPerAttentionLayer;
+    }
+
+    [[nodiscard]] std::pair<std::vector<SizeType32>::const_iterator, std::vector<SizeType32>::const_iterator>
+    getNumKvHeadsPerLayerLocalRange(SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        // count number of previous non-local attention layers
+        auto const numPrevAttnLayers
+            = countLowerRankLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+        auto const firstLocalAttentionLayerIt = mNumKvHeadsPerAttentionLayer.cbegin() + numPrevAttnLayers;
+        auto const numLocalAttentionLayers
+            = countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+        return std::make_pair(firstLocalAttentionLayerIt, firstLocalAttentionLayerIt + numLocalAttentionLayers);
+    }
+
+    void setNumKvHeadsPerLayer(std::vector<SizeType32> const& headsPerLayer)
+    {
+        auto const numElems = static_cast<SizeType32>(headsPerLayer.size());
+        TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
+            "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
+        mNumKvHeadsPerAttentionLayer = headsPerLayer;
+    }
+
+    [[nodiscard]] SizeType32 getSumLocalKvHeads(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        auto [cbegin, cend] = getNumKvHeadsPerLayerLocalRange(pipelineParallelism, pipelineParallelismRank);
+        auto const sumLocalHeads = std::reduce(cbegin, cend);
+        return sumLocalHeads;
+    }
+
 private:
     SizeType32 mVocabSize;
+    SizeType32 mNbLayers;
     SizeType32 mNbAttentionLayers;
     SizeType32 mNbRnnLayers;
     SizeType32 mNbHeads;
-    SizeType32 mNbKvHeads;
     SizeType32 mHiddenSize;
     SizeType32 mSizePerHead;
     nvinfer1::DataType mDataType;
@@ -703,6 +787,7 @@ private:
     bool mUseShapeInference;
     ManageWeightsType mManageWeightsType;
     std::string mModelName;
+    std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
 };
 
 } // namespace tensorrt_llm::runtime

@@ -276,8 +276,8 @@ void LookaheadRandomLlm::foretell(TensorPtr const& output, TensorConstPtr const&
         {
             right &= maskLocation.at(i, j) ? oracleRange[positionRange[j]] == inputRange[j] : true;
         }
-        if (i < verifyStart)
-        { // lookahead might be right
+        if (i < verifyStart && false)
+        { // lookahead might be right. Since we verify lookahead branch, then must be right.
             outputRange[i] = ((right || rand() % 5) && legal) ? oracleRange[positionRange[i] + 1] : invalid;
         }
         else

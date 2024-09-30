@@ -5,6 +5,65 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.13.0
+
+### Key Features and Enhancements
+  - Supported lookahead decoding (experimental), see `docs/source/speculative_decoding.md`.
+  - Added some enhancements to the `ModelWeightsLoader` (a unified checkpoint converter, see `docs/source/architecture/model-weights-loader.md`).
+    -  Supported Qwen models.
+    -  Supported auto-padding for indivisible TP shape in INT4-wo/INT8-wo/INT4-GPTQ.
+    -  Improved performance on `*.bin` and `*.pth`.
+  - Supported OpenAI Whisper in C++ runtime.
+  - Added some enhancements to the `LLM` class.
+    - Supported LoRA.
+    - Supported engine building using dummy weights.
+    - Supported `trust_remote_code` for customized models and tokenizers downloaded from Hugging Face Hub.
+  - Supported beam search for streaming mode.
+  - Supported tensor parallelism for Mamba2.
+  - Supported returning generation logits for streaming mode.
+  - Added `curand` and `bfloat16` support for `ReDrafter`.
+  - Added sparse mixer normalization mode for MoE models.
+  - Added support for QKV scaling in FP8 FMHA.
+  - Supported FP8 for MoE LoRA.
+  - Supported KV cache reuse for P-Tuning and LoRA.
+  - Supported in-flight batching for CogVLM models.
+  - Supported LoRA for the `ModelRunnerCpp` class.
+  - Supported `head_size=48` cases for FMHA kernels.
+  - Added FP8 examples for DiT models, see `examples/dit/README.md`.
+  - Supported decoder with encoder input features for the C++ `executor` API.
+
+### API Changes
+  - [BREAKING CHANGE] Set `use_fused_mlp` to `True` by default.
+  - [BREAKING CHANGE] Enabled `multi_block_mode` by default.
+  - [BREAKING CHANGE] Enabled `strongly_typed` by default in `builder` API.
+  - [BREAKING CHANGE] Renamed `maxNewTokens`, `randomSeed` and `minLength` to `maxTokens`, `seed` and `minTokens` following OpenAI style.
+  - The `LLM` class
+    - [BREAKING CHANGE] Updated `LLM.generate` arguments to include `PromptInputs` and `tqdm`.
+  - The C++ `executor` API
+    - [BREAKING CHANGE] Added `LogitsPostProcessorConfig`.
+    - Added `FinishReason` to `Result`.
+
+### Model Updates
+  - Supported Gemma 2, see "Run Gemma 2" section in `examples/gemma/README.md`.
+
+### Fixed Issues
+  - Fixed an accuracy issue when enabling remove padding issue for cross attention. (#1999)
+  - Fixed the failure in converting qwen2-0.5b-instruct when using `smoothquant`. (#2087)
+  - Matched the `exclude_modules` pattern in `convert_utils.py` to the changes in `quantize.py`. (#2113)
+  - Fixed build engine error when `FORCE_NCCL_ALL_REDUCE_STRATEGY` is set.
+  - Fixed unexpected truncation in the quant mode of `gpt_attention`.
+  - Fixed the hang caused by race condition when canceling requests.
+  - Fixed the default factory for `LoraConfig`. (#1323)
+
+### Infrastructure Changes
+  - Base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.07-py3`.
+  - Base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:24.07-py3`.
+  - The dependent TensorRT version is updated to 10.4.0.
+  - The dependent CUDA version is updated to 12.5.1.
+  - The dependent PyTorch version is updated to 2.4.0.
+  - The dependent ModelOpt version is updated to v0.15.
+
+
 ## TensorRT-LLM Release 0.12.0
 
 ### Key Features and Enhancements

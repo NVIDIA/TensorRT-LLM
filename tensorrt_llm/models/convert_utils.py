@@ -3,7 +3,6 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from datasets import load_dataset
 
@@ -404,9 +403,8 @@ def generate_int8(
     # compute weight scaling factors for fp->int8 and int8->fp
     if is_qkv and not multi_query_mode:
         scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
-            dim=-1, keepdims=True)[0].cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
-                                                             -1).cpu().numpy()
+            dim=-1, keepdims=True)[0]
+        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3, -1)
     elif is_qkv and multi_query_mode:
         hidden_dim = weights.shape[0]
         local_dim = act_range["w"].shape[0]
@@ -421,62 +419,67 @@ def generate_int8(
             scale_w_v.max(dim=0, keepdim=True)[0]
         ])
 
-        scale_w_orig_quant_t = 127. / scale_w_qkv_t.cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
+        scale_w_orig_quant_t = 127. / scale_w_qkv_t
+        scale_w_orig_quant_c = 127. / act_range["w"]
     else:
-        scale_w_orig_quant_t = 127. / act_range["w"].max().cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
+        scale_w_orig_quant_t = 127. / act_range["w"].max()
+        scale_w_orig_quant_c = 127. / act_range["w"]
     scale_w_quant_orig_t = 1.0 / scale_w_orig_quant_t
     scale_w_quant_orig_c = 1.0 / scale_w_orig_quant_c
 
+    scale_w_orig_quant_c = scale_w_orig_quant_c.to(torch.float32)
+    scale_w_orig_quant_t = scale_w_orig_quant_t.to(torch.float32)
+
     # compute the rest of needed scaling factors
-    scale_x_orig_quant_t = np.array(127. / act_range["x"].max().item())
-    scale_y_orig_quant_t = np.array(127. / act_range["y"].max().item())
-    scale_y_quant_orig_t = np.array(act_range["y"].max().item() / 127.)
+    scale_x_orig_quant_t = 127. / act_range["x"].max()
+    scale_y_orig_quant_t = 127. / act_range["y"].max()
+    scale_y_quant_orig_t = act_range["y"].max() / 127.
     scale_y_accum_quant_t = scale_y_orig_quant_t / (scale_x_orig_quant_t *
                                                     scale_w_orig_quant_t)
     scale_y_accum_quant_c = scale_y_orig_quant_t / (scale_x_orig_quant_t *
                                                     scale_w_orig_quant_c)
     if is_qkv and not multi_query_mode:
-        scale_y_accum_quant_t = np.broadcast_to(scale_y_accum_quant_t,
-                                                scale_w_orig_quant_c.shape)
-        scale_w_quant_orig_t = np.broadcast_to(scale_w_quant_orig_t,
-                                               scale_w_orig_quant_c.shape)
+        scale_y_accum_quant_t = torch.broadcast_to(scale_y_accum_quant_t,
+                                                   scale_w_orig_quant_c.shape)
+        scale_w_quant_orig_t = torch.broadcast_to(scale_w_quant_orig_t,
+                                                  scale_w_orig_quant_c.shape)
     if is_qkv and multi_query_mode:
-        scale_q_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[0],
-                                            scale_w_q.shape)
-        scale_k_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[1],
-                                            scale_w_k.shape)
-        scale_v_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[2],
-                                            scale_w_v.shape)
-        scale_y_accum_quant_t = np.concatenate(
+        scale_q_y_accum_t = torch.broadcast_to(scale_y_accum_quant_t[0],
+                                               scale_w_q.shape)
+        scale_k_y_accum_t = torch.broadcast_to(scale_y_accum_quant_t[1],
+                                               scale_w_k.shape)
+        scale_v_y_accum_t = torch.broadcast_to(scale_y_accum_quant_t[2],
+                                               scale_w_v.shape)
+        scale_y_accum_quant_t = torch.concat(
             [scale_q_y_accum_t, scale_k_y_accum_t, scale_v_y_accum_t])
-        scale_w_quant_orig_t = np.concatenate([
-            np.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
-            np.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
-            np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
+        scale_w_quant_orig_t = torch.concat([
+            torch.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
+            torch.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
+            torch.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
         ])
 
-    to_i8 = lambda x: x.round().clip(-127, 127).astype(np.int8)
+    to_i8 = lambda x: x.round().clip(-127, 127).to(torch.int8)
 
     if is_qkv and multi_query_mode:
-        scale_w_quant_orig_t_expand = np.ones([weights.shape[-1]])
-        scale_w_quant_orig_t_expand[:hidden_dim] = scale_w_quant_orig_t[0]
-        scale_w_quant_orig_t_expand[hidden_dim:hidden_dim +
-                                    kv_dim] = scale_w_quant_orig_t[1]
-        scale_w_quant_orig_t_expand[-kv_dim:] = scale_w_quant_orig_t[2]
-        weight_int8 = to_i8(weights * scale_w_quant_orig_t_expand)
+        if weights.device != scale_w_quant_orig_t.device:
+            scale_w_quant_orig_t = scale_w_quant_orig_t.to(weights.device)
+        weight_int8 = to_i8(weights / scale_w_quant_orig_t)
     else:
+        if weights.device != scale_w_orig_quant_t.device:
+            scale_w_orig_quant_t = scale_w_orig_quant_t.to(weights.device)
         weight_int8 = to_i8(weights * scale_w_orig_quant_t)
+    if weights.device != scale_w_orig_quant_c.device:
+        scale_w_orig_quant_c = scale_w_orig_quant_c.to(weights.device)
+
     return {
         "weight.int8": weight_int8,
         "weight.int8.col": to_i8(weights * scale_w_orig_quant_c),
-        "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
-        "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
-        "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
-        "scale_y_accum_quant": scale_y_accum_quant_t.astype(np.float32),
-        "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
-        "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
+        "scale_x_orig_quant": scale_x_orig_quant_t.to(torch.float32),
+        "scale_w_quant_orig": scale_w_quant_orig_t.to(torch.float32),
+        "scale_w_quant_orig.col": scale_w_quant_orig_c.to(torch.float32),
+        "scale_y_accum_quant": scale_y_accum_quant_t.to(torch.float32),
+        "scale_y_accum_quant.col": scale_y_accum_quant_c.to(torch.float32),
+        "scale_y_quant_orig": scale_y_quant_orig_t.to(torch.float32),
     }
 
 

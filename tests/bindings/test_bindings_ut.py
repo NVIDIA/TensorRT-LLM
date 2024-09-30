@@ -40,9 +40,10 @@ def test_model_config():
     num_heads = 16
     hidden_size = 768
     data_type = _tb.DataType.FLOAT
-    model_config = _tb.ModelConfig(vocab_size, num_attention_layers,
-                                   num_rnn_layers, num_heads, hidden_size,
-                                   data_type)
+    model_config = _tb.ModelConfig(vocab_size,
+                                   num_attention_layers + num_rnn_layers,
+                                   num_attention_layers, num_rnn_layers,
+                                   num_heads, hidden_size, data_type)
     assert model_config.vocab_size == vocab_size
     assert model_config.num_attention_layers() == num_attention_layers
     assert model_config.num_rnn_layers() == num_rnn_layers
@@ -53,10 +54,23 @@ def test_model_config():
     assert model_config.vocab_size_padded(1) is not None
     assert model_config.size_per_head == hidden_size // num_heads
 
-    assert model_config.num_kv_heads == num_heads
+    num_kv_heads_per_layer = model_config.num_kv_heads_per_layer
+    for layer_idx in range(num_attention_layers):
+        assert model_config.num_kv_heads(layer_idx) == num_heads
+        assert num_kv_heads_per_layer[layer_idx] == num_heads
+
     num_kv_heads = 1
-    model_config.num_kv_heads = num_kv_heads
-    assert model_config.num_kv_heads == num_kv_heads
+    model_config.set_num_kv_heads(num_kv_heads)
+    num_kv_heads_per_layer = model_config.num_kv_heads_per_layer
+    for layer_idx in range(num_attention_layers):
+        assert model_config.num_kv_heads(layer_idx) == num_kv_heads
+        assert num_kv_heads_per_layer[layer_idx] == num_kv_heads
+
+    num_kv_heads_per_layer[-1] = 2
+    model_config.num_kv_heads_per_layer = num_kv_heads_per_layer
+    for nheads, ref in zip(model_config.num_kv_heads_per_layer,
+                           num_kv_heads_per_layer):
+        assert nheads == ref
 
     assert not model_config.use_gpt_attention_plugin
     model_config.use_gpt_attention_plugin = True
@@ -182,6 +196,7 @@ def test_sampling_config():
 def test_gpt_json_config():
     model_config = {
         "vocab_size": 1000,
+        "num_layers": 18,  # >= attn + rnn
         "num_attention_layers": 12,
         "num_rnn_layers": 2,
         "num_heads": 4,

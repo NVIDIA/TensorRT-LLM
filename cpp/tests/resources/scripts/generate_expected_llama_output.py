@@ -72,7 +72,7 @@ def generate_outputs(num_beams, only_multi_gpu=False):
     elif COMM_WORLD.size == 4:
         tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
     elif COMM_WORLD.size == 2:
-        tp_pp_sizes = [(1, 2)]
+        tp_pp_sizes = [(1, 2), (2, 1)]
     else:
         raise RuntimeError(
             f"The world size of MPI {COMM_WORLD.size} is not equal to 1, 2, or 4."

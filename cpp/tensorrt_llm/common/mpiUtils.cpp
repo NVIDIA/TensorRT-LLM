@@ -314,6 +314,18 @@ void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType d
 #endif // ENABLE_MULTI_DEVICE
 }
 
+void MpiComm::allgatherv(void const* sendbuf, int sendcount, MpiType sendtype, void* recvbuf,
+    std::vector<int> const& recvcounts, std::vector<int> const& displs, MpiType recvtype) const
+{
+#if ENABLE_MULTI_DEVICE
+    MPICHECK(MPI_Allgatherv(sendbuf, sendcount, getMpiDtype(sendtype), recvbuf, recvcounts.data(), displs.data(),
+        getMpiDtype(recvtype), mComm));
+
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+}
+
 void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const
 {
 #if ENABLE_MULTI_DEVICE

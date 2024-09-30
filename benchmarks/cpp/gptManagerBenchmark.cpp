@@ -159,6 +159,8 @@ struct BenchmarkParams
     std::optional<int> sinkTokenLength{std::nullopt};
     bool multiBlockMode{true};
     bool enableContextFMHAFP32Acc{false};
+    bool cudaGraphMode{false};
+    SizeType32 cudaGraphCacheSize{0};
 
     // lora / peft params
     std::optional<std::string> loraDir{std::nullopt};
@@ -470,7 +472,38 @@ public:
             mRequestBenchInfos[requestId].firstTokenSeen = true;
         }
 
-        mRequestBenchInfos[requestId].outputLength += 1;
+        mRequestBenchInfos[requestId].decodingIter += 1;
+    }
+
+    void recordToken(uint64_t requestId, std::list<NamedTensor> const& responseTensors)
+    {
+        int32_t outputLength = 1;
+        for (auto& tensor : responseTensors)
+        {
+            if (tensor.name == inference_request::kSequenceLengthTensorName)
+            {
+                // Tensor of shape nBeams, and we only need the first one
+                outputLength = *(bufferCast<int32_t>(*(tensor.tensor)));
+                break;
+            }
+        }
+
+        mRequestBenchInfos[requestId].outputLength += outputLength;
+        this->recordToken(requestId);
+    }
+
+    void recordToken(uint64_t requestId, texec::Response const& response)
+    {
+        auto outputTokenIds = response.getResult().outputTokenIds;
+
+        int32_t outputLength = 1;
+        for (auto const& beam : outputTokenIds)
+        {
+            outputLength = std::max(static_cast<int32_t>(beam.size()), outputLength);
+        }
+
+        mRequestBenchInfos[requestId].outputLength += outputLength;
+        this->recordToken(requestId);
     }
 
     void recordEnd(uint64_t requestId, std::list<NamedTensor> const& responseTensors, bool hasError)
@@ -500,7 +533,7 @@ public:
         }
         else
         {
-            this->recordToken(requestId);
+            this->recordToken(requestId, responseTensors);
         }
     }
 
@@ -532,7 +565,7 @@ public:
             }
             else
             {
-                this->recordToken(requestId);
+                this->recordToken(requestId, response);
             }
         }
     }
@@ -821,8 +854,9 @@ public:
             benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
         texec::PeftCacheConfig peftCacheConfig(0, benchmarkParams.loraDeviceNumModLayers, 8, 64, 4, 4, 4, 24, 8,
             std::nullopt, benchmarkParams.loraHostCacheSize);
-        texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(
-            benchmarkParams.multiBlockMode, benchmarkParams.enableContextFMHAFP32Acc);
+        texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(benchmarkParams.multiBlockMode,
+            benchmarkParams.enableContextFMHAFP32Acc, benchmarkParams.cudaGraphMode,
+            benchmarkParams.cudaGraphCacheSize);
         texec::ExecutorConfig executorConfig(
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
@@ -940,7 +974,7 @@ public:
                 {
                     if (!warmup && !response.hasError())
                     {
-                        mRecorder->recordToken(reqId);
+                        mRecorder->recordToken(reqId, response);
                     }
                 }
             }
@@ -1228,7 +1262,7 @@ public:
             {
                 if (errMsg.empty())
                 {
-                    mRecorder->recordToken(requestId);
+                    mRecorder->recordToken(requestId, response_tensors);
                 }
             }
         }
@@ -1458,8 +1492,8 @@ void benchmarkGptManager(std::filesystem::path const& engineDir, TrtGptModelType
                 : benchmarkParams.executorLookaheadConfig.has_value()     ? texec::DecodingMode::Lookahead()
                                                                           : texec::DecodingMode::Auto(),
             benchmarkParams.executorLookaheadConfig, benchmarkParams.medusaChoices);
-    optionalParams.extendedRuntimePerfKnobConfig = texec::ExtendedRuntimePerfKnobConfig(
-        benchmarkParams.multiBlockMode, benchmarkParams.enableContextFMHAFP32Acc);
+    optionalParams.extendedRuntimePerfKnobConfig = texec::ExtendedRuntimePerfKnobConfig(benchmarkParams.multiBlockMode,
+        benchmarkParams.enableContextFMHAFP32Acc, benchmarkParams.cudaGraphMode, benchmarkParams.cudaGraphCacheSize);
 
     auto const jsonConfig = GptJsonConfig::parse(engineDir / "config.json");
     auto const worldConfig = WorldConfig::mpi(jsonConfig.getGpusPerNode(), jsonConfig.getTensorParallelism(),
@@ -1895,7 +1929,8 @@ int main(int argc, char* argv[])
     options.add_options()("return_generation_logits", "Whether to return generation logits.",
         cxxopts::value<bool>()->default_value("false"));
 
-    options.add_options()("scheduler_policy", "Choose scheduler policy between max_utilization/guaranteed_no_evict.",
+    options.add_options()("scheduler_policy",
+        "Choose scheduler policy between max_utilization/guaranteed_no_evict/static_batch.",
         cxxopts::value<std::string>()->default_value("guaranteed_no_evict"));
 
     options.add_options()("first_batch_delay",
@@ -1946,6 +1981,12 @@ int main(int argc, char* argv[])
         cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "encoder_engine_dir", "Directory that store the engines of the encoder models.", cxxopts::value<std::string>());
+    options.add_options()("cuda_graph_mode", "When enabled, inference is executed with cuda graph.",
+        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("cuda_graph_cache_size",
+        "Specify how many cuda graphs are cached in the runtime. Larger cache gives better perf, but consumes more GPU "
+        "memory.",
+        cxxopts::value<SizeType32>()->default_value("0"));
 
     options.add_options()("enable_context_fmha_fp32_acc", "Enable FMHA runner FP32 accumulation",
         cxxopts::value<bool>()->default_value("false"));
@@ -2131,6 +2172,12 @@ int main(int argc, char* argv[])
     // Argument: enable_context_fmha_fp32_acc
     benchmarkParams.enableContextFMHAFP32Acc = result["enable_context_fmha_fp32_acc"].as<bool>();
 
+    // Argument: cuda_graph_mode
+    benchmarkParams.cudaGraphMode = result["cuda_graph_mode"].as<bool>();
+
+    // Argument: cuda_graph_mode
+    benchmarkParams.cudaGraphCacheSize = result["cuda_graph_cache_size"].as<SizeType32>();
+
     std::optional<TokenIdType> padId;
     // Argument: Padding token id
     if (result.count("pad_id"))
@@ -2167,6 +2214,10 @@ int main(int argc, char* argv[])
     else if (capacitySchedulerPolicyArg == "guaranteed_no_evict")
     {
         capacitySchedulerPolicy = texec::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT;
+    }
+    else if (capacitySchedulerPolicyArg == "static_batch")
+    {
+        capacitySchedulerPolicy = texec::CapacitySchedulerPolicy::kSTATIC_BATCH;
     }
     else
     {

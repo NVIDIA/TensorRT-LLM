@@ -192,8 +192,12 @@ class GPTJForCausalLM(DecoderModelForCausalLM):
                                               **kwargs)
 
         if not use_preloading:
+            trust_remote_code = kwargs.pop('trust_remote_code', True)
+
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-                hf_model_dir, torch_dtype='auto', trust_remote_code=True)
+                hf_model_dir,
+                torch_dtype='auto',
+                trust_remote_code=trust_remote_code)
         weights = load_weights_from_hf_model(hf_model, config)
 
         check_share_embedding(weights, config)

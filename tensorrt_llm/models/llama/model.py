@@ -297,7 +297,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         load_by_shard = kwargs.pop('load_by_shard', False)
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is not None:
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER"
+                          ) is not None and not isinstance(
+                              hf_model_or_dir, transformers.PreTrainedModel):
             if "vila" in hf_model_or_dir or "llava" in hf_model_or_dir:
                 hf_model_or_dir = load_hf_llama(hf_model_or_dir,
                                                 load_model_on_cpu)
@@ -326,14 +328,15 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             config.num_key_value_heads = config.num_key_value_heads // 2
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
-            if "llava" in hf_model_or_dir:
+            model_name = hf_model.config.model_type if use_preloading else hf_model_or_dir
+            if "llava" in model_name:
                 custom_dict = {
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head"
                 }
-            elif "vila" in hf_model_or_dir:
+            elif "vila" in model_name:
                 hf_model_dir += "/llm"
-            elif "exaone" in hf_model_or_dir:
+            elif "exaone" in model_name:
                 custom_dict = {
                     "transformer": "transformer",
                     "layers": "h",
@@ -441,11 +444,14 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                    mapping=mapping,
                                                    quant_config=quant_config,
                                                    **kwargs)
+            trust_remote_code = kwargs.pop("trust_remote_code", True)
+
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
                              device=device,
-                             calib_dataset=calib_dataset)
+                             calib_dataset=calib_dataset,
+                             trust_remote_code=trust_remote_code)
         else:
             raise ValueError(
                 f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."

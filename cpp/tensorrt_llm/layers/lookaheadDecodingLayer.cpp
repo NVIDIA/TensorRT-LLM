@@ -24,6 +24,7 @@
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
@@ -80,14 +81,14 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
     mNextDraftTokens = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
     mNextDraftPosIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
     mGenerationLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mGenerationLengthsMax = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mPositionOffsets
         = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
     mPositionIds = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
+    mAttentionMask
+        = BufferManager::cpu(ITensor::makeShape({maxTokensPerStep, maxTokensPerStep}), nvinfer1::DataType::kBOOL);
     mPackedMask = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep,
                                          static_cast<ITensor::DimType64>(divUp(maxTokensPerStep, 32))}),
         nvinfer1::DataType::kINT32);
-    mSamplingMask = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kBOOL);
     mNextDraftLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mSequenceLengths = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
 }
@@ -113,7 +114,6 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
 
     mWorkspaceSize = getTopKWorkspaceSize<T>(maxBatchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
     mTargetTokensDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kINT32);
-    mSamplingMaskDevice = mBufferManager->gpu(maxBatchShape2D, nvinfer1::DataType::kBOOL);
     mCurandStatesDevice
         = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 
@@ -168,6 +168,7 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
         {
             SizeType32 gbi = batchSlotsRange[bi];
             (BufferRange<SizeType32>(*mCpuAlgo->mGenerationLengths))[gbi] = 1;
+            (BufferRange<SizeType32>(*mCpuAlgo->mNextDraftLengths))[gbi] = 0;
             BufferLocation<SizeType32>(*mCpuAlgo->mPositionOffsets).at(gbi, 0) = 0;
             BufferRange<SizeType32> packedMaskRange(*ITensor::at(mCpuAlgo->mPackedMask, {gbi}));
             for (auto& mask : packedMaskRange)
@@ -184,11 +185,6 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
             PRINT_SHAPE(setupParams->attentionPackedMasks);
             mBufferManager->copy(
                 *ITensor::at(mCpuAlgo->mGenerationLengths, {gbi}), *ITensor::at(setupParams->generationLengths, {gbi}));
-            if (setupParams->actualGenerationLengths)
-            {
-                mBufferManager->copy(*ITensor::at(mCpuAlgo->mGenerationLengths, {gbi}),
-                    *ITensor::at(setupParams->actualGenerationLengths, {gbi}));
-            }
             mBufferManager->copy(
                 *ITensor::at(mCpuAlgo->mPositionOffsets, {gbi}), *ITensor::at(setupParams->positionOffsets, {gbi}));
             mBufferManager->copy(
@@ -261,39 +257,32 @@ size_t LookaheadDecodingLayer<T>::getWorkspaceSize() const noexcept
     return std::max(mWorkspaceSize, mSetupWorkspaceSize);
 }
 
-template <typename T>
-void LookaheadDecodingLayer<T>::posIdsToMask(TensorPtr mask, TensorConstPtr posIds)
+inline void initAttentionMask(TensorPtr const& mask, std::shared_ptr<runtime::BufferManager>& bufferManager)
 {
-    auto len = ITensor::volume(posIds->getShape());
-    TLLM_CHECK(mask->getDimension<0>() > len);
-    TLLM_CHECK(mask->getDimension<1>() * 32 > len);
-    auto posIdsRange = BufferRange<SizeType32 const>(*posIds);
-    auto maskLocation = BufferLocation<SizeType32>(*mask);
-
-    for (auto i = 0; i < maskLocation.size(); i++)
+    bufferManager->setZero(*mask);
+    BufferLocation<bool> maskLocation(*mask);
+    auto maskShape = mask->getShape();
+    for (SizeType32 i = 0; i < maskShape.d[0]; i++)
     {
-        maskLocation[i] = 0;
+        maskLocation.at(i, 0) = true;
     }
-    maskLocation.at(0, 0) = 1;
+}
 
-    auto setBit = [](SizeType32& x, SizeType32 idx) { x |= (1 << idx); };
-    if (len > 0)
+inline void convertBoolToInt32(TensorPtr const& dst, TensorConstPtr const& src)
+{
+    auto dstShape = dst->getShape();
+    auto srcShape = src->getShape();
+    TLLM_CHECK(dstShape.d[0] == srcShape.d[0]);
+    TLLM_CHECK(dstShape.d[1] * 32 >= srcShape.d[1]);
+    BufferLocation<SizeType32> dstLocation(*dst);
+    BufferLocation<bool const> srcLocation(*src);
+
+    auto setBit = [](SizeType32& x, SizeType32 idx, bool value) { x |= (value << idx); };
+    for (auto i = 0; i < srcShape.d[0]; i++)
     {
-        std::vector<std::pair<SizeType32, SizeType32>> stack;
-        stack.emplace_back(0, posIdsRange[0] - 1);
-        for (auto i = 1; i < len + 1; i++)
+        for (auto j = 0; j < srcShape.d[1]; j++)
         {
-            auto cur = posIdsRange[i - 1];
-            while (stack.size() > 0 && cur <= stack.back().second)
-            {
-                stack.pop_back();
-            }
-            TLLM_CHECK(stack.size() > 0 ? cur == stack.back().second + 1 : true);
-            stack.emplace_back(i, cur);
-            for (auto prev : stack)
-            {
-                setBit(maskLocation.at(i, prev.first / 32), prev.first % 32);
-            }
+            setBit(dstLocation.at(i, j / 32), j % 32, srcLocation.at(i, j));
         }
     }
 }
@@ -307,11 +296,15 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mCpuAlgo->mBatchSlots->reshape(inputs->batchSlots->getShape());
     mBufferManager->copy(*inputs->batchSlots, *mCpuAlgo->mBatchSlots);
     mBufferManager->copy(*inputs->curTokensPerStep.value(), *mCpuAlgo->mTokensPerStep);
-    mBufferManager->copy(*inputs->curTokensPerStep.value(), *mCpuAlgo->mTokensPerStep);
     mBufferManager->copy(*inputs->endIds, *mCpuAlgo->mEndIds);
     mBufferManager->copy(*outputs->sequenceLength.value(), *mCpuAlgo->mSequenceLengths);
 
     mBufferManager->copy(*mTargetTokensDevice, *mCpuAlgo->mTargetTokens);
+
+    if (outputs->prevDraftLengths)
+    {
+        mBufferManager->copy(*mCpuAlgo->mNextDraftLengths, *outputs->prevDraftLengths);
+    }
 
     mBufferManager->getStream().synchronize();
 
@@ -325,7 +318,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     BufferRange<SizeType32> numNewTokensCumSumRange(*mCpuAlgo->mNumNewTokensCumSum);
     BufferRange<SizeType32> batchSlotsRange(*mCpuAlgo->mBatchSlots);
     BufferRange<SizeType32> generationLengthsRange(*mCpuAlgo->mGenerationLengths);
-    BufferRange<SizeType32> generationLengthsMaxRange(*mCpuAlgo->mGenerationLengthsMax);
     BufferRange<SizeType32> nextDraftLengthsRange(*mCpuAlgo->mNextDraftLengths);
     BufferRange<SizeType32> sequenceLengthsRange(*mCpuAlgo->mSequenceLengths);
     BufferLocation<SizeType32> pathsOffsetLocation(*mCpuAlgo->mPathsOffsets);
@@ -334,6 +326,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mBufferManager->setZero(*mCpuAlgo->mPathsOffsets);
     mBufferManager->setZero(*mCpuAlgo->mNumNewTokens);
     mBufferManager->setZero(*mCpuAlgo->mNumNewTokensCumSum);
+    mBufferManager->setZero(*mCpuAlgo->mPackedMask);
 
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
@@ -342,7 +335,6 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
         SizeType32 const tokensPerStep = generationLengthsRange[gbi];
         TensorPtr sampledTokens = ITensor::slice(mCpuAlgo->mTargetTokens, {gbi, 0}, tokensPerStep);
-        PRINT_VALUES(sampledTokens);
 
         if (tokensPerStep == 1)
         {
@@ -369,13 +361,17 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
 
         sequenceLengthsRange[gbi] += numNewTokensRange[gbi];
 
+        initAttentionMask(mCpuAlgo->mAttentionMask, mBufferManager);
+
         theAlgo.prepare(                                     //
             ITensor::at(mCpuAlgo->mNextDraftTokens, {gbi}),  //
             ITensor::at(mCpuAlgo->mNextDraftPosIds, {gbi}),  //
-            ITensor::at(mCpuAlgo->mSamplingMask, {gbi}),     //
             ITensor::at(mCpuAlgo->mNextDraftLengths, {gbi}), //
+            mCpuAlgo->mAttentionMask, 1,                     //
             ITensor::at(mCpuAlgo->mSequenceLengths, {gbi}),  //
             ITensor::at(mCpuAlgo->mOutputIds, {gbi, numNewTokensRange[gbi] - 1}));
+
+        convertBoolToInt32(ITensor::at(mCpuAlgo->mPackedMask, {gbi}), mCpuAlgo->mAttentionMask);
 
         BufferLocation<SizeType32> posIdsLocation(*ITensor::at(mCpuAlgo->mPositionIds, {gbi}));
         for (auto& posid : posIdsLocation)
@@ -385,20 +381,14 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
         mBufferManager->copy(*ITensor::slice(mCpuAlgo->mNextDraftPosIds, {gbi, 0}, nextDraftLengthsRange[gbi]),
             *ITensor::slice(mCpuAlgo->mPositionIds, {gbi, 1}, nextDraftLengthsRange[gbi]));
 
-        posIdsToMask(                                  //
-            ITensor::at(mCpuAlgo->mPackedMask, {gbi}), //
-            ITensor::slice(mCpuAlgo->mNextDraftPosIds, {gbi, 0}, nextDraftLengthsRange[gbi]));
-
         BufferRange<SizeType32> offsetRange(*ITensor::at(mCpuAlgo->mPositionOffsets, {gbi}));
-        TLLM_CHECK_WITH_INFO(
-            posIdsLocation.size() == offsetRange.size(), "%ld, %ld", posIdsLocation.size(), offsetRange.size());
         for (auto i = 0; i < posIdsLocation.size(); i++)
         {
             offsetRange[i] = posIdsLocation[i] - posIdsLocation[0];
         }
+
         TensorPtr accepted = ITensor::slice(mCpuAlgo->mOutputIds, {gbi, 0}, numNewTokensRange[gbi]);
         TensorPtr draft = ITensor::slice(mCpuAlgo->mNextDraftTokens, {gbi, 0}, nextDraftLengthsRange[gbi]);
-
         TLLM_LOG_DEBUG("CPU ALGO [ %d ] forward, %s", gbi, D(sampledTokens).values().c_str());
         TLLM_LOG_DEBUG("[%d][%d] CPU ALGO [ %d ] forward, %s, %s", mGlobalSteps, batchSize, gbi,
             D(accepted).values().c_str(), D(draft).values().c_str());
@@ -430,28 +420,22 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mBufferManager->copy(*mCpuAlgo->mNumNewTokensCumSum, *outputs->numNewTokensCumSum); //
     mBufferManager->copy(*mCpuAlgo->mNextDraftTokens, *outputs->nextDraftTokens);
 
-    mBufferManager->copy(*mCpuAlgo->mPackedMask, *outputs->packedMasks);
+    for (SizeType32 bi = 0; bi < batchSize; bi++)
+    {
+        SizeType32 gbi = batchSlotsRange[bi];
+        // nextDraftLengthsRange[gbi] = mDecoderDomain.getMaxDecodingTokens() - 1;
+        generationLengthsRange[gbi] = nextDraftLengthsRange[gbi] + 1;
+    }
 
     if (outputs->nextDraftLengths)
     {
         mBufferManager->copy(*mCpuAlgo->mNextDraftLengths, *outputs->nextDraftLengths);
     }
 
-    for (SizeType32 bi = 0; bi < batchSize; bi++)
-    {
-        SizeType32 gbi = batchSlotsRange[bi];
-        generationLengthsRange[gbi] = nextDraftLengthsRange[gbi] + 1;
-        generationLengthsMaxRange[gbi] = mDecoderDomain.getMaxDecodingTokens();
-    }
     mBufferManager->copy(*mCpuAlgo->mPackedMask, *outputs->packedMasks);
-    mBufferManager->copy(*mCpuAlgo->mGenerationLengthsMax, *outputs->generationLengths);
+    mBufferManager->copy(*mCpuAlgo->mGenerationLengths, *outputs->generationLengths);
     mBufferManager->copy(*mCpuAlgo->mPositionOffsets, *outputs->positionOffsets);
     mBufferManager->copy(*mCpuAlgo->mPositionIds, *outputs->positionIds);
-
-    if (outputs->actualGenerationLengths)
-    {
-        mBufferManager->copy(*mCpuAlgo->mGenerationLengths, *outputs->actualGenerationLengths);
-    }
 
     mBufferManager->getStream().synchronize();
 

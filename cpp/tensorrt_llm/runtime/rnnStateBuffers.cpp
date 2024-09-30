@@ -15,11 +15,11 @@
  */
 
 #include "tensorrt_llm/runtime/rnnStateBuffers.h"
+#include "iBuffer.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 using namespace tensorrt_llm::runtime;
-namespace tc = tensorrt_llm::common;
 
 RnnStateBuffers::RnnStateBuffers()
 {
@@ -92,8 +92,8 @@ RnnStateBuffers::RnnStateBuffers(
         auto statePtrsShape = ITensor::makeShape({localNbLayers});
         slotMappingDevice = bufferManager.gpu(slotMappingShape, nvinfer1::DataType::kINT32);
         slotMappingHost = BufferManager::cpu(slotMappingShape, nvinfer1::DataType::kINT32);
-        rnnStatePtrs = BufferManager::cpu(statePtrsShape, nvinfer1::DataType::kINT64);
-        convStatePtrs = BufferManager::cpu(statePtrsShape, nvinfer1::DataType::kINT64);
+        rnnStatePtrs = BufferManager::cpu(statePtrsShape, TRTDataType<void*>::value);
+        convStatePtrs = BufferManager::cpu(statePtrsShape, TRTDataType<void*>::value);
     }
     else
     {
@@ -179,8 +179,8 @@ void RnnStateBuffers::fillStatePtrs()
     rnnStatePtr.resize(mLocalNbLayers);
     convStatePtr.resize(mLocalNbLayers);
 
-    void** rnnStatePtrArray = static_cast<void**>(rnnStatePtrs->data());
-    void** convStatePtrArray = static_cast<void**>(convStatePtrs->data());
+    auto* rnnStatePtrArray = bufferCast<void*>(*rnnStatePtrs);
+    auto* convStatePtrArray = bufferCast<void*>(*convStatePtrs);
 
     for (int i = 0; i < mLocalNbLayers; i++)
     {

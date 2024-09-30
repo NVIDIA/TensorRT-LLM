@@ -75,10 +75,10 @@ public:
     static void serialize(kv_cache::CacheState const& state, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(kv_cache::CacheState const& state);
 
-    // ContextPhaseState
-    [[nodiscard]] static ContextPhaseState deserializeContextPhaseState(std::istream& is);
-    static void serialize(ContextPhaseState const& contextPhaseState, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(ContextPhaseState const& contextPhaseState);
+    // DataTransceiverState
+    [[nodiscard]] static DataTransceiverState deserializeDataTransceiverState(std::istream& is);
+    static void serialize(DataTransceiverState const& dataTransceiverState, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(DataTransceiverState const& dataTransceiverState);
 
     // ContextPhaseParams
     [[nodiscard]] static ContextPhaseParams deserializeContextPhaseParams(std::istream& is);

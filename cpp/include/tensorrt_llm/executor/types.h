@@ -198,6 +198,10 @@ enum class CapacitySchedulerPolicy
     /// @brief GUARANTEED_NO_EVICT uses KV cache more conservatively guaranteeing that a request, once started, will run
     /// to completion without eviction.
     kGUARANTEED_NO_EVICT = 1,
+
+    /// @brief kSTATIC_BATCH does not schedule new requests until all requests in current batch are completed.
+    /// Similar to kGUARANTEED_NO_EVICT, requests will run to completion without eviction.
+    kSTATIC_BATCH = 2
 };
 
 std::ostream& operator<<(std::ostream& os, CapacitySchedulerPolicy policy);

@@ -87,13 +87,11 @@ If a GPU is not listed, it is important to note that TensorRT-LLM is expected to
   - TensorRT-LLM requires Linux x86_64 or Windows.
 * - GPU Model Architectures
   -
-    - [NVIDIA Hopper H100 GPU](https://www.nvidia.com/en-us/data-center/h100/)
-    - [NVIDIA L40S GPU](https://www.nvidia.com/en-us/data-center/l40s/)
-    - [NVIDIA Ada Lovelace GPU](https://www.nvidia.com/en-us/technologies/ada-architecture/)
-    - [NVIDIA Ampere A100 GPU](https://www.nvidia.com/en-us/data-center/a100/)
-    - [NVIDIA A30 GPU](https://www.nvidia.com/en-us/data-center/products/a30-gpu/)
-    - [NVIDIA Turing T4 GPU](https://www.nvidia.com/en-us/data-center/tesla-t4/)
-    - [NVIDIA Volta V100 GPU](https://www.nvidia.com/en-us/data-center/v100/) (experimental)
+    - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
+    - [NVIDIA Ada Lovelace Architecture](https://www.nvidia.com/en-us/technologies/ada-architecture/)
+    - [NVIDIA Ampere Architecture](https://www.nvidia.com/en-us/data-center/ampere-architecture/)
+    - [NVIDIA Turing Architecture](https://www.nvidia.com/en-us/geforce/turing/)
+    - [NVIDIA Volta Architecture](https://www.nvidia.com/en-us/data-center/volta-gpu-architecture/) (experimental)
 ```
 
 (support-matrix-software)=
@@ -110,7 +108,7 @@ The following table shows the supported software for TensorRT-LLM.
 * - Container
   - [24.07](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.3](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.4](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4

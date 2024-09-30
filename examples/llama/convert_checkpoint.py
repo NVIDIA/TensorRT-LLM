@@ -79,7 +79,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4', 'int4_gptq'],
+        choices=['int8', 'int4', 'int4_gptq', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -280,6 +280,12 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         quant_config.has_zero_point = True
         quant_config.pre_quant_scale = False
         quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+
+    if args.weight_only_precision == 'int4_awq':
+        quant_config.group_size = args.group_size
+        quant_config.has_zero_point = False
+        quant_config.pre_quant_scale = True
+        quant_config.quant_algo = QuantAlgo.W4A16_AWQ
 
     return quant_config
 

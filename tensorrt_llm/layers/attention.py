@@ -251,11 +251,13 @@ class KeyValueCacheParams:
                  kv_cache_block_offsets: Tensor = None,
                  host_kv_cache_block_offsets: Tensor = None,
                  host_kv_cache_pool_pointers: Tensor = None,
+                 host_kv_cache_pool_mapping: Tensor = None,
                  cache_indirection: Tensor = None,
                  past_key_value_length: Tensor = None,
                  cross_kv_cache_block_offsets: Tensor = None,
                  host_cross_kv_cache_block_offsets: Tensor = None,
-                 host_cross_kv_cache_pool_pointers: Tensor = None):
+                 host_cross_kv_cache_pool_pointers: Tensor = None,
+                 host_cross_kv_cache_pool_mapping: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.host_max_attention_window_sizes = host_max_attention_window_sizes
@@ -263,9 +265,11 @@ class KeyValueCacheParams:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_block_offsets = host_kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
+        self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.cross_kv_cache_block_offsets = cross_kv_cache_block_offsets
         self.host_cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets
         self.host_cross_kv_cache_pool_pointers = host_cross_kv_cache_pool_pointers
+        self.host_cross_kv_cache_pool_mapping = host_cross_kv_cache_pool_mapping
         self.cache_indirection = cache_indirection
         # self.past_key_value_length = past_key_value_length
 
@@ -349,7 +353,8 @@ class Attention(Module):
                  max_attn_value=0.0,
                  block_sparse_params=None,
                  use_implicit_relative_attention=False,
-                 reorder=False):
+                 reorder=False,
+                 layer_idx_in_cache_pool=None):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -357,6 +362,7 @@ class Attention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_kv_heads = num_kv_heads
+        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool if layer_idx_in_cache_pool is not None else local_layer_idx
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
@@ -857,8 +863,7 @@ class Attention(Module):
                     embed_positions_short_factors_for_attention_plugin,
                     concat([0, 0, 0]),
                     concat([
-                        max(attention_params.sequence_length,
-                            self.original_max_position_embeddings),
+                        self.max_position_embeddings,
                         self.rotary_embedding_dim // 2, 2
                     ]))
                 long = slice(
@@ -866,8 +871,7 @@ class Attention(Module):
                     embed_positions_long_factors_for_attention_plugin,
                     concat([0, 0, 0]),
                     concat([
-                        max(attention_params.sequence_length,
-                            self.original_max_position_embeddings),
+                        self.max_position_embeddings,
                         self.rotary_embedding_dim // 2, 2
                     ]))
                 short = short.view((1, -1))
@@ -916,6 +920,7 @@ class Attention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -956,6 +961,9 @@ class Attention(Module):
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers if not self.cross_attention else
                 kv_cache_params.host_cross_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping if not self.cross_attention else
+                kv_cache_params.host_cross_kv_cache_pool_mapping,
                 do_cross_attention=self.cross_attention,
                 cross_qkv=cross_qkv,
                 cross_qkv_length=attention_params.encoder_max_input_length,
@@ -1702,6 +1710,8 @@ class CogVLMAttention(Attention):
                 host_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping,
                 do_cross_attention=self.cross_attention,
                 cross_qkv=None,
                 cross_qkv_length=attention_params.encoder_max_input_length,
