@@ -82,6 +82,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -108,7 +112,6 @@
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#known-issues">Known Issues</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#unexpected-extra-gpu-memory-allocation-when-enabling-multiple-profiles">Unexpected extra GPU memory allocation when enabling <code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#fused-matmul-gated-silu-llama">Fused Matmul + Gated-SiLU (LLaMA)</a></li>
 </ul>
 </li>
@@ -182,18 +185,12 @@ performance that can be delivered by TensorRT-LLM.</p>
 <section id="known-issues">
 <h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
 <p>The following issues are being addressed to improve the efficiency of TensorRT-LLM.</p>
-<section id="unexpected-extra-gpu-memory-allocation-when-enabling-multiple-profiles">
-<h3>Unexpected extra GPU memory allocation when enabling <code class="docutils literal notranslate"><span class="pre">--multiple_profiles</span></code><a class="headerlink" href="#unexpected-extra-gpu-memory-allocation-when-enabling-multiple-profiles" title="Link to this heading"></a></h3>
-<p>We observed that enabling multiple profiles can lead to extra
-unexpected GPU memory usage on some cases starting from v0.11.
-The issue will be addressed in future releases.</p>
-</section>
 <section id="fused-matmul-gated-silu-llama">
 <h3>Fused Matmul + Gated-SiLU (LLaMA)<a class="headerlink" href="#fused-matmul-gated-silu-llama" title="Link to this heading"></a></h3>
 <p>The current implementation combines two Matmul operations into one Matmul followed by
-a separate SwiGLU kernel (when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span></code> is enabled). There is also a more
+a separate SwiGLU kernel (when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span></code> is enabled). There is also a more
 efficient implementation that runs single Matmul + SwiGLU fused kernel for FP8 on Hopper
-(when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code> is enabled). The gemm_swiglu_plugin
+(when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code> is enabled). The gemm_swiglu_plugin
 will support more data types and GPU architectures in the future release.</p>
 </section>
 </section>
@@ -202,7 +199,7 @@ will support more data types and GPU architectures in the future release.</p>
 <p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
 and shows the throughput client-server scenario under maximum load.</p>
 <p>The performance numbers below were collected using the steps described in this document.</p>
-<p><strong>All data in the table below was generated using version 0.12.0 and presents token throughput in tokens/second.</strong></p>
+<p><strong>All data in the table below was generated using version 0.13.0 and presents token throughput in tokens/second.</strong></p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p></p></th>
@@ -220,22 +217,22 @@ and shows the throughput client-server scenario under maximum load.</p>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p><strong>GPU</strong></p></td>
-<td><p>H200 141GB HBM3</p></td>
-<td><p>GH200 120GB</p></td>
-<td><p>H100 80GB HBM3</p></td>
-<td><p>H100 80GB HBM3</p></td>
-<td><p>A100-SXM4-80GB</p></td>
-<td><p>L40S</p></td>
+<td><p><strong>H200 141GB HBM3</strong></p></td>
+<td><p><strong>GH200 120GB</strong></p></td>
+<td><p><strong>H100 80GB HBM3</strong></p></td>
+<td><p><strong>H100 80GB HBM3</strong></p></td>
+<td><p><strong>A100-SXM4-80GB</strong></p></td>
+<td><p><strong>L40S</strong></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
 <td><p><strong>Precision</strong></p></td>
-<td><p>FP8</p></td>
-<td><p>FP8</p></td>
-<td><p>FP8</p></td>
-<td><p>Mixed</p></td>
-<td><p>Mixed</p></td>
-<td><p>FP8</p></td>
+<td><p><strong>FP8</strong></p></td>
+<td><p><strong>FP8</strong></p></td>
+<td><p><strong>FP8</strong></p></td>
+<td><p><strong>FP16</strong></p></td>
+<td><p><strong>FP16</strong></p></td>
+<td><p><strong>FP8</strong></p></td>
 </tr>
 <tr class="row-even"><td><p><strong>Model</strong></p></td>
 <td><p><strong>Input/Output Lengths</strong></p></td>
@@ -250,702 +247,1782 @@ and shows the throughput client-server scenario under maximum load.</p>
 <tr class="row-odd"><td><p>GPTJ 6B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>24834.76</p></td>
-<td><p>22454.79</p></td>
-<td><p>24429.55</p></td>
-<td><p>13085.91</p></td>
-<td><p>5864.81</p></td>
-<td><p>7647.24</p></td>
+<td><p>24,533.54</p></td>
+<td><p>22,368.50</p></td>
+<td><p>24,318.61</p></td>
+<td><p>12,936.63</p></td>
+<td><p>5,964.19</p></td>
+<td><p>7,688.44</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>1</p></td>
-<td><p>8348.93</p></td>
-<td><p>6656.25</p></td>
-<td><p>7831.38</p></td>
-<td><p>3882.21</p></td>
-<td><p>2194.57</p></td>
-<td><p>1843.91</p></td>
+<td><p>8,375.67</p></td>
+<td><p>6,588.73</p></td>
+<td><p>7,829.91</p></td>
+<td><p>3,931.61</p></td>
+<td><p>2,215.88</p></td>
+<td><p>1,842.82</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/4096</p></td>
 <td><p>1</p></td>
-<td><p>5062.80</p></td>
-<td><p>3678.91</p></td>
-<td><p>3968.98</p></td>
-<td><p>2046.53</p></td>
-<td><p>1118.22</p></td>
-<td><p>980.67</p></td>
+<td><p>5,048.59</p></td>
+<td><p>3,662.81</p></td>
+<td><p>3,955.28</p></td>
+<td><p>2,041.06</p></td>
+<td><p>1,118.12</p></td>
+<td><p>980.23</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/128</p></td>
 <td><p>1</p></td>
-<td><p>2776.53</p></td>
-<td><p>2491.03</p></td>
-<td><p>2724.38</p></td>
-<td><p>1488.56</p></td>
-<td><p>657.01</p></td>
-<td><p>741.06</p></td>
+<td><p>2,770.27</p></td>
+<td><p>2,520.37</p></td>
+<td><p>2,698.08</p></td>
+<td><p>1,479.48</p></td>
+<td><p>650.09</p></td>
+<td><p>746.54</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>1,791.39</p></td>
+<td><p>1,449.23</p></td>
+<td><p>1,623.17</p></td>
+<td><p>818.80</p></td>
+<td><p>436.85</p></td>
+<td><p>413.33</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>6,770.60</p></td>
+<td><p>5,565.62</p></td>
+<td><p>6,149.65</p></td>
+<td><p>3,030.03</p></td>
+<td><p>1,673.05</p></td>
+<td><p>1,538.45</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>6,465.73</p></td>
+<td><p>5,580.37</p></td>
+<td><p>6,078.80</p></td>
+<td><p>2,797.48</p></td>
+<td><p>1,673.45</p></td>
+<td><p>1,531.57</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>1</p></td>
+<td><p>3,637.42</p></td>
+<td><p>2,998.01</p></td>
+<td><p>3,060.80</p></td>
+<td><p>1,285.08</p></td>
+<td><p>845.83</p></td>
+<td><p>753.55</p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA v3.1 8B</p></td>
+<td><p>128/128</p></td>
+<td><p>1</p></td>
+<td><p>28,125.59</p></td>
+<td><p>26,045.60</p></td>
+<td><p>27,147.22</p></td>
+<td><p>15,647.83</p></td>
+<td><p>6,687.04</p></td>
+<td><p>8,548.90</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>1</p></td>
+<td><p>22,989.20</p></td>
+<td><p>16,497.79</p></td>
+<td><p>19,221.02</p></td>
+<td><p>8,882.95</p></td>
+<td><p>4,918.53</p></td>
+<td><p>4,988.61</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>16,077.62</p></td>
+<td><p>9,637.91</p></td>
+<td><p>11,856.11</p></td>
+<td><p>5,462.96</p></td>
+<td><p>3,054.46</p></td>
+<td><p>2,768.91</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>1</p></td>
+<td><p>3,625.83</p></td>
+<td><p>3,357.60</p></td>
+<td><p>3,497.30</p></td>
+<td><p>1,859.37</p></td>
+<td><p>796.17</p></td>
+<td><p>1,000.90</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>3,823.76</p></td>
+<td><p>3,217.40</p></td>
+<td><p>3,276.69</p></td>
+<td><p>1,687.74</p></td>
+<td><p>788.66</p></td>
+<td><p>872.14</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>19,382.37</p></td>
+<td><p>15,128.77</p></td>
+<td><p>13,996.05</p></td>
+<td><p>6,834.76</p></td>
+<td><p>3,929.83</p></td>
+<td><p>3,911.14</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>16,435.21</p></td>
+<td><p>12,355.41</p></td>
+<td><p>13,411.43</p></td>
+<td><p>7,160.92</p></td>
+<td><p>3,592.16</p></td>
+<td><p>3,648.21</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>1</p></td>
+<td><p>11,072.97</p></td>
+<td><p>7,850.75</p></td>
+<td><p>8,851.23</p></td>
+<td><p>4,152.21</p></td>
+<td><p>2,269.78</p></td>
+<td><p>2,055.78</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>20000/2000</p></td>
+<td><p>1</p></td>
+<td><p>1,634.98</p></td>
+<td><p>1,200.89</p></td>
+<td><p>1,278.04</p></td>
+<td><p>595.89</p></td>
+<td><p>316.43</p></td>
+<td><p>263.75</p></td>
+</tr>
+<tr class="row-even"><td><p>LLaMA v3 8B</p></td>
+<td><p>128/128</p></td>
+<td><p>1</p></td>
+<td><p>27,940.47</p></td>
+<td><p>26,117.13</p></td>
+<td><p>27,156.81</p></td>
+<td><p>15,489.11</p></td>
+<td><p>6,656.98</p></td>
+<td><p>8,734.57</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>1</p></td>
+<td><p>23,228.98</p></td>
+<td><p>16,417.04</p></td>
+<td><p>19,209.17</p></td>
+<td><p>8,901.43</p></td>
+<td><p>4,967.37</p></td>
+<td><p>5,004.93</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>15,980.94</p></td>
+<td><p>9,351.95</p></td>
+<td><p>11,889.67</p></td>
+<td><p>5,455.91</p></td>
+<td><p>3,053.27</p></td>
+<td><p>2,768.15</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>1</p></td>
+<td><p>3,631.45</p></td>
+<td><p>3,339.90</p></td>
+<td><p>3,476.37</p></td>
+<td><p>1,918.56</p></td>
+<td><p>796.28</p></td>
+<td><p>1,050.68</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>3,836.98</p></td>
+<td><p>3,186.22</p></td>
+<td><p>3,279.24</p></td>
+<td><p>1,668.42</p></td>
+<td><p>792.95</p></td>
+<td><p>860.31</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>19,725.45</p></td>
+<td><p>15,241.74</p></td>
+<td><p>14,218.30</p></td>
+<td><p>6,816.62</p></td>
+<td><p>3,899.64</p></td>
+<td><p>3,990.73</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>16,201.60</p></td>
+<td><p>12,049.81</p></td>
+<td><p>13,371.60</p></td>
+<td><p>7,041.47</p></td>
+<td><p>3,617.10</p></td>
+<td><p>3,679.10</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>3631.54</p></td>
-<td><p>2994.81</p></td>
-<td><p>3004.17</p></td>
-<td><p>1280.54</p></td>
-<td><p>854.37</p></td>
-<td><p>754.16</p></td>
+<td><p>11,097.69</p></td>
+<td><p>7,255.55</p></td>
+<td><p>8,852.87</p></td>
+<td><p>4,251.45</p></td>
+<td><p>2,269.68</p></td>
+<td><p>2,048.94</p></td>
 </tr>
 <tr class="row-even"><td><p>LLaMA v2 7B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>19706.35</p></td>
-<td><p>17803.58</p></td>
-<td><p>19068.99</p></td>
-<td><p>11393.48</p></td>
-<td><p>5272.39</p></td>
-<td><p>6345.72</p></td>
+<td><p>19,549.13</p></td>
+<td><p>17,823.45</p></td>
+<td><p>19,298.99</p></td>
+<td><p>11,436.31</p></td>
+<td><p>5,238.68</p></td>
+<td><p>6,396.62</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>1</p></td>
-<td><p>7651.12</p></td>
-<td><p>5472.34</p></td>
-<td><p>6610.03</p></td>
-<td><p>2964.65</p></td>
-<td><p>1785.79</p></td>
-<td><p>1551.37</p></td>
+<td><p>7,675.14</p></td>
+<td><p>5,438.53</p></td>
+<td><p>6,607.33</p></td>
+<td><p>2,985.61</p></td>
+<td><p>1,807.39</p></td>
+<td><p>1,566.03</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>128/4096</p></td>
 <td><p>1</p></td>
-<td><p>4424.90</p></td>
-<td><p>3271.61</p></td>
-<td><p>3649.38</p></td>
-<td><p>1596.87</p></td>
-<td><p>957.12</p></td>
-<td><p>817.24</p></td>
+<td><p>4,397.83</p></td>
+<td><p>3,310.09</p></td>
+<td><p>3,628.46</p></td>
+<td><p>1,575.35</p></td>
+<td><p>957.24</p></td>
+<td><p>821.83</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>2048/128</p></td>
 <td><p>1</p></td>
-<td><p>2385.54</p></td>
-<td><p>2035.42</p></td>
-<td><p>2271.63</p></td>
-<td><p>1189.06</p></td>
-<td><p>564.77</p></td>
-<td><p>625.09</p></td>
+<td><p>2,392.31</p></td>
+<td><p>2,064.18</p></td>
+<td><p>2,304.02</p></td>
+<td><p>1,157.55</p></td>
+<td><p>560.35</p></td>
+<td><p>619.83</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
-<td><p>2048/2048</p></td>
+<td><p>5000/500</p></td>
 <td><p>1</p></td>
-<td><p>3191.34</p></td>
-<td><p>2726.29</p></td>
-<td><p>2802.41</p></td>
-<td><p>1243.96</p></td>
-<td><p>735.19</p></td>
-<td><p>641.56</p></td>
-</tr>
-<tr class="row-odd"><td><p>LLaMA v3 8B</p></td>
-<td><p>128/128</p></td>
-<td><p>1</p></td>
-<td><p>28288.75</p></td>
-<td><p>25420.52</p></td>
-<td><p>27399.75</p></td>
-<td><p>15567.44</p></td>
-<td><p>6586.88</p></td>
-<td><p>8745.80</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>23230.62</p></td>
-<td><p>16426.68</p></td>
-<td><p>19198.73</p></td>
-<td><p>8817.39</p></td>
-<td><p>4882.13</p></td>
-<td><p>5084.49</p></td>
+<td><p>1,570.37</p></td>
+<td><p>1,250.11</p></td>
+<td><p>1,419.09</p></td>
+<td><p>624.75</p></td>
+<td><p>366.39</p></td>
+<td><p>347.03</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>128/4096</p></td>
+<td><p>500/2000</p></td>
 <td><p>1</p></td>
-<td><p>16144.44</p></td>
-<td><p>9832.66</p></td>
-<td><p>12084.97</p></td>
-<td><p>5352.37</p></td>
-<td><p>3079.90</p></td>
-<td><p>2755.13</p></td>
+<td><p>6,044.15</p></td>
+<td><p>4,717.51</p></td>
+<td><p>5,188.69</p></td>
+<td><p>2,382.75</p></td>
+<td><p>1,408.58</p></td>
+<td><p>1,231.78</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
+<td><p>1000/1000</p></td>
 <td><p>1</p></td>
-<td><p>3623.79</p></td>
-<td><p>3290.22</p></td>
-<td><p>3463.26</p></td>
-<td><p>1852.48</p></td>
-<td><p>781.63</p></td>
-<td><p>980.86</p></td>
+<td><p>5,896.10</p></td>
+<td><p>4,825.24</p></td>
+<td><p>5,208.97</p></td>
+<td><p>2,462.65</p></td>
+<td><p>1,431.92</p></td>
+<td><p>1,277.79</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>11093.62</p></td>
-<td><p>7573.35</p></td>
-<td><p>8894.11</p></td>
-<td><p>3986.83</p></td>
-<td><p>2268.13</p></td>
-<td><p>2051.79</p></td>
+<td><p>3,193.42</p></td>
+<td><p>2,693.21</p></td>
+<td><p>2,792.53</p></td>
+<td><p>1,263.11</p></td>
+<td><p>734.38</p></td>
+<td><p>641.47</p></td>
 </tr>
 <tr class="row-even"><td><p>Mistral 7B</p></td>
 <td><p>128/128</p></td>
 <td><p>1</p></td>
-<td><p>30223.01</p></td>
-<td><p>27696.90</p></td>
-<td><p>29788.46</p></td>
-<td><p>16319.25</p></td>
-<td><p>6807.02</p></td>
-<td><p>9612.58</p></td>
+<td><p>30,152.19</p></td>
+<td><p>27,738.08</p></td>
+<td><p>29,672.75</p></td>
+<td><p>16,711.12</p></td>
+<td><p>6,863.59</p></td>
+<td><p>9,676.88</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
 <td><p>1</p></td>
-<td><p>24989.54</p></td>
-<td><p>17942.29</p></td>
-<td><p>20509.72</p></td>
-<td><p>9982.01</p></td>
-<td><p>5296.02</p></td>
-<td><p>5444.89</p></td>
+<td><p>24,742.09</p></td>
+<td><p>17,528.14</p></td>
+<td><p>20,318.60</p></td>
+<td><p>9,774.11</p></td>
+<td><p>5,321.44</p></td>
+<td><p>5,437.25</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>128/4096</p></td>
 <td><p>1</p></td>
-<td><p>17036.14</p></td>
-<td><p>10846.03</p></td>
-<td><p>12807.80</p></td>
-<td><p>5718.89</p></td>
-<td><p>3241.33</p></td>
-<td><p>2931.17</p></td>
+<td><p>16,905.49</p></td>
+<td><p>10,671.38</p></td>
+<td><p>12,715.46</p></td>
+<td><p>5,740.41</p></td>
+<td><p>3,257.23</p></td>
+<td><p>2,941.08</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>2048/128</p></td>
 <td><p>1</p></td>
-<td><p>3678.80</p></td>
-<td><p>3294.02</p></td>
-<td><p>3521.71</p></td>
-<td><p>1887.75</p></td>
-<td><p>786.43</p></td>
-<td><p>1002.49</p></td>
+<td><p>3,676.37</p></td>
+<td><p>3,369.77</p></td>
+<td><p>3,502.83</p></td>
+<td><p>1,893.42</p></td>
+<td><p>796.00</p></td>
+<td><p>996.65</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>3,890.07</p></td>
+<td><p>3,401.45</p></td>
+<td><p>3,358.65</p></td>
+<td><p>1,740.69</p></td>
+<td><p>807.07</p></td>
+<td><p>904.45</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>20,788.70</p></td>
+<td><p>15,035.59</p></td>
+<td><p>15,962.94</p></td>
+<td><p>7,494.80</p></td>
+<td><p>4,168.89</p></td>
+<td><p>4,088.52</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>17,620.46</p></td>
+<td><p>13,362.84</p></td>
+<td><p>14,213.48</p></td>
+<td><p>7,281.07</p></td>
+<td><p>3,794.31</p></td>
+<td><p>3,972.63</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
 <td><p>2048/2048</p></td>
 <td><p>1</p></td>
-<td><p>11510.54</p></td>
-<td><p>8357.75</p></td>
-<td><p>9214.61</p></td>
-<td><p>4284.82</p></td>
-<td><p>2363.25</p></td>
-<td><p>2154.26</p></td>
+<td><p>11,747.88</p></td>
+<td><p>8,599.03</p></td>
+<td><p>9,200.19</p></td>
+<td><p>4,349.39</p></td>
+<td><p>2,320.50</p></td>
+<td><p>2,170.16</p></td>
 </tr>
-<tr class="row-odd"><td><p>Mixtral 8x7B</p></td>
+<tr class="row-even"><td><p></p></td>
+<td><p>20000/2000</p></td>
+<td><p>1</p></td>
+<td><p>1,693.41</p></td>
+<td><p>1,271.85</p></td>
+<td><p>1,299.05</p></td>
+<td><p>609.91</p></td>
+<td><p>324.52</p></td>
+<td><p>276.19</p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA v3.1 405B</p></td>
 <td><p>128/128</p></td>
-<td><p>2</p></td>
-<td><p>24895.03</p></td>
-<td><p>8785.80</p></td>
-<td><p>24394.71</p></td>
-<td><p>15529.86</p></td>
-<td><p>5921.41</p></td>
+<td><p>8</p></td>
+<td><p>3,734.50</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>42014.24</p></td>
-<td><p>38828.53</p></td>
-<td><p>40197.42</p></td>
-<td><p>28132.17</p></td>
-<td><p>11414.95</p></td>
-<td><p>6820.26</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
-<td><p>2</p></td>
-<td><p>29389.21</p></td>
-<td><p>5474.69</p></td>
-<td><p>20873.02</p></td>
-<td><p>7066.02</p></td>
-<td><p>4306.98</p></td>
+<td><p>8</p></td>
+<td><p>3,039.70</p></td>
 <td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>52348.10</p></td>
-<td><p>41573.66</p></td>
-<td><p>40588.05</p></td>
-<td><p>21285.72</p></td>
-<td><p>10974.83</p></td>
-<td><p>7467.15</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/4096</p></td>
-<td><p>2</p></td>
-<td><p>21480.27</p></td>
-<td><p>2277.66</p></td>
-<td><p>12838.28</p></td>
-<td><p>3986.01</p></td>
-<td><p>2400.11</p></td>
+<td><p>8</p></td>
+<td><p>3,144.97</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>39182.04</p></td>
-<td><p>28626.55</p></td>
-<td><p>28337.31</p></td>
-<td><p>12447.13</p></td>
-<td><p>7278.89</p></td>
-<td><p>5233.43</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
 <td><p>2048/128</p></td>
-<td><p>2</p></td>
-<td><p>2934.44</p></td>
-<td><p>1003.51</p></td>
-<td><p>2898.27</p></td>
-<td><p>1834.77</p></td>
-<td><p>693.51</p></td>
+<td><p>8</p></td>
+<td><p>454.17</p></td>
 <td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>5152.40</p></td>
-<td><p>4724.01</p></td>
-<td><p>5028.61</p></td>
-<td><p>3393.18</p></td>
-<td><p>1362.93</p></td>
-<td><p>805.49</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>2</p></td>
-<td><p>14029.17</p></td>
-<td><p>2671.88</p></td>
-<td><p>10479.45</p></td>
-<td><p>3531.31</p></td>
-<td><p>1945.88</p></td>
+<td><p>5000/500</p></td>
+<td><p>8</p></td>
+<td><p>459.91</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>8</p></td>
+<td><p>2,967.98</p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>25436.05</p></td>
-<td><p>20302.56</p></td>
-<td><p>19971.72</p></td>
-<td><p>9622.66</p></td>
-<td><p>5221.74</p></td>
-<td><p>3616.30</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>LLaMA v3 70B</p></td>
+<tr class="row-odd"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>8</p></td>
+<td><p>2,259.32</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>8</p></td>
+<td><p>2,067.15</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>20000/2000</p></td>
+<td><p>8</p></td>
+<td><p>447.67</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p>LLaMA v3.1 70B</p></td>
 <td><p>128/128</p></td>
+<td><p>1</p></td>
+<td><p>3,923.61</p></td>
+<td><p>2,998.99</p></td>
+<td><p>2,168.72</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>2</p></td>
-<td><p>5386.88</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p>2959.22</p></td>
-<td><p>1301.14</p></td>
+<td><p>5,358.16</p></td>
+<td><p>1,839.02</p></td>
+<td><p>5,215.12</p></td>
+<td><p>3,156.10</p></td>
+<td><p>1,340.20</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>4</p></td>
-<td><p>8944.26</p></td>
-<td><p>8587.01</p></td>
-<td><p>8642.05</p></td>
-<td><p>5966.47</p></td>
-<td><p>2413.95</p></td>
-<td><p></p></td>
+<td><p>8,969.59</p></td>
+<td><p>8,655.98</p></td>
+<td><p>8,677.59</p></td>
+<td><p>5,845.53</p></td>
+<td><p>2,426.46</p></td>
+<td><p>1,434.63</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>16125.20</p></td>
+<td><p>16,449.68</p></td>
 <td><p></p></td>
-<td><p>15397.47</p></td>
-<td><p>10406.55</p></td>
-<td><p>4548.32</p></td>
-<td><p>1364.08</p></td>
+<td><p>15,711.60</p></td>
+<td><p>10,643.75</p></td>
+<td><p>4,491.42</p></td>
+<td><p>1,365.36</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>128/2048</p></td>
-<td><p>2</p></td>
-<td><p>7007.27</p></td>
+<td><p>1</p></td>
+<td><p>3,503.59</p></td>
+<td><p>1,343.53</p></td>
+<td><p>344.22</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p>720.73</p></td>
-<td><p>500.83</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>12906.75</p></td>
-<td><p>10761.53</p></td>
-<td><p>8978.95</p></td>
-<td><p>4736.61</p></td>
-<td><p>2380.02</p></td>
+<td><p>2</p></td>
+<td><p>7,068.42</p></td>
+<td><p>1,146.08</p></td>
+<td><p>5,654.43</p></td>
+<td><p>801.82</p></td>
+<td><p>498.44</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>19417.37</p></td>
-<td><p></p></td>
-<td><p>14822.93</p></td>
-<td><p>6672.14</p></td>
-<td><p>3815.08</p></td>
-<td><p>1809.40</p></td>
+<td><p>4</p></td>
+<td><p>12,890.95</p></td>
+<td><p>10,358.10</p></td>
+<td><p>9,377.87</p></td>
+<td><p>4,791.11</p></td>
+<td><p>2,460.91</p></td>
+<td><p>1,748.87</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>19,947.02</p></td>
+<td><p></p></td>
+<td><p>15,168.97</p></td>
+<td><p>6,892.18</p></td>
+<td><p>4,148.33</p></td>
+<td><p>1,890.62</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>2,314.83</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>2</p></td>
-<td><p>6183.85</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p>369.29</p></td>
-<td><p>251.24</p></td>
+<td><p>6,227.19</p></td>
+<td><p>896.56</p></td>
+<td><p>3,302.41</p></td>
+<td><p>413.22</p></td>
+<td><p>268.86</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>4</p></td>
-<td><p>8859.54</p></td>
-<td><p>7270.77</p></td>
-<td><p>6073.48</p></td>
-<td><p>2969.99</p></td>
-<td><p>1634.82</p></td>
-<td><p></p></td>
+<td><p>10,059.64</p></td>
+<td><p>6,628.22</p></td>
+<td><p>6,501.69</p></td>
+<td><p>3,056.98</p></td>
+<td><p>1,660.93</p></td>
+<td><p>1,180.87</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>13969.95</p></td>
+<td><p>14,393.28</p></td>
 <td><p></p></td>
-<td><p>10094.57</p></td>
-<td><p>4358.77</p></td>
-<td><p>2847.54</p></td>
-<td><p>1313.78</p></td>
+<td><p>9,699.99</p></td>
+<td><p>4,238.15</p></td>
+<td><p>2,705.77</p></td>
+<td><p>1,417.60</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/128</p></td>
-<td><p>2</p></td>
-<td><p>696.59</p></td>
+<td><p>1</p></td>
+<td><p>459.73</p></td>
+<td><p>372.44</p></td>
+<td><p>211.51</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p>301.46</p></td>
-<td><p>140.88</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>1044.35</p></td>
-<td><p>1000.55</p></td>
-<td><p>1022.06</p></td>
-<td><p>681.72</p></td>
-<td><p>278.76</p></td>
+<td><p>2</p></td>
+<td><p>689.30</p></td>
+<td><p>280.61</p></td>
+<td><p>690.05</p></td>
+<td><p>323.66</p></td>
+<td><p>143.39</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>2018.47</p></td>
-<td><p></p></td>
-<td><p>1933.15</p></td>
-<td><p>1279.46</p></td>
-<td><p>543.73</p></td>
-<td><p>163.36</p></td>
+<td><p>4</p></td>
+<td><p>1,047.96</p></td>
+<td><p>1,015.14</p></td>
+<td><p>1,016.24</p></td>
+<td><p>672.37</p></td>
+<td><p>278.87</p></td>
+<td><p>167.87</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2,061.19</p></td>
+<td><p></p></td>
+<td><p>1,964.49</p></td>
+<td><p>1,273.97</p></td>
+<td><p>539.57</p></td>
+<td><p>163.91</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>534.79</p></td>
+<td><p>283.19</p></td>
+<td><p>112.21</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>943.78</p></td>
+<td><p>337.04</p></td>
+<td><p>897.36</p></td>
+<td><p>224.31</p></td>
+<td><p>115.63</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1,437.45</p></td>
+<td><p>1,383.61</p></td>
+<td><p>1,329.82</p></td>
+<td><p>851.12</p></td>
+<td><p>361.39</p></td>
+<td><p>235.90</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2,795.95</p></td>
+<td><p></p></td>
+<td><p>2,472.69</p></td>
+<td><p>1,438.10</p></td>
+<td><p>679.27</p></td>
+<td><p>224.33</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>2,758.24</p></td>
+<td><p>1,083.48</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>6,063.53</p></td>
+<td><p>851.46</p></td>
+<td><p>4,347.69</p></td>
+<td><p>652.34</p></td>
+<td><p>423.06</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>10,061.89</p></td>
+<td><p>9,090.78</p></td>
+<td><p>8,378.16</p></td>
+<td><p>3,441.34</p></td>
+<td><p>2,072.88</p></td>
+<td><p>1,436.41</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>16,139.49</p></td>
+<td><p></p></td>
+<td><p>10,790.85</p></td>
+<td><p>5,792.17</p></td>
+<td><p>3,115.20</p></td>
+<td><p>1,512.78</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>2,539.65</p></td>
+<td><p>728.79</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>4,572.03</p></td>
+<td><p>1,223.92</p></td>
+<td><p>3,880.41</p></td>
+<td><p>737.40</p></td>
+<td><p>451.82</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>7,612.56</p></td>
+<td><p>6,705.02</p></td>
+<td><p>6,553.00</p></td>
+<td><p>3,655.64</p></td>
+<td><p>1,731.86</p></td>
+<td><p>1,113.18</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>12,660.86</p></td>
+<td><p></p></td>
+<td><p>11,121.10</p></td>
+<td><p>5,599.45</p></td>
+<td><p>3,013.95</p></td>
+<td><p>1,120.73</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
+<td><p>1</p></td>
+<td><p>1,753.58</p></td>
+<td><p>611.08</p></td>
+<td><p>161.60</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>2</p></td>
-<td><p>3525.18</p></td>
+<td><p>3,407.26</p></td>
+<td><p>626.26</p></td>
+<td><p>2,432.55</p></td>
 <td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p>87.54</p></td>
+<td><p>108.91</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>4</p></td>
-<td><p>6550.76</p></td>
-<td><p>4859.38</p></td>
-<td><p>4870.26</p></td>
-<td><p>2379.66</p></td>
-<td><p>1209.69</p></td>
-<td><p></p></td>
+<td><p>6,565.77</p></td>
+<td><p>4,864.55</p></td>
+<td><p>4,948.83</p></td>
+<td><p>2,396.06</p></td>
+<td><p>1,220.93</p></td>
+<td><p>855.44</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>9706.95</p></td>
+<td><p>9,948.56</p></td>
 <td><p></p></td>
-<td><p>7670.04</p></td>
-<td><p>3692.41</p></td>
-<td><p>2192.28</p></td>
-<td><p>895.23</p></td>
+<td><p>8,527.52</p></td>
+<td><p>3,819.60</p></td>
+<td><p>2,103.68</p></td>
+<td><p>924.89</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>20000/2000</p></td>
+<td><p>1</p></td>
+<td><p>262.82</p></td>
+<td><p>88.89</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>598.19</p></td>
+<td><p>177.04</p></td>
+<td><p>414.17</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1,047.27</p></td>
+<td><p>958.88</p></td>
+<td><p>856.31</p></td>
+<td><p>375.85</p></td>
+<td><p>187.42</p></td>
+<td><p>140.73</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>1,793.52</p></td>
+<td><p></p></td>
+<td><p>1,359.27</p></td>
+<td><p>650.78</p></td>
+<td><p>344.41</p></td>
+<td><p>122.04</p></td>
+</tr>
+<tr class="row-even"><td><p>LLaMA v3 70B</p></td>
+<td><p>128/128</p></td>
+<td><p>1</p></td>
+<td><p>3,924.02</p></td>
+<td><p>3,161.73</p></td>
+<td><p>2,177.84</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>5,388.22</p></td>
+<td><p>1,551.84</p></td>
+<td><p>5,205.80</p></td>
+<td><p>3,186.61</p></td>
+<td><p>1,321.55</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>8,958.95</p></td>
+<td><p>8,618.55</p></td>
+<td><p>8,678.68</p></td>
+<td><p>5,857.16</p></td>
+<td><p>2,424.68</p></td>
+<td><p>1,432.46</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>16,375.41</p></td>
+<td><p></p></td>
+<td><p>15,703.26</p></td>
+<td><p>10,627.36</p></td>
+<td><p>4,490.19</p></td>
+<td><p>1,333.09</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/2048</p></td>
+<td><p>1</p></td>
+<td><p>3,519.24</p></td>
+<td><p>1,346.37</p></td>
+<td><p>353.68</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>7,071.54</p></td>
+<td><p>862.54</p></td>
+<td><p>5,878.06</p></td>
+<td><p>802.98</p></td>
+<td><p>512.11</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>12,876.38</p></td>
+<td><p>10,015.23</p></td>
+<td><p>8,929.23</p></td>
+<td><p>4,768.27</p></td>
+<td><p>2,458.73</p></td>
+<td><p>1,737.31</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>20,013.92</p></td>
+<td><p></p></td>
+<td><p>15,171.91</p></td>
+<td><p>6,875.97</p></td>
+<td><p>3,906.35</p></td>
+<td><p>1,892.41</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>1</p></td>
+<td><p>2,310.85</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>6,199.95</p></td>
+<td><p>602.98</p></td>
+<td><p>3,311.05</p></td>
+<td><p>413.29</p></td>
+<td><p>269.02</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>9,633.49</p></td>
+<td><p>7,370.19</p></td>
+<td><p>6,489.95</p></td>
+<td><p>3,053.89</p></td>
+<td><p>1,677.51</p></td>
+<td><p>1,199.71</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>14,552.09</p></td>
+<td><p></p></td>
+<td><p>9,632.02</p></td>
+<td><p>4,259.39</p></td>
+<td><p>2,697.61</p></td>
+<td><p>1,358.34</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/128</p></td>
+<td><p>1</p></td>
+<td><p>458.75</p></td>
+<td><p>371.70</p></td>
+<td><p>210.27</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>694.00</p></td>
+<td><p>277.85</p></td>
+<td><p>692.74</p></td>
+<td><p>321.71</p></td>
+<td><p>144.61</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1,048.84</p></td>
+<td><p>1,016.03</p></td>
+<td><p>1,022.77</p></td>
+<td><p>690.10</p></td>
+<td><p>279.06</p></td>
+<td><p>168.52</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2,072.33</p></td>
+<td><p></p></td>
+<td><p>1,976.76</p></td>
+<td><p>1,273.41</p></td>
+<td><p>542.93</p></td>
+<td><p>158.63</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>533.37</p></td>
+<td><p>303.33</p></td>
+<td><p>112.68</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>936.82</p></td>
+<td><p>379.62</p></td>
+<td><p>899.29</p></td>
+<td><p>224.65</p></td>
+<td><p>115.00</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1,442.76</p></td>
+<td><p>1,384.62</p></td>
+<td><p>1,326.95</p></td>
+<td><p>853.73</p></td>
+<td><p>361.06</p></td>
+<td><p>235.19</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2,797.36</p></td>
+<td><p></p></td>
+<td><p>2,483.56</p></td>
+<td><p>1,437.15</p></td>
+<td><p>678.70</p></td>
+<td><p>225.15</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>2,763.89</p></td>
+<td><p>1,074.62</p></td>
+<td><p>293.47</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>6,054.46</p></td>
+<td><p>1,109.13</p></td>
+<td><p>4,356.55</p></td>
+<td><p>683.11</p></td>
+<td><p>423.82</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>10,103.08</p></td>
+<td><p>7,325.93</p></td>
+<td><p>8,370.32</p></td>
+<td><p>3,436.29</p></td>
+<td><p>2,064.47</p></td>
+<td><p>1,412.78</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>16,857.45</p></td>
+<td><p></p></td>
+<td><p>10,760.65</p></td>
+<td><p>5,665.02</p></td>
+<td><p>3,159.89</p></td>
+<td><p>1,517.76</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>2,540.45</p></td>
+<td><p>1,164.45</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>4,590.38</p></td>
+<td><p>1,040.64</p></td>
+<td><p>3,879.25</p></td>
+<td><p>768.53</p></td>
+<td><p>453.73</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>7,606.92</p></td>
+<td><p>6,655.61</p></td>
+<td><p>6,547.23</p></td>
+<td><p>3,655.19</p></td>
+<td><p>1,732.86</p></td>
+<td><p>1,117.53</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>12,660.32</p></td>
+<td><p></p></td>
+<td><p>11,155.47</p></td>
+<td><p>5,617.24</p></td>
+<td><p>2,894.58</p></td>
+<td><p>1,126.50</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>1</p></td>
+<td><p>1,746.77</p></td>
+<td><p>610.87</p></td>
+<td><p>162.10</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>3,405.72</p></td>
+<td><p>738.51</p></td>
+<td><p>2,548.70</p></td>
+<td><p></p></td>
+<td><p>108.66</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>6,571.34</p></td>
+<td><p>4,880.28</p></td>
+<td><p>5,060.39</p></td>
+<td><p>2,391.55</p></td>
+<td><p>1,222.11</p></td>
+<td><p>854.65</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>9,923.96</p></td>
+<td><p></p></td>
+<td><p>8,480.48</p></td>
+<td><p>3,826.38</p></td>
+<td><p>2,181.07</p></td>
+<td><p>927.54</p></td>
 </tr>
 <tr class="row-even"><td><p>LLaMA v2 70B</p></td>
 <td><p>128/128</p></td>
-<td><p>2</p></td>
-<td><p>6355.16</p></td>
+<td><p>1</p></td>
+<td><p>3,969.25</p></td>
+<td><p>3,502.35</p></td>
+<td><p>3,413.82</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p>2927.71</p></td>
-<td><p>1374.05</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>10818.97</p></td>
-<td><p>10819.19</p></td>
-<td><p>10754.99</p></td>
-<td><p>6603.10</p></td>
-<td><p>2765.94</p></td>
+<td><p>2</p></td>
+<td><p>6,394.64</p></td>
+<td><p>3,252.69</p></td>
+<td><p>6,432.82</p></td>
+<td><p>3,170.28</p></td>
+<td><p>1,336.48</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>16667.25</p></td>
-<td><p></p></td>
-<td><p>16074.84</p></td>
-<td><p>11369.11</p></td>
-<td><p>4796.89</p></td>
-<td><p>1402.92</p></td>
+<td><p>4</p></td>
+<td><p>11,031.42</p></td>
+<td><p>11,126.95</p></td>
+<td><p>10,865.42</p></td>
+<td><p>6,420.88</p></td>
+<td><p>2,766.00</p></td>
+<td><p>1,487.71</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>17,060.04</p></td>
+<td><p></p></td>
+<td><p>16,384.83</p></td>
+<td><p>11,146.15</p></td>
+<td><p>4,742.74</p></td>
+<td><p>1,404.99</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>128/2048</p></td>
+<td><p>1</p></td>
+<td><p>3,742.99</p></td>
+<td><p>1,660.81</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>2</p></td>
-<td><p>6185.77</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p>668.52</p></td>
-<td><p>445.04</p></td>
+<td><p>6,453.25</p></td>
+<td><p>1,335.80</p></td>
+<td><p>5,775.34</p></td>
+<td><p>757.21</p></td>
+<td><p>476.46</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>4</p></td>
-<td><p>12884.76</p></td>
-<td><p>11356.48</p></td>
-<td><p>8870.71</p></td>
-<td><p>5067.06</p></td>
-<td><p>2710.53</p></td>
-<td><p></p></td>
+<td><p>13,869.67</p></td>
+<td><p>11,098.69</p></td>
+<td><p>9,536.82</p></td>
+<td><p>5,274.27</p></td>
+<td><p>2,686.16</p></td>
+<td><p>1,880.22</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>19053.13</p></td>
+<td><p>19,220.48</p></td>
 <td><p></p></td>
-<td><p>17534.62</p></td>
-<td><p>8805.16</p></td>
-<td><p>5665.93</p></td>
-<td><p>2203.33</p></td>
+<td><p>17,715.01</p></td>
+<td><p>8,904.94</p></td>
+<td><p>5,520.41</p></td>
+<td><p>2,186.68</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>128/4096</p></td>
-<td><p>2</p></td>
-<td><p>4873.24</p></td>
+<td><p>1</p></td>
+<td><p>2,459.63</p></td>
+<td><p></p></td>
+<td><p>446.60</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p>334.10</p></td>
-<td><p>215.70</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>8664.90</p></td>
-<td><p>6311.85</p></td>
-<td><p>7564.99</p></td>
-<td><p>3354.02</p></td>
-<td><p>1884.46</p></td>
+<td><p>2</p></td>
+<td><p>4,831.03</p></td>
+<td><p>684.68</p></td>
+<td><p>3,354.60</p></td>
+<td><p>385.98</p></td>
+<td><p>235.22</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>15110.32</p></td>
-<td><p></p></td>
-<td><p>10584.03</p></td>
-<td><p>5373.10</p></td>
-<td><p>3672.80</p></td>
-<td><p>1787.76</p></td>
+<td><p>4</p></td>
+<td><p>8,988.84</p></td>
+<td><p>8,397.13</p></td>
+<td><p>7,619.62</p></td>
+<td><p>3,228.36</p></td>
+<td><p>1,941.07</p></td>
+<td><p>1,318.51</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>15,115.41</p></td>
+<td><p></p></td>
+<td><p>12,506.95</p></td>
+<td><p>5,996.81</p></td>
+<td><p>3,539.36</p></td>
+<td><p>1,782.93</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>2048/128</p></td>
+<td><p>1</p></td>
+<td><p>458.88</p></td>
+<td><p>400.31</p></td>
+<td><p>328.90</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>2</p></td>
-<td><p>732.09</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p>302.49</p></td>
-<td><p>141.70</p></td>
+<td><p>745.71</p></td>
+<td><p>457.57</p></td>
+<td><p>742.17</p></td>
+<td><p>308.02</p></td>
+<td><p>138.81</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>4</p></td>
-<td><p>1272.90</p></td>
-<td><p>1269.58</p></td>
-<td><p>1265.80</p></td>
-<td><p>774.93</p></td>
-<td><p>320.79</p></td>
-<td><p></p></td>
+<td><p>1,297.10</p></td>
+<td><p>1,330.90</p></td>
+<td><p>1,270.78</p></td>
+<td><p>755.30</p></td>
+<td><p>321.72</p></td>
+<td><p>171.67</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>2015.77</p></td>
+<td><p>2,060.53</p></td>
 <td><p></p></td>
-<td><p>1943.96</p></td>
-<td><p>1355.78</p></td>
-<td><p>569.48</p></td>
-<td><p>165.52</p></td>
+<td><p>2,009.57</p></td>
+<td><p>1,348.71</p></td>
+<td><p>561.71</p></td>
+<td><p>160.37</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>1</p></td>
+<td><p>548.46</p></td>
+<td><p>364.00</p></td>
+<td><p>224.17</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>1,020.86</p></td>
+<td><p>335.07</p></td>
+<td><p>885.67</p></td>
+<td><p>212.20</p></td>
+<td><p>112.43</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>1,759.69</p></td>
+<td><p>1,683.26</p></td>
+<td><p>1,590.94</p></td>
+<td><p>837.57</p></td>
+<td><p>386.78</p></td>
+<td><p>231.54</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>2,839.69</p></td>
+<td><p></p></td>
+<td><p>2,546.12</p></td>
+<td><p>1,570.91</p></td>
+<td><p>709.66</p></td>
+<td><p>238.59</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>1</p></td>
+<td><p>3,019.28</p></td>
+<td><p>1,364.66</p></td>
+<td><p>716.54</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>6,402.94</p></td>
+<td><p>1,292.24</p></td>
+<td><p>4,462.98</p></td>
+<td><p>629.21</p></td>
+<td><p>387.61</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>12,429.18</p></td>
+<td><p>8,951.07</p></td>
+<td><p>8,753.09</p></td>
+<td><p>4,012.41</p></td>
+<td><p>2,158.17</p></td>
+<td><p>1,517.53</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>16,789.12</p></td>
+<td><p></p></td>
+<td><p>15,260.29</p></td>
+<td><p>7,384.79</p></td>
+<td><p>4,104.80</p></td>
+<td><p>1,739.28</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>2,706.04</p></td>
+<td><p>1,449.83</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2</p></td>
+<td><p>4,693.24</p></td>
+<td><p>960.39</p></td>
+<td><p>3,958.45</p></td>
+<td><p>736.68</p></td>
+<td><p>425.70</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>8,557.11</p></td>
+<td><p>7,278.64</p></td>
+<td><p>6,817.41</p></td>
+<td><p>3,866.05</p></td>
+<td><p>1,876.40</p></td>
+<td><p>1,188.91</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>13,483.04</p></td>
+<td><p></p></td>
+<td><p>11,511.74</p></td>
+<td><p>6,543.96</p></td>
+<td><p>3,285.82</p></td>
+<td><p>1,241.42</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p>2048/2048</p></td>
-<td><p>2</p></td>
-<td><p>3508.50</p></td>
+<td><p>1</p></td>
+<td><p>1,911.20</p></td>
+<td><p>798.50</p></td>
+<td><p>412.37</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p>321.95</p></td>
-<td><p>212.97</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>6642.69</p></td>
-<td><p>5545.83</p></td>
-<td><p>4889.26</p></td>
-<td><p>2439.10</p></td>
-<td><p>1276.58</p></td>
+<td><p>2</p></td>
+<td><p>3,408.82</p></td>
+<td><p>767.24</p></td>
+<td><p>2,551.21</p></td>
+<td><p>388.82</p></td>
+<td><p>226.60</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>10178.71</p></td>
-<td><p></p></td>
-<td><p>8071.77</p></td>
-<td><p>4275.74</p></td>
-<td><p>2589.60</p></td>
-<td><p>1083.45</p></td>
+<td><p>4</p></td>
+<td><p>6,702.46</p></td>
+<td><p>5,354.80</p></td>
+<td><p>5,212.02</p></td>
+<td><p>2,512.22</p></td>
+<td><p>1,316.92</p></td>
+<td><p>891.95</p></td>
 </tr>
-<tr class="row-odd"><td><p>Falcon 180B</p></td>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>10,348.65</p></td>
+<td><p></p></td>
+<td><p>8,016.14</p></td>
+<td><p>4,414.75</p></td>
+<td><p>2,492.09</p></td>
+<td><p>1,083.26</p></td>
+</tr>
+<tr class="row-even"><td><p>Mixtral 8x7B</p></td>
 <td><p>128/128</p></td>
+<td><p>2</p></td>
+<td><p>25,135.25</p></td>
+<td><p>8,512.51</p></td>
+<td><p>24,572.90</p></td>
+<td><p>15,395.59</p></td>
+<td><p>5,927.88</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>4</p></td>
-<td><p>5129.55</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>42,394.61</p></td>
+<td><p>40,148.01</p></td>
+<td><p>40,309.25</p></td>
+<td><p>27,747.43</p></td>
+<td><p>11,205.51</p></td>
+<td><p>6,784.44</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>8370.98</p></td>
+<td><p>54,648.80</p></td>
 <td><p></p></td>
-<td><p>8268.72</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>51,683.16</p></td>
+<td><p>40,116.51</p></td>
+<td><p>18,496.66</p></td>
+<td><p>6,437.72</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>128/2048</p></td>
-<td><p>4</p></td>
-<td><p>7823.79</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>2</p></td>
+<td><p>29,412.17</p></td>
+<td><p>3,271.02</p></td>
+<td><p>20,938.80</p></td>
+<td><p>7,391.51</p></td>
+<td><p>4,278.79</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>4</p></td>
+<td><p>52,603.13</p></td>
+<td><p>43,071.34</p></td>
+<td><p>40,580.94</p></td>
+<td><p>21,332.15</p></td>
+<td><p>10,946.58</p></td>
+<td><p>7,475.05</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>8</p></td>
-<td><p>13278.59</p></td>
+<td><p>70,427.00</p></td>
 <td><p></p></td>
-<td><p>13107.48</p></td>
+<td><p>64,161.64</p></td>
+<td><p>41,101.18</p></td>
+<td><p>21,235.99</p></td>
+<td><p>9,955.21</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>128/4096</p></td>
+<td><p>2</p></td>
+<td><p>21,312.11</p></td>
+<td><p>2,254.56</p></td>
 <td><p></p></td>
-<td><p></p></td>
+<td><p>3,896.02</p></td>
+<td><p>2,388.14</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>128/4096</p></td>
+<td><p></p></td>
 <td><p>4</p></td>
-<td><p>6374.10</p></td>
+<td><p>39,353.01</p></td>
+<td><p>30,065.77</p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>7,108.03</p></td>
+<td><p>5,232.44</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>12660.89</p></td>
+<td><p>32,992.62</p></td>
 <td><p></p></td>
-<td><p>10493.79</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>47,860.65</p></td>
+<td><p>27,261.67</p></td>
+<td><p>15,943.70</p></td>
+<td><p>8,081.21</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p>2048/128</p></td>
-<td><p>4</p></td>
-<td><p>601.67</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>2</p></td>
+<td><p>2,946.01</p></td>
+<td><p>921.87</p></td>
+<td><p>2,894.09</p></td>
+<td><p>1,790.49</p></td>
+<td><p>684.71</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>4</p></td>
+<td><p>5,237.58</p></td>
+<td><p>5,056.60</p></td>
+<td><p>4,988.14</p></td>
+<td><p>3,354.89</p></td>
+<td><p>1,338.54</p></td>
+<td><p>803.50</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
 <td><p>8</p></td>
-<td><p>1002.57</p></td>
+<td><p>7,053.32</p></td>
 <td><p></p></td>
-<td><p>991.22</p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>6,559.63</p></td>
+<td><p>5,072.46</p></td>
+<td><p>2,244.39</p></td>
+<td><p>753.39</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>5000/500</p></td>
+<td><p>2</p></td>
+<td><p>3,848.10</p></td>
+<td><p>997.06</p></td>
+<td><p>3,630.24</p></td>
+<td><p>1,656.04</p></td>
+<td><p>739.84</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
+<td><p></p></td>
 <td><p>4</p></td>
-<td><p>3869.76</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>6,877.65</p></td>
+<td><p>6,466.39</p></td>
+<td><p>6,237.22</p></td>
+<td><p>3,607.46</p></td>
+<td><p>1,619.49</p></td>
+<td><p>1,048.60</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
 <td><p>8</p></td>
-<td><p>7134.33</p></td>
+<td><p>9,531.26</p></td>
 <td><p></p></td>
-<td><p>6386.83</p></td>
+<td><p>8,709.34</p></td>
+<td><p>6,237.96</p></td>
+<td><p>2,927.13</p></td>
+<td><p>1,109.25</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>500/2000</p></td>
+<td><p>2</p></td>
+<td><p>23,539.24</p></td>
+<td><p>2,773.86</p></td>
+<td><p>16,886.30</p></td>
+<td><p>5,773.33</p></td>
+<td><p>3,325.73</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>4</p></td>
+<td><p>40,035.05</p></td>
+<td><p>33,478.35</p></td>
+<td><p>32,047.73</p></td>
+<td><p>16,897.03</p></td>
+<td><p>8,908.09</p></td>
+<td><p>6,153.32</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
+<td><p>8</p></td>
+<td><p>60,572.77</p></td>
+<td><p></p></td>
+<td><p>41,597.80</p></td>
+<td><p>31,392.32</p></td>
+<td><p>16,954.54</p></td>
+<td><p>7,980.34</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>1000/1000</p></td>
+<td><p>2</p></td>
+<td><p>18,644.51</p></td>
+<td><p>4,540.15</p></td>
+<td><p>14,154.95</p></td>
+<td><p>5,826.43</p></td>
+<td><p>3,289.27</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>32,709.62</p></td>
+<td><p>29,046.16</p></td>
+<td><p>25,291.30</p></td>
+<td><p>14,307.91</p></td>
+<td><p>7,461.63</p></td>
+<td><p>4,697.19</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>44,072.88</p></td>
+<td><p></p></td>
+<td><p>40,628.46</p></td>
+<td><p>27,633.48</p></td>
+<td><p>13,741.62</p></td>
+<td><p>5,706.17</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>2048/2048</p></td>
+<td><p>2</p></td>
+<td><p>14,017.70</p></td>
+<td><p>2,870.77</p></td>
+<td><p>10,448.79</p></td>
+<td><p>3,535.21</p></td>
+<td><p>1,954.32</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>25,550.44</p></td>
+<td><p>21,488.32</p></td>
+<td><p>19,977.11</p></td>
+<td><p>9,620.99</p></td>
+<td><p>5,191.30</p></td>
+<td><p>3,593.18</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>24,999.94</p></td>
+<td><p></p></td>
+<td><p>31,678.85</p></td>
+<td><p>19,372.52</p></td>
+<td><p>10,572.07</p></td>
+<td><p>4,860.61</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p>20000/2000</p></td>
+<td><p>2</p></td>
+<td><p>2,195.84</p></td>
+<td><p>367.81</p></td>
+<td><p>1,583.86</p></td>
+<td><p>626.60</p></td>
+<td><p>320.41</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>4</p></td>
+<td><p>4,086.41</p></td>
+<td><p>3,301.28</p></td>
+<td><p>2,982.42</p></td>
+<td><p>1,586.09</p></td>
+<td><p>807.67</p></td>
+<td><p>579.49</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>8</p></td>
+<td><p>5,797.57</p></td>
+<td><p></p></td>
+<td><p>5,163.91</p></td>
+<td><p>3,106.98</p></td>
+<td><p>1,653.55</p></td>
+<td><p>821.64</p></td>
 </tr>
 <tr class="row-odd"><td><p><em>TP stands for Tensor Parallelism</em></p></td>
 <td><p></p></td>
@@ -1078,6 +2155,26 @@ remain in the system longer and therefore require less requests to achieve stead
 <td><p>4096</p></td>
 <td><p>1500</p></td>
 </tr>
+<tr class="row-odd"><td><p>5000</p></td>
+<td><p>500</p></td>
+<td><p>5500</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-even"><td><p>1000</p></td>
+<td><p>1000</p></td>
+<td><p>2000</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-odd"><td><p>500</p></td>
+<td><p>2000</p></td>
+<td><p>2500</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>20000</p></td>
+<td><p>2000</p></td>
+<td><p>22000</p></td>
+<td><p>1000</p></td>
+</tr>
 </tbody>
 </table>
 </section>
@@ -1164,7 +2261,7 @@ using the <code class="docutils literal notranslate"><span class="pre">--kv_cach
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4253467580>
+<jinja2.runtime.BlockReference object at 0x7fb972be4340>
 
 <div class="footer">
     <p>

@@ -112,6 +112,7 @@ class, which encapsulates the following parameters:
 The [`SamplingConfig`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime/samplingConfig.h)
 class encapsulates parameters that control the
 [generation](https://huggingface.co/blog/how-to-generate) of new tokens.
+A comparison of selecting decoding method is listed as the table below (`X` means it is not supported yet).
 Except for the `beamWidth` parameter, all the fields are optional and the
 runtime will use a default value if no values are provided by the user. For
 vector fields, the TensorRT-LLM runtime supports one value per sequence (that is,
@@ -119,70 +120,69 @@ the vector contains `batchSize` values). If all the sequences use the same
 value for a given parameter, the vector can be limited to a single element
 (that is, `size() == 1`).
 
+|        Method name in HF         |                    Condition in HF                    | Method name in TRT-LLM |              Condition in TRT-LLM              |
+| :------------------------------: | :---------------------------------------------------: | :--------------------: | :--------------------------------------------: |
+|        assisted decoding         | `assistant_model` or `prompt_lookup_num_tokens!=None` |           X            |                                                |
+|       beam-search decoding       |          `num_beams>1` and `do_sample=False`          |      beam search       |                `beamWidth > 1`                 |
+| beam-search multinomial sampling |          `num_beams>1` and `do_sample=True`           |           X            |                                                |
+| constrained beam-search decoding |    `constraints!=None` or `force_words_ids!=None`     |           X            |                                                |
+|        contrastive search        |            `penalty_alpha>0` and `top_k>1`            |           X            |                                                |
+|   diverse beam-search decoding   |         `num_beams>1` and `num_beam_groups>1`         |           X            |                                                |
+|         greedy decoding          |          `num_beams=1` and `do_sample=False`          |        sampling        | `beamWidth == 1` and `topK=0` and `topP=0.0f`  |
+|       multinomial sampling       |          `num_beams=1` and `do_sample=True`           |        sampling        | `beamWidth == 1` and (`topK>0` or `topP>0.0f`) |
+
 ***General***
 
- * `temperature`, a vector of floating-point numbers to control the
-   modulation of logits when sampling new tokens. It can have any value `>= 0.0f`. The default value is `1.0f`(no modulation).
- * `minLength`, a vector of integers to set a lower-bound on the number of tokens
-   generated. It can have any value `>= 0`. Value `0` has no effect, the first generated token can be EOS. The default value is `1` (at least one non-EOS token is generated).
- * `repetitionPenalty`, a vector of float-point numbers to penalize tokens
-    (irrespective of the number of appearances). It is multiplicative penalty. It can have any value `> 0.0f`. Repetition penalty `< 1.0f` encourages repetition, `> 1.0f` discourages it. The default value is `1.0f` (no effect).
- * `presencePenalty`, a vector of float-point numbers to penalize tokens
-   already present in the sequence (irrespective of the number of appearances). It is additive penalty.
-   It can have any value, values `< 0.0f` encourage repetition, `> 0.f` discourage it. The default value is `0.0f` (no effect).
- * `frequencyPenalty`, a vector of float-point numbers to penalize tokens
-   already present in the sequence (dependent on the number of appearances). It is additive penalty. It can have any value, values `< 0.0f` encourage repetition, `> 0.0f` discourage it.
-   The default value is `0.0f`(no effect).
- * `noRepeatNgramSize`, a vector of integers. It can have any value `> 0`. If set to int `> 0`, all ngrams of that size can only occur once.
+|   Name in TRT-LLM   |                         Description                          |   Data type   |                        Range of value                        |                     Default value                     |       Name in HF       |
+| :-----------------: | :----------------------------------------------------------: | :-----------: | :----------------------------------------------------------: | :---------------------------------------------------: | :--------------------: |
+|    `temperature`    |          modulation of logits in sampling workflow           | List\[Float\] |                     \[0.0f, $+\infty$\)                      |                `1.0f` (no modulation)                 |     `temperature`      |
+|     `minLength`     |        lower-bound on the number of tokens generated         |  List\[Int\]  |                       \[0, $+\infty$\)                       | `0` (no effect (the first generated token can be EOS) |      `min_length`      |
+| `repetitionPenalty` | penalize repetitive tokens <br> multiplicative, irrespective of appearances count | List\[Float\] | \[0.0f, $+\infty$\) <br> `< 1.0f` encourages repetition <br> `> 1.0f` discourages it |                  `1.0f` (no effect)                   |  `repetition_penalty`  |
+|  `presencePenalty`  | penalize existed tokens <br> additive, irrespective of appearances count | List\[Float\] | \($-\infty$, $+\infty$\) <br> `< 0.0f` encourages repetition <br> `> 0.0f` discourages it |                  `0.0f` (no effect)                   |           no           |
+| `frequencyPenalty`  | penalize existed tokens <br> additive, dependent on appearances count | List\[Float\] | \($-\infty$, $+\infty$\) <br> `< 0.0f` encourages repetition <br> `> 0.0f` discourages it |                  `0.0f` (no effect)                   |           no           |
+| `noRepeatNgramSize` |                                                              |  List\[Int\]  | \[0, $+\infty$\) <br> `> 0` all ngrams of that size can only occur once |                    `0` (no effect)                    | `no_repeat_ngram_size` |
 
-The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually
-exclusive.
+* The tokens of input prompt are included during adopting `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` onto logits.
+
+* The parameters `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` are not mutually exclusive.
 
 ***Sampling***
 
- * `randomSeed`, a vector of 64-bit integers to control the random seed used by
-   the random number generator in sampling. Its default value is `0`,
- * `topK`, a vector of integers to control the number of logits to sample from.
-   Must be in range of `[0, 1024]`. Its default value is `0`.
-   Note that if different values are provided for the
-   different sequences in the batch, the performance of the implementation will
-   depend on the largest value. For efficiency reasons, we recommend to batch
-   requests with similar `topK` values together,
- * `topP`, a vector of floating-point values to control the top-P probability
-   to sample from. Must be in range of `[0.f, 1.f]`. Its default value is `0.f`,
- * `topPDecay`, `topPMin` and `topPResetIds`, vectors to control the decay in
-   the `topP` algorithm. The `topP` values are modulated by
-   a decay that exponentially depends on the length of the sequence as explained in
-   [_Factuality Enhanced Language Models for Open-Ended Text Generation_](https://arxiv.org/abs/2206.04624).
-   `topPDecay` is the decay, `topPMin` is the lower-bound and `topPResetIds`
-   indicates where to reset the decay.
-   `topPDecay`, `topPMin` must be in ranges of `(0.f, 1.f]` and `(0.f, 1.f]` respectively.
-   Defaults are `1.f`, `1.0e-6,f` and `-1`,
+| Name in TRT-LLM |               Description               |   Data type   |  Range of value   |  Default value   | Name in HF |
+| :-------------: | :-------------------------------------: | :-----------: | :---------------: | :--------------: | :--------: |
+|  `randomSeed`   | random seed for random number generator |     Int64     |   \[0, 2^64-1\]   |       `0`        |     no     |
+|     `topK`      |   the number of logits to sample from   |  List\[Int\]  |    \[0, 1024\]    |       `0`        |  `top_k`   |
+|     `topP`      |  the top-P probability to sample from   | List\[Float\] |  \[0.0f, 1.0f\]   |      `0.0f`      |  `top_p`   |
+|   `topPDecay`   |    the decay in the `topP` algorithm    | List\[Float\] |  \(0.0f, 1.0f\]   |      `1.0f`      |     no     |
+|    `topPMin`    |    the decay in the `topP` algorithm    | List\[Float\] |  \(0.0f, 1.0f\]   |    `1.0e-6,f`    |     no     |
+| `topPResetIds`  |    the decay in the `topP` algorithm    |  List\[Int\]  | \[-1, $+\infty$\) | `-1` (no effect) |     no     |
 
-If both `topK` and `topP` fields are set, the `topK` method will be run for
-sequences with a `topK` value greater than `0.f`. In that case, the `topP`
-value for that sequence also influences the result. If the `topK` values for
-some sequences are `0.f`, the `topP` method will be used for those remaining
-sequences. If both `topK` and `topP` are zero, greedy search is performed.
+ * If setting `topK = 0` and `topP = 0.0f`, greedy search is performed.
+ * If setting `topK > 0` and `topP = 0.0f`, `topK` tokens of highest probilities will become the candidates of sampling (named `TopK sampling` in TRT-LLM).
+ * If setting `topK = 0` and `topP > 0.0f`, tokens will be sorted with probility descendly, then the tokens with highest probilities which the accumulated probility larger than `topP` will become the candidates of sampling (named `TopP sampling` in TRT-LLM).
+ * If setting `topK > 0` and `topP > 0.0f`, `topK` tokens of highest probilities will be selected, then those selected tokens will be sorted with probility descendly and their probility will be normalized, then the tokens with highest normalized probilities which the accumulated probility larger than `topP` will become the candidates of sampling (named `TopKTopP sampling` in TRT-LLM)
+
+ * If different `topK` values are provided for the different sequences in the batch, the performance of the implementation will depend on the largest value. For efficiency reasons, we recommend to batch requests with similar `topK` values together.
+
+ * `topPDecay`, `topPMin` and `topPResetIds` are explained in
+   [_Factuality Enhanced Language Models for Open-Ended Text Generation_](https://arxiv.org/abs/2206.04624).
+   `topPDecay` is the decay, `topPMin` is the lower-bound and `topPResetIds` indicates where to reset the decay.
 
 ***Beam-search***
 
- * `beamWidth`, is the width used for the [beam
-   search](https://en.wikipedia.org/wiki/Beam_search) sampling algorithm. There
-   is no explicit upper-bound on the beam width but increasing the beam width
-   will likely increase the latency. Use `1` to disable beam-search,
- * `beamSearchDiversityRate`, a floating-point value that controls the
-   diversity in beam-search. It can have any value  `>= 0.0f`. The default value is `0.f`,
- * `lengthPenalty`, a floating-point value that controls how to penalize the
-   longer sequences in beam-search (the log-probability of a sequence will be
-   penalized by a factor that depends on `1.f / (length ^ lengthPenalty)`). The
-   default is value `0.f`,
- * `earlyStopping`, an integer value that controls whether the generation process
-   finishes once `beamWidth` sentences are generated (end up with `end_token`).
-   Default value `1` means `earlyStopping` is enabled, value `0` means `earlyStopping`
-   is disabled, other values means the generation process is dependent on
-   `length_penalty`.
-The `beamWidth` parameter is a scalar value. It means that in this release of
+|      Name in TRT-LLM      |           Description           |   Data type   |      Range of value      |       Default value       |     Name in HF      |
+| :-----------------------: | :-----------------------------: | :-----------: | :----------------------: | :-----------------------: | :-----------------: |
+|        `beamWidth`        | width for beam-search algorithm |      Int      |        \[0, 64\]         | `0` (disable beam search) |    `beam_width`     |
+| `beamSearchDiversityRate` |  diversity of generated tokens  | List\[Float\] |     \[0, $+\infty$\)     |          `0.0f`           | `diversity_penalty` |
+|      `lengthPenalty`      |    penalize longer sequences    | List\[Float\] |     \[0, $+\infty$\)     |          `0.0f`           |  `length_penalty`   |
+|      `earlyStopping`      |      see description below      |  List\[Int\]  | \($-\infty$, $+\infty$\) |            `0`            |  `early_stopping`   |
+
+ * Beam-search algorithm: [beam search](https://en.wikipedia.org/wiki/Beam_search).
+ * Parameter `diversity_penalty` in HF is only used for `diverse beam-search decoding` (or named `Group-Beam-Search`), which is not supported by TRT-LLM yet.
+ * If setting `earlyStopping = 1`, decoding will stop once `beamWidth` finished sentences are generated.
+ * If setting `earlyStopping = 0`, decoding will keep going until no better sentences (with better score) can be generated.
+ * If setting `earlyStopping` to other values, decoding will stop only depending on `lengthlengthPenalty`.
+ * The `beamWidth` parameter is a scalar value. It means that in this release of
 TensorRT-LLM, it is not possible to specify a different width for each input
 sequence. This limitation is likely to be removed in a future release.
 

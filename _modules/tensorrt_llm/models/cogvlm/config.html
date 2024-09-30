@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -178,15 +182,11 @@
                  <span class="n">attn_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                  <span class="n">rotary_base</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">10000.0</span><span class="p">,</span>
                  <span class="n">rotary_scaling</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">vision_start</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-                 <span class="n">vision_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1225</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp_bias</span> <span class="o">=</span> <span class="n">mlp_bias</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attn_bias</span> <span class="o">=</span> <span class="n">attn_bias</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_base</span> <span class="o">=</span> <span class="n">rotary_base</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span> <span class="o">=</span> <span class="n">rotary_scaling</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span> <span class="o">=</span> <span class="n">vision_start</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">=</span> <span class="n">vision_length</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="s1">&#39;rope_gpt_neox&#39;</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
@@ -199,8 +199,6 @@
         <span class="n">output</span><span class="p">[</span><span class="s1">&#39;attn_bias&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_bias</span>
         <span class="n">output</span><span class="p">[</span><span class="s1">&#39;rotary_base&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_base</span>
         <span class="n">output</span><span class="p">[</span><span class="s1">&#39;rotary_scaling&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span>
-        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;vision_start&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span>
-        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;vision_length&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span>
         <span class="k">return</span> <span class="n">output</span></div>
 </div>
 
@@ -213,7 +211,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f42518346d0>
+<jinja2.runtime.BlockReference object at 0x7fb9619f4760>
 
 <div class="footer">
     <p>

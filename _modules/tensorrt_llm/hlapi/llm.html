@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -159,7 +163,8 @@
 
 <span class="kn">from</span> <span class="nn">..</span> <span class="kn">import</span> <span class="n">bindings</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
-<span class="kn">from</span> <span class="nn">..executor</span> <span class="kn">import</span> <span class="n">GenerationExecutor</span><span class="p">,</span> <span class="n">GenerationResult</span>
+<span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">EngineConfig</span>
+<span class="kn">from</span> <span class="nn">..executor</span> <span class="kn">import</span> <span class="n">GenerationExecutor</span><span class="p">,</span> <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">LoRARequest</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">.llm_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_REMAINING_ARGS_DOCSTRING</span><span class="p">,</span> <span class="n">CachedModelLoader</span><span class="p">,</span>
                         <span class="n">LlmArgs</span><span class="p">,</span> <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span>
@@ -197,10 +202,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer</span></div>
 
 
-<div class="viewcode-block" id="RequestOutput.handle_generation_msg">
-<a class="viewcode-back" href="../../../llm-api/index.html#tensorrt_llm.hlapi.RequestOutput.handle_generation_msg">[docs]</a>
-    <span class="k">def</span> <span class="nf">handle_generation_msg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensors</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">handle_generation_msg</span><span class="p">(</span><span class="n">tensors</span><span class="p">,</span> <span class="n">error</span><span class="p">)</span>
+<div class="viewcode-block" id="RequestOutput.handle_response">
+<a class="viewcode-back" href="../../../llm-api/index.html#tensorrt_llm.hlapi.RequestOutput.handle_response">[docs]</a>
+    <span class="k">def</span> <span class="nf">handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">beam_output</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">outputs</span><span class="p">:</span>
@@ -257,6 +262,9 @@
                  <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;executor_cls&quot;</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">)</span>
+
         <span class="k">try</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">LlmArgs</span><span class="o">.</span><span class="n">from_kwargs</span><span class="p">(</span>
                 <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
@@ -301,7 +309,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
 
-        <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
+        <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;_shutdown&#39;</span><span class="p">)</span></div>
 
 
     <span class="nd">@property</span>
@@ -316,16 +324,19 @@
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">,</span>
                                         <span class="n">List</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">use_tqdm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">lora_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">,</span>
+                                     <span class="n">Sequence</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Generate output for the given prompts in the synchronous mode.</span>
 <span class="sd">        Synchronous generation accepts either single prompt or batched prompts.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            inputs (Union[str, Iterable[str], List[int], Iterable[List[int]]]): The prompt text or token ids.</span>
+<span class="sd">            inputs (Union[PromptInputs, Sequence[PromptInputs]]): The prompt text or token ids.</span>
 <span class="sd">                Note, it must be single prompt or batched prompts.</span>
 <span class="sd">            sampling_params (Optional[Union[SamplingParams, List[SamplingParams]]]): The sampling params for the</span>
 <span class="sd">                generation, a default one will be used if not provided.</span>
-<span class="sd">            use_tqdm: Whether to use tqdm to display the progress bar.</span>
+<span class="sd">            use_tqdm (bool): Whether to use tqdm to display the progress bar.</span>
+<span class="sd">            lora_request (Optional[Union[LoRARequest, Sequence[LoRARequest]]]): LoRA request to use for generation, if any.</span>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.</span>
@@ -344,8 +355,13 @@
                 <span class="n">sp</span> <span class="o">=</span> <span class="n">sampling_params</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">sp</span> <span class="o">=</span> <span class="n">sampling_params</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">lora_request</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">lora_req</span> <span class="o">=</span> <span class="n">lora_request</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">lora_req</span> <span class="o">=</span> <span class="n">lora_request</span>
             <span class="n">future</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">request_inputs</span><span class="p">,</span>
                                          <span class="n">sampling_params</span><span class="o">=</span><span class="n">sp</span><span class="p">,</span>
+                                         <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_req</span><span class="p">,</span>
                                          <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
             <span class="n">futures</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
 
@@ -367,22 +383,27 @@
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">PromptInputs</span><span class="p">,</span>
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">lora_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RequestOutput</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Generate output for the given prompt in the asynchronous mode.</span>
 <span class="sd">        Asynchronous generation accepts single prompt only.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            inputs (Union[str, List[int]]): The prompt text or token ids; must be single prompt.</span>
+<span class="sd">            inputs (PromptInputs): The prompt text or token ids; must be single prompt.</span>
 <span class="sd">            sampling_params (Optional[SamplingParams]): The sampling params for the generation, a default one will be</span>
 <span class="sd">                used if not provided.</span>
+<span class="sd">            lora_request (Optional[LoRARequest]): LoRA request to use for generation, if any.</span>
 <span class="sd">            streaming (bool): Whether to use the streaming mode for the generation.</span>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            RequestOutput: The output data of the completion request to the LLM.</span>
 <span class="sd">        &#39;&#39;&#39;</span>
+        <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_prompt_token_ids</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_prompt_token_ids</span><span class="p">(</span>
+                <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span>
         <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">):</span>
             <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span>
@@ -392,21 +413,22 @@
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-        <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-
         <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span>
             <span class="n">prompt_token_ids</span><span class="p">,</span>
             <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span>
+            <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">RequestOutput</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span> <span class="nf">_prepare_prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">_prepare_prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                                  <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;tokenizer is required to tokenize string prompt&quot;</span><span class="p">)</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">prompt</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span>
+            <span class="n">prompt</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_prepare_sampling_params</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
@@ -436,9 +458,9 @@
         <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
         <span class="n">prompt_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">prompt_len</span> <span class="o">+</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_new_tokens</span> <span class="o">&gt;</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">prompt_len</span> <span class="o">+</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&gt;</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="si">}</span><span class="s2">) and max_new_tokens (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="si">}</span><span class="s2">) and max_tokens (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;max_seq_len (</span><span class="si">{</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">&gt;</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -463,6 +485,19 @@
             <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
+            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
+                                                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
+            <span class="n">lora_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span>
+            <span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span>
+            <span class="n">num_lora_modules</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">*</span> \
+                <span class="nb">len</span><span class="p">(</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">missing_qkv_modules</span><span class="p">)</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">PeftCacheConfig</span><span class="p">(</span>
+                <span class="n">num_device_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_loras</span><span class="p">,</span>
+                <span class="n">num_host_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_cpu_loras</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">logits_post_processor_map</span><span class="p">:</span>
@@ -472,7 +507,7 @@
         <span class="n">executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_context</span>
         <span class="n">executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
             <span class="n">executor_config</span><span class="o">=</span><span class="n">executor_config</span><span class="p">,</span>
             <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
@@ -546,7 +581,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251a148e0>
+<jinja2.runtime.BlockReference object at 0x7fb9706c0370>
 
 <div class="footer">
     <p>

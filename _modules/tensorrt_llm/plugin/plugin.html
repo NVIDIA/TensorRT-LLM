@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -230,7 +234,8 @@
 <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">&quot;gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">:</span>
-    <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
 <span class="p">}</span>
 
 
@@ -322,6 +327,7 @@
     <span class="n">_quantize_tensor_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_moe_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_mamba_conv1d_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="c1"># Features</span>
     <span class="n">_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -456,6 +462,7 @@
     <span class="s2">&quot;moe_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;mamba_conv1d_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;nccl_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">,</span>
 
     <span class="c1"># Features</span>
     <span class="s2">&quot;context_fmha&quot;</span><span class="p">,</span>
@@ -489,19 +496,20 @@
                 <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
                 <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span><span class="p">,</span>
                 <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="n">x</span> <span class="k">if</span> <span class="n">x</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">plugin_dtype_options</span><span class="p">],</span>
-                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;Whether to enable/disable </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> and the dtype.&quot;</span><span class="p">)</span>
+                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;Whether to enable/disable ``</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">`` and the dtype.&quot;</span>
+            <span class="p">)</span>
         <span class="k">elif</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="nb">bool</span><span class="p">:</span>
             <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span>
                 <span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
                 <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
                 <span class="n">default</span><span class="o">=</span><span class="s2">&quot;enable&quot;</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span><span class="p">,</span>
                 <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;enable&quot;</span><span class="p">,</span> <span class="s2">&quot;disable&quot;</span><span class="p">],</span>
-                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;Whether to enable/disable </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;Whether to enable/disable ``</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">``.&quot;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
                                 <span class="nb">type</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">type</span><span class="p">,</span>
                                 <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-                                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+                                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;``</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">``.&quot;</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">parser</span>
 
 
@@ -599,7 +607,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f42515b4910>
+<jinja2.runtime.BlockReference object at 0x7fb9705feec0>
 
 <div class="footer">
     <p>

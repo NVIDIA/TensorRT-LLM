@@ -58,71 +58,15 @@ python3 ../run.py --engine_dir ./llama-3.1-8b-engine  --max_output_len 100 --tok
 
 To create a production-ready deployment of your LLM, use the [Triton Inference Server backend for TensorRT-LLM](https://github.com/triton-inference-server/tensorrtllm_backend) to leverage the TensorRT-LLM C++ runtime for rapid inference execution and include optimizations like in-flight batching and paged KV caching. Triton Inference Server with the TensorRT-LLM backend is available as a [pre-built container through NVIDIA NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver/tags).
 
-1. Pull down the example model repository so that Triton Inference Server can read the model and any associated metadata.
+1. Clone the TensorRT-LLM backend repository:
 
-    ```bash
-    # After exiting the TensorRT-LLM Docker container
-    cd ..
-    git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
-    cd tensorrtllm_backend
-    cp ../TensorRT-LLM/examples/llama/out/*   all_models/inflight_batcher_llm/tensorrt_llm/1/
-    ```
-
-    The `tensorrtllm_backend` repository includes the skeleton of a model repository under `all_models/inflight_batcher_llm/` that you can use.
-
-2. Copy the model you compiled ({ref}`quick-start-guide-compile`) to the example model repository.
-
-3. Modify the configuration files from the model repository. Specify the path to the compiled model engine, the tokenizer, and how to handle memory allocation for the KV cache when performing inference in batches.
-
-    ```bash
-    python3 tools/fill_template.py --in_place \
-        all_models/inflight_batcher_llm/tensorrt_llm/config.pbtxt \
-        decoupled_mode:true,engine_dir:/all_models/inflight_batcher_llm/tensorrt_llm/1,\
-    max_tokens_in_paged_kv_cache:,batch_scheduler_policy:guaranteed_completion,kv_cache_free_gpu_mem_fraction:0.2,\
-    max_num_sequences:4
-
-    python tools/fill_template.py --in_place \
-        all_models/inflight_batcher_llm/preprocessing/config.pbtxt \
-        tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
-
-    python tools/fill_template.py --in_place \
-        all_models/inflight_batcher_llm/postprocessing/config.pbtxt \
-        tokenizer_type:llama,tokenizer_dir:Meta-Llama-3.1-8B-Instruct
-    ```
-
-4. Start Triton Inference Server in the container. Specify `world_size`, which is the number of GPUs the model was built for, and point to the `model_repo` that was just set up.
-
-    ```bash
-    docker run -it --rm --gpus all --network host --shm-size=1g \
-    -v $(pwd)/all_models:/all_models \
-    -v $(pwd)/scripts:/opt/scripts \
-    nvcr.io/nvidia/tritonserver:23.10-trtllm-python-py3
-
-    # Log in to huggingface-cli to get tokenizer
-    huggingface-cli login --token *****
-
-    # Install python dependencies
-    pip install sentencepiece protobuf
-
-    # Launch Server
-    python /opt/scripts/launch_triton_server.py --model_repo /all_models/inflight_batcher_llm --world_size 1
-    ```
-
-## Send Requests
-
-Use one of the Triton Inference Server client libraries or send HTTP requests to the generated endpoint. To get started, you can use the more fully featured client script or the following command:
-
-```bash
-curl -X POST localhost:8000/v2/models/ensemble/generate -d \
-'{
-"text_input": "How do I count to nine in French?",
-"parameters": {
-"max_tokens": 100,
-"bad_words":[""],
-"stop_words":[""]
-}
-}'
+```console
+cd ..
+git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
+cd tensorrtllm_backend
 ```
+
+2. Refer to [End to end workflow to run llama 7b](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md) in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.
 
 ## LLM API
 The LLM API is a Python API to setup & infer with TensorRT-LLM directly in python.It allows for optimizing models by specifying a HuggingFace repo name or a model checkpoint. The LLM API handles checkpoint conversion, engine building, engine loading, and model inference, all from one python object.
@@ -146,7 +90,6 @@ In this Quick Start Guide, you:
 - Retrieved the model weights
 - Compiled and ran the model
 - Deployed the model with Triton Inference Server
-- Sent HTTP requests
 
 For more examples, refer to:
 

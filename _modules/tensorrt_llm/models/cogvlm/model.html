@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -164,9 +168,12 @@
 <span class="c1"># limitations under the License.</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span>
 
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+
+<span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">maximum</span><span class="p">,</span> <span class="n">minimum</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span>
-                           <span class="nb">slice</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">expand</span><span class="p">,</span> <span class="n">op_and</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span>
+                           <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">,</span> <span class="n">where</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">CogVLMAttention</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
                        <span class="n">Embedding</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
@@ -207,14 +214,10 @@
             <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
-            <span class="n">vision_start</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span>
-            <span class="n">vision_length</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vision_length</span><span class="p">,</span>
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">vision_start</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">vision_length</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">GatedMLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                             <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">mlp_hidden_size</span><span class="p">,</span>
@@ -236,20 +239,26 @@
                                       <span class="n">eps</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
                                       <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_states</span><span class="p">,</span>
+        <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">vision_token_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
         <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
                                           <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                                           <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-                                          <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">)</span>
+                                          <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+                                          <span class="n">vision_token_mask</span><span class="o">=</span><span class="n">vision_token_mask</span><span class="p">,</span>
+                                          <span class="n">position_embedding</span><span class="o">=</span><span class="n">position_ids</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -259,24 +268,10 @@
         <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">bs</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">seq_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">bos</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-                    <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">vis_seq_length</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">vision_hidden_states</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-            <span class="n">hidden_states</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="n">vis_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-        <span class="n">text_seq_length</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span>
-            <span class="mi">0</span><span class="p">,</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">))</span>
-        <span class="n">language_hidden_states</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-            <span class="n">hidden_states</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_length</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_start</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">bs</span><span class="p">,</span> <span class="n">text_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-
-        <span class="n">bos_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">bos</span><span class="p">)</span>
-        <span class="n">language_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">language_hidden_states</span><span class="p">)</span>
-        <span class="n">vision_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_mlp</span><span class="p">(</span><span class="n">vision_hidden_states</span><span class="p">)</span>
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">bos_qkv</span><span class="p">,</span> <span class="n">vision_qkv</span><span class="p">,</span> <span class="n">language_qkv</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">vision_mlp_out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">language_mlp_out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">vision_token_mask</span><span class="p">,</span> <span class="n">vision_mlp_out</span><span class="p">,</span>
+                              <span class="n">language_mlp_out</span><span class="p">)</span>
 
         <span class="c1"># hidden_states = self.mlp(hidden_states,</span>
         <span class="c1">#                          lora_layer_params=lora_layer_params)</span>
@@ -294,6 +289,7 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">use_prompt_tuning</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span>
         <span class="n">EmbeddingCls</span> <span class="o">=</span> <span class="n">PromptTuningEmbedding</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">use_prompt_tuning</span> <span class="k">else</span> <span class="n">Embedding</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">EmbeddingCls</span><span class="p">(</span>
@@ -342,12 +338,45 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">recv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">prev_pp_rank</span><span class="p">())</span>
 
+        <span class="n">vision_mask</span> <span class="o">=</span> <span class="n">input_ids</span> <span class="o">&gt;</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="n">seq_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>  <span class="c1"># lvvvvvvllvvvvlll</span>
+            <span class="n">zero</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">bool</span><span class="p">)))</span>
+            <span class="n">one</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ones</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">bool</span><span class="p">)))</span>
+
+            <span class="n">t1</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">t2</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">vision_token_mask</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">op_and</span><span class="p">(</span><span class="n">t1</span> <span class="o">==</span> <span class="n">one</span><span class="p">,</span> <span class="n">t2</span> <span class="o">==</span> <span class="n">one</span><span class="p">),</span>
+                                        <span class="n">zero</span><span class="p">])</span>  <span class="c1"># 0111110001110000</span>
+            <span class="n">vision_token_mask</span> <span class="o">=</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">vision_token_mask</span><span class="p">,</span>
+                                          <span class="o">-</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># [num_tokens, 1]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">seq_length</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span>
+                               <span class="mi">1</span><span class="p">)</span>  <span class="c1"># lvvvvvvllvvvvlll, lvvvvvvllvvvvlll</span>
+            <span class="n">batch_size</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="n">t1</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">concat</span><span class="p">([</span><span class="n">batch_size</span><span class="p">,</span>
+                                                    <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]))</span>
+            <span class="n">t2</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">vision_mask</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="n">concat</span><span class="p">([</span><span class="n">batch_size</span><span class="p">,</span>
+                                                    <span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]))</span>
+            <span class="n">zero</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span>
+                <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">bool</span><span class="p">))),</span>
+                <span class="n">concat</span><span class="p">([</span><span class="n">batch_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">]))</span>
+            <span class="n">one</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ones</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">bool</span><span class="p">)))</span>
+
+            <span class="n">vision_token_mask</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">op_and</span><span class="p">(</span><span class="n">t1</span> <span class="o">==</span> <span class="n">one</span><span class="p">,</span> <span class="n">t2</span> <span class="o">==</span> <span class="n">one</span><span class="p">),</span> <span class="n">zero</span><span class="p">],</span>
+                                       <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># 0111110001110000 [bs, seqlen]</span>
+            <span class="n">vision_token_mask</span> <span class="o">=</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">vision_token_mask</span><span class="p">,</span>
+                                          <span class="o">-</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># [bs, seqlen, 1]</span>
+
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
                                             <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                                             <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
                                             <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
                                             <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
-                                            <span class="n">lora_params</span><span class="o">=</span><span class="n">lora_params</span><span class="p">)</span>
+                                            <span class="n">lora_params</span><span class="o">=</span><span class="n">lora_params</span><span class="p">,</span>
+                                            <span class="n">vision_token_mask</span><span class="o">=</span><span class="n">vision_token_mask</span><span class="p">,</span>
+                                            <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">hidden_states</span>
@@ -435,7 +464,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251a16110>
+<jinja2.runtime.BlockReference object at 0x7fb955b5d7e0>
 
 <div class="footer">
     <p>

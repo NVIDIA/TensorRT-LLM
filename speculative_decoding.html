@@ -80,6 +80,10 @@
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -227,7 +231,7 @@ and setting <code class="docutils literal notranslate"><span class="pre">enableB
 <span class="nb">export</span><span class="w"> </span><span class="nv">COMMON_COMMAND</span><span class="o">=</span><span class="s2">&quot;--max_batch_size=1 --max_input_len=2048 --max_seq_len=3072 --gpt_attention_plugin=float16 --gemm_plugin=float16 --remove_input_padding=enable --paged_kv_cache=enable --context_fmha=enable --use_paged_context_fmha=enable --gather_generation_logits&quot;</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_COMMAND_FP16</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$COMMON_COMMAND</span><span class="s2">&quot;</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TARGET_COMMAND_FP16</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$DRAFT_COMMAND_FP16</span><span class="s2"> --max_draft_len=</span><span class="nv">$MAX_DRAFT_LENGTH</span><span class="s2"> --speculative_decoding_mode draft_tokens_external&quot;</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_COMMAND_FP8</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$COMMON_COMMAND</span><span class="s2"> --strongly_typed --use_fp8_context_fmha=enable&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_COMMAND_FP8</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$COMMON_COMMAND</span><span class="s2"> --use_fp8_context_fmha=enable&quot;</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TARGET_COMMAND_FP8</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$DRAFT_COMMAND_FP8</span><span class="s2"> --max_draft_len=</span><span class="nv">$MAX_DRAFT_LENGTH</span><span class="s2"> --speculative_decoding_mode draft_tokens_external&quot;</span>
 
 <span class="c1"># Build checkpoints and engines in tensorrt_llm/examples/llama/</span>
@@ -457,6 +461,88 @@ However, similar to any new model, you can follow the same approach to define yo
 <p>This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read <a class="reference external" href="https://arxiv.org/html/2403.09919v1">the ReDrafter paper</a>.</p>
 <p>TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as <code class="docutils literal notranslate"><span class="pre">explicit_draft_tokens</span></code>. Please, visit the <span class="xref myst">ReDrafter README</span> for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.</p>
 </section>
+<section id="lookahead-decoding">
+<h1>Lookahead decoding<a class="headerlink" href="#lookahead-decoding" title="Link to this heading"></a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>Lookahead is a general feature of all LLM models. This tutorial uses vicuna-7b-v1.3 as an example. Some models may have limitations to apply this Lookahead feature, known as specific XQA support.</p>
+<p>Lookahead algorithm depends on a tuple of <code class="docutils literal notranslate"><span class="pre">(windows_size,</span> <span class="pre">ngram_size,</span> <span class="pre">verification_set_size)</span></code>. TensorRT-LLM needs to specify the Lookahead configurations in three places:</p>
+<ol class="arabic simple">
+<li><p><em>The built model engine</em>.</p></li>
+</ol>
+<p>To build an engine with Lookahead support, <code class="docutils literal notranslate"><span class="pre">--specualtive_decoding_mode</span> <span class="pre">lookahead_decoding</span></code> must be specified.</p>
+<p>When building the engine for speculative decoding, including Lookahead, <code class="docutils literal notranslate"><span class="pre">--max_draft_len</span></code> must be provided. For Lookahead, the <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> is defined as:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span> <span class="nf">max_draft_len</span><span class="p">(</span><span class="n">windows_size</span><span class="p">,</span> <span class="n">ngram_size</span><span class="p">,</span> <span class="n">verification_set_size</span><span class="p">):</span>
+    <span class="k">return</span> <span class="p">(</span><span class="mi">0</span> <span class="k">if</span> <span class="p">(</span><span class="n">ngran_size</span><span class="o">==</span><span class="mi">1</span><span class="p">)</span> <span class="k">else</span> <span class="n">ngram_size</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
+        <span class="o">+</span> <span class="p">(</span><span class="n">windows_size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">verification_set_size</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">ngram_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p><em>The TensorRT-LLM runtime program</em>.
+When TensorRT-LLM starts, it needs to reserve resources according to an <code class="docutils literal notranslate"><span class="pre">executor_lookahead_config</span></code>. The configuration should be equal to the config in the engine-building phase. The executor lookahead configuration is noted as <code class="docutils literal notranslate"><span class="pre">(W,</span> <span class="pre">N,</span> <span class="pre">G)</span></code>.</p></li>
+<li><p><em>The request</em>.
+Each request can be assigned a specific lookahead configuration when input to the execution engine, noted as <code class="docutils literal notranslate"><span class="pre">(w,</span> <span class="pre">n,</span> <span class="pre">g)</span></code>. If none is assigned, the executor config is used. The request lookahead config is valid and fixed along the request lifecycle. The minimum Lookahead config is <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">1,</span> <span class="pre">0)</span></code>, meaning only one Jacobi window, ngram size one, and no verification candidates, which is automatically degenerated to normal mode. The meaningful minimum configuration is <code class="docutils literal notranslate"><span class="pre">(2,</span> <span class="pre">2,</span> <span class="pre">1)</span></code>. It is required that the request lookahead config and executor config satisfy <code class="docutils literal notranslate"><span class="pre">w</span> <span class="pre">&lt;=</span> <span class="pre">W,</span> <span class="pre">n</span> <span class="pre">&lt;=</span> <span class="pre">N,</span> <span class="pre">g</span> <span class="pre">&lt;=</span> <span class="pre">G</span></code>.</p></li>
+</ol>
+</section>
+<section id="build-and-execute-an-engine-from-a-model">
+<h2>Build and execute an engine from a model<a class="headerlink" href="#build-and-execute-an-engine-from-a-model" title="Link to this heading"></a></h2>
+<p>Vicuna models re-use Llmama Python scripts located in <a class="reference internal" href="#../../examples/llama"><span class="xref myst">examples/llama</span></a>.</p>
+<section id="convert-a-model-to-checkpoint">
+<h3>Convert a model to checkpoint<a class="headerlink" href="#convert-a-model-to-checkpoint" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MODEL_DIR</span><span class="o">=</span>/path/to/vicuna-7b-v1.3
+<span class="nv">ENGINE_DIR</span><span class="o">=</span>tmp/engine
+<span class="nv">CKPT_DIR</span><span class="o">=</span>tmp/engine/ckpt
+
+python3<span class="w"> </span>examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+--model_dir<span class="o">=</span><span class="nv">$MODEL_DIR</span><span class="w">                       </span><span class="se">\</span>
+--output_dir<span class="o">=</span><span class="nv">$CKPT_DIR</span><span class="w">                       </span><span class="se">\</span>
+--dtype<span class="o">=</span>float16<span class="w">                              </span><span class="se">\</span>
+--tp_size<span class="o">=</span><span class="m">1</span><span class="w">                                  </span><span class="se">\</span>
+--pp_size<span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
+</section>
+<section id="build-checkpoints-for-an-engine">
+<h3>Build checkpoints for an engine<a class="headerlink" href="#build-checkpoints-for-an-engine" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-build<span class="w">                   </span><span class="se">\</span>
+--checkpoint_dir<span class="o">=</span><span class="nv">$CKPT_DIR</span><span class="w">     </span><span class="se">\</span>
+--output_dir<span class="o">=</span><span class="nv">$ENGINE_DIR</span><span class="w">       </span><span class="se">\</span>
+--gpt_attention_plugin<span class="o">=</span>float16<span class="w"> </span><span class="se">\</span>
+--gemm_plugin<span class="o">=</span>float16<span class="w">          </span><span class="se">\</span>
+--max_batch_size<span class="o">=</span><span class="m">32</span><span class="w">            </span><span class="se">\</span>
+--max_input_len<span class="o">=</span><span class="m">1024</span><span class="w">           </span><span class="se">\</span>
+--max_seq_len<span class="o">=</span><span class="m">2048</span><span class="w">             </span><span class="se">\</span>
+--max_beam_width<span class="o">=</span><span class="m">1</span><span class="w">             </span><span class="se">\</span>
+--log_level<span class="o">=</span>error<span class="w">              </span><span class="se">\</span>
+--max_draft_len<span class="o">=</span><span class="m">83</span><span class="w">             </span><span class="se">\</span>
+--speculative_decoding_mode<span class="o">=</span>lookahead_decoding
+</pre></div>
+</div>
+</section>
+<section id="execute-an-engine">
+<h3>Execute an engine<a class="headerlink" href="#execute-an-engine" title="Link to this heading"></a></h3>
+<p>Run <code class="docutils literal notranslate"><span class="pre">examples/run.py</span></code> to generate sequences.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/run.py<span class="w">              </span><span class="se">\</span>
+--max_output_len<span class="o">=</span><span class="m">32</span><span class="w">                 </span><span class="se">\</span>
+--lookahead_config<span class="o">=[</span><span class="m">7</span>,7,7<span class="o">]</span><span class="w">          </span><span class="se">\</span>
+--tokenizer_dir<span class="o">=</span><span class="nv">$MODEL_DIR</span><span class="w">          </span><span class="se">\</span>
+--engine_dir<span class="o">=</span><span class="w"> </span><span class="nv">$ENGINE_DIR</span><span class="w">           </span><span class="se">\</span>
+--log_levelverbose--input_text<span class="w"> </span><span class="s1">&#39;Once upon&#39;</span><span class="w"> </span><span class="s1">&#39;To be, or not&#39;</span><span class="w"> </span><span class="s1">&#39;Be not afraid of greatness&#39;</span>
+</pre></div>
+</div>
+<p>Run <code class="docutils literal notranslate"><span class="pre">examples/summarize.py</span></code> to summarize the CNN daily dataset.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/summarize.py<span class="w">         </span><span class="se">\</span>
+--test_trt_llm<span class="w">                       </span><span class="se">\</span>
+--hf_model_dir<span class="nv">$MODEL_DIR</span><span class="w">             </span><span class="se">\</span>
+--data_type<span class="w"> </span>fp16<span class="w">                     </span><span class="se">\</span>
+--engine_dir<span class="nv">$ENGINE_DIR</span><span class="w">              </span><span class="se">\</span>
+--lookahead_config<span class="o">=</span><span class="w"> </span><span class="o">[</span><span class="m">7</span>,7,7<span class="o">]</span><span class="w">          </span><span class="se">\</span>
+--test_hf
+</pre></div>
+</div>
+</section>
+</section>
+</section>
 
 
            </div>
@@ -466,7 +552,7 @@ However, similar to any new model, you can follow the same approach to define yo
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251c815a0>
+<jinja2.runtime.BlockReference object at 0x7fb97062f250>
 
 <div class="footer">
     <p>

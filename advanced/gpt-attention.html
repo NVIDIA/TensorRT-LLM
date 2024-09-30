@@ -82,6 +82,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -263,8 +267,9 @@ enable) additional features in future releases. For example, enable the support
 for IA3.</p>
 <p><em>The masked MHA kernel has a special version that distributes the work across
 multiple CUDA thread-blocks on the GPU for cases where the GPU occupancy is
-low. That mode called multi-block can be enabled using the <code class="docutils literal notranslate"><span class="pre">multi_block_mode</span></code>
-flag during runtime. Users are recommended to test that mode in scenarios where both the batch
+low. That mode called multi-block is turned on by default starting from TRT-LLM 0.13,
+and can be disabled using <code class="docutils literal notranslate"><span class="pre">--multi_block_mode=False</span></code> during runtime.
+Users are recommended to test that mode in scenarios where both the batch
 size and the number of heads in the model are relatively small. The exact
 definition of small in that context will depend on the model of the GPU and is
 hard to predict but to provide with a rule of thumb, it is worth testing that
@@ -395,14 +400,17 @@ overwrite the “least recently used” caches.</p>
 the <code class="docutils literal notranslate"><span class="pre">sliding</span> <span class="pre">window_size</span></code>.</p>
 <p>This feature helps to reduce the memory footprint of the kv cache when
 dealing with very long sequences.</p>
+<p>The feature, which allows different <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> values
+for each layer, is also supported. To utilize this feature, simply provide an
+<code class="docutils literal notranslate"><span class="pre">int32</span> <span class="pre">torch.Tensor</span></code> or <code class="docutils literal notranslate"><span class="pre">list</span></code> to the <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code> when using python
+runtime session, or provide a vector to the <code class="docutils literal notranslate"><span class="pre">KvCacheConfig</span></code> when using cpp runtime.
+If the number of the provided elements is less than the number of layers, the provided
+tensor/list/vector will be repeated multiple times to the number of layers and then be
+saved as a new tensor. This tensor will serve as the buffer for <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code>,
+setting unique values for each layer. However, it’s important to note that the
+memory allocation for the kv cache still relies on the buffer’s maximum value.</p>
 <p>_Note that the cyclic kv cache feature doesn’t work with beam searching currently as
 the context kv cache are shared across beams.</p>
-<p><em>The experimental feature, which allows different <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> values
-for each layer, is also supported. To utilize this feature, simply provide an
-<code class="docutils literal notranslate"><span class="pre">int32</span> <span class="pre">torch.Tensor</span></code> with a shape of <code class="docutils literal notranslate"><span class="pre">[num_layers]</span></code> to the <code class="docutils literal notranslate"><span class="pre">GenerationSession.setup</span></code>.
-This tensor will serve as the buffer for <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code>,
-setting unique values for each layer. However, it’s important to note that the
-memory allocation for the kv cache still relies on the buffer’s maximum value.</em></p>
 </section>
 <section id="streamingllm">
 <h2>StreamingLLM<a class="headerlink" href="#streamingllm" title="Link to this heading"></a></h2>
@@ -506,7 +514,7 @@ is computed as:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4261c86dd0>
+<jinja2.runtime.BlockReference object at 0x7fb971cc4b80>
 
 <div class="footer">
     <p>

@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -177,7 +181,7 @@
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">mpi_comm</span><span class="p">,</span> <span class="n">mpi_world_size</span><span class="p">,</span> <span class="n">numpy_to_torch</span>
 <span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span><span class="p">,</span> <span class="n">MpiComm</span>
 <span class="kn">from</span> <span class="nn">..bindings.executor</span> <span class="kn">import</span> <span class="n">Executor</span>
-<span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">get_engine_version</span>
+<span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span><span class="p">,</span> <span class="n">get_engine_version</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
@@ -338,6 +342,90 @@
         <span class="s1">&#39;max_beam_width&#39;</span><span class="p">:</span> <span class="n">builder_config</span><span class="p">[</span><span class="s1">&#39;max_beam_width&#39;</span><span class="p">]</span>
     <span class="p">}</span>
     <span class="k">return</span> <span class="n">model_config</span><span class="p">,</span> <span class="n">other_config</span>
+
+
+<span class="k">def</span> <span class="nf">_engine_config_to_model_config</span><span class="p">(</span><span class="n">engine_config</span><span class="p">:</span> <span class="n">EngineConfig</span><span class="p">,</span>
+                                   <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ModelConfig</span><span class="p">:</span>
+    <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">pretrained_config</span>
+    <span class="n">build_config</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span>
+
+    <span class="n">tp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+    <span class="n">num_heads</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
+    <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_key_value_heads</span>
+    <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_kv_heads</span> <span class="o">+</span> <span class="n">tp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">tp_size</span>
+    <span class="n">hidden_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="n">tp_size</span>
+    <span class="n">head_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">head_size</span>
+
+    <span class="n">rnn_config_items</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s1">&#39;conv_kernel&#39;</span><span class="p">,</span> <span class="s1">&#39;layer_types&#39;</span><span class="p">,</span> <span class="s1">&#39;rnn_hidden_size&#39;</span><span class="p">,</span> <span class="s1">&#39;state_size&#39;</span><span class="p">,</span>
+        <span class="s1">&#39;state_dtype&#39;</span><span class="p">,</span> <span class="s1">&#39;rnn_head_size&#39;</span><span class="p">,</span> <span class="s1">&#39;rnn_conv_dim_size&#39;</span>
+    <span class="p">]</span>
+    <span class="n">rnn_configs_kwargs</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">rnn_config_items</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="n">item</span><span class="p">):</span>
+            <span class="n">rnn_configs_kwargs</span><span class="p">[</span><span class="n">item</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="n">item</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">build_config</span><span class="p">,</span> <span class="s1">&#39;kv_cache_type&#39;</span><span class="p">):</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">Warning</span><span class="p">(</span>
+            <span class="s1">&#39;Build config doesn</span><span class="se">\&#39;</span><span class="s1">t have kv_cache_type, you might need to rebuild your enigne.&#39;</span>
+        <span class="p">)</span>
+
+    <span class="c1"># TODO(oargov): this is a hack, make it prettier!</span>
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s2">&quot;get_layer_num_kv_heads&quot;</span><span class="p">):</span>
+        <span class="c1"># each layer has a different number of kv heads</span>
+        <span class="n">attention_layers</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">layer_idx</span> <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer_type</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
+                <span class="n">pretrained_config</span><span class="o">.</span><span class="n">layer_types</span><span class="p">)</span> <span class="k">if</span> <span class="n">layer_type</span> <span class="o">==</span> <span class="s2">&quot;attention&quot;</span>
+        <span class="p">]</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s2">&quot;layer_types&quot;</span><span class="p">)</span> <span class="k">else</span> <span class="nb">list</span><span class="p">(</span>
+            <span class="nb">range</span><span class="p">(</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">))</span>
+        <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">pretrained_config</span><span class="o">.</span><span class="n">get_layer_num_kv_heads</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">attention_layers</span> <span class="k">else</span> <span class="mi">0</span>
+            <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
+        <span class="p">]</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">return</span> <span class="n">ModelConfig</span><span class="p">(</span>
+        <span class="n">max_batch_size</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span>
+        <span class="n">max_beam_width</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
+        <span class="n">vocab_size</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+        <span class="n">num_layers</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+        <span class="n">head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
+        <span class="n">gpt_attention_plugin</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span>
+            <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">),</span>
+        <span class="n">mamba_conv1d_plugin</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span>
+            <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">mamba_conv1d_plugin</span><span class="p">),</span>
+        <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">,</span>
+        <span class="n">paged_state</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">,</span>
+        <span class="n">tokens_per_block</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+        <span class="n">quant_mode</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
+        <span class="n">gather_context_logits</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">,</span>
+        <span class="n">gather_generation_logits</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+        <span class="n">max_prompt_embedding_table_size</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span>
+        <span class="n">max_prompt_embedding_table_size</span><span class="p">,</span>
+        <span class="n">lora_plugin</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">,</span>
+        <span class="n">lora_target_modules</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span><span class="p">,</span>
+        <span class="n">trtllm_modules_to_hf_modules</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span>
+        <span class="n">trtllm_modules_to_hf_modules</span><span class="p">,</span>
+        <span class="n">max_medusa_tokens</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+            <span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;max_draft_len&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">num_medusa_heads</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_medusa_heads</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+            <span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">rnn_configs_kwargs</span><span class="p">,</span>
+        <span class="n">num_kv_heads_per_layer</span><span class="o">=</span><span class="n">num_kv_heads_per_layer</span><span class="p">,</span>
+        <span class="n">redrafter_num_beams</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">redrafter_num_beams</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+            <span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;redrafter_num_beams&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">redrafter_draft_len_per_beam</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span>
+        <span class="n">redrafter_draft_len_per_beam</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;redrafter_draft_len_per_beam&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">kv_cache_type</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">build_config</span><span class="p">,</span> <span class="s1">&#39;kv_cache_type&#39;</span><span class="p">,</span>
+                              <span class="n">KVCacheType</span><span class="o">.</span><span class="n">CONTINUOUS</span><span class="p">),</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
 
 <span class="k">class</span> <span class="nc">ModelRunnerMixin</span><span class="p">:</span>
@@ -595,91 +683,14 @@
             <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
             <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunner&#39;</span><span class="p">:</span>
-        <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">pretrained_config</span>
-        <span class="n">build_config</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">build_config</span>
-
-        <span class="n">tp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
-        <span class="n">num_heads</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
-        <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_key_value_heads</span>
-        <span class="n">num_kv_heads</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_kv_heads</span> <span class="o">+</span> <span class="n">tp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">tp_size</span>
-        <span class="n">hidden_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="n">tp_size</span>
-        <span class="n">head_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">head_size</span>
-
-        <span class="n">rnn_config_items</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="s1">&#39;conv_kernel&#39;</span><span class="p">,</span> <span class="s1">&#39;layer_types&#39;</span><span class="p">,</span> <span class="s1">&#39;rnn_hidden_size&#39;</span><span class="p">,</span> <span class="s1">&#39;state_size&#39;</span><span class="p">,</span>
-            <span class="s1">&#39;state_dtype&#39;</span><span class="p">,</span> <span class="s1">&#39;rnn_head_size&#39;</span><span class="p">,</span> <span class="s1">&#39;rnn_conv_dim_size&#39;</span>
-        <span class="p">]</span>
-        <span class="n">rnn_configs_kwargs</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">rnn_config_items</span><span class="p">:</span>
-            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="n">item</span><span class="p">):</span>
-                <span class="n">rnn_configs_kwargs</span><span class="p">[</span><span class="n">item</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="n">item</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">build_config</span><span class="p">,</span> <span class="s1">&#39;kv_cache_type&#39;</span><span class="p">):</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">Warning</span><span class="p">(</span>
-                <span class="s1">&#39;Build config doesn</span><span class="se">\&#39;</span><span class="s1">t have kv_cache_type, you might need to rebuild your enigne.&#39;</span>
-            <span class="p">)</span>
-
-        <span class="c1"># TODO(oargov): this is a hack, make it prettier!</span>
-        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s2">&quot;get_layer_num_kv_heads&quot;</span><span class="p">):</span>
-            <span class="c1"># each layer has a different number of kv heads</span>
-            <span class="n">attention_layers</span> <span class="o">=</span> <span class="p">[</span>
-                <span class="n">layer_idx</span> <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">layer_type</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
-                    <span class="n">pretrained_config</span><span class="o">.</span><span class="n">layer_types</span><span class="p">)</span> <span class="k">if</span> <span class="n">layer_type</span> <span class="o">==</span> <span class="s2">&quot;attention&quot;</span>
-            <span class="p">]</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s2">&quot;layer_types&quot;</span><span class="p">)</span> <span class="k">else</span> <span class="nb">list</span><span class="p">(</span>
-                <span class="nb">range</span><span class="p">(</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">))</span>
-            <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="p">[</span>
-                <span class="n">pretrained_config</span><span class="o">.</span><span class="n">get_layer_num_kv_heads</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
-                <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">attention_layers</span> <span class="k">else</span> <span class="mi">0</span>
-                <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
-            <span class="p">]</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="kc">None</span>
-
-        <span class="n">model_config</span> <span class="o">=</span> <span class="n">ModelConfig</span><span class="p">(</span>
-            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span>
-            <span class="n">max_beam_width</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
-            <span class="n">vocab_size</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">num_layers</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
-            <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
-            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
-            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">head_size</span><span class="o">=</span><span class="n">head_size</span><span class="p">,</span>
-            <span class="n">gpt_attention_plugin</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span>
-                <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">),</span>
-            <span class="n">mamba_conv1d_plugin</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span>
-                <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">mamba_conv1d_plugin</span><span class="p">),</span>
-            <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span>
-            <span class="n">remove_input_padding</span><span class="p">,</span>
-            <span class="n">paged_state</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_state</span><span class="p">,</span>
-            <span class="n">tokens_per_block</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
-            <span class="n">quant_mode</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
-            <span class="n">gather_context_logits</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">,</span>
-            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">max_prompt_embedding_table_size</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span>
-            <span class="n">max_prompt_embedding_table_size</span><span class="p">,</span>
-            <span class="n">lora_plugin</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">,</span>
-            <span class="n">lora_target_modules</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span><span class="p">,</span>
-            <span class="n">trtllm_modules_to_hf_modules</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span>
-            <span class="n">trtllm_modules_to_hf_modules</span><span class="p">,</span>
-            <span class="n">max_medusa_tokens</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
-                <span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;max_draft_len&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="n">num_medusa_heads</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_medusa_heads</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
-                <span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="o">**</span><span class="n">rnn_configs_kwargs</span><span class="p">,</span>
-            <span class="n">gpu_weights_percent</span><span class="o">=</span><span class="n">gpu_weights_percent</span><span class="p">,</span>
-            <span class="n">num_kv_heads_per_layer</span><span class="o">=</span><span class="n">num_kv_heads_per_layer</span><span class="p">,</span>
-            <span class="n">redrafter_num_beams</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">redrafter_num_beams</span>
-            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;redrafter_num_beams&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="n">redrafter_draft_len_per_beam</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span>
-            <span class="n">redrafter_draft_len_per_beam</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
-                <span class="n">pretrained_config</span><span class="p">,</span> <span class="s1">&#39;redrafter_draft_len_per_beam&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="n">kv_cache_type</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">build_config</span><span class="p">,</span> <span class="s1">&#39;kv_cache_type&#39;</span><span class="p">,</span>
-                                  <span class="n">KVCacheType</span><span class="o">.</span><span class="n">CONTINUOUS</span><span class="p">))</span>
+        <span class="n">model_config</span> <span class="o">=</span> <span class="n">_engine_config_to_model_config</span><span class="p">(</span>
+            <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">gpu_weights_percent</span><span class="o">=</span><span class="n">gpu_weights_percent</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">model_config</span><span class="o">.</span><span class="n">kv_cache_type</span> <span class="o">==</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">DISABLED</span><span class="p">:</span>
             <span class="k">assert</span> <span class="n">max_output_len</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">max_output_len</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">&#39;Disabled KV cache is intended for context phase only now.&#39;</span>
 
+        <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">pretrained_config</span>
+        <span class="n">build_config</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">build_config</span>
         <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span>
         <span class="n">max_input_len</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_input_len</span>
         <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
@@ -713,7 +724,7 @@
         <span class="k">if</span> <span class="n">session</span><span class="o">.</span><span class="n">use_lora_plugin</span><span class="p">:</span>
             <span class="n">lora_manager</span> <span class="o">=</span> <span class="n">LoraManager</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">lora_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">lora_manager</span><span class="o">.</span><span class="n">load_from_ckpt</span><span class="p">(</span><span class="n">model_dir</span><span class="o">=</span><span class="n">lora_dir</span><span class="p">,</span>
+                <span class="n">lora_manager</span><span class="o">.</span><span class="n">load_from_ckpt</span><span class="p">(</span><span class="n">lora_dir</span><span class="p">,</span>
                                             <span class="n">model_config</span><span class="o">=</span><span class="n">model_config</span><span class="p">,</span>
                                             <span class="n">runtime_mapping</span><span class="o">=</span><span class="n">runtime_mapping</span><span class="p">,</span>
                                             <span class="n">ckpt_source</span><span class="o">=</span><span class="n">lora_ckpt_source</span><span class="p">)</span>
@@ -815,7 +826,7 @@
             <span class="k">if</span> <span class="n">session</span><span class="o">.</span><span class="n">use_lora_plugin</span><span class="p">:</span>
                 <span class="n">lora_manager</span> <span class="o">=</span> <span class="n">LoraManager</span><span class="p">()</span>
                 <span class="k">if</span> <span class="n">lora_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="n">lora_manager</span><span class="o">.</span><span class="n">load_from_ckpt</span><span class="p">(</span><span class="n">model_dir</span><span class="o">=</span><span class="n">lora_dir</span><span class="p">,</span>
+                    <span class="n">lora_manager</span><span class="o">.</span><span class="n">load_from_ckpt</span><span class="p">(</span><span class="n">lora_dir</span><span class="p">,</span>
                                                 <span class="n">model_config</span><span class="o">=</span><span class="n">model_config</span><span class="p">,</span>
                                                 <span class="n">runtime_mapping</span><span class="o">=</span><span class="n">runtime_mapping</span><span class="p">,</span>
                                                 <span class="n">ckpt_source</span><span class="o">=</span><span class="n">lora_ckpt_source</span><span class="p">)</span>
@@ -917,6 +928,7 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.generate">[docs]</a>
     <span class="k">def</span> <span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">batch_input_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
+                 <span class="n">position_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">sampling_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">prompt_table</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">prompt_tasks</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1024,6 +1036,7 @@
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
             <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
             <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+            <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
             <span class="o">**</span><span class="n">ptuning_kwargs</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">sampling_config</span><span class="o">.</span><span class="n">return_dict</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">streaming</span><span class="p">:</span>
@@ -1055,7 +1068,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f425165b760>
+<jinja2.runtime.BlockReference object at 0x7fb952d8f610>
 
 <div class="footer">
     <p>

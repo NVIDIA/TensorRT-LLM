@@ -79,6 +79,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
@@ -238,7 +242,8 @@
                  <span class="n">max_blocks_per_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span>
                  <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        expected block pool shape: [num_blocks, num_layers, 2, block_size]</span>
+<span class="sd">        If layers are homogeneous then the expected block pool shape is: [num_blocks, num_layers, 2, block_size]</span>
+<span class="sd">        Otherwise, the expected block pool shape is: [num_blocks, 2, block_size]</span>
 <span class="sd">        &quot;&quot;&quot;</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">max_blocks_per_seq</span> <span class="o">=</span> <span class="n">max_blocks_per_seq</span>
@@ -424,6 +429,7 @@
             <span class="n">block_size</span><span class="o">=</span><span class="n">block_size</span><span class="p">,</span>
             <span class="n">max_blocks_per_seq</span><span class="o">=</span><span class="n">max_blocks_per_seq</span><span class="p">,</span>
             <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">)</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span> <span class="o">=</span> <span class="n">max_attention_window_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_len</span> <span class="o">=</span> <span class="n">sink_token_len</span>
@@ -593,8 +599,15 @@
                                                           <span class="nb">int</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span><span class="p">:</span>
-            <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
-                <span class="mi">1</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">has_single_pool</span><span class="p">():</span>
+                <span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_single_kv_cache_manager</span><span class="p">(</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="s2">&quot;Currently, using KVCacheUpdater with more then single memory pool is not supported&quot;</span>
+                <span class="p">)</span>
+
+            <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
             <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="n">host_kv_cache_block_offsets</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">update_kv_cache_draft_token_location</span><span class="p">(</span>
                 <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
@@ -605,13 +618,13 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span><span class="p">,</span>
                 <span class="n">rewind_tokens_count</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
+                <span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
                 <span class="n">rewind_tokens_tensor</span><span class="p">,</span>
                 <span class="kc">None</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_pool_pointers</span><span class="p">,</span>
                 <span class="n">kv_cache_block_offsets</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">max_blocks_per_seq</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
+                <span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">blocks_manager</span><span class="o">.</span><span class="n">max_blocks_per_seq</span><span class="p">,</span>
+                <span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
                 <span class="kc">None</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
@@ -642,7 +655,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f4251c814b0>
+<jinja2.runtime.BlockReference object at 0x7fb952d8dbd0>
 
 <div class="footer">
     <p>
