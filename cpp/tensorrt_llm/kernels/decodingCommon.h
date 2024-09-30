@@ -210,7 +210,7 @@ template <typename T>
 void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
     FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize, int32_t maxBatchSize,
     int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
-    float const* minPs, cudaStream_t stream);
+    float const*const* minPs, cudaStream_t stream);
 
 //! \brief Distributes values located in src to dst according to the indieces from batchSlots
 //!

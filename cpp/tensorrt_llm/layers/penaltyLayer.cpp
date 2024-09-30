@@ -302,7 +302,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
         invokeAddBiasSoftMax((T*) nullptr, logits, (T*) nullptr, penaltyParams.biases, penaltyParams.endIds, nullptr,
             penaltyParams.batchSlots, penaltyParams.batchSize, mDecoderDomain.getBatchSize(), penaltyParams.beamWidth,
             penaltyParams.vocabSize, penaltyParams.vocabSizePadded, /*skipSoftMax*/ false,
-            /*batchSlotsLogits*/ penaltyParams.batchSlots != nullptr, bufferCast<float>(*params->minPs), penaltyParams.stream);
+            /*batchSlotsLogits*/ penaltyParams.batchSlots != nullptr, bufferCast<float const*>(*params->minPs), penaltyParams.stream);
     }
 
     invokeBatchApplyPenalty(penaltyParams);
