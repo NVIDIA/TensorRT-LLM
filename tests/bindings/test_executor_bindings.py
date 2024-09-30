@@ -1023,6 +1023,11 @@ def test_scheduler_config():
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == None
 
+    capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.STATIC_BATCH
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == None
+
     context_chunking_policy = trtllm.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
                                     context_chunking_policy)

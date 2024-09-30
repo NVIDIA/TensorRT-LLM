@@ -47,7 +47,7 @@ class QWenDecoderLayer(Module):
 
         dtype = config.dtype
         self.tp_group = config.mapping.tp_group
-        tp_size = config.mapping.tp_size
+        self.tp_size = config.mapping.tp_size
 
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                        eps=config.norm_epsilon,
@@ -69,7 +69,7 @@ class QWenDecoderLayer(Module):
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=self.tp_group,
-            tp_size=tp_size,
+            tp_size=self.tp_size,
             quant_mode=config.quant_mode,
             dense_bias=False)
 
@@ -90,7 +90,7 @@ class QWenDecoderLayer(Module):
                 dtype=dtype,
                 bias=False,
                 tp_group=self.tp_group,
-                tp_size=tp_size,
+                tp_size=self.tp_size,
                 quant_mode=config.quant_mode,
                 is_expert=True)
             self.shared_expert_gate = RowLinear(config.hidden_size,
@@ -115,7 +115,7 @@ class QWenDecoderLayer(Module):
                           dtype=dtype,
                           bias=config.mlp_bias,
                           tp_group=self.tp_group,
-                          tp_size=tp_size,
+                          tp_size=self.tp_size,
                           quant_mode=config.quant_mode,
                           **mlp_kwargs)
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
@@ -168,7 +168,8 @@ class QWenDecoderLayer(Module):
 
         if shared_output is not None:
             hidden_states = hidden_states + shared_output
-            hidden_states = allreduce(hidden_states, self.tp_group)
+            if self.tp_size > 1 and self.tp_group is not None:
+                hidden_states = allreduce(hidden_states, self.tp_group)
 
         hidden_states = residual + hidden_states
         if use_cache:

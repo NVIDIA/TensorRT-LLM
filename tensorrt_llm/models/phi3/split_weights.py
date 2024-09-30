@@ -15,8 +15,8 @@
 
 import torch
 
-from tensorrt_llm.models.convert_utils import (get_weight_and_bias, split,
-                                               split_matrix_tp,
+from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
+                                               split, split_matrix_tp,
                                                split_qkv_bias_tp, split_qkv_tp)
 
 from ..._utils import pad_vocab_size
@@ -110,10 +110,13 @@ def split_weights_tp(config, weights, dtype):
     num_heads = config.num_attention_heads
     num_kv_heads = config.num_key_value_heads
     hidden_size = config.hidden_size
+    moe_variant = config.architecture == "PhiMoEForCausalLM"
 
     mha_mode = num_heads == num_kv_heads
     tp_size = config.mapping.tp_size
     rank = config.mapping.tp_rank
+    moe_tp_size = config.mapping.moe_tp_size
+    moe_tp_rank = config.mapping.moe_tp_rank
     use_weight_only = config.quant_mode.is_weight_only()
     plugin_weight_only_quant_type = None
     if use_weight_only and config.quant_mode.is_int8_weight_only() == 'int8':
@@ -121,8 +124,7 @@ def split_weights_tp(config, weights, dtype):
     elif use_weight_only and config.quant_mode.is_int4_weight_only() == 'int4':
         plugin_weight_only_quant_type = torch.quint4x2
 
-    # Helper
-    def get_weight(weight, prefix, bias):
+    def get_quant_weight(weight, prefix, bias):
         return get_tllm_linear_weight(weight, prefix, bias, use_weight_only,
                                       plugin_weight_only_quant_type)
 
@@ -156,25 +158,43 @@ def split_weights_tp(config, weights, dtype):
             split_bias = split_qkv_bias_tp(qkv_bias, num_heads, hidden_size,
                                            tp_size, rank)
 
-        weights.update(get_weight(split_weight, prefix, split_bias))
+        weights.update(get_quant_weight(split_weight, prefix, split_bias))
 
         prefix = layer_prefix + 'attention.dense'
         attn_dense_weight, attn_dense_bias = get_weight_and_bias(
             weights, prefix, dtype)
         split_v = split_matrix_tp(attn_dense_weight, tp_size, rank, dim=1)
-        weights.update(get_weight(split_v, prefix, attn_dense_bias))
+        weights.update(get_quant_weight(split_v, prefix, attn_dense_bias))
 
         prefix = layer_prefix + 'mlp.fc'
-        mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(weights, prefix, dtype)
-        split_v = split_matrix_tp(mlp_fc_weight, tp_size, rank, dim=0)
-        bias = split_matrix_tp(mlp_fc_bias, tp_size, rank, dim=0)
-        weights.update(get_weight(split_v, prefix, bias))
+        if not moe_variant:
+            mlp_fc_weight, mlp_fc_bias = get_weight_and_bias(
+                weights, prefix, dtype)
+            split_v = split_matrix_tp(mlp_fc_weight, tp_size, rank, dim=0)
+            bias = split_matrix_tp(mlp_fc_bias, tp_size, rank, dim=0)
+            weights.update(get_quant_weight(split_v, prefix, bias))
+        else:
+            mlp_fc_weight = get_weight(weights, prefix, dtype)
+            w3 = split_matrix_tp(mlp_fc_weight, 2, 0, dim=1)
+            split_w3 = split_matrix_tp(w3, moe_tp_size, moe_tp_rank, dim=1)
+            w1 = split_matrix_tp(mlp_fc_weight, 2, 1, dim=1)
+            split_w1 = split_matrix_tp(w1, moe_tp_size, moe_tp_rank, dim=1)
+            split_v = torch.concat([split_w3, split_w1], dim=-2)
+            weights.update(get_quant_weight(split_v, prefix, None))
 
         prefix = layer_prefix + 'mlp.proj'
-        mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
-            weights, prefix, dtype)
-        split_v = split_matrix_tp(mlp_proj_weight, tp_size, rank, dim=1)
-        weights.update(get_weight(split_v, prefix, mlp_proj_bias))
+        if not moe_variant:
+            mlp_proj_weight, mlp_proj_bias = get_weight_and_bias(
+                weights, prefix, dtype)
+            split_v = split_matrix_tp(mlp_proj_weight, tp_size, rank, dim=1)
+            weights.update(get_quant_weight(split_v, prefix, mlp_proj_bias))
+        else:
+            mlp_proj_weight = get_weight(weights, prefix, dtype)
+            split_v = split_matrix_tp(mlp_proj_weight,
+                                      moe_tp_size,
+                                      moe_tp_rank,
+                                      dim=2)
+            weights.update(get_quant_weight(split_v, prefix, None))
 
     weights['transformer.vocab_embedding.weight'] = split_embedding(
         weights['transformer.vocab_embedding.weight'], tp_size, rank)
@@ -182,5 +202,10 @@ def split_weights_tp(config, weights, dtype):
                                                 tp_size,
                                                 rank,
                                                 dim=0)
+    if moe_variant:
+        weights['lm_head.bias'] = split_matrix_tp(weights['lm_head.bias'],
+                                                  tp_size,
+                                                  rank,
+                                                  dim=0)
 
     return weights

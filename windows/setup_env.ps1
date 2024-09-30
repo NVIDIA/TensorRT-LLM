@@ -43,6 +43,8 @@ if (-not $skipCUDA){
             $cudaUri = 'https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_551.78_windows.exe'
         } elseif ($cudaVersion -eq "12.5.1"){
             $cudaUri = 'https://developer.download.nvidia.com/compute/cuda/12.5.1/local_installers/cuda_12.5.1_555.85_windows.exe'
+        } elseif ($cudaVersion -eq "12.6.0"){
+            $cudaUri = 'https://developer.download.nvidia.com/compute/cuda/12.6.0/local_installers/cuda_12.6.0_560.76_windows.exe'
         } else {
             $cudaUri = Read-Host "Please go to https://developer.nvidia.com/cuda-downloads and input the url of the CUDA version you wish to use"
         }
@@ -146,7 +148,7 @@ if(-not $skipCUDNN){
         Add-Content -Path $env:LOCALAPPDATA\trt_env_outlog.txt -Value "0"
         New-Item -Path $env:LOCALAPPDATA\CUDNN -ItemType Directory -Force
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.1.0.70_cuda12-archive.zip' -OutFile $env:LOCALAPPDATA\CUDNN\cudnn.zip
+        Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.2.1.18_cuda12-archive.zip' -OutFile $env:LOCALAPPDATA\CUDNN\cudnn.zip
         Expand-Archive -Path $env:LOCALAPPDATA\CUDNN\cudnn.zip -DestinationPath $env:LOCALAPPDATA\CUDNN\cudnn_unzip
 
         New-Item -Path ".\" -Name "CUDNN" -ItemType "directory"
@@ -156,9 +158,9 @@ if(-not $skipCUDNN){
         New-Item -Path $binPath -ItemType Directory
         New-Item -Path $includePath -ItemType Directory
         New-Item -Path $libPath -ItemType Directory
-        Copy-Item -Path "$env:LOCALAPPDATA\CUDNN\cudnn_unzip\cudnn-windows-x86_64-9.1.0.70_cuda12-archive\bin\*" -Destination $binPath
-        Copy-Item -Path "$env:LOCALAPPDATA\CUDNN\cudnn_unzip\cudnn-windows-x86_64-9.1.0.70_cuda12-archive\include\*" -Destination $includePath
-        Copy-Item -Path "$env:LOCALAPPDATA\CUDNN\cudnn_unzip\cudnn-windows-x86_64-9.1.0.70_cuda12-archive\lib\x64\*" -Destination $libPath
+        Copy-Item -Path "$env:LOCALAPPDATA\CUDNN\cudnn_unzip\cudnn-windows-x86_64-9.2.1.18_cuda12-archive\bin\*" -Destination $binPath
+        Copy-Item -Path "$env:LOCALAPPDATA\CUDNN\cudnn_unzip\cudnn-windows-x86_64-9.2.1.18_cuda12-archive\include\*" -Destination $includePath
+        Copy-Item -Path "$env:LOCALAPPDATA\CUDNN\cudnn_unzip\cudnn-windows-x86_64-9.2.1.18_cuda12-archive\lib\x64\*" -Destination $libPath
 
         [Environment]::SetEnvironmentVariable("CUDNN", "$PWD;$binPath;$includePath;$libPath", [EnvironmentVariableTarget]::Machine)
 
@@ -181,10 +183,10 @@ if (-not ($skipTRT)) {
         Write-Output "Grabbing TensorRT..."
         $ProgressPreference = 'SilentlyContinue'
         New-Item -Path .\TensorRT -ItemType Directory
-        Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.3.0/zip/TensorRT-10.3.0.26.Windows.win10.cuda-12.5.zip' -OutFile .\TensorRT\trt.zip
+        Invoke-WebRequest -Uri 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.4.0/zip/TensorRT-10.4.0.26.Windows.win10.cuda-12.6.zip' -OutFile .\TensorRT\trt.zip
         Expand-Archive -Path .\TensorRT\trt.zip -DestinationPath .\TensorRT\
         Remove-Item -Path .\TensorRT\trt.zip -Force
-        $trtPath = Join-Path $TRT_BASE TensorRT-10.3.0.26
+        $trtPath = Join-Path $TRT_BASE TensorRT-10.4.0.26
         Write-Output "TensorRT installed at ${trtPath}"
 
         $trtSubPaths = @{

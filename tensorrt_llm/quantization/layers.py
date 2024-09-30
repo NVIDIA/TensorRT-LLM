@@ -35,11 +35,12 @@ from ..parameter import Parameter
 
 # isort: off
 from .functional import (
-    change_qkv_leading_dim, dequantize, fp8_rowwise_gemm, fp8_rowwise_rms_norm,
-    postprocess_fp8_rowwise, postprocess_weight_only, quantize,
+    dequantize, fp8_rowwise_gemm, fp8_rowwise_rms_norm, postprocess_fp8_rowwise,
+    postprocess_weight_only, postprocess_weight_only_groupwise, quantize,
     quantize_fp8_per_token, quantize_per_token, quantize_tensor,
-    smooth_quant_gemm, smooth_quant_layer_norm, smooth_quant_rms_norm,
-    weight_only_groupwise_quant_matmul, weight_only_quant_matmul, pad_like)
+    validate_group_size, smooth_quant_gemm, smooth_quant_layer_norm,
+    smooth_quant_rms_norm, weight_only_groupwise_quant_matmul,
+    weight_only_quant_matmul)
 # isort: on
 from .mode import QuantMode
 
@@ -848,14 +849,15 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         else:
             self.register_parameter('alpha', None)
 
+        validate_group_size(self)
         if pre_quant_scale:
             self.tllm_to_externel_key_dict = {
-                "weight":
-                ["weight", "weight_scaling_factor", "prequant_scaling_factor"]
+                "weights_scaling_factor": "weight_scale",
+                "prequant_scaling_factor": "input_quantizer._pre_quant_scale",
             }  # AWQ
         else:
             self.tllm_to_externel_key_dict = {
-                "weight": ["qweight", "qzeros", "scales"]
+                "weight": ["qweight", "scales", "qzeros"]
             }  # GPTQ
 
     def forward(self, x, lora_runtime_params=None):
@@ -882,74 +884,13 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        using_head_as_leading_dim = kwargs.get("using_head_as_leading_dim",
-                                               False)
-        config = kwargs.get("config", None)
-        num_heads = config.num_attention_heads
-        if using_head_as_leading_dim:
-            assert config.num_attention_heads == config.num_key_value_heads, "using_head_as_leading_dim require head_size to be multiple of 3."
-        if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
+        if tllm_key.endswith("zero") or (
+                self.prequant_scaling_factor is None
+                and tllm_key.endswith("weights_scaling_factor")):
             return {}
-        if self.is_qkv and type(weights) is list and len(weights) > 3:
-            weights = [
-                torch.cat(weights[i::len(weights) // 3], dim=1)
-                for i in range(len(weights) // 3)
-            ]
-
-        if tllm_key.endswith("bias"):
-            if self.is_padded:
-                weights = torch.split(weights, self.out_features,
-                                      0)[self.tp_rank]
-                weights = pad_like(weights, self.bias.shape)
-            if using_head_as_leading_dim:
-                weights = change_qkv_leading_dim(weights, num_heads)
-            return weights
-        elif tllm_key.endswith("weight"):
-            qweight_int32, qzeros_int32, scales_fp16 = weights
-            qweight_unpacked_int8 = unpack_int32_into_int8(
-                qweight_int32.T).T.contiguous() - 8
-            qweight = qweight_unpacked_int8
-            qweight[qweight < 0] += 16
-            qweight = qweight.view(torch.uint8)
-            if using_head_as_leading_dim:
-                qweight = change_qkv_leading_dim(qweight, num_heads)
-                scales_fp16 = change_qkv_leading_dim(scales_fp16, num_heads)
-            if self.is_padded:
-                qweight = torch.split(qweight, self.out_features,
-                                      1)[self.tp_rank]
-                qweight = pad_like(qweight,
-                                   (self.in_features, self.out_features))
-            qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
-            qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
-                qweight.contiguous(), torch.quint4x2,
-                torch.float16).view(str_dtype_to_torch(self.dtype))
-            # zeros = zeros * scales
-            qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
-            if using_head_as_leading_dim:
-                qzeros_unpacked_int32 = change_qkv_leading_dim(
-                    qzeros_unpacked_int32, num_heads)
-            if self.is_padded:
-                scales_fp16 = torch.split(scales_fp16,
-                                          self.weights_scaling_factor.shape[1],
-                                          1)[self.tp_rank]
-                qzeros_unpacked_int32 = torch.split(
-                    qzeros_unpacked_int32, self.weights_scaling_factor.shape[1],
-                    1)[self.tp_rank]
-                scales_fp16 = pad_like(scales_fp16,
-                                       self.weights_scaling_factor.shape, 1)
-                qzeros_unpacked_int32 = pad_like(qzeros_unpacked_int32,
-                                                 self.zero.shape, 7)
-            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 7) * scales_fp16
-            zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
-                str_dtype_to_torch(self.dtype))
-
-            results = {
-                tllm_key: qweight,
-                tllm_key.replace("weight", "weights_scaling_factor"):
-                scales_fp16,
-                tllm_key.replace("weight", "zero"): zeros_x_scales_fp16,
-            }
-            return results
+        torch_dtype = str_dtype_to_torch(self.dtype)
+        return postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype,
+                                                 self, **kwargs)
 
 
 WeightOnlyGroupwiseQuantColumnLinear = WeightOnlyGroupwiseQuantLinear
@@ -1021,14 +962,15 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         else:
             self.register_parameter('alpha', None)
 
+        validate_group_size(self)
         if pre_quant_scale:
             self.tllm_to_externel_key_dict = {
-                "weight":
-                ["weight", "weight_scaling_factor", "prequant_scaling_factor"]
+                "weights_scaling_factor": "weight_scale",
+                "prequant_scaling_factor": "input_quantizer._pre_quant_scale",
             }  # AWQ
         else:
             self.tllm_to_externel_key_dict = {
-                "weight": ["qweight", "qzeros", "scales"]
+                "weight": ["qweight", "scales", "qzeros"]
             }  # GPTQ
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
@@ -1056,54 +998,13 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        if not (tllm_key.endswith("bias") or tllm_key.endswith("weight")):
+        if tllm_key.endswith("zero") or (
+                self.prequant_scaling_factor is None
+                and tllm_key.endswith("weights_scaling_factor")):
             return {}
-        if tllm_key.endswith("bias"):
-            if self.is_padded:
-                weights = pad_like(weights, self.bias.shape)
-            if self.tp_size > 1:
-                weights /= self.tp_size
-            return weights
-        elif tllm_key.endswith("weight"):
-            qweight_int32, qzeros_int32, scales_fp16 = weights
-            qweight_unpacked_int8 = unpack_int32_into_int8(
-                qweight_int32.T).T.contiguous() - 8
-            qweight = qweight_unpacked_int8
-            qweight[qweight < 0] += 16
-            qweight = qweight.view(torch.uint8)
-            if self.is_padded:
-                qweight = torch.split(qweight, self.in_features,
-                                      0)[self.tp_rank]
-                qweight = pad_like(qweight,
-                                   (self.in_features, self.out_features))
-            qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
-            qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
-                qweight.contiguous(), torch.quint4x2,
-                torch.float16).view(str_dtype_to_torch(self.dtype))
-            # zeros = zeros * scales
-            qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
-            if self.is_padded:
-                scales_fp16 = torch.split(scales_fp16,
-                                          self.weights_scaling_factor.shape[0],
-                                          0)[self.tp_rank]
-                qzeros_unpacked_int32 = torch.split(
-                    qzeros_unpacked_int32, self.weights_scaling_factor.shape[0],
-                    0)[self.tp_rank]
-                scales_fp16 = pad_like(scales_fp16,
-                                       self.weights_scaling_factor.shape, 1)
-                qzeros_unpacked_int32 = pad_like(qzeros_unpacked_int32,
-                                                 self.zero.shape, 7)
-            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 7) * scales_fp16
-            zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
-                str_dtype_to_torch(self.dtype))
-
-            results = {
-                tllm_key: qweight,
-                tllm_key.replace("weight", "weights_scaling_factor"):
-                scales_fp16,
-                tllm_key.replace("weight", "zero"): zeros_x_scales_fp16,
-            }
-            return results
+        torch_dtype = str_dtype_to_torch(self.dtype)
+        return postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype,
+                                                 self, **kwargs)
 
 
 class SmoothQuantMLP(Module):
@@ -1594,7 +1495,10 @@ class Fp8RowwiseMLP(Module):
         if self.quant_mode.has_fp8_rowwise():
             # Quantize per token outputs tuple:
             # quantized tensor and scaling factors per token
-            inter = quantize_fp8_per_token(inter, self.clamp_val.val)
+            if hasattr(self.clamp_val, "val"):
+                inter = quantize_fp8_per_token(inter, self.clamp_val.val)
+            else:
+                inter = quantize_fp8_per_token(inter)
         output = self.proj(inter)
         return output
 
@@ -1718,32 +1622,31 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
 
 class SmoothQuantAttention(Module):
 
-    def __init__(
-            self,
-            *,
-            local_layer_idx,
-            hidden_size,
-            num_attention_heads,
-            num_kv_heads=None,
-            max_position_embeddings=1024,
-            num_layers=1,
-            apply_query_key_layer_scaling=False,
-            attention_head_size=None,
-            attention_mask_type=AttentionMaskType.padding,
-            bias=True,
-            dense_bias=None,
-            dtype=None,
-            position_embedding_type=PositionEmbeddingType.learned_absolute,
-            rotary_embedding_base=10000.0,
-            rotary_embedding_scaling=None,
-            rotary_embedding_percentage=1.0,
-            tp_group=None,
-            tp_size=1,
-            tp_rank=0,
-            scale_alibi_bias=False,
-            paged_kv_cache=False,
-            quant_mode=QuantMode(0),
-    ):
+    def __init__(self,
+                 *,
+                 local_layer_idx,
+                 hidden_size,
+                 num_attention_heads,
+                 num_kv_heads=None,
+                 max_position_embeddings=1024,
+                 num_layers=1,
+                 apply_query_key_layer_scaling=False,
+                 attention_head_size=None,
+                 attention_mask_type=AttentionMaskType.padding,
+                 bias=True,
+                 dense_bias=None,
+                 dtype=None,
+                 position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 rotary_embedding_base=10000.0,
+                 rotary_embedding_scaling=None,
+                 rotary_embedding_percentage=1.0,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 scale_alibi_bias=False,
+                 paged_kv_cache=False,
+                 quant_mode=QuantMode(0),
+                 layer_idx_in_cache_pool=None):
         super().__init__()
         self.local_layer_idx = local_layer_idx
         self.attention_mask_type = attention_mask_type
@@ -1752,6 +1655,7 @@ class SmoothQuantAttention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
@@ -1916,6 +1820,7 @@ class SmoothQuantAttention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -1938,6 +1843,8 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping,
                 host_context_lengths=attention_params.host_context_lengths,
                 use_cache=use_cache,
                 spec_decoding_generation_lengths=spec_decoding_params.

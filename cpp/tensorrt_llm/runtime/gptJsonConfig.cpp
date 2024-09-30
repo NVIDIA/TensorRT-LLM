@@ -85,6 +85,8 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
 
     auto constexpr layerNameAttention = "attention";
     auto constexpr layerNameRecurrent = "recurrent";
+    auto constexpr layerNameLinear = "linear";
+    auto constexpr layerNameNoop = "no_op";
 
     // The json field specifies a "group" of layers, which gets repeated multiple times
     // Note that the total number of layers does not need to be a multiple of a layer
@@ -102,9 +104,17 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
         {
             result[i] = ModelConfig::LayerType::kRECURRENT;
         }
+        else if (layerStringTypes[i % groupSize] == layerNameLinear)
+        {
+            result[i] = ModelConfig::LayerType::kLINEAR;
+        }
+        else if (layerStringTypes[i % groupSize] == layerNameNoop)
+        {
+            result[i] = ModelConfig::LayerType::kNOOP;
+        }
         else
         {
-            TLLM_LOG_ERROR("Unknown layer type: %s", layerStringTypes[i % groupSize].c_str());
+            TLLM_LOG_WARNING("Unknown layer type: %s, assuming attention", layerStringTypes[i % groupSize].c_str());
         }
     }
 
@@ -147,9 +157,25 @@ ModelConfig createModelConfig(
 
     auto const mlpHiddenSize = parseJsonFieldOptional<SizeType32>(config, mlpHiddenSizeField);
 
-    auto modelConfig = ModelConfig{vocabSize, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
+    auto numKvHeadsPerAttentionLayer
+        = parseJsonFieldOr<std::vector<SizeType32>>(config, "num_kv_heads_per_layer", std::vector<SizeType32>());
+
+    auto modelConfig
+        = ModelConfig{vocabSize, numLayers, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
+
+    if (!numKvHeadsPerAttentionLayer.empty())
+    {
+        std::transform(numKvHeadsPerAttentionLayer.cbegin(), numKvHeadsPerAttentionLayer.cend(),
+            numKvHeadsPerAttentionLayer.begin(),
+            [tensorParallelism](SizeType32 const numKvHeads) { return std::max(numKvHeads / tensorParallelism, 1); });
+        modelConfig.setNumKvHeadsPerLayer(numKvHeadsPerAttentionLayer);
+    }
+    else
+    {
+        modelConfig.setNbKvHeads(numKvHeads);
+    }
+
     modelConfig.setSizePerHead(sizePerHead);
-    modelConfig.setNbKvHeads(numKvHeads);
     modelConfig.setLayerTypes(layerTypes);
 
     // Set logits datatype
@@ -269,9 +295,24 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
 
     if (loraTargetModules.has_value())
     {
+        auto const& loraModuleNames = loraTargetModules.value();
+        auto const& numKvHeadsPerLayer = modelConfig.getNumKvHeadsPerLayer();
+        if (!loraModuleNames.empty())
+        {
+            TLLM_CHECK_WITH_INFO(std::all_of(numKvHeadsPerLayer.cbegin(), numKvHeadsPerLayer.cend(),
+                                     [firstNumKvHeads = numKvHeadsPerLayer[0]](SizeType32 numKvHeads)
+                                     { return numKvHeads == firstNumKvHeads; }),
+                "LORA with a VGQA model is not supported");
+        }
+        // TODO(oargov): don't assume all layers have the same num_kv_heads to support VGQA
+        auto const numKvHeads = numKvHeadsPerLayer.empty() ? modelConfig.getNbHeads() : numKvHeadsPerLayer[0];
+        bool hasMoE = !engineVersionNone && json.at("pretrained_config").contains("moe");
+        auto const numExperts = hasMoE
+            ? json.at("pretrained_config").at("moe").at("num_experts").template get<SizeType32>()
+            : SizeType32{0};
         modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
-            modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
-            modelConfig.getSizePerHead(), tensorParallelism));
+            modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(), numKvHeads, modelConfig.getSizePerHead(),
+            tensorParallelism, numExperts));
     }
 
     modelConfig.setMaxLoraRank(loraMaxRank);

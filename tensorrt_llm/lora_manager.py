@@ -244,6 +244,15 @@ def load_hf_lora(
     if len(lora_config.lora_target_modules) == 0:
         lora_config.lora_target_modules = lora_loader.get_target_modules(
             trtllm_modules_to_hf_modules)
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. "
+            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
+        )
+
+    missing_qkv_modules = LoraManager.get_missing_qkv_modules(
+        lora_config.lora_target_modules)
+    lora_config.lora_target_modules.extend(missing_qkv_modules)
 
     if lora_loader.is_valid:
         config = model.config

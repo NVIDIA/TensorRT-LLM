@@ -400,7 +400,8 @@ public:
             TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
                 "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
             TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-                "inputTokenExtraIds vector size must be the same as input token vector size.");
+                "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
+                mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
         }
     }
 
@@ -411,7 +412,7 @@ public:
 
     /// @brief Get the params of the context
     /// @return The params of the context
-    std::optional<executor::ContextPhaseParams> const& getContextPhaseParams() const noexcept
+    [[nodiscard]] std::optional<executor::ContextPhaseParams> const& getContextPhaseParams() const noexcept
     {
         return mContextPhaseParams;
     }
@@ -423,10 +424,10 @@ public:
 
     /// @brief Get the state params of the context
     /// @return The state params of the context
-    executor::ContextPhaseState const& getContextPhaseState() const
+    [[nodiscard]] executor::DataTransceiverState const& getDataTransceiverState() const
     {
         TLLM_CHECK(mContextPhaseParams.has_value());
-        return *static_cast<executor::ContextPhaseState const*>(mContextPhaseParams.value().getState());
+        return *static_cast<executor::DataTransceiverState const*>(mContextPhaseParams.value().getState());
     }
 
     /// @brief Get total number of tokens for this req (prompt + generated)
@@ -659,6 +660,11 @@ public:
         return mSequenceIndex > 0;
     }
 
+    [[nodiscard]] RequestIdType getParentRequestId() const
+    {
+        return mParentRequestId;
+    }
+
     /// @brief Return a vector of the last-generated tokens of shape [num_beams]
     [[nodiscard]] VecTokens const& getLastTokens()
     {
@@ -858,14 +864,46 @@ public:
         return mOrigPromptLen;
     }
 
-    void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen)
+    [[nodiscard]] SizeType32 getPromptLen() const
     {
-        mPrepopulatedPromptLen = prepopulatedPromptLen;
+        return mPromptLen;
     }
 
-    [[nodiscard]] SizeType32 getPrepopulatedPromptLen() const
+    void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
-        return mPrepopulatedPromptLen;
+        auto const promptLen = getPromptLen();
+        TLLM_CHECK(prepopulatedPromptLen < promptLen);
+
+        if (prepopulatedPromptLen > 0)
+        {
+            // Currently, the runtime process is to apply for cache first and then determine prepopulation.
+            // Use the prepopulated length to advance the context position and decrease chunk size if necessary.
+            if (isFullContextRequest())
+            {
+                setContextCurrentPosition(prepopulatedPromptLen);
+                setContextChunkSize(promptLen);
+            }
+            else
+            {
+                auto chunkSize = getContextChunkSize();
+                if (prepopulatedPromptLen + chunkSize < promptLen)
+                {
+                    // make sure to end at block boundary after current chunk
+                    auto const flooredEndPosition
+                        = (prepopulatedPromptLen + chunkSize) / kvTokensPerBlock * kvTokensPerBlock;
+                    chunkSize = flooredEndPosition - prepopulatedPromptLen;
+                    TLLM_CHECK(chunkSize <= getContextChunkSize());
+                }
+                setContextCurrentPosition(prepopulatedPromptLen);
+                setContextChunkSize(chunkSize);
+            }
+            if (!isLastContextChunk())
+            {
+                TLLM_CHECK_WITH_INFO((getContextCurrentPosition() + getContextChunkSize()) % kvTokensPerBlock == 0,
+                    "To prevent cache fragmentation, the context position after current chunk should be divisible "
+                    "by the number of tokens per block, except for the last chunk.");
+            }
+        }
     }
 
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
@@ -1276,7 +1314,7 @@ public:
                 }
                 // TODO: fill the rank ids
                 result.contextPhaseParams = executor::ContextPhaseParams{
-                    std::move(firstGenTokens), mContextPhaseParams.value().releaseState()};
+                    std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState()};
             }
 
             auto const calculateNbTokensOut = [this](SizeType32 maxNbTokens)
@@ -1513,8 +1551,8 @@ private:
         {
             if (mInputTokenExtraIds.value()->size() != inputTokens.size())
             {
-                std::string errStr = "inputTokenExtraIds vector size must be the same as input token vector size.";
-                TLLM_THROW(errStr);
+                TLLM_THROW("inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
+                    mInputTokenExtraIds.value()->size(), inputTokens.size());
             }
             VecTokenExtraIds tokenExtraIds = *mInputTokenExtraIds.value();
             for (std::size_t i = 0; i < inputTokens.size(); ++i)

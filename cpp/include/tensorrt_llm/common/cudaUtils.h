@@ -161,7 +161,7 @@ inline std::optional<bool> isCudaLaunchBlocking()
     return result;
 }
 
-inline void syncAndCheck(char const* const file, int const line)
+inline bool doCheckError()
 {
     auto const cudaLaunchBlocking = isCudaLaunchBlocking();
 #ifndef NDEBUG
@@ -170,10 +170,15 @@ inline void syncAndCheck(char const* const file, int const line)
     bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif
 
-    if (checkError)
+    return checkError;
+}
+
+inline void syncAndCheck(char const* const file, int const line)
+{
+    if (doCheckError())
     {
-        cudaError_t result = cudaDeviceSynchronize();
-        check(result, "cudaDeviceSynchronize", file, line);
+        check(cudaGetLastError(), "cudaGetLastError", file, line);
+        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize", file, line);
     }
 }
 

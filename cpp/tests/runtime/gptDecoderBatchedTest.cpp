@@ -195,7 +195,8 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     SizeType32 constexpr nbRnnLayers{0};
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
-    ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{
+        vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
     auto streamPtr = std::make_shared<CudaStream>();
@@ -315,7 +316,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     SizeType32 constexpr nbRnnLayers{0};
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
-    ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{
+        vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
     auto streamPtr = std::make_shared<CudaStream>();
@@ -440,7 +442,8 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     SizeType32 constexpr nbRnnLayers{0};
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
-    ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{
+        vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
     modelConfig.setSpeculativeDecodingMode(SpeculativeDecodingMode::DraftTokensExternal());
 

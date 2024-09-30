@@ -45,12 +45,17 @@ from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
+from tensorrt_llm.runtime import GenerationSequence
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import (skip_bf16_fp32_accum, skip_bf16_pre_ampere,
                         skip_fp8_pre_ada, skip_fp32_accum_pre_ampere,
                         unittest_name_func)
+
+from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
+    MemoryPoolsAllocator
+from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
+    PoolsKVCacheManager
 
 
 class TestFunctional(unittest.TestCase):
@@ -217,6 +222,7 @@ class TestFunctional(unittest.TestCase):
                                  bias,
                                  host_kv_cache_block_offsets,
                                  host_kv_cache_pool_pointers,
+                                 host_kv_cache_pool_mapping,
                                  sequence_length,
                                  host_past_key_value_lengths,
                                  host_max_attention_window_sizes,
@@ -291,8 +297,15 @@ class TestFunctional(unittest.TestCase):
                     dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 host_kv_cache_pool_pointers_tensor = Tensor(
                     name='host_kv_cache_pool_pointers',
-                    shape=(1, ),
+                    shape=(
+                        1,
+                        1,
+                    ),
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_kv_cache_pool_mapping_tensor = Tensor(
+                    name='host_kv_cache_pool_mapping',
+                    shape=(1, ),
+                    dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 host_runtime_perf_knobs_tensor = Tensor(
                     name='host_runtime_perf_knobs',
                     shape=[16],
@@ -419,6 +432,7 @@ class TestFunctional(unittest.TestCase):
                     host_kv_cache_block_offsets_tensor,
                     host_kv_cache_pool_pointers=
                     host_kv_cache_pool_pointers_tensor,
+                    host_kv_cache_pool_mapping=host_kv_cache_pool_mapping_tensor,
                     host_context_lengths=host_context_lengths_tensor,
                     qkv_bias=qkv_bias,
                     host_runtime_perf_knobs=host_runtime_perf_knobs_tensor)
@@ -443,6 +457,7 @@ class TestFunctional(unittest.TestCase):
                 'kv_cache_block_offsets': kv_cache_block_offsets,
                 'host_kv_cache_block_offsets': host_kv_cache_block_offsets,
                 'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers,
+                'host_kv_cache_pool_mapping': host_kv_cache_pool_mapping,
                 'host_runtime_perf_knobs': host_runtime_perf_knobs
             }
             if use_int8_kv_cache or use_fp8_kv_cache:
@@ -780,18 +795,27 @@ class TestFunctional(unittest.TestCase):
             torch.cuda.synchronize()
             return torch_output, torch_present
 
-        # Init KV cache block manager
-        block_size = plugin_kv_num_heads * tokens_per_block * head_size
-        kv_cache_manager = KVCacheManager(num_layers=1,
-                                          num_blocks=num_blocks,
-                                          block_size=block_size,
-                                          tokens_per_block=tokens_per_block,
-                                          max_blocks_per_seq=max_blocks_per_seq,
-                                          max_attention_window_size=max_seq_len,
-                                          sink_token_len=sink_token_len,
-                                          beam_width=beam_width)
-        host_kv_cache_pool_pointers = torch.tensor(
-            [ordered_key_value.data_ptr(), 0], dtype=torch.int64)
+        # Init Pools KV cache manager
+        memory_pools_allocator = MemoryPoolsAllocator(
+            num_blocks=num_blocks,
+            tokens_per_block=tokens_per_block,
+            head_size=head_size)
+        num_kv_heads_per_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
+            plugin_kv_num_heads, 1)
+        memory_pools_allocator.allocate(dtype, num_kv_heads_per_layer)
+        pools_kv_cache_manager = PoolsKVCacheManager(
+            memory_pools_allocator.pools_metadata,
+            max_blocks_per_seq,
+            num_blocks,
+            tokens_per_block,
+            head_size,
+            max_attention_window_size=max_seq_len,
+            beam_width=beam_width,
+            sink_token_len=sink_token_len)
+
+        host_kv_cache_pool_pointers = memory_pools_allocator.get_kv_cache_pool_pointers(
+        )
+        host_kv_cache_pool_mapping = memory_pools_allocator.pool_mapping
         print("pool ptr ", ordered_key_value.data_ptr())
 
         torch_cache_list = [None] * num_req
@@ -848,11 +872,15 @@ class TestFunctional(unittest.TestCase):
                 # Add sequence to the manager
                 sequence = GenerationSequence(seq_idx=iteration,
                                               batch_idx=iteration)
-                kv_cache_manager.add_sequence(sequence, in_len_req.clone())
+                pools_kv_cache_manager.add_sequence(sequence,
+                                                    in_len_req.clone())
 
             # Get arrays of pointers to the "pages" of KV values
-            offset_array = kv_cache_manager.get_block_offsets(beam_width)
-            dense_offset_array = offset_array[sequence_selection]
+            offset_array = pools_kv_cache_manager.get_block_offsets(beam_width)
+            assert offset_array.shape[
+                0] == 1, f"test is suppose to use only one pool. sequence_selection is based on a single pool"
+            # assume only one pool
+            dense_offset_array = offset_array[0][sequence_selection]
 
             host_input_lengths = np.concatenate(input_length_list)
             host_input_lengths = torch.tensor(host_input_lengths,
@@ -1022,11 +1050,11 @@ class TestFunctional(unittest.TestCase):
             session, output = _construct_execution(
                 session, input_tensor, weight_plugin, bias_plugin,
                 dense_offset_array, host_kv_cache_pool_pointers,
-                sequence_lengths, host_past_key_value_lengths,
-                host_max_attention_window_sizes, host_sink_token_length,
-                context_lengths, max_context_length, cache_indirection,
-                num_heads, hidden_size, num_kv_heads, output, dtype,
-                kv_quant_scale, kv_dequant_scale, host_context_lengths,
+                host_kv_cache_pool_mapping, sequence_lengths,
+                host_past_key_value_lengths, host_max_attention_window_sizes,
+                host_sink_token_length, context_lengths, max_context_length,
+                cache_indirection, num_heads, hidden_size, num_kv_heads, output,
+                dtype, kv_quant_scale, kv_dequant_scale, host_context_lengths,
                 host_request_types, generation_host_runtime_perf_knobs,
                 use_fp8_context_fmha, atten_output_quant_scale)
 
@@ -1050,7 +1078,7 @@ class TestFunctional(unittest.TestCase):
             finished = [False for _ in range(cache_num_req)]
             # Iterate to the next step. Increase number of tokens for all unfinished sequences
             # And allocate new blocks if needed
-            kv_cache_manager.step(finished)
+            pools_kv_cache_manager.step(finished)
 
 
 if __name__ == "__main__":

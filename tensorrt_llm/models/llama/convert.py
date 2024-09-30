@@ -1084,7 +1084,8 @@ def quantize(hf_model_dir: str,
              output_dir: str,
              config: LLaMAConfig,
              device: str = 'cuda',
-             calib_dataset: str = 'cnn_dailymail'):
+             calib_dataset: str = 'cnn_dailymail',
+             trust_remote_code: bool = True):
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
@@ -1101,20 +1102,22 @@ def quantize(hf_model_dir: str,
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
-    hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
+    hf_config = AutoConfig.from_pretrained(hf_model_dir,
+                                           trust_remote_code=trust_remote_code)
     assert "llava" not in hf_config.model_type, "Smooth quant llava/vila/llava_next is not supported yet"
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
-        trust_remote_code=True)
+        trust_remote_code=trust_remote_code)
 
     os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
         "TOKENIZERS_PARALLELISM", "false")
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir,
-                                              trust_remote_code=True,
-                                              use_fast=False,
-                                              padding_side='left')
+    tokenizer = AutoTokenizer.from_pretrained(
+        hf_model_dir,
+        trust_remote_code=trust_remote_code,
+        use_fast=False,
+        padding_side='left')
 
     dataset = load_calib_dataset(calib_dataset)
 

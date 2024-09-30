@@ -57,6 +57,7 @@ class ResidualLayer(Module):
             layer_types = layer_types + config.layer_types[0:(
                 (layer_idx + 1) % layer_type_len)]
             attention_layer_idx = layer_types.count('attention') - 1
+
             self.attention = Attention(
                 local_layer_idx=attention_layer_idx,
                 hidden_size=config.hidden_size,
@@ -209,6 +210,8 @@ class RecurrentGemmaModel(Module):
                     host_kv_cache_block_offsets,
                     host_kv_cache_pool_pointers=kv_cache_params.
                     host_kv_cache_pool_pointers,
+                    host_kv_cache_pool_mapping=kv_cache_params.
+                    host_kv_cache_pool_mapping,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 conv_state=past_conv,
@@ -499,7 +502,6 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 mapping, num_profiles)
 
         # attention inputs
-        num_attention_layers = self.layer_types.count('attention')
         attn_layer_idx = []
         for i in range(self.config.num_hidden_layers):
             if self.layer_types[i] == 'attention':
@@ -511,7 +513,7 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             max_seq_len=max_seq_len,
             num_kv_heads=self.config.num_key_value_heads,
             head_size=self.config.head_size,
-            num_layers=num_attention_layers,
+            num_layers=self.config.num_hidden_layers,
             kv_dtype=str_dtype_to_trt(self.config.kv_dtype),
             num_profiles=num_profiles,
             enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
@@ -522,17 +524,6 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
             mapping=mapping,
             streamingllm=streamingllm,
             attn_layer_idx=attn_layer_idx)
-
-        kv_idx = 0
-        past_key_value = []
-        for i in range(self.config.num_hidden_layers):
-            if self.layer_types[i] == 'attention' and not paged_kv_cache:
-                past_key_value.append(
-                    attention_inputs['past_key_value'][kv_idx])
-                kv_idx += 1
-            else:
-                past_key_value.append(None)
-        attention_inputs['past_key_value'] = past_key_value
 
         # recurrent inputs
         recurrent_inputs = self.prepare_recurrent_inputs(
@@ -601,6 +592,8 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                     'host_kv_cache_block_offsets'],
                 host_kv_cache_pool_pointers=attention_inputs[
                     'host_kv_cache_pool_pointers'],
+                host_kv_cache_pool_mapping=attention_inputs[
+                    'host_kv_cache_pool_mapping'],
                 cache_indirection=attention_inputs['cache_indirection'],
             ),
             'attention_params':

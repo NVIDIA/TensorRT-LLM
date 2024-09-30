@@ -85,7 +85,7 @@ class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
     GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
+        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
@@ -182,6 +182,7 @@ private:
         KV_CACHE_BLOCK_OFFSETS,
         HOST_KV_CACHE_BLOCK_OFFSETS,
         HOST_KV_CACHE_POOL_POINTERS,
+        HOST_KV_CACHE_POOL_MAPPING,
         PAST_KEY_VALUE,
         KV_CACHE_QUANTIZATION_SCALE,
         KV_CACHE_DEQUANTIZATION_SCALE,

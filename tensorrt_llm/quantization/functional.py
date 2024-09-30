@@ -628,6 +628,25 @@ def preprocess_weights_for_mixed_gemm(weight, quant_mode):
                                        original_shape[1] // 2)
 
 
+def validate_group_size(layer):
+    # TODO: Remove this function and its usage after W4A8-AWQ with group_size = 64 is implemented.
+    W4A8_AWQ = 8
+    if layer.quant_algo & W4A8_AWQ and layer.group_size == 64:
+        raise NotImplementedError(
+            "W4A8_AWQ with group_size = 64 is not implemented yet!")
+
+
+def unpack_int32_into_int8(w_packed):
+    # Unpack inputs packed in int32/float32 into uint4 and store them in int8 format
+    w_packed_int4x2 = w_packed.contiguous().view(torch.uint8)
+    w_unpacked = torch.zeros(w_packed_int4x2.shape[0],
+                             w_packed_int4x2.shape[1] * 2,
+                             dtype=torch.int8)
+    w_unpacked[:, ::2] = w_packed_int4x2 % 16
+    w_unpacked[:, 1::2] = w_packed_int4x2 // 16
+    return w_unpacked.contiguous()
+
+
 def change_qkv_leading_dim(w, num_heads):
     if w.dim() == 1:
         w = w.reshape(num_heads, 3, -1)
@@ -680,6 +699,124 @@ def postprocess_weight_only(tllm_key, weights, quant_mode, layer):
                                   tp_dim)[layer.tp_rank]
             weights = pad_like(weights, (layer.out_features, ))
         return {tllm_key: weights}  # Bias
+
+
+def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
+                                      **kwargs):
+    using_head_as_leading_dim = kwargs.get("using_head_as_leading_dim", False)
+    config = kwargs.get("config", None)
+    use_autoawq = kwargs.get("use_autoawq", None)
+    num_heads = config.num_attention_heads
+    USE_GPTQ = layer.prequant_scaling_factor is None and use_autoawq is None
+    USE_HF_AWQ = layer.prequant_scaling_factor is None and use_autoawq is not None
+    USE_MODELOPT_AWQ = layer.prequant_scaling_factor is not None
+
+    tp_dim = 1 if isinstance(layer, ColumnLinear) else 0
+    is_qkv = layer.is_qkv if hasattr(layer, "is_qkv") else False
+
+    if using_head_as_leading_dim:
+        assert config.num_attention_heads == config.num_key_value_heads, "using_head_as_leading_dim require head_size to be multiple of 3."
+    if tllm_key.endswith("weights_scaling_factor"):
+        # TODO: Remove reshaping after modelopt optimizes scale shape
+        if is_qkv:
+            for idx, w in enumerate(weights):
+                scales = w.to(torch_dtype)
+                scales = scales.reshape(-1,
+                                        layer.weights_scaling_factor.shape[0]).T
+                scales = scales.chunk(layer.tp_size, 1)[layer.tp_rank]
+                weights[idx] = scales
+            weights = torch.cat(weights, dim=1)
+        else:
+            scales = weights.to(torch_dtype)
+            scales_shape = [
+                layer.weights_scaling_factor.shape[1],
+                layer.weights_scaling_factor.shape[0]
+            ]
+            scales_shape[1 - tp_dim] *= layer.tp_size
+            scales = scales.reshape(scales_shape).T
+            weights = scales.chunk(layer.tp_size, tp_dim)[layer.tp_rank]
+    if is_qkv and isinstance(weights, list) and len(weights) >= 3:
+        if USE_MODELOPT_AWQ:
+            if tllm_key.endswith("prequant_scaling_factor"):
+                weights = weights[0]
+            else:
+                weights = torch.cat(weights, dim=0)
+        elif len(weights) > 3:
+            weights = [
+                torch.cat(weights[i::len(weights) // 3], dim=1)
+                for i in range(len(weights) // 3)
+            ]
+
+    if tllm_key.endswith("bias"):
+        if is_qkv and isinstance(weights, list):
+            weights = torch.cat(weights)
+        if layer.is_padded:
+            weights = pad_like(weights, layer.bias.shape)
+        if using_head_as_leading_dim:
+            weights = change_qkv_leading_dim(weights, num_heads)
+        results = {tllm_key: weights}
+    elif tllm_key.endswith("weight"):
+        if USE_GPTQ:
+            qweight = unpack_int32_into_int8(weights[0].T).T - 8
+        elif USE_HF_AWQ:
+            qweight = unpack_int32_into_int8(weights[0]) - 8
+        else:
+            qweight = unpack_int32_into_int8(weights.T)
+        qweight[qweight < 0] += 16
+        qweight = qweight.view(torch.uint8)
+        if using_head_as_leading_dim:
+            qweight = change_qkv_leading_dim(qweight, num_heads)
+        if layer.is_padded:
+            qweight = torch.split(qweight, layer.out_features,
+                                  tp_dim)[layer.tp_rank]
+            qweight = pad_like(qweight, (layer.in_features, layer.out_features))
+        qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+        qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
+            qweight.contiguous(), torch.quint4x2,
+            torch.float16).view(torch_dtype)
+        results = {tllm_key: qweight}
+
+        # scales and zeros for GPTQ and HF-AWQ
+        if USE_GPTQ or USE_HF_AWQ:
+            scales = weights[1].to(torch_dtype)
+            qzeros = unpack_int32_into_int8(weights[2])
+            if using_head_as_leading_dim:
+                scales = change_qkv_leading_dim(scales, num_heads)
+                qzeros = change_qkv_leading_dim(qzeros, num_heads)
+            if layer.is_padded:
+                scales = torch.split(scales,
+                                     layer.weights_scaling_factor.shape[tp_dim],
+                                     tp_dim)[layer.tp_rank]
+                scales = pad_like(scales, layer.weights_scaling_factor.shape, 1)
+                qzeros = torch.split(qzeros,
+                                     layer.weights_scaling_factor.shape[tp_dim],
+                                     tp_dim)[layer.tp_rank]
+                qzeros = pad_like(qzeros, layer.zero.shape, 7)
+            zeros_x_scales = (-qzeros + 8 - 1 * USE_GPTQ) * scales
+            zeros_x_scales = zeros_x_scales.to(torch_dtype)
+            results.update({
+                tllm_key.replace("weight", "weights_scaling_factor"):
+                scales,
+                tllm_key.replace("weight", "zero"):
+                zeros_x_scales,
+            })
+    elif tllm_key.endswith("weights_scaling_factor"):
+        # TODO: Remove reshaping after modelopt optimizes scale shape
+        if layer.is_padded:
+            raise NotImplementedError(
+                "Auto-padding is not Implemented for ModelOpt HF-AWQ.")
+        results = {tllm_key: weights}
+    elif tllm_key.endswith("prequant_scaling_factor"):
+        prequant_scale = weights.to(torch_dtype).reshape(1, -1)
+        if layer.is_padded and tp_dim == 1:
+            prequant_scale = torch.split(prequant_scale,
+                                         layer.prequant_scaling_factor.shape[1],
+                                         1)[layer.tp_rank]
+            prequant_scale = pad_like(prequant_scale,
+                                      layer.prequant_scaling_factor.shape, 0)
+        results = {tllm_key: prequant_scale}
+
+    return results
 
 
 def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):

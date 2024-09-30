@@ -342,9 +342,6 @@ def build_model(
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
 
-    if build_config.plugin_config.reduce_fusion and model_config.mapping.tp_size == 1:
-        build_config.plugin_config.reduce_fusion = False
-
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size

@@ -3,7 +3,7 @@
 set -ex
 
 ARCH=$(uname -m)
-CMAKE_VERSION="3.24.4"
+CMAKE_VERSION="3.30.2"
 
 PARSED_CMAKE_VERSION=$(echo $CMAKE_VERSION | sed 's/\.[0-9]*$//')
 CMAKE_FILE_NAME="cmake-${CMAKE_VERSION}-linux-${ARCH}"

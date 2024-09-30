@@ -40,12 +40,17 @@ from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime import GenerationSequence, KVCacheManager
+from tensorrt_llm.runtime import GenerationSequence
+from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
+    PoolsKVCacheManager
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import (getSMVersion, skip_bf16_fp32_accum,
                         skip_bf16_pre_ampere, skip_fp8_pre_ada,
                         skip_fp32_accum_pre_ampere, unittest_name_func)
+
+from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
+    MemoryPoolsAllocator
 
 
 class TestFunctional(unittest.TestCase):
@@ -399,11 +404,12 @@ class TestFunctional(unittest.TestCase):
         def _construct_execution(
                 session, input_tensor, weight, bias, past_key_value,
                 host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
-                packed_mask_for_fmha, sequence_length,
-                host_past_key_value_lengths, host_max_attention_window_sizes,
-                host_sink_token_length, context_lengths, host_context_lengths,
-                cache_indirection, host_request_types, num_heads, hidden_size,
-                num_kv_heads, output, dtype, max_context_length, shape_dict,
+                host_kv_cache_pool_mapping, packed_mask_for_fmha,
+                sequence_length, host_past_key_value_lengths,
+                host_max_attention_window_sizes, host_sink_token_length,
+                context_lengths, host_context_lengths, cache_indirection,
+                host_request_types, num_heads, hidden_size, num_kv_heads,
+                output, dtype, max_context_length, shape_dict,
                 kv_int8_quant_scale, kv_int8_dequant_scale, configuration,
                 host_runtime_perf_knobs):
             kv_cache_block_offsets = None
@@ -480,6 +486,7 @@ class TestFunctional(unittest.TestCase):
                 kv_cache_block_offsets_tensor = None
                 host_kv_cache_block_offsets_tensor = None
                 host_kv_cache_pool_pointers_tensor = None
+                host_kv_cache_pool_mapping_tensor = None
                 if paged_kv_cache:
                     kv_cache_block_offsets_tensor = Tensor(
                         name='kv_cache_block_offsets',
@@ -491,8 +498,15 @@ class TestFunctional(unittest.TestCase):
                         dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                     host_kv_cache_pool_pointers_tensor = Tensor(
                         name='host_kv_cache_pool_pointers',
-                        shape=(1, ),
+                        shape=(
+                            1,
+                            1,
+                        ),
                         dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                    host_kv_cache_pool_mapping_tensor = Tensor(
+                        name='host_kv_cache_pool_mapping',
+                        shape=(1, ),
+                        dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 else:
                     past_key_value_tensor = Tensor(
                         name='past_key_value',
@@ -606,6 +620,7 @@ class TestFunctional(unittest.TestCase):
                     host_kv_cache_block_offsets_tensor,
                     host_kv_cache_pool_pointers=
                     host_kv_cache_pool_pointers_tensor,
+                    host_kv_cache_pool_mapping=host_kv_cache_pool_mapping_tensor,
                     max_context_length=max_context_length,
                     qkv_bias=qkv_bias,
                     host_runtime_perf_knobs=host_runtime_perf_knobs_tensor)
@@ -639,6 +654,8 @@ class TestFunctional(unittest.TestCase):
                     'host_kv_cache_block_offsets'] = host_kv_cache_block_offsets
                 inputs[
                     'host_kv_cache_pool_pointers'] = host_kv_cache_pool_pointers
+                inputs[
+                    'host_kv_cache_pool_mapping'] = host_kv_cache_pool_mapping
             else:
                 inputs['past_key_value'] = past_key_value
 
@@ -725,24 +742,34 @@ class TestFunctional(unittest.TestCase):
                                         dtype=torch_kv_cache_dtype,
                                         device='cuda')
         host_kv_cache_pool_pointers = None
+        host_kv_cache_pool_mapping = None
         # Init KV cache block manager
         if paged_kv_cache:
-            block_size = plugin_kv_num_heads * tokens_per_block * head_size
-            kv_cache_manager = KVCacheManager(
-                num_layers=1,
+            memory_pools_allocator = MemoryPoolsAllocator(
                 num_blocks=num_blocks,
-                block_size=block_size,
                 tokens_per_block=tokens_per_block,
-                max_blocks_per_seq=max_blocks_per_seq,
+                head_size=head_size)
+
+            num_kv_heads_per_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
+                plugin_kv_num_heads, 1)
+            memory_pools_allocator.allocate(dtype, num_kv_heads_per_layer)
+            pools_kv_cache_manager = PoolsKVCacheManager(
+                memory_pools_allocator.pools_metadata,
+                max_blocks_per_seq,
+                num_blocks,
+                tokens_per_block,
+                head_size,
                 max_attention_window_size=max_seq_len,
-                sink_token_len=sink_token_len,
-                beam_width=beam_width)
+                beam_width=beam_width,
+                sink_token_len=sink_token_len)
+
             host_kv_cache_pool_pointers = torch.tensor(
                 [present_key_value.data_ptr(), 0], dtype=torch.int64)
+            host_kv_cache_pool_mapping = memory_pools_allocator.pool_mapping
 
             # Add sequences to the kv_cache_manager
             for bi in range(batch_size):
-                kv_cache_manager.add_sequence(
+                pools_kv_cache_manager.add_sequence(
                     GenerationSequence(seq_idx=bi, batch_idx=bi), in_len)
 
         weight = torch.randn(shape_dict['weight'],
@@ -992,6 +1019,10 @@ class TestFunctional(unittest.TestCase):
 
             if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:
                 if paged_kv_cache:
+                    assert pools_kv_cache_manager.has_single_pool(
+                    ) is True, f"Current test assuming only one memory pool"
+                    kv_cache_manager = pools_kv_cache_manager.get_single_kv_cache_manager(
+                    )
                     kv_cache_cont = kv_cache_manager.blocks_manager.get_continuous_caches(
                         present_key_value)
                     kv_cache_cont = kv_cache_cont.permute(1, 0, 2)
@@ -1054,9 +1085,12 @@ class TestFunctional(unittest.TestCase):
             kv_cache_block_offsets = None
             if paged_kv_cache:
                 # Get arrays of pointers to the "pages" of KV values
+                assert pools_kv_cache_manager.has_single_pool(
+                ) is True, f"Current test assuming only one memory pool"
+                kv_cache_manager = pools_kv_cache_manager.get_single_kv_cache_manager(
+                )
                 kv_cache_block_offsets = kv_cache_manager.get_block_offsets(
                     beam_width)
-
             if step == 0:
                 host_request_types = torch.tensor([0] * batch_size,
                                                   dtype=torch.int32)
@@ -1181,8 +1215,9 @@ class TestFunctional(unittest.TestCase):
                 session, output, present_key_value = _construct_execution(
                     session, input_tensor, weight_plugin, bias_plugin,
                     present_key_value, kv_cache_block_offsets,
-                    host_kv_cache_pool_pointers, packed_mask_for_fmha,
-                    sequence_length, host_past_key_value_lengths,
+                    host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+                    packed_mask_for_fmha, sequence_length,
+                    host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     input_lengths, host_context_lengths, cache_indirection,
                     host_request_types, num_heads, hidden_size, num_kv_heads,
@@ -1191,7 +1226,6 @@ class TestFunctional(unittest.TestCase):
                     context_host_runtime_perf_knobs)
                 del session
                 session = None
-
                 # Note: Volta has larger errors.
                 # We speculate it’s because Volta’s TC is smaller and more calculations are required,
                 # which may lead to more error accumulation.
@@ -1353,7 +1387,8 @@ class TestFunctional(unittest.TestCase):
                 session, tiled_output, present_key_value = _construct_execution(
                     session, tiled_input_tensor, weight_plugin, bias_plugin,
                     tiled_present_key_value, kv_cache_block_offsets,
-                    host_kv_cache_pool_pointers, None, tiled_sequence_length,
+                    host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+                    None, tiled_sequence_length,
                     tiled_host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     tiled_input_lengths, tiled_host_context_lengths,
@@ -1374,7 +1409,7 @@ class TestFunctional(unittest.TestCase):
             if paged_kv_cache:
                 # Iterate to the next step. Increase number of tokens for all unfinished sequences
                 # And allocate new blocks if needed
-                kv_cache_manager.step([False] * batch_size)
+                pools_kv_cache_manager.step([False] * batch_size)
         # assert False, "Force fail"
         return
 

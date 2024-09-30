@@ -621,7 +621,7 @@ Currently, CogVLM only support bfloat16 precision.
 1. Download Huggingface weights
 
     ```bash
-    export MODEL_NAME="Phi-3-vision-128k-instruct"
+    export MODEL_NAME="Phi-3-vision-128k-instruct" # or Phi-3.5-vision-instruct
     git clone https://huggingface.co/microsoft/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 

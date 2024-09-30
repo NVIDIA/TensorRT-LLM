@@ -210,8 +210,6 @@ struct LookaheadSetupParams : public DecodingSetupParams
     TensorPtr positionOffsets;
     //! see LookaheadDecodingOutputs::attentionPackedMasks
     TensorPtr attentionPackedMasks;
-    //! see LookaheadDecodingOutputs::actualGenerationLengths
-    TensorPtr actualGenerationLengths;
 };
 
 class BaseDecodingInputs
@@ -551,8 +549,6 @@ public:
     TensorPtr positionOffsets;
     //! [maxBatchSize, maxDecodingTokens]
     TensorPtr positionIds;
-    //! The actual decoding tokens length, for debug and for future.
-    TensorPtr actualGenerationLengths;
 };
 
 class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs

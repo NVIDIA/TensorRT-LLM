@@ -18,6 +18,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig
 from tensorrt_llm.hlapi.llm import RequestOutput
 from tensorrt_llm.hlapi.openai_protocol import (
+    ChatCompletionLogProbs, ChatCompletionLogProbsContent,
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
@@ -68,9 +69,14 @@ class OpenaiServer:
                  kv_cache_config: KvCacheConfig,
                  hf_tokenizer: PreTrainedTokenizer = None):
         self.llm = llm
-        self.model = model
         self.kv_cache_config = kv_cache_config
         self.tokenizer = hf_tokenizer
+
+        model_dir = Path(model)
+        if model_dir.exists() and model_dir.is_dir():
+            self.model = model_dir.name
+        else:
+            self.model = model
 
         self.app = FastAPI()
 
@@ -110,12 +116,7 @@ class OpenaiServer:
         return JSONResponse(content=ver)
 
     async def get_model(self) -> JSONResponse:
-        model_dir = Path(self.model)
-        if model_dir.exists() and model_dir.is_dir():
-            model = model_dir.name
-        else:
-            model = self.model
-        model_list = ModelList(data=[ModelCard(id=model)])
+        model_list = ModelList(data=[ModelCard(id=self.model)])
         return JSONResponse(content=model_list.model_dump())
 
     async def openai_chat(self, request: ChatCompletionRequest) -> Response:
@@ -138,29 +139,47 @@ class OpenaiServer:
                 usage = None
             return usage
 
+        def create_logprobs(token_ids: List[int],
+                            logprobs: List[float]) -> ChatCompletionLogProbs:
+            assert len(token_ids) == len(logprobs), \
+                   "token_ids and logprobs have different lengths"
+            content: List[ChatCompletionLogProbsContent] = []
+            for token_id, logprob in zip(token_ids, logprobs):
+                token = self.tokenizer.decode(token_id)
+                # returning multiple logprobs is not supported
+                first_logprob = ChatCompletionLogProbsContent(
+                    token=token, logprob=max(logprob, -9999.0),
+                    bytes=list(token.encode("utf-8", errors="replace"))
+                )
+                content.append(first_logprob)
+            chat_logprobs = ChatCompletionLogProbs(content=content)
+            return chat_logprobs
+
         async def chat_stream_generator(promise: RequestOutput) -> AsyncGenerator[str, None]:
             first_iteration = True
             num_choices = 1 if request.n is None else request.n
             finish_reason_sent = [False] * num_choices
             role = get_role()
+
+            def yield_first_chat(num_tokens: int, role: str = None, content: str = None):
+                for i in range(num_choices):
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=i,
+                        delta=DeltaMessage(
+                            role=role, content=content),
+                        logprobs=None,
+                        finish_reason=None)
+                    chunk = ChatCompletionStreamResponse(
+                        choices=[choice_data], model=self.model)
+                    chunk.usage = stream_usage_info(num_tokens, 0)
+
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
+
             async for res in promise:
                 prompt_tokens = len(res.prompt_token_ids)
                 if first_iteration:
-                    # Send first response for each request.n (index) with
-                    # the role
-                    for i in range(num_choices):
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=i,
-                            delta=DeltaMessage(role=role),
-                            logprobs=None,
-                            finish_reason=None)
-                        chunk = ChatCompletionStreamResponse(
-                            choices=[choice_data], model=request.model)
-                        chunk.usage = stream_usage_info(
-                            prompt_tokens, 0)
-
-                        data = chunk.model_dump_json()
-                        yield f"data: {data}\n\n"
+                    yield_first_chat(prompt_tokens, role=role)
 
                     if request.echo:
                         last_msg_content = ""
@@ -171,22 +190,7 @@ class OpenaiServer:
                                 "content"]
 
                         if last_msg_content:
-                            for i in range(num_choices):
-                                choice_data = (
-                                    ChatCompletionResponseStreamChoice(
-                                        index=i,
-                                        delta=DeltaMessage(
-                                            content=last_msg_content),
-                                        logprobs=None,
-                                        finish_reason=None))
-                                chunk = ChatCompletionStreamResponse(
-                                    choices=[choice_data],
-                                    model=request.model)
-                                chunk.usage = stream_usage_info(
-                                    prompt_tokens, 0)
-                                data = chunk.model_dump_json(
-                                    exclude_unset=True)
-                            yield f"data: {data}\n\n"
+                            yield_first_chat(prompt_tokens, content=last_msg_content)
                 first_iteration = False
 
                 for output in res.outputs:
@@ -213,8 +217,12 @@ class OpenaiServer:
                             index=i,
                             delta=delta_message,
                             finish_reason=None)
+                        if request.logprobs:
+                            logprobs = output.logprobs_diff
+                            token_ids = output.token_ids_diff
+                            choice_data.logprobs = create_logprobs(token_ids, logprobs)
                         chunk = ChatCompletionStreamResponse(
-                            choices=[choice_data], model=request.model)
+                            choices=[choice_data], model=self.model)
                         chunk.usage = stream_usage_info(
                             prompt_tokens, output.length)
                         data = chunk.model_dump_json()
@@ -233,7 +241,7 @@ class OpenaiServer:
                 )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
-                    choices=[], model=request.model, usage=final_usage)
+                    choices=[], model=self.model, usage=final_usage)
                 final_usage_data = final_usage_chunk.model_dump_json()
                 yield f"data: {final_usage_data}\n\n"
 
@@ -259,6 +267,9 @@ class OpenaiServer:
                     index=output.index,
                     message=message,
                 )
+
+                if request.logprobs:
+                    choice.logprobs = create_logprobs(output.token_ids, output.logprobs)
                 choices.append(choice)
 
             if request.echo:
@@ -279,7 +290,7 @@ class OpenaiServer:
                 total_tokens=num_prompt_tokens + num_generated_tokens,
             )
             response = ChatCompletionResponse(
-                model=request.model,
+                model=self.model,
                 choices=choices,
                 usage=usage,
             )
@@ -303,12 +314,15 @@ class OpenaiServer:
             )
             sampling_params = request.to_sampling_params()
 
-            promise = self.llm.generate_async(prompt, sampling_params,
-                                              request.stream)
+            promise = self.llm.generate_async(
+                inputs=prompt,
+                sampling_params=sampling_params,
+                streaming=request.stream,
+            )
             if request.stream:
                 response_generator = chat_stream_generator(promise)
                 return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                                            media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise)
                 return JSONResponse(content=response.model_dump())
@@ -352,7 +366,7 @@ class OpenaiServer:
                         delta_text = prompt + delta_text
                         echoed[response_idx] = True
                     response = CompletionStreamResponse(
-                        model=request.model,
+                        model=self.model,
                         choices=[
                             CompletionResponseStreamChoice(
                                 index=response_idx, text=delta_text)
@@ -387,7 +401,7 @@ class OpenaiServer:
                 total_tokens=num_gen_tokens + num_prompt_tokens,
             )
             response = CompletionResponse(
-                model=request.model,
+                model=self.model,
                 choices=choices,
                 usage=usage_info,
             )
@@ -403,8 +417,11 @@ class OpenaiServer:
             promises: List[RequestOutput] = []
             sampling_params = request.to_sampling_params()
             for prompt in prompts:
-                promise = self.llm.generate_async(prompt, sampling_params,
-                                                    request.stream)
+                promise = self.llm.generate_async(
+                    inputs=prompt,
+                    sampling_params=sampling_params,
+                    streaming=request.stream,
+                )
                 promises.append(promise)
             generator = merge_promises(promises)
             num_choices = len(prompts) if request.n is None else len(prompts) * request.n

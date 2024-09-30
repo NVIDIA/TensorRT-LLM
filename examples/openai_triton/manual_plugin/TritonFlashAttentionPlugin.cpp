@@ -197,15 +197,17 @@ int TritonFlashAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputD
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
+    int res = 1;
     if (mType == DataType::kHALF)
     {
-        return enqueueImpl<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        res = enqueueImpl<half>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     else if (mType == DataType::kFLOAT)
     {
-        return enqueueImpl<float>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        res = enqueueImpl<float>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
-    return 1;
+    sync_check_cuda_error();
+    return res;
 }
 
 // IPluginV2Ext Methods

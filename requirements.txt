@@ -8,7 +8,7 @@ lark
 mpi4py
 numpy<2
 onnx>=1.12.0
-openai
+openai==1.39.0
 polygraphy
 psutil
 pynvml>=11.5.0
@@ -17,7 +17,7 @@ pandas
 h5py==3.10.0
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.3.0
+tensorrt~=10.4.0
 # https://github.com/pytorch/pytorch/blob/v2.4.0/version.txt uses 2.4.0a0.
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-07.html#rel-24-07 uses 2.4.0a0.
 torch>=2.4.0a0,<=2.4.0
@@ -27,7 +27,6 @@ pillow==10.3.0
 wheel
 optimum
 evaluate
-janus
 mpmath>=1.3.0
 click
 click_option_group

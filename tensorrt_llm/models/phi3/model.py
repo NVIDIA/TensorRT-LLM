@@ -5,8 +5,9 @@ from transformers import AutoModelForCausalLM
 
 from ..._utils import pad_vocab_size
 from ...functional import PositionEmbeddingType, Tensor
-from ...layers import (MLP, Attention, AttentionMaskType, BlockSparseAttnParams,
-                       ColumnLinear, Embedding, LayerNorm, RmsNorm)
+from ...layers import (MLP, MOE, Attention, AttentionMaskType,
+                       BlockSparseAttnParams, ColumnLinear, Embedding,
+                       LayerNorm, MoeConfig, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
@@ -31,6 +32,7 @@ class Phi3DecoderLayer(Module):
         self.gegelu_limit = None
 
         self.small_variant = config.architecture == "Phi3SmallForCausalLM"
+        self.moe_variant = config.architecture == "PhiMoEForCausalLM"
         if self.small_variant:
             self.gegelu_limit = config.gegelu_limit
 
@@ -51,10 +53,14 @@ class Phi3DecoderLayer(Module):
                 config.blocksparse_num_local_blocks,
                 config.blocksparse_vertical_stride)
 
+        if self.small_variant or self.moe_variant:
             self.input_layernorm = LayerNorm(
-                normalized_shape=config.hidden_size, dtype=config.dtype)
+                normalized_shape=config.hidden_size,
+                dtype=config.dtype,
+                eps=config.norm_epsilon)
             self.post_layernorm = LayerNorm(normalized_shape=config.hidden_size,
-                                            dtype=config.dtype)
+                                            dtype=config.dtype,
+                                            eps=config.norm_epsilon)
         else:
             self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                            eps=config.norm_epsilon,
@@ -80,7 +86,7 @@ class Phi3DecoderLayer(Module):
             original_max_position_embeddings = config.original_max_position_embeddings
             position_embedding_type = PositionEmbeddingType.long_rope
 
-            if self.small_variant:
+            if self.small_variant or self.moe_variant:
                 rope_scaling_short_mscale = config.longrope_short_mscale
                 rope_scaling_long_mscale = config.longrope_long_mscale
 
@@ -94,7 +100,7 @@ class Phi3DecoderLayer(Module):
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
             attention_mask_type=attention_mask_type,
-            bias=self.small_variant,
+            bias=self.small_variant or self.moe_variant,
             q_scaling=q_scaling,
             tp_group=tp_group,
             tp_size=tp_size,
@@ -106,14 +112,27 @@ class Phi3DecoderLayer(Module):
             original_max_position_embeddings=original_max_position_embeddings,
             block_sparse_params=block_sparse_attn_params)
 
-        self.mlp = MLP(hidden_size=config.hidden_size,
-                       ffn_hidden_size=config.intermediate_size,
-                       hidden_act=config.hidden_act,
-                       dtype=config.dtype,
-                       tp_group=tp_group,
-                       tp_size=tp_size,
-                       quant_mode=config.quant_mode,
-                       bias=self.small_variant)
+        ClsMLP = MLP
+        mlp_kwargs = {}
+        if hasattr(config, "moe"):
+            ClsMLP = MOE
+            moe_config = MoeConfig()
+            for key, value in config.moe.items():
+                setattr(moe_config, key, value)
+            mlp_kwargs = {
+                "moe_config": moe_config,
+                "mapping": config.mapping,
+            }
+
+        self.mlp = ClsMLP(hidden_size=config.hidden_size,
+                          ffn_hidden_size=config.intermediate_size,
+                          hidden_act=config.hidden_act,
+                          dtype=config.dtype,
+                          tp_group=tp_group,
+                          tp_size=tp_size,
+                          quant_mode=config.quant_mode,
+                          bias=self.small_variant,
+                          **mlp_kwargs)
 
     def forward(
         self,
@@ -141,10 +160,14 @@ class Phi3DecoderLayer(Module):
 
         post_attention_input = hidden_states + attention_output
         post_attention_output = self.post_layernorm(post_attention_input)
-        feed_forward_hidden_states = self.mlp(
-            post_attention_output,
-            gegelu_limit=self.gegelu_limit,
-            lora_layer_params=lora_layer_params)
+        if self.small_variant:
+            feed_forward_hidden_states = self.mlp(
+                post_attention_output,
+                gegelu_limit=self.gegelu_limit,
+                lora_layer_params=lora_layer_params)
+        else:
+            feed_forward_hidden_states = self.mlp(
+                post_attention_output, lora_layer_params=lora_layer_params)
         hidden_states = post_attention_input + feed_forward_hidden_states
         if use_cache:
             return (hidden_states, presents)
@@ -161,10 +184,13 @@ class Phi3Model(Module):
 
         self.layers = DecoderLayerList(Phi3DecoderLayer, config)
         self.small_variant = config.architecture == "Phi3SmallForCausalLM"
-        if self.small_variant:
+        self.moe_variant = config.architecture == "PhiMoEForCausalLM"
+        if self.small_variant or self.moe_variant:
             self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
+                                  eps=config.norm_epsilon,
                                   dtype=config.dtype)
-            self.mup_embedding_multiplier = config.mup_embedding_multiplier
+            if self.small_variant:
+                self.mup_embedding_multiplier = config.mup_embedding_multiplier
         else:
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
                                 eps=config.norm_epsilon,
@@ -216,9 +242,10 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
+        self.moe_variant = config.architecture == "PhiMoEForCausalLM"
         lm_head = ColumnLinear(config.hidden_size,
                                vocab_size_padded,
-                               bias=False,
+                               bias=self.moe_variant,
                                dtype=config.dtype,
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
@@ -257,8 +284,12 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
                                               **kwargs)
 
         if not use_preloading:
+            trust_remote_code = kwargs.pop('trust_remote_code', True)
+
             hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
+                hf_model_dir,
+                torch_dtype="auto",
+                trust_remote_code=trust_remote_code)
 
         assert isinstance(hf_model, transformers.PreTrainedModel)
 

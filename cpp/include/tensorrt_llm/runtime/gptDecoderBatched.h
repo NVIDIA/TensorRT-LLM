@@ -62,12 +62,12 @@ public:
     void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
         std::vector<SamplingConfig> const& samplingConfigs) override;
 
-    TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
-    void forwardSync(decoder_batch::Token const& token) override;
+    void forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent) override;
 
-    void forwardSync(
-        decoder_batch::Token const& token, decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    void forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent, decoder_batch::Output& output,
+        decoder_batch::Input const& input) override;
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
@@ -271,7 +271,7 @@ private:
     void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
 
     //! @brief Updates finished state on host for all active requests
-    void updateFinished(decoder_batch::Token const& token);
+    void updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent);
 
     //! @brief Sets inputs for explicit draft tokens.
     void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
@@ -289,7 +289,7 @@ private:
     CudaStreamPtr mRuntimeStream;
     CudaStreamPtr mDecoderStream;
     BufferManager mBufferManager;
-    TokenPtr mForwardToken;
+    DecoderFinishedEventPtr mDecoderFinishEvent;
     CudaEvent mForwardEvent;
 
     using GptDecoderPtr = std::unique_ptr<IGptDecoder>;

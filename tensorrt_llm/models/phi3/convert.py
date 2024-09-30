@@ -34,6 +34,12 @@ def load_weights_from_hf_model(hf_model, config):
             key = key.replace("mlp.down_proj.", "mlp.proj.")  #128k
             key = key.replace("mlp.gate_proj.", "mlp.fc.")  #128k
             key = key.replace("o_proj.", "dense.")  #128k
+
+            #MoE
+            key = key.replace("block_sparse_moe.gate", "mlp.router")
+            key = key.replace("block_sparse_moe.experts.0.w3", "mlp.fc")
+            key = key.replace("block_sparse_moe.experts.0.w2", "mlp.proj")
+
             #Layer norm
             key = key.replace("post_attention_layernorm.",
                               "post_layernorm.")  #128k
@@ -54,16 +60,44 @@ def load_weights_from_hf_model(hf_model, config):
             # Swap the halves
             value = torch.cat((second_half, first_half), dim=0)
 
+        if config.architecture == "PhiMoEForCausalLM":
+            num_experts = config.moe["num_experts"]
+            mlp_hidden_size = config.intermediate_size
+            num_hidden = config.hidden_size
+            rank_experts = list(range(num_experts))
+            if config.mapping.has_moe_ep():
+                rank_experts = config.mapping.ep_experts(num_experts)
+
+            def get_moe_weight(key, suffix):
+                param = []
+                for expert in rank_experts:
+                    name = key.replace(f"0.{suffix}", f"{expert}.{suffix}")
+                    fc_value = hf_state_dict[name]
+                    param.append(fc_value)
+                w = torch.stack(param)
+                return w.reshape(-1, mlp_hidden_size, num_hidden)
+
+            if ".0.w3" in orig_key:
+                w3 = get_moe_weight(orig_key, 'w3')
+                w1 = get_moe_weight(orig_key.replace("w3", "w1"), 'w1')
+                value = torch.concat([w3, w1], dim=-2)
+            elif ".0.w2" in orig_key:
+                w2 = get_moe_weight(orig_key, 'w2')
+                value = w2.reshape(-1, num_hidden, mlp_hidden_size)
+            elif any([k in orig_key for k in ["w1", "w2", "w3"]]):
+                continue
+
         if "q_proj" in key:  #128k
             q_param = value
             k_param = hf_state_dict[orig_key.replace("q_proj", "k_proj")]
             v_param = hf_state_dict[orig_key.replace("q_proj", "v_proj")]
             value = torch.cat([q_param, k_param, v_param], dim=0)
-            key = key.replace("q_proj.weight", "qkv.weight")
+            key = key.replace("q_proj", "qkv")
         elif "k_proj" in key or "v_proj" in key:
             continue
 
-        weights[key] = value.to(torch_dtype).cpu()
+        dtype = torch.float if "router" in key else torch_dtype
+        weights[key] = value.to(dtype).cpu()
 
     if config.architecture == 'Phi3SmallForCausalLM':
         weights['lm_head.weight'] = weights[
@@ -74,6 +108,8 @@ def load_weights_from_hf_model(hf_model, config):
             if "qkv." in key:
                 weights[key] = shuffle_qkv_weights(weights[key], config)
 
+    if config.architecture in ['Phi3SmallForCausalLM', "PhiMoEForCausalLM"
+                               ] and config.mapping.has_tp():
         weights = split_weights_tp(config, weights, torch_dtype)
 
     return weights

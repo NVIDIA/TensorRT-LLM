@@ -79,7 +79,8 @@ class BlocksManager(object):
                  max_blocks_per_seq: int = 128,
                  beam_width: int = 1):
         """
-        expected block pool shape: [num_blocks, num_layers, 2, block_size]
+        If layers are homogeneous then the expected block pool shape is: [num_blocks, num_layers, 2, block_size]
+        Otherwise, the expected block pool shape is: [num_blocks, 2, block_size]
         """
 
         self.max_blocks_per_seq = max_blocks_per_seq
@@ -263,6 +264,7 @@ class KVCacheManager(object):
             block_size=block_size,
             max_blocks_per_seq=max_blocks_per_seq,
             beam_width=beam_width)
+
         self.tokens_per_block = tokens_per_block
         self.max_attention_window_size = max_attention_window_size
         self.sink_token_len = sink_token_len
@@ -422,8 +424,15 @@ class KVCacheUpdater:
                                                           int) else 0
         assert self.use_paged_kv_cache is not None
         if self.use_paged_kv_cache:
-            host_kv_cache_block_offsets = self.kv_cache_manager.get_block_offsets(
-                1)
+            if self.kv_cache_manager.has_single_pool():
+                kv_cache_manager = self.kv_cache_manager.get_single_kv_cache_manager(
+                )
+            else:
+                raise RuntimeError(
+                    "Currently, using KVCacheUpdater with more then single memory pool is not supported"
+                )
+
+            host_kv_cache_block_offsets = kv_cache_manager.get_block_offsets(1)
             kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
             torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
                 accepted_draft_token_offsets,
@@ -434,13 +443,13 @@ class KVCacheUpdater:
                 self.num_kv_heads,
                 self.head_dim * self.elt_size,
                 rewind_tokens_count,
-                self.kv_cache_manager.max_attention_window_size,
+                kv_cache_manager.max_attention_window_size,
                 rewind_tokens_tensor,
                 None,
                 self.host_kv_cache_pool_pointers,
                 kv_cache_block_offsets,
-                self.kv_cache_manager.blocks_manager.max_blocks_per_seq,
-                self.kv_cache_manager.tokens_per_block,
+                kv_cache_manager.blocks_manager.max_blocks_per_seq,
+                kv_cache_manager.tokens_per_block,
                 None,
             )
         else:

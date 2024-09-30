@@ -7,9 +7,8 @@ import time
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-import numpy as np
 import safetensors
 import torch
 import torch.nn as nn
@@ -203,6 +202,27 @@ def args_to_build_options(args):
     }
 
 
+def get_weight(params: Dict[str, torch.Tensor], prefix: str,
+               dtype: torch.dtype) -> torch.Tensor:
+    if f'{prefix}' in params:
+        return params[f'{prefix}'].to(dtype).detach().cpu()
+    elif f'{prefix}.weight' not in params:
+        return None
+    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
+
+
+def get_bias(params: Dict[str, torch.Tensor], prefix: str,
+             dtype: torch.dtype) -> torch.Tensor:
+    if f'{prefix}.bias' not in params:
+        return None
+    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
+
+
+def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
+                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
+    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
+
+
 @torch.no_grad()
 def capture_activation_range(model,
                              tokenizer,
@@ -369,9 +389,8 @@ def convert_hf_dbrx(model_params: dict,
                 is_qkv=True,
                 multi_query_mode=multi_query_mode)
             weights[
-                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.from_numpy(
-                    np.array([int8_weights['scale_y_quant_orig']],
-                             dtype=np.float32)).contiguous()
+                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = int8_weights[
+                    'scale_y_quant_orig'].contiguous()
 
         # input layer_norm
         input_ln_weight = get_weight(model_params,

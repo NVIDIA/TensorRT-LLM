@@ -974,14 +974,11 @@ def deserialize_managed_weights(path: str | Path) -> dict[str, np.ndarray]:
     return managed_weights
 
 
-def build(model: PretrainedModel,
-          build_config: BuildConfig,
-          return_build_config: bool = False) -> Engine | BuildConfig:
+def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''Build engine from given model and optimization options specified in the build_config
        WARNING: this function may change the given \p model object state in some optimization passes
        to avoid cloning a model since normally the LLM models consumes large memory.
        Create a new fresh model object if you need to build with different options.
-
     '''
     tic = time.time()
     # avoid changing the input config
@@ -990,6 +987,12 @@ def build(model: PretrainedModel,
     build_config.update_kv_cache_type(model.config.architecture)
 
     _init_max_seq_len(model.config, build_config)
+
+    if build_config.plugin_config.reduce_fusion and (
+            model.config.mapping.tp_size == 1
+            or model.config.architecture != "LlamaForCausalLM"):
+        logger.warning('Overriding reduce_fusion to False')
+        build_config.plugin_config.reduce_fusion = False
 
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
@@ -1097,11 +1100,6 @@ def build(model: PretrainedModel,
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(nccl_plugin)
 
-    # NOTE: Please never change the build_config object after this point!
-    if return_build_config:
-        # Get an modified build_config that is the same as the one in the final engine dir
-        return build_config
-
     with net_guard(network):
         # Prepare
         network.set_named_parameters(model.named_parameters())
@@ -1149,6 +1147,10 @@ def build(model: PretrainedModel,
             prepare_input_args = {
                 "max_batch_size": build_config.max_batch_size,
             }
+
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
+            prepare_input_args[
+                "spec_decoding_is_generation_length_variable"] = True
 
         inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)

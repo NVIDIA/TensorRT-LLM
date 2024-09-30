@@ -11,7 +11,9 @@
  */
 
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
+#include "iTensor.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm::runtime
@@ -28,8 +30,6 @@ LookaheadDecodingBuffers::LookaheadDecodingBuffers(
     , positionIds(
           bufferManager.gpu(ITensor::makeShape({maxNumSequences, maxTokensPerStep}), nvinfer1::DataType::kINT32))
 {
-    TLLM_LOG_DEBUG(
-        "LookaheadDecodingBuffers, maxNumSequences = %d, maxTokensPerStep = %d", maxNumSequences, maxTokensPerStep);
 }
 
 LookaheadRuntimeBuffers::LookaheadRuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -40,11 +40,11 @@ LookaheadRuntimeBuffers::LookaheadRuntimeBuffers(SizeType32 maxBatchSize, SizeTy
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Lookahead decoding does not support beam search");
 
-    // auto const tokensPerStep = modelConfig.getMaxTokensPerStep();
     auto const tokensPerStep = modelConfig.getMaxDecodingTokens();
     auto const numPackedMasks = static_cast<ITensor::DimType64>(tensorrt_llm::common::divUp(tokensPerStep, 32));
 
-    // Copy buffers to device
+    cumSumLength = manager.pinned(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+
     packedMasksDevice
         = manager.gpu(ITensor::makeShape({maxBatchSize * tokensPerStep, numPackedMasks}), nvinfer1::DataType::kINT32);
     positionOffsetsDevice = manager.gpu(ITensor::makeShape({maxBatchSize, tokensPerStep}), nvinfer1::DataType::kINT32);
@@ -76,24 +76,59 @@ void LookaheadRuntimeBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType
 
     auto const tokensPerStep = modelConfig.getMaxDecodingTokens();
 
+    manager.copy(seqSlots, *batchSlotsHostCopy);
+    manager.copy(*decoderLookaheadBuffers.generationLengths, *generationLengthsHostCopy);
     manager.copy(*decoderLookaheadBuffers.positionOffsets, *positionOffsetsHostCopy);
     manager.copy(*decoderLookaheadBuffers.packedMasks, *packedMaskHostCopy);
     manager.copy(*decoderLookaheadBuffers.positionIds, *positionIdsHostCopy);
-    manager.copy(seqSlots, *batchSlotsHostCopy);
-    manager.copy(*decoderLookaheadBuffers.generationLengths, *generationLengthsHostCopy);
 
     manager.getStream().synchronize();
 
     BufferRange<SizeType32 const> batchSlotsRange(*batchSlotsHostCopy);
+    BufferRange<SizeType32> cumSumLengthRange(*cumSumLength);
+
+    SizeType32 maxGenerationLength = 0;
     for (SizeType32 bi = 0; bi < numGenSequences; bi++)
     {
         SizeType32 gbi = batchSlotsRange[bi + numCtxSequences];
-        manager.copy(*ITensor::at(generationLengthsHostCopy, {gbi}), *ITensor::at(generationLengthsHost, {bi}));
-        manager.copy(*ITensor::at(positionOffsetsHostCopy, {gbi}), *ITensor::at(positionOffsetsHost, {bi}));
-        manager.copy(*ITensor::slice(packedMaskHostCopy, gbi * tokensPerStep, tokensPerStep),
-            *ITensor::slice(packedMaskHost, bi * tokensPerStep, tokensPerStep));
-        manager.copy(*ITensor::at(positionIdsHostCopy, {gbi}), *ITensor::at(positionIdsHost, {bi}));
+        SizeType32 theLength = BufferRange<SizeType32>(*generationLengthsHostCopy)[gbi];
+        maxGenerationLength = std::max(maxGenerationLength, theLength);
     }
+
+    auto positionOffsetShape = positionOffsetsHost->getShape();
+    positionOffsetShape.d[1] = maxGenerationLength;
+    positionOffsetsHost->reshape(positionOffsetShape);
+    positionOffsetsDevice->reshape(positionOffsetShape);
+
+    auto positionIdsShape = positionIdsHostCopy->getShape();
+    auto positionIdsShape1D = ITensor::makeShape({ITensor::volume(positionIdsShape)});
+    positionIdsHostCopy->reshape(positionIdsShape1D);
+    positionIdsHost->reshape(positionIdsShape1D);
+
+    cumSumLengthRange[0] = 0;
+    for (SizeType32 bi = 0; bi < numGenSequences; bi++)
+    {
+        SizeType32 gbi = batchSlotsRange[bi + numCtxSequences];
+        SizeType32 theLength = BufferRange<SizeType32>(*generationLengthsHostCopy)[gbi];
+
+        manager.copy(*ITensor::at(generationLengthsHostCopy, {gbi}), *ITensor::at(generationLengthsHost, {bi}));
+
+        manager.copy(*ITensor::slice(positionOffsetsHostCopy, {gbi, 0}, theLength),
+            *ITensor::slice(positionOffsetsHost, {bi, 0}, theLength));
+
+        manager.copy(*ITensor::slice(packedMaskHostCopy, gbi * tokensPerStep, theLength),
+            *ITensor::slice(packedMaskHost, cumSumLengthRange[0], theLength));
+
+        manager.copy(*ITensor::slice(positionIdsHostCopy, gbi * tokensPerStep, theLength),
+            *ITensor::slice(positionIdsHost, cumSumLengthRange[0], theLength));
+
+        cumSumLengthRange[0] += theLength;
+    }
+
+    positionIdsHostCopy->reshape(positionIdsShape);
+    positionIdsHost->reshape(positionIdsShape);
+    positionIdsDevice->reshape(positionIdsShape);
+
     manager.copy(*ITensor::slice(generationLengthsHost, 0, numGenSequences),
         *ITensor::slice(generationLengthsDevice, 0, numGenSequences));
     manager.copy(*ITensor::slice(positionOffsetsHost, 0, numGenSequences),
@@ -102,6 +137,7 @@ void LookaheadRuntimeBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType
         *ITensor::slice(packedMasksDevice, 0, numGenSequences * tokensPerStep));
     manager.copy(
         *ITensor::slice(positionIdsHost, 0, numGenSequences), *ITensor::slice(positionIdsDevice, 0, numGenSequences));
+    positionIdsDevice->reshape(ITensor::makeShape({cumSumLengthRange[0]}));
 
     manager.getStream().synchronize();
 

@@ -6,7 +6,8 @@ import os
 from enum import IntFlag, auto
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Generator, List, Optional, Union
+from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
+                    Union)
 
 import numpy as np
 import safetensors
@@ -403,6 +404,8 @@ class DecoderLayerList(ModuleList):
                     host_kv_cache_block_offsets,
                     host_kv_cache_pool_pointers=kv_cache_params.
                     host_kv_cache_pool_pointers,
+                    host_kv_cache_pool_mapping=kv_cache_params.
+                    host_kv_cache_pool_mapping,
                     cache_indirection=kv_cache_params.cache_indirection),
                 attention_params=attention_params,
                 **kwargs)
@@ -462,10 +465,14 @@ class PretrainedModel(Module,
         return cls(config)
 
     @classmethod
-    def from_checkpoint(cls,
-                        ckpt_dir: str,
-                        rank: Optional[int] = None,
-                        config: Optional[PretrainedConfig] = None):
+    def from_checkpoint(
+        cls,
+        ckpt_dir: str,
+        rank: Optional[int] = None,
+        config: Optional[PretrainedConfig] = None,
+        *,
+        preprocess_weights_hook: Optional[Callable[[Dict[str, Tensor]],
+                                                   Dict[str, Tensor]]] = None):
         if config is None:
             config = PretrainedConfig.from_json_file(
                 os.path.join(ckpt_dir, 'config.json'))
@@ -480,6 +487,10 @@ class PretrainedModel(Module,
         weights = safetensors.torch.load_file(weights_path)
 
         is_checkpoint_pruned = getattr(config, 'is_pruned', False)
+
+        if preprocess_weights_hook is not None:
+            weights = preprocess_weights_hook(weights)
+
         preprocess_weights(weights, config, from_pruned=is_checkpoint_pruned)
         model = cls(config)
         model.load(weights, from_pruned=is_checkpoint_pruned)
@@ -629,6 +640,8 @@ class PretrainedModel(Module,
                     'host_kv_cache_block_offsets'],
                 host_kv_cache_pool_pointers=model_inputs[
                     'host_kv_cache_pool_pointers'],
+                host_kv_cache_pool_mapping=model_inputs[
+                    'host_kv_cache_pool_mapping'],
                 cache_indirection=model_inputs['cache_indirection'],
             ),
             'attention_params':
@@ -1191,7 +1204,6 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
         model.load(weights)
     """
     quant_algo = model_config.quantization.quant_algo
-    kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
     exclude_modules = model_config.quantization.exclude_modules
 
     # INT4_AWQ
@@ -1211,7 +1223,9 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                 weights[name] = preprocessor(param.T.contiguous(),
                                              torch.quint4x2,
                                              activation_type).view(dtype)
-            if name.endswith('weights_scaling_factor'):
+            if name.endswith('weights_scaling_factor'
+                             ) and param.shape[0] > param.shape[1]:
+                # TODO: refine on supporting ModelOpt HF-AWQ
                 weights[name] = param.T.contiguous().to(
                     str_dtype_to_torch(model_config.dtype))
             if name.endswith('prequant_scaling_factor'):
@@ -1265,12 +1279,6 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                                             quant_algo=quant_algo,
                                             exclude_modules=exclude_modules,
                                             plugin=True)
-
-    # FP8 kv_cache_scaling_factor is always 1.0
-    if kv_cache_quant_algo == QuantAlgo.FP8:
-        for name, param in weights.items():
-            if name.endswith('kv_cache_scaling_factor'):
-                weights[name] = torch.tensor([1.0], dtype=torch.float32)
 
     # Parallel block rowlinear should not have duplicate bias.
     elif model_config.architecture == 'GPTJForCausalLM':

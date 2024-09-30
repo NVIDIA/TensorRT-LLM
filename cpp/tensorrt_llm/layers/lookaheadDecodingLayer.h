@@ -48,7 +48,6 @@ public:
 private:
     void forwardSyncCPU(std::shared_ptr<LookaheadDecodingOutputs> const& outputs,
         std::shared_ptr<LookaheadDecodingInputs> const& inputs);
-    void posIdsToMask(TensorPtr mask, TensorConstPtr posIds);
 
 private:
     using Base::mDecoderDomain;
@@ -57,7 +56,6 @@ private:
     size_t mSetupWorkspaceSize{};
     TensorPtr mCurandStatesDevice;
     TensorPtr mTargetTokensDevice;
-    TensorPtr mSamplingMaskDevice;
 
     struct CpuAlgorithmResources
     {
@@ -78,11 +76,10 @@ private:
 
         TensorPtr mNextDraftTokens;
         TensorPtr mNextDraftPosIds;
-        TensorPtr mSamplingMask;
         TensorPtr mNextDraftLengths;
         TensorPtr mSequenceLengths;
         TensorPtr mGenerationLengths;
-        TensorPtr mGenerationLengthsMax;
+        TensorPtr mAttentionMask;
         TensorPtr mPackedMask;
         TensorPtr mPositionOffsets;
         TensorPtr mPositionIds;

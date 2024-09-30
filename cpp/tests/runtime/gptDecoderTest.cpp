@@ -81,7 +81,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
     SizeType32 constexpr batchSize{4};
-    ModelConfig modelConfig{vocabSize, nbLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{vocabSize, nbLayers + nbRnnLayers, nbLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
     SizeType32 constexpr maxInputLength{8};

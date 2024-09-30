@@ -1,18 +1,16 @@
 # Phi
 
-This document explains how to build the [phi-2](https://huggingface.co/microsoft/phi-2), [Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct),
-[Phi-3-mini-128k-instruct](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct), [Phi-3-small-8k-instruct](https://huggingface.co/microsoft/Phi-3-small-8k-instruct), [Phi-3-small-128k-instruct](https://huggingface.co/microsoft/Phi-3-small-128k-instruct), [Phi-3-medium-4k-instruct](https://huggingface.co/microsoft/Phi-3-medium-4k-instruct/) and [Phi-3-medium-128k-instruct](https://huggingface.co/microsoft/Phi-3-medium-128k-instruct/)
-models using TensorRT-LLM and run on a single GPU.
+This document explains how to build Phi-2, Phi-3 and Phi-3.5 family of models using TensorRT-LLM and run on a single or multiple GPUs.
+For multimodal models (Phi-3-vision-128k-instruct and Phi-3.5-vision-instruct), see `../multimodal/README.md`.
 
-- [Phi](#phi)
-  - [Overview](#overview)
-  - [Support Matrix](#support-matrix)
-  - [Usage](#usage)
-    - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
-    - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
-    - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
-    - [4. Quantization](#4-quantization)
-    - [5. Run Phi-3 with LoRA](#5-run-phi-3-with-lora)
+- [Overview](#overview)
+- [Support Matrix](#support-matrix)
+- [Usage](#usage)
+  - [1. Convert weights from HF Transformers to TensorRT-LLM format](#1-convert-weights-from-hf-transformers-to-tensorrt-llm-format)
+  - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
+  - [3. Summarization using the Phi model](#3-summarization-using-the-phi-model)
+  - [4. Quantization](#4-quantization)
+  - [5. Run Phi-3 with LoRA](#5-run-phi-3-with-lora)
 
 ## Overview
 
@@ -29,13 +27,15 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 |    Model Name    | FP16  | BF16  | FP8   | INT8  | TP   |
 | :--------------: | :---: | :---: | :---: | :---: | :---: |
-|    phi-2    |   Y   |   Y    |   |    | Y |
+|    Phi-2    |   Y   |   Y    |   |    | Y |
 | Phi-3-mini-4k-instruct    |   Y   |   Y   | Y   | Y  |
 | Phi-3-mini-128k-instruct  |   Y   |   Y   | Y   | Y  |
 | Phi-3-small-8k-instruct   |   Y   |   Y   | Y   | Y  | Y |
 | Phi-3-small-128k-instruct |   Y   |   Y   | Y   | Y  | Y |
 | Phi-3-medium-8k-instruct  |   Y   |   Y   | Y   | Y  |
 | Phi-3-medium-128k-instruct |  Y   |   Y   | Y   | Y  |
+| Phi-3.5-mini-instruct     |   Y   |   Y   | Y   | Y  |
+| Phi-3.5-MoE-instruct      |   Y   |   Y   | Y   | Y  | Y |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * TP: Tensor Parallel
@@ -56,6 +56,11 @@ python ./convert_checkpoint.py \
                     --output_dir ./phi-checkpoint \
                     --dtype float16
 ```
+
+If a model supports tensor-parallelism, number of tensor parallel ranks to split the model into can be specified as `--tp_size` argument to `convert_checkpoint.py`.
+
+For Phi-3.5-MoE-instruct model, expert parallelism can be enabled using `--moe_tp_size` and `--moe_ep_size` arguments.
+The section on Parallelism Modes in `../mixtral/README.md` discusses tensor and expert parallelism for Mixture of Experts models in detail.
 
 ### 2. Build TensorRT engine(s)
 

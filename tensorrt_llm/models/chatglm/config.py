@@ -75,6 +75,7 @@ class ChatGLMConfig(PretrainedConfig):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         import transformers
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
 
         # load hugging face config
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
@@ -82,7 +83,7 @@ class ChatGLMConfig(PretrainedConfig):
         else:
             hf_config_dir = str(hf_config_or_dir)
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
 
         logits_dtype = kwargs.pop('logits_dtype', 'float32')
         use_parallel_embedding = kwargs.pop('use_parallel_embedding', False)

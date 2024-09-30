@@ -717,16 +717,19 @@ To run the GPTQ LLaMa example, the following steps are required:
 
 1. Weight quantization:
 
-    Quantized weights for GPTQ are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
+    Quantized weights for GPTQ are generated using [AutoGPTQ](https://github.com/AutoGPTQ/AutoGPTQ) as follow:
 
     ```bash
-    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
-    cd GPTQ-for-LLaMa
-    pip install -r requirements.txt
+    git clone https://github.com/AutoGPTQ/AutoGPTQ
+    cd AutoGPTQ
+    pip install .
+
+    # Download the quant_autogptq script
+    wget https://gist.githubusercontent.com/TheBloke/b47c50a70dd4fe653f64a12928286682/raw/ebcee019d90a178ee2e6a8107fdd7602c8f1192a/quant_autogptq.py
 
     # Quantize weights into INT4 and save as safetensors
     # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
-    python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
+    python quant_autogptq.py ./tmp/llama/7B ./llama-7b-4bit-gs128.safetensors wikitext --bits 4 --group_size 128 --desc_act 0 --damp 0.1 --dtype float16 --seqlen 4096 --num_samples 3 --use_fast
     ```
 
     Let us build the TRT-LLM engine with the saved `./llama-7b-4bit-gs128.safetensors`.

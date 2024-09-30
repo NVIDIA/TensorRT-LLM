@@ -4594,6 +4594,7 @@ def gpt_attention(
     kv_cache_block_offsets: Optional[Tensor] = None,
     host_kv_cache_block_offsets: Tensor = None,
     host_kv_cache_pool_pointers: Tensor = None,
+    host_kv_cache_pool_mapping: Tensor = None,
     do_cross_attention: bool = False,
     cross_qkv: Optional[Tensor] = None,  # for cross attention
     cross_qkv_length: Optional[Tensor] = None,  # for cross attention
@@ -4609,6 +4610,7 @@ def gpt_attention(
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
+    layer_idx_in_cache_pool: Optional[int] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4785,8 +4787,11 @@ def gpt_attention(
             The same as kv_cache_block_offsets, but on cpu,
 
         host_kv_cache_pool_pointers:
-            The tensor of pool pointers for the KV cache. Its shape is [2],
+            The tensor of pool pointers for the KV cache. Its shape is [num_layers, 2],
             See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
+
+        host_kv_cache_pool_mapping:
+            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,],
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -4861,6 +4866,9 @@ def gpt_attention(
     assert host_max_attention_window_sizes is not None
     assert host_sink_token_length is not None
 
+    if layer_idx_in_cache_pool is None:
+        layer_idx_in_cache_pool = layer_idx
+
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
     if isinstance(qkv, list):
         is_unfuse_qkv_gemm = 1
@@ -4884,6 +4892,10 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    layer_idx_in_cache_pool = trt.PluginField(
+        "layer_idx_in_cache_pool",
+        np.array(layer_idx_in_cache_pool, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5034,13 +5046,14 @@ def gpt_attention(
                                    trt.PluginFieldType.INT32)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, qk_tanh_scale, position_embedding_type,
-        rotary_embedding_dim, rotary_embedding_base,
-        rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
+        layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
+        qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
+        rotary_embedding_base, rotary_embedding_scale_type,
+        rotary_embedding_scale, rotary_embedding_short_m_scale,
+        rotary_embedding_long_m_scale, rotary_embedding_max_positions,
+        rotary_embedding_original_max_positions, tp_size, tp_rank,
+        unfuse_qkv_gemm, context_fmha_type, enable_xqa,
         kv_cache_quant_mode_field, remove_input_padding, mask_type,
         block_sparse_block_size, block_sparse_homo_head_pattern,
         block_sparse_num_local_blocks, block_sparse_vertical_stride,
@@ -5079,9 +5092,10 @@ def gpt_attention(
             assert kv_cache_block_offsets is not None, "Paged kv cache is enabled, the kv_cache_block_offsets tensor shall not be None"
             assert host_kv_cache_block_offsets is not None, "Paged kv cache is enabled, the host_kv_cache_block_offsets tensor shall not be None"
             assert host_kv_cache_pool_pointers is not None, "Paged kv cache is enabled, the host_kv_cache_pool_pointers tensor shall not be None"
+            assert host_kv_cache_pool_mapping is not None, "Paged kv cache is enabled, the host_kv_cache_pool_mapping tensor shall not be None"
             plug_inputs += [
                 kv_cache_block_offsets, host_kv_cache_block_offsets,
-                host_kv_cache_pool_pointers
+                host_kv_cache_pool_pointers, host_kv_cache_pool_mapping
             ]
         else:
             plug_inputs += [past_key_value]

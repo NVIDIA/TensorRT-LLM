@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import datetime
+import io
 import json
 import secrets
 import time
@@ -9,14 +10,14 @@ import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Listener
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from queue import Queue
-from typing import (Any, Dict, Generator, List, NamedTuple, Optional, Tuple,
-                    Union)
+from typing import (Any, Dict, Generator, List, Literal, NamedTuple, Optional,
+                    Tuple, Union)
 
 import numpy as np
 import torch
-from janus import Queue as AsyncQueue
 
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
@@ -24,7 +25,7 @@ from .builder import ConfigEncoder, Engine, EngineConfig
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
-from .hlapi.utils import ManagedThread, SamplingParams, exception_handler
+from .hlapi.utils import ManagedThread, SamplingParams
 from .lora_manager import LoraManager
 from .runtime import ModelConfig
 from .runtime.model_runner import _engine_config_to_model_config
@@ -98,25 +99,109 @@ class CompletionOutput:
         token_ids (List[int]): The token ids of the generated output text.
         cumulative_logprob (float): The cumulative log probability of the generated output text.
         logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested.
+        finish_reason (Literal['stop', 'length']): The reason why the sequence is finished.
+        stop_reason (Union[int, str]): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason.
         generation_logits (torch.Tensor): The logits on the generated output token ids.
+        length (int): The number of generated tokens.
+        token_ids_diff (List[int]): Newly generated token ids.
+        logprobs_diff (List[float]): Logprobs of newly generated tokens.
+        text_diff (str): Newly generated tokens.
     """
     index: int
     text: str = ""
     token_ids: List[int] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
     logprobs: List[float] = field(default_factory=list)
-    generation_logits: Optional[torch.Tensor] = field(default=None, repr=False)
+    finish_reason: Optional[Literal['stop', 'length']] = None
+    stop_reason: Optional[Union[int, str]] = None
+    generation_logits: Optional[torch.Tensor] = None
     _last_text: str = field(default="", init=False, repr=False)
+    _last_logprobs_len: int = field(default=0, init=False, repr=False)
+    _last_token_ids_len: int = field(default=0, init=False, repr=False)
 
     @property
     def length(self):
         return len(self.token_ids)
 
     @property
+    def token_ids_diff(self) -> List[int]:
+        diff = self.token_ids[self._last_token_ids_len:]
+        self._last_token_ids_len = len(self.token_ids)
+        return diff
+
+    @property
+    def logprobs_diff(self) -> List[float]:
+        diff = self.logprobs[self._last_logprobs_len:]
+        self._last_logprobs_len = len(self.logprobs)
+        return diff
+
+    @property
     def text_diff(self) -> str:
         diff = self.text[len(self._last_text):]
         self._last_text = self.text
         return diff
+
+
+class _SyncQueue:
+    '''
+    A simplified Queue that provides a `get` method that is compatible with the asyncio event loop.
+    '''
+
+    def __init__(self,
+                 queue: Queue,
+                 event: asyncio.Event,
+                 loop: Optional[asyncio.AbstractEventLoop] = None):
+        self._q = queue
+        self._event = event
+        self._loop = loop or asyncio.get_event_loop()
+
+    def put(self, item) -> None:
+
+        async def _set_event(event):
+            event.set()
+
+        self._q.put_nowait(item)
+
+        if self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(_set_event(self._event),
+                                             self._loop)
+        else:
+            raise AsyncQueue.EventLoopShutdownError
+
+    def full(self) -> bool:
+        return self._q.full()
+
+
+class _AsyncQueue:
+    '''
+    A simplified asyncio.Queue that provides a `get` method that is compatible with the standard library Queue.
+    '''
+
+    def __init__(self, queue: Queue):
+        self._event = asyncio.Event()
+        self._q = queue
+
+    async def get(self):
+        await self._event.wait()
+        res = self._q.get()
+        if self._q.empty():
+            self._event.clear()
+        return res
+
+
+class AsyncQueue:
+    '''
+    AsyncQueue is container containing `async_q` for `async get` and `sync_q` for sync `get`.
+    This is used to provide a compatible interface for janus.Queue.
+    '''
+
+    class EventLoopShutdownError(Exception):
+        pass
+
+    def __init__(self):
+        self._q = Queue()
+        self.async_q = _AsyncQueue(self._q)
+        self.sync_q = _SyncQueue(self._q, self.async_q._event)
 
 
 class CppExecutorError(RuntimeError):
@@ -204,14 +289,23 @@ class GenerationResult:
                 self.outputs[i].generation_logits = tensors.generation_logits[
                     i, :self.outputs[i].length]
 
-        if self.finished and not self._generation_request.sampling_params.include_stop_str_in_output:
-            for beam_output in self.outputs:
-                for stop_ids in self._generation_request.sampling_params._get_stop_words(
-                ):
-                    if beam_output.token_ids[-len(stop_ids):] == stop_ids:
-                        beam_output.token_ids = beam_output.token_ids[:-len(
-                            stop_ids)]
-                        break
+        if self.finished:
+            for i, beam_output in enumerate(self.outputs):
+                if response.finish_reasons[i] == tllm.FinishReason.END_ID:
+                    beam_output.finish_reason = 'stop'
+                elif response.finish_reasons[i] == tllm.FinishReason.STOP_WORDS:
+                    beam_output.finish_reason = 'stop'
+                    sampling_params = self._generation_request.sampling_params
+                    for stop_reason, stop_ids in sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if beam_output.token_ids[-len(stop_ids):] == stop_ids:
+                            beam_output.stop_reason = stop_reason
+                            if not sampling_params.include_stop_str_in_output:
+                                beam_output.token_ids = beam_output.token_ids[:-len(
+                                    stop_ids)]
+                            break
+                elif response.finish_reasons[i] == tllm.FinishReason.LENGTH:
+                    beam_output.finish_reason = 'length'
 
         if tensors.context_logits is not None:
             self.context_logits = tensors.context_logits
@@ -281,7 +375,10 @@ class GenerationResult:
             return e
 
     def _repr_fields(self):
-        return ['request_id', 'prompt_token_ids', 'outputs', 'finished']
+        return [
+            'request_id', 'prompt_token_ids', 'outputs', 'finished',
+            "context_logits"
+        ]
 
     def __repr__(self) -> str:
         repr = []
@@ -305,8 +402,10 @@ class GenerationExecutor(ABC):
 
     class ResponseTensors(NamedTuple):
         output_token_ids: list
-        context_logits: Optional[torch.Tensor]
-        generation_logits: Optional[torch.Tensor]
+        # context_logits is a tensor or a string denoting the path to the shared memory.
+        context_logits: Optional[torch.Tensor | str]
+        # generation_logits is a tensor or a string denoting the path to the shared memory.
+        generation_logits: Optional[torch.Tensor | str]
         log_probs: Optional[list]
         cum_log_probs: Optional[list]
 
@@ -314,6 +413,7 @@ class GenerationExecutor(ABC):
         """ The response from the cpp-executor to the Python main thread. """
         request_id: int
         tensors: Optional["GenerationExecutor.ResponseTensors"]
+        finish_reasons: Optional[List[tllm.FinishReason]]
         is_final: Optional[bool]
         # error is either str from cpp-executor or a Exception from Python threads/processes
         error: Optional[str | Exception]
@@ -327,15 +427,14 @@ class GenerationExecutor(ABC):
         self._stats = None
         self.stats_queue = None
 
+        atexit.register(self.shutdown)
+
         # This is used to capture the exceptions from the threads.
         self._error_queue = Queue()
 
         # mapping of pending request_id -> response
         self._pending_responses: Dict[
             int, List[GenerationExecutor.PendingResponse]] = {}
-
-        exception_handler.register(self, 'shutdown')
-        atexit.register(self.shutdown)
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -406,6 +505,7 @@ class GenerationExecutor(ABC):
         # more than one error.
         if not self._error_queue.empty():
             e = self._error_queue.get()
+            self.shutdown()
             # We can catch some exceptions here.
             raise e
 
@@ -567,9 +667,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 self._lora_manager = LoraManager()
 
         self.await_response_thread = ManagedThread(
-            self.await_response_task, error_queue=self._error_queue)
+            self.await_response_task,
+            error_queue=self._error_queue,
+            name="await_response_thread")
         self.dispatch_stats_thread = ManagedThread(
-            self.dispatch_stats_task, error_queue=self._error_queue)
+            self.dispatch_stats_task,
+            error_queue=self._error_queue,
+            name="dispatch_stats_thread")
 
     def create_stats_queue(self):
         # Stats queue is created during first submission to ensure event loop exists if it is needed.
@@ -619,10 +723,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 milliseconds=100)):
             req_id = response.request_id
             if response.has_error():
-                rsp = self.Response(req_id,
-                                    tensors=None,
-                                    is_final=None,
-                                    error=response.error_msg)
+                rsp = self.Response(
+                    req_id,
+                    tensors=None,
+                    finish_reasons=response.result.finish_reasons,
+                    is_final=None,
+                    error=response.error_msg)
             else:
                 tensors = self.ResponseTensors(
                     response.result.output_token_ids,
@@ -630,10 +736,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     response.result.generation_logits,
                     response.result.log_probs, response.result.cum_log_probs)
 
-                rsp = self.Response(req_id,
-                                    tensors,
-                                    is_final=response.result.is_final,
-                                    error=None)
+                rsp = self.Response(
+                    req_id,
+                    tensors,
+                    finish_reasons=response.result.finish_reasons,
+                    is_final=response.result.is_final,
+                    error=None)
 
             if self._to_delay_response(rsp):
                 continue
@@ -647,6 +755,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if bck_error is not None:
                 rsp = self.Response(req_id,
                                     tensors=None,
+                                    finish_reasons=None,
                                     is_final=None,
                                     error=bck_error)
 
@@ -663,7 +772,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         for stats in self.engine.get_latest_iteration_stats():
             while hasattr(self.stats_queue, "full") and self.stats_queue.full():
                 self.stats_queue.get()
-            self.stats_queue.put(stats.to_json_str())
+
+            try:
+                self.stats_queue.put(stats.to_json_str())
+            except AsyncQueue.EventLoopShutdownError:
+                # This happens in the last stats loop while the generate workflow is stopped.
+                pass
+            except Exception as e:
+                raise e
 
         return True  # success
 
@@ -816,29 +932,102 @@ class IpcQueue:
     def put(self, obj: Any):
         if self.conn is None:
             self.setup()
+
+        if isinstance(obj, GenerationExecutor.Response):
+            tensors = self._store_tensors_in_shmm(obj.tensors)
+            obj = GenerationExecutor.Response(request_id=obj.request_id,
+                                              tensors=tensors,
+                                              finish_reasons=obj.finish_reasons,
+                                              is_final=obj.is_final,
+                                              error=obj.error)
+
         self.conn.send(obj)
 
     def get(self) -> Any:
         if self.conn is None:
             self.setup()
-        return self.conn.recv()
+
+        obj = self.conn.recv()
+        if isinstance(obj, GenerationExecutor.Response):
+            tensors = self._load_tensors_from_shmm(obj.tensors)
+            obj = GenerationExecutor.Response(request_id=obj.request_id,
+                                              tensors=tensors,
+                                              finish_reasons=obj.finish_reasons,
+                                              is_final=obj.is_final,
+                                              error=obj.error)
+        return obj
+
+    def _store_tensors_in_shmm(
+        self, tensors: GenerationExecutor.ResponseTensors
+    ) -> GenerationExecutor.ResponseTensors:
+        # The tensors are huge and cannot be transferred through socket directly. We need to store them in shared memory,
+        # and replace the tensors with the shared memory path.
+        def store_tensor(tensor: Optional[torch.Tensor]) -> Optional[str]:
+            if tensor is None:
+                return None
+            # NOTE: We create random shmm here rather than two specific shmm for context and generation logit, since the
+            # shmm may not be read timely by the IpcQueue.get() in the other side, so there might be multiple alive shmm
+            # for logits.
+            # A known issue: the shmm instance may leak if the IpcQueue.get() thread is stopped before the IpcQueue.put()
+            # thread. This is not a big issue since the shmm will be automatically cleaned up when the process exits.
+            shm = SharedMemory(create=True, size=tensor.nbytes + 2048)
+            torch.save(tensor, shm._mmap)
+            shm.close()
+            return shm.name
+
+        return GenerationExecutor.ResponseTensors(
+            output_token_ids=tensors.output_token_ids,
+            context_logits=store_tensor(tensors.context_logits),
+            generation_logits=store_tensor(tensors.generation_logits),
+            log_probs=tensors.log_probs,
+            cum_log_probs=tensors.cum_log_probs,
+        )
+
+    def _load_tensors_from_shmm(
+        self, tensors: GenerationExecutor.ResponseTensors
+    ) -> GenerationExecutor.ResponseTensors:
+
+        def load_tensor(tensor: Optional[str]) -> Optional[torch.Tensor]:
+            if tensor is None or isinstance(tensor, torch.Tensor):
+                return tensor
+
+            shm = SharedMemory(name=tensor, create=False)
+            tensor = torch.load(io.BytesIO(shm.buf))
+            shm.close()
+            shm.unlink()
+            return tensor
+
+        return GenerationExecutor.ResponseTensors(
+            output_token_ids=tensors.output_token_ids,
+            context_logits=load_tensor(tensors.context_logits),
+            generation_logits=load_tensor(tensors.generation_logits),
+            log_probs=tensors.log_probs,
+            cum_log_probs=tensors.cum_log_probs,
+        )
 
     @property
     def address(self) -> Tuple[str, int, bytes]:
         return (self.host_port[0], self.host_port[1], self.authkey)
 
+    def __del__(self):
+        if self.conn is not None:
+            self.conn.close()
+        if self.is_server:
+            self.listener.close()
+
 
 class ExecutorBindingsProxy(GenerationExecutor):
 
-    def __init__(
-        self,
-        workers_kwargs,
-        model_world_size: int = 1,
-        mpi_session: Optional[MpiSession] = None,
-    ) -> None:
+    def __init__(self,
+                 workers_kwargs,
+                 model_world_size: int = 1,
+                 mpi_session: Optional[MpiSession] = None,
+                 *,
+                 worker_cls: type = ExecutorBindingsWorker) -> None:
         super().__init__()
 
         self.workers_started = False
+        self.worker_cls = worker_cls
 
         self.request_queue = IpcQueue(is_server=True)
         # Return request id back to dispatcher
@@ -868,22 +1057,23 @@ class ExecutorBindingsProxy(GenerationExecutor):
         })
 
         self.dispatch_result_thread = ManagedThread(
-            self.dispatch_result_task, error_queue=self._error_queue)
+            self.dispatch_result_task,
+            error_queue=self._error_queue,
+            name="proxy_dispatch_result_thread")
         self.dispatch_stats_thread = ManagedThread(
-            self.dispatch_stats_task, error_queue=self._error_queue)
-
-        exception_handler.register(self, 'shutdown')
-        atexit.register(self.shutdown)
+            self.dispatch_stats_task,
+            error_queue=self._error_queue,
+            name="proxy_dispatch_stats_thread")
 
     @staticmethod
-    def workers_main(
-        engine: Union[Path, Engine],
-        request_queue_addr: Tuple[str, int, bytes],
-        request_id_queue_addr: Tuple[str, int, bytes],
-        result_queue_addr: Tuple[str, int, bytes],
-        stats_queue_addr: Tuple[str, int, bytes],
-        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1)
-    ) -> None:
+    def workers_main(engine: Union[Path, Engine],
+                     request_queue_addr: Tuple[str, int, bytes],
+                     request_id_queue_addr: Tuple[str, int, bytes],
+                     result_queue_addr: Tuple[str, int, bytes],
+                     stats_queue_addr: Tuple[str, int, bytes],
+                     executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(
+                         1),
+                     worker_cls: type = ExecutorBindingsWorker) -> None:
         result_queue = None
 
         if mpi_rank() == 0:
@@ -899,7 +1089,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             mp_stats_queue.put(None)
 
         try:
-            executor = ExecutorBindingsWorker(engine, executor_config)
+            executor = worker_cls(engine, executor_config)
         except Exception as e:
             raise CppExecutorError(f"Failed to initialize executor: {e}") from e
 
@@ -917,7 +1107,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
                     notify_proxy_threads_to_quit()
 
             except ExecutorBindingsWorker.WorkerExit as e:
-                raise e
+                raise e  # This will capture by the with-statement and exit normally.
 
             except Exception as e:  # other critical errors
                 if mpi_rank() == 0:
@@ -947,14 +1137,29 @@ class ExecutorBindingsProxy(GenerationExecutor):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
-        if (stats := self.mp_stats_queue.get()) is None:
-            return False  # shutdown the thread
-
         # get-stats is not urgent, so we can sleep a bit
+
         time.sleep(0.1)
+
+        try:
+            stats = self.mp_stats_queue.get()
+        except:
+            return False
+
+        if stats is None:
+            return False
+
         while self.stats_queue.full():
             self.stats_queue.get()
-        self.stats_queue.put(stats)
+
+        try:
+            self.stats_queue.put(stats)
+        except AsyncQueue.EventLoopShutdownError:
+            # This happens in the last stats loop while the generate workflow is stopped.
+            pass
+        except Exception as e:
+            raise e
+
         return True  # success
 
     def start(self):
@@ -966,7 +1171,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 self._error_queue.put_nowait(future.exception())
 
         self.mpi_futures = self.mpi_session.submit(
-            ExecutorBindingsProxy.workers_main, **self.workers_kwargs)
+            ExecutorBindingsProxy.workers_main,
+            **self.workers_kwargs,
+            worker_cls=self.worker_cls)
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
@@ -988,8 +1195,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
             f.result()
 
         if self.dispatch_result_thread.is_alive():
-            self.dispatcher.join()
+            self.dispatch_result_thread.stop()
+            self.dispatch_result_thread.join()
         if self.dispatch_stats_thread.is_alive():
+            self.dispatch_stats_thread.stop()
             self.dispatch_stats_thread.join()
 
         # It is possible that some requests are still pending in the workers, we need to process them before shutdown

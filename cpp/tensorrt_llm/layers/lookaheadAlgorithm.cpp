@@ -18,14 +18,48 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
+#include <memory>
 #include <tuple>
 
 namespace tensorrt_llm::layers
 {
 
 using namespace tensorrt_llm::runtime;
+
+LookaheadAlgorithm::LookaheadAlgorithm(
+    runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id)
+    : mMaxW(maxW)
+    , mMaxN(maxN)
+    , mMaxG(maxG)
+    , mFilling(0)
+    , mPoolManager(maxG)
+    , mId(id)
+    , mGoldenTokensMax(
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), nvinfer1::DataType::kINT32))
+    , mPrefillsMax(runtime::BufferManager::cpu(
+          runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), nvinfer1::DataType::kINT32))
+    , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), nvinfer1::DataType::kINT32))
+    , mPastTokensMax(
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), nvinfer1::DataType::kINT32))
+    , mGuessTokensMax(
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxG * (maxN - 1)}), nvinfer1::DataType::kINT32))
+{
+    runtime::SizeType32 maxGeneratedLen, maxDraftLen;
+    std::tie(maxGeneratedLen, std::ignore, maxDraftLen, std::ignore)
+        = executor::LookaheadDecodingConfig(maxW, maxN, maxG).calculateSpeculativeResource();
+    mAttentionMask = runtime::BufferManager::cpu(
+        runtime::ITensor::makeShape({maxDraftLen, maxDraftLen}), nvinfer1::DataType::kBOOL);
+    mDraftTokensMax
+        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), nvinfer1::DataType::kINT32);
+    mSampledTokensMax
+        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxGeneratedLen}), nvinfer1::DataType::kINT32);
+    mEncodeMapMax = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), nvinfer1::DataType::kINT32);
+}
 
 void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeType32 n, SizeType32 g)
 {
@@ -36,7 +70,7 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
     mW = w;
     mN = n;
     mG = g;
-    std::tie(std::ignore, std::ignore, mRuntimeMaxDraftLen, std::ignore)
+    std::tie(std::ignore, std::ignore, mRuntimeMaxDraftLen, mRuntimeMaxDraftPathLen)
         = executor::LookaheadDecodingConfig(mW, mN, mG).calculateSpeculativeResource();
 
     mPoolManager.setup(mG);
@@ -81,8 +115,8 @@ void LookaheadAlgorithm::accept(TensorConstPtr const& generatedTokens)
 }
 
 //! lookahead has two phase, prefill the past tokens matrix and maintain past tokens matrix.
-runtime::SizeType32 LookaheadAlgorithm::lookahead(TensorPtr const& draftTokens, TensorPtr const& positionIds,
-    TensorPtr const& samplingMask, runtime::SizeType32 offset)
+runtime::SizeType32 LookaheadAlgorithm::lookahead(
+    TensorPtr const& draftTokens, TensorPtr const& positionIds, runtime::SizeType32 startPosId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -90,7 +124,6 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(TensorPtr const& draftTokens, 
     SizeType32 len = prefill + mFilling * mW;
     TLLM_CHECK(len <= ITensor::volume(draftTokens->getShape()));
     TLLM_CHECK(len <= ITensor::volume(positionIds->getShape()));
-    TLLM_CHECK(len <= ITensor::volume(samplingMask->getShape()));
     BufferRange<TokenIdType> prefillRange(*mPrefills);
     BufferRange<TokenIdType> pastRange(*mPastTokens);
     BufferRange<TokenIdType> draftRange(*draftTokens);
@@ -112,11 +145,6 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(TensorPtr const& draftTokens, 
     }
 
     BufferRange<TokenIdType> positionIdsRange(*positionIds);
-    BufferRange<bool> samplingMaskRange(*samplingMask);
-    for (auto& v : samplingMaskRange)
-    {
-        v = 0;
-    }
     SizeType32 idx = 0, wj = 0;
     auto fillPosition = [&positionIdsRange, &idx](SizeType32 start, SizeType32 len)
     {
@@ -127,20 +155,18 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(TensorPtr const& draftTokens, 
     };
     if (prefill >= 0)
     {
-        fillPosition(offset, prefill);
+        fillPosition(startPosId, prefill);
         for (wj = 0; wj < mW; wj++)
         {
-            fillPosition(offset + prefill + wj, mFilling);
-            samplingMaskRange[prefill + wj * mFilling + mFilling - 1] = true;
+            fillPosition(startPosId + prefill + wj, mFilling);
         }
     }
     else
     {
-        fillPosition(offset, mFilling - 1);
+        fillPosition(startPosId, mFilling - 1);
         for (wj = 1; wj < mW; wj++)
         {
-            fillPosition(offset - 1 + wj, mFilling);
-            samplingMaskRange[wj * mFilling + mFilling - 1 - 1] = true;
+            fillPosition(startPosId - 1 + wj, mFilling);
         }
     }
     PRINT_VALUES(positionIds);
@@ -150,7 +176,7 @@ runtime::SizeType32 LookaheadAlgorithm::lookahead(TensorPtr const& draftTokens, 
 }
 
 runtime::SizeType32 LookaheadAlgorithm::guess(TensorPtr const& guessTokens, TensorPtr const& guessIds,
-    TensorPtr const& samplingMask, runtime::SizeType32 offset, runtime::TokenIdType lastToken)
+    runtime::SizeType32 startPosId, runtime::TokenIdType lastToken)
 {
     auto guesses = mPoolManager.guess(lastToken, mW);
 
@@ -158,67 +184,227 @@ runtime::SizeType32 LookaheadAlgorithm::guess(TensorPtr const& guessTokens, Tens
     std::for_each(guesses.begin(), guesses.end(), [&len](auto& a) { len += ITensor::volume(a->getShape()); });
     TLLM_CHECK(len <= ITensor::volume(guessTokens->getShape()));
     TLLM_CHECK(len <= ITensor::volume(guessIds->getShape()));
-    TLLM_CHECK(len <= ITensor::volume(samplingMask->getShape()));
     BufferRange<TokenIdType> guessTokensRange(*guessTokens);
     BufferRange<SizeType32> guessIdsRange(*guessIds);
-    BufferRange<bool> samplingMaskRange(*samplingMask);
 
     SizeType32 cur = 0;
     for (auto guess : guesses)
     {
         BufferRange<TokenIdType const> guessRange(*guess);
         std::copy(guessRange.begin(), guessRange.end(), guessTokensRange.begin() + cur);
-        SizeType32 tmp = offset;
+        SizeType32 tmp = startPosId;
         std::for_each(
             guessIdsRange.begin() + cur, guessIdsRange.begin() + cur + mN - 1, [&tmp](auto& v) { v = tmp++; });
         cur += ITensor::volume(guess->getShape());
     }
 
-    std::for_each(samplingMaskRange.begin(), samplingMaskRange.begin() + len, [](auto& a) { a = true; });
-
     return len;
 }
 
+void LookaheadAlgorithm::posIdsToMask(TensorPtr const& mask, TensorConstPtr const& posIds)
+{
+    auto len = ITensor::volume(posIds->getShape());
+    TLLM_CHECK(mask->getDimension<0>() >= len);
+    TLLM_CHECK(mask->getDimension<1>() >= len);
+    auto posIdsRange = BufferRange<SizeType32 const>(*posIds);
+    auto maskLocation = BufferLocation<bool>(*mask);
+
+    for (auto& item : maskLocation)
+    {
+        item = false;
+    }
+
+    if (len > 0)
+    {
+        std::vector<std::pair<SizeType32, SizeType32>> stack;
+        for (auto i = 0; i < len; i++)
+        {
+            auto cur = posIdsRange[i];
+            while (stack.size() > 0 && cur <= stack.back().second)
+            {
+                stack.pop_back();
+            }
+            TLLM_CHECK(stack.size() > 0 ? cur == stack.back().second + 1 : true);
+            stack.push_back(std::make_pair(i, cur));
+            for (auto prev : stack)
+            {
+                maskLocation.at(i, prev.first) = true;
+            }
+        }
+    }
+}
+
+struct TreeValue;
+using TreeMap = std::unordered_map<TokenIdType, TreeValue>;
+
+struct TreeValue
+{
+    TreeValue()
+        : nexts(std::make_shared<TreeMap>())
+    {
+    }
+
+    using Nexts = std::shared_ptr<TreeMap>;
+    Nexts nexts{nullptr};
+    std::list<SizeType32> sources;
+};
+
+using TreeNode = TreeMap::value_type;
+
+template <typename BF, typename AF>
+void treeDFS(TreeNode& node, BF const& visitBefore, AF const& visitAfter)
+{
+    visitBefore(node);
+    for (auto& next : *(node.second.nexts))
+    {
+        treeDFS(next, visitBefore, visitAfter);
+    }
+    visitAfter(node);
+}
+
+SizeType32 LookaheadAlgorithm::treeEncode(
+    TensorPtr const& tokens, TensorPtr const& posIds, TensorPtr const& mask, TensorPtr const& encodeMap)
+{
+    TLLM_CHECK(ITensor::volume(tokens->getShape()) == ITensor::volume(posIds->getShape()));
+    auto len = ITensor::volume(tokens->getShape());
+
+    BufferRange<TokenIdType> tokensRange(*tokens);
+    BufferRange<SizeType32> posIdsRange(*posIds);
+    BufferLocation<bool> maskLocation(*mask);
+    BufferRange<SizeType32> mapRange(*encodeMap);
+
+    auto branches = std::make_shared<TreeMap>();
+
+    for (auto i = 0; i < len; i++)
+    {
+        auto nexts = branches;
+        for (auto j = 0; j <= i; j++)
+        {
+            if (maskLocation.at(i, j))
+            {
+                auto pos = posIdsRange[j];
+                auto tok = tokensRange[j];
+                auto found = nexts->find(tok);
+                if (found != nexts->end())
+                {
+                    found->second.sources.push_back(j);
+                    nexts = found->second.nexts;
+                }
+                else
+                {
+                    auto [inserted, ok] = nexts->insert({tok, TreeValue()});
+                    inserted->second.sources.push_back(j);
+                    nexts = inserted->second.nexts;
+                }
+            }
+        }
+    }
+
+    for (auto& item : maskLocation)
+    {
+        item = 0;
+    }
+    std::vector<std::pair<SizeType32, TokenIdType>> stack;
+    SizeType32 offset = 0;
+    SizeType32 posId = posIdsRange.size() ? posIdsRange[0] : 0;
+
+    auto visitBefore
+        = [&stack, &maskLocation, &tokensRange, &posIdsRange, &posId, &offset, &mapRange](TreeNode const& node)
+    {
+        stack.push_back(std::make_pair(offset, node.first));
+        for (auto const& source : node.second.sources)
+        {
+            mapRange[source] = offset;
+        }
+        for (auto const& prev : stack)
+        {
+            maskLocation.at(offset, prev.first) = true;
+        }
+        tokensRange[offset] = node.first;
+        posIdsRange[offset] = posId;
+        offset++;
+        posId++;
+    };
+    auto visitAfter = [&stack, &posId](TreeNode const& node)
+    {
+        stack.pop_back();
+        posId--;
+    };
+
+    for (auto& next : *branches)
+    {
+        treeDFS(next, visitBefore, visitAfter);
+    }
+
+    for (SizeType32 i = offset; i < len; i++)
+    {
+        tokensRange[i] = 0;
+        posIdsRange[i] = 0;
+    }
+    for (SizeType32 i = 0; i < len; i++)
+    {
+        for (SizeType32 j = i < offset ? offset : 0; j < len; j++)
+        {
+            maskLocation.at(i, j) = false;
+        }
+    }
+
+    return offset;
+}
+
 void LookaheadAlgorithm::prepare(TensorPtr const& draftTokens, TensorPtr const& positionIds,
-    TensorPtr const& samplingMask, TensorPtr const& length, TensorConstPtr const& offsetPtr,
-    TensorConstPtr const& lastTokenPtr)
+    TensorPtr const& draftLengthPtr, TensorPtr const& attentionMask, SizeType32 attentionMaskOffset,
+    TensorConstPtr const& lastPositionIdPtr, TensorConstPtr const& lastTokenPtr)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     if (mRuntimeMaxDraftLen == 0)
     {
-        (BufferRange<SizeType32>(*length))[0] = 0;
+        mDraftTokens = ITensor::slice(mDraftTokensMax, 0, 0);
+        mEncodeMap = ITensor::slice(mEncodeMapMax, 0, 0);
+        (BufferRange<SizeType32>(*draftLengthPtr))[0] = 0;
         return;
     }
 
     auto lastToken = BufferRange<TokenIdType const>(*lastTokenPtr)[0];
-    auto offset = BufferRange<SizeType32 const>(*offsetPtr)[0];
+    auto offset = BufferRange<SizeType32 const>(*lastPositionIdPtr)[0];
 
     SizeType32 inputLen = ITensor::volume(draftTokens->getShape());
     TLLM_CHECK(inputLen >= mRuntimeMaxDraftLen);
 
     BufferRange<TokenIdType> draftRange(*draftTokens);
     BufferRange<TokenIdType> positionRange(*positionIds);
-    BufferRange<bool> samplingRange(*samplingMask);
 
     SizeType32 filledLen = 0;
 
     filledLen += lookahead(ITensor::slice(draftTokens, filledLen, mRuntimeMaxDraftLen - filledLen),
-        ITensor::slice(positionIds, filledLen, mRuntimeMaxDraftLen - filledLen),
-        ITensor::slice(samplingMask, filledLen, mRuntimeMaxDraftLen - filledLen), offset);
+        ITensor::slice(positionIds, filledLen, mRuntimeMaxDraftLen - filledLen), offset);
 
     auto guessStart = filledLen;
     filledLen += guess(ITensor::slice(draftTokens, filledLen, mRuntimeMaxDraftLen - filledLen),
-        ITensor::slice(positionIds, filledLen, mRuntimeMaxDraftLen - filledLen),
-        ITensor::slice(samplingMask, filledLen, mRuntimeMaxDraftLen - filledLen), offset, lastToken);
+        ITensor::slice(positionIds, filledLen, mRuntimeMaxDraftLen - filledLen), offset, lastToken);
     auto guessEnd = filledLen;
 
+    std::copy(draftRange.begin() + guessStart, draftRange.begin() + guessEnd,
+        BufferRange<TokenIdType>(*mGuessTokensMax).begin());
     mGuessTokens = ITensor::slice(mGuessTokensMax, 0, guessEnd - guessStart);
 
-    std::copy(draftRange.begin() + guessStart, draftRange.begin() + guessEnd,
-        BufferRange<TokenIdType>(*mGuessTokens).begin());
+    posIdsToMask(mAttentionMask, ITensor::slice(positionIds, 0, filledLen));
 
-    (BufferRange<SizeType32>(*length))[0] = filledLen;
+    auto draftLen = treeEncode(ITensor::slice(draftTokens, 0, filledLen), ITensor::slice(positionIds, 0, filledLen),
+        mAttentionMask, mEncodeMapMax);
+
+    for (SizeType32 i = 0; i < draftLen; i++)
+    {
+        BufferRange<bool> srcRange(*ITensor::at(mAttentionMask, {i}));
+        BufferRange<bool> dstRange(*ITensor::slice(attentionMask, {i + attentionMaskOffset, attentionMaskOffset}));
+        std::copy(srcRange.begin(), srcRange.end(), dstRange.begin());
+    }
+
+    std::copy(draftRange.begin(), draftRange.begin() + draftLen, BufferRange<TokenIdType>(*mDraftTokensMax).begin());
+    mDraftTokens = ITensor::slice(mDraftTokensMax, 0, draftLen);
+    (BufferRange<SizeType32>(*draftLengthPtr))[0] = draftLen;
+    mEncodeMap = ITensor::slice(mEncodeMapMax, 0, filledLen);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -229,29 +415,31 @@ void LookaheadAlgorithm::verify(TensorPtr const& accepted, TensorPtr const& acce
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(ITensor::volume(goldenTokens->getShape()) == ITensor::volume(mGuessTokens->getShape()));
+    TLLM_CHECK(ITensor::volume(goldenTokens->getShape()) == ITensor::volume(mDraftTokens->getShape()));
     BufferRange<TokenIdType const> goldRange(*goldenTokens);
-    BufferRange<TokenIdType> guessTokensRange(*mGuessTokens);
-    auto guessSize = ITensor::volume(mGuessTokens->getShape());
+    BufferRange<TokenIdType> draftRange(*mDraftTokens);
+    BufferLocation<bool const> maskLocation(*mAttentionMask);
+    auto draftSize = ITensor::volume(mDraftTokens->getShape());
+    auto end = *BufferRange<TokenIdType const>(*endToken).begin();
 
-    SizeType32 guesses = (mN - 1 > 0) ? (guessSize / (mN - 1)) : 0;
-    SizeType32 hit = 0, maxHit = 0, hitIdx = 0;
-    for (SizeType32 i = 0; i < guesses; i++)
+    SizeType32 maxHit = 0, hitIdx = 0;
+    for (SizeType32 i = 0; i < draftSize; i++)
     {
         SizeType32 hit = 0;
-        for (SizeType32 j = 0; j < mN - 1; j++)
+        TokenIdType cur = newLastToken;
+        for (SizeType32 j = 0; j < draftSize; j++)
         {
-            auto idx = i * (mN - 1) + j;
-            bool ok
-                = (j == 0) ? (newLastToken == guessTokensRange[idx]) : (goldRange[idx - 1] == guessTokensRange[idx]);
-            bool finish = guessTokensRange[idx] == *BufferRange<TokenIdType const>(*endToken).begin();
-            if (ok && !finish)
+            if (maskLocation.at(i, j))
             {
-                hit++;
-            }
-            else
-            {
-                break;
+                if (draftRange[j] == cur && draftRange[j] != end)
+                {
+                    hit++;
+                    cur = goldRange[j];
+                }
+                else
+                {
+                    break;
+                }
             }
         }
         if (hit > maxHit)
@@ -261,17 +449,19 @@ void LookaheadAlgorithm::verify(TensorPtr const& accepted, TensorPtr const& acce
         }
     }
 
-    BufferRange<TokenIdType> acceptedRange(*accepted);
-    acceptedRange[0] = newLastToken;
-    std::copy(goldRange.begin() + hitIdx * (mN - 1), goldRange.begin() + hitIdx * (mN - 1) + maxHit,
-        acceptedRange.begin() + 1);
+    maxHit = maxHit > mRuntimeMaxDraftPathLen ? mRuntimeMaxDraftPathLen : maxHit;
 
+    SizeType32 acceptedIdx = 0;
+    BufferRange<TokenIdType> acceptedRange(*accepted);
     BufferRange<SizeType32> acceptedOffsetsRange(*acceptedOffsets);
-    auto lookSize = 1 + mN - 2 - mFilling + mFilling * mW;
-    // acceptedOffsetsRange[0] = 0;
-    for (SizeType32 i = 0; i < maxHit; i++)
+    acceptedRange[acceptedIdx] = newLastToken;
+    for (SizeType32 j = 0; j < draftSize; j++)
     {
-        acceptedOffsetsRange[i] = lookSize + hitIdx * (mN - 1) + i - 1;
+        if (maskLocation.at(hitIdx, j) && acceptedIdx < maxHit)
+        {
+            acceptedOffsetsRange[acceptedIdx++] = j;
+            acceptedRange[acceptedIdx] = goldRange[j];
+        }
     }
 
     *BufferRange<SizeType32>(*acceptedLength).begin() = maxHit + 1;
@@ -325,7 +515,19 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(ITensor::volume(acceptedTokens->getShape()) >= mN);
-    BufferRange<TokenIdType const> sampledRange(*sampledTokens);
+    BufferRange<TokenIdType const> zippedTokensRange(*sampledTokens);
+    BufferRange<TokenIdType const> sampledRange(*mSampledTokensMax);
+
+    BufferRange<SizeType32 const> mapRange(*mEncodeMap);
+    BufferRange<TokenIdType> unzipRange(*mSampledTokensMax);
+    mSampledTokens = ITensor::slice(mSampledTokensMax, 0, mEncodeMap->getShape().d[0] + 1);
+
+    unzipRange[0] = zippedTokensRange[0];
+    for (SizeType32 i = 0; i < mapRange.size(); i++)
+    {
+        unzipRange[i + 1] = zippedTokensRange[mapRange[i] + 1];
+    }
+
     BufferRange<TokenIdType> keyRange(*mKeyTokens);
     BufferRange<TokenIdType> pastRange(*mPastTokens);
 
@@ -359,13 +561,15 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     }
 
     auto guessSize = ITensor::volume(mGuessTokens->getShape());
-    auto outputSize = ITensor::volume(sampledTokens->getShape());
+    auto outputSize = ITensor::volume(mSampledTokens->getShape());
     auto lookSize = 1 + (mN > 1 ? mN - 2 : 0) - mFilling + mFilling * mW;
     TLLM_CHECK(guessSize + lookSize == outputSize);
 
-    TensorConstPtr goldenTokens = ITensor::slice(sampledTokens, lookSize, guessSize);
+    TensorConstPtr goldenTokens = ITensor::slice(mSampledTokens, lookSize, guessSize);
 
-    verify(acceptedTokens, acceptedOffsets, acceptedLength, newLastToken, goldenTokens, endToken);
+    auto& acptLen = *BufferRange<SizeType32>(*acceptedLength).begin();
+
+    verify(acceptedTokens, acceptedOffsets, acceptedLength, newLastToken, ITensor::slice(sampledTokens, 1), endToken);
 
     accept(ITensor::slice(acceptedTokens, 0, *BufferRange<SizeType32>(*acceptedLength).begin()));
 

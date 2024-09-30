@@ -38,7 +38,7 @@ public:
     GPTAttentionPluginCommon() = delete;
 
     GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
+        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
@@ -307,6 +307,7 @@ protected:
     int mVisionStart;
     int mVisionLength;
     int mNumKVHeads;
+    int mLayerIdxInCachePool;
     int mHeadSize;
     int mUnidirectional;
     float mQScaling;
@@ -389,6 +390,7 @@ protected:
         ss << "gptAttentionCommon members ====================" << std::endl;
         ss << "mNumHeads: " << mNumHeads << std::endl;
         ss << "mNumKVHeads: " << mNumKVHeads << std::endl;
+        ss << "mLayerIdxInCachePool " << mLayerIdxInCachePool << std::endl;
         ss << "mHeadSize: " << mHeadSize << std::endl;
         ss << "mUnidirectional: " << mUnidirectional << std::endl;
         ss << "mQScaling: " << mQScaling << std::endl;

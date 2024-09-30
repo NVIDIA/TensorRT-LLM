@@ -80,6 +80,8 @@ class LLM:
 
         dtype(str): The data type for the model weights and activations.
 
+        trust_remote_code(bool): Download the model and tokenizer from trust remote code (e.g, Hugging Face)
+
         revision(Optional[str]): The revision of the model.
 
         tokenzier_revision(Optional[str]): The revision of the tokenizer.
@@ -92,11 +94,13 @@ class LLM:
                  skip_tokenizer_init: bool = False,
                  tensor_parallel_size: int = 1,
                  dtype: str = "auto",
+                 trust_remote_code: bool = False,
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any):
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        self.mpi_session: Optional[MpiSession] = None
 
         try:
             self.args = LlmArgs.from_kwargs(
@@ -105,6 +109,7 @@ class LLM:
                 skip_tokenizer_init=skip_tokenizer_init,
                 tensor_parallel_size=tensor_parallel_size,
                 dtype=dtype,
+                trust_remote_code=trust_remote_code,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
@@ -113,7 +118,6 @@ class LLM:
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
 
-        self.mpi_session: Optional[MpiSession] = None
         if self.args.parallel_config.is_multi_gpu:
             if get_device_count() < self.args.parallel_config.world_size:
                 raise RuntimeError(
@@ -131,16 +135,21 @@ class LLM:
                 self.mpi_session = MpiCommSession(
                     n_workers=self.args.parallel_config.world_size)
 
-        # Due to the Executor can only accept a engine path, we need to save the engine to a directory
-        self._engine_dir: Optional[Path] = None
-        self._executor: Optional[GenerationExecutor] = None
-        self._workspace = tempfile.TemporaryDirectory("llm-workspace")
+        try:
+            # Due to the Executor can only accept a engine path, we need to save the engine to a directory
+            self._engine_dir: Optional[Path] = None
+            self._executor: Optional[GenerationExecutor] = None
+            self._workspace = tempfile.TemporaryDirectory("llm-workspace")
 
-        self.runtime_context: Optional[_ModelRuntimeContext] = None
-        self.llm_build_stats = LlmBuildStats()
+            self.runtime_context: Optional[_ModelRuntimeContext] = None
+            self.llm_build_stats = LlmBuildStats()
 
-        self._build_model()
-        self._tokenizer = self._try_load_tokenizer()
+            self._build_model()
+            self._tokenizer = self._try_load_tokenizer()
+        except Exception as e:
+            if self.mpi_session is not None:
+                self.mpi_session.shutdown()
+            raise e
 
         exception_handler.register(self, '_shutdown')
 
@@ -314,7 +323,7 @@ class LLM:
         elif self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
-            lora_config = self.args.build_config.lora_config
+            lora_config = engine_config.build_config.lora_config
             max_lora_rank = lora_config.max_lora_rank
             num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
@@ -352,7 +361,8 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
-        return ModelLoader.load_hf_tokenizer(self.args.model_dir)
+        return ModelLoader.load_hf_tokenizer(self.args.model_dir,
+                                             self.args.trust_remote_code)
 
     @property
     def tokenizer(self) -> Optional[TokenizerBase]:

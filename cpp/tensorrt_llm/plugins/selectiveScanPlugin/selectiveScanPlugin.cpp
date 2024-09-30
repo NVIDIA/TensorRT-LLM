@@ -347,6 +347,7 @@ int SelectiveScanPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     {
         invokeSelectiveScanUpdate<T, float>(ssm_params, stream);
     }
+    sync_check_cuda_error();
     return 0;
 }
 

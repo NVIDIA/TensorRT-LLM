@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "gptAttentionPlugin.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -26,6 +27,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
+#include <NvInferRuntimeBase.h>
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -41,8 +43,8 @@ static char const* GPT_ATTENTION_PLUGIN_VERSION{"1"};
 static char const* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
 GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length,
-    int num_kv_heads, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
-    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    int num_kv_heads, int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
+    float qk_tanh_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale,
@@ -57,9 +59,9 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
     bool use_cache, bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
     int spec_decoding_max_generation_length)
-    : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, qk_tanh_scale, position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
-        rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
+    : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, layer_idx_in_cache_pool,
+        head_size, unidirectional, q_scaling, qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
+        rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
         rotary_embedding_long_m_scale, rotary_embedding_max_positions, rotary_embedding_original_max_positions, tp_size,
         tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa, kv_cache_quant_mode, remove_input_padding, mask_type,
         block_sparse_params, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
@@ -94,6 +96,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::KV_CACHE_BLOCK_OFFSETS: return useKVCache() && mPagedKVCache;
     case IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS: return useKVCache() && mPagedKVCache;
     case IdxEntry::HOST_KV_CACHE_POOL_POINTERS: return useKVCache() && mPagedKVCache;
+    case IdxEntry::HOST_KV_CACHE_POOL_MAPPING: return useKVCache() && mPagedKVCache;
     case IdxEntry::PAST_KEY_VALUE: return useKVCache() && !mPagedKVCache;
     case IdxEntry::KV_CACHE_QUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
     case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
@@ -243,6 +246,11 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         // kv cache pool pointers
         return inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
+    }
+    else if (useKVCache() && mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)))
+    {
+        // kv cache pool mapping
+        return inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (useKVCache() && mKVCacheQuantMode.hasInt8KvCache()
         && (!mPagedKVCache && (pos == getIdx(IdxEntry::PAST_KEY_VALUE) || pos == nbInputs + 1)))
@@ -478,6 +486,7 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
             outputDesc, inputs, outputs, workspace, stream);
     }
 
+    sync_check_cuda_error();
     TLLM_LOG_TRACE("Attention plugin stop at layer %d", mLayerIdx);
 
     return 0;
@@ -624,27 +633,36 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         auto const& kvCacheBlockOffsets = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)];
         auto const& kvCacheBlockOffsetsShape = inputDesc[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)].dims;
         max_blocks_per_sequence = kvCacheBlockOffsetsShape.d[kvCacheBlockOffsetsShape.nbDims - 1];
-        auto const seqStride = getStride(kvCacheBlockOffsetsShape, 0);
+
+        std::int32_t const* host_pool_mapping
+            = static_cast<std::int32_t const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)]);
+
+        const int32_t layerToPool = host_pool_mapping[mLayerIdx];
+        auto const seqStride = getStride(kvCacheBlockOffsetsShape, 1);
+        auto const poolStride = getStride(kvCacheBlockOffsetsShape, 0);
         auto const seqOffset = seqIdxBeg * seqStride;
+        auto const poolOffset = layerToPool * poolStride;
 
         block_offsets
             = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::KV_CACHE_BLOCK_OFFSETS)])
-            + seqOffset;
+            + poolOffset + seqOffset;
 
         host_block_offsets
             = reinterpret_cast<kernels::KVBlockArray::DataType*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)])
-            + seqOffset;
+            + poolOffset + seqOffset;
 
         auto const* const typed_host_pool_pointers
             = static_cast<char* const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)]);
 
         auto const cacheElemSize = (mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
+
         auto const blockSize = mTokensPerBlock * mNumKVHeads * mHeadSize;
         auto const bytesPerBlock = blockSize * cacheElemSize;
-        auto const layerOffset = mLayerIdx * 2 * bytesPerBlock;
+        auto const layerOffset = mLayerIdxInCachePool * 2 * bytesPerBlock;
 
-        host_primary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[0] + layerOffset);
-        host_secondary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[1] + layerOffset);
+        host_primary_pool_pointer = reinterpret_cast<void*>(typed_host_pool_pointers[layerToPool * 2] + layerOffset);
+        host_secondary_pool_pointer
+            = reinterpret_cast<void*>(typed_host_pool_pointers[layerToPool * 2 + 1] + layerOffset);
     }
 
     AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0])
@@ -962,8 +980,9 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
         auto* obj = new GPTAttentionPlugin(p.getScalar<int32_t>("layer_idx").value(),
             p.getScalar<int32_t>("num_heads").value(), p.getScalar<int32_t>("vision_start").value(),
             p.getScalar<int32_t>("vision_length").value(), p.getScalar<int32_t>("num_kv_heads").value(),
-            p.getScalar<int32_t>("head_size").value(), p.getScalar<int32_t>("unidirectional").value(),
-            p.getScalar<float>("q_scaling").value(), p.getScalar<float>("qk_tanh_scale").value(),
+            p.getScalar<int32_t>("layer_idx_in_cache_pool").value(), p.getScalar<int32_t>("head_size").value(),
+            p.getScalar<int32_t>("unidirectional").value(), p.getScalar<float>("q_scaling").value(),
+            p.getScalar<float>("qk_tanh_scale").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
             p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
             static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),

@@ -179,7 +179,7 @@ public:
 
     static std::vector<LoraModule> createLoraModules(std::vector<std::string> const& loraModuleNames,
         SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
-        SizeType32 attentionHeadSize, SizeType32 tpSize);
+        SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts);
 
     static ModuleType constexpr toModuleType(std::string_view const& name)
     {

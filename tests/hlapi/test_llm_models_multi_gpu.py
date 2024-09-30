@@ -40,7 +40,8 @@ def test_llm_baichuan2_7b_tp2():
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
-                     tensor_parallel_size=2)
+                     tensor_parallel_size=2,
+                     trust_remote_code=True)
 
 
 @skip_single_gpu

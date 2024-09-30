@@ -18,12 +18,6 @@ performance that can be delivered by TensorRT-LLM.
 
 The following issues are being addressed to improve the efficiency of TensorRT-LLM.
 
-### Unexpected extra GPU memory allocation when enabling `--multiple_profiles`
-
-We observed that enabling multiple profiles can lead to extra
-unexpected GPU memory usage on some cases starting from v0.11.
-The issue will be addressed in future releases.
-
 ### Fused Matmul + Gated-SiLU (LLaMA)
 
 The current implementation combines two Matmul operations into one Matmul followed by
@@ -45,7 +39,7 @@ The performance numbers below were collected using the steps described in this d
 |              |                          |               |                 |             |                |                |                |         |
 | ------------ | ------------------------ | ------------- | --------------- | ----------- | -------------- | -------------- | -------------- | ------- |
 |              |                          | **GPU**       | H200 141GB HBM3 | GH200 120GB | H100 80GB HBM3 | H100 80GB HBM3 | A100-SXM4-80GB | L40S    |
-|              |                          | **Precision** | FP8             | FP8         | FP8            | Mixed          | Mixed          | FP8     |
+|              |                          | **Precision** | FP8             | FP8         | FP8            | FP16           | FP16           | FP8     |
 | **Model**    | **Input/Output Lengths** | **TP**        |                 |             |                |                |                |         |
 | GPTJ 6B      | 128/128                  | 1             | 24834.76        | 22454.79    | 24429.55       | 13085.91       | 5864.81        | 7647.24 |
 |              | 128/2048                 | 1             | 8348.93         | 6656.25     | 7831.38        | 3882.21        | 2194.57        | 1843.91 |

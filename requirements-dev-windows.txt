@@ -1,5 +1,5 @@
 -r requirements-windows.txt
---extra-index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://download.pytorch.org/whl/cu124
 datasets
 einops
 graphviz

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tests/layers/randomLlm.h"
 
@@ -84,9 +85,10 @@ TEST_P(LookaheadAlgorithmTest, predict)
     std::tie(std::ignore, std::ignore, maxDraftLenRuntime, std::ignore)
         = executor::LookaheadDecodingConfig(w, n, g).calculateSpeculativeResource();
     auto shape = ITensor::makeShape({maxTokensPerStep});
+    auto shape2d = ITensor::makeShape({maxTokensPerStep, maxTokensPerStep});
     auto shapeSingle = ITensor::makeShape({1});
     TensorPtr posidMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-    TensorPtr smaskMax = BufferManager::cpu(shape, nvinfer1::DataType::kBOOL);
+    TensorPtr attentionMaskMax = BufferManager::cpu(shape2d, nvinfer1::DataType::kBOOL);
     TensorPtr inputLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
     auto& inputLength(*BufferRange<SizeType32>(*inputLengthPtr).begin());
 
@@ -123,26 +125,34 @@ TEST_P(LookaheadAlgorithmTest, predict)
     {
         TLLM_LOG_DEBUG("\noracle[%d] = '%c'", sequenceLength - 1, static_cast<char>(sequenceRange[sequenceLength - 1]));
         bufferCast<SizeType32>(*posidMax)[0] = sequenceLength - 1;
-        bufferCast<bool>(*smaskMax)[0] = true;
+        BufferLocation<bool> amaskLocation(*attentionMaskMax);
+        for (auto& item : amaskLocation)
+        {
+            item = false;
+        }
+        for (SizeType32 i = 0; i < maxTokensPerStep; i++)
+        {
+            amaskLocation.at(i, 0) = true;
+        }
+
         algo.prepare(                                                     //
             ITensor::slice(sequence, sequenceLength, maxDraftLenRuntime), //
             ITensor::slice(posidMax, 1, maxDraftLenRuntime),              //
-            ITensor::slice(smaskMax, 1, maxDraftLenRuntime),              //
             inputLengthPtr,                                               //
+            attentionMaskMax, 1,                                          //
             sequenceLengthPtr,                                            //
             ITensor::slice(sequence, sequenceLength - 1, 1));
 
         TensorPtr input = ITensor::slice(sequence, sequenceLength - 1, inputLength + 1);
         TensorPtr posid = ITensor::slice(posidMax, 0, inputLength + 1);
-        TensorPtr smask = ITensor::slice(smaskMax, 0, inputLength + 1);
+        TensorPtr amask = ITensor::slice(attentionMaskMax, 0, inputLength + 1);
 
         PRINT_TOKENS(input);
         PRINT_VALUES(posid);
-        PRINT_VALUES(smask);
+        PRINT_VALUES(amask);
 
         TensorPtr output = ITensor::slice(outputMax, 0, inputLength + 1);
-        llm.foretell(output, input, posid);
-        llm.sampleByMask(output, smask);
+        llm.foretell(output, input, posid, amask);
         PRINT_TOKENS(output);
 
         // algo.update(acceptedMax, acceptedOffsetsMax, acceptedLengthPtr, output, endIdPtr);
@@ -206,5 +216,47 @@ INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmall_121, LookaheadAlgorit
 INSTANTIATE_TEST_CASE_P(CombineLookaheadAlgorithmTestSmall_222, LookaheadAlgorithmTest,
     testing::Combine(testing::Values(std::make_tuple(2, 2)), testing::Values(std::make_tuple(2, 2)),
         testing::Values(std::make_tuple(2, 2))));
+
+TEST(LookaheadAlgorithmTest, treeEncodeTest)
+{
+    auto testWithData = [](TensorPtr inputTokens, TensorPtr inputPosIds, SizeType32 lastPosId, SizeType32 gold_len)
+    {
+        auto shape = inputTokens->getShape();
+        auto shape2d = ITensor::makeShape({shape.d[0], shape.d[0]});
+
+        TensorPtr inputMasks = BufferManager::cpu(shape2d, nvinfer1::DataType::kBOOL);
+        LookaheadAlgorithm::posIdsToMask(inputMasks, inputPosIds);
+
+        TensorPtr outputTokens = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+        TensorPtr outputPosIds = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+        TensorPtr encodeMap = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
+        TensorPtr outputMasks = BufferManager::cpu(shape2d, nvinfer1::DataType::kBOOL);
+
+        // auto len = LookaheadAlgorithm::treeEncode(outputTokens, outputPosIds, outputMasks, inputTokens, inputPosIds,
+        // inputMasks, '$', 9);
+        auto len = LookaheadAlgorithm::treeEncode(inputTokens, inputPosIds, inputMasks, encodeMap);
+        TLLM_LOG_DEBUG("len = %d", len);
+
+        EXPECT_EQ(len, gold_len);
+    };
+
+    testWithData(                                                 //
+        initTensor(std::string("01234512345")),                   //
+        initTensor({10, 11, 12, 13, 14, 15, 11, 12, 13, 14, 15}), //
+        9, 6);
+
+    testWithData(                                                 //
+        initTensor(std::string("01234512abc")),                   //
+        initTensor({10, 11, 12, 13, 14, 15, 11, 12, 13, 14, 15}), //
+        9, 9);
+
+    testWithData(                                                                     //
+        initTensor(std::string("01234512abc2aBCD")),                                  //
+        initTensor({10, 11, 12, 13, 14, 15, 11, 12, 13, 14, 15, 12, 13, 14, 15, 16}), //
+        9, 12);
+
+    testWithData(initTensor(std::string("wmplhi  folxamp")),
+        initTensor({21, 22, 23, 24, 25, 26, 27, 21, 22, 23, 24, 21, 22, 23, 24}), 20, 15);
+}
 
 } // namespace tensorrt_llm::tests::layers

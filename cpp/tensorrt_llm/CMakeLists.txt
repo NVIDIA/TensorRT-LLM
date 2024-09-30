@@ -348,9 +348,11 @@ endif()
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")
   set(AS_NEEDED_FLAG "-Wl,--as-needed")
+  set(NO_AS_NEEDED_FLAG "-Wl,--no-as-needed")
 else() # Windows
   set(UNDEFINED_FLAG "")
   set(AS_NEEDED_FLAG "")
+  set(NO_AS_NEEDED_FLAG "")
 endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)

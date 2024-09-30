@@ -93,7 +93,8 @@ void InitBindings(pybind11::module_& m)
 
     py::enum_<tle::CapacitySchedulerPolicy>(m, "CapacitySchedulerPolicy")
         .value("MAX_UTILIZATION", tle::CapacitySchedulerPolicy::kMAX_UTILIZATION)
-        .value("GUARANTEED_NO_EVICT", tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT);
+        .value("GUARANTEED_NO_EVICT", tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
+        .value("STATIC_BATCH", tle::CapacitySchedulerPolicy::kSTATIC_BATCH);
 
     py::enum_<tle::ContextChunkingPolicy>(m, "ContextChunkingPolicy")
         .value("EQUAL_PROGRESS", tle::ContextChunkingPolicy::kEQUAL_PROGRESS)
@@ -299,7 +300,8 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("max_verification_set_size", &tle::LookaheadDecodingConfig::getVerificationSetSize);
 
     py::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
-        .def(py::init<VecTokens>(), py::arg("first_gen_tokens"));
+        .def(py::init<VecTokens, tle::ContextPhaseParams::RequestIdType>(), py::arg("first_gen_tokens"),
+            py::arg("req_id"));
 
     py::class_<tle::Request> request(m, "Request");
     request
@@ -631,14 +633,18 @@ void InitBindings(pybind11::module_& m)
 
     auto extendedRuntimePerfKnobConfigSetstate = [](py::tuple state)
     {
-        if (state.size() != 2)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
         }
-        return tle::ExtendedRuntimePerfKnobConfig(state[0].cast<bool>(), state[1].cast<bool>());
+        return tle::ExtendedRuntimePerfKnobConfig(
+            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[2].cast<SizeType32>());
     };
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
-    { return py::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc()); };
+    {
+        return py::make_tuple(self.getMultiBlockMode(), self.getEnableContextFMHAFP32Acc(), self.getCudaGraphMode(),
+            self.getCudaGraphCacheSize());
+    };
     py::class_<tle::ExtendedRuntimePerfKnobConfig>(m, "ExtendedRuntimePerfKnobConfig")
         .def(
             py::init<bool, bool>(), py::arg("multi_block_mode") = true, py::arg("enable_context_fmha_fp32_acc") = false)
@@ -646,6 +652,10 @@ void InitBindings(pybind11::module_& m)
             &tle::ExtendedRuntimePerfKnobConfig::setMultiBlockMode)
         .def_property("enable_context_fmha_fp32_acc", &tle::ExtendedRuntimePerfKnobConfig::getEnableContextFMHAFP32Acc,
             &tle::ExtendedRuntimePerfKnobConfig::setEnableContextFMHAFP32Acc)
+        .def_property("cuda_graph_mode", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphMode,
+            &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphMode)
+        .def_property("cuda_graph_cache_size", &tle::ExtendedRuntimePerfKnobConfig::getCudaGraphCacheSize,
+            &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphCacheSize)
         .def(py::pickle(extendedRuntimePerfKnobConfigGetstate, extendedRuntimePerfKnobConfigSetstate));
 
     auto executorConfigGetState = [](tle::ExecutorConfig const& self)

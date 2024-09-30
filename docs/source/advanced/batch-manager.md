@@ -147,6 +147,7 @@ Note: this feature isn't supported with the `V1` batching scheme for the moment.
 * `capacitySchedulerPolicy`, policy used to select the subset available requests in each iteration of the InflightBatching generation loop.
   - `MAX_UTILIZATION` packs as many requests as the underlying TRT engine can support in any iteration of the InflightBatching generation loop. While this is expected to maximize GPU throughput, it might require that some requests be paused and restarted depending on peak KV cache memory availability.
   - `GUARANTEED_NO_EVICT` uses KV cache more conservatively guaranteeing that a request, once started, will run to completion without eviction.
+  - `STATIC_BATCH` similarly to `GUARANTEED_NO_EVICT` schedules the maximum possible batch size without eviction. New requests are scheduled only after all requests in the previous batch have finished.
 
 ### Optional GptManager parameters
 * `TrtGptModelOptionalParams` class encapsulates the following fields:
@@ -227,6 +228,9 @@ It can also adopt a more conservative approach and schedule requests only when i
 knows that the memory allocation will be sufficient to process all active requests
 even in the worst case of KV cache consumption. That mode corresponds to a
 `SchedulerConfig::capacitySchedulerPolicy` set to `kGUARANTEED_NO_EVICT`.
+Another traditional batching scheme with a batch of requests running in lockstep
+until generation for all of them is completed corresponds to
+`SchedulerConfig::capacitySchedulerPolicy` set to `kSTATIC_BATCH`.
 
 The `GptManager`'s worker thread terminates when the `GptManager` destructor is
 called and there are no more active requests.

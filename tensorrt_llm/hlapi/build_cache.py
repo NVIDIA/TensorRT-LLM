@@ -35,6 +35,10 @@ class BuildCacheConfig:
         cache_root (str): The root directory for the build cache.
         max_records (int): The maximum number of records to store in the cache.
         max_cache_storage_gb (float): The maximum amount of storage (in GB) to use for the cache.
+
+    Note:
+        The build-cache assumes the weights of the model are not changed during the execution. If the weights are
+        changed, you should remove the caches manually.
     """
 
     def __init__(self,
@@ -82,31 +86,33 @@ class BuildCache:
         if config.max_records < 1:
             raise ValueError("max_records should be greater than 0")
 
+    def free_storage_in_gb(self) -> float:
+        ''' Get the free storage capacity of the cache. '''
+        # measure the root directory
+        if self.cache_root.parent.exists():
+            usage = shutil.disk_usage(self.cache_root.parent)
+            return usage.free / 1024**3
+        return 0
+
     def get_engine_building_cache_stage(self,
                                         build_config: BuildConfig,
                                         model_path: Optional[Path] = None,
+                                        force_rebuild: bool = False,
                                         **kwargs) -> 'CachedStage':
         '''
         Get the build step for engine building.
         '''
-        from tensorrt_llm.hlapi.llm_utils import \
-            _ModelFormatKind  # avoid cyclic import
-        force_rebuild = False
-        if parallel_config := kwargs.get('parallel_config'):
-            if parallel_config.auto_parallel:
-                force_rebuild = True
-        if model_format := kwargs.get('model_format'):
-            if model_format is not _ModelFormatKind.HF:
-                force_rebuild = True
+        build_config_str = json.dumps(self.prune_build_config_for_cache_key(
+            build_config.to_dict()),
+                                      sort_keys=True)
 
-        build_config_str = BuildCache.prune_build_config_for_cache_key(
-            build_config.to_dict())
+        kwargs_str = json.dumps(kwargs, sort_keys=True)
 
         return CachedStage(parent=self,
                            kind=CacheRecord.Kind.Engine,
                            cache_root=self.cache_root,
                            force_rebuild=force_rebuild,
-                           inputs=[build_config_str, model_path, kwargs])
+                           inputs=[build_config_str, model_path, kwargs_str])
 
     def prune_caches(self, has_incoming_record: bool = False):
         '''
@@ -246,7 +252,7 @@ class CachedStage:
         }
         return res
 
-    def cache_hitted(self) -> bool:
+    def is_cached(self) -> bool:
         '''
         Check if the product of the build step is in the cache
         '''
@@ -265,22 +271,36 @@ class CachedStage:
 
     @contextlib.contextmanager
     def write_guard(self):
-        '''
-        Write the filelock to indicate that the build step is in progress
+        ''' Guard the cache writing process.
+
+        The cache writing process should be atomic, so the filelock is used to protect the cache writing process. And
+        the cache metadata will be written to the cache directory.
+
+        Args:
+            final_engien_dir: the final engine directory
         '''
         self.parent.prune_caches(has_incoming_record=True)
 
         target_dir = self.get_cache_path()
-        target_dir.mkdir(parents=True, exist_ok=True)
-        # TODO[chunweiy]: deal with the cache modification conflict
-        lock = filelock.FileLock(target_dir / '.filelock', timeout=10)
 
-        with open(target_dir / 'metadata.json', 'w') as f:
+        # To avoid the cache modification conflict, a dummy directory is used to write the cache, and then rename it to
+        # the target directory
+        dummy_target_dir = Path(f"{target_dir.parent}/{target_dir.name}.dummy")
+
+        dummy_target_dir.mkdir(parents=True, exist_ok=True)
+        # TODO[chunweiy]: deal with the cache modification conflict
+        lock = filelock.FileLock(dummy_target_dir / '.filelock', timeout=10)
+
+        with open(dummy_target_dir / 'metadata.json', 'w') as f:
             f.write(json.dumps(self.get_cache_metadata()))
 
-        lock.__enter__()
-        yield target_dir / 'content'
-        lock.__exit__(None, None, None)
+        with lock:
+            yield dummy_target_dir / 'content'
+
+            # If engine building is successful, rename the dummy directory to the target directory
+            if target_dir.exists():
+                shutil.rmtree(target_dir)
+            shutil.move(dummy_target_dir, target_dir)
 
 
 @dataclass(unsafe_hash=True)
