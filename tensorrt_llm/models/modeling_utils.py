@@ -15,6 +15,7 @@ import torch
 from .._common import default_net
 from .._utils import (get_init_params, numpy_to_torch, release_gc,
                       str_dtype_to_torch, str_dtype_to_trt, trt_dtype_to_torch)
+from ..bindings import KVCacheType
 from ..functional import (PositionEmbeddingType, Tensor,
                           gather_last_token_logits, tanh)
 from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
@@ -353,7 +354,8 @@ class DecoderLayerList(ModuleList):
                 attention_params=None,
                 position_ids=None,
                 lora_params=None,
-                spec_decoding_params=None):
+                spec_decoding_params=None,
+                vision_token_mask=None):
         kv_cache_params.fill_none_tensor_list(len(self.layer_list))
 
         if use_cache:
@@ -369,6 +371,8 @@ class DecoderLayerList(ModuleList):
             kwargs = {}
             if position_ids is not None:
                 kwargs['position_ids'] = position_ids
+            if vision_token_mask is not None:
+                kwargs['vision_token_mask'] = vision_token_mask
             if lora_layer_params is not None:
                 kwargs['lora_layer_params'] = lora_layer_params
             if spec_decoding_params is not None:
@@ -557,6 +561,15 @@ class PretrainedModel(Module,
         multiple_profiles = default_net().plugin_config.multiple_profiles
         streamingllm = default_net().plugin_config.streamingllm
 
+        kv_cache_type = None
+        if not use_cache:
+            kv_cache_type = KVCacheType.DISABLED
+        else:
+            if paged_kv_cache:
+                kv_cache_type = KVCacheType.PAGED
+            else:
+                kv_cache_type = KVCacheType.CONTINUOUS
+
         model_inputs = self.prepare_basic_inputs(
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -570,7 +583,7 @@ class PretrainedModel(Module,
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
-            paged_kv_cache=paged_kv_cache,
+            kv_cache_type=kv_cache_type,
             tokens_per_block=tokens_per_block,
             num_heads=self.config.num_attention_heads,
             max_num_tokens=max_num_tokens,
@@ -598,7 +611,7 @@ class PretrainedModel(Module,
             'position_ids':
             model_inputs['position_ids'],
             'use_cache':
-            True,
+            kv_cache_type != KVCacheType.DISABLED,
             'last_token_ids':
             model_inputs['last_token_ids'],
             'attention_mask':
@@ -640,7 +653,6 @@ class PretrainedModel(Module,
                 model_inputs['lora_ranks'],
                 model_inputs['lora_weights_pointers'],
                 host_context_lengths=model_inputs['host_context_lengths'],
-                max_num_tokens=max_num_tokens,
                 host_request_types=model_inputs['host_request_types'])
         if model_inputs['spec_decoding_params'] is not None:
             result['spec_decoding_params'] = model_inputs[
@@ -813,6 +825,14 @@ def fuse_gate_mlp(
     for name, mlp, layer in model.named_modules_with_parent():
         if isinstance(mlp, GatedMLP):
             init_params = get_init_params(mlp)
+
+            hidden_act = init_params["hidden_act"]
+            if hidden_act not in ["silu", "gelu"]:
+                logger.warning(
+                    f"fuse_gate_mlp cannot be done for {name} due to unsupported activation {hidden_act}. Skipping."
+                )
+                continue
+
             init_params["inner_layernorm"] = mlp.inner_layernorm is not None
             fused_layer = FusedGatedMLP(**init_params)
 
@@ -1171,7 +1191,6 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
         model.load(weights)
     """
     quant_algo = model_config.quantization.quant_algo
-    kv_cache_quant_algo = model_config.quantization.kv_cache_quant_algo
     exclude_modules = model_config.quantization.exclude_modules
 
     # INT4_AWQ
@@ -1191,7 +1210,9 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                 weights[name] = preprocessor(param.T.contiguous(),
                                              torch.quint4x2,
                                              activation_type).view(dtype)
-            if name.endswith('weights_scaling_factor'):
+            if name.endswith('weights_scaling_factor'
+                             ) and param.shape[0] > param.shape[1]:
+                # TODO: refine on supporting ModelOpt HF-AWQ
                 weights[name] = param.T.contiguous().to(
                     str_dtype_to_torch(model_config.dtype))
             if name.endswith('prequant_scaling_factor'):
@@ -1246,12 +1267,6 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                                             exclude_modules=exclude_modules,
                                             plugin=True)
 
-    # FP8 kv_cache_scaling_factor is always 1.0
-    if kv_cache_quant_algo == QuantAlgo.FP8:
-        for name, param in weights.items():
-            if name.endswith('kv_cache_scaling_factor'):
-                weights[name] = torch.tensor([1.0], dtype=torch.float32)
-
     # Parallel block rowlinear should not have duplicate bias.
     elif model_config.architecture == 'GPTJForCausalLM':
         if model_config.mapping.tp_rank > 0:
@@ -1276,6 +1291,17 @@ def check_share_embedding(weights: Dict[str, torch.Tensor],
                 model_config.share_embedding_table = False
             else:
                 weights.pop("lm_head.weight")
+
+
+def get_kv_cache_type_from_legacy(use_cache: bool,
+                                  paged_kv_cache: bool) -> KVCacheType:
+    if use_cache:
+        if paged_kv_cache:
+            return KVCacheType.PAGED
+        else:
+            return KVCacheType.CONTINUOUS
+    else:
+        return KVCacheType.DISABLED
 
 
 def save_config(config: PretrainedConfig, *, output_dir: str,

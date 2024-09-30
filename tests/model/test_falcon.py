@@ -24,6 +24,7 @@ from transformers import FalconConfig, FalconForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.models.falcon.convert import load_weights_from_hf_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
@@ -528,6 +529,7 @@ class TestFalcon(unittest.TestCase):
             max_beam_width=beam_width,
             model_name=model_name,
             vocab_size=hf_config.vocab_size,
+            kv_cache_type=KVCacheType.CONTINUOUS,
             num_layers=hf_config.num_hidden_layers,
             num_heads=hf_config.num_attention_heads,
             num_kv_heads=hf_config.num_kv_heads,

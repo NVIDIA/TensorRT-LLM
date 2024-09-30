@@ -49,19 +49,19 @@ protected:
     void TearDown() override {}
 
     int mDeviceCount;
-    std::shared_ptr<nvinfer1::ILogger> mLogger{};
+    std::shared_ptr<nvinfer1::ILogger> mLogger;
 };
 
 std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<BufferManager> manager, size_t vocabSize,
     size_t vocabSizePadded, size_t batchSize, size_t beamWidth, int step, int ite, int maxInputLength,
-    size_t maxSeqLength, size_t sinkTokenLength, int localBatchSize, std::vector<int>& cpuOutputIds,
-    std::vector<float> cpuLogits, int noRepeatNgramSizeValue = 0)
+    size_t maxSeqLength, int localBatchSize, std::vector<int>& cpuOutputIds, std::vector<float> cpuLogits,
+    int noRepeatNgramSizeValue = 0)
 {
     constexpr int endId = 1;
     auto signedBatchSize = static_cast<int32_t>(batchSize);
     auto signedBeamWidth = static_cast<int32_t>(beamWidth);
     auto signedMaxSeqLength = static_cast<int32_t>(maxSeqLength);
-    cudaDeviceProp prop;
+    cudaDeviceProp prop{};
     tc::check_cuda_error(cudaGetDeviceProperties(&prop, 0));
 
     std::vector<int> cpuEndIds(batchSize, endId);
@@ -88,13 +88,16 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
     setupParams->decodingParams = std::make_shared<tl::SamplingSetupParams>();
 
     auto batchSlots = getDefaultBatchSlots(batchSize, *manager);
-    ddLayer.setup(batchSize, beamWidth, batchSlots, setupParams);
+    auto workspace = std::make_shared<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        manager, decodingDomain, TRTDataType<float>::value, ddLayer.getWorkspaceSize());
+    ddLayer.setup(batchSize, beamWidth, batchSlots, setupParams, workspace);
 
     auto forwardParams = std::make_shared<tl::SamplingInputs>(gpuEndIds, batchSlots, step, ite, localBatchSize);
     auto logitsShape
         = ITensor::makeShape({signedBatchSize, static_cast<int64_t>(beamWidth), static_cast<int64_t>(vocabSizePadded)});
-    forwardParams->logits = manager->gpu(logitsShape, nvinfer1::DataType::kFLOAT);
-    manager->copy(cpuLogits.data(), *forwardParams->logits.value(), MemoryType::kCPU);
+    ITensor::SharedPtr inputLogits = manager->gpu(logitsShape, nvinfer1::DataType::kFLOAT);
+    forwardParams->logits = inputLogits;
+    manager->copy(cpuLogits.data(), *inputLogits, MemoryType::kCPU);
 
     forwardParams->banWordsInputs = std::make_shared<tl::BanWordsDecodingInputs>(localBatchSize);
 
@@ -108,7 +111,7 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
     outputParams->finished = manager->gpu(
         ITensor::makeShape({signedBatchSize, signedBeamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-    ddLayer.forwardAsync(outputParams, forwardParams);
+    ddLayer.forwardAsync(outputParams, forwardParams, workspace);
 
     return outputParams;
 }
@@ -128,7 +131,6 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
     constexpr int maxSeqLength{9};
     constexpr int localBatchSize{batchSize};
     constexpr int noRepeatNgramSize{3};
-    constexpr int sinkTokenLength{0};
 
     std::vector<int> cpuOutputIds(batchSize * beamWidth * maxSeqLength);
     int ids[maxInputLength] = {10, 11, 12, 40, 41, 42, 40, 41};
@@ -144,7 +146,7 @@ TEST_F(SamplingTest, SamplingWithNoRepeatNGramSize)
     cpuLogits[43] = 5.0;
 
     auto outputParams = dynamicDecodeTest(manager, vocabSize, vocabSizePadded, batchSize, beamWidth, step, ite,
-        maxInputLength, maxSeqLength, sinkTokenLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
+        maxInputLength, maxSeqLength, localBatchSize, cpuOutputIds, cpuLogits, noRepeatNgramSize);
 
     manager->copy(*outputParams->outputIds, cpuOutputIds.data(), MemoryType::kCPU);
     EXPECT_EQ(cpuOutputIds[maxSeqLength - 1], 43);

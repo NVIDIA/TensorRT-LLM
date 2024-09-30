@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, LlamaTokenizer
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization import QuantMode
 
@@ -74,7 +75,10 @@ def parse_args():
     )
     parser.add_argument(
         '--multi_block_mode',
-        action='store_true',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
@@ -92,6 +96,7 @@ def TRTLLaMA(args, config):
     quantization_config = pretrained_config['quantization']
 
     build_config = config['build_config']
+    kv_cache_type = KVCacheType(build_config['kv_cache_type'])
     plugin_config = build_config['plugin_config']
 
     dtype = pretrained_config['dtype']
@@ -111,7 +116,6 @@ def TRTLLaMA(args, config):
     use_gpt_attention_plugin = bool(plugin_config['gpt_attention_plugin'])
     remove_input_padding = plugin_config['remove_input_padding']
     num_kv_heads = pretrained_config['num_key_value_heads']
-    paged_kv_cache = plugin_config['paged_kv_cache']
     tokens_per_block = plugin_config['tokens_per_block']
 
     quant_mode = QuantMode.from_quant_algo(
@@ -132,7 +136,7 @@ def TRTLLaMA(args, config):
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         hidden_size=hidden_size,
-        paged_kv_cache=paged_kv_cache,
+        kv_cache_type=kv_cache_type,
         tokens_per_block=tokens_per_block,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,

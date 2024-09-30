@@ -21,7 +21,7 @@ from ..functional import (ACT2FN, Tensor, concat, conv2d, gather, mamba_conv1d,
                           permute, selective_scan, shape, split, view)
 from ..module import Module
 from ..parameter import Parameter
-from .linear import Linear
+from .linear import ColumnLinear, Linear, RowLinear
 from .normalization import RmsNorm
 
 
@@ -240,32 +240,40 @@ class Mamba2(Module):
                  chunk_size=256,
                  bias=False,
                  rmsnorm=True,
-                 dtype=None):
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
-        self.d_inner = d_inner
+        assert d_inner % tp_size == 0
+        self.d_inner = d_inner // tp_size
         self.headdim = headdim
-        self.ngroups = ngroups
+        assert ngroups % tp_size == 0
+        self.ngroups = ngroups // tp_size
         self.chunk_size = chunk_size
         self.rmsnorm = rmsnorm
         self.dtype = dtype
-        assert self.d_inner % self.headdim == 0
-        self.nheads = self.d_inner // self.headdim
+        assert d_inner % headdim == 0
+        nheads = d_inner // headdim
+        assert nheads % tp_size == 0
+        self.nheads = nheads // tp_size
 
         self.A = Parameter(shape=(self.nheads, ), dtype="float32")
         self.D = Parameter(shape=(self.nheads, ), dtype="float32")
         self.dt_bias = Parameter(shape=(self.nheads, ), dtype="float32")
 
-        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
-        self.in_proj = Linear(self.d_model,
-                              d_in_proj,
-                              bias=bias,
-                              dtype=dtype,
-                              gather_output=False)
+        d_in_proj = 2 * d_inner + 2 * ngroups * d_state + nheads
+        self.in_proj = ColumnLinear(d_model,
+                                    d_in_proj,
+                                    bias=bias,
+                                    dtype=dtype,
+                                    tp_group=tp_group,
+                                    tp_size=tp_size,
+                                    gather_output=False)
 
-        self.conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
+        self.conv_dim = (d_inner + 2 * ngroups * d_state) // tp_size
         self.conv1d = MambaConv1d(self.conv_dim,
                                   self.d_conv,
                                   pre_stride=self.d_inner,
@@ -274,15 +282,16 @@ class Mamba2(Module):
 
         if rmsnorm:
             self.norm = RmsNorm(normalized_shape=self.d_inner,
-                                num_groups=ngroups,
+                                num_groups=self.ngroups,
                                 eps=1e-5,
                                 dtype=dtype)
 
-        self.out_proj = Linear(self.d_inner,
-                               self.d_model,
-                               bias=bias,
-                               dtype=dtype,
-                               gather_output=False)
+        self.out_proj = RowLinear(d_inner,
+                                  d_model,
+                                  bias=bias,
+                                  dtype=dtype,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size)
 
     def forward(self,
                 hidden_states: Tensor,

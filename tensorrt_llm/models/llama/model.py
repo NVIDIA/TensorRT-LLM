@@ -23,7 +23,6 @@ from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
                            non_gated_version, recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
-from ...logger import logger
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
@@ -352,14 +351,10 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             if quant_ckpt_path is not None:
                 hf_model_dir = quant_ckpt_path
 
-            # TODO(enweiz): check whether can enable share_embedding_table according to weights
-            if config.share_embedding_table:
-                logger.warning(
-                    f"{cls.__name__} does not support share_embedding_table; setting share_embedding_table=False."
-                )
-                config.share_embedding_table = False
-            model = cls(config)
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            if config.share_embedding_table:
+                config.share_embedding_table = loader.check_share_embedding()
+            model = cls(config)
             loader.generate_tllm_weights(model)
         else:
             if use_preloading:
@@ -447,11 +442,14 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                                    mapping=mapping,
                                                    quant_config=quant_config,
                                                    **kwargs)
+            trust_remote_code = kwargs.pop("trust_remote_code", True)
+
             convert.quantize(hf_model_dir,
                              output_dir,
                              config=config,
                              device=device,
-                             calib_dataset=calib_dataset)
+                             calib_dataset=calib_dataset,
+                             trust_remote_code=trust_remote_code)
         else:
             raise ValueError(
                 f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."

@@ -111,7 +111,6 @@ protected:
 
     bool mComputeProbs = false;
 
-    TensorPtr mLogitsDevice;
     TensorPtr mContextLengthDevice;
     TensorPtr mSeqLengthsDevice;
     TensorPtr mFinishedDevice;
@@ -128,11 +127,11 @@ protected:
 
     TensorPtr mCurandStatesDevice;
     TensorPtr mPenaltyWorkspaceDevice;
-    BufferPtr mSamplingWorkspaceDevice;
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::layers::BaseLayer> mSamplingLayer;
+    std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
     std::vector<T> mTestLogitsInit;
 

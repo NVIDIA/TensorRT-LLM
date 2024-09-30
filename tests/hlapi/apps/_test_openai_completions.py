@@ -36,8 +36,9 @@ def async_client(server: RemoteOpenAIServer):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("echo", [True, False])
 async def test_completion_streaming(async_client: openai.AsyncOpenAI,
-                                    model_name: str):
+                                    model_name: str, echo: bool):
     prompt = "What is an LLM?"
 
     single_completion = await async_client.completions.create(
@@ -45,13 +46,17 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
         prompt=prompt,
         max_tokens=5,
         temperature=0.0,
+        echo=echo,
     )
     single_output = single_completion.choices[0].text
-    stream = await async_client.completions.create(model=model_name,
-                                                   prompt=prompt,
-                                                   max_tokens=5,
-                                                   temperature=0.0,
-                                                   stream=True)
+    stream = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+        echo=echo,
+    )
     chunks: List[str] = []
     async for chunk in stream:
         chunks.append(chunk.choices[0].text)

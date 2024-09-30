@@ -13,12 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
+import subprocess
+import sys
+from os.path import abspath, dirname
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
+import torch
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
-from tensorrt_llm.bindings import GptJsonConfig
+from tensorrt_llm._utils import supports_inflight_batching  # noqa
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
@@ -67,13 +73,6 @@ DEFAULT_PROMPT_TEMPLATES = {
 }
 
 
-def supports_inflight_batching(engine_dir):
-    config_path = Path(engine_dir) / "config.json"
-    json_config = GptJsonConfig.parse_file(config_path)
-    model_config = json_config.model_config
-    return model_config.supports_inflight_batching
-
-
 def read_decoder_start_token_id(engine_dir):
     with open(Path(engine_dir) / "config.json", 'r') as f:
         config = json.load(f)
@@ -113,17 +112,24 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
                    model_version: Optional[str] = None,
                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
-        use_fast = True
-        if tokenizer_type is not None and tokenizer_type == "llama":
-            use_fast = False
-        # Should set both padding_side and truncation_side to be 'left'
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
-                                                  legacy=False,
-                                                  padding_side='left',
-                                                  truncation_side='left',
-                                                  trust_remote_code=True,
-                                                  tokenizer_type=tokenizer_type,
-                                                  use_fast=use_fast)
+        if 'whisper' in model_name.lower():
+            tokenizer = AutoTokenizer.from_pretrained('openai/whisper-large-v3',
+                                                      language='english',
+                                                      task='transcribe',
+                                                      predict_timestamps=False)
+        else:
+            use_fast = True
+            if tokenizer_type is not None and tokenizer_type == "llama":
+                use_fast = False
+            # Should set both padding_side and truncation_side to be 'left'
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir,
+                legacy=False,
+                padding_side='left',
+                truncation_side='left',
+                trust_remote_code=True,
+                tokenizer_type=tokenizer_type,
+                use_fast=use_fast)
     elif model_name == 'GemmaForCausalLM' or model_name == 'RecurrentGemmaForCausalLM':
         from transformers import GemmaTokenizer
 
@@ -161,11 +167,60 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
     return tokenizer, pad_id, end_id
 
 
+def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
+                           engine_dir: str,
+                           multimodal_input_file: Optional[str]):
+    encoder_input_features = None
+    encoder_input_ids = None
+    if 'whisper' in model_name.lower():
+        tllm_path = dirname(dirname(abspath(__file__)))
+        sys.path.insert(0, tllm_path)
+
+        from examples.whisper.whisper_utils import \
+            log_mel_spectrogram  # cannot directly import whisper due to name collision
+
+        config_path = os.path.join(engine_dir, 'encoder', 'config.json')
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        n_mels = config['pretrained_config']['n_mels']
+        dtype = config['pretrained_config']['dtype']
+
+        # download mel filters file
+        subprocess.run([
+            "wget", "-nc", f"--directory-prefix={engine_dir}",
+            "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
+        ],
+                       check=True)
+
+        mel, total_duration = log_mel_spectrogram(multimodal_input_file,
+                                                  n_mels,
+                                                  return_duration=True,
+                                                  mel_filters_dir=engine_dir)
+        mel = mel.type(str_dtype_to_torch(dtype))  # [featureDim, seqLen]
+        decoder_input_ids = batch_input_ids
+        encoder_input_features = [torch.einsum('DL->LD', mel)]
+        encoder_output_lengths = [encoder_input_features[0].shape[0] // 2]
+    else:
+        encoder_input_ids = batch_input_ids
+        decoder_start_token_id = read_decoder_start_token_id(
+            os.path.join(engine_dir, "decoder"))
+        decoder_input_ids = [
+            torch.tensor([decoder_start_token_id], dtype=torch.int32)
+            for _ in batch_input_ids
+        ]
+        encoder_output_lengths = None
+    return encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids
+
+
 def add_common_args(parser):
     # sampling arguments
     parser.add_argument('--num_beams',
                         type=int,
                         help="Use beam search if num_beams > 1",
+                        default=1)
+    parser.add_argument('--num_return_sequences',
+                        type=int,
+                        help="Number of sequences to generate for each input.",
                         default=1)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=1)
@@ -218,12 +273,16 @@ def add_common_args(parser):
         '--max_attention_window_size',
         type=int,
         default=None,
+        nargs="+",
         help=
         'The attention window size that controls the sliding window attention / cyclic kv cache behavior'
     )
     parser.add_argument(
         '--multi_block_mode',
-        action='store_true',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
@@ -288,7 +347,14 @@ def add_common_args(parser):
         help="Medusa choice to use, if not none, will use Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
-
+    parser.add_argument(
+        '--lookahead_config',
+        type=str,
+        default=None,
+        help=
+        "executor and request lookahead config to use, if not none, will use lookahead decoding."
+        "   E.g.: [5, 6, 7] for [max_window_size, max_ngram_size, max_verification_set_size]."
+    )
     # model arguments
     parser.add_argument('--engine_dir', type=str, default='engine_outputs')
     parser.add_argument(

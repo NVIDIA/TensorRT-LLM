@@ -620,8 +620,10 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
+    size_t const fmha_bmm1_scale_size = mFP8ContextFMHA ? sizeof(float) * 2 : 0;
+    size_t const fmha_bmm2_scale_size = mFP8ContextFMHA ? sizeof(float) : 0;
 
-    int const NUM_BUFFERS = 16;
+    int const NUM_BUFFERS = 18;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -639,6 +641,8 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForContext(nvinfer1::DataType t
     workspaces[13] = padding_offset_size;
     workspaces[14] = encoder_padding_offset_size;
     workspaces[15] = fmha_scheduler_counter;
+    workspaces[16] = fmha_bmm1_scale_size;
+    workspaces[17] = fmha_bmm2_scale_size;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     return context_workspace_size;
@@ -719,20 +723,23 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     KVBlockArray::DataType* hostKvCacheBlockOffsets = nullptr;
-    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+    if (useKVCache())
     {
-        kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
-            params.cyclic_attention_window_size, params.sink_token_length, params.host_primary_pool_pointer,
-            params.host_secondary_pool_pointer, params.block_offsets);
-        hostKvCacheBlockOffsets = params.host_block_offsets;
-    }
-    else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
-    {
-        using BufferDataType = typename KVCacheBuffer::DataType;
-        kv_cache_buffer = KVLinearBuffer(params.batch_size,
-            isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
-            params.cyclic_attention_window_size, params.sink_token_length, false,
-            reinterpret_cast<BufferDataType*>(params.key_value_cache));
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        {
+            kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
+                sizePerToken, params.cyclic_attention_window_size, params.sink_token_length,
+                params.host_primary_pool_pointer, params.host_secondary_pool_pointer, params.block_offsets);
+            hostKvCacheBlockOffsets = params.host_block_offsets;
+        }
+        else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
+        {
+            using BufferDataType = typename KVCacheBuffer::DataType;
+            kv_cache_buffer = KVLinearBuffer(params.batch_size,
+                isCrossAttention() ? params.cross_qkv_length : params.max_attention_window, sizePerToken,
+                params.cyclic_attention_window_size, params.sink_token_length, false,
+                reinterpret_cast<BufferDataType*>(params.key_value_cache));
+        }
     }
 
     auto const quant_option = tc::QuantMode::fromDescription();
@@ -799,6 +806,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     size_t const encoder_padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.cross_qkv_length;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
+    size_t const fmha_bmm1_scale_size = mFP8ContextFMHA ? sizeof(float) * 2 : 0;
+    size_t const fmha_bmm2_scale_size = mFP8ContextFMHA ? sizeof(float) : 0;
 
     bool const is_qk_buf_float_ = true;
 
@@ -828,6 +837,10 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
         : reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, encoder_padding_offset_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
+    float* fmha_bmm1_scale_ptr
+        = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_bmm1_scale_size));
+    float* fmha_bmm2_scale_ptr
+        = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_bmm2_scale_size));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     // Note: self attn and cross attn should use different params
@@ -849,13 +862,17 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
     decoder_params.maxQSeqLength = params.input_seq_length;
     decoder_params.maxEncoderQSeqLength
         = isCrossAttention() ? params.cross_qkv_length : 0; // cross attention uses encoder seq length
-    decoder_params.removePadding = mRemovePadding;
     decoder_params.attentionWindowSize = params.cyclic_attention_window_size;
     decoder_params.sinkTokenLength = params.sink_token_length;
     decoder_params.numTokens = params.num_tokens;
     decoder_params.attentionMaskType = mMaskType;
     decoder_params.blockSparseParams = mBlockSparseParams;
     decoder_params.fmhaTileCounter = fmha_tile_counter_ptr;
+    decoder_params.quantScaleO = params.attention_output_orig_quant;
+    decoder_params.dequantScaleQkv = params.kv_scale_quant_orig;
+    decoder_params.fmhaHostBmm1Scale = 1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling);
+    decoder_params.fmhaBmm1Scale = fmha_bmm1_scale_ptr;
+    decoder_params.fmhaBmm2Scale = fmha_bmm2_scale_ptr;
     // Rotary embedding inv_freq buffer.
     decoder_params.rotaryEmbeddingScale = mRotaryEmbeddingScale;
     decoder_params.rotaryEmbeddingBase = mRotaryEmbeddingBase;
@@ -895,6 +912,12 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
         cudaMemcpyAsync(attention_mask, h_attention_mask.data(),
             sizeof(T) * params.batch_size * params.cross_qkv_length * params.input_seq_length, cudaMemcpyHostToDevice,
             stream);
+    }
+
+    // FIXME: a temporary solution to make sure the padding part is 0.
+    if (!mRemovePadding)
+    {
+        cudaMemsetAsync(params.context_buf, 0, params.num_tokens * local_hidden_units_qo * sizeof(T), stream);
     }
 
     KvCacheDataType const cache_type = mKVCacheQuantMode.hasInt8KvCache()
@@ -950,6 +973,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
         preprocessingParams.cyclic_kv_cache_len = params.cyclic_attention_window_size;
         preprocessingParams.sink_token_len = params.sink_token_length;
         preprocessingParams.token_num = params.num_tokens;
+        preprocessingParams.remove_padding = mRemovePadding;
         preprocessingParams.head_num = mNumHeads;
         preprocessingParams.kv_head_num = mNumKVHeads;
         preprocessingParams.qheads_per_kv_head = mNumHeads / mNumKVHeads;
@@ -1029,7 +1053,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
         fmhaParams.cuKvSeqLenPtr = cu_kv_seqlens;
         fmhaParams.cuMaskRowsPtr = cu_mask_rows;
         fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
-        fmhaParams.scaleBmm2Ptr = params.attention_output_orig_quant;
+        fmhaParams.scaleBmm1Ptr = fmha_bmm1_scale_ptr;
+        fmhaParams.scaleBmm2Ptr = fmha_bmm2_scale_ptr;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
 
@@ -1459,7 +1484,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(
 
     // Apply position embedding to the keys in the K cache
     KVLinearBuffer shift_k_cache_buffer;
-    if (mPosShiftEnabled && !isCrossAttention())
+    if (useKVCache() && mPosShiftEnabled && !isCrossAttention())
     {
         shift_k_cache_buffer
             = KVLinearBuffer(batch_beam, params.max_attention_window, sizePerToken, params.cyclic_attention_window_size,

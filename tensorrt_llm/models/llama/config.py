@@ -83,6 +83,8 @@ class LLaMAConfig(PretrainedConfig):
             **kwargs):
         import transformers
 
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
+
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
@@ -97,7 +99,7 @@ class LLaMAConfig(PretrainedConfig):
                     LlavaLlamaConfig, LlavaLlamaModel)
 
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
             if hf_config.model_type == "llava":
                 # LLaVA = Vision model + Llama LLM
                 # We load a llava config and use its' text config as llama config

@@ -195,6 +195,7 @@ loader = ModelWeightsLoader(external_checkpoint_dir, llava_dict)
 loader.generate_tllm_weights(trtllm_model)
 ```
 Users need to specify the different part from the default `tllm_to_externel_key_dict`. The loader still have support across different precisions.
+The support for LLaVA and Exaone is in `LLaMAForCausalLM.from_hugging_face()` of [model.py](../../../tensorrt_llm/models/llama/model.py), and can also be taken as examples.
 
 ### Models with customized weight layout
 For models with different weight layout, users can write the conversion loop explicitly and do customized operations.
@@ -225,9 +226,10 @@ for tllm_key, _ in tqdm(trtllm_model.named_parameters()):
         tllm_weights.update(loader.load(tllm_key, preprocess=customized_preprocess))
     else:
         tllm_weights.update(loader.load(tllm_key))
-loader.check(tllm_weights)
+loader.fill(tllm_weights)
 ```
 This will apply `preprocess` after `load_tensor()` and before `postprocess`, and demonstrates how to convert the loaded shard into default HF layout. The loader still have support for precisions quantized from FP16/BF16 (e.g. INT8-wo/INT4-wo), the other precisions may require special operations, and can be addressed inside the `preprocess` function.
+The support for Qwen-1 is in `QWenForCausalLM.from_hugging_face()` of [model.py](../../../tensorrt_llm/models/qwen/model.py), and can also be taken as example.
 
 ### Fully customized
 If the model weights loader cannot satisfy the requirements, users can write the conversion loop totally on their own.
@@ -247,8 +249,8 @@ for tllm_key, param in tqdm(trtllm_model.named_parameters()):
 In this mode, every precision require user's own support.
 
 ## Trouble shooting
-The weights loader is an experimental feature fow now, and is enabled for LLaMA family models by default.
+The weights loader is an experimental feature for now, and is enabled for LLaMA family models and Qwen models by default.
 
 If users are encountered with failure caused by `ModelWeightsLoader`, a workaround is passing environmental variable `TRTLLM_DISABLE_UNIFIED_CONVERTER=1` to disable the model weights loader and fallback to the legacy path.
 
-This workaround will be removed in future version after the LLaMA weights conversion is stable.
+This workaround will be removed in future version after the LLaMA/Qwen weights conversion is stable.

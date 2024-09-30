@@ -64,9 +64,6 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
     std::copy(std::prev(promptRange.end(), mN - 1), promptRange.end(), goldRange.begin());
     mGuessTokens = ITensor::slice(mGuessTokensMax, 0, 0);
     mFilling = (mN - 1) > 0 ? 1 : 0;
-    PRINT_TOKENS(prompt);
-    PRINT_TOKENS(mPrefills);
-    PRINT_TOKENS(mPastTokens);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -271,10 +268,10 @@ void LookaheadAlgorithm::verify(TensorPtr const& accepted, TensorPtr const& acce
 
     BufferRange<SizeType32> acceptedOffsetsRange(*acceptedOffsets);
     auto lookSize = 1 + mN - 2 - mFilling + mFilling * mW;
-    acceptedOffsetsRange[0] = 0;
+    // acceptedOffsetsRange[0] = 0;
     for (SizeType32 i = 0; i < maxHit; i++)
     {
-        acceptedOffsetsRange[1 + i] = lookSize + hitIdx * (mN - 1) + i;
+        acceptedOffsetsRange[i] = lookSize + hitIdx * (mN - 1) + i - 1;
     }
 
     *BufferRange<SizeType32>(*acceptedLength).begin() = maxHit + 1;

@@ -3694,7 +3694,7 @@ inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, T const* pointer, int
 }
 
 template <typename Vec_k, typename T, typename T_scale>
-inline __device__ void store_8bits_kv_cache_vec(T* pointer, Vec_k const& vec, int idx, T_scale scale)
+inline __device__ void store_8bits_vec(T* pointer, Vec_k const& vec, int idx, T_scale scale)
 {
     assert(false); // Not used.
 }
@@ -3733,7 +3733,7 @@ inline __device__ void load_8bits_kv_cache_vec(Vec_k* vec, __nv_fp8_e4m3 const* 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Vec_k>
-inline __device__ void store_8bits_kv_cache_vec(int8_t* pointer, Vec_k const& vec, int idx, float scale)
+inline __device__ void store_8bits_vec(int8_t* pointer, Vec_k const& vec, int idx, float scale)
 {
     using Packed_8bits_t = typename packed_type<int8_t, num_elems<Vec_k>::value>::type;
     using Packed_Float_t = typename packed_type<float, num_elems<Vec_k>::value>::type;
@@ -3746,7 +3746,7 @@ inline __device__ void store_8bits_kv_cache_vec(int8_t* pointer, Vec_k const& ve
 
 #ifdef ENABLE_FP8
 template <typename Vec_k, typename T_scale>
-inline __device__ void store_8bits_kv_cache_vec(__nv_fp8_e4m3* pointer, Vec_k const& vec, int idx, T_scale scale)
+inline __device__ void store_8bits_vec(__nv_fp8_e4m3* pointer, Vec_k const& vec, int idx, T_scale scale)
 {
     using Packed_8bits_t = typename packed_type<__nv_fp8_e4m3, num_elems<Vec_k>::value>::type;
     Packed_8bits_t out_quant;

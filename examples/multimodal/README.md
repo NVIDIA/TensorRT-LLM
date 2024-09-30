@@ -160,7 +160,7 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
 
 ## CogVLM
 
-Currently, CogVLM only support bfloat16 precision and doesn't support `remove_input_padding` feature.
+Currently, CogVLM only support bfloat16 precision.
 
 1. Download Huggingface weights
 
@@ -188,11 +188,11 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu \
     --gemm_plugin bfloat16 \
     --gpt_attention_plugin bfloat16 \
-    --remove_input_padding disable \
+    --remove_input_padding enable \
     --max_batch_size 48 \
     --max_input_len 2048 \
     --max_seq_len 3076 \
-    --paged_kv_cache disable \
+    --paged_kv_cache enable \
     --enable_xqa disable \
     --bert_attention_plugin disable \
     --moe_plugin disable \
@@ -216,6 +216,8 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --temperature 0.2 \
     --repetition_penalty 1.2 \
     --enable_context_fmha_fp32_acc
+
+    CogVLM uses model_runner_cpp by default. To switch to model_runner, set `--use_py_session` in the command mentioned above.
     ```
 
 ## Deplot
@@ -300,7 +302,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --gemm_plugin float16 \
-        --use_fused_mlp \
+        --use_fused_mlp=enable \
         --max_batch_size 1 \
         --max_input_len 2048 \
         --max_seq_len 2560 \
@@ -405,7 +407,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --gemm_plugin float16 \
-        --use_fused_mlp \
+        --use_fused_mlp=enable \
         --max_batch_size 1 \
         --max_input_len 2048 \
         --max_seq_len 2560 \
@@ -417,7 +419,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --gpt_attention_plugin float16 \
         --gemm_plugin float16 \
-        --use_fused_mlp \
+        --use_fused_mlp=enable \
         --max_batch_size 1 \
         --max_input_len 4096 \
         --max_seq_len 5120 \
@@ -427,9 +429,9 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     # for VILA
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
-        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --gemm_plugin float16 \
-        --use_fused_mlp \
+        --use_fused_mlp=enable \
         --max_batch_size 1 \
         --max_input_len 2048 \
         --max_seq_len 2560 \
@@ -458,7 +460,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     For VILA, you can use either local file or web url as input images.
     Suppose you have a local image `av.png` downloaded from `https://github.com/Efficient-Large-Model/VILA/blob/main/demo_trt_llm/av.png` and the url of `merlion.png`
     ```bash
-    wget -O av.png https://raw.githubusercontent.com/Efficient-Large-Model/VILA/main/demo_trt_llm/av.png
+    wget -O av.png https://raw.githubusercontent.com/Efficient-Large-Model/VILA/main/demo_images/av.png
 
     python run.py  \
         --max_new_tokens 100 \
@@ -507,7 +509,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --calib_size 32
    ```
 
-   Then follow the same `trtllm-build` and `run.py` steps as before. NOTE: for `trtllm-build` command, do not use `--use_fused_mlp` in these quantization modes.
+   Then follow the same `trtllm-build` and `run.py` steps as before. NOTE: for `trtllm-build` command, do not use `--use_fused_mlp=enable` in these quantization modes.
 
 ## NeVA
 

@@ -15,6 +15,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import tensorrt_llm
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
+                                               split_matrix_tp)
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -486,31 +488,6 @@ def split_qkv_weight(weight: torch.Tensor,
         return weight[rank, ...].clone().contiguous()
     else:
         return weight[rank, ...].ravel().clone().contiguous()
-
-
-def split(v, tp_size, idx, dim=0):
-    if tp_size == 1:
-        return v
-    if len(v.shape) == 1:
-        return torch.chunk(v, tp_size)[idx].contiguous()
-    else:
-        return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
-
-
-def split_matrix_tp(v, tensor_parallel, rank, dim):
-    return split(v, tensor_parallel, rank, dim=dim)
-
-
-def get_weight(config, prefix, dtype):
-    return config[prefix + '.weight'].to(dtype).detach()
-
-
-def get_bias(config, prefix, dtype):
-    return config[prefix + '.bias'].to(dtype).detach()
-
-
-def get_weight_and_bias(config, prefix, dtype):
-    return get_weight(config, prefix, dtype), get_bias(config, prefix, dtype)
 
 
 def get_tllm_linear_weight(weight,

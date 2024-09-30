@@ -125,7 +125,7 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
         { // Generation phase
             if (beamWidth > 1)
             {
-                auto parentBeam = parentIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 2];
+                auto parentBeam = parentIdsPtr[batchSlot][beamIdx * maxSeqLen + currentStep - 1];
                 penaltyWorkspacePrev += ((batchIdx * beamWidth + parentBeam) * maxTokensPerStep + stepIdx) * vocabSize;
                 for (auto index = static_cast<SizeType32>(threadIdx.x); index < vocabSize;
                      index += static_cast<SizeType32>(blockDim.x))
@@ -187,6 +187,15 @@ __global__ void batchApplyPenalty(T const* const* inputLogits, T* outputLogits, 
                         logit -= frequencyPenalty * numOccurences;
                     }
                 }
+            }
+            // do clamp to prevent overflow
+            if (logit > static_cast<float>(-MASK_VAL))
+            {
+                logit = static_cast<float>(-MASK_VAL);
+            }
+            else if (logit < static_cast<float>(MASK_VAL))
+            {
+                logit = static_cast<float>(MASK_VAL);
             }
             outLogitsPtr[index] = logit;
         }

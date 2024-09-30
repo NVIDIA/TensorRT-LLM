@@ -67,6 +67,12 @@ It is possible to build engines with tensor and pipeline parallelism for LLaMA u
 PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
 ```
 
+If there is an issue finding model_spec.so in engine building, manually build model_spec.so by
+
+```bash
+make -C cpp/build/ modelSpec
+```
+
 #### Generate expected output
 
 End-to-end tests read inputs and expected outputs from Numpy files located at [cpp/tests/resources/data](resources/data). The expected outputs can be generated using [scripts](resources/scripts) which employ the Python runtime to run the built engines:

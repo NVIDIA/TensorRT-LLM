@@ -72,8 +72,7 @@ def test_save_load():
                 tokenizer.encode(inp) for inp in batch_input_text
             ]
             outputs = executor.generate(
-                batch_input_ids,
-                sampling_params=SamplingParams(max_new_tokens=10))
+                batch_input_ids, sampling_params=SamplingParams(max_tokens=10))
 
             for idx, output in enumerate(outputs):
                 tensorrt_llm.logger.info(f"Input: {batch_input_text[idx]}")
@@ -129,7 +128,7 @@ def test_async_io():
             async def generate_and_print(idx, inp):
                 result = async_engine.generate_async(
                     tokenizer.encode(inp),
-                    sampling_params=SamplingParams(max_new_tokens=10),
+                    sampling_params=SamplingParams(max_tokens=10),
                     streaming=False)
                 await result.aresult()
                 output_text = tokenizer.decode(result.outputs[0].token_ids)
@@ -138,7 +137,7 @@ def test_async_io():
 
                 async for stream in async_engine.generate_async(
                         tokenizer.encode(inp),
-                        sampling_params=SamplingParams(max_new_tokens=10),
+                        sampling_params=SamplingParams(max_tokens=10),
                         streaming=True):
                     output_text = tokenizer.decode(stream.outputs[0].token_ids)
                     tensorrt_llm.logger.info(

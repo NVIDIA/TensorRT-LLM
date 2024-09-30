@@ -26,15 +26,11 @@ class CogVLMConfig(PretrainedConfig):
                  attn_bias: bool = False,
                  rotary_base: float = 10000.0,
                  rotary_scaling: Optional[dict] = None,
-                 vision_start: int = 1,
-                 vision_length: int = 1225,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
         self.rotary_base = rotary_base
         self.rotary_scaling = rotary_scaling
-        self.vision_start = vision_start
-        self.vision_length = vision_length
         self.position_embedding_type = 'rope_gpt_neox'
         super().__init__(**kwargs)
 
@@ -45,6 +41,4 @@ class CogVLMConfig(PretrainedConfig):
         output['attn_bias'] = self.attn_bias
         output['rotary_base'] = self.rotary_base
         output['rotary_scaling'] = self.rotary_scaling
-        output['vision_start'] = self.vision_start
-        output['vision_length'] = self.vision_length
         return output

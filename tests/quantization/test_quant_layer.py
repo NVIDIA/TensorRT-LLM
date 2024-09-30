@@ -441,6 +441,7 @@ class TestSmoothQuant(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         network = builder.create_network()
         # Allow SQ plugin of dtype type
         network.plugin_config.smooth_quant_gemm_plugin = dtype

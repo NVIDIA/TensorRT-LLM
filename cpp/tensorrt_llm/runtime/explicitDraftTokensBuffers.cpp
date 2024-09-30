@@ -306,6 +306,10 @@ void ExplicitDraftTokensBuffers::setFromInputs(SizeType32 numCtxSequences, SizeT
         setFromInputs<half>(numCtxSequences, numGenSequences, vocabSizePadded, seqSlots, draftBuffers,
             contextPositionIds, *explicitDraftTokensModule, stream);
         break;
+    case nvinfer1::DataType::kBF16:
+        setFromInputs<__nv_bfloat16>(numCtxSequences, numGenSequences, vocabSizePadded, seqSlots, draftBuffers,
+            contextPositionIds, *explicitDraftTokensModule, stream);
+        break;
     default:
         TLLM_THROW("DataType %d not supported in ExplicitDraftTokensBuffers", static_cast<SizeType32>(dtype));
         break;

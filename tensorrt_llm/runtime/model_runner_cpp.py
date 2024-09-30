@@ -19,14 +19,17 @@ from typing import List, Optional, Union
 
 import torch
 
-import tensorrt_llm.bindings.executor as trtllm
-
 from .. import profiler
-from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
+from .._utils import mpi_broadcast
+from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
+                        WorldConfig)
+from ..bindings import executor as trtllm
+from ..builder import EngineConfig
 from ..logger import logger
 from ..mapping import Mapping
-from .generation import LogitsProcessor, SamplingConfig, StoppingCriteria
-from .model_runner import ModelRunnerMixin
+from .generation import (LogitsProcessor, LoraManager, SamplingConfig,
+                         StoppingCriteria)
+from .model_runner import ModelRunnerMixin, _engine_config_to_model_config
 
 _bindings_dtype_to_torch_dtype_dict = {
     DataType.FLOAT: torch.float,
@@ -45,22 +48,30 @@ class ModelRunnerCpp(ModelRunnerMixin):
     An interface class that wraps Executor and provides generation methods.
     """
 
-    def __init__(self, executor: trtllm.Executor, max_batch_size: int,
-                 max_input_len: int, max_seq_len: int, max_beam_width: int,
-                 model_config: ModelConfig, world_config: WorldConfig) -> None:
+    def __init__(self,
+                 executor: trtllm.Executor,
+                 max_batch_size: int,
+                 max_input_len: int,
+                 max_seq_len: int,
+                 max_beam_width: int,
+                 model_config: ModelConfig,
+                 world_config: WorldConfig,
+                 use_kv_cache: bool,
+                 lora_manager: Optional[LoraManager] = None) -> None:
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.model_config = model_config
-        self.mapping = Mapping(world_size=world_config.tensor_parallelism *
-                               world_config.pipeline_parallelism,
+        self.mapping = Mapping(world_size=world_config.size,
                                rank=world_config.rank,
                                gpus_per_node=world_config.gpus_per_node,
                                tp_size=world_config.tensor_parallelism,
                                pp_size=world_config.pipeline_parallelism)
         self.world_config = world_config
+        self.use_kv_cache = use_kv_cache
+        self.lora_manager = lora_manager
 
     @classmethod
     def from_dir(
@@ -73,10 +84,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         max_input_len: Optional[int] = None,
         max_output_len: Optional[int] = None,
         max_beam_width: Optional[int] = None,
-        max_attention_window_size: Optional[int] = None,
+        max_attention_window_size: Optional[list[int]] = None,
         sink_token_length: Optional[int] = None,
         kv_cache_free_gpu_memory_fraction: Optional[float] = None,
         medusa_choices: list[list[int]] | None = None,
+        lookahead_config: list[int] | None = None,
         debug_mode: bool = False,
         lora_ckpt_source: str = "hf",
         gpu_weights_percent: float = 1,
@@ -84,7 +96,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         kv_cache_enable_block_reuse: bool = False,
         enable_chunked_context: bool = False,
         is_enc_dec: bool = False,
-        multi_block_mode: Optional[bool] = None,
+        multi_block_mode: bool = True,
         enable_context_fmha_fp32_acc: Optional[bool] = None
     ) -> 'ModelRunnerCpp':
         """
@@ -113,7 +125,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The runtime beam width limit. If max_beam_width is not None, it should not
                 be larger than the engine's max_beam_width; otherwise, the engine's max_beam_width
                 will be used.
-            max_attention_window_size (int):
+            max_attention_window_size (List[int]):
                 The attention window size that controls the sliding window attention / cyclic kv cache behavior.
             sink_token_length (int) :
                 The sink token length, default=0.
@@ -154,6 +166,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
             decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
             decoder_model_config = decoder_json_config.model_config
+            use_kv_cache = decoder_model_config.kv_cache_type != KVCacheType.DISABLED
+
+            if not use_kv_cache:
+                assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
             tp_size = decoder_json_config.tensor_parallelism
             pp_size = decoder_json_config.pipeline_parallelism
@@ -192,11 +208,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                        max_seq_len=max_input_len + max_output_len,
                        max_beam_width=max_beam_width,
                        model_config=decoder_model_config,
-                       world_config=world_config)
+                       world_config=world_config,
+                       use_kv_cache=use_kv_cache)
 
         config_path = Path(engine_dir) / "config.json"
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
+        use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
+
+        if not use_kv_cache:
+            assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
         # Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor
         # by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and
@@ -208,6 +229,48 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                        pipeline_parallelism=pp_size,
                                        gpus_per_node=gpus_per_node)
         assert rank == world_config.rank
+
+        if model_config.use_lora_plugin and rank == 0:
+            engine_config = EngineConfig.from_json_file(
+                f"{engine_dir}/config.json")
+            lora_manager = LoraManager()
+            if lora_dir is None:
+                config_lora_dir = engine_config.build_config.lora_config.lora_dir
+                if len(config_lora_dir) > 0:
+                    lora_dir = [
+                        f"{engine_dir}/{dir}" for dir in config_lora_dir
+                    ]
+                    lora_ckpt_source = engine_config.build_config.lora_config.lora_ckpt_source
+
+            if lora_dir is not None:
+                runtime_model_config = _engine_config_to_model_config(
+                    engine_config, gpu_weights_percent=gpu_weights_percent)
+                # For Executor, only rank 0 can enqueue requests, and should hold all lora weights
+                lora_manager.load_from_ckpt(lora_dir,
+                                            model_config=runtime_model_config,
+                                            runtime_mapping=None,
+                                            ckpt_source=lora_ckpt_source)
+            else:
+                raise RuntimeError(
+                    f"LoRA weights are unspecified and also unavailable in the engine_dir ({engine_dir})."
+                )
+
+            max_lora_rank = engine_config.build_config.lora_config.max_lora_rank
+            num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
+                len(lora_manager.lora_target_modules + lora_manager.missing_qkv_modules)
+            num_lora_adapters = min(lora_manager.num_lora_adapters, 8)
+            peft_cache_config = trtllm.PeftCacheConfig(
+                num_device_module_layer=max_lora_rank * num_lora_modules *
+                num_lora_adapters,
+                num_host_module_layer=max_lora_rank * num_lora_modules *
+                num_lora_adapters,
+            )
+        else:
+            lora_manager = None
+            peft_cache_config = trtllm.PeftCacheConfig()
+
+        if world_config.size > 1:
+            peft_cache_config = mpi_broadcast(peft_cache_config, 0)
 
         profiler.start('load tensorrt_llm engine')
 
@@ -223,6 +286,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config.medusa_choices = medusa_choices
             if multi_block_mode is not None:
                 multi_block_mode = False  # Medusa doesn't support multi-block mode.
+
+        if lookahead_config is not None:
+            [w, n, g] = lookahead_config
+            decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
+                w, n, g)
 
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
@@ -244,10 +312,24 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             assert max_beam_width <= model_config.max_beam_width
 
+        debug_config = None
+        if debug_mode:
+            # To debug specific tensors, add tensor names in the following list
+            #   if none provided, all input and output tensors will be dumped
+            #   if not none, it will disable all input/output dump
+            debug_tensor_names: List[str] = [
+            ]  # modify this list for specific tensor dump
+            debug_config = trtllm.DebugConfig(
+                dump_input_tensors=True,
+                dump_output_tensors=True,
+                debug_tensor_names=debug_tensor_names)
+
         trtllm_config = trtllm.ExecutorConfig(
             max_beam_width=max_beam_width,
             kv_cache_config=kv_cache_config,
             decoding_config=decoding_config,
+            peft_cache_config=peft_cache_config,
+            debug_config=debug_config,
             gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
@@ -266,7 +348,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                    max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    model_config=model_config,
-                   world_config=world_config)
+                   world_config=world_config,
+                   use_kv_cache=use_kv_cache,
+                   lora_manager=lora_manager)
 
     def _check_inputs(self, batch_input_ids: List[List[int]],
                       sampling_config: trtllm.SamplingConfig, max_new_tokens):
@@ -336,28 +420,35 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def gather_generation_logits(self) -> bool:
         return self.model_config.compute_generation_logits
 
-    def generate(self,
-                 batch_input_ids: List[torch.Tensor],
-                 *,
-                 encoder_input_ids: List[torch.Tensor] = None,
-                 sampling_config: Optional[SamplingConfig] = None,
-                 lora_uids: Optional[list] = None,
-                 streaming: bool = False,
-                 stopping_criteria: Optional[StoppingCriteria] = None,
-                 logits_processor: Optional[LogitsProcessor] = None,
-                 max_new_tokens: int = 1,
-                 end_id: int | None = None,
-                 pad_id: int | None = None,
-                 bad_words_list: list[list[int]] | None = None,
-                 stop_words_list: list[list[int]] | None = None,
-                 return_dict: bool = False,
-                 output_sequence_lengths: bool = False,
-                 output_log_probs: bool = False,
-                 output_cum_log_probs: bool = False,
-                 prompt_table: Optional[Union[str, torch.Tensor]] = None,
-                 prompt_tasks: Optional[str] = None,
-                 return_all_generated_tokens: bool = False,
-                 **kwargs) -> Union[torch.Tensor, dict]:
+    def generate(
+            self,
+            batch_input_ids: List[torch.Tensor],
+            *,
+            position_ids: List[torch.Tensor] = None,
+            encoder_input_ids: List[torch.Tensor] = None,
+            encoder_input_features: List[
+                torch.Tensor] = None,  # TODO: add to doc string
+            encoder_output_lengths: List[int] = None,
+            sampling_config: Optional[SamplingConfig] = None,
+            lora_uids: Optional[list] = None,
+            lookahead_config: list[int] | None = None,
+            streaming: bool = False,
+            stopping_criteria: Optional[StoppingCriteria] = None,
+            logits_processor: Optional[LogitsProcessor] = None,
+            max_new_tokens: int = 1,
+            num_return_sequences: int = 1,
+            end_id: int | None = None,
+            pad_id: int | None = None,
+            bad_words_list: list[list[int]] | None = None,
+            stop_words_list: list[list[int]] | None = None,
+            return_dict: bool = False,
+            output_sequence_lengths: bool = False,
+            output_log_probs: bool = False,
+            output_cum_log_probs: bool = False,
+            prompt_table: Optional[Union[str, torch.Tensor]] = None,
+            prompt_tasks: Optional[str] = None,
+            return_all_generated_tokens: bool = False,
+            **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
         The generation-controlling parameters are set in the sampling_config; it will be set to a default one if not passed.
@@ -366,6 +457,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
         Args:
             batch_input_ids (List[torch.Tensor]):
                 A list of input id tensors. Each tensor is of shape (sequence_length, ).
+            position_ids (List[torch.Tensor]):
+                A list of position id tensors. Each tensor is of shape (sequence_length, ).
+            encoder_input_ids (List[torch.Tensor]):
+                A list of encoder input id tensors for encoder-decoder models (optional). Each tensor is of shape (sequence_length, ).
+            encoder_input_features: (List[torch.Tensor]):
+                A list of encoder input feature tensors for multimodal encoder-decoder models (optional). Each tensor is of shape (sequence_length, feature_dim).
+            encoder_output_lengths: (List[int]):
+                A list of encoder output lengths (optional) if encoder output has different length from encoder input (due to convolution down-sampling, etc.)
             sampling_config (SamplingConfig):
                 The sampling configuration to be used as base parametrization for the generation call.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -384,6 +483,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Custom logits processors.
             return_all_generated_tokens (bool):
                 Whether the full output is returned at each streaming step
+            num_return_sequences (int):
+                The number of sequences to generate for each input. It will
+                return (batch_size * num_return_sequences) sequences in total.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -396,14 +498,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 self.gather_generation_logits=True, respectively).
         """
         # TODO: Check if these can be supported now and support them
-        if lora_uids is not None:
-            raise RuntimeError("LoRA is not supported in C++ session.")
         if stopping_criteria is not None:
             raise RuntimeError(
                 "Stopping criteria is not supported in C++ session.")
         if logits_processor is not None:
             raise RuntimeError(
                 "Logits processor is not supported in C++ session.")
+
+        if not self.use_kv_cache and max_new_tokens > 1:
+            raise RuntimeError(
+                'Disabled KV cache is intended for context phase only now.')
 
         # If we are in a multi-gpu scenario, only rank 0 continues
         if not self.session.can_enqueue_requests():
@@ -419,12 +523,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
             # Note: Due to a Python3.10 bug one cannot use inspect on it currently
             accepted_parameters = [
                 "num_beams", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-                "top_p_decay", "random_seed", "temperature", "min_length",
+                "top_p_decay", "temperature", "min_tokens",
                 "beam_search_diversity_rate", "repetition_penalty",
                 "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping", "no_repeat_ngram_size"
+                "early_stopping", "no_repeat_ngram_size", "random_seed"
             ]
-            rename_params = {"num_beams": "beam_width"}
+            rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
             sampling_params = {
                 k: v
                 for k, v in kwargs.items() if k in accepted_parameters
@@ -457,41 +561,56 @@ class ModelRunnerCpp(ModelRunnerMixin):
         bad_words_list = self._prepare_words_list(bad_words_list,
                                                   len(batch_input_ids_list))
 
+        lora_configs = self._prepare_lora_configs(lora_uids,
+                                                  len(batch_input_ids_list))
+        request_lookahead_config = None
+        if lookahead_config is not None:
+            [w, n, g] = lookahead_config
+            request_lookahead_config = trtllm.LookaheadDecodingConfig(w, n, g)
+
         requests = [
             trtllm.Request(
                 input_token_ids=input_ids,
                 encoder_input_token_ids=encoder_input_ids_list[i]
                 if encoder_input_ids is not None else None,
-                max_new_tokens=max_new_tokens,
+                encoder_output_length=encoder_output_lengths[i]
+                if encoder_output_lengths is not None else None,
+                encoder_input_features=encoder_input_features[i].contiguous()
+                if encoder_input_features is not None else None,
+                position_ids=position_ids[i].tolist()
+                if position_ids is not None else None,
+                max_tokens=max_new_tokens,
+                num_return_sequences=num_return_sequences,
                 pad_id=pad_id,
                 end_id=end_id,
                 stop_words=stop_words,
                 bad_words=bad_words,
                 sampling_config=sampling_config,
+                lookahead_config=request_lookahead_config,
                 streaming=streaming,
                 output_config=output_config,
                 prompt_tuning_config=prompt_tuning_config,
-                return_all_generated_tokens=return_all_generated_tokens)
-            for i, (input_ids, stop_words, bad_words,
-                    prompt_tuning_config) in enumerate(
-                        zip(batch_input_ids_list, stop_words_list,
-                            bad_words_list, prompt_tuning_configs))
+                lora_config=lora_config,
+                return_all_generated_tokens=return_all_generated_tokens) for i,
+            (input_ids, stop_words, bad_words, prompt_tuning_config,
+             lora_config) in enumerate(
+                 zip(batch_input_ids_list, stop_words_list, bad_words_list,
+                     prompt_tuning_configs, lora_configs))
         ]
 
         request_ids = self.session.enqueue_requests(requests)
         if not streaming:
-            return self._initialize_and_fill_output(request_ids, end_id,
-                                                    return_dict,
-                                                    output_sequence_lengths,
-                                                    output_log_probs,
-                                                    output_cum_log_probs,
-                                                    batch_input_ids, streaming)
+            return self._initialize_and_fill_output(
+                request_ids, end_id, return_dict, output_sequence_lengths,
+                output_log_probs, output_cum_log_probs, batch_input_ids,
+                streaming, max_new_tokens, num_return_sequences)
         else:
             return self._stream(request_ids, end_id, return_dict,
                                 output_sequence_lengths, output_log_probs,
                                 output_cum_log_probs, batch_input_ids,
                                 batch_input_ids_list, streaming,
-                                return_all_generated_tokens)
+                                return_all_generated_tokens, max_new_tokens,
+                                num_return_sequences)
 
     def _prepare_words_list(self, words_list: List[List[List[int]]],
                             batch_size: int):
@@ -522,13 +641,30 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 ]
         return prompt_tuning_configs
 
-    def _initialize_and_fill_output(self, request_ids, end_id, return_dict,
-                                    output_sequence_lengths, output_log_probs,
-                                    output_cum_log_probs, batch_input_ids,
-                                    streaming):
-        output_ids = [[] for _ in range(len(request_ids))]
-        for reqid_pos in range(len(request_ids)):
-            output_ids[reqid_pos] = [[] for _ in range(self.max_beam_width)]
+    def _prepare_lora_configs(self, lora_uids, batch_size):
+        if lora_uids is None:
+            return [None] * batch_size
+        assert len(lora_uids) == batch_size
+        return [
+            trtllm.LoraConfig(task_id=int(uid),
+                              weights=self.lora_manager.cpp_lora_weights[uid],
+                              config=self.lora_manager.cpp_lora_config[uid])
+            if int(uid) >= 0 else None for uid in lora_uids
+        ]
+
+    def _initialize_and_fill_output(self,
+                                    request_ids,
+                                    end_id,
+                                    return_dict,
+                                    output_sequence_lengths,
+                                    output_log_probs,
+                                    output_cum_log_probs,
+                                    batch_input_ids,
+                                    streaming,
+                                    max_new_tokens: int,
+                                    num_return_sequences: int = 1):
+        output_ids = [[[] for _ in range(self.max_beam_width)]
+                      for _ in range(len(request_ids) * num_return_sequences)]
 
         multi_responses = self.session.await_responses(request_ids)
         responses = [
@@ -538,121 +674,178 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return self._fill_output(responses, output_ids, end_id, return_dict,
                                  output_sequence_lengths, output_log_probs,
                                  output_cum_log_probs, batch_input_ids, [],
-                                 streaming, request_ids, False)
+                                 streaming, request_ids, False, max_new_tokens,
+                                 num_return_sequences)
 
-    def _stream(self, request_ids, end_id, return_dict, output_sequence_lengths,
-                output_log_probs, output_cum_log_probs, batch_input_ids,
-                batch_input_ids_list, streaming, return_all_generated_tokens):
-        output_ids = [[] for _ in range(len(request_ids))]
-        for reqid_pos in range(len(request_ids)):
+    def _stream(self,
+                request_ids,
+                end_id,
+                return_dict,
+                output_sequence_lengths,
+                output_log_probs,
+                output_cum_log_probs,
+                batch_input_ids,
+                batch_input_ids_list,
+                streaming,
+                return_all_generated_tokens,
+                max_new_tokens: int,
+                num_return_sequences: int = 1):
+
+        output_ids = [[]
+                      for _ in range(len(request_ids) * num_return_sequences)]
+        for reqid_pos in range(len(request_ids) * num_return_sequences):
+            batch_idx = reqid_pos // num_return_sequences
             output_ids[reqid_pos] = [
-                copy.deepcopy(batch_input_ids_list[reqid_pos])
+                copy.deepcopy(batch_input_ids_list[batch_idx])
                 for _ in range(self.max_beam_width)
             ]
 
-        finished_reqs = 0
-        while finished_reqs < len(request_ids):
+        finished_request_ids = set()
+        while finished_request_ids != set(request_ids):
             responses = self.session.await_responses()
-
             for response in responses:
                 if response.result.is_final:
-                    finished_reqs += 1
+                    finished_request_ids.add(response.request_id)
 
             yield self._fill_output(responses, output_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
                                     batch_input_ids_list, streaming,
-                                    request_ids, return_all_generated_tokens)
+                                    request_ids, return_all_generated_tokens,
+                                    max_new_tokens, num_return_sequences)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
                      output_cum_log_probs, batch_input_ids,
                      batch_input_ids_list, streaming, request_ids,
-                     return_all_generated_tokens):
+                     return_all_generated_tokens, max_new_tokens,
+                     num_return_sequences):
         cuda_device = torch.device("cuda")
+
+        # Total number of output sequences = batch_size * num_return_sequences.
+        batch_size = len(batch_input_ids)
+        num_output_sequences = len(output_ids)
+        num_beams = len(output_ids[0])
+        assert batch_size * num_return_sequences == num_output_sequences
+
+        def req_idx(response: trtllm.Response):
+            batch_idx = request_ids.index(response.request_id)
+            seq_idx = response.result.sequence_index
+            return batch_idx * num_return_sequences + seq_idx
 
         for response in responses:
             if response.has_error():
                 raise RuntimeError(response.error_msg)
 
-            reqid_pos = request_ids.index(response.request_id)
-            for beam, output_tokens in enumerate(
-                    response.result.output_token_ids):
-                if return_all_generated_tokens:
-                    output_ids[reqid_pos][
-                        beam] = batch_input_ids_list[reqid_pos] + output_tokens
-                else:
-                    output_ids[reqid_pos][beam] += output_tokens
+            result = response.result
+            batch_idx = request_ids.index(response.request_id)
 
-        sequence_lengths = []
-        for output in output_ids:
-            sequence_lengths.append([len(a) for a in output])
+            for beam, output_tokens in enumerate(result.output_token_ids):
+                # Return shape = (batch_size * num_return_seq, beam, seq_len)
+                if return_all_generated_tokens:
+                    output_ids[req_idx(response)][beam] = (
+                        batch_input_ids_list[batch_idx] + output_tokens)
+                else:
+                    output_ids[req_idx(response)][beam] += output_tokens
+
+        if output_sequence_lengths:
+            sequence_lengths = [[len(b) for b in beam] for beam in output_ids]
 
         if streaming:
             output_ids = copy.deepcopy(output_ids)
 
-        for beam in output_ids:
-            for output_tokens in beam:
-                output_tokens += (self.max_seq_len -
-                                  len(output_tokens)) * [end_id]
-
+        # Pad by end_id tokens (batch * n, num_beams, max_seq_len).
+        for beams in output_ids:
+            for token_ids in beams:
+                token_ids += [end_id] * (self.max_seq_len - len(token_ids))
         output_ids = torch.tensor(output_ids,
                                   dtype=torch.int32,
                                   device=cuda_device)
 
         if return_dict:
             outputs = {'output_ids': output_ids}
+
+            input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
+                                         dtype=torch.int32,
+                                         device=cuda_device)
+
             if output_sequence_lengths:
                 outputs['sequence_lengths'] = torch.tensor(sequence_lengths,
                                                            dtype=torch.int32,
                                                            device=cuda_device)
             if self.gather_context_logits:
-                outputs['context_logits'] = [
-                    a.result.context_logits.cuda() for a in responses
-                    if a.result.context_logits is not None
-                ]
-                # Pad context_logits into a rectangle
-                max_input_length = max(a.shape[0]
-                                       for a in outputs['context_logits'])
-                for i, a in enumerate(outputs['context_logits']):
-                    pad_length = max_input_length - a.shape[0]
-                    outputs['context_logits'][i] = torch.nn.functional.pad(
-                        a, [0, 0, 0, pad_length])
-                outputs['context_logits'] = torch.stack(
-                    outputs['context_logits'])
+                context_logits = None
+                max_input_len = input_lengths.max()
+                for response in responses:
+                    result = response.result
+                    logits = result.context_logits
+                    if logits is None:
+                        continue
+                    input_len, vocab_size = logits.shape
+                    if context_logits is None:
+                        context_logits = torch.zeros(
+                            (num_output_sequences, max_input_len, vocab_size),
+                            dtype=logits.dtype,
+                            device=cuda_device)
+                    context_logits[req_idx(response), :input_len, :] = logits
+                assert context_logits is not None
+                outputs['context_logits'] = context_logits
+
             if self.gather_generation_logits:
-                outputs['generation_logits'] = [
-                    a.result.generation_logits.cuda() for a in responses
-                    if a.result.generation_logits is not None
-                ]
-                outputs['generation_logits'] = torch.stack(
-                    outputs['generation_logits'])
+                if not streaming:
+                    gen_shape = (num_beams, max_new_tokens, vocab_size)
+                elif streaming and return_all_generated_tokens:
+                    gen_shape = (max_new_tokens, num_beams, vocab_size)
+                else:  # streaming and not return_all_generated_tokens
+                    gen_shape = (1, num_beams, vocab_size)
+
+                gen_logits = None
+                for response in responses:
+                    # gen logits shape: (beam, seq, vocab)
+                    logits = response.result.generation_logits
+                    if logits is None:
+                        continue
+                    num_beams, seq_len, vocab_size = logits.shape
+                    if gen_logits is None:
+                        gen_logits = torch.zeros(
+                            (num_output_sequences, *gen_shape),
+                            dtype=logits.dtype,
+                            device=cuda_device)
+                    batch_idx = request_ids.index(response.request_id)
+                    seq_idx = response.result.sequence_index
+                    reqid_pos = batch_idx * num_return_sequences + seq_idx
+                    if streaming:
+                        gen_logits[reqid_pos, :seq_len, ...] = logits[0]
+                    else:
+                        gen_logits[reqid_pos, :, :seq_len, ...] = logits[0]
+                outputs['generation_logits'] = gen_logits
+
             if output_log_probs:
-                outputs['log_probs'] = [
-                    a.result.log_probs for a in responses
-                    if a.result.log_probs is not None
-                ]
-                # Pad log_probs into a rectangle
-                max_seq_len = max(
-                    len(a) for beam_list in outputs['log_probs']
-                    for a in beam_list)
-                for i, a in enumerate(outputs['log_probs']):
-                    for j, b in enumerate(a):
-                        pad_length = max_seq_len - len(b)
-                        outputs['log_probs'][i][j] = b + [0.0] * pad_length
-                outputs['log_probs'] = torch.tensor(outputs['log_probs'],
-                                                    device=cuda_device)
+                log_probs = None
+                for response in responses:
+                    if log_probs is None:
+                        # TODO: Refactor not to allocate a buffer per step.
+                        output_len = len(response.result.log_probs[0])
+                        log_probs = torch.zeros(
+                            (num_output_sequences, num_beams, output_len),
+                            dtype=torch.float32)
+                    for i, lprobs in enumerate(response.result.log_probs):
+                        log_probs[req_idx(response), i, :len(lprobs)] = \
+                            torch.tensor(lprobs)
+                assert isinstance(log_probs, torch.Tensor)
+                outputs['log_probs'] = log_probs.to(cuda_device)
+
             if output_cum_log_probs:
-                outputs['cum_log_probs'] = [
-                    a.result.cum_log_probs for a in responses
-                    if a.result.cum_log_probs is not None
-                ]
-                outputs['cum_log_probs'] = torch.tensor(
-                    outputs['cum_log_probs'], device=cuda_device)
-            input_lengths = torch.tensor([x.size(0) for x in batch_input_ids],
-                                         dtype=torch.int32,
-                                         device=cuda_device)
+                cum_log_probs = torch.zeros((num_output_sequences, num_beams),
+                                            dtype=torch.float32)
+                for response in responses:
+                    if response.result.cum_log_probs is not None:
+                        cum_log_probs[req_idx(response), :] = \
+                            torch.tensor(response.result.cum_log_probs)
+                outputs['cum_log_probs'] = cum_log_probs.to(cuda_device)
+
             outputs = self._prepare_outputs(outputs, input_lengths)
         else:
             outputs = output_ids
+
         return outputs

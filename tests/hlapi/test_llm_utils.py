@@ -2,7 +2,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from transformers import AutoTokenizer
 
 from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.hlapi.llm_utils import *
@@ -137,11 +136,12 @@ def test_ConfigArbitor_multi_configs_perf_conflict():
     plugin_config = PluginConfig()
     kv_cache_config = KvCacheConfig()
 
+    old_paged_kv_cache = plugin_config.paged_kv_cache
     arb(plugin_config=plugin_config, kv_cache_config=kv_cache_config)
 
     assert plugin_config.use_paged_context_fmha == True  # perf0 is disabled
     assert kv_cache_config.enable_block_reuse == True
-    assert plugin_config.paged_kv_cache == True  # perf0 is disabled
+    assert plugin_config.paged_kv_cache == old_paged_kv_cache  # perf0 is disabled
 
 
 def test_ConfigArbitor_perf_fallback():
@@ -169,10 +169,9 @@ def test_ConfigArbitor_perf_fallback():
 
 
 def test_ModelLoader():
-    args = LlmArgs(llama_model_path)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+    args = LlmArgs(llama_model_path, kv_cache_config=kv_cache_config)
     args.setup()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     # Test with HF model
     temp_dir = tempfile.TemporaryDirectory()
@@ -195,7 +194,8 @@ def test_ModelLoader():
 
 def test_CachedModelLoader():
     # CachedModelLoader enables engine caching and multi-gpu building
-    args = LlmArgs(llama_model_path)
+    args = LlmArgs(llama_model_path,
+                   kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
     args.enable_build_cache = True
     args.setup()
     stats = LlmBuildStats()

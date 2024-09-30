@@ -131,6 +131,8 @@ private:
     // @fixme: seems this is shared across multiple clones.
     // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
     CublasGemmWrapperPtr mCublasWrapper;
+    std::shared_ptr<cublasHandle_t> mcublasHandle;
+    std::shared_ptr<cublasLtHandle_t> mcublasLtHandle;
 
     GemmDims mDims{};
     GemmIdCublas mGemmId{};

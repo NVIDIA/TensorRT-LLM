@@ -15,6 +15,7 @@
 
 import argparse
 import ast
+import itertools
 import os
 from pathlib import Path
 
@@ -140,14 +141,16 @@ def main(args):
         bad_words_list = tensorrt_llm.runtime.decode_words_list(
             args.bad_words, tokenizer)
 
-    # random_seed = 5
+    random_seed = args.random_seed
     temperature = args.temperature
     num_beams = args.num_beams
+    num_return_sequences = args.num_return_sequences
     length_penalty = args.length_penalty
     early_stopping = args.early_stopping
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
+    torch.manual_seed(random_seed)
 
     output_dir = Path(args.output_dir) if args.output_dir else None
     if output_dir is not None:
@@ -164,13 +167,22 @@ def main(args):
     # TODO: Add random_seed flag in gptj
     rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
         args.rouge_dir) else "rouge"
-    metric_tensorrt_llm = [evaluate.load(rouge_dir) for _ in range(num_beams)]
-    metric_hf = [evaluate.load(rouge_dir) for _ in range(num_beams)]
-    for i in range(num_beams):
-        metric_tensorrt_llm[i].seed = 0
+    metric_tensorrt_llm = [[evaluate.load(rouge_dir) for _ in range(num_beams)]
+                           for _ in range(num_return_sequences)]
+    for i, j in itertools.product(range(num_return_sequences),
+                                  range(num_beams)):
+        metric_tensorrt_llm[i][j].seed = 0
+    ppls_trt_llm = [[[] for _ in range(num_beams)]
+                    for _ in range(num_return_sequences)]
+
+    # HF returns num_return_sequences output ids. If beam search is enabled,
+    # num_return_sequences should be less or equal to num_beams.
+    num_returns_hf = (num_beams
+                      if num_return_sequences == 1 else num_return_sequences)
+    metric_hf = [evaluate.load(rouge_dir) for _ in range(num_returns_hf)]
+    for i in range(num_returns_hf):
         metric_hf[i].seed = 0
-    ppls_trt_llm = [[] for _ in range(num_beams)]
-    ppls_hf = [[] for _ in range(num_beams)]
+    ppls_hf = [[] for _ in range(num_returns_hf)]
 
     def _prepare_inputs(batch_input_texts,
                         eval_task='summarize',
@@ -244,6 +256,7 @@ def main(args):
                 batch_input_ids,
                 max_new_tokens=output_len,
                 max_attention_window_size=max_attention_window_size,
+                num_return_sequences=num_return_sequences,
                 sink_token_length=sink_token_length,
                 end_id=end_id,
                 pad_id=pad_id,
@@ -259,8 +272,10 @@ def main(args):
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
                 lora_uids=args.lora_task_uids,
+                lookahead_config=args.lookahead_config,
                 output_sequence_lengths=True,
                 return_dict=True,
+                random_seed=random_seed,
                 medusa_choices=args.medusa_choices)
             torch.cuda.synchronize()
 
@@ -268,46 +283,46 @@ def main(args):
         if runtime_rank == 0:
             output_ids = outputs['output_ids']
             output_beams_list = [
-                tokenizer.batch_decode(output_ids[batch_idx, :,
-                                                  input_lengths[batch_idx]:],
-                                       skip_special_tokens=True)
-                for batch_idx in range(batch_size)
+                tokenizer.batch_decode(
+                    beam_tokens[:, input_lengths[i // num_return_sequences]:],
+                    skip_special_tokens=True)
+                for i, beam_tokens in enumerate(output_ids)
             ]
             output_ids_list = [
-                output_ids[batch_idx, :, input_lengths[batch_idx]:]
-                for batch_idx in range(batch_size)
+                beam_tokens[:, input_lengths[i // num_return_sequences]:]
+                for i, beam_tokens in enumerate(output_ids)
             ]
 
-            ppls = [[] for _ in range(batch_size)]
-            seq_lengths_array = outputs["sequence_lengths"].cpu().tolist()
+            ppls = [[] for _ in range(batch_size * num_return_sequences)]
             lengths_info = {
                 'input_lengths': input_lengths,
-                'seq_lengths': seq_lengths_array
+                'seq_lengths': outputs["sequence_lengths"].cpu().tolist(),
             }
             if eval_ppl:
                 seq_lengths = outputs['sequence_lengths']
                 context_logits = outputs['context_logits']
-                # Remove the first generation logits which are same to last context logits
+                # Remove the first generation logits which are same to last
+                # context logits.
                 generation_logits = outputs['generation_logits'][:, :, 1:]
-                for batch_idx in range(batch_size):
+                for result_idx in range(batch_size * num_return_sequences):
+                    batch_idx = result_idx // num_return_sequences
                     # [batch, beam, step]
                     for beam_idx in range(num_beams):
-                        curr_len = seq_lengths[batch_idx, beam_idx]
+                        curr_len = seq_lengths[result_idx, beam_idx]
                         curr_ctx_len = input_lengths[batch_idx]
                         curr_gen_len = curr_len - curr_ctx_len
 
-                        curr_ids = output_ids[batch_idx, beam_idx, 1:curr_len]
+                        curr_ids = output_ids[result_idx, beam_idx, 1:curr_len]
                         curr_logits = torch.cat([
-                            context_logits[batch_idx],
-                            generation_logits[batch_idx,
+                            context_logits[result_idx],
+                            generation_logits[result_idx,
                                               beam_idx, :curr_gen_len - 1]
                         ],
                                                 dim=0)
                         curr_ppl = ppl(curr_logits, curr_ids)
-                        logger.debug(
-                            f"TensorRT-LLM PPL: {curr_ppl:.3f} | Generation length: {curr_gen_len}"
-                        )
-                        ppls[batch_idx].append(curr_ppl)
+                        logger.debug(f"TensorRT-LLM PPL: {curr_ppl:.3f} | "
+                                     f"Generation length: {curr_gen_len}")
+                        ppls[result_idx].append(curr_ppl)
 
             return output_beams_list, output_ids_list, ppls, lengths_info
         return [], [], [], {}
@@ -349,31 +364,43 @@ def main(args):
             local_early_stopping = "never"
 
         with torch.no_grad():
+            hf_config = {}
+            if num_beams == 1:
+                hf_config.update({
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "do_sample": True,
+                })
+            else:
+                hf_config.update({
+                    "num_beams": num_beams,
+                    "early_stopping": local_early_stopping,
+                })
+                assert num_return_sequences < num_beams, (
+                    f'In HF, num_return_sequences ({num_return_sequences}) '
+                    f'has to be smaller or equal to num_beams ({num_beams})')
             outputs = model.generate(batch_input_ids,
                                      max_new_tokens=output_len,
-                                     top_k=top_k,
+                                     num_return_sequences=num_return_sequences,
                                      temperature=temperature,
                                      eos_token_id=end_id,
                                      pad_token_id=pad_id,
-                                     num_beams=num_beams,
-                                     num_return_sequences=num_beams,
                                      length_penalty=length_penalty,
-                                     early_stopping=local_early_stopping,
                                      output_scores=True,
-                                     return_dict_in_generate=True)
+                                     return_dict_in_generate=True,
+                                     **hf_config)
             if eval_ppl and batch_size == 1:
                 # model.generate cannot return context logits?
                 # Will cause additional latency
                 context_outputs = model(batch_input_ids)
 
         output_ids = outputs['sequences']
-        tokens_list = output_ids[:, len(batch_input_ids[0]):].tolist()
-        output_ids = output_ids.reshape([batch_size, num_beams, -1])
+        tokens_list = output_ids[:, max_length:].tolist()
+        output_ids = output_ids.reshape([batch_size, num_returns_hf, -1])
         output_lines_list = [
-            tokenizer.batch_decode(output_ids[:, i,
-                                              len(batch_input_ids[0]):],
+            tokenizer.batch_decode(output_ids[:, i, max_length:],
                                    skip_special_tokens=True)
-            for i in range(num_beams)
+            for i in range(num_returns_hf)
         ]
 
         ppls = [[] for _ in range(batch_size)]
@@ -395,7 +422,7 @@ def main(args):
             generation_logits = generation_logits.view(batch_size, num_beams,
                                                        max_gen_len, voc_size)
             for batch_idx in range(batch_size):
-                for beam_idx in range(num_beams):
+                for beam_idx in range(num_returns_hf):
                     curr_len = seq_lens[batch_idx, beam_idx]
                     curr_ctx_len = input_lengths[batch_idx]
                     curr_gen_len = curr_len - curr_ctx_len
@@ -441,6 +468,12 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if args.lookahead_config is not None:
+            args.lookahead_config = ast.literal_eval(args.lookahead_config)
+            assert len(
+                args.lookahead_config
+            ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
+            runner_kwargs.update(lookahead_config=args.lookahead_config)
         if not args.use_py_session:
             runner_kwargs.update(
                 max_batch_size=max_batch_size,
@@ -497,7 +530,7 @@ def main(args):
                 min_input_length=args.min_input_length)
             profiler.stop('tensorrt_llm')
 
-            empty_batch = (runtime_rank == 0 and len(output_tensorrt_llm) == 0)
+            empty_batch = runtime_rank == 0 and len(output_tensorrt_llm) == 0
             empty_batch = mpi_broadcast(empty_batch, 0)
             if empty_batch:
                 # No valid samples in the current batch, skip this iteration
@@ -508,23 +541,21 @@ def main(args):
                 input_lengths = lengths_info['input_lengths']
                 seq_lengths = lengths_info['seq_lengths']
                 output_token_count_trt_llm = sum(
-                    seq_lengths[bs][bm] - input_lengths[bs]
-                    for bm in range(len(output_tensorrt_llm[0]))
-                    for bs in range(len(output_tensorrt_llm)))
+                    beam_len - input_lengths[seq_idx // num_return_sequences]
+                    for seq_idx, beam_lens in enumerate(seq_lengths)
+                    for beam_len in beam_lens)
                 total_output_token_count_trt_llm += output_token_count_trt_llm
 
-                for batch_idx in range(len(output_tensorrt_llm)):
-                    for beam_idx in range(num_beams):
-                        metric_tensorrt_llm[beam_idx].add_batch(
-                            predictions=[
-                                output_tensorrt_llm[batch_idx][beam_idx]
-                            ],
-                            references=[
-                                datapoint[dataset_output_key][batch_idx]
-                            ])
+                for result_idx, output_beams in enumerate(output_tensorrt_llm):
+                    batch_idx, seq_idx = divmod(result_idx,
+                                                num_return_sequences)
+                    reference = datapoint[dataset_output_key][batch_idx]
+                    for beam_idx, output_beam in enumerate(output_beams):
+                        metric_tensorrt_llm[seq_idx][beam_idx].add_batch(
+                            predictions=[output_beam], references=[reference])
                         if args.eval_ppl:
-                            ppls_trt_llm[beam_idx].append(
-                                curr_ppls_trt_llm[batch_idx][beam_idx])
+                            ppls_trt_llm[seq_idx][beam_idx].append(
+                                curr_ppls_trt_llm[result_idx][beam_idx])
                 if output_dir is not None:
                     for i in range(len(output_tensorrt_llm[0])):
                         for beam_idx in range(num_beams):
@@ -624,8 +655,7 @@ def main(args):
             if runtime_rank == 0:
                 seq_lengths = [len(tokens) for tokens in token_list]
                 total_output_token_count_hf += sum(seq_lengths)
-
-                for beam_idx in range(num_beams):
+                for beam_idx in range(num_returns_hf):
                     for batch_idx in range(len(output_hf[beam_idx])):
                         metric_hf[beam_idx].add_batch(
                             predictions=[output_hf[beam_idx][batch_idx]],
@@ -637,7 +667,7 @@ def main(args):
                                 curr_ppls_hf[batch_idx][beam_idx])
                 if output_dir is not None:
                     for i in range(len(output_hf[0])):
-                        for beam_idx in range(num_beams):
+                        for beam_idx in range(num_returns_hf):
                             with (output_dir / 'hf.out').open('a') as f:
                                 f.write(
                                     f'[{data_point_idx + i}] [Beam {beam_idx}] {output_hf[beam_idx][i]}\n'
@@ -652,7 +682,7 @@ def main(args):
             ite_count += 1
         del model
 
-    if runtime_rank == 0:
+    if runtime_rank == 0 and args.max_ite > 0:
         if test_trt_llm:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(
@@ -665,24 +695,25 @@ def main(args):
             logger.info(
                 f'TensorRT-LLM (tokens per second: {total_output_token_count_trt_llm / profiler.elapsed_time_in_sec("tensorrt_llm")})'
             )
-            for beam_idx in range(num_beams):
+            for seq_idx, beam_idx in itertools.product(
+                    range(num_return_sequences), range(num_beams)):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
                     computed_metrics_tensorrt_llm = metric_tensorrt_llm[
-                        beam_idx].compute()
+                        seq_idx][beam_idx].compute()
                     for key in computed_metrics_tensorrt_llm.keys():
                         logger.info(
                             f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
                         )
-                    if args.check_accuracy and beam_idx == 0:
+                    if args.check_accuracy and seq_idx == 0 and beam_idx == 0:
                         assert computed_metrics_tensorrt_llm[
                             'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
                 if args.eval_ppl:
                     logger.info(
-                        f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
+                        f"  Per-token perplexity: {np.mean(ppls_trt_llm[seq_idx][beam_idx])}"
                     )
-                    if args.check_accuracy and beam_idx == 0:
-                        avg_ppl = np.mean(ppls_trt_llm[beam_idx])
+                    if args.check_accuracy and seq_idx == 0 and beam_idx == 0:
+                        avg_ppl = np.mean(ppls_trt_llm[seq_idx][beam_idx])
                         assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})"
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
@@ -696,7 +727,7 @@ def main(args):
                 f'Hugging Face (tokens per second: {total_output_token_count_hf / profiler.elapsed_time_in_sec("hf")})'
             )
 
-            for beam_idx in range(num_beams):
+            for beam_idx in range(num_returns_hf):
                 logger.info(f"HF beam {beam_idx} result")
                 computed_metrics_hf = metric_hf[beam_idx].compute()
                 if args.eval_task != "eval_context_ppl":

@@ -70,7 +70,7 @@ protected:
 
         mWorldConfig = WorldConfig(2);
 
-        mModelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2));
+        mModelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2, 0));
     }
 
     std::unique_ptr<BufferManager> mManager;

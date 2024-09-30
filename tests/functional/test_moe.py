@@ -432,7 +432,7 @@ class TestMoE(unittest.TestCase):
         self.lora_fc2_ranks = torch.tensor((lora_rank, ),
                                            dtype=torch.int32).repeat(num_reqs)
 
-    def create_lora_params(self, num_reqs, max_num_tokens):
+    def create_lora_params(self, num_reqs):
 
         moe_h_to_4h_weights_pointers = Tensor(
             shape=(num_reqs, 2),
@@ -499,7 +499,6 @@ class TestMoE(unittest.TestCase):
                 moe_gate_weights_pointers,
             }],
             host_context_lengths=host_context_lengths,
-            max_num_tokens=max_num_tokens,
             host_request_types=host_request_types,
             weight_index=0,
         )
@@ -730,8 +729,8 @@ class TestMoE(unittest.TestCase):
         )
 
     @parameterized.expand(list(
-        product(["float16", "bfloat16", "float32", "int4", "int8"],
-                ["gelu", "geglu"], [True], [32, 64])),
+        product(["float16", "bfloat16", "int4", "int8"], ["gelu", "geglu"],
+                [True], [32, 64])),
                           name_func=unittest_name_func)
     def test_mlp_lora_comparison(self, dtype_str, actfn, use_plugin, lora_rank):
         """This test uses one expert and compares the result to a plain MLP"""
@@ -964,7 +963,7 @@ class TestMoE(unittest.TestCase):
             if use_lora:
                 network.plugin_config.lora_plugin = trt_dtype_to_str(dtype)
                 network.plugin_config.remove_input_padding = False
-                self.create_lora_params(input_shape[0], max_num_tokens=30)
+                self.create_lora_params(input_shape[0])
                 lora_params = self.lora_params
 
             moe_config = MoeConfig(num_experts=num_experts,

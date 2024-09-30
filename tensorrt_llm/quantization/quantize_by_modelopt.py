@@ -16,15 +16,11 @@
 Adapted from examples/quantization/hf_ptq.py
 """
 
-import contextlib
 import copy
 import json
 import os
 import random
-import shutil
 import sys
-import tarfile
-import tempfile
 import time
 
 import numpy as np
@@ -35,6 +31,7 @@ from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from .._utils import release_gc
 from ..logger import logger
 from ..mapping import Mapping
 from .mode import QuantAlgo
@@ -127,6 +124,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
+    "GPTBigCodeForCausalLM": "gptnext",
     "GLM": "glm",
 }
 
@@ -546,9 +544,6 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
-        torch.cuda.empty_cache(
-        )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
-
         # Workaround for combining medusa head
         # TODO: move these integration into modelopt to avoid redundant reading and writing
         if medusa_model_dir is not None:
@@ -561,82 +556,15 @@ def quantize_and_export(*,
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
                 export_path, end_time - start_time))
 
-
-def load_config(model_file: str):
-    """Load model config from extracted directory or '.nemo' tarball."""
-    from modelopt.torch.utils import print_rank_0
-    from omegaconf import OmegaConf
-
-    if os.path.isfile(model_file):
-        with tempfile.TemporaryDirectory() as tmp, tarfile.open(
-                model_file, "r:") as tar:
-            try:
-                tar.extract("./model_config.yaml", path=tmp)
-            except KeyError:
-                print_rank_0("File name not found, trying legacy name...")
-                tar.extract("model_config.yaml", path=tmp)
-            model_config = OmegaConf.load(os.path.join(tmp,
-                                                       "model_config.yaml"))
-    elif os.path.isdir(model_file):
-        model_config = OmegaConf.load(
-            os.path.join(model_file, "model_config.yaml"))
-    else:
-        raise FileNotFoundError(model_file)
-
-    return model_config
-
-
-def save_artifacts(model, output_dir: str, use_abspath: bool = False) -> None:
-    """Save all model artifacts and tokenizer config to a given output directory."""
-    from modelopt.torch.utils import print_rank_0
-    from nemo.utils import AppState
-    from omegaconf import OmegaConf
-
-    app_state = AppState()
-    model_file = app_state.model_restore_path
-    model_cfg = copy.deepcopy(model.cfg)
-    if not hasattr(model, "artifacts"):
-        if hasattr(model_cfg, "tokenizer"):
-            OmegaConf.save(model_cfg.tokenizer,
-                           os.path.join(output_dir, "tokenizer_config.yaml"))
-        return
-
-    # Setup model file handling context: directory or tarball
-    if os.path.isfile(model_file):
-        model_file_handler = tarfile.open
-        kwargs = {"name": model_file, "mode": "r:"}
-    elif os.path.isdir(model_file):
-        model_file_handler = contextlib.nullcontext
-        kwargs = {}
-    else:
-        raise FileNotFoundError(model_file)
-
-    # Copy or extract artifacts depending on the context
-    with model_file_handler(**kwargs) as maybe_tar:
-        for arti_name, arti_item in model.artifacts.items():
-            _, arti_file = arti_item.path.split("nemo:")
-            arti_path = os.path.join(output_dir, arti_name)
-            if maybe_tar is not None:
-                try:
-                    maybe_tar.extract(f"./{arti_file}", path=output_dir)
-                except KeyError:
-                    print_rank_0("File name not found, trying legacy name...")
-                    maybe_tar.extract(f"{arti_file}", path=output_dir)
-                os.rename(os.path.join(output_dir, arti_file), arti_path)
-            else:
-                shutil.copy(os.path.join(model_file, arti_file), arti_path)
-            # Store artifact path as basename by default. Otherwise save absolute path but bear in mind
-            # that in this case output directory should be permanent for correct artifact recovery later
-            arti_path = os.path.abspath(
-                arti_path) if use_abspath else os.path.basename(arti_path)
-            OmegaConf.update(model_cfg, arti_name, arti_path)
-
-    if hasattr(model_cfg, "tokenizer"):
-        OmegaConf.save(model_cfg.tokenizer,
-                       os.path.join(output_dir, "tokenizer_config.yaml"))
+        # Need to delete the model and release memory explicitly;
+        # otherwise torch may retain its GPU memory until a delayed GC running,
+        # which reduces the available GPU memory for subsequent stages.
+        del model
+        release_gc()
 
 
 def unwrap_model(model, module_instances=None):
+    # Reference: https://github.com/NVIDIA/Megatron-LM/blob/core_r0.8.0/megatron/training/utils.py
     from megatron.core import DistributedDataParallel as DDP
     from megatron.core.transformer.module import Float16Module
 
@@ -714,8 +642,11 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
     from modelopt.torch.utils import print_rank_0
     from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import \
         MegatronGPTModel
+    from nemo.collections.nlp.modules.common.text_generation_strategy import \
+        GPTModelTextGenerationStrategy
     from nemo.collections.nlp.parts.nlp_overrides import (
         NLPDDPStrategy, NLPSaveRestoreConnector)
+    from nemo.utils.model_utils import load_config, save_artifacts
     from omegaconf.omegaconf import open_dict
     from pytorch_lightning.trainer.trainer import Trainer
 
@@ -741,7 +672,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         model_cfg.sequence_parallel = False
         # Only custom modelopt spec is supported for PTQ: this custom spec is largely based on local Megatron-LM
         # layer definitions to avoid Transformer Engine implementations that are currently not supported.
-        model_cfg.name = "ammo"
+        model_cfg.name = "modelopt"
 
     # trainer required for restoring model parallel models
     trainer_config = {
@@ -793,6 +724,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         'compute_logprob': False,
         'batch_size': batch_size,
         'max_context_length': calib_max_seq_length,
+        'strategy': GPTModelTextGenerationStrategy(model),
     }
     model.set_inference_config(inference_config)
 
@@ -896,11 +828,15 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         inference_pipeline_parallel=pp_size,
     )
 
-    torch.cuda.empty_cache(
-    )  # otherwise torch is keeping using GPU, other routine like build engine has less free GPU to use
     end_time = time.time()
     print_rank_0(
         f"Model config exported to: {output_dir}. Total time used {end_time - start_time}s"
     )
     if torch.distributed.get_rank() == 0:
         save_artifacts(model, output_dir, use_abspath=True)
+
+    # Need to delete the model and release memory explicitly;
+    # otherwise torch may retain its GPU memory until a delayed GC running,
+    # which reduces the available GPU memory for subsequent stages.
+    del model
+    release_gc()

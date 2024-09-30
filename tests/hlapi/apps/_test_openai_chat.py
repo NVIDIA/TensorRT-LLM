@@ -4,6 +4,7 @@ import os
 import sys
 from typing import List
 
+import numpy as np
 import openai
 import pytest
 from openai_server import RemoteOpenAIServer
@@ -49,6 +50,7 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
         model=model_name,
         messages=messages,
         max_tokens=10,
+        logprobs=True,
     )
     assert chat_completion.id is not None
     assert len(chat_completion.choices) == 1
@@ -56,9 +58,18 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     message = chat_completion.choices[0].message
     assert message.content is not None and len(message.content) >= 10
     assert message.role == "assistant"
-    messages.append({"role": "assistant", "content": message.content})
+
+    # test logprobs
+    logprobs = chat_completion.choices[0].logprobs.content
+    assert len(logprobs) == 10
+    for logprob in logprobs:
+        assert logprob.token is not None
+        assert logprob.logprob is not None
+        assert logprob.bytes is not None
+        assert len(logprob.top_logprobs) == 0
 
     # test multi-turn dialogue
+    messages.append({"role": "assistant", "content": message.content})
     messages.append({"role": "user", "content": "express your result in json"})
     chat_completion = client.chat.completions.create(
         model=model_name,
@@ -99,8 +110,13 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
         messages=messages,
         max_tokens=10,
         temperature=0.0,
+        logprobs=True,
     )
     output = chat_completion.choices[0].message.content
+    logprobs = [
+        logprob_content.logprob
+        for logprob_content in chat_completion.choices[0].logprobs.content
+    ]
 
     # test streaming
     stream = await async_client.chat.completions.create(
@@ -108,18 +124,28 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
         messages=messages,
         max_tokens=10,
         temperature=0.0,
+        logprobs=True,
         stream=True,
     )
-    chunks: List[str] = []
+    str_chunks: List[str] = []
+    logprob_chunks: List[float] = []
+
     # TODO{pengyunl}: add stop_reason test when supported
     async for chunk in stream:
         delta = chunk.choices[0].delta
+        if logprob_chunk := chunk.choices[0].logprobs:
+            assert len(logprob_chunk.content) == 1
+            assert len(logprob_chunk.content[0].top_logprobs) == 0
+            logprob_chunks.append(logprob_chunk.content[0].logprob)
         if delta.role:
             assert delta.role == "assistant"
         if delta.content:
-            chunks.append(delta.content)
+            str_chunks.append(delta.content)
     assert delta.content
-    assert "".join(chunks) == output
+    assert "".join(str_chunks) == output
+    assert len(logprob_chunks) == len(logprobs)
+    logprobs, logprob_chunks = np.array(logprobs), np.array(logprob_chunks)
+    assert np.allclose(logprobs, logprob_chunks)
 
 
 @pytest.mark.asyncio

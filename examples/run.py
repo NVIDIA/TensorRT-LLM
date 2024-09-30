@@ -18,11 +18,12 @@ import ast
 import csv
 import os
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import torch
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-                   add_common_args, load_tokenizer, read_decoder_start_token_id,
+                   add_common_args, load_tokenizer, prepare_enc_dec_inputs,
                    read_model_name, supports_inflight_batching,
                    throttle_generator)
 
@@ -51,6 +52,9 @@ def parse_arguments(args=None):
         help=
         'CSV or Numpy file containing tokenized input. Alternative to text input.',
         default=None)
+    parser.add_argument('--multimodal_input_file',
+                        type=str,
+                        help='Path to multimodal input file.')
     parser.add_argument('--output_csv',
                         type=str,
                         help='CSV file where the tokenized output is stored.',
@@ -98,14 +102,18 @@ def parse_input(tokenizer,
 
     batch_input_ids = []
     if input_file is None:
-        for curr_text in input_text:
-            if prompt_template is not None:
-                curr_text = prompt_template.format(input_text=curr_text)
-            input_ids = tokenizer.encode(curr_text,
-                                         add_special_tokens=add_special_tokens,
-                                         truncation=True,
-                                         max_length=max_input_length)
-            batch_input_ids.append(input_ids)
+        if 'whisper' in model_name.lower():
+            batch_input_ids.append(tokenizer.prefix_tokens)
+        else:
+            for curr_text in input_text:
+                if prompt_template is not None:
+                    curr_text = prompt_template.format(input_text=curr_text)
+                input_ids = tokenizer.encode(
+                    curr_text,
+                    add_special_tokens=add_special_tokens,
+                    truncation=True,
+                    max_length=max_input_length)
+                batch_input_ids.append(input_ids)
     else:
         if input_file.endswith('.csv'):
             with open(input_file, 'r') as csv_file:
@@ -151,35 +159,43 @@ def parse_input(tokenizer,
 
 
 def print_output(tokenizer,
-                 output_ids,
-                 input_lengths,
-                 sequence_lengths,
-                 output_csv=None,
-                 output_npy=None,
-                 context_logits=None,
-                 generation_logits=None,
-                 cum_log_probs=None,
-                 log_probs=None,
-                 output_logits_npy=None,
-                 output_cum_log_probs_npy=None,
-                 output_log_probs_npy=None):
-    batch_size, num_beams, _ = output_ids.size()
+                 output_ids: torch.Tensor,
+                 input_lengths: List[int],
+                 sequence_lengths: torch.Tensor,
+                 output_csv: Optional[str] = None,
+                 output_npy: Optional[str] = None,
+                 context_logits: Optional[torch.Tensor] = None,
+                 generation_logits: Optional[torch.Tensor] = None,
+                 cum_log_probs: Optional[torch.Tensor] = None,
+                 log_probs: Optional[torch.Tensor] = None,
+                 output_logits_npy: Optional[str] = None,
+                 output_cum_log_probs_npy: Optional[str] = None,
+                 output_log_probs_npy: Optional[str] = None):
+    num_output_sents, num_beams, _ = output_ids.size()
+    batch_size = len(input_lengths)
+    num_return_sequences = num_output_sents // batch_size
+
     if output_csv is None and output_npy is None:
-        for batch_idx in range(batch_size):
-            inputs = output_ids[batch_idx][0][:input_lengths[batch_idx]].tolist(
-            )
+        for i in range(batch_size * num_return_sequences):
+            batch_idx = i // num_return_sequences
+            seq_idx = i % num_return_sequences
+            inputs = output_ids[i][0][:input_lengths[batch_idx]].tolist()
             input_text = tokenizer.decode(inputs)
-            print(f'Input [Text {batch_idx}]: \"{input_text}\"')
+            if seq_idx == 0:
+                print(f'Input [Text {batch_idx}]: \"{input_text}\"')
+
             for beam in range(num_beams):
                 output_begin = input_lengths[batch_idx]
-                output_end = sequence_lengths[batch_idx][beam]
-                outputs = output_ids[batch_idx][beam][
-                    output_begin:output_end].tolist()
+                output_end = sequence_lengths[i][beam]
+                outputs = output_ids[i][beam][output_begin:output_end].tolist()
                 output_text = tokenizer.decode(outputs)
-                print(
-                    f'Output [Text {batch_idx} Beam {beam}]: \"{output_text}\"')
+                index_str = (f'Text {batch_idx} Seq {seq_idx} Beam {beam}'
+                             if num_return_sequences > 1 else
+                             f'Text {batch_idx} Beam {beam}')
+                print(f'Output [{index_str}]: \"{output_text}\"')
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
+
     if output_csv is not None:
         output_file = Path(output_csv)
         output_file.parent.mkdir(exist_ok=True, parents=True)
@@ -237,18 +253,20 @@ def main(args):
     logger.set_level(args.log_level)
 
     # different handling if encoder-decoder models
-    is_enc_dec = {
+    is_enc_dec = {'encoder', 'decoder'}.issubset({
         name
         for name in os.listdir(args.engine_dir)
         if os.path.isdir(os.path.join(args.engine_dir, name))
-    } == {'encoder', 'decoder'}
+    })
     if is_enc_dec:
         logger.warning(
             "This path is an encoder-decoder model. Using different handling.")
         assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
 
     model_name, model_version = read_model_name(
-        args.engine_dir) if not is_enc_dec else ("", "")
+        args.engine_dir if not is_enc_dec else os.path.
+        join(args.engine_dir, 'encoder'))
+
     if args.tokenizer_dir is None and model_name in DEFAULT_HF_MODEL_DIRS:
         logger.warning(
             "tokenizer_dir is not specified. Try to infer from model_name, but this may be incorrect."
@@ -269,6 +287,7 @@ def main(args):
     prompt_template = None
     if args.use_prompt_template and model_name in DEFAULT_PROMPT_TEMPLATES:
         prompt_template = DEFAULT_PROMPT_TEMPLATES[model_name]
+
     batch_input_ids = parse_input(tokenizer=tokenizer,
                                   input_text=args.input_text,
                                   prompt_template=prompt_template,
@@ -298,18 +317,16 @@ def main(args):
             args.bad_words, tokenizer)
 
     if is_enc_dec:
-        encoder_input_ids = batch_input_ids
-        decoder_start_token_id = read_decoder_start_token_id(
-            os.path.join(args.engine_dir, "decoder"))
-        decoder_input_ids = [
-            torch.tensor([decoder_start_token_id], dtype=torch.int32)
-            for _ in batch_input_ids
-        ]
+        encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids = prepare_enc_dec_inputs(
+            batch_input_ids, model_name, args.engine_dir,
+            args.multimodal_input_file)
 
     input_lengths = [x.size(0) for x in decoder_input_ids
                      ] if is_enc_dec else [x.size(0) for x in batch_input_ids]
-    encoder_input_lengths = [x.size(0)
-                             for x in encoder_input_ids] if is_enc_dec else None
+
+    encoder_input_lengths = [
+        x.size(0) for x in (encoder_input_features or encoder_input_ids)
+    ] if is_enc_dec else None
 
     if not args.use_py_session and not supports_inflight_batching(
             os.path.join(args.engine_dir, "decoder") if is_enc_dec else args.
@@ -349,6 +366,7 @@ def main(args):
         debug_mode=args.debug_mode,
         lora_ckpt_source=args.lora_ckpt_source,
         gpu_weights_percent=args.gpu_weights_percent,
+        max_output_len=args.max_output_len,
     )
     if not args.use_py_session:
         runner_kwargs.update(is_enc_dec=is_enc_dec)
@@ -357,12 +375,17 @@ def main(args):
         assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
         assert args.num_beams == 1, "Medusa should use num_beams == 1"
         runner_kwargs.update(medusa_choices=args.medusa_choices)
+    if args.lookahead_config is not None:
+        args.lookahead_config = ast.literal_eval(args.lookahead_config)
+        assert len(
+            args.lookahead_config
+        ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
+        runner_kwargs.update(lookahead_config=args.lookahead_config)
     if not args.use_py_session:
         runner_kwargs.update(
             max_batch_size=len(batch_input_ids),
             max_input_len=max(
                 encoder_input_lengths if is_enc_dec else input_lengths),
-            max_output_len=args.max_output_len,
             max_beam_width=args.num_beams,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,
@@ -381,6 +404,10 @@ def main(args):
             batch_input_ids=decoder_input_ids
             if is_enc_dec else batch_input_ids,
             encoder_input_ids=encoder_input_ids if is_enc_dec else None,
+            encoder_input_features=encoder_input_features
+            if is_enc_dec else None,
+            encoder_output_lengths=encoder_output_lengths
+            if is_enc_dec else None,
             max_new_tokens=args.max_output_len,
             max_attention_window_size=args.max_attention_window_size,
             sink_token_length=args.sink_token_length,
@@ -390,6 +417,7 @@ def main(args):
             top_k=args.top_k,
             top_p=args.top_p,
             num_beams=args.num_beams,
+            num_return_sequences=args.num_return_sequences,
             length_penalty=args.length_penalty,
             early_stopping=args.early_stopping,
             repetition_penalty=args.repetition_penalty,
@@ -419,10 +447,10 @@ def main(args):
                 sequence_lengths = curr_outputs['sequence_lengths']
                 cum_log_probs = None
                 log_probs = None
-                if args.output_cum_log_probs_npy != None:
-                    cum_log_probs = outputs['cum_log_probs']
-                if args.output_log_probs_npy != None:
-                    log_probs = outputs['log_probs']
+                if args.output_cum_log_probs_npy is not None:
+                    cum_log_probs = curr_outputs['cum_log_probs']
+                if args.output_log_probs_npy is not None:
+                    log_probs = curr_outputs['log_probs']
                 print_output(
                     tokenizer,
                     output_ids,
@@ -446,9 +474,9 @@ def main(args):
                 context_logits = outputs['context_logits']
             if runner.gather_generation_logits:
                 generation_logits = outputs['generation_logits']
-            if args.output_cum_log_probs_npy != None:
+            if args.output_cum_log_probs_npy is not None:
                 cum_log_probs = outputs['cum_log_probs']
-            if args.output_log_probs_npy != None:
+            if args.output_log_probs_npy is not None:
                 log_probs = outputs['log_probs']
             print_output(tokenizer,
                          output_ids,
@@ -464,7 +492,7 @@ def main(args):
                          output_cum_log_probs_npy=args.output_cum_log_probs_npy,
                          output_log_probs_npy=args.output_log_probs_npy)
 
-    if args.run_profiling:
+    if args.run_profiling:  # support profiling
         ite = 10
         # warmup
         for _ in range(ite):
@@ -486,11 +514,12 @@ def main(args):
                     frequency_penalty=args.frequency_penalty,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
-                    output_cum_log_probs=(args.output_cum_log_probs_npy !=
-                                          None),
-                    output_log_probs=(args.output_log_probs_npy != None),
+                    output_cum_log_probs=(args.output_cum_log_probs_npy
+                                          is not None),
+                    output_log_probs=(args.output_log_probs_npy is not None),
                     random_seed=args.random_seed,
                     lora_uids=args.lora_task_uids,
+                    lookahead_config=args.lookahead_config,
                     prompt_table=args.prompt_table_path,
                     prompt_tasks=args.prompt_tasks,
                     streaming=args.streaming,

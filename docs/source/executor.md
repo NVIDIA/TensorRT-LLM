@@ -17,12 +17,12 @@ The `Executor` class is responsible for receiving requests from the client, and 
 
 #### Logits Post-Processor (optional)
 
-Users can alter the logits produced the network, by providing a map of named callbacks of the form:
+Users can alter the logits produced by the network, by providing a map of named callbacks of the form:
 
 ```
 std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
 ```
-to the `ExecutorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
+to an instance of `LogitsPostProcessorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
 
 The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits.
 
@@ -37,16 +37,20 @@ We also provide a batched version that allows altering logits of multiple reques
 std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&, std::vector<std::optional<IdType>> const&)>
 ```
 
-A single batched callback can be specified in `ExecutorConfig`. Each request can opt to apply this callback by specifying the name of the logits
+A single batched callback can be specified in `LogitsPostProcessorConfig`. Each request can opt to apply this callback by specifying the name of the logits
 post-processor as `Request::kBatchedPostProcessorName`.
 
 Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
+
+In a multi-GPU run, callback is invoked on all tensor parallel ranks (in last pipeline rank) by default.
+For correct execution, user should replicate client-side state accessed by callback on all tensor parallel ranks.
+If replication is expensive or infeasible, use `LogitsPostProcessorConfig::setReplicate(false)` to invoke callback only on first tensor parallel rank.
 
 ### The Request Class
 
 The `Request` class is used to define properties of the request, such as the input token ids and the maximum number of tokens to generate. The `streaming` parameter can be used to indicate if the request should generate a response for each new generated tokens (`streaming = true`) or only after all tokens have been generated (`streaming = false`). Other mandatory parameters of the request include the sampling configuration (defined by the `SamplingConfig` class) which contains parameters controlling the decoding process and the output configuration (defined by the `OutputConfig` class) which controls what information should be included in the `Result` for a particular response.
 
-Optional parameters can also be provided when constructing a request such as a list of bad words, a list of stop words, a client id, or configurations objects for prompt tuning, LoRA, or speculative decoding for example.
+Optional parameters can also be provided when constructing a request such as a list of bad words, a list of stop words, a client id, or configurations objects for prompt tuning, LoRA, or speculative decoding, or a number of sequences to generate for example.
 
 ### The Response Class
 
@@ -54,7 +58,19 @@ The `awaitResponses` method of the `Executor` class returns a vector of response
 
 ### The Result Class
 
-The `Result` class holds the result for a given request. It contains a Boolean parameter called `isFinal` that indicates if this is the last `Result` that will be returned for the given request id. It also contains the generated tokens. If the request is configured with `streaming = false`, the `isFinal` Boolean will be set to `true` and all generated tokens will be included in the `outputTokenIds`. If `streaming = true` is used, a `Result` will only include 1 token and the `isFinal` flag will be set to `true` for the last result associated with this request.
+The `Result` class holds the result for a given request. It contains a Boolean parameter called `isFinal` that indicates if this is the last `Result` that will be returned for the given request id. It also contains the generated tokens. If the request is configured with `streaming = false` and `numReturnSequences = 1`, a single response will be returned, the `isFinal` Boolean will be set to `true` and all generated tokens will be included in the `outputTokenIds`. If `streaming = true` and `numReturnSequences = 1` is used, a `Result` will include one or more tokens (depending on the request `returnAllGeneratedTokens` parameter) except the last result and the `isFinal` flag will be set to `true` for the last result associated with this request.
+
+The request `numReturnSequences` parameter controls the number of output sequences to generate for each prompt. When this option is used, the Executor will return at least `numReturnSequences` responses for each request, each containing one Result. The `sequenceIndex` attribute of the `Result` class indicates the index of the generated sequence in the result (`0 <= sequenceIndex < numReturnSequences`).  It contains a Boolean parameter called `isSequenceFinal` that indicates if this is the last result for the sequence and also contains a Boolean parameter `isFinal` that indicates when all sequences for the request have been generated.  When `numReturnSequences = 1`, `isFinal` is identical to `isSequenceFinal`.
+
+Here is an example that shows how a subset of 3 responses might look like for `numReturnSequences = 3`:
+
+```
+Response 1: requestId = 1, Result with sequenceIndex = 0, isSequenceFinal = false, isFinal = false
+Response 2: requestId = 1, Result with sequenceIndex = 1, isSequenceFinal = true,  isFinal = false
+Response 3: requestId = 1, Result with sequenceIndex = 2, isSequenceFinal = false, isFinal = false
+```
+
+In this example, each response contains one result for different sequences. The `isSequenceFinal` flag of the second Result is set to true, indicating that it is the last result for `sequenceIndex = 1`, however, the isFinal flag of each Response is set to false because sequences 0 and 2 are not completed.
 
 ### Sending Requests with Different Beam Widths
 

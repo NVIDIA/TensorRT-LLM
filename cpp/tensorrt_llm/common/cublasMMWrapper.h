@@ -21,7 +21,6 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <string>
 
@@ -48,8 +47,6 @@ protected:
     cublasLtMatrixLayout_t mCDesc{NULL};
 
     cudaStream_t mStream;
-    //@fixme: we may not need the mutex if we copy the wrapper instead of sharing in GemmPlugin::clone()
-    std::shared_ptr<std::mutex> mMutex{std::make_shared<std::mutex>()};
 
     void* mCublasWorkspace = nullptr;
 

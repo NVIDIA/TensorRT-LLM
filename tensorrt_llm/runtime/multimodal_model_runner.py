@@ -8,7 +8,6 @@ import requests
 # isort: off
 import torch
 import numpy as np
-import tensorrt as trt
 # isort: on
 from huggingface_hub import hf_hub_download
 from PIL import Image
@@ -17,11 +16,20 @@ from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from .. import profiler
 from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
-                      trt_dtype_to_torch)
+                      supports_inflight_batching, trt_dtype_to_torch)
 from ..logger import logger
 from .enc_dec_model_runner import EncDecModelRunner
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo
+
+try:
+    import tensorrt_llm.bindings  # NOQA
+    PYTHON_BINDINGS = True
+except ImportError:
+    PYTHON_BINDINGS = False
+
+if PYTHON_BINDINGS:
+    from .model_runner_cpp import ModelRunnerCpp
 
 
 class LlavaNextUtils:
@@ -180,6 +188,36 @@ class MultimodalModelRunner:
             self.llm_name = AutoConfig.from_pretrained(
                 self.args.hf_model_dir).text_config._name_or_path
 
+        if self.decoder_llm:
+            if not supports_inflight_batching(self.args.llm_engine_dir):
+                logger.warning(
+                    "The given engine does not support in-flight batching, fallback to python session"
+                )
+                self.args.use_py_session = True
+
+            if not PYTHON_BINDINGS and not self.args.use_py_session:
+                logger.warning(
+                    "Python bindings of C++ session is unavailable, fallback to Python session."
+                )
+                self.args.use_py_session = True
+
+            args.debug_mode = False
+            if args.debug_mode and not self.args.use_py_session:
+                logger.warning(
+                    "Debug mode is not supported in C++ session for now, fallback to Python session."
+                )
+                self.args.use_py_session = True
+
+            if self.model_type != 'cogvlm' and not self.args.use_py_session:
+                logger.warning(
+                    "Only the cogvlm is supported in C++ session for now, fallback to Python session."
+                )
+                self.args.use_py_session = True
+
+            self.use_py_session = self.args.use_py_session
+        else:
+            self.use_py_session = True
+
         self.init_image_encoder()
         self.init_tokenizer()
         self.init_llm()
@@ -262,14 +300,24 @@ class MultimodalModelRunner:
 
     def init_llm(self):
         if self.decoder_llm:
-            self.model = ModelRunner.from_dir(self.args.llm_engine_dir,
-                                              rank=mpi_rank(),
-                                              debug_mode=False,
-                                              stream=self.stream,
-                                              enable_context_fmha_fp32_acc=self.
-                                              args.enable_context_fmha_fp32_acc)
-            self.model_config = self.model.session._model_config
-            self.runtime_mapping = self.model.session.mapping
+            if self.use_py_session:
+                self.model = ModelRunner.from_dir(
+                    self.args.llm_engine_dir,
+                    rank=tensorrt_llm.mpi_rank(),
+                    debug_mode=False,
+                    stream=self.stream,
+                    enable_context_fmha_fp32_acc=self.args.
+                    enable_context_fmha_fp32_acc)
+                self.model_config = self.model.session._model_config
+            else:
+                self.model = ModelRunnerCpp.from_dir(
+                    self.args.llm_engine_dir,
+                    rank=tensorrt_llm.mpi_rank(),
+                    debug_mode=False,
+                    enable_context_fmha_fp32_acc=self.args.
+                    enable_context_fmha_fp32_acc)
+                self.model_config = self.model.model_config
+            self.runtime_mapping = self.model.mapping
         else:
             self.model = EncDecModelRunner.from_engine(
                 os.path.basename(self.args.hf_model_dir),
@@ -321,8 +369,7 @@ class MultimodalModelRunner:
             self.vision_precision))  # [num_frames, 3, H, W]
         return media_tensors.unsqueeze(0)  #[1, num_frames, 3, H, W]
 
-    def preprocess(self, warmup, pre_prompt, post_prompt, image,
-                   attention_mask):
+    def preprocess(self, warmup, pre_prompt, post_prompt, image):
         if self.model_type == 'kosmos-2':
             input_ids = image['input_ids'].clone()
             image_mask = image["image_embeds_position_mask"]
@@ -347,8 +394,8 @@ class MultimodalModelRunner:
             profiler.start("Vision")
 
         visual_features, visual_atts = self.get_visual_features(
-            torch.stack(image['image_patches'], dim=0)
-            if self.model_type == 'fuyu' else image, attention_mask)
+            torch.stack(image['image_patches'], dim=0) if self.model_type ==
+            'fuyu' else image)
 
         if not warmup:
             profiler.stop("Vision")
@@ -522,19 +569,31 @@ class MultimodalModelRunner:
 
         return batch_splits
 
+    def prepare_position_ids_for_cogvlm(self, input_ids):
+        batch_size = len(input_ids)
+        position_ids = torch.arange(input_ids.shape[1])
+        position_ids[2:1227] = 2
+        position_ids[1227:] = torch.arange(3, input_ids.shape[1] + 1 - 1225)
+
+        position_ids = position_ids.to(torch.int32).to('cuda')
+        input_position_ids = []
+        for i in range(batch_size):
+            input_position_ids.append(position_ids)
+
+        return input_position_ids
+
     def generate(self,
                  pre_prompt,
                  post_prompt,
                  image,
                  decoder_input_ids,
                  max_new_tokens,
-                 attention_mask,
                  warmup=False):
         if not warmup:
             profiler.start("Generate")
 
         input_ids, input_lengths, ptuning_args, visual_features = self.preprocess(
-            warmup, pre_prompt, post_prompt, image, attention_mask)
+            warmup, pre_prompt, post_prompt, image)
         if warmup: return None
 
         profiler.start("LLM")
@@ -547,10 +606,22 @@ class MultimodalModelRunner:
                                                add_special_tokens=False)[0]
 
             ptuning_args[0] = torch.stack([ptuning_args[0]])
+            if self.model_type == 'cogvlm':
+                input_position_ids = self.prepare_position_ids_for_cogvlm(
+                    input_ids)
+                batch_size = len(input_ids)
+                if not self.use_py_session:
+                    prompt_tasks = ",".join(np.arange(batch_size).astype(str))
+                    ptuning_args[0] = ptuning_args[0].view(
+                        batch_size, ptuning_args[2].cpu().item(), -1)
+
             output_ids = self.model.generate(
                 input_ids,
+                input_position_ids=input_position_ids
+                if self.model_type == 'cogvlm' else None,
                 sampling_config=None,
                 prompt_table=ptuning_args[0],
+                prompt_tasks=prompt_tasks if not self.use_py_session else None,
                 max_new_tokens=max_new_tokens,
                 end_id=end_id,
                 pad_id=self.tokenizer.pad_token_id
@@ -583,8 +654,7 @@ class MultimodalModelRunner:
                 debug_mode=False,
                 prompt_embedding_table=ptuning_args[0],
                 prompt_tasks=ptuning_args[1],
-                prompt_vocab_size=ptuning_args[2],
-                attention_mask=attention_mask)
+                prompt_vocab_size=ptuning_args[2])
 
             # Reset input_lengths to match decoder_input_ids
             input_lengths = torch.ones(input_lengths.shape,
@@ -610,20 +680,14 @@ class MultimodalModelRunner:
             profiler.stop("Generate")
             return None
 
-    def get_visual_features(self, image, attention_mask):
+    def get_visual_features(self, image):
         visual_features = {
             'input': image.to(str_dtype_to_torch(self.vision_precision))
         }
-        if attention_mask is not None:
-            visual_features['attention_mask'] = attention_mask
         tensor_info = [
             TensorInfo('input', str_dtype_to_trt(self.vision_precision),
                        image.shape)
         ]
-        if attention_mask is not None:
-            tensor_info.append(
-                TensorInfo('attention_mask', trt.DataType.INT32,
-                           attention_mask.shape))
 
         visual_output_info = self.visual_encoder_session.infer_shapes(
             tensor_info)
@@ -704,11 +768,22 @@ class MultimodalModelRunner:
             visual_features = visual_features.view(visual_features.shape[0], -1,
                                                    visual_features.shape[-1])
 
-        fake_prompt_id = torch.arange(
-            self.model_config.vocab_size, self.model_config.vocab_size +
-            visual_features.shape[0] * visual_features.shape[1])
-        fake_prompt_id = fake_prompt_id.reshape(visual_features.shape[0],
-                                                visual_features.shape[1])
+        if self.use_py_session:
+            # Non-IFB Mode(used in python session): All requests in a batch have their prompt_table concatenated in
+            # a shape of (bs*vision_embedding_len, vision_hidden). So only one fake_prompt_id is needed for the
+            # entire batch, with values from 0 to bs * vision_embedding_len-1.
+            fake_prompt_id = torch.arange(
+                self.model_config.vocab_size, self.model_config.vocab_size +
+                visual_features.shape[0] * visual_features.shape[1])
+            fake_prompt_id = fake_prompt_id.reshape(visual_features.shape[0],
+                                                    visual_features.shape[1])
+        else:
+            # IFB Mode(used in c++ session): Each request's prompt_table is independent and requires a fake_prompt_id
+            # for each request, with values ranging from 0 to vision_embedding_len-1.
+            fake_prompt_id = torch.arange(
+                self.model_config.vocab_size,
+                self.model_config.vocab_size + visual_features.shape[1])
+            fake_prompt_id = fake_prompt_id.repeat(visual_features.shape[0], 1)
 
         if 'cogvlm' in self.model_type:
             input_ids = torch.cat(
@@ -788,13 +863,19 @@ class MultimodalModelRunner:
             assert prompt_table.shape[
                 1] == hidden_size, "Prompt table dimensions do not match hidden size"
 
-            prompt_table = prompt_table.cuda().to(
-                dtype=str_dtype_to_torch(self.model_config.dtype))
+            if hasattr(self.model_config, 'dtype'):
+                prompt_table = prompt_table.cuda().to(
+                    dtype=str_dtype_to_torch(self.model_config.dtype))
+            else:
+                prompt_table = prompt_table.cuda().to(dtype=self.model.dtype)
         else:
             prompt_table = torch.empty([1, hidden_size]).cuda()
             task_vocab_size = torch.zeros([1]).cuda()
 
-        if self.model_config.remove_input_padding:
+        remove_input_padding = self.model_config.remove_input_padding if hasattr(
+            self.model_config,
+            'remove_input_padding') else self.model_config.use_packed_input
+        if remove_input_padding:
             tasks = torch.zeros([torch.sum(input_lengths)],
                                 dtype=torch.int32).cuda()
             if self.decoder_llm: tasks = tasks.unsqueeze(0)
@@ -870,7 +951,6 @@ class MultimodalModelRunner:
 
     def setup_inputs(self, input_text, raw_image):
         from torchvision import transforms
-        attention_mask = None
         if 'blip2' in self.model_type:
             from transformers import Blip2Processor
             processor = Blip2Processor.from_pretrained(self.args.hf_model_dir)
@@ -933,10 +1013,6 @@ class MultimodalModelRunner:
             )
             image = inputs['flattened_patches']
             image = image.expand(self.args.batch_size, -1, -1).contiguous()
-            attention_mask = inputs['attention_mask'].to(self.device).to(
-                torch.int)
-            attention_mask = attention_mask.expand(self.args.batch_size,
-                                                   -1).contiguous()
             pre_prompt = ""
             post_prompt = None
         elif self.model_type == "neva":
@@ -1078,10 +1154,10 @@ class MultimodalModelRunner:
             decoder_input_ids = decoder_input_ids.repeat(
                 (self.args.batch_size, 1))
 
-        return input_text, pre_prompt, post_prompt, image, decoder_input_ids, attention_mask
+        return input_text, pre_prompt, post_prompt, image, decoder_input_ids
 
     def run(self, input_text, input_image, max_new_tokens):
-        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, attention_mask = self.setup_inputs(
+        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids = self.setup_inputs(
             input_text, input_image)
 
         output_text = self.generate(pre_prompt,
@@ -1089,7 +1165,6 @@ class MultimodalModelRunner:
                                     processed_image,
                                     decoder_input_ids,
                                     max_new_tokens,
-                                    attention_mask=attention_mask,
                                     warmup=False)
 
         return input_text, output_text

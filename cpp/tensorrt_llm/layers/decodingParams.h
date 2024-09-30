@@ -17,17 +17,15 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/request.h"
 #include <tensorrt_llm/runtime/common.h>
 #include <tensorrt_llm/runtime/speculativeDecodingModule.h>
 
 #include <optional>
 #include <utility>
 #include <vector>
-
-namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm::layers
 {
@@ -186,6 +184,7 @@ public:
     // Hack to init some data for the context phase in the setup.
     TensorPtr randomDataSample; // [maxBatchSize], on gpu
     TensorPtr temperatures;     // [maxBatchSize], on gpu
+    nvinfer1::DataType dtype;   // [1], on cpu
 };
 
 class DynamicDecodeSetupParams : public BaseSetupParams
@@ -198,12 +197,21 @@ public:
     std::shared_ptr<DecodingSetupParams> decodingParams;
 };
 
-class LookaheadSetupParams : public DecodingSetupParams
+struct LookaheadSetupParams : public DecodingSetupParams
 {
-public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
     std::vector<runtime::ITensor::SharedConstPtr> prompt;       // [batchSize][maxSeqLen] on cpu
-    std::optional<std::vector<uint64_t>> randomSeed;            // [1] or [batchSize] on cpu
     std::vector<executor::LookaheadDecodingConfig> algoConfigs; // [1 or batchSize] on cpu
+
+    //! see LookaheadDecodingOutputs::generationLengths
+    TensorPtr generationLengths;
+    //! see LookaheadDecodingOutputs::positionOffsets
+    TensorPtr positionOffsets;
+    //! see LookaheadDecodingOutputs::attentionPackedMasks
+    TensorPtr attentionPackedMasks;
+    //! see LookaheadDecodingOutputs::actualGenerationLengths
+    TensorPtr actualGenerationLengths;
 };
 
 class BaseDecodingInputs
@@ -247,9 +255,9 @@ public:
     runtime::SizeType32 maxStopWordsLen{0};
     //! [maxBatchSize], on gpu
     std::optional<TensorConstPtr> sequenceLimitLength;
-    //! [maxBatchSize][2, stop_words_length], on gpu
+    //! [maxBatchSize][2, stop_words_length], pinned
     std::optional<TensorConstPtr> stopWordsPtr;
-    //! [maxBatchSize], on gpu
+    //! [maxBatchSize], pinned
     std::optional<TensorConstPtr> stopWordsLengths;
 };
 
@@ -265,7 +273,7 @@ public:
         , ite{ite}
         , maxAttentionWindow{maxAttentionWindow}
         , sinkTokenLength{sinkTokenLength}
-        , batchSlots{batchSlots}
+        , batchSlots{std::move(batchSlots)}
     {
     }
 
@@ -284,9 +292,9 @@ public:
     //! DynamicDecodeLayer::forward checks for it
     //! Need both of these fields to support legacy code during transition period to the batched decoder
     //! [forwardBatchSize, beamWidth, vocabSizePadded]
-    std::optional<TensorPtr> logits;
+    std::optional<TensorConstPtr> logits;
     //! [forwardBatchSize][beamWidth, vocabSizePadded], on gpu
-    std::optional<std::vector<TensorPtr>> logitsVec;
+    std::optional<std::vector<TensorConstPtr>> logitsVec;
     //! [forwardBatchSize], on pinned memory
     TensorConstPtr batchSlots;
 
@@ -320,8 +328,7 @@ public:
     //! optional parameters
     //! [localBatchSize]
     curandState_t* curandStates{};
-    //! Pointer to the workspace for sampling computation
-    void* samplingWorkspace{};
+
     //! Flag to mark that logits tensor contains probabilities
     bool probsComputed{};
 };
@@ -396,17 +403,11 @@ public:
 
 class LookaheadDecodingInputs : public DecodingInputs
 {
-    using TensorConstPtr = runtime::ITensor::SharedConstPtr;
-
 public:
-    explicit LookaheadDecodingInputs(TensorPtr endIds, TensorConstPtr batchSlots)
+    explicit LookaheadDecodingInputs(TensorConstPtr endIds, TensorConstPtr batchSlots)
         : DecodingInputs{std::move(endIds), std::move(batchSlots)}
-    //, logits{logits}
     {
     }
-    // TODO(liweim) reuse base logits and curTokensPerStep.
-    // TensorConstPtr logits;        // [batchSize, maxTokensPerStep, vocabSizePadded] on gpu
-    // TensorConstPtr tokensPerStep; // [maxBatchSize] on gpu
 };
 
 class BaseDecodingOutputs
@@ -525,6 +526,33 @@ public:
     TensorPtr pathsOffsets;
     //! [maxBatchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)]
     TensorPtr packedMasks;
+};
+
+class LookaheadDecodingOutputs : public SpeculativeDecodingOutputs
+{
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+public:
+    explicit LookaheadDecodingOutputs(TensorPtr outputIds)
+        : SpeculativeDecodingOutputs{std::move(outputIds)}
+    {
+    }
+
+    //! for TLLM engine input "spec_decoding_generation_lengths", indicating how many tokens to be generated.
+    //! currently, the 1st step of generation is 1, set at `setup`, others are maxDecodingTokens, set at `forward`.
+    //! [maxBatchSize]
+    TensorPtr generationLengths;
+    //! for TLLM engine input "spec_decoding_position_offsets",
+    //! indicating each token position offset base on the last golden token = 0.
+    //! ABC<D>efgxyz--- // sequence tokens, ABCD: golden; efg, xyz: draft; ---: padding.
+    //! ***<0>123123--- // positionOffsets.
+    //! 012<3>456456--- // positionIds.
+    //! [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionOffsets;
+    //! [maxBatchSize, maxDecodingTokens]
+    TensorPtr positionIds;
+    //! The actual decoding tokens length, for debug and for future.
+    TensorPtr actualGenerationLengths;
 };
 
 class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs

@@ -15,8 +15,10 @@ from click_option_group import optgroup
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.bench.enums import IFBSchedulingPolicy
-from tensorrt_llm.bench.run.dataclasses import ResponseRecord, RuntimeConfig
-from tensorrt_llm.bench.run.utils import (StatsKeeper, get_executor_request,
+from tensorrt_llm.bench.run.dataclasses import (BenchmarkStatistics,
+                                                RuntimeConfig)
+from tensorrt_llm.bench.run.utils import (ResponseTuple, StatsKeeper,
+                                          get_executor_request,
                                           get_settings_from_engine)
 from tensorrt_llm.bench.utils.data import generate_dataset_from_stream
 from tensorrt_llm.logger import logger
@@ -83,6 +85,12 @@ from tensorrt_llm.logger import logger
     help="Number of requests to cap benchmark run at. Minimum between value and"
     "length of dataset.",
 )
+@click.option(
+    "--streaming",
+    is_flag=True,
+    default=False,
+    help="Enable streaming mode for requests.",
+)
 @click.pass_obj
 def run_command(
     bench_env: BenchmarkEnvironment,
@@ -113,6 +121,7 @@ def run_command(
     runtime_max_tokens = runtime_max_bs if runtime_max_tokens else engine_tokens
     kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
     beam_width = params.pop("beam_width")
+    streaming = params.pop("streaming")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -138,7 +147,10 @@ def run_command(
     while requests:
         request = requests.pop()
         executor_requests.append(
-            get_executor_request(request, pad_id=-1, eos_id=-1))
+            get_executor_request(request,
+                                 pad_id=-1,
+                                 eos_id=-1,
+                                 streaming=streaming))
         del request
 
     logger.info("Setting up benchmarker and infrastructure.")
@@ -151,6 +163,7 @@ def run_command(
         runtime_cfg=runtime_config,
         request_queue=new_request_queue,
         response_queue=response_queue,
+        streaming=streaming,
     )
     logger.set_level("info")
     try:
@@ -195,7 +208,7 @@ class ExecutorManager:
         self.response_thread = Thread(target=self.response_daemon)
         self.response_thread.start()
 
-    def enqueue(self, *requests: trtllm.Request) -> Generator[int]:
+    def enqueue(self, *requests: trtllm.Request) -> Generator[Tuple[int, int]]:
         """Generate the next request identifier.
 
         Yields:
@@ -227,17 +240,14 @@ class ExecutorManager:
 
         def _process_response() -> None:
             responses = self.executor.await_responses(timeout=timedelta(
-                milliseconds=1))
+                microseconds=0.00000000000001))
             now = monotonic_ns()
-            for response in responses:
-                # logger.info("Pushing response to queue")
-                self.responses.put(
-                    ResponseRecord(
-                        timestamp=now,
-                        request_id=response.request_id,
-                        has_error=response.has_error(),
-                        is_final=response.result.is_final,
-                        output_tokens=response.result.output_token_ids[0]))
+            if len(responses) > 0:
+                self.responses.put([
+                    ResponseTuple(now, r.request_id, r.result.is_final,
+                                  r.has_error(), r.result.output_token_ids[0])
+                    for r in responses
+                ])
 
         while not self._shutdown.is_set():
             _process_response()
@@ -259,6 +269,7 @@ class ThroughputBenchmark:
         runtime_cfg: RuntimeConfig,
         request_queue: mp.Queue,
         response_queue: mp.Queue,
+        streaming: bool,
     ) -> None:
         """Initialize the throughput benchmark.
 
@@ -280,6 +291,7 @@ class ThroughputBenchmark:
 
         # Runtime configuration for Executor
         self.runtime_config = deepcopy(runtime_cfg)
+        self.streaming = streaming
         self.executor = None
 
         # Request and response reporting structures
@@ -364,8 +376,17 @@ class ThroughputBenchmark:
                                                  new_request[2])
 
             while not self.response_queue.empty():
-                response: ResponseRecord = self.response_queue.get_nowait()
-                self.statistics.register_response(response)
+                responses: Tuple[
+                    int,
+                    List[trtllm.Response]] = self.response_queue.get_nowait()
+                for response in responses:
+                    self.statistics.register_response(
+                        response.request_id,
+                        response.timestamp,
+                        response.final,
+                        response.error,
+                        response.tokens,
+                    )
 
         logger.info("Collecting live stats...")
         # TODO: Revisit this conditional, if the request rate is slow enough this
@@ -382,7 +403,7 @@ class ThroughputBenchmark:
         self.parsing_complete.set()
         logger.info("Ending statistics collection.")
 
-    def report_statistics(self) -> None:
+    def report_statistics(self) -> BenchmarkStatistics:
         """Report internal statistics about benchmark."""
 
         config_path = self.runtime_config.engine_dir / "config.json"
@@ -395,8 +416,8 @@ class ThroughputBenchmark:
         pretrain_cfg = engine_config["pretrained_config"]
         total_latency_s = stats.total_latency_ns / 1.0e9
 
-        logger.info(
-            "\n===========================================================\n"
+        logging_info = (
+            "\n\n===========================================================\n"
             "= ENGINE DETAILS\n"
             "===========================================================\n"
             f"Model:\t\t\t{rt_cfg.model}\n"
@@ -416,16 +437,34 @@ class ThroughputBenchmark:
             f"Max Runtime Batch Size:\t{rt_cfg.settings_config.max_batch_size}\n"
             f"Max Runtime Tokens:\t{rt_cfg.settings_config.max_num_tokens}\n"
             f"Scheduling Policy:\t{rt_cfg.settings_config.scheduler_policy.values[1]}\n"
-            f"KV Memory Percentage:\t{rt_cfg.settings_config.kv_cache_percent * 100.0}%\n"
-            f"Issue Rate (req/sec):\t{stats.issue_rate_ns * 1e9}"
+            f"KV Memory Percentage:\t{rt_cfg.settings_config.kv_cache_percent * 100.0:.2f}%\n"
+            f"Issue Rate (req/sec):\t{stats.issue_rate_ns * 1e9:.4E}\n"
             f"\n"
             "===========================================================\n"
-            "= STATISTICS\n"
+            "= PERFORMANCE OVERVIEW \n"
             "===========================================================\n"
             f"Number of requests:\t\t{stats.num_requests}\n"
-            f"Average Input Length (tokens):\t{stats.average_input_length}\n"
-            f"Average Output Length (tokens):\t{stats.average_output_length}\n"
-            f"Token Throughput (tokens/sec):\t{stats.total_output_tokens / total_latency_s}\n"
-            f"Request Throughput (req/sec):\t{stats.num_requests / total_latency_s}\n"
-            f"Total Latency (seconds):\t{total_latency_s}\n"
-            "===========================================================\n")
+            f"Average Input Length (tokens):\t{stats.average_input_length:.4f}\n"
+            f"Average Output Length (tokens):\t{stats.average_output_length:.4f}\n"
+            f"Token Throughput (tokens/sec):\t{stats.total_output_tokens / total_latency_s:.4f}\n"
+            f"Request Throughput (req/sec):\t{stats.num_requests / total_latency_s:.4f}\n"
+            f"Total Latency (ms):\t\t{stats.total_latency_ns * 1.0e-6:.4f}\n")
+
+        if self.streaming:
+            logging_info = (
+                f"{logging_info}"
+                "\n"
+                "===========================================================\n"
+                "= STREAMING STATISTICS \n"
+                "===========================================================\n"
+                f"Average request latency (ms):\t\t{stats.request_percentiles.average * 1.0e-6:.4f}\n"
+                f"Average time-to-first-token (ms):\t{stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
+                f"Average inter-token latency (ms):\t{stats.itl_percentiles.average * 1.0e-6:.4f}\n"
+            )
+
+        logging_info = (
+            f"{logging_info}"
+            "\n===========================================================\n")
+
+        logger.info(logging_info)
+        return stats

@@ -105,7 +105,7 @@ public:
         int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
         nvinfer1::DataType weight_type, nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode,
         bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
-        MOEExpertScaleNormalizationMode normalization_mode, bool force_determinism,
+        MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
         MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
         LoraPluginProfilerPtr lora_profiler, int max_low_rank);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
@@ -166,6 +166,7 @@ private:
     bool mUseBias{};
     MOEParallelismConfig mParallelismConfig{};
     MOEExpertScaleNormalizationMode mNormalizationMode{};
+    float mSparseMixerEpsilon = false;
 
     GemmDims mDims{};
     bool mUseDeterministicKernels = false;
@@ -216,8 +217,8 @@ private:
     WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
-    kernels::QuantParams getQuantParams(
-        void const* scale_1, void const* scale_2, void const* scale_3 = nullptr, void const* scale_4 = nullptr) const;
+    kernels::QuantParams getQuantParams(void const* scale_1, void const* scale_2, void const* scale_3 = nullptr,
+        void const* scale_4 = nullptr, void const* scale_5 = nullptr) const;
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
     kernels::LoraParams getLoraParams(
@@ -333,9 +334,14 @@ private:
         return getExpertFP8Dequant2Index() + hasExpertFp8FinalQuantScales();
     }
 
+    IndexType getInputFP8DequantIndex() const
+    {
+        return getExpertFP8QuantFinalIndex() + (hasExpertFp8QuantScales() && hasLora());
+    }
+
     IndexType getLoraFC1WeightPtrsIndex() const
     {
-        return getExpertFP8QuantFinalIndex() + hasLora();
+        return getInputFP8DequantIndex() + hasLora();
     }
 
     IndexType getLoraFC1RanksIndex() const

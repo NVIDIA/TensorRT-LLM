@@ -22,18 +22,15 @@
 #include <vector>
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/kernels/samplingTopKKernels.h"
+#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tests/layers/randomLlm.h"
 
@@ -42,7 +39,6 @@ namespace tensorrt_llm::tests::layers
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
 
-namespace tk = tensorrt_llm::kernels;
 namespace trk = tensorrt_llm::runtime::kernels;
 
 using TensorPtr = runtime::ITensor::SharedPtr;
@@ -204,13 +200,13 @@ private:
 
     void newRequests(std::vector<SizeType32> requestIds);
 
-    void manageBatch(void);
+    void manageBatch();
 
-    void llmForward(void);
+    void llmForward();
 
-    void decodeForward(void);
+    void decodeForward();
 
-    void verifyDecode(void);
+    void verifyDecode();
 
 protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
@@ -220,7 +216,6 @@ protected:
 
     TensorPtr mAlgoConfigBatch;
 
-    TensorPtr mFinished;
     TensorPtr mOutputIds;
     TensorPtr mSequenceLengths;
     TensorPtr mProbs;
@@ -230,14 +225,19 @@ protected:
     TensorPtr mBatchSlots;
     TensorPtr mBatchSlotsMax;
 
+    TensorPtr mNewTokens;
     TensorPtr mNumNewTokens;
-    TensorPtr mKNumNewTokensCumSum;
+    TensorPtr mNumNewTokensCumSum;
     TensorPtr mPathsOffsets;
     TensorPtr mDraftLengths;
     TensorPtr mDraftTokens;
-    TensorPtr mDraftPosIds;
     TensorPtr mPackedMasks;
     TensorPtr mPackedMasksBool;
+    TensorPtr mGenerationLengths;
+    TensorPtr mGenerationLengthsMax;
+    TensorPtr mPositionOffsets;
+    TensorPtr mPositionIds;
+    TensorPtr mAttentionPackedMask;
 
     TensorPtr mInputTokensBatch;
     TensorPtr mPositionIdsBatch;
@@ -250,6 +250,7 @@ protected:
     std::vector<TensorPtr> mPrompt;
     std::vector<std::shared_ptr<RandomLlm>> mLlm;
     std::shared_ptr<LookaheadDecodingLayer<float>> mDecoder;
+    std::shared_ptr<DecodingLayerWorkspace> mDecodingWorkspace;
     SizeType32 mVocabSize;
     SizeType32 mMaxTokensPerStep;
     TestParam mTestParam;
@@ -264,7 +265,7 @@ void LookaheadDecodingLayerTest::SetUp()
     mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
     mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
 
-    int32_t device;
+    int32_t device = 0;
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&mDeviceProp, device);
 
@@ -279,9 +280,10 @@ void LookaheadDecodingLayerTest::allocateBuffers()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const maxBatchSize = mTestParam.maxBatchSize;
     auto const vocabSize = mAscii->getVocabSize();
+    auto const maxBeamSize = 1;
 
-    SizeType32 maxNumNewTokens, maxDraftLen;
-    std::tie(mMaxTokensPerStep, maxNumNewTokens, maxDraftLen, std::ignore)
+    SizeType32 maxNumNewTokens, maxDraftLen, maxAcceptedDraftLen;
+    std::tie(mMaxTokensPerStep, maxNumNewTokens, maxDraftLen, maxAcceptedDraftLen)
         = executor::LookaheadDecodingConfig(mTestParam.maxW, mTestParam.maxN, mTestParam.maxG)
               .calculateSpeculativeResource();
     //    mMaxTokensPerStep = maxTokensPerStep;
@@ -348,12 +350,11 @@ void LookaheadDecodingLayerTest::allocateBuffers()
 
     mAlgoConfigBatch = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, 3}), nvinfer1::DataType::kINT32);
 
-    mFinished = BufferManager::pinnedPool(maxBatchShape1D, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mEndIds = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mTokensPerStep = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
     mOutputIds = BufferManager::pinnedPool(
-        ITensor::makeShape({maxBatchSize, mMaxSeqLen + mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+        ITensor::makeShape({maxBatchSize, maxBeamSize, mMaxSeqLen + mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
     mSequenceLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
     mProbs = BufferManager::pinnedPool(
@@ -366,21 +367,27 @@ void LookaheadDecodingLayerTest::allocateBuffers()
     mPositionIdsBatch
         = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
 
+    mNewTokens = BufferManager::pinnedPool(
+        ITensor::makeShape({mMaxTokensPerStep, maxBatchSize, 1}), nvinfer1::DataType::kINT32);
     mNumNewTokens = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mDraftTokens
         = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
-    mDraftPosIds
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
-    auto divUp32 = [](SizeType32 x) { return x / 32 + ((x % 32) ? 1 : 0); };
-    mPackedMasks = BufferManager::pinnedPool(
-        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, divUp32(mMaxTokensPerStep)}), nvinfer1::DataType::kINT32);
+    auto packedMaskShape = ITensor::makeShape(
+        {maxBatchSize, mMaxTokensPerStep, static_cast<ITensor::DimType64>(common::divUp(mMaxTokensPerStep, 32))});
+    mPackedMasks = BufferManager::pinnedPool(packedMaskShape, nvinfer1::DataType::kINT32);
     mPackedMasksBool = BufferManager::pinnedPool(
         ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, mMaxTokensPerStep}), nvinfer1::DataType::kBOOL);
-    mKNumNewTokensCumSum
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
-    mPathsOffsets
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxNumNewTokens}), nvinfer1::DataType::kINT32);
+    mNumNewTokensCumSum = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
+    mPathsOffsets = BufferManager::pinnedPool(
+        ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
+    mGenerationLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mGenerationLengthsMax = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mPositionOffsets
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+    mPositionIds
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+    mAttentionPackedMask = BufferManager::pinnedPool(packedMaskShape, nvinfer1::DataType::kINT32);
 
     mBatchSlotsMax = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
 
@@ -390,12 +397,12 @@ void LookaheadDecodingLayerTest::allocateBuffers()
 
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
 
-    trk::invokeFill(*mFinished, uint8_t{0}, *mStream);
     trk::invokeFill(*mEndIds, mAscii->getEndToken(), *mStream);
     trk::invokeFill(*mOutputIds, int32_t{0}, *mStream);
     trk::invokeFill(*mSequenceLengths, int32_t{0}, *mStream);
-    // trk::invokeFill(*mGeneratedLengths, int32_t{0}, *mStream);
     trk::invokeFill(*mTokensPerStep, mMaxTokensPerStep, *mStream);
+    mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        mBufferManager, decodingDomain, TRTDataType<float>::value, mDecoder->getWorkspaceSize());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -419,7 +426,7 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
         TokenIdType contextToken = mOracle[gbi][len];
         SizeType32 contextLen = len + 1;
 
-        BufferRange<TokenIdType> outputRange(*ITensor::at(mOutputIds, {gbi}));
+        BufferRange<TokenIdType> outputRange(*ITensor::at(mOutputIds, {gbi, 0}));
         for (auto& v : outputRange)
         {
             v = 0;
@@ -430,7 +437,7 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
         BufferLocation<TokenIdType>(*mDraftLengths).at(gbi) = 0;
         BufferLocation<SizeType32>(*mNumNewTokens).at(gbi) = 0;
 
-        mPrompt[gbi] = ITensor::slice(mOutputIds, {gbi, 0}, len + 1);
+        mPrompt[gbi] = ITensor::slice(mOutputIds, {gbi, 0, 0}, len + 1);
 
         for (auto& v : BufferRange<SizeType32>(*mHistogram[gbi]))
         {
@@ -455,23 +462,32 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
         setupParams->prompt.emplace_back(mPrompt[gbi]);
         setupParams->algoConfigs.emplace_back(mTestParam.w, mTestParam.n, mTestParam.g);
         PRINT_TOKENS(setupParams->prompt[bi]);
+        setupParams->generationLengths = mGenerationLengthsMax;
+        setupParams->actualGenerationLengths = mGenerationLengths;
+        setupParams->positionOffsets = mPositionOffsets;
+        // setupParams->outputs.positionIds = mPositionIds;
+        setupParams->attentionPackedMasks = mPackedMasks;
     }
     std::vector<uint64_t> seed(requestIds.begin(), requestIds.end());
     setupParams->randomSeed = std::make_optional(seed);
     TensorPtr newRequestSlots = ITensor::slice(mBatchSlotsMax, batchSize, requestSize);
     PRINT_VALUES(newRequestSlots);
     PRINT_VALUES(mBatchSlotsMax);
-    mDecoder->setup(requestSize, beamSize, newRequestSlots, setupParams);
+    mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
+    mDecodingWorkspace->setDeviceBatchSlots(newRequestSlots);
+    mDecoder->setup(requestSize, beamSize, newRequestSlots, setupParams, mDecodingWorkspace);
+
+    PRINT_VALUES(mPositionOffsets);
 
     batchSize += requestIds.size();
     mBatchSlots = ITensor::slice(mBatchSlotsMax, 0, batchSize);
-    TLLM_LOG_DEBUG("newwRequests mBatchSlots %s", D(mBatchSlots).values<int32_t>().c_str());
+    TLLM_LOG_DEBUG("new Requests mBatchSlots %s", D(mBatchSlots).values<int32_t>().c_str());
     PRINT_VALUES(mSequenceLengths);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadDecodingLayerTest::manageBatch(void)
+void LookaheadDecodingLayerTest::manageBatch()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const maxBatchSize = mTestParam.maxBatchSize;
@@ -493,7 +509,7 @@ void LookaheadDecodingLayerTest::manageBatch(void)
         SizeType32 gbi = batchSlotsRange[bi];
         SizeType32 nbi = newBatchSize;
 
-        TensorPtr theSequence = ITensor::at(mOutputIds, {gbi});
+        TensorPtr theSequence = ITensor::at(mOutputIds, {gbi, 0});
         BufferRange<SizeType32> theSequenceRange(*theSequence);
         auto theSequenceLength = BufferRange<SizeType32>(*mSequenceLengths)[gbi];
         auto theNumNewTokens = BufferRange<SizeType32>(*mNumNewTokens)[gbi];
@@ -520,19 +536,16 @@ void LookaheadDecodingLayerTest::manageBatch(void)
         }
 
         auto theDraftLen = BufferRange<SizeType32>(*mDraftLengths)[gbi];
-        BufferLocation<SizeType32>(*mTokensPerStep).at(gbi) = 1 + theDraftLen;
+        auto theGenerationLength = BufferRange<SizeType32>(*mGenerationLengths)[gbi];
+        TLLM_CHECK_DEBUG_WITH_INFO(
+            theDraftLen + 1 == theGenerationLength, "%d + 1 == %d", theDraftLen, theGenerationLength);
+        BufferLocation<SizeType32>(*mTokensPerStep).at(gbi) = theGenerationLength;
 
-        BufferLocation<SizeType32>(*mPositionIdsBatch).at(nbi, 0) = theSequenceLength - 1;
         BufferLocation<TokenIdType>(*mInputTokensBatch).at(nbi, 0) = theSequenceRange[theSequenceLength - 1];
-
-        TLLM_LOG_DEBUG("W=%d, N=%d, G=%d, w=%d, n=%d, g=%d, draftLen = %d", mTestParam.maxW, mTestParam.maxN,
-            mTestParam.maxG, mTestParam.w, mTestParam.n, mTestParam.g, theDraftLen);
-        PRINT_VALUES(mInputTokensBatch);
-
         mBufferManager->copy(*ITensor::slice(mDraftTokens, {gbi, 0}, theDraftLen),
             *ITensor::slice(mInputTokensBatch, {nbi, 1}, theDraftLen));
-        mBufferManager->copy(*ITensor::slice(mDraftPosIds, {gbi, 0}, theDraftLen),
-            *ITensor::slice(mPositionIdsBatch, {nbi, 1}, theDraftLen));
+        mBufferManager->copy(*ITensor::slice(mPositionIds, {gbi, 0}), *ITensor::slice(mPositionIdsBatch, {nbi, 0}));
+        BufferLocation<SizeType32>(*mPositionIdsBatch).at(nbi, 0) = theSequenceLength - 1;
 
         TLLM_LOG_DEBUG("W=%d, N=%d, G=%d, w=%d, n=%d, g=%d, draftLen = %d", mTestParam.maxW, mTestParam.maxN,
             mTestParam.maxG, mTestParam.w, mTestParam.n, mTestParam.g, theDraftLen);
@@ -589,26 +602,47 @@ void convertBoolToInt32(TensorPtr const& dst, TensorConstPtr const& src)
     }
 }
 
-void LookaheadDecodingLayerTest::llmForward(void)
+void LookaheadDecodingLayerTest::llmForward()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
-    PRINT_VALUES(mBatchSlots);
 
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         auto gbi = BufferRange<SizeType32>(*mBatchSlots)[bi];
+        auto start = BufferRange<SizeType32>(*mSequenceLengths)[gbi] - 1;
         auto len = BufferRange<SizeType32>(*mTokensPerStep)[gbi];
+        TLLM_LOG_DEBUG("LookaheadDecodingLayerTest::llmForward input len=%d", len);
         TensorPtr output = ITensor::slice(mProbs, {bi, 0}, len);
         TensorPtr golden = ITensor::slice(mGoldenSampledTokens, {gbi, 0}, len);
 
-        convertInt32ToBool(ITensor::at(mPackedMasksBool, {gbi}), ITensor::at(mPackedMasks, {gbi}));
+        BufferRange<SizeType32> idRange(*ITensor::slice(mPositionIdsBatch, {bi, 0}, len));
+        BufferRange<SizeType32> offsetRange(*ITensor::slice(mPositionOffsets, {gbi, 0}, len));
+        PRINT_VALUES(ITensor::slice(mPositionIdsBatch, {bi, 0}));
+        PRINT_VALUES(ITensor::slice(mPositionOffsets, {bi, 0}));
+        for (auto i = 0; i < idRange.size(); i++)
+        {
+            TLLM_CHECK(idRange[i] == start + offsetRange[i]);
+        }
 
-        mLlm[gbi]->forward(output,                           //
-            ITensor::slice(mInputTokensBatch, {bi, 0}, len), //
-            ITensor::slice(mPositionIdsBatch, {bi, 0}, len), //
-            ITensor::at(mPackedMasksBool, {gbi}));
+        if (false)
+        {
+            convertInt32ToBool(ITensor::at(mPackedMasksBool, {gbi}), ITensor::at(mPackedMasks, {gbi}));
+            mLlm[gbi]->forward(output,                           //
+                ITensor::slice(mInputTokensBatch, {bi, 0}, len), //
+                ITensor::slice(mPositionIdsBatch, {bi, 0}, len), //
+                ITensor::at(mPackedMasksBool, {gbi}));
+        }
+        else
+        {
+            convertInt32ToBool(ITensor::at(mPackedMasksBool, {gbi}), ITensor::at(mPackedMasks, {gbi}));
+            mLlm[gbi]->forward(output,                           //
+                start,                                           //
+                ITensor::slice(mInputTokensBatch, {bi, 0}, len), //
+                ITensor::slice(mPositionOffsets, {gbi, 0}, len), //
+                ITensor::at(mPackedMasksBool, {gbi}));
+        }
 
         mAscii->logitsToTensor(golden, output);
         TLLM_LOG_DEBUG("batch[%d] LLM golden: '%s'", gbi, D(golden).tokens().c_str());
@@ -617,7 +651,7 @@ void LookaheadDecodingLayerTest::llmForward(void)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadDecodingLayerTest::decodeForward(void)
+void LookaheadDecodingLayerTest::decodeForward()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -627,64 +661,84 @@ void LookaheadDecodingLayerTest::decodeForward(void)
     auto inputParams = std::make_shared<LookaheadDecodingInputs>(mEndIds, mBatchSlots);
     inputParams->localBatchSize = batchSize;
     inputParams->logits = ITensor::slice(mProbs, 0, batchSize);
-    inputParams->finished = mFinished; // TODO(liweim) ask finished protocol
+    inputParams->batchSlots = mBatchSlots;
     inputParams->curTokensPerStep = mTokensPerStep;
 
-    auto outputParams = std::make_shared<SpeculativeDecodingOutputs>(mOutputIds);
+    auto outputParams = std::make_shared<LookaheadDecodingOutputs>(mOutputIds);
 
     PRINT_VALUES(mSequenceLengths);
     outputParams->sequenceLength = mSequenceLengths;
-    outputParams->finished = mFinished;
     outputParams->nextDraftLengths = mDraftLengths;
     outputParams->nextDraftTokens = mDraftTokens;
-    outputParams->nextDraftPosIds = mDraftPosIds;
     outputParams->packedMasks = mPackedMasks;
     outputParams->numNewTokens = mNumNewTokens;
-    outputParams->numNewTokensCumSum = mKNumNewTokensCumSum;
+    outputParams->newTokens = mNewTokens;
+    outputParams->numNewTokensCumSum = mNumNewTokensCumSum;
     outputParams->pathsOffsets = mPathsOffsets;
+    outputParams->generationLengths = mGenerationLengthsMax;
+    outputParams->actualGenerationLengths = mGenerationLengths;
+    outputParams->positionOffsets = mPositionOffsets;
+    outputParams->positionIds = mPositionIds;
+    outputParams->packedMasks = mPackedMasks;
 
     PRINT_VALUES(mTokensPerStep);
 
-    mDecoder->forwardAsync(outputParams, inputParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mDecoder->forwardAsync(outputParams, inputParams, mDecodingWorkspace);
 
     mStream->synchronize();
 
-    mDecoder->forwardSync(outputParams, inputParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mDecoder->forwardSync(outputParams, inputParams, mDecodingWorkspace);
 
     mStream->synchronize();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LookaheadDecodingLayerTest::verifyDecode(void)
+void LookaheadDecodingLayerTest::verifyDecode()
 {
     auto batchSize = ITensor::volume(mBatchSlots->getShape());
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
         auto gbi = BufferRange<SizeType32>(*mBatchSlots)[bi];
         auto len = BufferRange<SizeType32>(*mTokensPerStep)[gbi];
-        TensorPtr golden = ITensor::slice(mGoldenSampledTokens, {gbi, 0}, len);
         auto sequenceLength = BufferLocation<SizeType32>(*mSequenceLengths).at(gbi);
-        auto numNewTokens = BufferLocation<SizeType32>(*mNumNewTokens).at(gbi);
-        TensorPtr newTokens = ITensor::slice(mOutputIds, {gbi, sequenceLength - numNewTokens}, numNewTokens);
-        TensorPtr pathOffsets = ITensor::slice(mPathsOffsets, {gbi, 0}, numNewTokens);
 
-        BufferRange<TokenIdType> goldenRange(*golden);
-        BufferRange<TokenIdType> newTokensRange(*newTokens);
-        BufferRange<SizeType32> offsetsRange(*pathOffsets);
-        for (SizeType32 i = 0; i < newTokensRange.size(); i++)
+        auto draftLength = BufferLocation<SizeType32>(*mDraftLengths).at(gbi);
+        auto generationLength = BufferLocation<SizeType32>(*mGenerationLengths).at(gbi);
+        BufferRange<SizeType32> posOffsetRange(*ITensor::slice(mPositionOffsets, {gbi, 0}, generationLength));
+        BufferRange<SizeType32> posIdRange(*ITensor::slice(mPositionIds, {gbi, 0}, generationLength));
+        TLLM_LOG_DEBUG("generationLength = %d, draftLength = %d", generationLength, draftLength);
+        TLLM_CHECK(draftLength + 1 == generationLength);
+        TLLM_CHECK(posOffsetRange[0] == 0);
+        TLLM_CHECK(posIdRange[0] == sequenceLength - 1);
+        for (SizeType32 i = 0; i < posIdRange.size(); i++)
         {
-            TLLM_CHECK(goldenRange[offsetsRange[i]] == newTokensRange[i]);
+            TLLM_CHECK(posIdRange[i] == posOffsetRange[i] + sequenceLength - 1);
         }
     }
-    BufferRange<SizeType32> cumSumRange(*mKNumNewTokensCumSum);
-    SizeType32 sum = 0;
-    TLLM_CHECK(cumSumRange[0] == sum);
+
+    BufferRange<SizeType32> cumSumRange(*mNumNewTokensCumSum);
+    BufferRange<SizeType32> pathOffsetsRange(*mPathsOffsets);
+    PRINT_VALUES(mNumNewTokensCumSum);
     for (SizeType32 gbi = 0; gbi < mTestParam.maxBatchSize; gbi++)
     {
+        SizeType32 pathOffsetBegin = cumSumRange[gbi];
+        SizeType32 pathOffsetEnd = cumSumRange[gbi + 1];
+        TensorPtr golden = ITensor::at(mGoldenSampledTokens, {gbi});
+        auto sequenceLength = BufferLocation<SizeType32>(*mSequenceLengths).at(gbi);
         auto numNewTokens = BufferLocation<SizeType32>(*mNumNewTokens).at(gbi);
-        sum += numNewTokens;
-        TLLM_CHECK(cumSumRange[gbi + 1] == sum);
+        TensorPtr newTokens = ITensor::slice(mOutputIds, {gbi, 0, sequenceLength - numNewTokens}, numNewTokens);
+        BufferRange<SizeType32> goldenRange(*ITensor::at(mGoldenSampledTokens, {gbi}));
+        BufferRange<TokenIdType> newTokensRange(
+            *ITensor::slice(mOutputIds, {gbi, 0, sequenceLength - numNewTokens}, numNewTokens));
+
+        SizeType32 ni = 1;
+        for (SizeType32 poi = pathOffsetBegin; poi < pathOffsetEnd; poi++)
+        {
+            TLLM_CHECK(goldenRange[pathOffsetsRange[poi] + 1] == newTokensRange[ni++]);
+        }
     }
 }
 

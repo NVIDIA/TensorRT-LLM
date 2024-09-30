@@ -66,9 +66,13 @@ def test_model_config():
     model_config.use_packed_input = True
     assert model_config.use_packed_input
 
-    assert not model_config.use_paged_kv_cache
-    model_config.use_paged_kv_cache = True
-    assert model_config.use_paged_kv_cache
+    assert model_config.kv_cache_type is not None
+    for enum_val in [
+            _tb.KVCacheType.CONTINUOUS, _tb.KVCacheType.PAGED,
+            _tb.KVCacheType.DISABLED
+    ]:
+        model_config.kv_cache_type = enum_val
+        assert model_config.kv_cache_type == enum_val
 
     assert model_config.tokens_per_block == 64
     tokens_per_block = 1024
@@ -262,6 +266,7 @@ def test_llm_request():
         "max_new_tokens": 5,
         "sampling_config": sampling_config,
         "input_tokens": [0, 1, 2],
+        "position_ids": [0, 1, 2],
         "is_streaming": True,
         "pad_id": 99,
         "end_id": 100,
@@ -295,6 +300,7 @@ def test_llm_request():
     assert llm_request.get_token(1, 2) == 2
     assert llm_request.get_tokens(1) == [0, 1, 2]
     assert llm_request.max_num_generated_tokens == 0
+    assert llm_request.position_ids == [0, 1, 2]
 
     llm_request.add_new_token(42, 0)
     assert llm_request.get_token(0, 3) == 42
@@ -354,6 +360,9 @@ def test_inference_request():
 
     ir = _tb.InferenceRequest(42, logits_post_processor)
     setattr(ir, _tb.tensor_names.INPUT_IDS, input_ids)
+
+    ir.position_ids = torch.tensor((0, 1), dtype=torch.int32)
+    torch.equal(ir.position_ids, torch.tensor((0, 1), dtype=torch.int32))
 
     assert ir.request_id == 42
     assert ir.input_ids is not None
@@ -474,7 +483,7 @@ def test_inference_request():
 def test_trt_gpt_model_optional_params():
     opt_params = _tb.TrtGptModelOptionalParams()
 
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
+    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
     opt_params.kv_cache_config = kv_cache_config
     assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
 
@@ -513,7 +522,7 @@ def test_trt_gpt_model_optional_params():
 
 
 def test_trt_gpt_model_optional_params_ctor():
-    kv_cache_config = _tb.KvCacheConfig(10, 10, 0, 0.5, False)
+    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
     enable_trt_overlap = True
     device_ids = [0, 1]
     normalize_log_probs = False

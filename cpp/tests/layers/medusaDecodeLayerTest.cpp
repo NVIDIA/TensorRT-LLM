@@ -185,6 +185,9 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
             mBufferManager->copy(*logitsHeadHostView, *logitsHeadBatchDeviceView);
         }
     }
+
+    mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        mBufferManager, decodingDomain, TRTDataType<T>::value, mMedusaDecodingLayer->getWorkspaceSize());
 }
 
 template <typename T>
@@ -252,8 +255,8 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     setupParams->runtimeTopK = std::make_optional<std::vector<SizeType32>>(params.runtimeTopK);
     setupParams->runtimeHeadsTopK = std::make_optional<std::vector<std::vector<SizeType32>>>(params.runtimeHeadsTopK);
     setupParams->randomSeed = {{0}};
-
-    mMedusaDecodingLayer->setup(mBatchSize, 1, mBatchSlots, setupParams);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mMedusaDecodingLayer->setup(mBatchSize, 1, mBatchSlots, setupParams, mDecodingWorkspace);
 
     mStream->synchronize();
 }
@@ -394,7 +397,8 @@ void MedusaDecodingLayerTest<T>::runTest(std::vector<std::vector<std::set<TokenI
     auto inputTensors = createInputTensors();
     auto outputTensors = createOutputTensors();
 
-    mMedusaDecodingLayer->forwardAsync(outputTensors, inputTensors);
+    mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
+    mMedusaDecodingLayer->forwardAsync(outputTensors, inputTensors, mDecodingWorkspace);
 
     mStream->synchronize();
 

@@ -95,7 +95,7 @@ class MpiPoolSession(MpiSession):
 
     def shutdown(self):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown()
+            self.mpi_pool.shutdown(wait=False)
             self.mpi_pool = None
 
     def _start_mpi_pool(self):
@@ -155,7 +155,7 @@ class MpiCommSession(MpiSession):
 
     def shutdown(self):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown()
+            self.mpi_pool.shutdown(wait=False)
             self.mpi_pool = None
 
     def _start_mpi_pool(self):

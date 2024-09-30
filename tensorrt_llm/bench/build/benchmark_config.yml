@@ -44,6 +44,11 @@ meta-llama/Meta-Llama-3-8B:
     general:
       max_batch_size: 2048
       max_num_tokens: 8192
+meta-llama/Meta-Llama-3.1-8B:
+  tp1_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 8192
 meta-llama/Meta-Llama-3-70B:
   tp1_pp1:
     general:
@@ -64,12 +69,56 @@ meta-llama/Meta-Llama-3-70B:
     general:
       max_batch_size: 8192
       max_num_tokens: 16384
+meta-llama/Meta-Llama-3.1-70B:
+  tp1_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 2048
+  tp2_pp1:
+    general:
+      max_batch_size: 256
+      max_num_tokens: 1024
+    4096:
+      max_batch_size: 2048
+      max_num_tokens: 1024
+  tp4_pp1:
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 1024
+  tp8_pp1:
+    general:
+      max_batch_size: 8192
+      max_num_tokens: 16384
+meta-llama/Meta-Llama-3.1-405B:
+  tp8_pp1:
+    general:
+      max_batch_size: 320
+      max_num_tokens: 5440
+    256:
+      max_batch_size: 2048
+      max_num_tokens: 4096
+    2500:
+      max_batch_size: 320
+      max_num_tokens: 512
+    4096:
+      max_batch_size: 192
+      max_num_tokens: 512
+    5500:
+      max_batch_size: 192
+      max_num_tokens: 512
+    22000:
+      max_batch_size: 64
+      max_num_tokens: 768
 mistralai/Mixtral-8x7B-v0.1:
   tp2_pp1:
     general:
       max_batch_size: 2048
       max_num_tokens: 3072
   tp4_pp1:
+    general:
+      max_batch_size: 8192
+      max_num_tokens: 8192
+  tp8_pp1:
     general:
       max_batch_size: 8192
       max_num_tokens: 8192

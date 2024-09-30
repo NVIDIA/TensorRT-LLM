@@ -289,6 +289,8 @@ private:
 
     TokenGeneratedCallback createOnTokenGeneratedCallback(GenerationOutput& outputs);
 
+    bool shouldUseKVCacheManager() const;
+
     class CudaGraphExecutor
     {
     public:
@@ -367,6 +369,7 @@ private:
     std::shared_ptr<AllReduceBuffers> mAllReduceBuffers;
 
     SizeType32 mDecoderMaxSequenceLength{};
+    std::vector<SizeType32> mDecoderMaxAttentionWindowVec{};
     SizeType32 mDecoderMaxAttentionWindow{};
     SizeType32 mDecoderSinkTokenLength{};
 

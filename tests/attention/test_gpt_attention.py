@@ -58,8 +58,8 @@ class TestFunctional(unittest.TestCase):
         test_cases += list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
                     [ContextFMHAType.disabled], ['float16', 'bfloat16'], [None],
-                    [2], [128], [4], [64], [0], [False], [False], [1, 4],
-                    [True, False], [True, False]))
+                    [2], [128], [4], [64], [0], [False], [1, 4], [True, False],
+                    [True, False]))
 
         # Test cases for input padding
         test_cases += list(
@@ -67,15 +67,15 @@ class TestFunctional(unittest.TestCase):
                 ContextFMHAType.disabled,
                 ContextFMHAType.enabled,
             ], ['float16', 'bfloat16'], [None], [2], [128], [4], [64], [False],
-                    [False], [False, True], [1], [False], [False]))
+                    [False, True], [1], [False], [False]))
 
         # Test cases for fused context MHAs
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
-                    [32, 64, 80, 96, 104, 112, 128], [0], [False],
-                    [False, True], [1], [False], [False]))
+                    [32, 64, 80, 96, 104, 112, 128], [0], [False, True], [1],
+                    [False], [False]))
 
         # Test cases for gptj rotary embedding.
         # The previous test cases have covered the gptneox rotary embedding.
@@ -83,15 +83,15 @@ class TestFunctional(unittest.TestCase):
             product(['gptj_attention'], [
                 ContextFMHAType.enabled,
             ], ['float16', 'bfloat16', 'float32'], [None], [2], [128], [32],
-                    [32, 64, 80, 96, 128], [0], [False], [False], [1],
-                    [True, False], [False]))
+                    [32, 64, 80, 96, 128], [0], [False], [1], [True, False],
+                    [False]))
 
         # Test cases of float32 d=256 case (for testing MMHA key loops).
         test_cases += list(
             product(['gptj_attention'], [
                 ContextFMHAType.enabled,
-            ], ['float32'], [None], [2], [128], [2], [256], [False], [False],
-                    [True], [1], [False], [True, False]))
+            ], ['float32'], [None], [2], [128], [2], [256], [False], [True],
+                    [1], [False], [True, False]))
 
         # # Test cases for the multi-block MMHA.
         # # NOTE: With long in_len=2048, beam_width=4 runs into OOM issue.
@@ -99,20 +99,20 @@ class TestFunctional(unittest.TestCase):
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [2], [2048], [4], [64], [0],
-                    [True], [False], [1], [False], [False]))
+                    [False], [1], [False], [False]))
 
         # Test cases for the multi-block MMHA (with large number of blocks per sequence).
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16', 'float32'], [None], [1], [4096], [1],
-                    [128], [0], [True], [False], [1], [False], [False]))
+                    [128], [0], [False], [1], [False], [False]))
 
         # Test cases for the 8-bit K/V cache.
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled],
                     ['float16', 'float32'], ['int8', 'fp8'], [2], [128], [4],
-                    [64], [0], [False], [False], [1, 4], [False], [False]))
+                    [64], [0], [False], [1, 4], [False], [False]))
 
         # test cases for multi-query attention
         test_cases += list(
@@ -120,17 +120,17 @@ class TestFunctional(unittest.TestCase):
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [2], [128], [4], [64], [1],
-                    [False], [False], [1, 4], [False], [False]))
+                    [False], [1, 4], [False], [False]))
 
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
                     ['bfloat16', 'float16'], [None], [2], [4], [8], [32],
-                    [2, 4], [False], [False], [1], [False], [False]))
+                    [2, 4], [False], [1], [False], [False]))
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.enabled], ['float32'],
-                    [None], [1], [165], [32], [128], [4], [False], [False], [1],
-                    [False], [False]))
+                    [None], [1], [165], [32], [128], [4], [False], [1], [False],
+                    [False]))
 
         # test cases for RoPE base and scaling
         test_cases += list(
@@ -144,7 +144,6 @@ class TestFunctional(unittest.TestCase):
                 [8],
                 [32],
                 [2, 4],
-                [False],
                 [False],
                 [1],
                 [False],
@@ -172,7 +171,6 @@ class TestFunctional(unittest.TestCase):
                 [128],
                 [4],
                 [False],
-                [False],
                 [1],
                 [False],
                 [False],
@@ -191,16 +189,16 @@ class TestFunctional(unittest.TestCase):
         # test cases for StreamingLLM
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.enabled], ['float16'],
-                    [None], [2], [128], [4], [64], [0], [False], [False],
-                    [1, 4], [True, False], [False], [10000.0], [None], [4]))
+                    [None], [2], [128], [4], [64], [0], [False], [1, 4],
+                    [True, False], [False], [10000.0], [None], [4]))
 
         # test cases for custom mask input.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
             ], ['float16', 'bfloat16'], [None], [4], [1056], [4], [32, 64, 128],
-                    [0], [False], [True], [1], [False], [False], [10000.0],
-                    [None], [0], [True]))
+                    [0], [True], [1], [False], [False], [10000.0], [None], [0],
+                    [True]))
 
         # add gpu_arch_lists for testing (help reducing workload if there are duplicates).
         test_cases = [("all", ) + case for case in test_cases]
@@ -220,7 +218,6 @@ class TestFunctional(unittest.TestCase):
                 [16],
                 [128],
                 [2],
-                [False, True],
                 [False],
                 [1],
                 [False, True],
@@ -242,7 +239,6 @@ class TestFunctional(unittest.TestCase):
                 [16],
                 [128],
                 [2],
-                [False, True],
                 [False],
                 [1],
                 [False, True],
@@ -266,7 +262,6 @@ class TestFunctional(unittest.TestCase):
                 [256],
                 [0],
                 [False],
-                [False],
                 [4],
                 [True],
                 [False],
@@ -283,7 +278,6 @@ class TestFunctional(unittest.TestCase):
                 [4],
                 [256],
                 [0],
-                [False],
                 [False],
                 [4],
                 [True],
@@ -313,7 +307,6 @@ class TestFunctional(unittest.TestCase):
                 [2, 8, 32],  # num_q_heads
                 [32, 64, 96, 128, 160],  # head_size
                 [2],  # num_kv_heads
-                [False],  # enable_multi_block_mmha
                 [False],
                 [1, 2, 4],  # beam_width
                 [False, True],  # paged_kv_cache
@@ -337,7 +330,6 @@ class TestFunctional(unittest.TestCase):
                 [32],
                 [128],
                 [2],
-                [False, True],
                 [False],
                 [1],
                 [False, True],
@@ -362,7 +354,6 @@ class TestFunctional(unittest.TestCase):
                            num_heads,
                            head_size,
                            num_kv_heads,
-                           enable_multi_block_mmha,
                            enable_remove_input_padding,
                            beam_width,
                            paged_kv_cache,
@@ -1091,8 +1082,8 @@ class TestFunctional(unittest.TestCase):
                     dtype=torch.int64,
                     device='cpu')
 
-                if enable_multi_block_mmha:
-                    context_host_runtime_perf_knobs[0] = 1  # multi_block_mode
+                context_host_runtime_perf_knobs[
+                    0] = 1  # multi_block_mode is default on
                 if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                     context_host_runtime_perf_knobs[
                         1] = 1  # enable_context_fmha_fp32_acc
@@ -1257,9 +1248,8 @@ class TestFunctional(unittest.TestCase):
                     dtype=torch.int64,
                     device='cpu')
 
-                if enable_multi_block_mmha:
-                    generation_host_runtime_perf_knobs[
-                        0] = 1  # multi_block_mode
+                generation_host_runtime_perf_knobs[
+                    0] = 1  # multi_block_mode is default on
                 if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                     generation_host_runtime_perf_knobs[
                         1] = 1  # enable_context_fmha_fp32_acc

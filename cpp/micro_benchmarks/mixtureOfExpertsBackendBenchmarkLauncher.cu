@@ -612,7 +612,7 @@ void help()
            "- \"bias\" - If bias should be used, 0 = no bias, 1 = bias\n"
            "- \"act_fn\" - The enum value of the activation function. See\n"
            "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
-           "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM. See\n"
+           "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM, 2 = SPARSE_MIXER. See\n"
            "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
            "- \"tactic_id, tactic_id1, tactic_id2\"\n"
            "The config for the CUTLASS GEMM. tactic_id sets the same tactic for both to the same tactic (except in "

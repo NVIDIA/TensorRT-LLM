@@ -418,6 +418,8 @@ class TestBloom(unittest.TestCase):
 
         bloom_config, hf_bloom = self._gen_hf_bloom(hidden_act, n_layer,
                                                     max_new_tokens, dtype)
+        if bloom_config.hidden_size // bloom_config.n_head < 32 and use_gpt_attention_plugin:
+            pytest.skip("unsupported head_size")
         runtime, engine_buffer = self._gen_tensorrt_llm_runtime(
             log_level,
             dtype,

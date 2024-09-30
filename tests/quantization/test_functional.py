@@ -52,6 +52,7 @@ class TestQuantizationFunctional(unittest.TestCase):
             device="cuda")
         scaling_factor_data = torch.tensor(0.4, dtype=torch.float32)
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         network = builder.create_network()
         if use_plugin:
             network.plugin_config.quantize_tensor_plugin = True

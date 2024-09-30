@@ -55,6 +55,7 @@ def create_gpt_attention_network(attention_type='gpt2_attention',
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         net.plugin_config.to_legacy_setting()
         net.plugin_config.gpt_attention_plugin = dtype

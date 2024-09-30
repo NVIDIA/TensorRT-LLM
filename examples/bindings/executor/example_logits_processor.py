@@ -53,7 +53,7 @@ def enqueue_requests(args: argparse.Namespace,
     for iter_id in range(args.batch_size):
         # Create the request.
         request = trtllm.Request(input_token_ids=prompt,
-                                 max_new_tokens=25,
+                                 max_tokens=25,
                                  end_id=tokenizer.eos_token_id,
                                  sampling_config=sampling_config,
                                  client_id=iter_id % 2)
@@ -179,12 +179,14 @@ if __name__ == "__main__":
 
     # Create the executor.
     executor_config = trtllm.ExecutorConfig(args.beam_width)
+    logits_proc_config = trtllm.LogitsPostProcessorConfig()
     if not args.lpp_batched:
-        executor_config.logits_post_processor_map = {
+        logits_proc_config.processor_map = {
             "my_logits_pp": logits_post_processor
         }
     else:
-        executor_config.logits_post_processor_batched = logits_post_processor_batched
+        logits_proc_config.processor_batched = logits_post_processor_batched
+    executor_config.logits_post_processor_config = logits_proc_config
     executor = trtllm.Executor(args.engine_path, trtllm.ModelType.DECODER_ONLY,
                                executor_config)
 

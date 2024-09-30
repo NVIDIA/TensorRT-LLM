@@ -115,6 +115,11 @@ template <typename T>
 void invokeCumsumLastDim(SizeType32 batchSize, SizeType32 inputLength, void const* __restrict__ input,
     void* __restrict__ output, void* deviceTempStorage, size_t tempStorageBytes, cudaStream_t stream)
 {
+    // For empty tensor support
+    if (batchSize == 0)
+    {
+        return;
+    }
 
     if (deviceTempStorage != nullptr) // we need to use DeviceScan
     {

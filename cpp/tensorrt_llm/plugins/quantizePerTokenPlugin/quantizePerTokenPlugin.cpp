@@ -203,7 +203,7 @@ int QuantizePerTokenPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
 #endif // ENABLE_FP8
 #endif // ENABLE_BF16
-
+    sync_check_cuda_error();
     return 0;
 }
 

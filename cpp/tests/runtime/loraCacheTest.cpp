@@ -167,7 +167,7 @@ TEST_F(LoraCacheTest, LoraCachePageManagerTest)
 TEST_F(LoraCacheTest, determineNumPages)
 {
     ModelConfig modelConfig(0, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
-    modelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2));
+    modelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2, 0));
     WorldConfig worldConfig(1, 1, 0);
 
     LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 12393, 40, 80, 16, 1);

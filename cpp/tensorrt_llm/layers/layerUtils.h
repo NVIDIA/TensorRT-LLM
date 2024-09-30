@@ -24,15 +24,11 @@
 #include <cuda_runtime.h>
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
 // Using a local lambda in beam search layers to fill buffers causes an internal compiler error on nvcc windows.
@@ -129,22 +125,7 @@ inline DecoderDomain getLocalDecoderDomain(
     {
         TLLM_THROW("Can't get local Decoder domain");
     }
-    return DecoderDomain(batchSize, beamWidth, vocabSize);
+    return {batchSize, beamWidth, vocabSize};
 }
 
-/// @brief A convenience function to copy the content of a standard vector to a layer workspace.
-template <typename T>
-inline void copyToWorkspace(
-    runtime::BufferManager const& bufferManager, std::vector<T> const& src, runtime::IBuffer::SharedPtr& workspace)
-{
-    auto const sizeOfWorkspaceInBytes = workspace->getSizeInBytes();
-    auto const sizeOfSrcInBytes = sizeof(T) * src.size();
-    TLLM_CHECK_WITH_INFO(sizeOfSrcInBytes <= sizeOfWorkspaceInBytes,
-        "The size of the workspace (%lu bytes) is insufficient for the data (%lu bytes)", sizeOfWorkspaceInBytes,
-        sizeOfSrcInBytes);
-    runtime::IBuffer::SharedPtr workspaceSlice = runtime::IBuffer::slice(workspace, 0, sizeOfSrcInBytes);
-    bufferManager.copy(src.data(), *workspaceSlice, runtime::MemoryType::kCPU);
-}
-
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

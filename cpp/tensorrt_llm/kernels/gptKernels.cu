@@ -159,7 +159,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // Store the result.
         if (batchIdx <= batchSizeBound && storeSeqOffsets)
         {
-            params.seqQOffsets[batchIdx] = params.removePadding ? seqQOffset : batchIdx * params.maxQSeqLength;
+            params.seqQOffsets[batchIdx] = seqQOffset;
             if (calculate_packed_mask_row_offsets)
             {
                 params.packedMaskRowOffsets[batchIdx] = packedMaskRowOffset;
@@ -228,10 +228,28 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         }
     }
 
-    // Reset fmha tile counter to 0 before launching fmha kernels.
-    if (threadIdx.x == 0 && blockIdx.x == 0 && params.fmhaTileCounter != nullptr)
+    // Perpare values for fmha.
+    if (threadIdx.x == 0 && blockIdx.x == 0)
     {
-        params.fmhaTileCounter[0] = 0u;
+        // Reset fmha tile counter to 0 before launching fmha kernels.
+        if (params.fmhaTileCounter)
+        {
+            params.fmhaTileCounter[0] = 0u;
+        }
+        // Take the quantization scales into consideration.
+        if (params.fmhaBmm1Scale)
+        {
+            // The scale after fmha bmm1.
+            params.fmhaBmm1Scale[0] = params.dequantScaleQkv[0] * params.dequantScaleQkv[0] * params.fmhaHostBmm1Scale;
+            // The scale prepared for log2 optimization.
+            constexpr float kLog2e = 1.4426950408889634074f;
+            params.fmhaBmm1Scale[1] = params.fmhaBmm1Scale[0] * kLog2e;
+        }
+        if (params.fmhaBmm2Scale)
+        {
+            // The scale after fmha bmm2.
+            params.fmhaBmm2Scale[0] = params.quantScaleO[0] * params.dequantScaleQkv[0];
+        }
     }
 }
 

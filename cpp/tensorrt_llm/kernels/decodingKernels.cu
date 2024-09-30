@@ -36,6 +36,7 @@ namespace tensorrt_llm
 
 namespace kernels
 {
+
 class CopyBeamHypothesesStruct
 {
 public:
@@ -174,18 +175,14 @@ struct RankNorm
 
 inline __device__ RankNorm swap(RankNorm const& rankNorm, int mask, int dir)
 {
-    // Exchange the rank and norm inside the warp.
+    // Exchange RankNorm data inside the warp
     RankNorm other;
     other.rank = __shfl_xor_sync(unsigned(-1), rankNorm.rank, mask);
     other.norm = __shfl_xor_sync(unsigned(-1), rankNorm.norm, mask);
-
-    // Update the sorted values.
+    // dir == 0 -> return larger one
+    // dir == 1 -> return smaller one
     bool doSwap = (rankNorm.norm != other.norm) && ((rankNorm.norm > other.norm) == dir);
-    RankNorm res;
-    res.rank = doSwap ? other.rank : rankNorm.rank;
-    res.norm = doSwap ? other.norm : rankNorm.norm;
-
-    return res;
+    return doSwap ? other : rankNorm;
 }
 
 inline __device__ uint32_t bfe(uint32_t a, uint32_t start, uint32_t len = 1)
@@ -258,11 +255,11 @@ __global__ void finalized(gatherTreeParam param)
 
         if (warpid == 0 && beamWidth > 16)
         {
-            rankNorm = swap(rankNorm, 0x10, bfe(laneid, 4) ^ bfe(laneid, 4)); // 17~32
-            rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3));
-            rankNorm = swap(rankNorm, 0x04, bfe(laneid, 4) ^ bfe(laneid, 2));
-            rankNorm = swap(rankNorm, 0x02, bfe(laneid, 4) ^ bfe(laneid, 1));
-            rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
+            rankNorm = swap(rankNorm, 0x10, bfe(laneid, 5) ^ bfe(laneid, 4)); // 17~32
+            rankNorm = swap(rankNorm, 0x08, bfe(laneid, 5) ^ bfe(laneid, 3));
+            rankNorm = swap(rankNorm, 0x04, bfe(laneid, 5) ^ bfe(laneid, 2));
+            rankNorm = swap(rankNorm, 0x02, bfe(laneid, 5) ^ bfe(laneid, 1));
+            rankNorm = swap(rankNorm, 0x01, bfe(laneid, 5) ^ bfe(laneid, 0));
         }
     }
     else
@@ -323,7 +320,8 @@ void invokeGatherTree(gatherTreeParam param)
 __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
 {
     // Move ALL unfinished beams from bh.outputIdsUnfinish to bh.outputIdsCBA
-    // So here might be more than `nBM` beams in bh.outputIdsCBA after the call
+    // So here might be more than `nBM` beams in bh.outputIdsCBA after this kernel
+    // Data movement:
     // bh.outputIdsUnfinish -> bh.outputIdsCBA
     // bh.sequenceLengths   -> bh.sequenceLengthsCBA
     // bh.cumLogProbs       -> bh.cumLogProbsCBA
@@ -392,6 +390,7 @@ void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
 __global__ void finalizeKernel(BeamHypotheses bh)
 {
     // Do index sort on bh.normedScoresCBA, then move buffers from CBA to output by the order of index
+    // Data movement:
     // bh.outputIdsCBA       -> bh.outputIds
     // bh.sequenceLengthsCBA -> bh.sequenceLengths
     // bh.cumLogProbsCBA     -> bh.cumLogProbs
@@ -414,6 +413,7 @@ __global__ void finalizeKernel(BeamHypotheses bh)
         smemScore[tid] = bh.normedScoresCBA[bid * nBM * 2 + tid];
     }
     __syncthreads();
+
     if (nCBA < 32)
     {
         int const warpid = tid / 32;
@@ -448,11 +448,11 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
         if (warpid == 0 && nCBA > 16)
         {
-            rankNorm = swap(rankNorm, 0x10, bfe(laneid, 4) ^ bfe(laneid, 4)); // 17~32
-            rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3));
-            rankNorm = swap(rankNorm, 0x04, bfe(laneid, 4) ^ bfe(laneid, 2));
-            rankNorm = swap(rankNorm, 0x02, bfe(laneid, 4) ^ bfe(laneid, 1));
-            rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
+            rankNorm = swap(rankNorm, 0x10, bfe(laneid, 5) ^ bfe(laneid, 4)); // 17~32
+            rankNorm = swap(rankNorm, 0x08, bfe(laneid, 5) ^ bfe(laneid, 3));
+            rankNorm = swap(rankNorm, 0x04, bfe(laneid, 5) ^ bfe(laneid, 2));
+            rankNorm = swap(rankNorm, 0x02, bfe(laneid, 5) ^ bfe(laneid, 1));
+            rankNorm = swap(rankNorm, 0x01, bfe(laneid, 5) ^ bfe(laneid, 0));
         }
 
         if (tid < nBM)

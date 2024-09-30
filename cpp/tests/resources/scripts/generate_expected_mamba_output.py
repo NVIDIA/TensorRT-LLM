@@ -74,7 +74,7 @@ def generate_outputs(num_beams):
     print('Generating Mamba FP16 outputs')
     input_name = 'input_tokens.npy'
     model_spec_obj = model_spec.ModelSpec(input_name, _tb.DataType.HALF)
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
 
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -96,7 +96,7 @@ def generate_outputs(num_beams):
                     model_spec_obj=model_spec_obj)
 
     print('Generating Mamba FP16-plugin-packed-paged outputs')
-    model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,
