@@ -55,9 +55,9 @@ def generate_output(
     model_spec_obj_list = [
         model_spec.ModelSpec(
             input_file, _tb.DataType.HALF).use_gpt_plugin().set_kv_cache_type(
-                model_spec.KVCacheType.CONTINUOUS),
+                _tb.KVCacheType.CONTINUOUS),
         model_spec.ModelSpec(input_file, _tb.DataType.HALF).use_gpt_plugin().
-        use_packed_input().set_kv_cache_type(model_spec.KVCacheType.PAGED),
+        use_packed_input().set_kv_cache_type(_tb.KVCacheType.PAGED),
     ]
 
     for model_spec_obj in model_spec_obj_list:

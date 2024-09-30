@@ -25,6 +25,7 @@ from tensorrt_llm._utils import (trt_dtype_to_torch, str_dtype_to_trt)
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.session import TensorInfo
 from tensorrt_llm.runtime import ModelConfig
+from tensorrt_llm.models.modeling_utils import get_kv_cache_type_from_legacy
 
 
 class EncDecBenchmark(BaseBenchmark):
@@ -100,6 +101,9 @@ class EncDecBenchmark(BaseBenchmark):
                 dtype = pretrained_config["dtype"]
 
                 paged_kv_cache = plugin_config['paged_kv_cache']
+                kv_cache_type = get_kv_cache_type_from_legacy(
+                    True, paged_kv_cache)
+
                 tokens_per_block = plugin_config['tokens_per_block']
 
                 gather_context_logits = builder_config.get(
@@ -120,7 +124,7 @@ class EncDecBenchmark(BaseBenchmark):
                     num_layers=num_layers,
                     gpt_attention_plugin=use_gpt_attention_plugin,
                     remove_input_padding=remove_input_padding,
-                    paged_kv_cache=paged_kv_cache,
+                    kv_cache_type=kv_cache_type,
                     tokens_per_block=tokens_per_block,
                     cross_attention=cross_attention,
                     has_position_embedding=has_position_embedding,

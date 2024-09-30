@@ -15,8 +15,6 @@
  */
 
 #include "explicitDraftTokensLayer.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
@@ -58,13 +56,11 @@ void ExplicitDraftTokensLayer<T>::allocateBuffer()
     mReduceWorkspaceSizeInBytes = invokeReduceMaxGenerationLengths(
         nullptr, mReduceWorkspaceSizeInBytes, nullptr, nullptr, mDecoderDomain.getBatchSize(), getStream());
 
-    auto workspaceSizeInBytes = std::max(mScanWorkspaceSizeInBytes, mReduceWorkspaceSizeInBytes);
-    mWorkspaceDevice = mBufferManager->gpu(workspaceSizeInBytes, nvinfer1::DataType::kINT8);
+    mWorkspaceSize = std::max(mScanWorkspaceSizeInBytes, mReduceWorkspaceSizeInBytes);
 
     mCurandStatesDevice = mBufferManager->gpu(
         ITensor::makeShape({mDecoderDomain.getBatchSize(), sizeof(curandState_t)}), TRTDataType<int8_t>::value);
     auto const batchSizeShape = ITensor::makeShape({mDecoderDomain.getBatchSize()});
-    mRandomSeedsDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<int64_t>::value);
     mGenerationLengthInclusiveSum = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
     mMaxGenerationLength = mBufferManager->gpu(ITensor::makeShape({1}), TRTDataType<SizeType32>::value);
     mTemperatureDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
@@ -78,64 +74,100 @@ void ExplicitDraftTokensLayer<T>::allocateBuffer()
 }
 
 template <typename T>
-void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
-    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+void ExplicitDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<ExplicitDraftTokensSetupParams>(baseSetupParams);
-    auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
-    auto randomSeedDevicePtr = bufferCast<uint64_t>(*mRandomSeedsDevice);
-    auto curandStatesDevicePtr = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
-
-    if (setupParams->randomSeed)
-    {
-        if (setupParams->randomSeed->size() == 1)
-        {
-            invokeCurandInitialize(
-                curandStatesDevicePtr, batchSlotsPtr, batchSize, setupParams->randomSeed->front(), getStream());
-            sync_check_cuda_error();
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(setupParams->randomSeed->size() == batchSize, "Random seed vector size mismatch.");
-            TensorPtr randomSeedsDeviceSlice = ITensor::slice(mRandomSeedsDevice, 0, batchSize);
-            mBufferManager->copy(setupParams->randomSeed.value().data(), *randomSeedsDeviceSlice, MemoryType::kCPU);
-            invokeCurandBatchInitialize(
-                curandStatesDevicePtr, batchSlotsPtr, batchSize, randomSeedDevicePtr, getStream());
-            sync_check_cuda_error();
-        }
-    }
-    else
-    {
-        // Initialize curand states using the default seed 0.
-        invokeCurandInitialize(
-            curandStatesDevicePtr, batchSlotsPtr, batchSize, DefaultDecodingParams::getSeed(), getStream());
-    }
+    workspace->initializeDeviceCurandStates(
+        setupParams->randomSeed, batchSize, workspace->getDeviceBatchSlots(), mCurandStatesDevice);
 
     // Setup penalties.
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
 
+    // Set decoder dtype to WAR the lack of bf16 support in decoder.
+    if (!mDecoderDtype)
+    {
+        mDecoderDtype = setupParams->dtype;
+    }
+
     fillBuffers(setupParams->temperature, DefaultDecodingParams::getTemperature(), mTemperature, mTemperatureDevice,
         batchSlots, getLimitsPenalty(DecodingPenaltyType::Temperature), "temperature penalty");
 
-    fillContextBuffers(batchSize, batchSlots, *setupParams);
+    // Dispatch context buffer fill
+    if (mDecoderDtype == nvinfer1::DataType::kFLOAT)
+    {
+        fillContextBuffers<float>(batchSize, batchSlots, *setupParams, workspace);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kHALF)
+    {
+        fillContextBuffers<half>(batchSize, batchSlots, *setupParams, workspace);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kBF16)
+    {
+        fillContextBuffers<__nv_bfloat16>(batchSize, batchSlots, *setupParams, workspace);
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void ExplicitDraftTokensLayer<T>::fillContextBuffers(
-    SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& setupParams)
+void ExplicitDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    FillContextExplicitDraftTokensParams<T> params;
-    params.randDataSample = bufferCast<T>(*setupParams.randomDataSample);
-    params.outputTemperatures = bufferCast<T>(*setupParams.temperatures);
+    auto inputs = std::dynamic_pointer_cast<ExplicitDraftTokensInputs>(baseInputs);
+    auto outputs = std::dynamic_pointer_cast<ExplicitDraftTokensOutputs>(baseOutputs);
+
+    // DO NOT CHANGE THE ORDER.
+
+    // Convert masks to packed masks per request.
+    convertPackedMask(*outputs, *inputs, workspace);
+
+    // Slice output ids, pos ids, next draft tokens.
+    if (mDecoderDtype == nvinfer1::DataType::kFLOAT)
+    {
+        splitInputDataToBatchSlots<float>(*outputs, *inputs, workspace);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kHALF)
+    {
+        splitInputDataToBatchSlots<half>(*outputs, *inputs, workspace);
+    }
+    else if (mDecoderDtype == nvinfer1::DataType::kBF16)
+    {
+        splitInputDataToBatchSlots<__nv_bfloat16>(*outputs, *inputs, workspace);
+    }
+
+    // Pack accepted paths for KV cache rewind.
+    packAcceptedPaths(*outputs, *inputs, workspace);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+size_t ExplicitDraftTokensLayer<T>::getWorkspaceSize() const noexcept
+{
+    return mWorkspaceSize;
+}
+
+template <typename T>
+template <typename Dtype>
+void ExplicitDraftTokensLayer<T>::fillContextBuffers(SizeType32 batchSize, BufferConstPtr batchSlots,
+    ExplicitDraftTokensSetupParams const& setupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    FillContextExplicitDraftTokensParams<Dtype> params;
+    params.randDataSample = bufferCast<Dtype>(*setupParams.randomDataSample);
+    params.outputTemperatures = bufferCast<Dtype>(*setupParams.temperatures);
     params.inputTemperatures = bufferCastOrNull<float>(mTemperatureDevice);
     params.curandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
-    params.batchSlots = bufferCast<SizeType32>(*batchSlots);
+    params.batchSlots = workspace->getDeviceBatchSlotsPtr();
     params.batchSize = batchSize;
 
     params.checkParams();
@@ -146,71 +178,16 @@ void ExplicitDraftTokensLayer<T>::fillContextBuffers(
 }
 
 template <typename T>
-void ExplicitDraftTokensLayer<T>::forwardAsync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto inputs = std::dynamic_pointer_cast<ExplicitDraftTokensInputs>(baseInputs);
-    auto outputs = std::dynamic_pointer_cast<ExplicitDraftTokensOutputs>(baseOutputs);
-
-    // DO NOT CHANGE THE ORDER.
-
-    // Convert masks to packed masks per request.
-    convertPackedMask(*outputs, *inputs);
-
-    // Slice output ids, pos ids, next draft tokens.
-    splitInputDataToBatchSlots(*outputs, *inputs);
-
-    // Pack accepted paths for KV cache rewind.
-    packAcceptedPaths(*outputs, *inputs);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-size_t ExplicitDraftTokensLayer<T>::getWorkspaceSize() const noexcept
-{
-    return mWorkspaceDevice->getSizeInBytes();
-}
-
-template <typename T>
-void ExplicitDraftTokensLayer<T>::convertPackedMask(
-    ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
-    auto masksDevice = bufferCast<bool>(*inputs.masks);
-    auto generationLengths = bufferCast<SizeType32>(*inputs.generationLengths);
-    auto packedMasksDevice = bufferCast<SizeType32>(*outputs.packedMasks);
-
-    auto const batchSize = inputs.localBatchSize;
-
-    auto generationLengthInclusiveSumPtr = bufferCastOrNull<SizeType32>(mGenerationLengthInclusiveSum);
-    auto workSpaceDevicePtr = mWorkspaceDevice->data();
-    auto maxGenerationLengthPtr = bufferCastOrNull<SizeType32>(mMaxGenerationLength);
-    invokeScanReduceGenerationLengths(batchSize, generationLengths, workSpaceDevicePtr, mScanWorkspaceSizeInBytes,
-        generationLengthInclusiveSumPtr, workSpaceDevicePtr, mReduceWorkspaceSizeInBytes, maxGenerationLengthPtr,
-        getStream());
-
-    invokeConvertMaskToPackedMask(batchSize, generationLengthInclusiveSumPtr, maxGenerationLengthPtr, masksDevice,
-        batchSlots, mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingDraftTokens(),
-        mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingTokens(), packedMasksDevice, getStream());
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
-    ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs)
+template <typename Dtype>
+void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs,
+    ExplicitDraftTokensInputs const& inputs, std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputs.localBatchSize;
     auto const maxSeqLen = outputs.outputIds->getDimension<-1>();
 
-    ExtractExplicitDraftTokensParams<T> params;
+    ExtractExplicitDraftTokensParams<Dtype> params;
 
     params.outputIds = bufferCast<TokenIdType>(*outputs.outputIds);
     params.outputPositionIdsBase = bufferCast<SizeType32>(*outputs.positionIdsBase);
@@ -222,10 +199,10 @@ void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
     params.nextDraftLengths = bufferCast<SizeType32>(*outputs.nextDraftLengths);
     params.prevDraftLengths = bufferCast<SizeType32>(*outputs.prevDraftLengths);
     params.sequenceLengths = bufferCast<SizeType32>(*outputs.sequenceLength.value());
-    params.randDataSample = bufferCast<T>(*outputs.randomDataSample);
-    params.randDataVerification = bufferCast<T>(*outputs.randomDataValidation);
-    params.outputDraftProbs = bufferCast<T>(*outputs.nextDraftProbs);
-    params.outputTemperatures = bufferCast<T>(*outputs.temperatures);
+    params.randDataSample = bufferCast<Dtype>(*outputs.randomDataSample);
+    params.randDataVerification = bufferCast<Dtype>(*outputs.randomDataValidation);
+    params.outputDraftProbs = bufferCast<Dtype>(*outputs.nextDraftProbs);
+    params.outputTemperatures = bufferCast<Dtype>(*outputs.temperatures);
     params.outputGenerationLengths = bufferCast<SizeType32>(*outputs.generationLengths);
     params.outputBestPathIndices = bufferCast<SizeType32>(*mBestPathIndicesSlots);
     params.outputLastDraftIndices = bufferCast<SizeType32>(*mLastDraftIndicesSlots);
@@ -239,7 +216,7 @@ void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
     params.inputPositionIdsBase = bufferCast<SizeType32>(*inputs.positionIdsBase);
     params.packedPositionIds = bufferCast<SizeType32>(*inputs.packedPosIds);
     params.nextFlatTokens = bufferCast<TokenIdType>(*inputs.nextFlatTokens);
-    params.nextDraftProbs = bufferCast<T>(*inputs.nextDraftProbs);
+    params.nextDraftProbs = bufferCast<Dtype>(*inputs.nextDraftProbs);
     params.lastGenerationLengths = bufferCastOrNull<SizeType32>(inputs.lastGenerationLengths);
     params.generationLengthInclusiveSum = bufferCast<SizeType32>(*mGenerationLengthInclusiveSum);
     params.lastDraftIndices = bufferCast<SizeType32>(*inputs.lastDraftIndices);
@@ -269,8 +246,35 @@ void ExplicitDraftTokensLayer<T>::splitInputDataToBatchSlots(
 }
 
 template <typename T>
-void ExplicitDraftTokensLayer<T>::packAcceptedPaths(
-    ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs)
+void ExplicitDraftTokensLayer<T>::convertPackedMask(ExplicitDraftTokensOutputs const& outputs,
+    ExplicitDraftTokensInputs const& inputs, std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
+    auto masksDevice = bufferCast<bool>(*inputs.masks);
+    auto generationLengths = bufferCast<SizeType32>(*inputs.generationLengths);
+    auto packedMasksDevice = bufferCast<SizeType32>(*outputs.packedMasks);
+
+    auto const batchSize = inputs.localBatchSize;
+
+    auto generationLengthInclusiveSumPtr = bufferCastOrNull<SizeType32>(mGenerationLengthInclusiveSum);
+    auto workSpaceDevicePtr = workspace->getRawWorkspaceDevicePtr();
+    auto maxGenerationLengthPtr = bufferCastOrNull<SizeType32>(mMaxGenerationLength);
+    invokeScanReduceGenerationLengths(batchSize, generationLengths, workSpaceDevicePtr, mScanWorkspaceSizeInBytes,
+        generationLengthInclusiveSumPtr, workSpaceDevicePtr, mReduceWorkspaceSizeInBytes, maxGenerationLengthPtr,
+        getStream());
+
+    invokeConvertMaskToPackedMask(batchSize, generationLengthInclusiveSumPtr, maxGenerationLengthPtr, masksDevice,
+        batchSlots, mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingDraftTokens(),
+        mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingTokens(), packedMasksDevice, getStream());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void ExplicitDraftTokensLayer<T>::packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs,
+    ExplicitDraftTokensInputs const& inputs, std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -279,7 +283,7 @@ void ExplicitDraftTokensLayer<T>::packAcceptedPaths(
     auto numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
     auto numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
     auto pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);
-    auto batchSlots = bufferCast<SizeType32>(*inputs.batchSlots);
+    auto batchSlots = workspace->getDeviceBatchSlotsPtr();
     auto bestPathIndicesSlotsPtr = bufferCastOrNull<SizeType32>(mBestPathIndicesSlots);
     auto lastDraftIndicesSlotsPtr = bufferCastOrNull<SizeType32>(mLastDraftIndicesSlots);
 

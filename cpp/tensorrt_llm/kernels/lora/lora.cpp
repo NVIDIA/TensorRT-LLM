@@ -127,7 +127,8 @@ size_t LoraImpl::getWorkspaceSize(
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     auto const typeSize = tensorrt_llm::common::getDTypeSize(type);
-    TLLM_CHECK(numTokens >= numReqs);
+    TLLM_CHECK_WITH_INFO(
+        numTokens >= numReqs, fmtstr("num tokens %ld should be greater than num reqs %ld", numTokens, numReqs));
 
     return (size_t) getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices)
         + getLowRankWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, typeSize)

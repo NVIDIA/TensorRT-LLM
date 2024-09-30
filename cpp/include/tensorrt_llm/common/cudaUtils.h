@@ -172,8 +172,8 @@ inline void syncAndCheck(char const* const file, int const line)
 
     if (checkError)
     {
-        cudaError_t result = cudaDeviceSynchronize();
-        check(result, "cudaDeviceSynchronize", file, line);
+        check(cudaGetLastError(), "cudaGetLastError", file, line);
+        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize", file, line);
     }
 }
 
@@ -296,6 +296,15 @@ inline int getDeviceCount()
     int count = 0;
     check_cuda_error(cudaGetDeviceCount(&count));
     return count;
+}
+
+/// @brief Identifies the memory type of the given pointer.
+template <typename T>
+cudaMemoryType getPtrCudaMemoryType(T* ptr)
+{
+    cudaPointerAttributes attributes{};
+    check_cuda_error(cudaPointerGetAttributes(&attributes, ptr));
+    return attributes.type;
 }
 
 /// Get the memory info

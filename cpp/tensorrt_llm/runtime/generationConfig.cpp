@@ -20,8 +20,8 @@
 using namespace tensorrt_llm::runtime;
 
 GenerationConfig GenerationConfig::fromInput(ITensor const& inputIds, ITensor& inputLengthsHost, bool const inputPacked,
-    SizeType32 const beamWidth, SizeType32 const maxAttentionWindow, SizeType32 const sinkTokenLength,
-    SizeType32 const maxSequenceLength)
+    SizeType32 const beamWidth, std::vector<SizeType32> const maxAttentionWindowVec,
+    SizeType32 const maxAttentionWindow, SizeType32 const sinkTokenLength, SizeType32 const maxSequenceLength)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const batchSize = static_cast<SizeType32>(inputLengthsHost.getSize());
@@ -64,6 +64,6 @@ GenerationConfig GenerationConfig::fromInput(ITensor const& inputIds, ITensor& i
         "generated.");
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return GenerationConfig{
-        batchSize, beamWidth, maxInputLength, maxAttentionWindow, sinkTokenLength, maxSequenceLength, inputLengthSum};
+    return GenerationConfig{batchSize, beamWidth, maxInputLength, maxAttentionWindowVec, maxAttentionWindow,
+        sinkTokenLength, maxSequenceLength, inputLengthSum};
 }

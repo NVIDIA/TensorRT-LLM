@@ -117,16 +117,16 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
 }
 
 void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inputLengths, bool inputPacked,
-    SizeType32 beamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    BufferManager& manager)
+    SizeType32 beamWidth, std::vector<SizeType32> maxAttentionWindowVec, SizeType32 maxAttentionWindow,
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, BufferManager& manager)
 {
     contextLengthsDevice = inputLengths;
     contextLengthsHost->reshape(inputLengths->getShape());
     manager.copy(*contextLengthsDevice, *contextLengthsHost);
     manager.getStream().synchronize(); // wait for context lengths to be copied to host
 
-    generationConfig = GenerationConfig::fromInput(
-        inputIds, *contextLengthsHost, inputPacked, beamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
+    generationConfig = GenerationConfig::fromInput(inputIds, *contextLengthsHost, inputPacked, beamWidth,
+        maxAttentionWindowVec, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
 }
 
 void RuntimeBuffers::reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig)

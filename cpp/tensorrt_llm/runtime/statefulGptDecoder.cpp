@@ -50,11 +50,12 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 
     auto& dOutput = mDecodingOutput;
     auto outputIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput = std::make_unique<DecodingOutput>(std::move(outputIds));
+    auto gatheredOutputIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dOutput = std::make_unique<DecodingOutput>(std::move(outputIds), std::move(gatheredOutputIds));
 
     dOutput->newTokens = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-    dOutput->finished
+    dOutput->finishReasons
         = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
     dOutput->finishedSum = mBufferManager.pinnedPool(ITensor::makeShape({1}), nvSizeType);
     dOutput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -117,12 +118,20 @@ void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWid
 
     auto& dOutput = *mDecodingOutput;
     dOutput.ids->reshape(outputIdsShape);
+    if (beamWidth > 1)
+    {
+        dOutput.gatheredIds->reshape(outputIdsShape);
+    }
+    else
+    {
+        dOutput.gatheredIds = dOutput.ids;
+    }
     dOutput.newTokens->reshape(batchSizeXbeamWidth);
     mBufferManager.setZero(*dOutput.newTokens);
     dOutput.parentIds->reshape(outputIdsShape);
-    dOutput.finished->reshape(batchSizeXbeamWidth);
-    dInput.finished = ITensor::view(dOutput.finished);
-    mBufferManager.setZero(*dOutput.finished);
+    dOutput.finishReasons->reshape(batchSizeXbeamWidth);
+    dInput.finishReasons = ITensor::view(dOutput.finishReasons);
+    mBufferManager.setZero(*dOutput.finishReasons);
 
     dOutput.finishedSum->reshape(batchSizeShape);
     mBufferManager.setZero(*dOutput.finishedSum);
@@ -257,7 +266,7 @@ void StatefulGptDecoder::newBatch(
     // output
     auto& dOutput = *mDecodingOutput;
     manager.setZero(*dOutput.newTokens);
-    manager.setZero(*dOutput.finished);
+    manager.setZero(*dOutput.finishReasons);
     manager.setZero(*dOutput.finishedSum);
 
     // If outputs contains cumLogProbs, use that
@@ -351,9 +360,8 @@ void StatefulGptDecoder::finalize(SamplingConfig const&) const
     // TODO (rkobus) can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
-    auto finalOutputIds = mBufferManager.gpu(outputIds->getShape(), outputIds->getDataType());
-    mDecoder->gatherTree(*finalOutputIds, *mDecodingOutput, *mDecodingInput, mBufferManager);
-    mBufferManager.copy(*finalOutputIds, *outputIds);
+    mDecoder->gatherTree(*mDecodingOutput, *mDecodingInput, mBufferManager);
+    mBufferManager.copy(*(mDecodingOutput->gatheredIds), *outputIds);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return;
 }

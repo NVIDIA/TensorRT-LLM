@@ -47,15 +47,25 @@ def get_all_lora_weights(lora_weights):
     pattern = re.compile(
         r'.*\.layers\.([0-9]+)\.(self_attn|mlp)\.([a-z_]+)\.lora_(A|B)\.weight.*'
     )
+    moe_pattern = re.compile(
+        r'.*\.layers\.([0-9]+)\.(block_sparse_moe)\.((experts)\.([0-9]+)\.|)([a-zA-Z0-9_]+)\.lora_(A|B)\.weight.*'
+    )
     for key, weights in lora_weights.items():
         m = pattern.match(key)
-        if not m:
+        m_moe = moe_pattern.match(key)
+        if m:
+            layer_idx = int(m.group(1))
+            hf_module = m.group(3)
+            inout = "in" if m.group(4) == "A" else "out"
+            all_weights[layer_idx][hf_module][inout] = weights
+        elif m_moe:
+            layer_idx = int(m_moe.group(1))
+            hf_module = m_moe.group(6)
+            inout = "in" if m_moe.group(7) == "A" else "out"
+            all_weights[layer_idx][hf_module][inout] = weights
+        else:
             print(f"no match {key}")
             continue
-        layer_idx = int(m.group(1))
-        hf_module = m.group(3)
-        inout = "in" if m.group(4) == "A" else "out"
-        all_weights[layer_idx][hf_module][inout] = weights
     return all_weights
 
 
@@ -87,6 +97,10 @@ hf_modules_to_trtllm_modules = {
     "gate_up_proj": "mlp_h_to_4h",
     "c_fc": "mlp_h_to_4h",
     "c_proj": "mlp_4h_to_h",
+    "w1": "moe_h_to_4h",
+    "w2": "moe_4h_to_h",
+    "w3": "moe_gate",
+    "gate": "moe_router",
 }  # lora modules on llama
 hf_modules_to_module_id = {
     k: LoraManager.LORA_MODULE_IDS[v]

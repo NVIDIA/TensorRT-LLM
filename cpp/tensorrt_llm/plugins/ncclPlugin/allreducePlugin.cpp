@@ -46,10 +46,6 @@ AllreducePlugin::AllreducePlugin(std::set<int> group, nvinfer1::DataType type, A
     , mAffine(affine)
     , mBias(bias)
 {
-    if (std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY") != nullptr)
-    {
-        mStrategy = AllReduceStrategyType::NCCL;
-    }
 }
 
 // Parameterized constructor
@@ -58,10 +54,6 @@ AllreducePlugin::AllreducePlugin(void const* data, size_t length)
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mType);
     read(d, mStrategy);
-    if (std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY") != nullptr)
-    {
-        mStrategy = AllReduceStrategyType::NCCL;
-    }
     read(d, mConfig);
     read(d, mOp);
     read(d, mEps);
@@ -239,7 +231,9 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 
     kernels::AllReduceStrategyType runtimeStrategy;
 
-    if (mStrategy == AllReduceStrategyType::NCCL)
+    static char* forceNcclAllReduceStrategyChar = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
+    bool forceNcclAllReduceStrategy = (forceNcclAllReduceStrategyChar != nullptr);
+    if (forceNcclAllReduceStrategy || mStrategy == AllReduceStrategyType::NCCL)
     {
         runtimeStrategy = AllReduceStrategyType::NCCL;
     }

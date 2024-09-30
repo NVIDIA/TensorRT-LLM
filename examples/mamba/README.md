@@ -25,10 +25,10 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 
 ## Support Matrix
 
-|    Model Name    | FP16  | BF16  |
-| :--------------: | :---: | :---: |
-|    Mamba1        |   Y   |   Y   |
-|    Mamba2        |   Y   |   Y   |
+|    Model Name    | FP16  | BF16  | TP  |
+| :--------------: | :---: | :---: | :-: |
+|    Mamba1        |   Y   |   Y   |  N  |
+|    Mamba2        |   Y   |   Y   |  Y  |
 
 * Mamba2: TensorRT-LLM can only support the pure Mamba model for now, will support the hybrid models later.
 
@@ -65,44 +65,56 @@ git clone https://huggingface.co/state-spaces/mamba2-130m ./mamba_model/mamba2-1
 git clone https://huggingface.co/mistralai/mamba-codestral-7B-v0.1 ./mamba_model/mamba-codestral-7B-v0.1
 ```
 
-Since mamba models use tokenizer from gpt-neox-20b model and mamba-codestral-7B-v0.1 uses the same tokenizer with mathstral-7B-v0.1 model, use the following command to fetch the checkpoint of gpt-neox-20b and mathstral-7B-v0.1.
+Since mamba models use tokenizer from gpt-neox-20b model, use the following command to fetch the checkpoint of gpt-neox-20b.
 
 ```bash
 # gpt-neox-20b
 git clone https://huggingface.co/EleutherAI/gpt-neox-20b ./mamba_model/gpt-neox-20b
-
-# mathstral-7B-v0.1
-git clone https://huggingface.co/mistralai/mathstral-7B-v0.1 ./mamba_model/mathstral-7B-v0.1
 ```
 
 ### 2. Convert weights from HF Transformers to TensorRT-LLM format
 The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF weights to TensorRT-LLM checkpoints.
 
+For the Mamba2 models, if they can support tensor parallelism, you can run them with 1, 2, 4 or 8 GPUs. Here we use
+mamba-codestral-7B-v0.1 as an example.
+
 ```bash
 # mamba-2.8b
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-2.8b/ \
+                             --ckpt_type hf \
                              --dtype bfloat16 \
                              --output_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/
 
 # mamba-130m
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-130m/ \
+                             --ckpt_type hf \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/
 
 # mamba2-2.7b
 python convert_checkpoint.py --model_dir ./mamba_model/mamba2-2.7b/ \
+                             --ckpt_type state_spaces \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba2-2.7b/trt_ckpt/fp16/1-gpu/
 
 # mamba2-130m
 python convert_checkpoint.py --model_dir ./mamba_model/mamba2-130m/ \
+                             --ckpt_type state_spaces \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba2-130m/trt_ckpt/fp16/1-gpu/
 
 # mamba-codestral-7B-v0.1
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
+                             --ckpt_type mistral_inference \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp16/1-gpu/
+
+# mamba-codestral-7B-v0.1 with 2-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
+                             --ckpt_type mistral_inference \
+                             --dtype float16 \
+                             --world_size 2 \
+                             --output_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp16/2-gpu/
 ```
 
 ### 3. Build TensorRT engine(s)
@@ -153,6 +165,15 @@ trtllm-build --checkpoint_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp1
              --max_input_len 924 \
              --max_seq_len 1024 \
              --output_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_engines/fp16/1-gpu/
+
+# mamba-codestral-7B-v0.1 with 2-way tensor parallelism.
+trtllm-build --checkpoint_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp16/2-gpu/ \
+             --paged_kv_cache disable \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 924 \
+             --max_seq_len 1024 \
+             --output_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_engines/fp16/2-gpu/
 ```
 
 Note that when building Mamba models, you need to disable the `paged_kv_cache` as it is used for
@@ -197,7 +218,15 @@ python ../summarize.py --test_trt_llm \
 # mamba-codestral-7B-v0.1
 python ../summarize.py --test_trt_llm \
                        --hf_model_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
-                       --tokenizer_dir ./mamba_model/mathstral-7B-v0.1/ \
+                       --tokenizer_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
                        --data_type fp16 \
                        --engine_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_engines/fp16/1-gpu/
+
+# mamba-codestral-7B-v0.1 with 2-way tensor parallelism.
+mpirun -n 2 --allow-run-as-root \
+    python ../summarize.py --test_trt_llm \
+                           --hf_model_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
+                           --tokenizer_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
+                           --data_type fp16 \
+                           --engine_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_engines/fp16/2-gpu/
 ```

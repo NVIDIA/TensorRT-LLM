@@ -454,7 +454,7 @@ public:
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {}, mUseLora);
+            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, {}, mUseLora);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -640,8 +640,8 @@ public:
         auto stream = streamPtr->get();
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, mExpertWeight1, mExpertBias1, mActType, mExpertWeight2,
             mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace,
-            mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, parallelism_config,
-            mNormMode, mUseLora, mLoraParams, stream);
+            mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, 0.01,
+            parallelism_config, mNormMode, mUseLora, mLoraParams, stream);
     }
 
     void runBenchmark(benchmark::State& state);

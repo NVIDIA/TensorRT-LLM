@@ -140,7 +140,7 @@ void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
     std::vector<SizeType32> const& sequenceLengths, SizeType32 batchSize, SizeType32 maxBeamWidth,
     SizeType32 maxSeqLength, SizeType32 tokenId, SizeType32 padId)
 {
-    auto outputsIds = decoder.getOutputIds();
+    auto outputsIds = decoder.getIds();
     // TODO: test parentIds
     // parentIds = decoder.getParentIds();
     ASSERT_TRUE(outputsIds);

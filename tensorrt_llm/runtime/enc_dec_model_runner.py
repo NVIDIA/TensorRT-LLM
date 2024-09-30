@@ -7,12 +7,12 @@ import torch
 import tensorrt as trt
 
 from ..logger import logger
-from .._ipc_utils import set_peer_access
 from .._utils import torch_to_numpy, trt_dtype_to_torch, mpi_world_size, mpi_rank
 from ..plugin.plugin import CustomAllReduceHelper
 from .generation import ModelConfig, SamplingConfig, LoraManager, GenerationSession
 from ..mapping import Mapping
 from .session import Session
+from ..models.modeling_utils import get_kv_cache_type_from_legacy
 
 
 def get_engine_name(rank):
@@ -66,6 +66,8 @@ def read_config(config_path: Path):
     max_prompt_embedding_table_size = builder_config.get(
         'max_prompt_embedding_table_size', 0)
 
+    kv_cache_type = get_kv_cache_type_from_legacy(True, paged_kv_cache)
+
     model_config = ModelConfig(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -77,7 +79,7 @@ def read_config(config_path: Path):
         num_layers=num_layers,
         gpt_attention_plugin=use_gpt_attention_plugin,
         remove_input_padding=remove_input_padding,
-        paged_kv_cache=paged_kv_cache,
+        kv_cache_type=kv_cache_type,
         tokens_per_block=tokens_per_block,
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
@@ -326,11 +328,10 @@ class EncDecModelRunner:
             device=self.device).contiguous()
 
         if self.encoder_runtime_mapping.tp_size > 1:
-            is_p2p_supported = set_peer_access(self.encoder_runtime_mapping)
             ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.encoder_runtime_mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(
-                    self.encoder_runtime_mapping.tp_size), is_p2p_supported)
+                    self.encoder_runtime_mapping.tp_size))
             inputs['all_reduce_workspace'] = all_reduce_workspace
 
         if self.encoder_model_config.lora_plugin:

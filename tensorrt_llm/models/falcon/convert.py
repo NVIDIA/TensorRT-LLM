@@ -1,10 +1,11 @@
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 
 from ...quantization import QuantAlgo
-from ..convert_utils import (iterate_shard_files, load_state_dict,
+from ..convert_utils import (get_weight, get_weight_and_bias,
+                             iterate_shard_files, load_state_dict,
                              retrieved_layer_index_from_name)
 from .config import FalconConfig
 
@@ -132,26 +133,6 @@ def split_qkv_weight(weight: torch.Tensor,
 def split_matrix(weight: torch.Tensor, tp_size: int, rank: int,
                  dim: int) -> torch.Tensor:
     return split(weight, tp_size, rank, dim=dim)
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> Optional[torch.Tensor]:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> Optional[torch.Tensor]:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(
-    params: Dict[str, torch.Tensor], prefix: str, dtype: torch.dtype
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def get_tllm_linear_weight(

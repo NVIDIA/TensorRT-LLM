@@ -11,3 +11,6 @@
 [submodule "3rdparty/NVTX"]
 	path = 3rdparty/NVTX
 	url = https://github.com/NVIDIA/NVTX.git
+[submodule "3rdparty/ucxx"]
+	path = 3rdparty/ucxx
+	url = https://github.com/GuanLuo/ucxx.git

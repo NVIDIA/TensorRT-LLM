@@ -55,7 +55,7 @@ def test_int4_awq_quantization():
     with GenerationExecutor.create(engine_dir) as executor:
         batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
         outputs = executor.generate(
-            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
+            batch_input_ids, sampling_params=SamplingParams(max_tokens=10))
         for idx, output in enumerate(outputs):
             print(f"Input: {batch_input_text[idx]}")
             output_text = tokenizer.decode(output.outputs[0].token_ids)
@@ -93,7 +93,7 @@ def test_fp8_quantization():
     with GenerationExecutor.create(engine_dir) as executor:
         batch_input_ids = [tokenizer.encode(inp) for inp in batch_input_text]
         outputs = executor.generate(
-            batch_input_ids, sampling_params=SamplingParams(max_new_tokens=10))
+            batch_input_ids, sampling_params=SamplingParams(max_tokens=10))
 
         for idx, output in enumerate(outputs):
             print(f"Input: {batch_input_text[idx]}")

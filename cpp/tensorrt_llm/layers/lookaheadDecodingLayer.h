@@ -17,11 +17,9 @@
 #pragma once
 
 #include "lookaheadAlgorithm.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/lookaheadModule.h"
 
 namespace tensorrt_llm::layers
 {
@@ -36,30 +34,29 @@ public:
 
     LookaheadDecodingLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
-        std::shared_ptr<BaseSetupParams> const& baseSetupParams) override;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
-        std::shared_ptr<BaseDecodingInputs> const& inputParams) override;
-
-    void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
-        std::shared_ptr<BaseDecodingInputs> const& inputParams) override;
+        std::shared_ptr<BaseDecodingInputs> const& inputParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
     //! @returns workspace needed for this layer in bytes
-    [[nodiscard]] size_t getWorkspaceSize() const noexcept;
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 private:
-    void forwardSyncCPU(std::shared_ptr<BaseDecodingOutputs> const& outputParams,
-        std::shared_ptr<BaseDecodingInputs> const& inputParams);
+    void forwardSyncCPU(std::shared_ptr<LookaheadDecodingOutputs> const& outputs,
+        std::shared_ptr<LookaheadDecodingInputs> const& inputs);
     void posIdsToMask(TensorPtr mask, TensorConstPtr posIds);
 
 private:
     using Base::mDecoderDomain;
 
+    size_t mWorkspaceSize{};
+    size_t mSetupWorkspaceSize{};
     TensorPtr mCurandStatesDevice;
-    TensorPtr mSamplingWorkspaceDevice;
     TensorPtr mTargetTokensDevice;
-    TensorPtr mRandomSeedsDevice;
     TensorPtr mSamplingMaskDevice;
 
     struct CpuAlgorithmResources
@@ -67,6 +64,7 @@ private:
         explicit CpuAlgorithmResources(DecoderDomain const& decoderDomain);
 
         std::vector<LookaheadAlgorithm> mAlgos;
+        std::vector<TensorPtr> mPrompts;
         TensorPtr mBatchSlots;
         TensorPtr mTargetTokens;
         TensorPtr mTokensPerStep;
@@ -76,16 +74,23 @@ private:
         TensorPtr mPathsOffsets;
         TensorPtr mNumNewTokens;
         TensorPtr mNumNewTokensCumSum;
+        TensorPtr mNewTokens;
 
         TensorPtr mNextDraftTokens;
         TensorPtr mNextDraftPosIds;
-        TensorPtr mPackedMasks;
         TensorPtr mSamplingMask;
         TensorPtr mNextDraftLengths;
         TensorPtr mSequenceLengths;
+        TensorPtr mGenerationLengths;
+        TensorPtr mGenerationLengthsMax;
+        TensorPtr mPackedMask;
+        TensorPtr mPositionOffsets;
+        TensorPtr mPositionIds;
     };
 
     std::optional<CpuAlgorithmResources> mCpuAlgo;
+
+    runtime::SizeType32 mGlobalSteps{0};
 };
 
 } // namespace tensorrt_llm::layers

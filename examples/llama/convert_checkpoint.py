@@ -79,7 +79,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4', 'int4_gptq'],
+        choices=['int8', 'int4', 'int4_gptq', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -134,6 +134,10 @@ def parse_arguments():
         type=str,
         default=None,
         help='Path of a quantized model checkpoint in .safetensors format')
+    parser.add_argument("--use_fp8",
+                        action="store_true",
+                        default=False,
+                        help="Enable FP8 per-tensor quantization")
     parser.add_argument("--use_fp8_rowwise",
                         action="store_true",
                         default=False,
@@ -246,6 +250,8 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
             quant_config.quant_algo = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
             quant_config.quant_algo = QuantAlgo.W4A16
+    elif args.use_fp8:
+        quant_config.quant_algo = QuantAlgo.FP8
     elif args.smoothquant:
         quant_config.smoothquant_val = args.smoothquant
         if args.per_channel:
@@ -274,6 +280,12 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         quant_config.has_zero_point = True
         quant_config.pre_quant_scale = False
         quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+
+    if args.weight_only_precision == 'int4_awq':
+        quant_config.group_size = args.group_size
+        quant_config.has_zero_point = False
+        quant_config.pre_quant_scale = True
+        quant_config.quant_algo = QuantAlgo.W4A16_AWQ
 
     return quant_config
 
@@ -407,6 +419,7 @@ def convert_and_save_hf(args):
                               pp_size=args.pp_size,
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
+            tik = time.time()
             llama = LLaMAForCausalLM.from_hugging_face(
                 model_dir,
                 args.dtype,
@@ -415,8 +428,11 @@ def convert_and_save_hf(args):
                 load_by_shard=load_by_shard,
                 **override_fields,
             )
+            print(f'Total time of reading and converting {time.time()-tik} s')
+            tik = time.time()
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
+            print(f'Total time of saving checkpoint {time.time()-tik} s')
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
         release_gc()

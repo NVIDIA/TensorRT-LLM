@@ -30,6 +30,18 @@ class UsageInfo(OpenAIBaseModel):
     completion_tokens: Optional[int] = 0
 
 
+class ModelCard(OpenAIBaseModel):
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "tensorrt_llm"
+
+
+class ModelList(OpenAIBaseModel):
+    object: str = "list"
+    data: List[ModelCard] = Field(default_factory=list)
+
+
 class ResponseFormat(OpenAIBaseModel):
     # type must be "json_object" or "text"
     type: Literal["text", "json_object"]
@@ -155,24 +167,35 @@ class CompletionRequest(OpenAIBaseModel):
         sampling_params = SamplingParams(
             top_k=self.top_k,
             top_p=self.top_p,
-            random_seed=self.seed,
+            seed=self.seed,
             temperature=self.temperature,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            max_new_tokens=self.max_tokens,
+            max_tokens=self.max_tokens,
             stop_token_ids=self.stop_token_ids,
             stop=self.stop,
             # NOTE: our early_stopping type definition is different from vLLM's
             # early_stopping=self.early_stopping,
             beam_width=self.best_of if self.best_of else self.n,
-            min_length=self.min_tokens,
+            min_tokens=self.min_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
         )
         if self.min_p > 0:
             sampling_params.top_p_min = self.min_p
         return sampling_params
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.best_of is None:
+            self.best_of = self.n
+
+    @model_validator(mode="after")
+    def check_beam_search(self):
+        if (self.n > 1 or self.best_of > 1) and not self.use_beam_search:
+            raise ValueError(
+                "Only support one response per prompt without beam search")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -444,22 +467,34 @@ class ChatCompletionRequest(OpenAIBaseModel):
         sampling_params = SamplingParams(
             top_p=self.top_p,
             top_k=self.top_k,
-            random_seed=self.seed,
+            seed=self.seed,
             temperature=self.temperature,
             beam_width=self.best_of,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            max_new_tokens=self.max_tokens,
-            min_length=self.min_tokens,
+            max_tokens=self.max_tokens,
+            min_tokens=self.min_tokens,
             stop_token_ids=self.stop_token_ids,
             stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            return_log_probs=self.logprobs,
         )
         if self.min_p > 0:
             sampling_params.top_p_min = self.min_p
         return sampling_params
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.best_of is None:
+            self.best_of = self.n
+
+    @model_validator(mode="after")
+    def check_beam_search(self):
+        if (self.n > 1 or self.best_of > 1) and not self.use_beam_search:
+            raise ValueError(
+                "Only support one response per prompt without beam search")
+        return self
 
     @model_validator(mode='before')
     @classmethod
@@ -483,8 +518,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if "top_logprobs" in data or "logprobs" in data:
-            raise ValueError("returning log probs is not supported")
+        top_logprobs = data.get("top_logprobs")
+        if top_logprobs is not None and top_logprobs > 0:
+            raise ValueError("top_logprobs is not supported")
         return data
 
     @model_validator(mode="before")

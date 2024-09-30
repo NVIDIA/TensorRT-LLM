@@ -134,8 +134,8 @@ class GemmaConfig(PretrainedConfig):
         cls,
         hf_config_or_dir: "HfConfigOrDir",
         dtype: str = "auto",
-        quant_config: Optional[QuantConfig] = None,
         mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
         **kwargs,
     ) -> "GemmaConfig":
         import transformers
@@ -153,7 +153,8 @@ class GemmaConfig(PretrainedConfig):
                 dtype = torch_dtype_to_str(dtype)
             if dtype == "float32":
                 dtype = "float16"
-
+        assert isinstance(quant_config, QuantConfig) or quant_config is None
+        assert isinstance(mapping, Mapping) or mapping is None
         return cls(
             architecture=hf_config.architectures[0],
             dtype=dtype,

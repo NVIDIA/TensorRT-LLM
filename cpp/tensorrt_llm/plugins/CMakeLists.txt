@@ -53,14 +53,15 @@ set(PLUGIN_LISTS
     selectiveScanPlugin
     mambaConv1dPlugin
     lruPlugin
-    cumsumLastDimPlugin)
+    cumsumLastDimPlugin
+    lowLatencyGemmPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})
   add_subdirectory(${PLUGIN_ITER})
 endforeach(PLUGIN_ITER)
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   include_directories(ncclPlugin)
   add_subdirectory(ncclPlugin)
 endif()
@@ -86,7 +87,7 @@ target_include_directories(
   PUBLIC ${CUDA_INSTALL_DIR}/include
   PRIVATE ${TARGET_DIR})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   target_include_directories(${PLUGIN_SHARED_TARGET}
                              PUBLIC ${MPI_C_INCLUDE_DIRS})
 endif()
@@ -134,6 +135,6 @@ target_link_libraries(
   ${CMAKE_DL_LIBS}
   ${SHARED_TARGET})
 
-if(ENABLE_MULTI_DEVICE EQUAL 1)
+if(ENABLE_MULTI_DEVICE)
   target_link_libraries(${PLUGIN_SHARED_TARGET} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()

@@ -53,13 +53,14 @@ class FalconConfig(PretrainedConfig):
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
         import transformers
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
             hf_config_dir = str(hf_config_or_dir)
             hf_config = transformers.AutoConfig.from_pretrained(
-                hf_config_dir, trust_remote_code=True)
+                hf_config_dir, trust_remote_code=trust_remote_code)
 
         # Falcon-7B config may not have num_kv_heads or n_head_kv.
         # Although Falcon-180B uses GQA (num_kv_heads=8), its config

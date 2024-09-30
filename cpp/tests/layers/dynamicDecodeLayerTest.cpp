@@ -16,6 +16,7 @@
 
 #include "tests/layers/dynamicDecodeLayerTest.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <algorithm>
 
 namespace tensorrt_llm::tests::layers::sampling
@@ -191,6 +192,8 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
     {
         allocateMedusaData(params);
     }
+    mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
+        mBufferManager, decodingDomain, TRTDataType<T>::value, mDecodeLayer->getWorkspaceSize());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -382,8 +385,7 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& p
     initXWordsTensors(batchSlotsPtr, bufferCast<SizeType32>(*mStopWords),
         reinterpret_cast<SizeType32**>(bufferCast<int64_t>(*mStopWordsPtrs)), bufferCast<SizeType32>(*mStopWordsLens),
         mMaxStopWordsLen, params.stopWords);
-
-    mDecodeLayer->setup(mBatchSize, mBeamWidth, mBatchSlots, setupParams);
+    mDecodeLayer->setup(mBatchSize, mBeamWidth, mBatchSlots, setupParams, mDecodingWorkspace);
 
     mStream->synchronize();
 
@@ -706,14 +708,14 @@ void DynamicDecodeLayerTest<T>::runTestImpl(
                 inputTensors->logitsVec = std::nullopt;
             }
             inputTensors->step = step;
-            mDecodeLayer->forwardAsync(outputTensors, inputTensors);
+            mDecodeLayer->forwardAsync(outputTensors, inputTensors, mDecodingWorkspace);
             mStream->synchronize();
             auto const newTokensHost = mBufferManager->copyFrom(*mNewTokens, tensorrt_llm::runtime::MemoryType::kCPU);
             auto const seqLenHost
                 = mBufferManager->copyFrom(*mSeqLengthsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
             auto const logitsHost = mBufferManager->copyFrom(*mLogitsDevice, tensorrt_llm::runtime::MemoryType::kCPU);
-            mBufferManager->copy(
-                mDecodeLayer->getRuntimeLogitsDevice(), *mRuntimeLogitsHost, tensorrt_llm::runtime::MemoryType::kGPU);
+            mBufferManager->copy(mDecodingWorkspace->getDeviceRuntimeLogits()->data(), *mRuntimeLogitsHost,
+                tensorrt_llm::runtime::MemoryType::kGPU);
             mStream->synchronize();
 
             if (greedySearch && !mDecodingMode.isMedusa())

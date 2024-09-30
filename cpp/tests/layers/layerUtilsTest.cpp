@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/layers/layerUtils.h"
-#include "cuda.h"
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include <gtest/gtest.h>
 #include <vector>
@@ -27,7 +25,6 @@ namespace tensorrt_llm::tests::layers
 {
 
 using namespace tensorrt_llm::runtime;
-using namespace tensorrt_llm::layers;
 
 template <typename T>
 class CopyToWorkspaceFixture : public testing::Test
@@ -53,7 +50,7 @@ TYPED_TEST(CopyToWorkspaceFixture, DataTooLarge_Throws)
     auto const data = std::vector<dataType>(numElements);
     auto const workspaceSizeInBytes = numElements * sizeof(dataType) / 2;
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
-    ASSERT_THROW(copyToWorkspace(*this->bufferManager, data, workspace), common::TllmException);
+    ASSERT_THROW(DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace), common::TllmException);
 }
 
 TYPED_TEST(CopyToWorkspaceFixture, DataMuchTooLarge_Throws)
@@ -63,7 +60,7 @@ TYPED_TEST(CopyToWorkspaceFixture, DataMuchTooLarge_Throws)
     auto const data = std::vector<dataType>(numElements);
     auto const workspaceSizeInBytes = numElements * sizeof(dataType) / 1000;
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
-    ASSERT_THROW(copyToWorkspace(*this->bufferManager, data, workspace), common::TllmException);
+    ASSERT_THROW(DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace), common::TllmException);
 }
 
 TYPED_TEST(CopyToWorkspaceFixture, DataFitsExactly_Succeeds)
@@ -73,7 +70,7 @@ TYPED_TEST(CopyToWorkspaceFixture, DataFitsExactly_Succeeds)
     auto const data = std::vector<dataType>(numElements);
     auto const workspaceSizeInBytes = numElements * sizeof(dataType);
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
-    copyToWorkspace(*this->bufferManager, data, workspace);
+    DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
     sync_check_cuda_error();
 
     // Copy back and check data integrity.
@@ -95,7 +92,7 @@ TYPED_TEST(CopyToWorkspaceFixture, DataSmallerThanWorkspace_Succeeds)
     auto const data = std::vector<dataType>(numElements);
     auto const workspaceSizeInBytes = numElements * sizeof(dataType) * 4;
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
-    copyToWorkspace(*this->bufferManager, data, workspace);
+    DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
     sync_check_cuda_error();
 
     // Copy back and check data integrity.
@@ -117,7 +114,7 @@ TYPED_TEST(CopyToWorkspaceFixture, DataMuchSmallerThanWorkspace_Succeeds)
     auto const data = std::vector<dataType>(numElements);
     auto const workspaceSizeInBytes = numElements * sizeof(dataType) * 1000;
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
-    copyToWorkspace(*this->bufferManager, data, workspace);
+    DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
     sync_check_cuda_error();
 
     // Copy back and check data integrity.

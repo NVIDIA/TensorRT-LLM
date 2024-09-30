@@ -200,7 +200,15 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.cu_q_seqlens = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
     mKernelParams.tile_id_counter_ptr = reinterpret_cast<uint32_t*>(runnerParams.tileCounterPtr);
     // TRT doesn't support host scales. Use device scales instead.
-    mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
+    // The scaleBmm1Ptr offset.
+    // 2 scales prepared for scaleBmm1 in the device memory: float scale, float (scale with log2e).
+    int64_t scaleBmm1PtrOffset = (mLaunchParams.useBase2ExpTrick ? 1 : 0);
+    // Only fp8 kernels need to load scales from the device memory.
+    if (mFixedParams.dataType == DATA_TYPE_E4M3)
+    {
+        mKernelParams.scale_bmm1_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm1Ptr + scaleBmm1PtrOffset);
+        mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
+    }
 
     // Separate q and kv buffers may have different q and kv sequence lengths.
     if (mFixedParams.attentionInputLayout != AttentionInputLayout::PACKED_QKV)

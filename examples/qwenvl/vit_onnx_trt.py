@@ -14,16 +14,18 @@
 # limitations under the License.
 import argparse
 import os
+import time
 from typing import List
 
 import requests
+import tensorrt as trt
 import torch
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import AutoModelForCausalLM
 
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import release_gc, str_dtype_to_torch
 
 
 class Preprocss:
@@ -70,21 +72,28 @@ class ONNX_TRT:
         ).eval()
         device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
         image = image_pre_obj.encode(image_url).to(device)
-        if not os.path.exists('image.pt'):
-            torch.save(image, 'image.pt')
+        if not os.path.exists("image.pt"):
+            torch.save(image, "image.pt")
 
         model_visual = model.transformer.visual
         model_visual.eval()
+        del model  # To save GPU memory
 
-        torch.onnx.export(model_visual,
-                          image.to('cuda'),
-                          onnx_file_path,
-                          opset_version=17,
-                          input_names=['input'],
-                          output_names=['output'],
-                          dynamic_axes={'input': {
-                              0: 'batch'
-                          }})
+        torch.onnx.export(
+            model_visual,
+            image.to("cuda"),
+            onnx_file_path,
+            opset_version=17,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {
+                0: "batch"
+            }},
+        )
+        release_gc()  # Further release memory
+        print(
+            f"Export to ONNX file successfully! The ONNX file stays in {onnx_file_path}"
+        )
 
     def generate_trt_engine(self,
                             onnxFile,
@@ -93,9 +102,6 @@ class ONNX_TRT:
                             optBS=2,
                             maxBS=4):
         print("Start converting TRT engine!")
-        from time import time
-
-        import tensorrt as trt
         logger = trt.Logger(trt.Logger.VERBOSE)
         builder = trt.Builder(logger)
         network = builder.create_network(
@@ -105,7 +111,7 @@ class ONNX_TRT:
         config.set_flag(trt.BuilderFlag.FP16)
         parser = trt.OnnxParser(network, logger)
 
-        with open(onnxFile, 'rb') as model:
+        with open(onnxFile, "rb") as model:
             if not parser.parse(model.read(), "/".join(onnxFile.split("/"))):
                 print("Failed parsing %s" % onnxFile)
                 for error in range(parser.num_errors):
@@ -118,55 +124,60 @@ class ONNX_TRT:
         nMaxBS = maxBS
         inputT = network.get_input(0)
         inputT.shape = [nBS, 3, self.image_size, self.image_size]
-        profile.set_shape(inputT.name,
-                          [nMinBS, 3, self.image_size, self.image_size],
-                          [nOptBS, 3, self.image_size, self.image_size],
-                          [nMaxBS, 3, self.image_size, self.image_size])
+        profile.set_shape(
+            inputT.name,
+            [nMinBS, 3, self.image_size, self.image_size],
+            [nOptBS, 3, self.image_size, self.image_size],
+            [nMaxBS, 3, self.image_size, self.image_size],
+        )
 
         config.add_optimization_profile(profile)
 
-        t0 = time()
+        t0 = time.time()
         engineString = builder.build_serialized_network(network, config)
-        t1 = time()
+        t1 = time.time()
         if engineString == None:
             print("Failed building %s" % planFile)
         else:
             print("Succeeded building %s in %d s" % (planFile, t1 - t0))
-        print("plan file is", planFile)
-        with open(planFile, 'wb') as f:
-            f.write(engineString)
+            with open(planFile, "wb") as f:
+                f.write(engineString)
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
     # onnx/visual_encoder
-    parser.add_argument('--onnxFile',
+    parser.add_argument("--onnxFile",
                         type=str,
-                        default='visual_encoder/visual_encoder.onnx',
-                        help='')
-    parser.add_argument('--pretrained_model_path',
+                        default="visual_encoder/visual_encoder.onnx",
+                        help="")
+    parser.add_argument("--pretrained_model_path",
                         type=str,
-                        default='Qwen-VL-Chat',
-                        help='')
-    parser.add_argument('--planFile',
-                        type=str,
-                        default='plan/visual_encoder/visual_encoder_fp16.plan',
-                        help='')
-    parser.add_argument('--only_trt',
-                        action='store_true',
-                        help='Run only convert the onnx to TRT engine.')
-    parser.add_argument('--minBS', type=int, default=1)
-    parser.add_argument('--optBS', type=int, default=1)
-    parser.add_argument('--maxBS', type=int, default=4)
-    parser.add_argument('--image_url', nargs='+', default=['./pics/demo.jpeg'])
+                        default="Qwen-VL-Chat",
+                        help="")
+    parser.add_argument(
+        "--planFile",
+        type=str,
+        default="plan/visual_encoder/visual_encoder_fp16.plan",
+        help="",
+    )
+    parser.add_argument(
+        "--only_trt",
+        action="store_true",
+        help="Run only convert the onnx to TRT engine.",
+    )
+    parser.add_argument("--minBS", type=int, default=1)
+    parser.add_argument("--optBS", type=int, default=1)
+    parser.add_argument("--maxBS", type=int, default=4)
+    parser.add_argument("--image_url", nargs="+", default=["./pics/demo.jpeg"])
     args = parser.parse_args()
     return args
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = parse_arguments()
     onnx_file_dir = os.path.dirname(args.onnxFile)
-    if not onnx_file_dir == '' and not os.path.exists(onnx_file_dir):
+    if not onnx_file_dir == "" and not os.path.exists(onnx_file_dir):
         os.makedirs(onnx_file_dir)
     plan_file_dir = os.path.dirname(args.planFile)
     if not os.path.exists(plan_file_dir):

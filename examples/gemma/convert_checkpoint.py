@@ -193,8 +193,8 @@ def main() -> None:
         trt_llm_config = GemmaConfig.from_hugging_face(
             args.model_dir,
             args.dtype,
-            quant_config,
             mapping=mapping,
+            quant_config=quant_config,
         )
     else:
         print(f"Loading source parameters from {args.model_dir.absolute()}")

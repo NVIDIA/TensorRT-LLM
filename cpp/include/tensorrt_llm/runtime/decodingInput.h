@@ -19,7 +19,6 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-#include <memory>
 #include <optional>
 
 namespace tensorrt_llm::runtime
@@ -35,7 +34,7 @@ public:
     using TensorPtr = ITensor::SharedPtr;
 
     DecodingInput(SizeType32 maxLength, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 batchSize,
-        TensorPtr logits, TensorPtr endIds, TensorConstPtr batchSlots)
+        TensorConstPtr logits, TensorPtr endIds, TensorConstPtr batchSlots)
         : step{maxLength}
         , maxLength{maxLength}
         , maxAttentionWindow{maxAttentionWindow}
@@ -68,9 +67,9 @@ public:
 
     SizeType32 maxBadWordsLen;     //!<  The maximum value in the `badWordsLens` tensor.
 
-    TensorPtr logits;              //!<  [batchSize, beamWidth, vocabSizePadded], on gpu. Logits are are a probability
+    TensorConstPtr logits;         //!<  [batchSize, beamWidth, vocabSizePadded], on gpu. Logits are are a probability
                                    //!<  distribution over the vocabulary, the output of the model.
-    std::optional<std::vector<TensorPtr>>
+    std::optional<std::vector<TensorConstPtr>>
         logitsVec; //!< Vector of size [batchSize] contains logits of size [beamWidth, vocabSizePadded], on gpu. This is
                    //!< another view on the @property logits
 
@@ -80,7 +79,7 @@ public:
         batchSlots; //!<  [batchSize], address map of the linear batch id to to the seq slots, int32_t, pinned
 
     // optional parameters
-    TensorConstPtr finished;      //!<  [batchSize, beamWidth], finished states at current iteration.
+    TensorConstPtr finishReasons; //!<  [batchSize, beamWidth], finished states at current iteration.
                                   //!<  If true for some request, the decoding step of it is skipped, on gpu
     TensorConstPtr
         sequenceLimitLength;      //!<  [batchSize], on gpu. The maximum sequence length for each sequence in the batch.
@@ -90,8 +89,8 @@ public:
     TensorConstPtr badWordsPtrs;           //!<  [batchSize][2, badWordsLength], on gpu
     TensorConstPtr badWordsLens;           //!<  [batchSize], on gpu
     std::vector<TensorPtr> stopWordsLists; // vector with batchSize elements of size [2, stopWordsLength], on gpu
-    TensorConstPtr stopWordsPtrs;          //!<  [batchSize][2, stopWordsLength], on gpu
-    TensorConstPtr stopWordsLens;          //!<  [batchSize], on gpu
+    TensorConstPtr stopWordsPtrs;          //!<  [batchSize][2, stopWordsLength], pinned
+    TensorConstPtr stopWordsLens;          //!<  [batchSize], pinned
     TensorConstPtr noRepeatNgramSize;      //!<  [batchSize], on gpu
 
     // parameters for beam search
@@ -129,9 +128,16 @@ public:
         TensorConstPtr seqSlots;              //!<  [batchSize]
     };
 
+    struct LookaheadInputs
+    {
+        TensorPtr tokensPerStep;
+    };
+
     std::optional<MedusaInputs> medusaInputs;
 
     std::optional<ExplicitDraftTokensInputs> explicitDraftTokensInputs;
+
+    std::optional<LookaheadInputs> lookaheadInputs;
 };
 
 } // namespace tensorrt_llm::runtime

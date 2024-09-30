@@ -276,7 +276,9 @@ if __name__ == "__main__":
                                      tokenizer.pad_token_id).sum(dim=1)
             output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
                 dim=1) - decoder_input_lengths
-            print("--------------------------------------")
+            print(
+                f"------ HF beam = {args.num_beams} --------------------------------"
+            )
             print("HF output_ids: ", output_ids)
             print("HF output text: ", hf_output_text)
             print("HF output generated lengths: ", output_gen_lengths)
@@ -315,7 +317,9 @@ if __name__ == "__main__":
         output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
             dim=1) - decoder_input_lengths
 
-        print("--------------------------------------")
+        print(
+            f"------ TRT-LLM beam = {args.num_beams} --------------------------------"
+        )
         if 'encoder_output' in tllm_output:
             encoder_output = tllm_output['encoder_output']
             print_tensor('TRT-LLM encoder_output:', encoder_output)
@@ -351,7 +355,7 @@ if __name__ == "__main__":
             save_npy(encoder_output,
                      'encoder_output')  # [num_tokens, hidden_size]
             save_npy(
-                output_ids, 'output_ids'
+                output_ids, f'output_ids_beam{args.num_beams}'
             )  # [batch_size, max_output_tokens], max_output_tokens = decoder_input_tokens + max_new_tokens
 
         # simple accuracy check

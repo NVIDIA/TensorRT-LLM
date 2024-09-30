@@ -47,7 +47,7 @@ Apart from the arguments mentioned above, you can also customize the build confi
 ```python
 llm = LLM(<model-path>,
           build_config=BuildConfig(
-            max_new_tokens=4096,
+            max_num_tokens=4096,
             max_batch_size=128,
             max_beam_width=4))
 ```
@@ -63,7 +63,6 @@ from tensorrt_llm.hlapi import LLM, KvCacheConfig
 
 llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(
-            max_new_tokens=128,
             free_gpu_memory_fraction=0.8))
 ```
 

@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace tensorrt_llm::runtime
 {
@@ -32,6 +33,23 @@ using SizeType32 = std::int32_t;
 
 // Token ID type
 using TokenIdType = std::int32_t;
+
+using LoraTaskIdType = std::uint64_t;
+using TokenExtraIdType = std::uint64_t;
+using VecTokenExtraIds = std::vector<TokenExtraIdType>;
+
+struct UniqueToken
+{
+    TokenIdType tokenId;
+    TokenExtraIdType tokenExtraId;
+
+    bool operator==(UniqueToken const& other) const noexcept
+    {
+        return (tokenId == other.tokenId && tokenExtraId == other.tokenExtraId);
+    }
+};
+
+using VecUniqueTokens = std::vector<UniqueToken>;
 
 template <typename T>
 using StringPtrMap = std::unordered_map<std::string, std::shared_ptr<T>>;

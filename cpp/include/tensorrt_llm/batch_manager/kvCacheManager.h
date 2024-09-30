@@ -36,37 +36,11 @@
 #include <unordered_map>
 #include <vector>
 
-namespace std
-{
-
-// Implement std::hash function object for vector<TokenIdType>.
-// This allows us to use unordered_map with vector<TokenIdType> as key.
-// Based on https://stackoverflow.com/questions/20511347/a-good-hash-function-for-a-vector/72073933#72073933
-
-template <>
-struct hash<vector<int32_t>>
-{
-    size_t operator()(vector<int32_t> const& vec) const noexcept
-    {
-        size_t seed = vec.size();
-        for (auto x : vec)
-        {
-            uint32_t y = static_cast<uint32_t>(x);
-            y = ((y >> 16) ^ y) * 0x45d9f3b;
-            y = ((y >> 16) ^ y) * 0x45d9f3b;
-            y = (y >> 16) ^ y;
-            seed ^= y + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-        return seed;
-    }
-};
-
-} // namespace std
-
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 class KVCacheBlock;
+class KVCacheManager;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
@@ -74,7 +48,56 @@ using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using BlockPtr = std::shared_ptr<KVCacheBlock>;
 using FreeBlocksQueue = std::list<BlockPtr>;
-using NextBlockMap = std::unordered_map<VecTokens, BlockPtr>;
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
+using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
+using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
+
+struct BlockKey
+{
+    LoraTaskIdType loraTaskId;
+    VecUniqueTokens uniqueTokens;
+
+    bool operator==(BlockKey const& other) const noexcept
+    {
+        return (loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
+    }
+};
+
+// Implement hash functor for BlockKey.
+// This allows us to use unordered_map with BlockKey as key.
+// Based on https://stackoverflow.com/questions/20511347/a-good-hash-function-for-a-vector/72073933#72073933
+struct BlockKeyHasher
+{
+    std::size_t operator()(BlockKey const& blockKey) const noexcept
+    {
+        size_t seed = blockKey.uniqueTokens.size();
+        for (auto const& uniqueToken : blockKey.uniqueTokens)
+        {
+            uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
+            a = ((a >> 16) ^ a) * 0x45d9f3b;
+            a = ((a >> 16) ^ a) * 0x45d9f3b;
+            a = (a >> 16) ^ a;
+
+            uint64_t b = uniqueToken.tokenExtraId;
+            b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+            b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
+            b = b ^ (b >> 31);
+
+            seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+
+        uint64_t c = blockKey.loraTaskId;
+        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
+        c = c ^ (c >> 31);
+
+        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+};
+
+using NextBlockMap = std::unordered_map<BlockKey, BlockPtr, BlockKeyHasher>;
 
 struct KvCacheStats
 {
@@ -117,9 +140,9 @@ public:
 
     [[nodiscard]] bool hasSchedulingRefs() const;
 
-    void setTokens(VecTokens& tokens, bool isFull);
+    void setBlockKey(BlockKey& blockKey, bool isFull);
 
-    [[nodiscard]] VecTokens const& getTokens() const;
+    [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
     void setFreeBlockIterator(FreeBlocksQueue::iterator freeBlockIterator);
 
@@ -129,15 +152,15 @@ public:
 
     void setPrevBlock(BlockPtr prevBlock);
 
-    void addNextBlock(VecTokens const& tokens, BlockPtr block);
+    void addNextBlock(BlockKey const& blockKey, BlockPtr block);
 
-    void removeNextBlock(VecTokens const& tokens);
+    void removeNextBlock(BlockKey const& blockKey);
 
     static std::shared_ptr<KVCacheBlock> findBestGPUBlockToFree(std::shared_ptr<KVCacheBlock> searchStart);
 
     static std::shared_ptr<KVCacheBlock> findLeafBlock(std::shared_ptr<KVCacheBlock> searchStart);
 
-    [[nodiscard]] BlockPtr findMatchingBlock(VecTokens const& tokens) const;
+    [[nodiscard]] BlockPtr findMatchingBlock(BlockKey const& blockKey) const;
 
     //! \brief Free block from previous block if present.
     void freeLeafBlock();
@@ -161,7 +184,7 @@ private:
     SizeType32 mSchedulingRefCount;
 
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
-    VecTokens mTokens;
+    BlockKey mBlockKey;
 
     // Previous block in sequence
     BlockPtr mPrevBlock;
@@ -288,8 +311,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
-        GenerationRequest& sequence, SizeType32 inputLength, std::shared_ptr<LlmRequest> const& llmRequest);
+    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+        std::shared_ptr<LlmRequest> const& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
@@ -389,6 +412,11 @@ public:
     //! \details Does nothing of block is already in primary memory.
     void onboardBlock(BlockPtr offloadBlock);
 
+    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
+    //! \details Only full blocks are considered.
+    BlockKey findNewContextBlock(
+        VecUniqueTokens const& uniqueTokens, std::shared_ptr<LlmRequest> const& llmRequest) const;
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -397,15 +425,16 @@ private:
     void addBlockToAllBeams(BlockPtr& block, GenerationRequest& sequence);
 
     //! \brief Store blocks in cached blocks.
-    //! \param blockedTokens Tokens of each block.
+    //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
-    void storeBlocks(std::list<VecTokens> blockedTokens, std::vector<KVCacheBlock::IdType> const& blockIds);
+    void storeBlocks(std::list<BlockKey> blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
 
     //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
-    //! \param blockedTokens Tokens of each block.
+    //! \param blockKeys Key of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::list<VecTokens> const& blockedTokens, GenerationRequest& sequence);
+    SizeType32 loadOrAllocateBlocks(
+        std::list<BlockKey> const& blockKeys, SizeType32 numContextBlocks, GenerationRequest& sequence);
 
     //! \brief Find best primary block to free.
     //! \details The best primary block to free is the primary block that appears first in the queue and have no primary
@@ -460,6 +489,9 @@ private:
     std::size_t mAllocTotalBlocks, mAllocNewBlocks, mReusedBlocks;
     // KV cache type (self or cross)
     CacheType mCacheType;
+
+private:
+    friend class KVCacheManager;
 };
 
 class KVCacheManager
@@ -545,11 +577,11 @@ public:
     /// @return  The number of blocks
     [[nodiscard]] SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead) const;
 
-    /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
-    /// maxNewTokens)
+    /// @brief  Function that computes the number of KV cache blocks remaining to advance a request to completion (i.e.
+    /// for maxNewTokens); the allocated blocks are excluded
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] SizeType32 getNeededBlocksToCompletion(LlmRequest const& req) const;
+    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req) const;
 
     void addContextTokens(SizeType32 seqSlotIdx, SizeType32 numTokens);
 
@@ -610,6 +642,15 @@ public:
     {
         return mCacheType == CacheType::kCROSS;
     }
+
+    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
+    //! \details Only full blocks are considered.
+    BlockKey findNewContextBlock(
+        VecUniqueTokens const& uniqueTokens, std::shared_ptr<LlmRequest> const& llmRequest) const;
+
+    //! \brief Store full context blocks contributed by llmRequest.
+    //! \details These blocks become reusable from next step.
+    void storeContextBlocks(SizeType32 seqSlotIdx, std::shared_ptr<LlmRequest> const& llmRequest);
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 

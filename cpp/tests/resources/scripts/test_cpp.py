@@ -383,6 +383,18 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         model_cache_arg=model_cache_arg,
                         only_multi_gpu_arg=['--tp', '4', '--pp', '1'])
 
+    prepare_model_tests(model_name="gpt",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
+
+    prepare_model_tests(model_name="chatglm",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
+
 
 def prepare_model_tests(model_name: str,
                         python_exe: str,
@@ -395,17 +407,23 @@ def prepare_model_tests(model_name: str,
 
     model_env = {**_os.environ, "PYTHONPATH": f"examples/{model_name}"}
     enc_dec_model_name_arg = []
+    beams_arg = []
     if model_name in ('bart', 't5'):
         enc_dec_model_name_arg = [
             '--hf_repo_name',
             'facebook/bart-large-cnn' if model_name == 'bart' else 't5-small'
         ]
+        if model_name == 't5' and (not only_multi_gpu_arg):
+            beams_arg = ['--beams', '1,2']
         model_name = 'enc_dec'
 
     build_engines = [
         python_exe,
         str(scripts_dir / f"build_{model_name}_engines.py")
-    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
+    ] + model_cache_arg + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg + beams_arg
+
+    if model_name in ['gpt']:
+        build_engines += ['--clean']
     run_command(build_engines, cwd=root_dir, env=model_env, timeout=1800)
 
     model_env["PYTHONPATH"] = "examples"
@@ -415,6 +433,11 @@ def prepare_model_tests(model_name: str,
     ] + only_fp8_arg + only_multi_gpu_arg + enc_dec_model_name_arg
     if "enc_dec" in model_name:
         generate_expected_output += model_cache_arg
+        generate_expected_output += beams_arg
+
+    if model_name in ['gpt']:
+        generate_expected_output += ['--clean']
+
     if only_multi_gpu_arg and model_name != 'enc_dec':
         for world_size in (2, 4):
             generate_command = [
@@ -454,6 +477,7 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
+    excluded_tests.append("ExplicitDraftTokensDecoding")
     excluded_tests.append("Mamba")
     excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
@@ -505,6 +529,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         included_tests.append("BartBasicTest")
     if run_t5:
         included_tests.append("T5BasicTest")
+        included_tests.append("T5Beam2Test")
     if run_redrafter:
         included_tests.append("ExplicitDraftTokens")
 
@@ -542,6 +567,28 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "mpiUtilsTest",
     ]
     run_command(mpi_utils_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    # Cache transceiver tests
+    cache_trans_test = [
+        "mpirun",
+        "-n",
+        "2",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
+    if _os.path.exists(
+            _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
+        ucx_trans_test = [
+            "mpirun",
+            "-n",
+            "2",
+            "--allow-run-as-root",
+            "batch_manager/ucxDataTransceiverTest",
+        ]
+        run_command(ucx_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     trt_model_test = produce_mpirun_command(
@@ -593,6 +640,43 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     )
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
+    #Logits processor test in leader mode
+    new_env = copy.copy(cpp_env)
+    xml_output_file = build_dir / "results-multi-gpu-logits-proc.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=4,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=LlamaExecutorTest/LogitsProcParamsTest*tp2_pp2*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    xml_output_file = build_dir / "results-multi-gpu-dist-executor_gpt.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=2,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=DistExecutorTest.GPTTokenComparison"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    xml_output_file = build_dir / "results-multi-gpu-dist-executor_chatglm.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=2,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=DistExecutorTest.ChatGLMTokenComparison"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
 
 def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                    build_dir: _pl.Path, resources_dir: _pl.Path,
@@ -640,7 +724,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
         if model_name == "gpt":
             input_file = 'input_tokens.npy'
             model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-            model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+            model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
             model_spec_obj.use_gpt_plugin()
             model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
             ) / "tp1-pp1-gpu"
@@ -681,7 +765,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
     if model_name == "gpt":
         input_file = 'input_tokens.npy'
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.use_packed_input()
         model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
@@ -874,7 +958,7 @@ if __name__ == "__main__":
 
     from build_engines_utils import init_model_spec_module
 
-    init_model_spec_module()
+    init_model_spec_module(force_init_trtllm_bindings=False)
 
     if test_args.run_all_models:
         test_args.run_gpt = True
@@ -886,6 +970,8 @@ if __name__ == "__main__":
         test_args.run_encoder = True
         test_args.run_bart = True
         test_args.run_t5 = True
+        test_args.run_medusa = True
+        test_args.run_redrafter = True
 
     del test_args.run_all_models
 

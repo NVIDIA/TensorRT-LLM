@@ -57,6 +57,7 @@ class TestFunctional(unittest.TestCase):
             head_size = hidden_size // num_heads
             # construct trt network
             builder = tensorrt_llm.Builder()
+            builder.strongly_typed = False  # Test need to run in weekly typed mode
             net = builder.create_network()
             net.plugin_config.to_legacy_setting()
             net.plugin_config.bert_attention_plugin = dtype

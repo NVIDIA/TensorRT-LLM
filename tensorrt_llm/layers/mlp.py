@@ -46,8 +46,7 @@ def fc_gate_lora(hidden_states, lora, lora_layer_params):
                     mlp_gate_lora_params.lora_weights_pointers[0]
                 ],
                 host_request_types=mlp_fc_lora_params.host_request_types,
-                host_context_lengths=mlp_fc_lora_params.host_context_lengths,
-                max_num_tokens=mlp_fc_lora_params.max_num_tokens)
+                host_context_lengths=mlp_fc_lora_params.host_context_lengths)
 
             mlp_fc_lora, mlp_gate_lora = lora(hidden_states, mlp_in_lora_params)
             mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
@@ -59,17 +58,18 @@ def fc_gate_lora(hidden_states, lora, lora_layer_params):
 class MLP(Module):
 
     def __init__(
-            self,
-            hidden_size,
-            ffn_hidden_size,
-            hidden_act,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            quant_mode=QuantMode(0),
-            inner_layernorm=False,
-            eps=1e-05,
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
     ):
         super().__init__()
         if hidden_act not in ACT2FN:
@@ -93,7 +93,8 @@ class MLP(Module):
                               bias=bias,
                               dtype=dtype,
                               tp_group=tp_group,
-                              tp_size=tp_size)
+                              tp_size=tp_size,
+                              is_expert=is_expert)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -104,6 +105,7 @@ class MLP(Module):
         self.tp_size = tp_size
         self.quant_mode = quant_mode
         self.eps = eps
+        self.is_expert = is_expert
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None
 
@@ -139,17 +141,18 @@ class MLP(Module):
 class GatedMLP(MLP):
 
     def __init__(
-            self,
-            hidden_size,
-            ffn_hidden_size,
-            hidden_act,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            quant_mode=QuantMode(0),
-            inner_layernorm=False,
-            eps=1e-05,
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
     ):
         super().__init__(hidden_size,
                          ffn_hidden_size,
@@ -160,7 +163,8 @@ class GatedMLP(MLP):
                          tp_size=tp_size,
                          quant_mode=quant_mode,
                          inner_layernorm=inner_layernorm,
-                         eps=eps)
+                         eps=eps,
+                         is_expert=is_expert)
 
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
@@ -210,17 +214,18 @@ class GatedMLP(MLP):
 class FusedGatedMLP(Module):
 
     def __init__(
-            self,
-            hidden_size,
-            ffn_hidden_size,
-            hidden_act,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            quant_mode=QuantMode(0),
-            inner_layernorm=False,
-            eps=1e-05,
+        self,
+        hidden_size,
+        ffn_hidden_size,
+        hidden_act,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        quant_mode=QuantMode(0),
+        inner_layernorm=False,
+        eps=1e-05,
+        is_expert=False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -248,7 +253,8 @@ class FusedGatedMLP(Module):
                               bias=bias,
                               dtype=dtype,
                               tp_group=tp_group,
-                              tp_size=tp_size)
+                              tp_size=tp_size,
+                              is_expert=is_expert)
 
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None

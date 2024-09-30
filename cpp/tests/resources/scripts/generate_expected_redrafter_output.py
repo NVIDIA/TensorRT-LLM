@@ -18,23 +18,35 @@ import argparse as _arg
 from pathlib import Path
 
 import run
+from build_engines_utils import init_model_spec_module
+
+init_model_spec_module()
+import os
+
+import model_spec
+
+import tensorrt_llm.bindings as _tb
 
 
-def generate_output(engine: str, output_name: str, max_output_len: int = 8):
-    # FIXME(nkorobov): rename model in the model cache dir
-    model = 'vicuna_redrafter'
+def generate_output(engine: str,
+                    model_spec_obj: model_spec.ModelSpec,
+                    max_output_len: int = 8):
+
+    model = 'vicuna-7b-redrafter'
+    hf_model = 'vicuna-7b-v1.3'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    hf_dir = models_dir / 'vicuna-7b-v1.3'
+    hf_dir = models_dir / hf_model
     tp_pp_dir = 'tp1-pp1-gpu/'
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
 
     data_dir = resources_dir / 'data'
-    input_file = data_dir / 'input_vicuna.npy'
+    input_filename = model_spec_obj.get_input_file()
+    input_file = data_dir / input_filename
     model_data_dir = data_dir / model
     output_dir = model_data_dir / 'sampling'
 
-    output_name += '_tp1_pp1'
+    base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
     args = run.parse_arguments([
         '--engine_dir',
@@ -44,21 +56,30 @@ def generate_output(engine: str, output_name: str, max_output_len: int = 8):
         '--tokenizer_dir',
         str(hf_dir),
         '--output_npy',
-        str(output_dir / (output_name + '.npy')),
+        str(output_dir / (base_output_name + '.npy')),
         '--output_csv',
-        str(output_dir / (output_name + '.csv')),
+        str(output_dir / (base_output_name + '.csv')),
         '--max_output_len',
         str(max_output_len),
         '--use_py_session',
     ])
     run.main(args)
+    print(f"Output saved at {str(output_dir / base_output_name)}.[npy|csv]")
 
 
 def generate_outputs():
-    print(f'Generating outputs for FP16')
-    generate_output(engine='fp16-plugin-packed-paged',
-                    output_name='output_tokens_long_fp16_plugin_packed_paged',
-                    max_output_len=128)
+    print(f'Generating outputs for ReDrafter FP16')
+    max_output_len = 128
+    model_spec_obj = model_spec.ModelSpec('input_vicuna.npy', _tb.DataType.HALF)
+    model_spec_obj.use_gpt_plugin()
+    model_spec_obj.set_max_output_length(max_output_len)
+    model_spec_obj.use_packed_input()
+    model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
+    model_spec_obj.use_explicit_draft_tokens_decoding()
+
+    generate_output(engine=model_spec_obj.get_model_path(),
+                    model_spec_obj=model_spec_obj,
+                    max_output_len=max_output_len)
 
 
 if __name__ == '__main__':

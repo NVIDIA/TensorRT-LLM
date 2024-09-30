@@ -32,6 +32,12 @@ namespace tensorrt_llm::layers
 {
 
 template <typename T>
+size_t PenaltyLayer<T>::getWorkspaceSize() const noexcept
+{
+    return mWorkspaceSize;
+}
+
+template <typename T>
 PenaltyLayer<T>::PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
     std::shared_ptr<BufferManager> bufferManager)
     : BaseLayer(decoderDomain, bufferManager)
@@ -42,12 +48,6 @@ PenaltyLayer<T>::PenaltyLayer(executor::DecodingMode const& mode, DecoderDomain 
     initialize();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
-size_t PenaltyLayer<T>::getWorkspaceSize() const noexcept
-{
-    return mPenaltyWorkspaceDevice->getSizeInBytes();
 }
 
 template <typename T>
@@ -98,8 +98,6 @@ void PenaltyLayer<T>::allocateBuffer()
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     mLogitsPtrsHost = mBufferManager->pinnedPool(ITensor::makeShape({}), TRTDataType<T*>::value);
-    mLogitsPtrsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<T*>::value);
     auto const batchSizeShape = ITensor::makeShape({mDecoderDomain.getBatchSize()});
     mTemperature = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mRepetitionPenalty = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
@@ -128,17 +126,16 @@ void PenaltyLayer<T>::allocateBuffer()
         mMinLengthDevice = mBufferManager->gpu(batchSizeShape, nvinfer1::DataType::kINT32);
     }
 
-    auto const runtimeLogitsDeviceSize = mDecoderDomain.getBatchSize() * mDecoderDomain.getMaxDecodingTokens()
-        * mDecoderDomain.getBeamWidth() * mDecoderDomain.getVocabSizePadded();
-
-    mRuntimeLogitsDevice = mBufferManager->gpu(ITensor::makeShape({runtimeLogitsDeviceSize}), TRTDataType<T>::value);
+    auto const logitsPtrDeviceDesc = std::make_pair(batchSizeShape, TRTDataType<T*>::value);
+    mWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(logitsPtrDeviceDesc);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
-void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferConstPtr batchSlots,
-    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -207,8 +204,9 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, BufferCo
 }
 
 template <typename T>
-void PenaltyLayer<T>::forwardAsync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -217,13 +215,11 @@ void PenaltyLayer<T>::forwardAsync(
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
-    auto batchSlots = bufferCast<SizeType32>(*params->batchSlots);
 
-    if (!mLogitsPtrsHost->data())
+    if (mLogitsPtrsHost->data() == nullptr)
     {
-        mLogitsPtrsHost = mBufferManager->pinnedPool(
-            ITensor::makeShape({static_cast<int32_t>(maxSeqLen), static_cast<int32_t>(mDecoderDomain.getBatchSize())}),
-            TRTDataType<T*>::value);
+        mLogitsPtrsHost->reshape(
+            ITensor::makeShape({static_cast<int32_t>(maxSeqLen), static_cast<int32_t>(mDecoderDomain.getBatchSize())}));
         mRuntimeMaxSeqLen = maxSeqLen;
     }
 
@@ -231,7 +227,7 @@ void PenaltyLayer<T>::forwardAsync(
 
     TensorPtr logitsPtrsHost = ITensor::slice(mLogitsPtrsHost, mCyclicStep, 1);
     logitsPtrsHost->squeeze(0);
-    auto logitsPtrsHostData = bufferCast<T*>(*logitsPtrsHost);
+    auto logitsPtrsHostData = bufferCast<T const*>(*logitsPtrsHost);
     for (SizeType32 bi = 0; bi < localDecoderDomain.getBatchSize(); bi++)
     {
         if (params->logitsVec)
@@ -243,15 +239,15 @@ void PenaltyLayer<T>::forwardAsync(
         }
         else
         {
-            TensorPtr logitsForBatchIndex = ITensor::slice(params->logits.value(), ITensor::makeShape({bi}));
+            TensorConstPtr logitsForBatchIndex = ITensor::slice(params->logits.value(), ITensor::makeShape({bi}));
             auto const ptrToLogitsForBatchIndex = bufferCastOrNull<T>(logitsForBatchIndex);
             logitsPtrsHostData[bi] = ptrToLogitsForBatchIndex;
         }
     }
 
-    auto inputLengths = bufferCastOrNull<SizeType32>(params->inputLengths);
+    auto const* inputLengths = bufferCastOrNull<SizeType32>(params->inputLengths);
     auto embeddingBias = bufferCastOrNull<T>(params->embeddingBias);
-    auto batchSlotsHostPtr = bufferCast<SizeType32>(*params->batchSlots);
+    auto const* batchSlotsHostPtr = bufferCast<SizeType32>(*params->batchSlots);
 #define GET_PENALTIES(capital_name, type)                                                                              \
     (mUse##capital_name                                                                                                \
         && !allOfBatchSlots(batchSlotsHostPtr, bufferCast<type>(*m##capital_name), localDecoderDomain.getBatchSize(),  \
@@ -267,17 +263,15 @@ void PenaltyLayer<T>::forwardAsync(
 
 #undef GET_PENALTIES
 
-    auto const tokensPerStep = bufferCastOrNull<SizeType32>(params->curTokensPerStep);
+    auto* const tokensPerStep = bufferCastOrNull<SizeType32>(params->curTokensPerStep);
 
-    InvokeBatchApplyPenaltyParams<T> penaltyParams;
+    InvokeBatchApplyPenaltyParams<T> penaltyParams{};
 
-    { // Moving the logits ptrs to device for faster access during kernel execution.
-        TensorPtr logitsPtrsDeviceSlice = ITensor::slice(mLogitsPtrsDevice, 0, localDecoderDomain.getBatchSize());
-        TensorPtr logitsPtrsHostSlice = ITensor::slice(logitsPtrsHost, 0, localDecoderDomain.getBatchSize());
-        mBufferManager->copy(*logitsPtrsHostSlice, *logitsPtrsDeviceSlice);
-        penaltyParams.inputLogits = reinterpret_cast<T const* const*>(bufferCast<T const*>(*logitsPtrsDeviceSlice));
-    }
-    penaltyParams.outputLogits = bufferCast<T>(*mRuntimeLogitsDevice);
+    TensorPtr logitsPtrsHostSlice = ITensor::slice(logitsPtrsHost, 0, localDecoderDomain.getBatchSize());
+    auto [logitsPtrsDeviceSlice] = workspace->mirrorInWorkspace(logitsPtrsHostSlice);
+    auto runtimeLogits = workspace->getDeviceRuntimeLogits();
+    penaltyParams.inputLogits = reinterpret_cast<T const* const*>(bufferCast<T const*>(*logitsPtrsDeviceSlice));
+    penaltyParams.outputLogits = bufferCast<T>(*runtimeLogits);
     penaltyParams.biases = embeddingBias;
     penaltyParams.penaltyWorkspace = bufferCastOrNull<TokenIdType>(mPenaltyWorkspaceDevice);
     penaltyParams.penaltyWorkspacePrev = bufferCastOrNull<TokenIdType>(mPenaltyWorkspacePrevDevice);
@@ -296,10 +290,21 @@ void PenaltyLayer<T>::forwardAsync(
     penaltyParams.sequenceLengths = bufferCast<SizeType32>(*outputs->sequenceLength.value());
     penaltyParams.minLengths = bufferCastOrNull<SizeType32>(minLengths);
     penaltyParams.endIds = bufferCast<TokenIdType>(*params->endIds);
-    penaltyParams.batchSlots = batchSlots;
+    penaltyParams.batchSlots = workspace->getDeviceBatchSlotsPtr();
     penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     penaltyParams.tokensPerStep = tokensPerStep;
     penaltyParams.stream = getStream();
+
+    if (penaltyParams.beamWidth > 1)
+    {
+        T** logits = const_cast<T**>(penaltyParams.inputLogits);
+        // `BeamSearch` needs converting logits into logProbs before penalties, but `Sampling` doesn't
+        invokeAddBiasSoftMax((T*) nullptr, logits, (T*) nullptr, penaltyParams.biases, penaltyParams.endIds, nullptr,
+            penaltyParams.batchSlots, penaltyParams.batchSize, mDecoderDomain.getBatchSize(), penaltyParams.beamWidth,
+            penaltyParams.vocabSize, penaltyParams.vocabSizePadded, /*skipSoftMax*/ false,
+            /*batchSlotsLogits*/ penaltyParams.batchSlots != nullptr, penaltyParams.stream);
+    }
+
     invokeBatchApplyPenalty(penaltyParams);
     sync_check_cuda_error();
 
@@ -307,7 +312,7 @@ void PenaltyLayer<T>::forwardAsync(
 
     auto const logitsShape = ITensor::makeShape({localDecoderDomain.getBatchSize(),
         mDecoderDomain.getMaxDecodingTokens(), localDecoderDomain.getBeamWidth(), mDecoderDomain.getVocabSizePadded()});
-    params->logits = ITensor::view(mRuntimeLogitsDevice, logitsShape);
+    params->logits = ITensor::view(runtimeLogits, logitsShape);
 
     if (mDecodingMode.isBeamSearch())
     {

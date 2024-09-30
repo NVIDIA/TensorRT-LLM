@@ -2,7 +2,9 @@
 import asyncio
 import logging
 from http import HTTPStatus
-from typing import AsyncGenerator, List, Optional, TypedDict, Union
+from pathlib import Path
+from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
+                    TypedDict)
 
 import click
 import uvicorn
@@ -16,13 +18,14 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig
 from tensorrt_llm.hlapi.llm import RequestOutput
 from tensorrt_llm.hlapi.openai_protocol import (
+    ChatCompletionLogProbs, ChatCompletionLogProbsContent,
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
     ChatMessage, CompletionRequest, CompletionResponse,
     CompletionResponseChoice, CompletionResponseStreamChoice,
     CompletionStreamResponse, DeltaMessage, ErrorResponse, FunctionCall,
-    ToolCall, UsageInfo)
+    ModelCard, ModelList, ToolCall, UsageInfo)
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
@@ -62,11 +65,18 @@ class OpenaiServer:
 
     def __init__(self,
                  llm: LLM,
+                 model: str,
                  kv_cache_config: KvCacheConfig,
                  hf_tokenizer: PreTrainedTokenizer = None):
         self.llm = llm
         self.kv_cache_config = kv_cache_config
         self.tokenizer = hf_tokenizer
+
+        model_dir = Path(model)
+        if model_dir.exists() and model_dir.is_dir():
+            self.model = model_dir.name
+        else:
+            self.model = model
 
         self.app = FastAPI()
 
@@ -90,6 +100,7 @@ class OpenaiServer:
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -103,6 +114,10 @@ class OpenaiServer:
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
+
+    async def get_model(self) -> JSONResponse:
+        model_list = ModelList(data=[ModelCard(id=self.model)])
+        return JSONResponse(content=model_list.model_dump())
 
     async def openai_chat(self, request: ChatCompletionRequest) -> Response:
 
@@ -124,29 +139,47 @@ class OpenaiServer:
                 usage = None
             return usage
 
+        def create_logprobs(token_ids: List[int],
+                            logprobs: List[float]) -> ChatCompletionLogProbs:
+            assert len(token_ids) == len(logprobs), \
+                   "token_ids and logprobs have different lengths"
+            content: List[ChatCompletionLogProbsContent] = []
+            for token_id, logprob in zip(token_ids, logprobs):
+                token = self.tokenizer.decode(token_id)
+                # returning multiple logprobs is not supported
+                first_logprob = ChatCompletionLogProbsContent(
+                    token=token, logprob=max(logprob, -9999.0),
+                    bytes=list(token.encode("utf-8", errors="replace"))
+                )
+                content.append(first_logprob)
+            chat_logprobs = ChatCompletionLogProbs(content=content)
+            return chat_logprobs
+
         async def chat_stream_generator(promise: RequestOutput) -> AsyncGenerator[str, None]:
             first_iteration = True
             num_choices = 1 if request.n is None else request.n
             finish_reason_sent = [False] * num_choices
             role = get_role()
+
+            def yield_first_chat(num_tokens: int, role: str = None, content: str = None):
+                for i in range(num_choices):
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=i,
+                        delta=DeltaMessage(
+                            role=role, content=content),
+                        logprobs=None,
+                        finish_reason=None)
+                    chunk = ChatCompletionStreamResponse(
+                        choices=[choice_data], model=self.model)
+                    chunk.usage = stream_usage_info(num_tokens, 0)
+
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
+
             async for res in promise:
                 prompt_tokens = len(res.prompt_token_ids)
                 if first_iteration:
-                    # Send first response for each request.n (index) with
-                    # the role
-                    for i in range(num_choices):
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=i,
-                            delta=DeltaMessage(role=role),
-                            logprobs=None,
-                            finish_reason=None)
-                        chunk = ChatCompletionStreamResponse(
-                            choices=[choice_data], model=request.model)
-                        chunk.usage = stream_usage_info(
-                            prompt_tokens, 0)
-
-                        data = chunk.model_dump_json()
-                        yield f"data: {data}\n\n"
+                    yield_first_chat(prompt_tokens, role=role)
 
                     if request.echo:
                         last_msg_content = ""
@@ -157,22 +190,7 @@ class OpenaiServer:
                                 "content"]
 
                         if last_msg_content:
-                            for i in range(num_choices):
-                                choice_data = (
-                                    ChatCompletionResponseStreamChoice(
-                                        index=i,
-                                        delta=DeltaMessage(
-                                            content=last_msg_content),
-                                        logprobs=None,
-                                        finish_reason=None))
-                                chunk = ChatCompletionStreamResponse(
-                                    choices=[choice_data],
-                                    model=request.model)
-                                chunk.usage = stream_usage_info(
-                                    prompt_tokens, 0)
-                                data = chunk.model_dump_json(
-                                    exclude_unset=True)
-                            yield f"data: {data}\n\n"
+                            yield_first_chat(prompt_tokens, content=last_msg_content)
                 first_iteration = False
 
                 for output in res.outputs:
@@ -199,8 +217,12 @@ class OpenaiServer:
                             index=i,
                             delta=delta_message,
                             finish_reason=None)
+                        if request.logprobs:
+                            logprobs = output.logprobs_diff
+                            token_ids = output.token_ids_diff
+                            choice_data.logprobs = create_logprobs(token_ids, logprobs)
                         chunk = ChatCompletionStreamResponse(
-                            choices=[choice_data], model=request.model)
+                            choices=[choice_data], model=self.model)
                         chunk.usage = stream_usage_info(
                             prompt_tokens, output.length)
                         data = chunk.model_dump_json()
@@ -219,7 +241,7 @@ class OpenaiServer:
                 )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
-                    choices=[], model=request.model, usage=final_usage)
+                    choices=[], model=self.model, usage=final_usage)
                 final_usage_data = final_usage_chunk.model_dump_json()
                 yield f"data: {final_usage_data}\n\n"
 
@@ -245,6 +267,9 @@ class OpenaiServer:
                     index=output.index,
                     message=message,
                 )
+
+                if request.logprobs:
+                    choice.logprobs = create_logprobs(output.token_ids, output.logprobs)
                 choices.append(choice)
 
             if request.echo:
@@ -265,18 +290,11 @@ class OpenaiServer:
                 total_tokens=num_prompt_tokens + num_generated_tokens,
             )
             response = ChatCompletionResponse(
-                model=request.model,
+                model=self.model,
                 choices=choices,
                 usage=usage,
             )
             return response
-
-        if request.best_of is None:
-            request.best_of = request.n
-        if (request.n > 1
-                or request.best_of > 1) and not request.use_beam_search:
-            return self.create_error_response(
-                "Only support one response per prompt without beam search")
 
         try:
             conversation: List[ConversationMessage] = []
@@ -296,12 +314,15 @@ class OpenaiServer:
             )
             sampling_params = request.to_sampling_params()
 
-            promise = self.llm.generate_async(prompt, sampling_params,
-                                              request.stream)
+            promise = self.llm.generate_async(
+                inputs=prompt,
+                sampling_params=sampling_params,
+                streaming=request.stream,
+            )
             if request.stream:
                 response_generator = chat_stream_generator(promise)
                 return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                                            media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise)
                 return JSONResponse(content=response.model_dump())
@@ -311,59 +332,68 @@ class OpenaiServer:
 
     async def openai_completion(self, request: CompletionRequest) -> Response:
 
-        # TODO{pengyunl}: improve performance by properly batching
-        async def completion_stream_generator(prompts: Union[List[str],
-                                                               List[List[int]]],
-                                              request: CompletionRequest):
-            num_choices = 1 if request.n is None else request.n
-            sampling_params = request.to_sampling_params()
+        def merge_promises(promises: List[RequestOutput]) -> AsyncIterator[Tuple[int, RequestOutput]]:
+            outputs = asyncio.Queue()
+            finished = [False] * len(promises)
 
-            for prompt_idx, prompt in enumerate(prompts):
-                promise = self.llm.generate_async(
-                    prompt,
-                    streaming=True,
-                    sampling_params=sampling_params,
-                )
-                gen_idx = 0
-                async for response in promise:
-                    for gen_idx, output in enumerate(response.outputs):
-                        responce_idx = prompt_idx * num_choices + gen_idx
-                        delta_text = output.text_diff.encode("utf-8")
-                        response = CompletionStreamResponse(
-                            model=request.model,
-                            choices=[
-                                CompletionResponseStreamChoice(
-                                    index=responce_idx, text=delta_text)
-                            ])
-                        response_json = response.model_dump_json(
-                            exclude_unset=False)
-                        yield f"data: {response_json}\n\n"
+            async def producer(i: int, promise: RequestOutput):
+                async for output in promise:
+                    await outputs.put((i, output))
+                finished[i] = True
+
+            _tasks = [asyncio.create_task(producer(i, promise))
+                for i, promise in enumerate(promises)
+            ]
+
+            async def consumer():
+                while not all(finished) or not outputs.empty():
+                    item = await outputs.get()
+                    yield item
+                await asyncio.gather(*_tasks)
+
+            return consumer()
+
+        async def create_completion_generator(generator: AsyncIterator[Tuple[int, RequestOutput]],
+                                              num_choices: int):
+            num_repsonse_per_request = 1 if request.n is None else request.n
+            echoed = [False] * num_choices
+            async for prompt_idx, requst_output in generator:
+                prompt = requst_output.prompt
+                for gen_idx, output in enumerate(requst_output.outputs):
+                    response_idx = prompt_idx * num_repsonse_per_request + gen_idx
+                    delta_text = output.text_diff
+                    if request.echo and not echoed[response_idx]:
+                        delta_text = prompt + delta_text
+                        echoed[response_idx] = True
+                    response = CompletionStreamResponse(
+                        model=self.model,
+                        choices=[
+                            CompletionResponseStreamChoice(
+                                index=response_idx, text=delta_text)
+                        ])
+                    response_json = response.model_dump_json(
+                        exclude_unset=False)
+                    yield f"data: {response_json}\n\n"
             yield f"data: [DONE]\n\n"
 
-        async def create_completion_response(prompts: Union[List[str],
-                                                            List[List[int]]],
-                                             request: CompletionRequest):
-            choices = []
+        async def create_completion_response(generator: AsyncIterator[Tuple[int, RequestOutput]],
+                                             num_choices: int):
+            choices = [None] * num_choices
+            num_repsonse_per_request = 1 if request.n is None else request.n
             num_prompt_tokens = num_gen_tokens = 0
-            sampling_params = request.to_sampling_params()
-            for prompt in prompts:
-                promise = self.llm.generate_async(
-                    prompt,
-                    streaming=False,
-                    sampling_params=sampling_params,
-                )
-                await promise.aresult()
-                num_prompt_tokens += len(promise.prompt_token_ids)
-                for output in promise.outputs:
+            async for prompt_idx, request_output in generator:
+                num_prompt_tokens += len(request_output.prompt_token_ids)
+                for gen_idx, output in enumerate(request_output.outputs):
                     num_gen_tokens += len(output.token_ids)
                     output_text = output.text
                     if request.echo:
-                        output_text = promise.prompt + output_text
+                        output_text = request_output.prompt + output_text
+                    idx = prompt_idx * num_repsonse_per_request + gen_idx
                     choice = CompletionResponseChoice(
-                        index=len(choices),
+                        index=idx,
                         text=output_text,
                     )
-                    choices.append(choice)
+                    choices[idx] = choice
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
@@ -371,18 +401,11 @@ class OpenaiServer:
                 total_tokens=num_gen_tokens + num_prompt_tokens,
             )
             response = CompletionResponse(
-                model=request.model,
+                model=self.model,
                 choices=choices,
                 usage=usage_info,
             )
             return response
-
-        if request.best_of is None:
-            request.best_of = request.n
-        if (request.n > 1
-                or request.best_of > 1) and not request.use_beam_search:
-            return self.create_error_response(
-                "Only support one response per prompt without beam search")
 
         try:
             if isinstance(request.prompt, str) or \
@@ -391,12 +414,23 @@ class OpenaiServer:
             else:
                 prompts = request.prompt
 
+            promises: List[RequestOutput] = []
+            sampling_params = request.to_sampling_params()
+            for prompt in prompts:
+                promise = self.llm.generate_async(
+                    inputs=prompt,
+                    sampling_params=sampling_params,
+                    streaming=request.stream,
+                )
+                promises.append(promise)
+            generator = merge_promises(promises)
+            num_choices = len(prompts) if request.n is None else len(prompts) * request.n
             if request.stream:
-                response_generator = completion_stream_generator(prompts, request)
+                response_generator = create_completion_generator(generator, num_choices)
                 return StreamingResponse(content=response_generator,
-                                        media_type="text/event-stream")
+                                         media_type="text/event-stream")
             else:
-                response = await create_completion_response(prompts, request)
+                response = await create_completion_response(generator, num_choices)
                 return JSONResponse(content=response.model_dump())
         except Exception as e:
             return self.create_error_response(str(e))
@@ -441,8 +475,9 @@ def entrypoint(model_dir: str,
     hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_dir)
 
     server = OpenaiServer(llm=llm,
-                       kv_cache_config=kv_cache_config,
-                       hf_tokenizer=hf_tokenizer)
+                          model=model_dir,
+                          kv_cache_config=kv_cache_config,
+                          hf_tokenizer=hf_tokenizer)
 
     asyncio.run(server(host, port))
 

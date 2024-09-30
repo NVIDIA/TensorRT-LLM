@@ -283,6 +283,7 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
         ''' Create a LLaMAForCausalLM object from give parameters
         '''
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        trust_remote_code = kwargs.pop('trust_remote_code', True)
 
         config = ChatGLMConfig.from_hugging_face(hf_model_or_dir,
                                                  dtype=dtype,
@@ -295,7 +296,7 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
             device_map = 'auto' if not load_model_on_cpu else 'cpu'
         hf_model = AutoModel.from_pretrained(
             hf_model_or_dir,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             torch_dtype='auto' if config.chatglm_version != 'glm' else getattr(
                 torch, config.dtype),
             device_map=device_map)

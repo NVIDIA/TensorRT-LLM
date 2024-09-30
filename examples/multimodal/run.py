@@ -66,6 +66,10 @@ def parse_arguments():
                         action='store_true',
                         default=None,
                         help="Enable FMHA runner FP32 accumulation.")
+    parser.add_argument('--use_py_session',
+                        default=False,
+                        action='store_true',
+                        help="Whether or not to use Python runtime session")
 
     return parser.parse_args()
 

@@ -35,7 +35,7 @@ public:
         tle::ModelType modelType, tle::ExecutorConfig const& executorConfig);
 
     Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
-        tle::ExecutorConfig const& executorConfig);
+        tle::ExecutorConfig const& executorConfig, std::optional<pybind11::dict> managedWeights);
 
     Executor(std::string const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
         std::string const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, tle::ModelType modelType,

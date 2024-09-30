@@ -31,170 +31,17 @@ from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       repeat_kv)
 from transformers.pytorch_utils import Conv1D
 
-from tensorrt_llm._utils import pad_vocab_size, torch_to_numpy
+from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.gemma.weight import dup_kv_weight
+from tensorrt_llm.models.convert_utils import (dup_kv_weight, generate_int8,
+                                               get_weight, smooth_gemm,
+                                               smooth_gemm_fc1_gate, split,
+                                               split_matrix_tp)
 
 if TYPE_CHECKING:
     from transformers import AutoModelForCausalLM, Cache
 
     # transformers included  ⬆️ `Cache` in https://github.com/huggingface/transformers/commit/633215ba58fe5114d8c8d32e415a04600e010701 - transformers 4.33, which is installed in the tests, is before this.
-
-
-def generate_int8(weights, act_range, is_qkv=False, multi_query_mode=False):
-    """
-     This function has two purposes:
-      - compute quantized weights, scaled either per-tensor or per-column
-      - compute scaling factors
-
-      Depending on the GEMM API (CUTLASS/CUBLAS) the required scaling factors differ.
-      CUTLASS uses two sets of scaling factors. One for the activation X, one for the weight W.
-      CUBLAS only has one (we can't do per-row scaling). So we must provide pre-multiplied scaling factor.
-
-      Here is the list of what we need (T means per-tensor, C per-column):
-        - scale_x_orig_quant puts fp activation into the quantized range (i.e. [-128, 127], for int8). Used before the GEMM. (T)
-        - scale_y_quant_orig puts quantized activation into the fp range. Used if the GEMM outputs int8. (T)
-        - scale_w_quant_orig puts weights from quant range to fp range (used with CUTLASS) (T, C)
-        - scale_y_accum_quant puts the GEMM result (XW) from accumulation range (int32)
-          to quant range (int8) (used for CUBLAS) (T, C)
-
-      Note that we don't do anything special about row-parallel GEMM. Theoretically, we could have per-GPU scaling factors too,
-      but then the model would change depending on the number of GPUs used.
-
-      For QKV projection, the behavior is special. Even if we have a single matrix to perform QKV projection, we consider it
-      as three different matrices: Q, K, and V. So per-tensor actually means one scaling factor for each Q, K and V.
-      For our GEMM implementation to respect this behavior, we use per-column mode and replicate values along columns.
-    """
-
-    # compute weight scaling factors for fp->int8 and int8->fp
-    fp32_weight = weights.to(torch.float32).cpu()
-    if is_qkv and not multi_query_mode:
-        scale_w_orig_quant_t = 127. / act_range["w"].reshape(3, -1).max(
-            dim=-1, keepdims=True)[0].cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].reshape(3,
-                                                             -1).cpu().numpy()
-    elif is_qkv and multi_query_mode:
-        hidden_dim = fp32_weight.shape[0]
-        local_dim = act_range["w"].shape[0]
-        kv_dim = (local_dim - hidden_dim) // 2
-        scale_w_q = act_range["w"][0:hidden_dim]
-        scale_w_k = act_range["w"][hidden_dim:hidden_dim + kv_dim]
-        scale_w_v = act_range["w"][-kv_dim:]
-
-        scale_w_qkv_t = torch.concat([
-            scale_w_q.max(dim=0, keepdim=True)[0],
-            scale_w_k.max(dim=0, keepdim=True)[0],
-            scale_w_v.max(dim=0, keepdim=True)[0]
-        ])
-
-        scale_w_orig_quant_t = 127. / scale_w_qkv_t.cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
-    else:
-        scale_w_orig_quant_t = 127. / act_range["w"].max().cpu().numpy()
-        scale_w_orig_quant_c = 127. / act_range["w"].cpu().numpy()
-    scale_w_quant_orig_t = 1.0 / scale_w_orig_quant_t
-    scale_w_quant_orig_c = 1.0 / scale_w_orig_quant_c
-
-    scale_w_orig_quant_c = scale_w_orig_quant_c.astype(np.float32)
-    scale_w_orig_quant_t = scale_w_orig_quant_t.astype(np.float32)
-    # compute the rest of needed scaling factors
-    scale_x_orig_quant_t = np.array(127. / act_range["x"].max().item())
-    scale_y_orig_quant_t = np.array(127. / act_range["y"].max().item())
-    scale_y_quant_orig_t = np.array(act_range["y"].max().item() / 127.)
-    scale_y_accum_quant_t = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_t)
-    scale_y_accum_quant_c = scale_y_orig_quant_t / (scale_x_orig_quant_t *
-                                                    scale_w_orig_quant_c)
-    if is_qkv and not multi_query_mode:
-        scale_y_accum_quant_t = np.broadcast_to(scale_y_accum_quant_t,
-                                                scale_w_orig_quant_c.shape)
-        scale_w_quant_orig_t = np.broadcast_to(scale_w_quant_orig_t,
-                                               scale_w_orig_quant_c.shape)
-    if is_qkv and multi_query_mode:
-        scale_q_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[0],
-                                            scale_w_q.shape)
-        scale_k_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[1],
-                                            scale_w_k.shape)
-        scale_v_y_accum_t = np.broadcast_to(scale_y_accum_quant_t[2],
-                                            scale_w_v.shape)
-        scale_y_accum_quant_t = np.concatenate(
-            [scale_q_y_accum_t, scale_k_y_accum_t, scale_v_y_accum_t])
-        scale_w_quant_orig_t = np.concatenate([
-            np.broadcast_to(scale_w_quant_orig_t[0], scale_w_q.shape),
-            np.broadcast_to(scale_w_quant_orig_t[1], scale_w_k.shape),
-            np.broadcast_to(scale_w_quant_orig_t[2], scale_w_v.shape)
-        ])
-
-    to_i8 = lambda x: torch_to_numpy(x.round().clip(-127, 127).to(torch.int8))
-
-    if is_qkv and multi_query_mode:
-        weight_int8 = to_i8(fp32_weight / scale_w_quant_orig_t)
-    else:
-        weight_int8 = to_i8(fp32_weight * scale_w_orig_quant_t)
-
-    return {
-        "weight.int8": weight_int8,
-        "weight.int8.col": to_i8(fp32_weight * scale_w_orig_quant_c),
-        "scale_x_orig_quant": scale_x_orig_quant_t.astype(np.float32),
-        "scale_w_quant_orig": scale_w_quant_orig_t.astype(np.float32),
-        "scale_w_quant_orig.col": scale_w_quant_orig_c.astype(np.float32),
-        "scale_y_accum_quant": scale_y_accum_quant_t.astype(np.float32),
-        "scale_y_accum_quant.col": scale_y_accum_quant_c.astype(np.float32),
-        "scale_y_quant_orig": scale_y_quant_orig_t.astype(np.float32),
-    }
-
-
-@torch.no_grad()
-def apply_smoothing(scales,
-                    gemm_weights,
-                    layernorm_weights=None,
-                    layernorm_bias=None,
-                    dtype=torch.float32,
-                    layernorm_1p=False):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-
-    if layernorm_weights is not None:
-        assert layernorm_weights.numel() == scales.numel()
-        layernorm_weights.div_(scales).to(dtype)
-    if layernorm_bias is not None:
-        assert layernorm_bias.numel() == scales.numel()
-        layernorm_bias.div_(scales).to(dtype)
-    if layernorm_1p:
-        layernorm_weights += (1 / scales) - 1
-
-    for gemm in gemm_weights:
-        gemm.mul_(scales.view(1, -1)).to(dtype)
-
-
-@torch.no_grad()
-def smooth_gemm(gemm_weights,
-                act_scales,
-                layernorm_weights=None,
-                layernorm_bias=None,
-                alpha: Optional[float] = 0.5,
-                weight_scales=None):
-    if not isinstance(gemm_weights, list):
-        gemm_weights = [gemm_weights]
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, gemm_weights, layernorm_weights, layernorm_bias,
-                    orig_dtype)
-
-    return scales
 
 
 @torch.no_grad()
@@ -257,45 +104,6 @@ def capture_activation_range(model,
         h.remove()
 
     return act_scales
-
-
-@torch.no_grad()
-def smooth_gemm_fc1_gate(fc1_weights,
-                         gate_weights,
-                         act_scales,
-                         layernorm_weights=None,
-                         layernorm_bias=None,
-                         alpha: Optional[float] = 0.5,
-                         weight_scales=None):
-    gemm_weights = []
-    if not isinstance(fc1_weights, list):
-        fc1_weights = [fc1_weights]
-    if not isinstance(gate_weights, list):
-        gate_weights = [gate_weights]
-
-    for i in range(len(fc1_weights)):
-        gemm_weight = torch.cat([fc1_weights[i], gate_weights[i]], dim=0)
-        gemm_weights.append(gemm_weight)
-
-    orig_dtype = gemm_weights[0].dtype
-
-    for gemm in gemm_weights:
-        # gemm_weights are expected to be transposed
-        assert gemm.shape[1] == act_scales.numel()
-
-    if weight_scales is None:
-        weight_scales = torch.cat(
-            [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
-            dim=0)
-        weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
-    scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
-              weight_scales.pow(1 - alpha)).clamp(min=1e-5)
-
-    apply_smoothing(scales, fc1_weights + gate_weights, layernorm_weights,
-                    layernorm_bias, orig_dtype)
-
-    return scales
 
 
 @torch.no_grad()
@@ -386,12 +194,12 @@ def get_tllm_linear_sq_weight(vals,
     results = {}
 
     def multi_query_split(data, local_dim, head_size, tp_size, cur_rank):
-        q, k, v = np.split(data, [local_dim, local_dim + head_size], axis=-1)
-        q_split = np.split(q, tp_size, axis=-1)
-        k_split = np.split(k, tp_size, axis=-1)
-        v_split = np.split(v, tp_size, axis=-1)
+        q, k, v = torch.split(data, [local_dim, head_size, head_size], dim=-1)
+        q_split = torch.split(q, q.shape[-1] // tp_size, dim=-1)
+        k_split = torch.split(k, q.shape[-1] // tp_size, dim=-1)
+        v_split = torch.split(v, q.shape[-1] // tp_size, dim=-1)
         return [
-            np.concatenate((q_split[ii], k_split[ii], v_split[ii]), axis=-1)
+            torch.concat((q_split[ii], k_split[ii], v_split[ii]), dim=-1)
             for ii in range(tp_size)
         ][cur_rank]
 
@@ -399,9 +207,9 @@ def get_tllm_linear_sq_weight(vals,
 
     if per_token:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = vals["weight.int8.col"]
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = vals["weight.int8"]
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -409,14 +217,14 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = np.split(original_weights,
-                                   tensor_parallel,
-                                   axis=cat_dim)[rank]
+            cur_weights = torch.split(original_weights,
+                                      original_weights.shape[-1] //
+                                      tensor_parallel,
+                                      dim=-1)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix +
-                'weight'] = torch.from_numpy(cur_weights).t().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
         if smoother_value is None:
             results[last_prefix] = torch.from_numpy(
                 np.array([1.0], dtype=np.float32))
@@ -425,6 +233,7 @@ def get_tllm_linear_sq_weight(vals,
             cur_per_channel_value = vals["scale_w_quant_orig.col"]
             if smoother_value is None:
                 if multi_query_mode:
+
                     cur_per_channel_value = multi_query_split(
                         vals["scale_w_quant_orig.col"], local_dim, head_size,
                         tensor_parallel, rank)
@@ -432,7 +241,7 @@ def get_tllm_linear_sq_weight(vals,
                     cur_per_channel_value = np.split(
                         vals["scale_w_quant_orig.col"],
                         tensor_parallel,
-                        axis=cat_dim)[rank]
+                        axis=-1)[rank]
         else:
             cur_per_channel_value = vals["scale_w_quant_orig"]
             if is_qkv:
@@ -441,18 +250,18 @@ def get_tllm_linear_sq_weight(vals,
                         vals["scale_w_quant_orig"], local_dim, head_size,
                         tensor_parallel, rank)
                 else:
-                    cur_per_channel_value = np.split(vals["scale_w_quant_orig"],
-                                                     tensor_parallel,
-                                                     axis=cat_dim)[rank]
+                    cur_per_channel_value = torch.split(
+                        vals["scale_w_quant_orig"],
+                        vals["scale_w_quant_orig"].shape[-1] // tensor_parallel,
+                        dim=-1)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array(cur_per_channel_value,
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix +
+                'per_channel_scale'] = cur_per_channel_value.reshape(col_shape)
     else:
         if per_channel:
-            original_weights = np.array(vals["weight.int8.col"])
+            original_weights = vals["weight.int8.col"]
         else:
-            original_weights = np.array(vals["weight.int8"])
+            original_weights = vals["weight.int8"]
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -460,14 +269,14 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = multi_query_split(original_weights, local_dim,
                                             head_size, tensor_parallel, rank)
         else:
-            cur_weights = np.split(original_weights,
-                                   tensor_parallel,
-                                   axis=cat_dim)[rank]
+            cur_weights = torch.split(original_weights,
+                                      original_weights.shape[-1] //
+                                      tensor_parallel,
+                                      dim=-1)[rank]
         if is_qkv:
             hidden_dim = cur_weights.shape[0]
             cur_weights = cur_weights.reshape(hidden_dim, -1)
-        results[prefix +
-                'weight'] = torch.from_numpy(cur_weights).t().contiguous()
+        results[prefix + 'weight'] = cur_weights.t().contiguous()
 
         if per_channel:
             cur_per_channel_value = vals["scale_y_accum_quant.col"]
@@ -495,22 +304,19 @@ def get_tllm_linear_sq_weight(vals,
                         tensor_parallel,
                         axis=cat_dim)[rank]
 
-        results[prefix + 'per_channel_scale'] = torch.from_numpy(
-            np.array([cur_per_channel_value],
-                     dtype=np.float32).reshape(col_shape)).contiguous()
+        results[prefix + 'per_channel_scale'] = cur_per_channel_value.reshape(
+            col_shape).contiguous()
 
-        results[last_prefix] = torch.from_numpy(
-            np.array([vals['scale_x_orig_quant']],
-                     dtype=np.float32)).contiguous()
+        results[last_prefix] = vals['scale_x_orig_quant'].contiguous()
 
-        results[prefix + 'act_scale'] = torch.from_numpy(
-            np.array([[vals["scale_y_quant_orig"]]],
-                     dtype=np.float32)).contiguous()
+        results[prefix + 'act_scale'] = vals["scale_y_quant_orig"].contiguous()
 
     if smoother_value is not None:
-        cur_smoother_value = np.split(smoother_value,
-                                      tensor_parallel,
-                                      axis=cat_dim)[rank]
+        cur_smoother_value = torch.split(smoother_value,
+                                         smoother_value.shape[-1] //
+                                         tensor_parallel,
+                                         dim=cat_dim)[rank]
+
         results[prefix + 'smoother'] = cur_smoother_value.reshape(
             smoother_shape).contiguous().to(torch.float32)
 
@@ -518,18 +324,6 @@ def get_tllm_linear_sq_weight(vals,
         results[prefix + 'bias'] = bias
 
     return results
-
-
-def split(weight: torch.Tensor,
-          tp_size: int,
-          rank: int = 0,
-          dim: int = 0) -> torch.Tensor:
-    if tp_size == 1:
-        return weight
-    elif weight.ndim == 1:
-        return torch.chunk(weight, tp_size)[rank].contiguous()
-    else:
-        return torch.chunk(weight, tp_size, dim=dim)[rank].contiguous()
 
 
 def split_qkv_tp(qkv, n_head, n_kv_heads, head_size, tensor_parallel, rank):
@@ -543,30 +337,6 @@ def split_qkv_tp(qkv, n_head, n_kv_heads, head_size, tensor_parallel, rank):
     k = split(k, tensor_parallel, rank, dim=0)
     v = split(v, tensor_parallel, rank, dim=0)
     return torch.concatenate([q, k, v], dim=0).contiguous()
-
-
-def split_matrix_tp(weight: torch.Tensor, tp_size: int, rank: int,
-                    dim: int) -> torch.Tensor:
-    return split(weight, tp_size, rank, dim=dim)
-
-
-def get_weight(params: Dict[str, torch.Tensor], prefix: str,
-               dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.weight' not in params:
-        return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
-
-
-def get_bias(params: Dict[str, torch.Tensor], prefix: str,
-             dtype: torch.dtype) -> torch.Tensor:
-    if f'{prefix}.bias' not in params:
-        return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
-
-
-def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
-                        dtype: torch.dtype) -> Tuple[torch.Tensor]:
-    return get_weight(params, prefix, dtype), get_bias(params, prefix, dtype)
 
 
 def get_tllm_linear_weight(
@@ -907,6 +677,8 @@ def convert_hf_model(*, hf_model: "AutoModelForCausalLM", mapping: Mapping,
             attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
                 attn_dense_weight, act_range.get(prefix + 'self_attn.o_proj'))
+            # import pdb
+            # pdb.set_trace()
             weights.update(
                 get_tllm_linear_sq_weight(
                     int8_weights,
@@ -1013,7 +785,7 @@ def convert_hf_model(*, hf_model: "AutoModelForCausalLM", mapping: Mapping,
                     smoother_value=smoother[prefix + 'mlp.down_proj'],
                     smoother_shape=[1, intermediate_size // tensor_parallel],
                     rank=mapping.tp_rank,
-                    cat_dim=0))
+                    cat_dim=-1))
         else:
             mlp_proj_weight = split_matrix_tp(mlp_proj_weight,
                                               tensor_parallel,

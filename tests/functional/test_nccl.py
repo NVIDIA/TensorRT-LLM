@@ -28,7 +28,6 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm._ipc_utils import peer_access
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceStrategy,
                                      allreduce)
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
@@ -97,25 +96,24 @@ class TestCommunicationPlugin(unittest.TestCase):
         input = self.reference_tensors[self.rank][:size].to(torch_dtype)
         inner_loop = 5
 
-        with peer_access(self.mapping):
-            with tensorrt_llm.net_guard(network):
+        with tensorrt_llm.net_guard(network):
 
-                x = Tensor(name='x',
-                           shape=input.shape,
-                           dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-                current_all_reduce_helper().set_workspace_tensor(self.mapping)
+            x = Tensor(name='x',
+                       shape=input.shape,
+                       dtype=tensorrt_llm.str_dtype_to_trt(dtype))
+            current_all_reduce_helper().set_workspace_tensor(self.mapping)
 
-                current = x
-                for i in range(inner_loop):
-                    current = allreduce(current, self.mapping.tp_group,
-                                        strategy, config)
+            current = x
+            for i in range(inner_loop):
+                current = allreduce(current, self.mapping.tp_group, strategy,
+                                    config)
 
-                current.mark_output('output', dtype)
+            current.mark_output('output', dtype)
 
-            # trt run
-            session = create_session(builder, network, precision=dtype)
-            inputs = {'x': input, 'all_reduce_workspace': workspace}
-            outputs = run_session(session, inputs)
+        # trt run
+        session = create_session(builder, network, precision=dtype)
+        inputs = {'x': input, 'all_reduce_workspace': workspace}
+        outputs = run_session(session, inputs)
 
         # compare diff
         torch.testing.assert_close(outputs['output'],

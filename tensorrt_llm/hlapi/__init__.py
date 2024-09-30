@@ -1,3 +1,4 @@
+from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput, SamplingParams
 from .llm_utils import (BuildConfig, CapacitySchedulerPolicy, KvCacheConfig,
                         QuantAlgo, QuantConfig, SchedulerConfig)
@@ -12,4 +13,5 @@ __all__ = [
     'BuildConfig',
     'QuantConfig',
     'QuantAlgo',
+    'BuildCacheConfig',
 ]

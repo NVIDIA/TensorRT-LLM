@@ -38,6 +38,7 @@ class TestPrecisionControl(unittest.TestCase):
 
         # construct trt network
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
         with tensorrt_llm.net_guard(net):
             network = tensorrt_llm.default_trtnet()

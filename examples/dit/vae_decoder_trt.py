@@ -32,17 +32,17 @@ class TRT_Exporter(object):
         print(f"Start exporting ONNX model to {onnxFile}!")
         latent = torch.randn(self.max_batch_size, self.latent_channel,
                              *self.latent_shape).cuda()
-        print(latent.shape)
         self.pytorch_model.cuda().eval()
-        torch.onnx.export(self.pytorch_model,
-                          latent,
-                          onnxFile,
-                          opset_version=17,
-                          input_names=['input'],
-                          output_names=['output'],
-                          dynamic_axes={'input': {
-                              0: 'batch'
-                          }})
+        with torch.inference_mode():
+            torch.onnx.export(self.pytorch_model,
+                              latent,
+                              onnxFile,
+                              opset_version=17,
+                              input_names=['input'],
+                              output_names=['output'],
+                              dynamic_axes={'input': {
+                                  0: 'batch'
+                              }})
 
     def generate_trt_engine(self, onnxFile, planFile):
         print(f"Start exporting TRT model to {planFile}!")

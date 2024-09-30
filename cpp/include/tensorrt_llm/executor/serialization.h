@@ -25,6 +25,13 @@
 namespace tensorrt_llm::executor
 {
 
+namespace kv_cache
+{
+class CommState;
+class CacheState;
+class SocketState;
+} // namespace kv_cache
+
 class Serialization
 {
 public:
@@ -52,6 +59,31 @@ public:
     [[nodiscard]] static LoraConfig deserializeLoraConfig(std::istream& is);
     static void serialize(LoraConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(LoraConfig const& config);
+
+    // CommState
+    [[nodiscard]] static kv_cache::CommState deserializeCommState(std::istream& is);
+    static void serialize(kv_cache::CommState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::CommState const& state);
+
+    // SocketState
+    [[nodiscard]] static kv_cache::SocketState deserializeSocketState(std::istream& is);
+    static void serialize(kv_cache::SocketState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::SocketState const& state);
+
+    // CacheState
+    [[nodiscard]] static kv_cache::CacheState deserializeCacheState(std::istream& is);
+    static void serialize(kv_cache::CacheState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::CacheState const& state);
+
+    // ContextPhaseState
+    [[nodiscard]] static ContextPhaseState deserializeContextPhaseState(std::istream& is);
+    static void serialize(ContextPhaseState const& contextPhaseState, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(ContextPhaseState const& contextPhaseState);
+
+    // ContextPhaseParams
+    [[nodiscard]] static ContextPhaseParams deserializeContextPhaseParams(std::istream& is);
+    static void serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(ContextPhaseParams const& contextPhaseParams);
 
     // Request
     [[nodiscard]] static Request deserializeRequest(std::istream& is);
@@ -121,6 +153,11 @@ public:
     static DecodingConfig deserializeDecodingConfig(std::istream& is);
     static void serialize(DecodingConfig const& decodingConfig, std::ostream& os);
     static size_t serializedSize(DecodingConfig const& decodingConfig);
+
+    // DebugConfig
+    static DebugConfig deserializeDebugConfig(std::istream& is);
+    static void serialize(DebugConfig const& debugConfig, std::ostream& os);
+    static size_t serializedSize(DebugConfig const& debugConfig);
 
     // ExecutorConfig
     static ExecutorConfig deserializeExecutorConfig(std::istream& is);

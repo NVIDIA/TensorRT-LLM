@@ -104,6 +104,7 @@ struct QKVPreprocessingParams
     int cyclic_kv_cache_len{0};
     int sink_token_len{0};
     int token_num{0};
+    bool remove_padding{true};
     int head_num{0};
     int kv_head_num{0};
     int qheads_per_kv_head{0};

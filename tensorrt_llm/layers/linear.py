@@ -23,7 +23,7 @@ from .._common import default_net, default_trtnet
 from .._utils import set_obj_attrs, str_dtype_to_torch, str_dtype_to_trt
 from ..functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
                           _add_plugin_info, _create_tensor, allgather,
-                          allreduce, cast, matmul)
+                          allreduce, cast, low_latency_gemm, matmul)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -204,9 +204,12 @@ class LinearBase(Module, metaclass=ABCMeta):
         ).plugin_config.manage_weights and self.prefer_managed_weight:
             use_gemm_plugin = default_net(
             ).plugin_config.gemm_plugin is not None
+            use_low_latency_gemm_plugin = default_net(
+            ).plugin_config.low_latency_gemm_plugin == 'fp8'
             return self.weight.get_managed_tensor(
                 network=default_net(),
-                need_transpose=self.weight_is_kn() and not use_gemm_plugin)
+                need_transpose=self.weight_is_kn() and not use_gemm_plugin
+                and not use_low_latency_gemm_plugin)
         else:
             return self.weight.get_constant_tensor(network=default_net())
 
@@ -215,13 +218,18 @@ class LinearBase(Module, metaclass=ABCMeta):
         x,
         weight,
         gemm_plugin: Optional[str] = None,
+        low_latency_gemm_plugin: Optional[str] = None,
         use_fp8: bool = False,
         alpha: Optional[np.ndarray] = None,
         lora_runtime_params: Optional[LoraRuntimeParams] = None,
         lora_hidden_state: Optional[Tensor] = None,
     ):
         hidden_state = x
-        if gemm_plugin:
+        if low_latency_gemm_plugin:
+            strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
+                self.dtype, str) else self.dtype
+            x = low_latency_gemm(x, weight, alpha, strict_dtype)
+        elif gemm_plugin:
             if gemm_plugin == 'fp8':
                 strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
                     self.dtype, str) else self.dtype
@@ -255,6 +263,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             x,
             weight,
             gemm_plugin: Optional[str] = None,
+            low_latency_gemm_plugin: Optional[str] = None,
             use_fp8: bool = False,
             alpha: Optional[np.ndarray] = None,
             lora_runtime_params: Optional[LoraRuntimeParams] = None,
@@ -264,6 +273,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             x,
             weight,
             gemm_plugin=gemm_plugin,
+            low_latency_gemm_plugin=low_latency_gemm_plugin,
             use_fp8=use_fp8,
             alpha=alpha,
             lora_runtime_params=lora_runtime_params,
@@ -348,23 +358,24 @@ class Linear(LinearBase):
         config = kwargs.get("config", None)
         if self.is_qkv:
             if isinstance(weights, list):
-                if config.remove_duplicated_kv_heads:
-                    head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
-                    k, v = weights[1:]
-                    k = k.reshape([
-                        k.shape[0] // head_size // 2, 2, head_size,
-                        self.in_features
-                    ])
-                    v = v.reshape([
-                        v.shape[0] // head_size // 2, 2, head_size,
-                        self.in_features
-                    ])
-                    assert (k[:, 0] == k[:, 1]).all()
-                    assert (v[:, 0] == v[:, 1]).all()
-                    k = k[:, 0].reshape([-1, self.in_features])
-                    v = v[:, 0].reshape([-1, self.in_features])
-                    weights[1] = k
-                    weights[2] = v
+                if hasattr(config, "remove_duplicated_kv_heads"):
+                    if config.remove_duplicated_kv_heads:
+                        head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
+                        k, v = weights[1:]
+                        k = k.reshape([
+                            k.shape[0] // head_size // 2, 2, head_size,
+                            self.in_features
+                        ])
+                        v = v.reshape([
+                            v.shape[0] // head_size // 2, 2, head_size,
+                            self.in_features
+                        ])
+                        assert (k[:, 0] == k[:, 1]).all()
+                        assert (v[:, 0] == v[:, 1]).all()
+                        k = k[:, 0].reshape([-1, self.in_features])
+                        v = v[:, 0].reshape([-1, self.in_features])
+                        weights[1] = k
+                        weights[2] = v
                 weights = torch.cat(weights)
             if using_head_as_leading_dim:
                 # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]
@@ -397,6 +408,7 @@ class RowLinear(LinearBase):
         strict_dtype: bool = False,
         pad_lda=0,
         prefer_managed_weight=True,
+        is_expert=False,
     ):
         super().__init__(
             local_in_features=in_features // tp_size,
@@ -411,6 +423,8 @@ class RowLinear(LinearBase):
         )
 
         self.tp_dim = 1
+        self.tp_size = tp_size
+        self.is_expert = is_expert
 
     @classmethod
     def tp_split_dim(cls) -> int:
@@ -427,12 +441,17 @@ class RowLinear(LinearBase):
                      == AllReduceFusionOp.RESIDUAL_RMS_NORM))
             if fuse_bias_into_all_reduce:
                 reduce_fusion_params.bias = self.bias.value
-            x = allreduce(x,
-                          self.tp_group,
-                          reduce_fusion_params=reduce_fusion_params)
-            if need_bias and not fuse_bias_into_all_reduce:
-                bias = cast(self.bias.value, x.dtype)
-                x = x + bias
+            if not self.is_expert:
+                x = allreduce(x,
+                              self.tp_group,
+                              reduce_fusion_params=reduce_fusion_params)
+                if need_bias and not fuse_bias_into_all_reduce:
+                    bias = cast(self.bias.value, x.dtype)
+                    x = x + bias
+            else:
+                if need_bias and not fuse_bias_into_all_reduce:
+                    bias = cast(self.bias.value, x.dtype)
+                    x = x + bias / self.tp_size
             return x
 
         if self.bias is not None:

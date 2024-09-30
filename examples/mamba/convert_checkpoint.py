@@ -5,14 +5,13 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import List, Union
 
 import safetensors.torch
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
-from transformers.utils import CONFIG_NAME
-from transformers.utils.hub import cached_file
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -20,9 +19,24 @@ from tensorrt_llm.models.convert_utils import (iterate_shard_files,
                                                load_state_dict)
 
 
+class CheckpointType(str, Enum):
+    mistral_inference = "mistral_inference"
+    state_spaces = "state_spaces"
+    hf = "hf"
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt_type",
+                        type=CheckpointType,
+                        choices=list(CheckpointType),
+                        default=CheckpointType.hf,
+                        help='Checkpoint type')
     parser.add_argument('--model_dir', type=Path, default=None)
+    parser.add_argument("--world_size",
+                        type=int,
+                        default=1,
+                        help="world size, only support tensor parallelism now")
     parser.add_argument('--dtype',
                         type=str,
                         default='float16',
@@ -58,6 +72,14 @@ def get_tllm_linear_weight(weight, prefix, bias=None):
     if bias is not None:
         results[prefix + 'bias'] = bias
     return results
+
+
+def split(v, tp_size, idx, dim=0):
+    assert v.shape[dim] % tp_size == 0
+    split_size = v.shape[dim] // tp_size
+    if tp_size == 1:
+        return v
+    return torch.split(v, split_size, dim=dim)[idx]
 
 
 def convert_hf_mamba(hf_mamba,
@@ -160,13 +182,18 @@ def rename_hf_to_tllm(name: str):
     return name
 
 
-def convert_from_hf_checkpoint(model_dir: Union[str, Path],
+def convert_from_hf_checkpoint(mamba_config: dict,
+                               model_dir: Union[str, Path],
                                rank=0,
                                dtype: Union[str, torch.dtype] = torch.float32,
                                mamba_version: str = 'Mamba1'):
     logger.info('Loading weights from HF Mamba...')
     tik = time.time()
 
+    tp_rank = rank
+    tp_size = mamba_config['mapping']['tp_size']
+    d_inner = mamba_config['rnn_hidden_size']
+    d_state = mamba_config['state_size']
     weights = {}
     if isinstance(dtype, str):
         dtype = tensorrt_llm.str_dtype_to_torch(dtype)
@@ -196,6 +223,44 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
                 in_proj_params = torch.split(param, param.size(0) // 2, dim=0)
                 weights[tllm_name.replace('proj', 'proj_x')] = in_proj_params[0]
                 weights[tllm_name.replace('proj', 'proj_z')] = in_proj_params[1]
+            elif 'in_proj' in name and mamba_version == 'Mamba2':
+                nheads = d_inner // mamba_config['rnn_head_size']
+                ngroups = mamba_config['ngroups']
+                in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt = torch.split(
+                    param, [
+                        d_inner, d_inner, ngroups * d_state, ngroups * d_state,
+                        nheads
+                    ],
+                    dim=0)
+                in_proj_z = split(in_proj_z, tp_size, tp_rank, dim=0)
+                in_proj_x = split(in_proj_x, tp_size, tp_rank, dim=0)
+                in_proj_b = split(in_proj_b, tp_size, tp_rank, dim=0)
+                in_proj_c = split(in_proj_c, tp_size, tp_rank, dim=0)
+                in_proj_dt = split(in_proj_dt, tp_size, tp_rank, dim=0)
+                in_proj = torch.concat(
+                    [in_proj_z, in_proj_x, in_proj_b, in_proj_c, in_proj_dt])
+                weights[tllm_name] = in_proj.contiguous()
+            elif 'conv1d' in name and mamba_version == 'Mamba2':
+                ngroups = mamba_config['ngroups']
+                conv_x, conv_b, conv_c = torch.split(
+                    param, [d_inner, ngroups * d_state, ngroups * d_state],
+                    dim=0)
+                conv_x = split(conv_x, tp_size, tp_rank, dim=0)
+                conv_b = split(conv_b, tp_size, tp_rank, dim=0)
+                conv_c = split(conv_c, tp_size, tp_rank, dim=0)
+                conv = torch.concat([conv_x, conv_b, conv_c])
+                weights[tllm_name] = conv.contiguous()
+            elif any(keyword in name for keyword in (
+                    'mixer.norm.weight',
+                    'A_log',
+                    'D',
+                    'dt_proj.bias',
+                    'dt_bias',
+            )) and mamba_version == 'Mamba2':
+                weights[tllm_name] = split(param, tp_size, tp_rank, dim=0)
+            elif 'out_proj' in name and mamba_version == 'Mamba2':
+                weights[tllm_name] = split(param, tp_size, tp_rank,
+                                           dim=1).contiguous()
             else:
                 weights[tllm_name] = param
         del model_params
@@ -205,6 +270,11 @@ def convert_from_hf_checkpoint(model_dir: Union[str, Path],
     if 'lm_head.weight' not in weights or weights['lm_head.weight'].data_ptr(
     ) == emb.data_ptr():
         weights['lm_head.weight'] = copy.deepcopy(emb)
+    if mamba_version == 'Mamba2':
+        weights['lm_head.weight'] = split(weights['lm_head.weight'],
+                                          tp_size,
+                                          tp_rank,
+                                          dim=0)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -218,9 +288,7 @@ def do_convert_from_ckpt(args):
 
 def convert(worker_rank, args, convert_args):
     convert_from_ckpt = do_convert_from_ckpt(args)
-    world_size = 1
-    args.workers = 1
-    for rank in range(worker_rank, world_size, args.workers):
+    for rank in range(worker_rank, args.world_size):
         if convert_from_ckpt:
             weights = convert_from_hf_checkpoint(rank=rank, **convert_args)
         else:
@@ -247,8 +315,8 @@ class MambaConfig:
     state_size: int = 128
     conv_kernel: int = 4
     use_bias: bool = False
-    headdim: int = 64
-    ngroups: int = 1
+    head_dim: int = 64
+    n_groups: int = 1
     chunk_size: int = 256
     ssm_rmsnorm: bool = True
 
@@ -256,18 +324,13 @@ class MambaConfig:
         self.__dict__.update(data_dict)
 
 
-def load_config_hf(model_name):
-    resolved_archive_file = cached_file(
-        model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
-    if resolved_archive_file is None:
-        resolved_archive_file = os.path.join(model_name, 'params.json')
-    config = json.load(open(resolved_archive_file))
-    if 'transformers_version' in config:  # transformer compatible models
+def load_config_hf(model_name, ckpt_type):
+    if ckpt_type == CheckpointType.hf:  # transformer compatible models
         hf_config = AutoConfig.from_pretrained(model_name,
                                                trust_remote_code=True)
-        # TODO: change mamba_version when transformers can support Mamba2 models
-        mamba_version = 'Mamba1'
-    elif 'ssm_cfg' in config:  # state-spaces/mamba models
+        mamba_version = 'Mamba2' if hf_config.model_type == 'mamba2' else 'Mamba1'
+    elif ckpt_type == CheckpointType.state_spaces:  # state-spaces/mamba models
+        config = json.load(open(os.path.join(model_name, 'config.json')))
         ssm_cfg = config.pop('ssm_cfg')
         cfg_to_mamba_cfg = {
             'd_model': 'hidden_size',
@@ -279,8 +342,8 @@ def load_config_hf(model_name):
             'd_state': 'state_size',
             'd_conv': 'conv_kernel',
             'bias': 'use_bias',
-            'headdim': 'headdim',
-            'ngroups': 'ngroups',
+            'headdim': 'head_dim',
+            'ngroups': 'n_groups',
             'chunk_size': 'chunk_size',
             'rmsnorm': 'ssm_rmsnorm',
         }
@@ -299,11 +362,12 @@ def load_config_hf(model_name):
         else:
             hf_config.intermediate_size = 2 * hf_config.hidden_size
         mamba_version = ssm_cfg.pop("layer", "Mamba1")
-    else:  # mistral format
+    elif ckpt_type == CheckpointType.mistral_inference:  # mistral inference format
+        config = json.load(open(os.path.join(model_name, 'params.json')))
         cfg_to_mamba_cfg = {
             'dim': 'hidden_size',
             'n_layers': 'num_hidden_layers',
-            'n_groups': 'ngroups',
+            'n_groups': 'n_groups',
             'fused_add_norm': None,
             'tie_embeddings': None,
             'model_type': None,
@@ -332,16 +396,16 @@ def main():
 
     args.output_dir.mkdir(exist_ok=True, parents=True)
 
-    hf_config, mamba_version = load_config_hf(args.model_dir)
+    hf_config, mamba_version = load_config_hf(args.model_dir, args.ckpt_type)
 
     vocab_size = hf_config.vocab_size
-    pad_vocab_size_multiple = hf_config.pad_vocab_size_multiple
+    pad_vocab_size_multiple = getattr(hf_config, "pad_vocab_size_multiple", 1)
     if vocab_size % pad_vocab_size_multiple != 0:
         vocab_size += pad_vocab_size_multiple - (vocab_size %
                                                  pad_vocab_size_multiple)
 
     config = {
-        'architecture': hf_config.architectures[0],
+        'architecture': 'MambaForCausalLM',
         'dtype': args.dtype,
         'logits_dtype': 'float32',
         'hidden_size': hf_config.hidden_size,
@@ -350,24 +414,30 @@ def main():
         'vocab_size': vocab_size,
         'rms_norm': hf_config.rms_norm,
         'residual_in_fp32': hf_config.residual_in_fp32,
-        'pad_vocab_size_multiple': hf_config.pad_vocab_size_multiple,
+        'pad_vocab_size_multiple': pad_vocab_size_multiple,
         'hidden_act': 'silu',
-        'num_attention_heads': 1,
+        'num_attention_heads': args.world_size,
         'rnn_hidden_size': hf_config.intermediate_size,
         'rnn_conv_dim_size': hf_config.intermediate_size,
         'state_size': hf_config.state_size,
         'conv_kernel': hf_config.conv_kernel,
         'use_bias': hf_config.use_bias,
         'mamba_version': mamba_version,
+        'mapping': {
+            'world_size': args.world_size,
+            'tp_size': args.world_size,
+            'pp_size': 1
+        },
     }
     if mamba_version == 'Mamba2':
-        conv_dim = hf_config.intermediate_size + 2 * hf_config.ngroups * hf_config.state_size
+        conv_dim = hf_config.intermediate_size + 2 * hf_config.n_groups * hf_config.state_size
+        ssm_rmsnorm = getattr(hf_config, "ssm_rmsnorm", hf_config.rms_norm)
         mamba2_cfg = {
-            'rnn_head_size': hf_config.headdim,
+            'rnn_head_size': hf_config.head_dim,
             'rnn_conv_dim_size': conv_dim,
-            'ngroups': hf_config.ngroups,
+            'ngroups': hf_config.n_groups,
             'chunk_size': hf_config.chunk_size,
-            'ssm_rmsnorm': hf_config.ssm_rmsnorm,
+            'ssm_rmsnorm': ssm_rmsnorm,
         }
         config.update(mamba2_cfg)
 
@@ -377,6 +447,7 @@ def main():
     convert_from_ckpt = do_convert_from_ckpt(args)
     # TODO: Add convert_hf_mamba support for Mamba2 when transformers can support Mamba2 models
     assert convert_from_ckpt or mamba_version == 'Mamba2', "Mamba2 can only support convert from checkpoints."
+    assert args.world_size == 1 or mamba_version == 'Mamba2', "Mamba1 can not support tensor parallelism."
     if not convert_from_ckpt:
         logger.info(f'Convert by using model')
         hf_mamba = AutoModelForCausalLM.from_pretrained(args.model_dir,
@@ -394,6 +465,7 @@ def main():
     else:
         convert_args['hf_mamba'] = hf_mamba
     convert_args['mamba_version'] = mamba_version
+    convert_args['mamba_config'] = config
 
     convert(0, args, convert_args)
 

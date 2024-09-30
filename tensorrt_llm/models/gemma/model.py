@@ -315,7 +315,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         config = GemmaConfig.from_hugging_face(hf_model_dir,
                                                dtype=dtype,
                                                mapping=mapping,
-                                               quantization=quant_config,
+                                               quant_config=quant_config,
                                                **(gemma_config_kwargs or {}))
 
         quant_algo = config.quantization.quant_algo
@@ -323,12 +323,13 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
             raise ValueError(
                 "There is no point in calling `quantize()` if both `quant_algo` and `kv_cache_quant_algo` are `None`"
             )
-        elif quant_algo in cls.MODELOPT_FLOW_QUANTIZATIONS:
+        elif quant_algo in MODELOPT_FLOW_QUANTIZATIONS:
             super().quantize(hf_model_dir,
                              output_dir,
                              dtype=config.dtype,
                              mapping=config.mapping,
-                             quant_config=config.quantization**quantize_kwargs)
+                             quant_config=config.quantization,
+                             **quantize_kwargs)
         elif quant_algo in cls.NATIVE_QUANT_FLOW:
             save_config(config, output_dir=output_dir, log=True)
             for config in config.for_each_rank():

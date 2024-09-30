@@ -31,7 +31,7 @@ namespace tensorrt_llm::layers
 template <typename T>
 size_t BeamSearchLayer<T>::getWorkspaceSize() const noexcept
 {
-    return mWorkspace->getSizeInBytes();
+    return mWorkspaceSize;
 }
 
 template <typename T>
@@ -50,8 +50,9 @@ BeamSearchLayer<T>::BeamSearchLayer(DecoderDomain const& decoderDomain, std::sha
 }
 
 template <typename T>
-void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beamWidth, BufferConstPtr batchSlots,
-    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beamWidth, TensorConstPtr batchSlots,
+    std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(beamWidth <= mDecoderDomain.getBeamWidth(),
@@ -66,7 +67,8 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
 
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
     fillBuffers(setupParams->beamSearchDiversityRate, DefaultDecodingParams::getBeamSearchDiversity(),
-        mDiversityRateHost, mDiversityRateDevice, batchSlots, std::make_pair(-fltEpsilon, fltMax), "diversity rate");
+        mBeamSearchDiversityRateHost, mBeamSearchDiversityRateDevice, batchSlots, std::make_pair(-fltEpsilon, fltMax),
+        "diversity rate");
     fillBuffers(setupParams->lengthPenalty, DefaultDecodingParams::getLengthPenalty(), mLengthPenaltyHost,
         mLengthPenaltyDevice, batchSlots, std::make_pair(fltMin, fltMax), "length penalty");
     fillBuffers(setupParams->earlyStopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
@@ -109,8 +111,9 @@ __global__ void updateCacheIndirectionKernel(
 }
 
 template <typename T>
-void BeamSearchLayer<T>::forwardAsync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -141,11 +144,11 @@ void BeamSearchLayer<T>::forwardAsync(
     bh.batchDones = op->beamHypotheses->batchDones;
     bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIdsPtr->getDimension<0>());
     bh.nBatchSize = ip->localBatchSize;
-    bh.batchSlots = bufferCast<SizeType32>(*ip->batchSlots);
+    bh.batchSlots = workspace->getDeviceBatchSlotsPtr();
     bh.nBeamWidth = op->outputIds->getDimension<1>();
     bh.nMaxSeqLen = op->outputIds->getDimension<2>();
     bh.nVocabSize = mDecoderDomain.getVocabSizePadded();
-    bh.diversityRates = bufferCast<float>(*mDiversityRateDevice);
+    bh.diversityRates = bufferCast<float>(*mBeamSearchDiversityRateDevice);
     bh.lengthPenalties = bufferCast<float>(*mLengthPenaltyDevice);
     bh.earlyStoppings = bufferCast<int>(*mEarlyStoppingDevice);
     bh.inputLengths = bufferCast<SizeType32>(*ip->inputLengths.value());
@@ -157,13 +160,13 @@ void BeamSearchLayer<T>::forwardAsync(
     bh.outputIdsPtr = bufferCast<TokenIdType*>(*op->outputIdsPtr);
     bh.parentIdsPtr = bufferCast<TokenIdType*>(*op->parentIdsPtr);
 
-    T const* logits = bufferCast<T>(*ip->logits.value());
+    T const* logits = bufferCast<T>(*workspace->getDeviceRuntimeLogits());
     T const* bias = static_cast<T const*>(nullptr);
     TLLM_CHECK_WITH_INFO(getWorkspaceSize() >= 2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
         common::fmtstr("Workspace size (%lu) is not enough for topk softmax required (%lu).",
             (uint64_t) getWorkspaceSize(), (uint64_t) (2 * bh.nMaxBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2)));
 
-    invokeTopkSoftMax(logits, bias, mWorkspace->data(), bh, getStream());
+    invokeTopkSoftMax(logits, bias, workspace->getRawWorkspaceDevicePtr(), bh, getStream());
     sync_check_cuda_error();
 
     if (bh.nBeamWidth > 1)
@@ -188,15 +191,14 @@ void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType32 const batchSize, run
     auto const nTempBuffer
         = batchSize * nPadBeamWidth * nMaxVocabPartForStage1FastKernel * (2 * (nPadBeamWidth * 2) + 2);
     auto const batchSizeShape = ITensor::makeShape({mDecoderDomain.getBatchSize()});
-    mDiversityRateHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
+    mBeamSearchDiversityRateHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mLengthPenaltyHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mEarlyStoppingHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
 
     // Unit of workspaceSize is number of elements (not Byte), align to 4 for further optimization
-    auto const workspaceSize = common::roundUp(nTopK, 4) * 2 + common::roundUp(nTempBuffer, 4);
-    mWorkspace = mBufferManager->gpu(workspaceSize, TRTDataType<float>::value);
+    mWorkspaceSize = common::roundUp(nTopK, 4) * 2 + common::roundUp(nTempBuffer, 4);
 
-    mDiversityRateDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+    mBeamSearchDiversityRateDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
     mLengthPenaltyDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
     mEarlyStoppingDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<int>::value);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

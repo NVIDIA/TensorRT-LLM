@@ -19,17 +19,18 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/common/workspace.h"
 
 #include <NvInferRuntimeBase.h>
 #include <cstddef>
-#include <unordered_set>
 
 namespace tensorrt_llm::runtime
 {
 
 namespace
 {
-bool setPeerAccess(WorldConfig const& worldConfig, bool enable)
+
+bool canAccessPeer(WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const srcDevice = worldConfig.getDevice();
@@ -49,20 +50,6 @@ bool setPeerAccess(WorldConfig const& worldConfig, bool enable)
             TLLM_LOG_INFO("cudaDeviceCanAccessPeer failed for device: %d peerDevice: %d", srcDevice, destDevice);
             TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
             return false;
-        }
-
-        if (enable)
-        {
-            cudaDeviceEnablePeerAccess(destDevice, 0);
-        }
-        else
-        {
-            cudaDeviceDisablePeerAccess(destDevice);
-        }
-        auto const error = cudaGetLastError();
-        if (error != cudaErrorPeerAccessAlreadyEnabled && error != cudaErrorPeerAccessNotEnabled)
-        {
-            TLLM_CUDA_CHECK(error);
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -85,8 +72,16 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // cudaIpcGetMemHandle only works with allocation created with cudaMalloc
-    mBuffer = BufferManager::gpuSync(bufferSize, nvinfer1::DataType::kUINT8);
+    // Note (jdebache): cudaIpcGet/OpenMemHandle does not work well with tiny allocations. The risk is that two small
+    // allocations will get 'packed' together, and that we will get the same IPC handle for both using
+    // cudaIpcGetMemHandle. We then try to open this handle twice on the receiving end, resulting in an 'already mapped'
+    // error. This manual alignment is a WAR for this behavior, until we move to using cuMemMap and OS handles to share
+    // these allocations, which is the recommended way. On top of that, we use gpuSync here (relying on cudaMalloc)
+    // instead of gpu (relying on cudaMallocAsync), because the default memory pool for cudaMallocAsync does not expose
+    // IPC handles. If we want to support stream-ordered allocations here, we need to create another pool with the
+    // correct handle type.
+    auto const ipcAlignedBufferSize = common::alignSize(bufferSize, 1LU << 21);
+    mBuffer = BufferManager::gpuSync(ipcAlignedBufferSize, nvinfer1::DataType::kUINT8);
     manager.setZero(*mBuffer);
     auto* bufferPtr = mBuffer->data();
 
@@ -147,7 +142,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const isP2pSupported = setPeerAccess(worldConfig, true);
+    auto const isP2pSupported = canAccessPeer(worldConfig);
 
     auto const tpSize = worldConfig.getTensorParallelism();
     auto const bufferSize = tpSize

@@ -1,6 +1,7 @@
 import os
 import sys
 
+import openai
 import pytest
 import requests
 from openai_server import RemoteOpenAIServer
@@ -24,6 +25,11 @@ def server(model_name: str):
         yield remote_server
 
 
+@pytest.fixture(scope="module")
+def client(server: RemoteOpenAIServer):
+    return server.get_client()
+
+
 def test_version(server: RemoteOpenAIServer):
     version_url = server.url_for("version")
     response = requests.get(version_url)
@@ -35,3 +41,8 @@ def test_health(server: RemoteOpenAIServer):
     health_url = server.url_for("health")
     response = requests.get(health_url)
     assert response.status_code == 200
+
+
+def test_model(client: openai.OpenAI, model_name: str):
+    model = client.models.list().data[0]
+    assert model.id == model_name.split('/')[-1]

@@ -80,7 +80,7 @@ def exist_cooridinate(input):
 if __name__ == '__main__':
     args = parse_arguments()
     stream = torch.cuda.current_stream().cuda_stream
-    image_embeds = vit_process(args.input_dir, args.vit_engine_dir, stream)
+    image_embeds = vit_process(args.images_path, args.vit_engine_path, stream)
     qinfer = QWenInfer(args.tokenizer_dir, args.qwen_engine_dir, args.log_level,
                        args.output_csv, args.output_npy, args.num_beams)
     qinfer.qwen_model_init()

@@ -68,6 +68,9 @@ template void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
 template void invokeFill(IBuffer&, bool, CudaStream const&);
 template void invokeFill(IBuffer&, half, CudaStream const&);
 template void invokeFill(IBuffer&, float, CudaStream const&);
+#ifdef ENABLE_BF16
+template void invokeFill(IBuffer&, __nv_bfloat16, CudaStream const&);
+#endif // ENABLE_BF16
 
 namespace
 {

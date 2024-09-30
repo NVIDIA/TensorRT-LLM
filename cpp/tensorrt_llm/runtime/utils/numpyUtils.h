@@ -25,8 +25,7 @@ namespace tensorrt_llm::runtime::utils
 {
 
 //! \brief Create new tensor from numpy file.
-[[nodiscard]] ITensor::UniquePtr loadNpy(
-    BufferManager const& manager, std::string const& npyFile, const MemoryType where);
+[[nodiscard]] ITensor::UniquePtr loadNpy(BufferManager const& manager, std::string const& npyFile, MemoryType where);
 
 //! \brief Save tensor to numpy file.
 void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string const& filename);

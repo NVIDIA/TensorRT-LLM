@@ -62,6 +62,35 @@ public:
         kRECURRENT,
     };
 
+    enum class KVCacheType : std::int32_t
+    {
+        kCONTINUOUS,
+        kPAGED,
+        kDISABLED,
+    };
+
+    static KVCacheType KVCacheTypeFromString(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(), ::toupper);
+
+        if (value == "CONTINUOUS")
+        {
+            return KVCacheType::kCONTINUOUS;
+        }
+        else if (value == "PAGED")
+        {
+            return KVCacheType::kPAGED;
+        }
+        else if (value == "DISABLED")
+        {
+            return KVCacheType::kDISABLED;
+        }
+        else
+        {
+            throw std::invalid_argument("Invalid KV cache type: " + value);
+        }
+    }
+
     enum class ManageWeightsType : std::int32_t
     {
         kDisabled,
@@ -81,8 +110,6 @@ public:
         , mUseGptAttentionPlugin(false)
         , mUseMambaConv1dPlugin(false)
         , mInputPacked{false}
-        , mPagedKvCache{false}
-        , mPagedState{false}
         , mTokensPerBlock{64}
         , mQuantMode{common::QuantMode::none()}
         , mMaxBatchSize(0)
@@ -209,16 +236,6 @@ public:
         mInputPacked = inputPacked;
     }
 
-    [[nodiscard]] bool constexpr usePagedKvCache() const noexcept
-    {
-        return mPagedKvCache;
-    }
-
-    void constexpr usePagedKvCache(bool pagedKvCache) noexcept
-    {
-        mPagedKvCache = pagedKvCache;
-    }
-
     [[nodiscard]] bool constexpr usePagedState() const noexcept
     {
         return mPagedState;
@@ -251,7 +268,8 @@ public:
 
     [[nodiscard]] bool constexpr supportsInflightBatching() const noexcept
     {
-        return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked && mPagedKvCache)
+        return (isTransformerBased() && mUseGptAttentionPlugin && mInputPacked
+                   && (mKVCacheType == KVCacheType::kDISABLED || mKVCacheType == KVCacheType::kPAGED))
             || (isRnnBased() && mUseMambaConv1dPlugin && mInputPacked && mPagedState);
     }
 
@@ -430,6 +448,32 @@ public:
         mMlpHiddenSize = mlpHiddenSize;
     }
 
+    // Utility functions for fast KVCacheType checking.
+    [[nodiscard]] bool constexpr isKVCacheEnabled() const noexcept
+    {
+        return mKVCacheType != KVCacheType::kDISABLED;
+    }
+
+    [[nodiscard]] bool constexpr isPagedKVCache() const noexcept
+    {
+        return mKVCacheType == KVCacheType::kPAGED;
+    }
+
+    [[nodiscard]] bool constexpr isContinuousKVCache() const noexcept
+    {
+        return mKVCacheType == KVCacheType::kCONTINUOUS;
+    }
+
+    [[nodiscard]] KVCacheType constexpr getKVCacheType() const noexcept
+    {
+        return mKVCacheType;
+    }
+
+    void constexpr setKVCacheType(KVCacheType kvCacheType) noexcept
+    {
+        mKVCacheType = kvCacheType;
+    }
+
     [[nodiscard]] bool constexpr useCrossAttention() const noexcept
     {
         return mUseCrossAttention;
@@ -591,6 +635,16 @@ public:
         mManageWeightsType = manageWeightType;
     }
 
+    [[nodiscard]] std::string const& getModelName() const noexcept
+    {
+        return mModelName;
+    }
+
+    void setModelName(std::string const& modelName)
+    {
+        mModelName = modelName;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbAttentionLayers;
@@ -603,7 +657,6 @@ private:
     bool mUseGptAttentionPlugin;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
-    bool mPagedKvCache;
     bool mPagedState;
     SizeType32 mTokensPerBlock;
     common::QuantMode mQuantMode;
@@ -630,6 +683,9 @@ private:
 
     std::optional<RnnConfig> mRnnConfig;
 
+    // Whether kv_cache is enabled. In kv_cache is disabled, it is only intended for context phase only now.
+    KVCacheType mKVCacheType = KVCacheType::kCONTINUOUS;
+
     // Configs related to encoder / enc-dec models
     SizeType32 mMaxEncoderLen{};
     SizeType32 mEncoderHiddenSize{};
@@ -646,6 +702,7 @@ private:
     nvinfer1::DataType mLogitsDtype;
     bool mUseShapeInference;
     ManageWeightsType mManageWeightsType;
+    std::string mModelName;
 };
 
 } // namespace tensorrt_llm::runtime
