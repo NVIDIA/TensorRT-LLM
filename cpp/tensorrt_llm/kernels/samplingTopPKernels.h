@@ -28,8 +28,13 @@ struct TopPSamplingKernelParams
     //! input buffer [batchSize, vocabSizePadded], required. Probabilities of each token in the vocab.
     T const* probs{nullptr};
 
-    //! output buffer [maxBatchSize][maxSeqLen], required. Contains pointers to rows with output tokens per request.
-    runtime::TokenIdType** outputIds{nullptr};
+    //! output buffer [maxBatchSize][maxSeqLen]. Contains pointers to rows with output tokens per request.
+    //! If nullptr, outputIds must be provided.
+    runtime::TokenIdType** outputIdsPtrs{nullptr};
+
+    //! output buffer [maxBatchSize, maxSeqLen], optional. Tensor to store output tokens.
+    //! Not used if outputIdsPtrs != nullptr
+    runtime::TokenIdType* outputIds{nullptr};
 
     //! pointer to the workspace. Has to be pre-allocated by caller.
     //! Function does not take ownership of the buffer.
@@ -73,6 +78,9 @@ struct TopPSamplingKernelParams
     runtime::SizeType32 batchSize{-1};
     runtime::SizeType32 maxBatchSize{-1};
     runtime::SizeType32 vocabSizePadded{-1};
+    runtime::SizeType32 maxSeqLen{-1};
+
+    bool returnAllTopP{false};
 
     void checkParams() const
     {
@@ -81,11 +89,16 @@ struct TopPSamplingKernelParams
         TLLM_CHECK(maxBatchSize >= batchSize);
         TLLM_CHECK(vocabSizePadded > 0);
         TLLM_CHECK(probs);
-        TLLM_CHECK(outputIds);
+        TLLM_CHECK(outputIds || outputIdsPtrs);
         TLLM_CHECK(workspace);
-        TLLM_CHECK(sequenceLength);
+        TLLM_CHECK((sequenceLength != nullptr) || returnAllTopP);
         TLLM_CHECK(curandState);
         TLLM_CHECK(topPs);
+
+        if (outputIds)
+        {
+            TLLM_CHECK(maxSeqLen > 0);
+        }
 
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
     }

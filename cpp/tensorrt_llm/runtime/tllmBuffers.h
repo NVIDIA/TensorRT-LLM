@@ -216,7 +216,7 @@ public:
         , mCapacity(capacity)
     {
         TLLM_CHECK_WITH_INFO(capacity == 0 || static_cast<bool>(mPtr), "Undefined pointer");
-        TLLM_CHECK_WITH_INFO(mCapacity >= 0, "Capacity must be non-negative");
+        TLLM_CHECK_WITH_INFO(mCapacity >= std::size_t(0), "Capacity must be non-negative");
     }
 
 protected:

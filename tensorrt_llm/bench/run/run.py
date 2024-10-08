@@ -20,7 +20,8 @@ from tensorrt_llm.bench.run.dataclasses import (BenchmarkStatistics,
 from tensorrt_llm.bench.run.utils import (ResponseTuple, StatsKeeper,
                                           get_executor_request,
                                           get_settings_from_engine)
-from tensorrt_llm.bench.utils.data import generate_dataset_from_stream
+from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+                                           initialize_tokenizer)
 from tensorrt_llm.logger import logger
 
 
@@ -133,9 +134,13 @@ def run_command(
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
+    # Initialize the HF tokenizer for the specified model.
+    tokenizer = initialize_tokenizer(bench_env.model)
+
     # Dataset Loading and Preparation
-    metadata, requests = generate_dataset_from_stream(dataset_path, model,
-                                                      num_requests)
+    with open(dataset_path, "r") as dataset:
+        metadata, requests = create_dataset_from_stream(
+            tokenizer, dataset, num_requests=num_requests)
     # TODO: Verify that the engine can handle the max/min ISL/OSL.
     if metadata.max_sequence_length > engine_max_seq_len:
         raise RuntimeError(

@@ -451,7 +451,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              config=config,
                              device=device,
                              calib_dataset=calib_dataset,
-                             trust_remote_code=trust_remote_code)
+                             trust_remote_code=trust_remote_code,
+                             calib_batches=calib_batches,
+                             calib_max_seq_length=calib_max_seq_length)
         else:
             raise ValueError(
                 f"The quant_config ({quant_config}) does not require calibration, try {cls.__name__}.from_hugging_face instead."

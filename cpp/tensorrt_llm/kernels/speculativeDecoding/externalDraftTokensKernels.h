@@ -26,84 +26,77 @@
 namespace tensorrt_llm::kernels::speculative_decoding
 {
 
-//! \brief Accepts or rejects draft tokens based on the equality of draft and target tokens
-//! for speculative decoding. Target token is accepted if targetToken == draftToken.
-//! If number of accepted tokens N < maxDraftTokens, then function accepts N + 1 tokens of target model.
-//! sequenceLengths, finishedSum and finishedFinal are modified accordingly.
-//!
-//! \param draftIds input buffer [batchSize, maxDraftTokens].
-//! Indices of the draft tokens.
-//! \param targetIds input buffer [batchSize, maxSeqLen]. Indices of the tokens decoded by the target model
-//! \param contextLengths input buffer [batchSize]. Context lengths of the requests without draft tokens
-//! \param numsDraftTokens input buffer [batchSize]. Number of draft tokens per request
-//! \param sequenceLengths input/output buffer [batchSize] sequence lengths of the requests in batch
-//! Modified in-place according to the accepted/rejected tokens
-//! \param finished input buffer [maxDraftTokens + 1, batchSize] finished states at each decoding iteration
-//! \param finishedFinal output buffer [batchSize] finished states after accepting/rejecting tokens
-//! \param finishedSum output buffer [1] total number of requests in batch that finished the execution
-//! \param batchSlots input buffer [batchSize], address map from local index
-//! to global index [0, batchSize] -> [0, maxBatchSize]
-//! \param batchSize current batch size
-//! \param maxBatchSize maximum batch size
-//! \param beamWidth beam width
-//! \param maxSeqLen maximum sequence length
-//! \param maxDraftTokens maximum number of draft tokens
-//! \param stream stream
-void invokeAcceptDraftTokensByIds(runtime::TokenIdType const* draftIds, runtime::TokenIdType const* targetIds,
-    runtime::SizeType32 const* contextLengths, runtime::SizeType32 const* numsDraftTokens,
-    runtime::SizeType32* sequenceLengths, FinishedState const* finished, FinishedState* finishedFinal,
-    runtime::SizeType32* finishedSum, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
-    runtime::SizeType32 maxBatchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 maxSeqLen,
-    runtime::SizeType32 maxDraftTokens, cudaStream_t stream);
-
-//! \brief Performs probabilistic acceptance of draft tokens based on their probability distributions.
-//! Corrects targetLogits for the next to the last accepted token
+//! \brief Accepts or rejects draft tokens based on their probability distributions or the equality of draft and target
+//! tokens. Corrects targetLogits for the last accepted token
 //! according to https://openreview.net/pdf?id=C9NEblP8vS
 //!
-//! \param draftLogits input/output buffer [draftTokens, batchSize, beamWidth, vocabSize].
-//! Initially contains token logits of the draft model.
-//! \param targetLogits input/output buffer [batchSize][draftTokens+1, beamWidth, vocabSize].
-//! Vector of pointers to the logits.
-//! Initially contains token logits of the target model.
-//! It is modified in-place for next to the last accepted token such as
-//! P'(x) = norm(max(0, P_{n+1}(x) - Q_{n+1}(x))), where N < maxDraftTokens is number of accepted tokens.
+//! \param batchSize current batch size
 //! \param draftProbs output buffer [maxDraftTokens, batchSize, beamWidth, vocabSize].
 //! Workspace buffer for token probabilities of the draft model.
 //! \param targetProbs output buffer [maxDraftTokens+1, batchSize, beamWidth, vocabSize].
 //! Workspace buffer for token probabilities of the target model.
 //! \param numsDraftTokens input buffer [batchSize]. Number of draft tokens per request
-//! \param finished output buffer [draftTokens, batchSize, beamWidth].
-//! At each step sets to NOT_FINISHED if token is accepted or SKIP_DECODING if token is not accepted
-//! \param curandState input buffer [batchSize]. Curand states properly
-//! initialized using invokeCurandInitialize per request.
-//! \param batchSlots input buffer [batchSize], address map from local index
-//! to global index [0, batchSize] -> [0, maxBatchSize]
-//! \param batchSize current batch size
-//! \param maxBatchSize maximum batch size
-//! \param beamWidth beam width
-//! \param vocabSize unpadded vocab size
-//! \param vocabSizePadded padded vocab size
+//! \param batchUseDraftLogits input buffer [batchSize]. Acceptance logic using draft logits or not, per request
+//! \param draftIds input buffer [batchSize, draftTokens]. Pointer to draft token ids.
+//! \param finishedInput input buffer [batchSize, beamWidth].
+//! \param finishedOutput output buffer [batchSize, beamWidth]. At each step sets SKIP_DECODING if token is not
+//! accepted.
+//! \param curandState input buffer [batchSize]. Curand states properly initialized using invokeCurandInitialize
+//! per request.
+//! \param batchSlots input buffer [batchSize], address map from local index to global index [0, batchSize] ->
+//! [0, maxBatchSize].
 //! \param maxDraftTokens maximum number of draft tokens
+//! \param beamWidth beam width (only beamWidth == 1 supported)
+//! \param vocabSizePadded padded vocab size
 //! \param randomThreshold True if use uniformly sampled threshold for token acceptance
 //! \param constantThreshold threshold used to accept tokens if randomThreshold is false
+//! \param step The current step of decoding (draft token id index)
+//! \param batchIsAccepted output buffer [batchSize]. Stores acceptance result for multinomial sampling later or
+//! forwarding next step.
+//! \param targetOutputIds input/output buffer [batchSize]. Stores target sampling output ids for acceptById
+//! logics.
 //! \param stream stream
 template <typename T>
-void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, T* targetProbs,
-    runtime::SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
-    runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize, runtime::SizeType32 vocabSizePadded,
-    runtime::SizeType32 maxDraftTokens, bool randomThreshold, float constantThreshold, cudaStream_t stream);
+void invokeAcceptDraftTokens(runtime::SizeType32 batchSize, T* draftProbs, T* targetProbs,
+    runtime::SizeType32 const* numsDraftTokens, bool const* batchUseDraftLogits, runtime::TokenIdType const* draftIds,
+    FinishedState const* finishedInput, FinishedState* finishedOutput, curandState_t* curandState,
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 maxDraftTokens, runtime::SizeType32 beamWidth,
+    runtime::SizeType32 vocabSizePadded, bool randomThreshold, float constantThreshold, runtime::SizeType32 step,
+    bool* batchIsAccepted, runtime::SizeType32* targetOutputIds, cudaStream_t stream);
 
-struct Candidate // Hold probability maximum and rate of target / dfraft, used in `acceptDraftTokensByLogits`
-{
-    float maxProb{0.f};
-    float rateQP{0.f};
-};
+//! \brief Mask the target logits with -inf for unselected topK/topP token ids.
+//! according to
+//! https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/generation/utils.py#L4064
+//!
+//! \param batchSize current batch size
+//! \param targetLogits input/output buffer [batchSize][draftTokens+1, beamWidth, vocabSize].
+//! Vector of pointers to the logits. (beamWidth == 1)
+//! Initially contains token logits of the target model.
+//! \param batchSlots input buffer [batchSize], address map from local index to global index [0, batchSize] ->
+//! [0, maxBatchSize].
+//! \param beamWidth beam width (only beamWidth == 1 supported)
+//! \param vocabSizePadded padded vocab size
+//! \param finishedInput input buffer [batchSize, beamWidth].
+//! \param maxBatchSize maximum batch size
+//! \param batchUseDraftLogits input buffer [batchSize]. Acceptance logic using draft logits or not, per request
+//! \param outputIdsAfterSampling input buffer [batchSize, vocabSize]. Stores all selected IDs from sampling for
+//! masking.
+//! \param targetOutputIds input/output buffer [batchSize]. Stores target sampling output ids for acceptById
+//! logics.
+//! \param numsDraftTokens input buffer [batchSize]. Number of draft tokens per request
+//! \param runtimeTopKDevicePtr input buffer [batchSize] the topks in sampling step, for porting topK ids out.
+//! \param maskBuffer input buffer [batchSize, vocabSize] for masking calculation (index value to position).
+//! \param stream stream
+template <typename T>
+void invokeMaskTargetLogits(runtime::SizeType32 batchSize, T* targetLogits, runtime::SizeType32 const* batchSlots,
+    runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSizePadded, FinishedState const* finishedInput,
+    runtime::SizeType32 maxBatchSize, bool const* batchUseDraftLogits, runtime::SizeType32* outputIdsAfterSampling,
+    runtime::SizeType32* targetOutputIds, runtime::SizeType32* runtimeTopKDevicePtr, bool* maskBuffer,
+    cudaStream_t stream);
 
-__device__ __forceinline__ Candidate reduce_op(Candidate const& a, Candidate const& b)
-{
-    // Max-reduce operator of Candidate
-    return (a.maxProb > b.maxProb) ? a : b;
-}
+void invokeForwardAcceptedTokens(runtime::SizeType32 batchSize, runtime::SizeType32 const* batchSlots,
+    bool* batchIsAccepted, runtime::SizeType32* outputSequenceLengths, runtime::TokenIdType const* draftIds,
+    runtime::TokenIdType** idsPtrs, runtime::SizeType32 step, runtime::SizeType32 maxDraftTokens,
+    runtime::TokenIdType const* endIds, FinishedState* finishedOutput, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

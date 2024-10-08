@@ -89,9 +89,11 @@ RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensor
     test -f bin/executorWorker && \
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
-    ln -sv lib/libnvinfer_plugin_tensorrt_llm.so lib/libnvinfer_plugin_tensorrt_llm.so.9 && \
     echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
     ldconfig
+# Test LD configuration
+RUN ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
+
 ARG SRC_DIR=/src/tensorrt_llm
 COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
 ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build

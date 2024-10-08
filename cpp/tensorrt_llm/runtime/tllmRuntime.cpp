@@ -20,10 +20,12 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/safetensors.h"
 #include "tensorrt_llm/executor/tensor.h"
-#include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tllmLogger.h"
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <type_traits>
 
 using namespace tensorrt_llm::runtime;
@@ -141,6 +143,24 @@ TllmRuntime::TllmRuntime(
     // Print context memory size for CI/CD to track.
     TLLM_LOG_INFO("[MemUsageChange] Allocated %.2f MiB for execution context memory.",
         static_cast<double>(devMemorySize) / 1048576.0);
+
+    cacheTensorNames();
+}
+
+void TllmRuntime::cacheTensorNames()
+{
+    for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
+    {
+        auto const* const name = mEngine->getIOTensorName(i);
+        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
+        {
+            mInputTensorNames.emplace_back(name);
+        }
+        else if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
+        {
+            mOutputTensorNames.emplace_back(name);
+        }
+    }
 }
 
 nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
@@ -188,68 +208,97 @@ bool TllmRuntime::executeContext(SizeType32 contextIndex) const
     return res;
 }
 
+void TllmRuntime::setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss)
+{
+    NVTX3_FUNC_RANGE();
+    auto& context = getContext(contextIndex);
+    for (auto const& name : mInputTensorNames)
+    {
+        auto const pos = tensorMap.find(name);
+        if (pos == tensorMap.end())
+        {
+            if (throwOnMiss)
+            {
+                auto expectedShape = mEngine->getTensorShape(name.c_str());
+                TLLM_THROW("Input tensor '%s' not found; expected shape: %s", name.c_str(),
+                    ITensor::toString(expectedShape).c_str());
+            }
+            else
+            {
+                continue;
+            }
+        }
+
+        auto const& tensor = pos->second;
+        auto const tensorDtype = tensor->getDataType();
+        auto const engineDtype = mEngine->getTensorDataType(name.c_str());
+        // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
+        TLLM_CHECK_WITH_INFO(tensorDtype == engineDtype
+                || (tensorDtype == nvinfer1::DataType::kFP8 && engineDtype == nvinfer1::DataType::kHALF),
+            "%s: expected type %d, provided type %d", name.c_str(), static_cast<std::int32_t>(engineDtype),
+            static_cast<std::int32_t>(tensorDtype));
+
+        auto const tensorShape = tensor->getShape();
+        auto const setInputShapeSuccess = context.setInputShape(name.c_str(), tensorShape);
+        if (!setInputShapeSuccess)
+        {
+            auto const minShape
+                = mEngine->getProfileShape(name.c_str(), contextIndex, nvinfer1::OptProfileSelector::kMIN);
+            auto const maxShape
+                = mEngine->getProfileShape(name.c_str(), contextIndex, nvinfer1::OptProfileSelector::kMAX);
+
+            TLLM_THROW("Tensor '%s' has invalid shape %s, expected in range min %s, max %s", name.c_str(),
+                ITensor::toString(tensorShape).c_str(), ITensor::toString(minShape).c_str(),
+                ITensor::toString(maxShape).c_str());
+        }
+        auto* const data = tensor->data();
+        if (data)
+        {
+            context.setInputTensorAddress(name.c_str(), data);
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(tensor->getSize() == 0, std::string("Invalid data for tensor: ") + name.c_str());
+            // TensorRT runtime does not support nullptr.
+            if (!mDummyTensor)
+            {
+                mDummyTensor = mBufferManager.gpu(ITensor::makeShape({1}));
+            }
+            context.setInputTensorAddress(name.c_str(), mDummyTensor->data());
+        }
+    }
+}
+
+void TllmRuntime::setStaticInputTensors(TensorMap const& tensorMap)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_FUNC_RANGE();
+
+    TLLM_CHECK_WITH_INFO(getNbContexts() > 0, "Contexts should be created before calling setStaticInputTensors");
+    for (auto contextIndex = 0; contextIndex < getNbContexts(); ++contextIndex)
+    {
+        setInputTensorsImpl(contextIndex, tensorMap, false);
+    }
+
+    // move static input tensor names to separate vector
+    auto const begin = mInputTensorNames.begin();
+    auto end = mInputTensorNames.end();
+    for (auto const& [name, tensor] : tensorMap)
+    {
+        end = std::remove(begin, end, name);
+    }
+    mInputTensorNames.erase(end, mInputTensorNames.end());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
+    setInputTensorsImpl(contextIndex, tensorMap, true);
+
     auto& context = getContext(contextIndex);
-    for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
-    {
-        char const* name = mEngine->getIOTensorName(i);
-        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
-        {
-            auto pos = tensorMap.find(name);
-            auto posWeight = mManagedWeightsMap.find(name);
-            if (pos == tensorMap.end() && posWeight == mManagedWeightsMap.end())
-            {
-                auto expectedShape = mEngine->getTensorShape(name);
-                TLLM_THROW(
-                    "Input tensor '%s' not found; expected shape: %s", name, ITensor::toString(expectedShape).c_str());
-            }
-            if (posWeight != mManagedWeightsMap.end() && mSetWeights.count(contextIndex) > 0)
-            {
-                continue; // This input tensor is a managed weight, and we have already set it in a previous call.
-            }
-
-            auto const& tensor = pos == tensorMap.end() ? posWeight->second : pos->second;
-            auto const tensorDtype = tensor->getDataType();
-            auto const engineDtype = mEngine->getTensorDataType(name);
-            // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
-            TLLM_CHECK_WITH_INFO(tensorDtype == engineDtype
-                    || (tensorDtype == nvinfer1::DataType::kFP8 && engineDtype == nvinfer1::DataType::kHALF),
-                "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
-                static_cast<std::int32_t>(tensorDtype));
-
-            auto const tensorShape = tensor->getShape();
-            auto const setInputShapeSuccess = context.setInputShape(name, tensorShape);
-            if (!setInputShapeSuccess)
-            {
-                auto const minShape = mEngine->getProfileShape(name, contextIndex, nvinfer1::OptProfileSelector::kMIN);
-                auto const maxShape = mEngine->getProfileShape(name, contextIndex, nvinfer1::OptProfileSelector::kMAX);
-
-                TLLM_THROW("Tensor '%s' has invalid shape %s, expected in range min %s, max %s", name,
-                    ITensor::toString(tensorShape).c_str(), ITensor::toString(minShape).c_str(),
-                    ITensor::toString(maxShape).c_str());
-            }
-            auto* const data = tensor->data();
-            if (data)
-            {
-                context.setInputTensorAddress(name, data);
-            }
-            else
-            {
-                TLLM_CHECK_WITH_INFO(tensor->getSize() == 0, std::string("Invalid data for tensor: ") + name);
-                // TensorRT runtime does not support nullptr.
-                if (!mDummyTensor)
-                {
-                    mDummyTensor = mBufferManager.gpu(ITensor::makeShape({1}));
-                }
-                context.setInputTensorAddress(name, mDummyTensor->data());
-            }
-        }
-    }
-
-    mSetWeights.insert(contextIndex);
     if (mUseShapeInference)
     {
         NVTX3_SCOPED_RANGE(infer_shapes);
@@ -278,41 +327,37 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
-    for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
+    for (auto const& name : mOutputTensorNames)
     {
-        auto const name = mEngine->getIOTensorName(i);
-        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
+        auto const engineDtype = mEngine->getTensorDataType(name.c_str());
+        auto const pos = tensorMap.find(name);
+        if (pos != tensorMap.end())
         {
-            auto const engineDtype = mEngine->getTensorDataType(name);
-            auto pos = tensorMap.find(name);
-            if (pos != tensorMap.end())
-            {
-                auto const& tensor = pos->second;
-                auto const tensorDtype = tensor->getDataType();
-                // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
-                TLLM_CHECK_WITH_INFO(tensorDtype == engineDtype
-                        || (tensorDtype == nvinfer1::DataType::kFP8 && engineDtype == nvinfer1::DataType::kHALF),
-                    "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
-                    static_cast<std::int32_t>(tensorDtype));
+            auto const& tensor = pos->second;
+            auto const tensorDtype = tensor->getDataType();
+            // WAR: TRT does not support mixed FP8 and FP16 input, so engine expects FP16 tensors.
+            TLLM_CHECK_WITH_INFO(tensorDtype == engineDtype
+                    || (tensorDtype == nvinfer1::DataType::kFP8 && engineDtype == nvinfer1::DataType::kHALF),
+                "%s: expected type %d, provided type %d", name.c_str(), static_cast<std::int32_t>(engineDtype),
+                static_cast<std::int32_t>(tensorDtype));
 
-                if (mUseShapeInference)
-                {
-                    auto const dims = context.getTensorShape(name);
-                    tensor->reshape(dims);
-                }
-                context.setTensorAddress(name, tensor->data());
-            }
-            else if (mUseShapeInference)
+            if (mUseShapeInference)
             {
-                auto const dims = context.getTensorShape(name);
-                auto tensor = ITensor::SharedPtr(mBufferManager.gpu(dims, engineDtype));
-                tensorMap.insert(pos, std::make_pair(name, tensor));
-                context.setTensorAddress(name, tensor->data());
+                auto const dims = context.getTensorShape(name.c_str());
+                tensor->reshape(dims);
             }
-            else
-            {
-                TLLM_THROW("Tensor %s is not found in tensorMap and shape inference is not allowed", name);
-            }
+            context.setTensorAddress(name.c_str(), tensor->data());
+        }
+        else if (mUseShapeInference)
+        {
+            auto const dims = context.getTensorShape(name.c_str());
+            auto tensor = ITensor::SharedPtr(mBufferManager.gpu(dims, engineDtype));
+            tensorMap.insert(pos, std::make_pair(name, tensor));
+            context.setTensorAddress(name.c_str(), tensor->data());
+        }
+        else
+        {
+            TLLM_THROW("Tensor %s is not found in tensorMap and shape inference is not allowed", name.c_str());
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -330,7 +375,7 @@ bool TllmRuntime::hasLayerProfiler(SizeType32 contextId) const
 
 void TllmRuntime::setLayerProfiler()
 {
-    mLayerProfiler.reset(new LayerProfiler);
+    mLayerProfiler = std::make_unique<LayerProfiler>();
     for (auto& context : mContexts)
     {
         context->setProfiler(mLayerProfiler.get());
@@ -351,6 +396,8 @@ void TllmRuntime::reportToProfiler(SizeType32 contextId)
 
 void TllmRuntime::loadManagedWeights(RawEngine const& rawEngine, int localRank)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_FUNC_RANGE();
     auto& engine = getEngine();
     auto& manager = getBufferManager();
     if (rawEngine.getManagedWeightsMapOpt().has_value())
@@ -386,4 +433,6 @@ void TllmRuntime::loadManagedWeights(RawEngine const& rawEngine, int localRank)
             mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
         }
     }
+    setStaticInputTensors(mManagedWeightsMap);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

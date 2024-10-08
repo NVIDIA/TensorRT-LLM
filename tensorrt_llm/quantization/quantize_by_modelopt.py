@@ -130,6 +130,22 @@ MODEL_NAME_PATTERN_MAP = {
 }
 
 
+class _CustomDataset(torch.utils.data.Dataset):
+
+    def __init__(self, encodings):
+        self.encodings = encodings
+
+    def __getitem__(self, idx):
+        item = {
+            key: torch.tensor(val[idx])
+            for key, val in self.encodings.items()
+        }
+        return item
+
+    def __len__(self):
+        return len(self.encodings["input_ids"])
+
+
 def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     logger.info(f"Initializing tokenizer from {ckpt_path}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -218,7 +234,9 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
                          calib_size=512,
-                         block_size=512):
+                         block_size=512,
+                         device=None,
+                         include_labels=False):
     logger.info("Loading calibration dataset")
     if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
@@ -227,7 +245,11 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             split="train")
         dataset = dataset["text"][:calib_size]
     elif "cnn_dailymail" in dataset_name_or_dir:
-        dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
+        dataset = load_dataset(
+            dataset_name_or_dir,
+            name="3.0.0",
+            split="train",
+        )
         dataset = dataset["article"][:calib_size]
     elif os.path.isdir(dataset_name_or_dir):
         logger.info(
@@ -246,7 +268,23 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                                 padding=True,
                                                 truncation=True,
                                                 max_length=block_size)
-    batch_encoded = batch_encoded["input_ids"]
+
+    if device:
+        batch_encoded = batch_encoded.to(device)
+
+    if include_labels:
+        # Labels are needed when backward is called in the model.
+        # The labels should be a shifted version of the input_ids.
+        # However, we should not shift the input_ids here since the labels are shifted by
+        # Huggingface models during loss calculation as shown here -
+        # https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095
+        batch_encoded["labels"] = torch.where(
+            batch_encoded["attention_mask"] > 0.5, batch_encoded["input_ids"],
+            -100)
+        batch_encoded = _CustomDataset(batch_encoded)
+    else:
+        # For backward compatibility, if labels are not needed, we only return input_ids.
+        batch_encoded = batch_encoded["input_ids"]
 
     calib_dataloader = DataLoader(batch_encoded,
                                   batch_size=batch_size,
@@ -255,7 +293,8 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
     return calib_dataloader
 
 
-def quantize_model(model, quant_cfg, calib_dataloader=None):
+def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
+                   weight_compression):
     import modelopt.torch.quantization as atq
 
     def calibrate_loop():
@@ -268,14 +307,40 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
             data = data.to(model.device)
             model(data)
 
+    QUANT_CFG_CHOICES = {
+        "int8": "INT8_DEFAULT_CFG",
+        "int8_sq": "INT8_SMOOTHQUANT_CFG",
+        "fp8": "FP8_DEFAULT_CFG",
+        "int4_awq": "INT4_AWQ_CFG",
+        "w4a8_awq": "W4A8_AWQ_BETA_CFG",
+    }
+
     logger.info("Starting quantization...")
     start_time = time.time()
-    atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+    if weight_compression:
+        logger.info("Starting mixed precision quantization...")
+        model, search_history = atq.auto_quantize(
+            model,
+            data_loader=calib_dataloader,
+            loss_func=lambda output, batch: output.loss,
+            constraints={"weight_compression": weight_compression},
+            quantization_formats=[
+                QUANT_CFG_CHOICES[item] for item in qformat.split(",")
+            ] + [None],
+            collect_func=lambda x: x,
+            num_calib_steps=len(calib_dataloader),
+            num_score_steps=min(
+                len(calib_dataloader), 128 // batch_size
+            ),  # Limit the number of score steps to avoid long calibration time
+            verbose=True,
+        )
+        atq.print_quant_summary(model)
+    else:
+        atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     end_time = time.time()
     logger.info(
         "Quantization done. Total time used: {:.2f} s.".format(end_time -
                                                                start_time))
-
     return model
 
 
@@ -367,7 +432,8 @@ def quantize_and_export(*,
                         max_draft_len=None,
                         medusa_hidden_act=None,
                         medusa_model_dir=None,
-                        quant_medusa_head=None):
+                        quant_medusa_head=None,
+                        weight_compression=None):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -403,7 +469,7 @@ def quantize_and_export(*,
                    ] and kv_cache_dtype is None:
         logger.info(f"No quantization applied, export {dtype} model")
     else:
-        if "awq" in qformat:
+        if any("awq" in item for item in qformat.split(",")):
             if calib_size > 32:
                 logger.info(
                     f"AWQ calibration could take longer with calib_size = {calib_size}, Using"
@@ -415,34 +481,53 @@ def quantize_and_export(*,
                 " set by adding the argument --batch_size <batch_size> to the command line.\n"
             )
 
+        # Check if qformat provided is supported. qformat is list of one element for non auto_quant case.
+        if all(item in quant_cfg_choices() for item in qformat.split(",")):
+            quant_cfg = quant_cfg_choices()[qformat.split(",")[0]]
+        else:
+            raise ValueError(f"Unsupported quantization format: {qformat}")
+
+        # Auto quantize does not use quant_cfg
+        if not weight_compression and "awq" in qformat:
+            quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
+            weight_quantizer = quant_cfg["quant_cfg"]["*weight_quantizer"]
+            if isinstance(weight_quantizer, list):
+                weight_quantizer = weight_quantizer[0]
+            weight_quantizer["block_sizes"][-1] = awq_block_size
+
+            # Coarser optimal scale search seems to resolve the overflow in TRT-LLM for some models
+            if "w4a8_awq" == qformat and model_type in ["gemma", "mpt"]:
+                quant_cfg["algorithm"] = {"method": "awq_lite", "alpha_step": 1}
+
         calib_dataloader = get_calib_dataloader(
             dataset_name_or_dir=calib_dataset,
             tokenizer=tokenizer,
             batch_size=batch_size,
             calib_size=calib_size,
             block_size=calib_max_seq_length,
+            device=torch.device("cuda") if weight_compression else None,
+            include_labels=weight_compression is not None,
         )
 
-        if qformat in quant_cfg_choices():
-            quant_cfg = quant_cfg_choices()[qformat]
-        else:
-            raise ValueError(f"Unsupported quantization format: {qformat}")
+        # Always turn on FP8 kv cache to save memory footprint.
+        # For int8_sq, we do not quantize kv cache to preserve accuracy.
+        # We turn off FP8 kv cache for unified_hf checkpoint
+        enable_quant_kv_cache = "int8" not in qformat
+        print(
+            f'{"Enable" if enable_quant_kv_cache else "Disable"} KV cache quantization'
+        )
+        quant_cfg["quant_cfg"]["*output_quantizer"] = {
+            "num_bits": 8 if qformat == "int8_sq" else (4, 3),
+            "axis": None,
+            "enable": enable_quant_kv_cache,
+        }
 
-        if "awq" in qformat:
-            quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
-            weight_quantizer = quant_cfg["quant_cfg"][
-                "*weight_quantizer"]  # type: ignore
-            if isinstance(weight_quantizer, list):
-                weight_quantizer = weight_quantizer[0]
-            weight_quantizer["block_sizes"][-1] = awq_block_size
+        # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
+        if model_type == "gemma" and "int8_sq" in qformat.split(","):
+            quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
-        if kv_cache_dtype is not None:
-            if kv_cache_dtype == "fp8":
-                for value in KV_CACHE_CFG.values():
-                    value.update({"num_bits": (4, 3)})  # type: ignore
-            quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
-
-        model = quantize_model(model, quant_cfg, calib_dataloader)
+        model = quantize_model(model, quant_cfg, calib_dataloader, batch_size,
+                               qformat, weight_compression)
 
     with torch.inference_mode():
         if model_type is None:
@@ -454,12 +539,34 @@ def quantize_and_export(*,
         export_path = output_dir
         start_time = time.time()
 
-        export_tensorrt_llm_checkpoint(model,
-                                       model_type,
-                                       getattr(torch, dtype),
-                                       export_dir=export_path,
-                                       inference_tensor_parallel=tp_size,
-                                       inference_pipeline_parallel=pp_size)
+        QUANT_ALGO = {
+            "int8": "INT8",
+            "int8_sq": "W8A8_SQ_PER_CHANNEL",
+            "fp8": "FP8",
+            "int4_awq": "W4A16_AWQ",
+            "w4a8_awq": "W4A8_AWQ",
+        }
+
+        # workaround for old API version
+        if weight_compression:
+            export_tensorrt_llm_checkpoint(
+                model,
+                model_type,
+                getattr(torch, dtype),
+                export_dir=export_path,
+                inference_tensor_parallel=tp_size,
+                inference_pipeline_parallel=pp_size,
+                auto_quant=weight_compression is not None,
+            )
+        else:
+            export_tensorrt_llm_checkpoint(
+                model,
+                model_type,
+                getattr(torch, dtype),
+                export_dir=export_path,
+                inference_tensor_parallel=tp_size,
+                inference_pipeline_parallel=pp_size,
+            )
 
         with open(f"{export_path}/config.json", "r") as f:
             tensorrt_llm_config = json.load(f)

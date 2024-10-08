@@ -45,7 +45,7 @@ public:
         std::shared_ptr<BaseDecodingInputs> const& inputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
-    //! \brief Calls forwardSync of configired decoding layer.
+    //! \brief Calls forwardSync of configured decoding layer.
     void forwardSync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;

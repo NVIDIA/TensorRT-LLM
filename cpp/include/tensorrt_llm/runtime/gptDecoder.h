@@ -64,16 +64,6 @@ public:
 
     virtual SamplingConfig const& getSamplingConfig() = 0;
 
-    static void acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor const& draftTokenIds,
-        ITensor const& contextLengths, ITensor const& numDraftTokens, ITensor& sequenceLengths,
-        ITensor const& finishedVec, ITensor& finishedFinal, ITensor& finishedSum, ITensor const& batchSlots,
-        BufferManager::CudaStreamPtr const& stream);
-
-    static void acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
-        ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
-        SizeType32 vocabSize, SizeType32 vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
-        curandState_t* curandState, BufferManager::CudaStreamPtr const& stream);
-
     static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
         size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
         BufferManager::CudaStreamPtr const& stream,

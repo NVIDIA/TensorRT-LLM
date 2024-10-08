@@ -55,6 +55,7 @@ enum class LlmRequestState : int32_t
                                               /// Waiting context-only request transmitting the kv cache
     kDISAGG_CONTEXT_COMPLETE = 8,             ///< Context-only request finished kv cache transmission.
     kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< For disaggregated serving only: transmitting the kv cache
+    kWAITING_TO_SEND_LOGITS = 10,             ///< Generation phase completed, logits not sent yet
 };
 
 enum LlmRequestType
@@ -132,8 +133,7 @@ public:
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(std::move(lookaheadConfig))
-        , mContextChunkSize(std::nullopt)
-        , mContextCurrentPosition(0)
+        , mContextChunkSize{mPromptLen}
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
@@ -186,8 +186,7 @@ public:
         , mLoraWeights(std::nullopt)
         , mLoraConfig(std::nullopt)
         , mLookaheadConfig(std::nullopt)
-        , mContextChunkSize(std::nullopt)
-        , mContextCurrentPosition(0)
+        , mContextChunkSize{mPromptLen}
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>())
@@ -390,6 +389,15 @@ public:
                 "Number of requested output tokens is changed to (%d).",
                 mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
             mMaxNewTokens = maxNewTokens;
+        }
+
+        if (mNumReturnSequences > 1 && mSamplingConfig.beamWidth > 1)
+        {
+            TLLM_THROW(
+                "Using mNumReturnSequences (%d) > 1 with beam search is currently disabled, since TensorRT-LLM returns "
+                "a total of mNumReturnSequences x beamWidth beams, rather than limiting the number of returned beams "
+                "to mNumReturnSequences. This restriction will be removed once the issue is resolved.",
+                mNumReturnSequences);
         }
 
         TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
@@ -722,7 +730,7 @@ public:
         mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
                                                                      : LlmRequestState::kCONTEXT_INIT;
         mContextCurrentPosition = 0;
-        mContextChunkSize = std::nullopt;
+        mContextChunkSize = mPromptLen;
         mSeqSlot.reset();
     }
 
@@ -869,34 +877,33 @@ public:
         return mPromptLen;
     }
 
+    [[nodiscard]] SizeType32 getPrepopulatedPromptLen() const
+    {
+        return mPrepopulatedPromptLen;
+    }
+
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         auto const promptLen = getPromptLen();
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
+        mPrepopulatedPromptLen = prepopulatedPromptLen;
 
         if (prepopulatedPromptLen > 0)
         {
             // Currently, the runtime process is to apply for cache first and then determine prepopulation.
             // Use the prepopulated length to advance the context position and decrease chunk size if necessary.
-            if (isFullContextRequest())
+            auto chunkSize = getContextChunkSize();
+            if (prepopulatedPromptLen + chunkSize < promptLen)
             {
-                setContextCurrentPosition(prepopulatedPromptLen);
-                setContextChunkSize(promptLen);
+                // make sure to end at block boundary after current chunk
+                auto const flooredEndPosition
+                    = (prepopulatedPromptLen + chunkSize) / kvTokensPerBlock * kvTokensPerBlock;
+                chunkSize = flooredEndPosition - prepopulatedPromptLen;
+                TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
-            else
-            {
-                auto chunkSize = getContextChunkSize();
-                if (prepopulatedPromptLen + chunkSize < promptLen)
-                {
-                    // make sure to end at block boundary after current chunk
-                    auto const flooredEndPosition
-                        = (prepopulatedPromptLen + chunkSize) / kvTokensPerBlock * kvTokensPerBlock;
-                    chunkSize = flooredEndPosition - prepopulatedPromptLen;
-                    TLLM_CHECK(chunkSize <= getContextChunkSize());
-                }
-                setContextCurrentPosition(prepopulatedPromptLen);
-                setContextChunkSize(chunkSize);
-            }
+            setContextCurrentPosition(prepopulatedPromptLen);
+            setContextChunkSize(chunkSize);
+
             if (!isLastContextChunk())
             {
                 TLLM_CHECK_WITH_INFO((getContextCurrentPosition() + getContextChunkSize()) % kvTokensPerBlock == 0,
@@ -1176,6 +1183,11 @@ public:
         return mState == LlmRequestState::kDISAGG_CONTEXT_COMPLETE;
     }
 
+    [[nodiscard]] bool isCompleteWaitingToSendLogits() const noexcept
+    {
+        return mState == LlmRequestState::kWAITING_TO_SEND_LOGITS;
+    }
+
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
     /// is still different from the unchunked state, which indicates the initial status.
     [[nodiscard]] bool isFullContextRequest() const noexcept
@@ -1211,12 +1223,11 @@ public:
         return mPromptLen - getContextCurrentPosition();
     }
 
-    /// To retrieve the context chunk size, throw an exception when the context is not chunked.
     [[nodiscard]] SizeType32 getContextChunkSize() const
     {
-        TLLM_CHECK_WITH_INFO(
-            isContextInitState() && mContextChunkSize, "The current request is not in context chunking state.");
-        return mContextChunkSize.value();
+        TLLM_CHECK_WITH_INFO(isContextInitState() || isDisaggGenerationInitState(),
+            "getContextChunkSize is only possible during the context phase.");
+        return mContextChunkSize;
     }
 
     /// To set the context chunk size, throw an exception when the chunk size is negative. If the chunk
@@ -1224,45 +1235,34 @@ public:
     /// remaining length.
     void setContextChunkSize(SizeType32 size)
     {
-        TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
+        TLLM_CHECK_WITH_INFO(isContextInitState(), "setContextChunkSize is only possible during the context phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         mContextChunkSize = std::min(size, getContextRemainingLength());
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
-    /// It will return true when the context is not chunked.
     [[nodiscard]] bool isLastContextChunk() const noexcept
     {
-        return isFullContextRequest()
-            || (isContextInitState() && getContextCurrentPosition() + getContextChunkSize() == mPromptLen);
+        return isDisaggGenerationInitState() || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
     }
 
-    /// Returns whether the position is at the beginning of the context. It will return true when the
-    /// context is not chunked.
+    /// Returns whether the position is at the beginning of the context.
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
-        return isFullContextRequest() || getContextCurrentPosition() == 0;
-    }
-
-    [[nodiscard]] executor::PriorityType priority() const noexcept
-    {
-        return mPriority;
+        return getContextCurrentPosition() == 0;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
     void moveToNextContextChunk()
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
-        if (mContextChunkSize)
-        {
-            mContextCurrentPosition += getContextChunkSize();
-            setContextChunkSize(0);
-        }
-        else
-        {
-            TLLM_CHECK_WITH_INFO(mContextCurrentPosition == 0, "Full context out of bounds.");
-            mContextCurrentPosition = mPromptLen;
-        }
+        mContextCurrentPosition += getContextChunkSize();
+        setContextChunkSize(0);
+    }
+
+    [[nodiscard]] executor::PriorityType priority() const noexcept
+    {
+        return mPriority;
     }
 
     /// Increment the counter of decoding iterations.
@@ -1282,20 +1282,24 @@ public:
         return static_cast<float>(getMaxNumGeneratedTokens()) / mDecodingIter;
     }
 
+    [[nodiscard]] bool isFinished() const noexcept
+    {
+        return isGenerationCompleteState() || isDisaggContextTransmissionState() || isCompleteWaitingToSendLogits();
+    }
+
     /// @brief  Create a Response from the current state of the request
     /// @return An optional Response
-    std::optional<executor::Response> createResponse()
+    std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0)
     {
         TLLM_CHECK(!isDisaggContextCompleteState());
-        if (isGenerationCompleteState() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)
-            || isDisaggContextTransmissionState())
+        if (isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS))
         {
             TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
 
             executor::Result result;
             result.sequenceIndex = mSequenceIndex;
 
-            result.isSequenceFinal = isGenerationCompleteState() || isDisaggContextTransmissionState();
+            result.isSequenceFinal = isFinished();
             mSequenceFinalVec->at(mSequenceIndex) = result.isSequenceFinal;
 
             result.isFinal = std::all_of(mSequenceFinalVec->begin(), mSequenceFinalVec->end(),
@@ -1333,8 +1337,7 @@ public:
 
             auto const startTokenPos = maxNbTokens - maxNbTokensOut;
 
-            auto const shouldSendResponse = isGenerationCompleteState()
-                || (mIsStreaming && maxNbTokens > getMaxSentTokenLen()) || isDisaggContextTransmissionState();
+            auto const shouldSendResponse = isFinished() || (mIsStreaming && maxNbTokens > getMaxSentTokenLen());
 
             if (!shouldSendResponse)
             {
@@ -1374,6 +1377,11 @@ public:
                             = runtime::ITensor::slice(getGenerationLogitsHost(), startGenTokenPos, maxNbTokensOut);
                         result.generationLogits = executor::detail::ofITensor(generationLogitsHostCurrentStep);
                     }
+                    else if (useFastLogits)
+                    {
+                        result.specDecFastLogitsInfo
+                            = executor::SpeculativeDecodingFastLogitsInfo{mRequestId, mpiWorldRank};
+                    }
                     else
                     {
                         result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
@@ -1392,7 +1400,7 @@ public:
                 setMaxSentTokenLen(maxNbTokens);
 
                 auto requestId = isChild() ? mParentRequestId : mRequestId;
-                auto response = executor::Response(requestId, std::move(result));
+                auto response = executor::Response(requestId, std::move(result), mClientId);
 
                 return response;
             }
@@ -1483,8 +1491,8 @@ protected:
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
     // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
     // of null value is that the context is not chunked.
-    std::optional<SizeType32> mContextChunkSize;
-    SizeType32 mContextCurrentPosition;
+    SizeType32 mContextChunkSize{0};
+    SizeType32 mContextCurrentPosition{0};
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
@@ -1636,6 +1644,8 @@ private:
 
 class LlmRequest : public GenericLlmRequest<runtime::ITensor::SharedPtr>
 {
+    friend class LlmRequestBindings;
+
 public:
     using Base = GenericLlmRequest<runtime::ITensor::SharedPtr>;
     using TensorPtr = Base::TensorPtr;

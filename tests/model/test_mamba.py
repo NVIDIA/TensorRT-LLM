@@ -251,7 +251,7 @@ class TestMamba(unittest.TestCase):
                                                   device=step1_id.device))
                 gen_ref = hf_outputs.logits[:, -1, :]
 
-        # get tensorrt llm mamba rumtime
+        # get tensorrt llm mamba runtime
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, model_name, gemm_plugin, mamba_conv1d_plugin, hf_config,
             hf_path, hf_mamba, load_mode, batch_size, input_len, output_len,

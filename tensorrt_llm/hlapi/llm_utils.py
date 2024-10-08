@@ -473,7 +473,7 @@ class LlmArgs:
     def _perform_config_arbitration(self):
         '''
         Arbitrate the configurations for the model building. The configs between different functional or performance
-        features might be confilcted, and this method will arbitrate the conflicts and raise errors if necessary.
+        features might be conflicted, and this method will arbitrate the conflicts and raise errors if necessary.
         '''
         self._config_arbitrator = _ConfigArbitrator()
         if self.build_config_mutable:
@@ -1460,7 +1460,7 @@ class CachedModelLoader:
 @dataclass
 class LlmBuildStats:
     ''' LlmBuildStats is the statistics for the LLM model building. '''
-    # Whether the cache is hitted for the engine
+    # Whether the cache is hit for the engine
     cache_hitted: bool = False
     cache_info: Optional[str] = None
 

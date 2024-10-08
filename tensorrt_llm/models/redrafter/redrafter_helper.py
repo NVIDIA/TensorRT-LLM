@@ -1,3 +1,4 @@
+import warnings
 from typing import Tuple
 
 import numpy as np
@@ -11,7 +12,7 @@ from tensorrt_llm.functional import (
     div, eq, exp, expand, expand_dims, floordiv, gather, gather_nd,
     index_select, int32_array, log_softmax, lt, max, maximum, masked_select,
     minimum, nonzero, not_op, op_and, rand, relu, scatter, select, shape, slice,
-    softmax, squeeze, stack, sum, topk, transpose, unsqueeze, view, where)
+    silu, softmax, squeeze, stack, sum, topk, transpose, unsqueeze, view, where)
 # isort: on
 from tensorrt_llm.layers import Embedding
 from tensorrt_llm.module import Module
@@ -358,9 +359,133 @@ def _unflatten_decoding_dim(x: Tensor, num_beams: int) -> Tensor:
     return x
 
 
-def _beam_search_candidates(x: Tensor, init_token: Tensor, embedding: Embedding,
-                            drafter: Module, num_beams: int, beam_length: int,
+def _beam_search_candidates(prompt_state: Tensor, init_token: Tensor,
+                            embedding: Embedding, drafter: Module,
+                            num_beams: int, beam_length: int,
                             is_rnn: bool) -> Tuple[Tensor, Tensor]:
+    """
+        This version of beam search matches with ReDrafter GitHub version as of 10/02/2024.
+        Link: https://github.com/apple/ml-recurrent-drafter/releases/tag/v1.1
+    """
+
+    LOG_0 = -50000.0
+    LOG_1 = 0.0
+
+    def maintain_logits(logits: Tensor) -> Tensor:
+        max_logits = max(logits, -1, keepdim=True)
+        max_logits = expand(max_logits,
+                            shape(logits, cast_to_dtype=INT_DTYPE_STR))
+        return logits - max_logits
+
+    def warp_logits(logits: Tensor,
+                    top_k: int = 50,
+                    mask_value: float = LOG_0) -> Tensor:
+        top_k = minimum(top_k, shape(logits,
+                                     dim=-1,
+                                     cast_to_dtype=INT_DTYPE_STR))
+        top_values, _ = topk(logits, k=top_k, dim=-1)  # [bs, nb, top_k]
+        starts = concat([0, 0, top_k - 1])
+        sizes = concat([shape(logits, 0), shape(logits, 1), 1])
+        lt_mask = logits < slice(top_values, starts=starts, sizes=sizes)
+        logits = where(lt_mask,
+                       constant_to_tensor_(mask_value, dtype=logits.dtype),
+                       logits)
+        return logits
+
+    def compute_logits(x: Tensor) -> Tensor:
+        """
+        x: [bs, nb, 2*H]
+        """
+        logits = drafter(x)  # [bs, nb, 2*H] => [bs, nb, V]
+        logits = maintain_logits(logits)  # [bs, nb, V]
+        logits = warp_logits(logits)  # [bs, nb, V]
+        return logits
+
+    assert prompt_state.ndim() == 2
+    assert init_token.ndim() == 1
+    assert beam_length > 1
+    batch_size = shape(prompt_state, 0, INT_DTYPE_STR)
+    vocab_size = embedding.num_embeddings
+    dtype = prompt_state.dtype
+
+    log_p_beam = expand(
+        unsqueeze(
+            constant(
+                numpy_array([LOG_1] + [LOG_0] * (num_beams - 1),
+                            trt_dtype=dtype)), 0),  # [1, nb]
+        concat([batch_size, num_beams]))  # [bs, nb]
+    context = _add_decoding_dim(prompt_state, num_beams)  # [bs, nb, H]
+    if init_token.ndim() == 1:
+        init_token = unsqueeze(init_token, -1)  # [bs] => [bs, 1]
+    beams = _add_decoding_dim(init_token, num_beams)  # [bs, nb, 1]
+
+    last_tokens = squeeze(beams, -1)  # [bs, nb]
+    state_shape = shape(context, cast_to_dtype=INT_DTYPE_STR)  # [bs, nb, H]
+    state = expand(expand_dims(constant_to_tensor_(0.0, dtype=dtype), [0, 1]),
+                   state_shape)  # [bs, nb, H]
+    logits_token_in_beam = None
+    candidate_length = beam_length - 1
+    for _ in range(candidate_length):
+        state = (
+            silu(drafter.rnn_w(embedding(last_tokens)) +
+                 drafter.rnn_u(state)) if is_rnn else embedding(last_tokens) +
+            state)  # [bs, nb, H]
+
+        logits_new_token = compute_logits(concat([context, state],
+                                                 -1))  # [bs, nb, V]
+        log_p_new_token = log_softmax(logits_new_token, -1)  # [bs, nb, V]
+
+        log_p_beam_new_token = log_p_new_token + unsqueeze(log_p_beam,
+                                                           2)  # [bs, nb, V]
+
+        tokens_times_beams = view(log_p_beam_new_token,
+                                  concat([batch_size, num_beams * vocab_size
+                                          ]))  # [bs, nb*V]
+        log_p_beam, topk_indices = topk(tokens_times_beams, k=num_beams,
+                                        dim=-1)  # [bs, nb]
+        top_beam_indices = topk_indices // vocab_size  # [bs, nb]
+        # Avoid repeated division for: top_token_ids = topk_indices % vocab_size
+        top_token_ids = topk_indices - (top_beam_indices * vocab_size
+                                        )  # [bs, nb]
+
+        # get the common indices to gather beams
+        gather_indices = _get_indices_for_gather_beams(batch_size,
+                                                       top_beam_indices,
+                                                       num_beams)
+
+        # update running beams, state, logits, and last_tokens
+        prev_top_beams = _gather_beams(beams, gather_indices, batch_size,
+                                       num_beams)  # [bs, nb] OR [bs, nb, 1+i]
+        if prev_top_beams.ndim() == 2:
+            prev_top_beams = unsqueeze(prev_top_beams, -1)  # [bs, nb, 1]
+        new_tokens = unsqueeze(top_token_ids, -1)  # [bs, nb, 1]
+        beams = concat([prev_top_beams, new_tokens], dim=-1)  # [bs, nb, 1+i+1]
+
+        state = _gather_beams(state, gather_indices, batch_size,
+                              num_beams)  # [bs, nb, H]
+
+        cur_logits_token_in_beam = unsqueeze(
+            _gather_beams(logits_new_token, gather_indices, batch_size,
+                          num_beams), 2)  # [bs, nb, 1, V]
+        if logits_token_in_beam is None:  # first iteration
+            logits_token_in_beam = cur_logits_token_in_beam
+        else:
+            logits_token_in_beam = concat(
+                [
+                    _gather_beams(logits_token_in_beam, gather_indices,
+                                  batch_size,
+                                  num_beams),  # prev_top_logits [bs, nb, i, V]
+                    cur_logits_token_in_beam
+                ],
+                dim=2)  # [bs, nb, i+1, V]
+        last_tokens = top_token_ids  # [bs, nb]
+    return beams, logits_token_in_beam
+
+
+def _beam_search_candidates_v0(x: Tensor, init_token: Tensor,
+                               embedding: Embedding, drafter: Module,
+                               num_beams: int, beam_length: int,
+                               is_rnn: bool) -> Tuple[Tensor, Tensor]:
     '''
     x: [bs, H]
     init_token: [bs]
@@ -372,6 +497,9 @@ def _beam_search_candidates(x: Tensor, init_token: Tensor, embedding: Embedding,
             draft_probs: (batch, num_beams, beam_length - 1, vocab_size)
                 Probabilities for the draft_tokens.
     '''
+    warnings.warn(
+        "This version of beam search is deprecated and will be removed in the future."
+    )
     NEG_INF = -50000.0
     batch_size = shape(x, 0, INT_DTYPE_STR)
     vocab_size = embedding.num_embeddings
@@ -408,7 +536,7 @@ def _beam_search_candidates(x: Tensor, init_token: Tensor, embedding: Embedding,
             h))  # [bs, nb, 2H] => [bs*nb, 2H] => [bs*nb, V]
         new_flat_log_probs = log_softmax(new_flat_logits, dim=-1)  # [bs*nb, V]
 
-        # compute probabilties and flatten the beams for topk
+        # compute probabilities and flatten the beams for topk
         candidate_log_probs = _unflatten_decoding_dim(
             new_flat_log_probs, num_beams)  # [bs*nb, V] => [bs, nb, V]
         log_probs = candidate_log_probs + unsqueeze(scores, 2)  # [bs, nb, V]

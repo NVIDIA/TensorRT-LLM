@@ -15,7 +15,7 @@
 
 import copy
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -24,6 +24,7 @@ from .._utils import mpi_broadcast
 from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
                         WorldConfig)
 from ..bindings import executor as trtllm
+from ..bindings.executor import ExternalDraftTokensConfig, ParallelConfig
 from ..builder import EngineConfig
 from ..logger import logger
 from ..mapping import Mapping
@@ -74,30 +75,34 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.lora_manager = lora_manager
 
     @classmethod
-    def from_dir(cls,
-                 engine_dir: str,
-                 *,
-                 lora_dir: Optional[str] = None,
-                 rank: int = 0,
-                 max_batch_size: Optional[int] = None,
-                 max_input_len: Optional[int] = None,
-                 max_output_len: Optional[int] = None,
-                 max_beam_width: Optional[int] = None,
-                 max_attention_window_size: Optional[list[int]] = None,
-                 sink_token_length: Optional[int] = None,
-                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-                 medusa_choices: list[list[int]] | None = None,
-                 lookahead_config: list[int] | None = None,
-                 debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf",
-                 gpu_weights_percent: float = 1,
-                 max_tokens_in_paged_kv_cache: int | None = None,
-                 kv_cache_enable_block_reuse: bool = False,
-                 enable_chunked_context: bool = False,
-                 is_enc_dec: bool = False,
-                 multi_block_mode: bool = True,
-                 enable_context_fmha_fp32_acc: Optional[bool] = None,
-                 cuda_graph_mode: Optional[bool] = None) -> 'ModelRunnerCpp':
+    def from_dir(
+        cls,
+        engine_dir: str,
+        *,
+        lora_dir: Optional[str] = None,
+        rank: int = 0,
+        max_batch_size: Optional[int] = None,
+        max_input_len: Optional[int] = None,
+        max_output_len: Optional[int] = None,
+        max_beam_width: Optional[int] = None,
+        max_attention_window_size: Optional[list[int]] = None,
+        sink_token_length: Optional[int] = None,
+        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+        medusa_choices: list[list[int]] | None = None,
+        lookahead_config: list[int] | None = None,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        gpu_weights_percent: float = 1,
+        max_tokens_in_paged_kv_cache: int | None = None,
+        kv_cache_enable_block_reuse: bool = False,
+        enable_chunked_context: bool = False,
+        is_enc_dec: bool = False,
+        multi_block_mode: bool = True,
+        enable_context_fmha_fp32_acc: Optional[bool] = None,
+        cuda_graph_mode: Optional[bool] = None,
+        logits_processor_map: Optional[Dict[str, LogitsProcessor]] = None,
+        device_ids: List[int] | None = None,
+    ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -150,6 +155,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Enable FMHA runner FP32 accumulation.
             cuda_graph_mode (bool):
                 Whether to use cuda graph for inference.
+            logits_processor_map (Dict[str, LogitsProcessor])
+                A map of logits processor functions indexed by names. A name can be provided later to
+                the generate() function to specify which logits processor to run.
+            device_ids (List[int]):
+                Device indices to run the Executor on.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
@@ -336,6 +346,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
             gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
+        trtllm_config.parallel_config = ParallelConfig(
+            trtllm.CommunicationType.MPI,
+            trtllm.CommunicationMode.LEADER,
+            device_ids=device_ids,
+            orchestrator_config=None)
+
+        logits_proc_config = trtllm.LogitsPostProcessorConfig()
+        if logits_processor_map is not None:
+            logits_proc_config.processor_map = logits_processor_map
+        trtllm_config.logits_post_processor_config = logits_proc_config
 
         executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
                                    trtllm_config)
@@ -437,7 +457,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             lookahead_config: list[int] | None = None,
             streaming: bool = False,
             stopping_criteria: Optional[StoppingCriteria] = None,
-            logits_processor: Optional[LogitsProcessor] = None,
+            logits_processor_names: list[str] | None = None,
             max_new_tokens: int = 1,
             num_return_sequences: int = 1,
             end_id: int | None = None,
@@ -485,8 +505,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Whether or not to use streaming mode for generation.
             stopping_criteria (StoppingCriteria):
                 Custom stopping criteria.
-            logits_processor (LogitsProcessor):
-                Custom logits processors.
+            logits_processor_names (List[str]):
+                Custom logits processor names.
             return_all_generated_tokens (bool):
                 Whether the full output is returned at each streaming step
             num_return_sequences (int):
@@ -507,9 +527,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if stopping_criteria is not None:
             raise RuntimeError(
                 "Stopping criteria is not supported in C++ session.")
-        if logits_processor is not None:
-            raise RuntimeError(
-                "Logits processor is not supported in C++ session.")
 
         if not self.use_kv_cache and max_new_tokens > 1:
             raise RuntimeError(
@@ -567,6 +584,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                                    len(batch_input_ids_list))
         bad_words_list = self._prepare_words_list(bad_words_list,
                                                   len(batch_input_ids_list))
+        logits_processor_names = self._prepare_names_list(
+            logits_processor_names, len(batch_input_ids_list))
 
         lora_configs = self._prepare_lora_configs(lora_uids,
                                                   len(batch_input_ids_list))
@@ -574,6 +593,29 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if lookahead_config is not None:
             [w, n, g] = lookahead_config
             request_lookahead_config = trtllm.LookaheadDecodingConfig(w, n, g)
+
+        # Draft-Target-Model speculative decoding
+        if "draft_tokens_list" in kwargs.keys() and kwargs[
+                "draft_tokens_list"] is not None and "draft_logits_list" in kwargs.keys(
+                ) and kwargs["draft_logits_list"] is not None:
+            # Use logits to accept
+            external_draft_tokens_configs = [
+                ExternalDraftTokensConfig(draft_tokens, draft_logits, 1.0e-8)
+                for draft_tokens, draft_logits in zip(
+                    kwargs["draft_tokens_list"], kwargs["draft_logits_list"])
+            ]
+            is_draft_target_model = True
+        elif "draft_tokens_list" in kwargs.keys(
+        ) and kwargs["draft_tokens_list"] is not None:
+            # Use tokens to accept
+            external_draft_tokens_configs = [
+                ExternalDraftTokensConfig(draft_tokens)
+                for draft_tokens in kwargs["draft_tokens_list"]
+            ]
+            is_draft_target_model = True
+        else:
+            external_draft_tokens_configs = [None] * len(batch_input_ids_list)
+            is_draft_target_model = False
 
         requests = [
             trtllm.Request(
@@ -598,11 +640,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 output_config=output_config,
                 prompt_tuning_config=prompt_tuning_config,
                 lora_config=lora_config,
-                return_all_generated_tokens=return_all_generated_tokens) for i,
+                return_all_generated_tokens=return_all_generated_tokens,
+                logits_post_processor_name=logits_post_processor_name,
+                external_draft_tokens_config=external_draft_tokens_config,
+            ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
-             lora_config) in enumerate(
+             lora_config, logits_post_processor_name,
+             external_draft_tokens_config) in enumerate(
                  zip(batch_input_ids_list, stop_words_list, bad_words_list,
-                     prompt_tuning_configs, lora_configs))
+                     prompt_tuning_configs, lora_configs,
+                     logits_processor_names, external_draft_tokens_configs))
         ]
 
         request_ids = self.session.enqueue_requests(requests)
@@ -610,20 +657,26 @@ class ModelRunnerCpp(ModelRunnerMixin):
             return self._initialize_and_fill_output(
                 request_ids, end_id, return_dict, output_sequence_lengths,
                 output_log_probs, output_cum_log_probs, batch_input_ids,
-                streaming, max_new_tokens, num_return_sequences)
+                streaming, max_new_tokens, num_return_sequences,
+                is_draft_target_model)
         else:
             return self._stream(request_ids, end_id, return_dict,
                                 output_sequence_lengths, output_log_probs,
                                 output_cum_log_probs, batch_input_ids,
                                 batch_input_ids_list, streaming,
                                 return_all_generated_tokens, max_new_tokens,
-                                num_return_sequences)
+                                num_return_sequences, is_draft_target_model)
 
     def _prepare_words_list(self, words_list: List[List[List[int]]],
                             batch_size: int):
         if words_list is None:
             return [None] * batch_size
         return words_list
+
+    def _prepare_names_list(self, names_list: List[str], batch_size: int):
+        if names_list is None:
+            return [None] * batch_size
+        return names_list
 
     def _prepare_ptuning_executor(self, batch_input_ids_list, prompt_table,
                                   prompt_tasks, input_token_extra_ids):
@@ -666,17 +719,20 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if int(uid) >= 0 else None for uid in lora_uids
         ]
 
-    def _initialize_and_fill_output(self,
-                                    request_ids,
-                                    end_id,
-                                    return_dict,
-                                    output_sequence_lengths,
-                                    output_log_probs,
-                                    output_cum_log_probs,
-                                    batch_input_ids,
-                                    streaming,
-                                    max_new_tokens: int,
-                                    num_return_sequences: int = 1):
+    def _initialize_and_fill_output(
+        self,
+        request_ids,
+        end_id,
+        return_dict,
+        output_sequence_lengths,
+        output_log_probs,
+        output_cum_log_probs,
+        batch_input_ids,
+        streaming,
+        max_new_tokens: int,
+        num_return_sequences: int = 1,
+        is_draft_target_model: bool = False,
+    ):
         output_ids = [[[] for _ in range(self.max_beam_width)]
                       for _ in range(len(request_ids) * num_return_sequences)]
 
@@ -689,21 +745,24 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                  output_sequence_lengths, output_log_probs,
                                  output_cum_log_probs, batch_input_ids, [],
                                  streaming, request_ids, False, max_new_tokens,
-                                 num_return_sequences)
+                                 num_return_sequences, is_draft_target_model)
 
-    def _stream(self,
-                request_ids,
-                end_id,
-                return_dict,
-                output_sequence_lengths,
-                output_log_probs,
-                output_cum_log_probs,
-                batch_input_ids,
-                batch_input_ids_list,
-                streaming,
-                return_all_generated_tokens,
-                max_new_tokens: int,
-                num_return_sequences: int = 1):
+    def _stream(
+        self,
+        request_ids,
+        end_id,
+        return_dict,
+        output_sequence_lengths,
+        output_log_probs,
+        output_cum_log_probs,
+        batch_input_ids,
+        batch_input_ids_list,
+        streaming,
+        return_all_generated_tokens,
+        max_new_tokens: int,
+        num_return_sequences: int = 1,
+        is_draft_target_model: bool = False,
+    ):
 
         output_ids = [[]
                       for _ in range(len(request_ids) * num_return_sequences)]
@@ -726,14 +785,15 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                     output_cum_log_probs, batch_input_ids,
                                     batch_input_ids_list, streaming,
                                     request_ids, return_all_generated_tokens,
-                                    max_new_tokens, num_return_sequences)
+                                    max_new_tokens, num_return_sequences,
+                                    is_draft_target_model)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
                      output_cum_log_probs, batch_input_ids,
                      batch_input_ids_list, streaming, request_ids,
                      return_all_generated_tokens, max_new_tokens,
-                     num_return_sequences):
+                     num_return_sequences, is_draft_target_model):
         cuda_device = torch.device("cuda")
 
         # Total number of output sequences = batch_size * num_return_sequences.
@@ -806,32 +866,39 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 outputs['context_logits'] = context_logits
 
             if self.gather_generation_logits:
-                if not streaming:
-                    gen_shape = (num_beams, max_new_tokens, vocab_size)
-                elif streaming and return_all_generated_tokens:
-                    gen_shape = (max_new_tokens, num_beams, vocab_size)
-                else:  # streaming and not return_all_generated_tokens
-                    gen_shape = (1, num_beams, vocab_size)
-
                 gen_logits = None
-                for response in responses:
-                    # gen logits shape: (beam, seq, vocab)
-                    logits = response.result.generation_logits
-                    if logits is None:
-                        continue
-                    num_beams, seq_len, vocab_size = logits.shape
-                    if gen_logits is None:
-                        gen_logits = torch.zeros(
-                            (num_output_sequences, *gen_shape),
-                            dtype=logits.dtype,
-                            device=cuda_device)
-                    batch_idx = request_ids.index(response.request_id)
-                    seq_idx = response.result.sequence_index
-                    reqid_pos = batch_idx * num_return_sequences + seq_idx
-                    if streaming:
-                        gen_logits[reqid_pos, :seq_len, ...] = logits[0]
-                    else:
-                        gen_logits[reqid_pos, :, :seq_len, ...] = logits[0]
+                if is_draft_target_model:
+                    # Put the outputs in a list rather than a tensor since their
+                    # length may vary among requests in a batch
+                    gen_logits = [
+                        a.result.generation_logits.cuda() for a in responses
+                        if a.result.generation_logits is not None
+                    ]
+                else:
+                    for response in responses:
+                        # gen logits shape: (beam, seq, vocab)
+                        logits = response.result.generation_logits
+                        if logits is None:
+                            continue
+                        num_beams, seq_len, vocab_size = logits.shape
+                        if not streaming:
+                            gen_shape = (num_beams, max_new_tokens, vocab_size)
+                        elif streaming and return_all_generated_tokens:
+                            gen_shape = (max_new_tokens, num_beams, vocab_size)
+                        else:  # streaming and not return_all_generated_tokens
+                            gen_shape = (1, num_beams, vocab_size)
+                        if gen_logits is None:
+                            gen_logits = torch.zeros(
+                                (num_output_sequences, *gen_shape),
+                                dtype=logits.dtype,
+                                device=cuda_device)
+                        batch_idx = request_ids.index(response.request_id)
+                        seq_idx = response.result.sequence_index
+                        reqid_pos = batch_idx * num_return_sequences + seq_idx
+                        if streaming:
+                            gen_logits[reqid_pos, :seq_len, ...] = logits[0]
+                        else:
+                            gen_logits[reqid_pos, :, :seq_len, ...] = logits[0]
                 outputs['generation_logits'] = gen_logits
 
             if output_log_probs:

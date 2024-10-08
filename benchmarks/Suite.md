@@ -42,7 +42,7 @@ This section covers how to benchmark TensorRT-LLM using inflight batching.
 ### Quickstart
 
 For this quick start guide, we will focus on running a short max throughput benchmark on
-`meta-llama/Llama-2-7b-hf` on a syntehtic dataset with a uniform distribution of prompts with ISL:OSL
+`meta-llama/Llama-2-7b-hf` on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
 of 128:128. In order to run the benchmark from start to finish simply run the following commands:
 
 ```shell
@@ -101,12 +101,12 @@ The workflow for `trtllm-bench` is composed of the following steps:
 The inflight benchmark utilizes a fixed JSON schema so that it is simple and
 straightforward to specify requests. The schema is defined as follows:
 
-| Key | Required | Type | Description |
-| :- | :-: | :-: | :- |
-| `task_id`| Y | String | Unique identifier for the request. |
-| `prompt` | N* | String | Input text for a generation request. |
-| `logits` | N* | List[Integer] | List of logits that make up the request prompt. |
-| `output_tokens` | Y | Integer | Number of generated tokens for this request. |
+| Key             | Required |     Type      | Description                                     |
+| :-------------- | :------: | :-----------: | :---------------------------------------------- |
+| `task_id`       |    Y     |    String     | Unique identifier for the request.              |
+| `prompt`        |    N*    |    String     | Input text for a generation request.            |
+| `logits`        |    N*    | List[Integer] | List of logits that make up the request prompt. |
+| `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
 
 > [!NOTE] Prompt and logits are mutually exclusive*
 > While having both `prompt` and `logits` is not required, at least one is required.

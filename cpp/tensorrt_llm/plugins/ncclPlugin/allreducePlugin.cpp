@@ -305,14 +305,17 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             ++tpRank;
         }
 
+        int token_num = size / inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank);
+            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, mOp);
 
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
         params.elts_total = size;
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
+
             int fusion_ptr_idx = 2;
             params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
             params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
@@ -320,6 +323,15 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             params.fusion_params.hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
             params.fusion_params.eps = mEps;
             params.fusion_params.intermediate_buffer = outputs[1];
+            for (int i = 0; i < tpSize; ++i)
+            {
+                params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
+                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 4 + i];
+                params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE]
+                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 5 + i];
+                params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE * 2]
+                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 6 + i];
+            }
         }
         tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
     }

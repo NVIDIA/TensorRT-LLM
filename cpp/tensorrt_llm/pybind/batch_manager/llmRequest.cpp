@@ -17,21 +17,28 @@
 #include "llmRequest.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/pybind/utils/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
+#include <ATen/ATen.h>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
 #include <torch/extension.h>
 
 #include <memory>
 
 namespace tb = tensorrt_llm::batch_manager;
 namespace tr = tensorrt_llm::runtime;
+namespace tle = tensorrt_llm::executor;
 
 using namespace tensorrt_llm::pybind::batch_manager;
+
+using LlmRequestPtr = std::shared_ptr<tb::LlmRequest>;
+using RequestList = std::list<LlmRequestPtr>;
 
 namespace
 {
@@ -166,7 +173,6 @@ void LlmRequest::initBindings(py::module_& m)
         .def_property_readonly("orig_prompt_len", &LlmRequest::getOrigPromptLen)
         .def("has_draft_tokens", &LlmRequest::hasDraftTokens)
         .def("move_to_next_context_chunk", &LlmRequest::moveToNextContextChunk)
-        .def("is_full_context_request", py::overload_cast<>(&LlmRequest::isFullContextRequest, py::const_))
         .def("is_last_context_chunk", py::overload_cast<>(&LlmRequest::isLastContextChunk, py::const_))
         .def("is_first_context_chunk", py::overload_cast<>(&LlmRequest::isFirstContextChunk, py::const_))
         .def("get_context_remaining_length", py::overload_cast<>(&LlmRequest::getContextRemainingLength, py::const_))
@@ -179,4 +185,141 @@ void LlmRequest::initBindings(py::module_& m)
             [](LlmRequest& self, LlmRequest::TensorPtr& logits)
             { self.setDraftLogits(std::make_optional<LlmRequest::TensorPtr>(logits)); })
         .def_property("num_return_sequences", &LlmRequest::getNumReturnSequences, &LlmRequest::setNumReturnSequences);
+}
+
+void tb::LlmRequestBindings::initBindings(py::module_& m)
+{
+    py::classh<tb::LlmRequest>(m, "PyLlmRequest")
+        .def("get_num_tokens", &tb::LlmRequest::getNumTokens, py::arg("beam"))
+        .def_property_readonly("max_beam_num_tokens", &tb::LlmRequest::getMaxBeamNumTokens)
+        .def("get_token", &tb::LlmRequest::getToken, py::arg("beam"), py::arg("pos"))
+        .def("get_tokens", py::overload_cast<tb::LlmRequest::SizeType32>(&tb::LlmRequest::getTokens, py::const_),
+            py::arg("beam"))
+        .def("get_tokens", py::overload_cast<>(&tb::LlmRequest::getTokens, py::const_))
+        .def_property_readonly("max_num_generated_tokens", &tb::LlmRequest::getMaxNumGeneratedTokens)
+        .def("add_new_token", &tb::LlmRequest::addNewToken, py::arg("token"), py::arg("beam"))
+        .def("add_new_tokens", &tb::LlmRequest::addNewTokens, py::arg("beam_tokens"))
+        .def("set_generated_tokens", &tb::LlmRequest::setGeneratedTokens, py::arg("generated_beam_tokens"))
+        .def("pause", &tb::LlmRequest::pause, py::arg("max_input_len"))
+        .def_property("max_sent_token_len", &tb::LlmRequest::getMaxSentTokenLen, &tb::LlmRequest::setMaxSentTokenLen)
+        .def("prompt_embedding_table",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getPromptEmbeddingTable();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def("bad_words_list",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getBadWordsList();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def_property(
+            "draft_logits",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getDraftLogits();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            },
+            [](tb::LlmRequest& self, at::Tensor& logits)
+            { self.setDraftLogits(std::make_optional<tb::LlmRequest::TensorPtr>(tr::TorchView::of(logits))); })
+        .def("embedding_bias",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getEmbeddingBias();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def("lora_config",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getLoraConfig();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def("lora_weights",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getLoraWeights();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def("stop_words_list",
+            [](tb::LlmRequest& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getStopWordsList();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
+        .def_property_readonly("prompt_vocab_size", &tb::LlmRequest::getPromptVocabSize)
+        .def_property_readonly("lora_task_id", &tb::LlmRequest::getLoraTaskId)
+        .def_property_readonly("lookahead_config", &tb::LlmRequest::getLookaheadConfig)
+        .def_property_readonly(
+            "context_current_position", py::overload_cast<>(&tb::LlmRequest::getContextCurrentPosition, py::const_))
+        .def_property("context_chunk_size", &tb::LlmRequest::getContextChunkSize, &tb::LlmRequest::setContextChunkSize)
+        .def_readwrite("request_id", &tb::LlmRequest::mRequestId)
+        .def_readwrite("prompt_len", &tb::LlmRequest::mPromptLen)
+        .def_readwrite("max_new_tokens", &tb::LlmRequest::mMaxNewTokens)
+        .def_readwrite("sampling_config", &tb::LlmRequest::mSamplingConfig)
+        .def_readwrite("state", &tb::LlmRequest::mState)
+        .def_readwrite("is_streaming", &tb::LlmRequest::mIsStreaming)
+        .def_readwrite("end_id", &tb::LlmRequest::mEndId)
+        .def_readwrite("pad_id", &tb::LlmRequest::mPadId)
+        .def_readwrite("seq_slot", &tb::LlmRequest::mSeqSlot)
+        .def_property_readonly("return_log_probs", &tb::LlmRequest::returnLogProbs)
+        .def_property_readonly("return_context_logits", &tb::LlmRequest::setReturnContextLogits)
+        .def_property_readonly("return_generation_logits", &tb::LlmRequest::setReturnGenerationLogits)
+        .def_property_readonly("log_probs", py::overload_cast<>(&tb::LlmRequest::getLogProbs, py::const_))
+        .def("get_log_probs", py::overload_cast<tb::LlmRequest::SizeType32>(&tb::LlmRequest::getLogProbs, py::const_))
+        .def("set_log_probs", &tb::LlmRequest::setLogProbs, py::arg("log_probs"), py::arg("beam"))
+        .def("set_return_encoder_output", &tb::LlmRequest::setReturnEncoderOutput, py::arg("return_encoder_output"))
+        .def("get_return_encoder_output", &tb::LlmRequest::getReturnEncoderOutput)
+        .def("priority", py::overload_cast<>(&tb::LlmRequest::priority, py::const_))
+        .def("set_priority", py::overload_cast<tle::PriorityType>(&tb::LlmRequest::setPriority))
+        .def_property_readonly("cum_log_probs", &tb::LlmRequest::getCumLogProbs)
+        .def("set_cum_log_prob", &tb::LlmRequest::setCumLogProb, py::arg("cum_log_prob"), py::arg("beam"))
+        .def_property_readonly("orig_prompt_len", &tb::LlmRequest::getOrigPromptLen)
+        .def("has_draft_tokens", &tb::LlmRequest::hasDraftTokens)
+        .def("move_to_next_context_chunk", &tb::LlmRequest::moveToNextContextChunk)
+        .def("is_last_context_chunk", py::overload_cast<>(&tb::LlmRequest::isLastContextChunk, py::const_))
+        .def("is_first_context_chunk", py::overload_cast<>(&tb::LlmRequest::isFirstContextChunk, py::const_))
+        .def(
+            "get_context_remaining_length", py::overload_cast<>(&tb::LlmRequest::getContextRemainingLength, py::const_))
+        .def_property(
+            "draft_tokens", [](tb::LlmRequest& self) { return *self.getDraftTokens(); },
+            [](tb::LlmRequest& self, tb::LlmRequest::VecTokens& draftTokens)
+            { self.setDraftTokens(std::make_shared<tb::LlmRequest::VecTokens>(std::move(draftTokens))); });
+
+    py::bind_vector<tb::RequestVector>(m, "RequestVector");
 }

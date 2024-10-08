@@ -95,7 +95,7 @@ public:
     // mandatory parameters for beam search
     TensorPtr logProbs;         // [BS, BM, MSL], must be float*
     TensorPtr cumLogProbs;      // [BS, BM], optional for sampling
-    TensorPtr parentIds;        // [BS, BM, MSL]
+    TensorPtr parentIds;        // [BS, BM, MSL] index of the beam where the previous token is
     TensorPtr lengths;          // [BS, BM], total sequence lengths including padding
     TensorPtr cacheIndirection; // [BS, BM, MSL], k/v indirection for next generation step
 

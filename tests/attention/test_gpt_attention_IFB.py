@@ -480,7 +480,6 @@ class TestFunctional(unittest.TestCase):
             builder_config = builder.create_builder_config(
                 name=attention_type,
                 precision=dtype,
-                opt_level=0,
                 fp8=use_fp8_context_fmha,
                 int8=int8_trt_flag)
             if session is None:

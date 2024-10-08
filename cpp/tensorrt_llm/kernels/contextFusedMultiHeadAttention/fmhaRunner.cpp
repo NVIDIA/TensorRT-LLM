@@ -165,7 +165,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // Use exp2f optimization for warp-specialized ws kernels on Hopper.
     if (mLaunchParams.useBase2ExpTrick)
     {
-        // The kernel adopts the log2f optimziation.
+        // The kernel adopts the log2f optimization.
         constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
         set_alpha(mKernelParams.scale_bmm1, scale_bmm1 * float(kLog2e), DATA_TYPE_FP32);
     }
@@ -364,8 +364,8 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
 void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
 {
     // split D into multiple groups in order to match the TMA swizzle mode (128B)
-    const uint32_t d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
-    const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
+    uint32_t const d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
+    uint32_t const d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
     // separate q, k, v and o tma descriptors
     Multiple_tma_descriptor<4> qkv_tma_descriptor;
@@ -421,8 +421,8 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     uint32_t fp32_to_tf32 = 0;
 
     // gmma descriptor mode
-    const uint32_t d_bytes_per_group = d_in_bytes / d_groups;
-    const cudaTmaDescSwizzle swizzle_mode = (d_bytes_per_group > 64
+    uint32_t const d_bytes_per_group = d_in_bytes / d_groups;
+    cudaTmaDescSwizzle const swizzle_mode = (d_bytes_per_group > 64
             ? cudaTmaDescSwizzle::SWIZZLE_128B
             : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));
 
@@ -474,8 +474,8 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
 void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams)
 {
     // split D into multiple groups in order to match the TMA swizzle mode (128B)
-    const uint32_t d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
-    const uint32_t d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
+    uint32_t const d_in_bytes = get_size_in_bytes(mLaunchParams.padded_d, mFixedParams.dataType);
+    uint32_t const d_groups = d_in_bytes > 128 ? d_in_bytes / 128 : 1;
 
     uint32_t q_step = 0, kv_step = 0;
     xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
@@ -518,7 +518,7 @@ void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams
         = (get_size_in_bytes(mFixedParams.dataType) == 1) ? cudaTmaDescFormat::U8 : cudaTmaDescFormat::F16_RN;
 
     // gmma descriptor mode
-    const uint32_t d_bytes_per_group = d_in_bytes / d_groups;
+    uint32_t const d_bytes_per_group = d_in_bytes / d_groups;
     cudaTmaDescSwizzle const swizzle_mode = (d_bytes_per_group > 64
             ? cudaTmaDescSwizzle::SWIZZLE_128B
             : (d_bytes_per_group > 32 ? cudaTmaDescSwizzle::SWIZZLE_64B : cudaTmaDescSwizzle::SWIZZLE_32B));

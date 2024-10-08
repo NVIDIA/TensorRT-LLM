@@ -292,7 +292,11 @@ def add_common_args(parser):
     parser.add_argument('--cuda_graph_mode',
                         action='store_true',
                         help="Enable cuda graphs in the inference.")
-    parser.add_argument('--log_level', type=str, default='info')
+    parser.add_argument(
+        '--log_level',
+        type=str,
+        choices=['verbose', 'info', 'warning', 'error', 'internal_error'],
+        default='info')
     parser.add_argument(
         '--no_prompt_template',
         dest='use_prompt_template',
@@ -344,18 +348,25 @@ def add_common_args(parser):
         " For example, '--num_prepend_vtokens=10' will prepend the tokens"
         " [vocab_size, vocab_size + 1, ..., vocab_size + 9] to the sentence.")
     parser.add_argument(
+        '--draft_target_model_config',
+        type=str,
+        default=None,
+        help=
+        "Configuration of Draft-Target-Model decoding, see `examples/draft_target_model/README.md` for more information."
+        "   E.g.: [4, [0], [1], False] for [draft_len, draft_model_device_list, target_model_device_list, use_logits]."
+    )
+    parser.add_argument(
         '--medusa_choices',
         type=str,
         default=None,
-        help="Medusa choice to use, if not none, will use Medusa decoding."
+        help="Configuration of Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
     )
     parser.add_argument(
         '--lookahead_config',
         type=str,
         default=None,
-        help=
-        "executor and request lookahead config to use, if not none, will use lookahead decoding."
+        help="Configuration of executor and request lookahead decoding."
         "   E.g.: [5, 6, 7] for [max_window_size, max_ngram_size, max_verification_set_size]."
     )
     # model arguments

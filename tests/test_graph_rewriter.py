@@ -455,7 +455,7 @@ class GPTAttentionPluginRemovePaddingRewritePass(PatternRewriter):
 
         new_inputs = flayer.clone_inputs()
         with net_guard(layer.network):
-            # Step 1: create new inputs and repalce the original arglist
+            # Step 1: create new inputs and replace the original arglist
             input = Tensor(
                 name='qkv',
                 dtype=trt.float16,

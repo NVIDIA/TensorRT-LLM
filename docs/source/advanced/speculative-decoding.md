@@ -32,11 +32,11 @@ may prove simpler than generating a summary for an article.
 Furthermore, when integrating Medusa with a standard PyTorch model implementation which may not be as finely
 tuned as TensorRT-LLM, the potential time savings are more pronounced.
 
-## Draft Model Approach
+## Draft-Target-Model Approach
 
-The Draft model approach involves the use of two distinct models trained independently
-but sharing the same vocabulary: a smaller Draft model and a larger Target model.
-For example, a GPT 125M model can serve as the Draft model, while a GPT 6.7B model acts as the Target model.
+The Draft-Target-Model involves the use of two distinct models trained independently but sharing the same vocabulary: a smaller Draft model and a larger Target model. For example, GPT 125M / 6.7B models can serve as the Draft / Target model.
+
+There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in [examples/draft_target_model/README.md](../../../examples/draft_target_model/README.md) and the code can be found in [examples/run.py](../../../examples/run.py).
 
 The management of Draft and Target models is facilitated through two separate `GptManager` instances.
 It is essential that you to coordinate the interactions between the Draft and Target models effectively.
@@ -341,7 +341,7 @@ Each request can be assigned a specific lookahead configuration when input to th
 
 ## Build and execute an engine from a model
 
-Vicuna models re-use Llmama Python scripts located in [examples/llama](../../examples/llama).
+Vicuna models reuse Llmama Python scripts located in [examples/llama](../../examples/llama).
 
 ### Convert a model to checkpoint
 ```bash

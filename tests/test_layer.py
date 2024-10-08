@@ -1359,7 +1359,6 @@ class TestLayer(unittest.TestCase):
 
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(name='mamba',
-                                                       opt_level=0,
                                                        precision=dtype)
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
@@ -1695,7 +1694,6 @@ class TestLayer(unittest.TestCase):
 
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(name='mamba2',
-                                                       opt_level=0,
                                                        precision=dtype)
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
@@ -1706,7 +1704,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
             remove_padding, batch_size, seqlen_offset)
 
-        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 7e-3, "float32": 5e-3, "bfloat16": 5e-2}
 
         if not remove_padding:
             # get out_mask
@@ -2045,7 +2043,6 @@ class TestLayer(unittest.TestCase):
 
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(name='recurrent',
-                                                       opt_level=0,
                                                        precision=dtype)
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)

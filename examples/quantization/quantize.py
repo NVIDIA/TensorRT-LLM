@@ -55,8 +55,13 @@ if __name__ == "__main__":
         help="Quantization format.",
         default="full_prec",
         choices=[
-            "fp8", "int8_sq", "int4_awq", "w4a8_awq", "int8_wo", "int4_wo",
-            "full_prec"
+            "fp8",
+            "int8_sq",
+            "int4_awq",
+            "w4a8_awq",
+            "int8_wo",
+            "int4_wo",
+            "full_prec",
         ],
     )
     parser.add_argument(
@@ -101,7 +106,34 @@ if __name__ == "__main__":
                         action='store_true',
                         help="whether to quantize the weights of medusa heads")
 
+    # auto quantization
+    parser.add_argument(
+        '--autoq_format',
+        default=None,
+        type=str,
+        help=
+        "Specific quantization algorithms will be searched in auto quantization."
+        "The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq']."
+        "You can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq)."
+        "Notice: fp8 and int8_sq can't be used at the same time.")
+    parser.add_argument(
+        '--weight_compression',
+        type=float,
+        default=None,
+        help="Percent of compression size when using mix precision quantization."
+        "The range is [0.0, 1.0], if you only indicate the autoq_format, it will be default to the lowest possible value."
+    )
+
     args = parser.parse_args()
+
+    # weight_compression check
+    if args.autoq_format:
+        lower_bound = 0.25 if '4' in args.autoq_format else 0.5
+        if args.weight_compression is None or args.weight_compression < lower_bound:
+            print(
+                f"invalid weight_compression value, will be set to {lower_bound}"
+            )
+            args.weight_compression = lower_bound
 
     if args.model_dir is not None:
         quantize_and_export(
@@ -109,7 +141,8 @@ if __name__ == "__main__":
             device=args.device,
             calib_dataset=args.calib_dataset,
             dtype=args.dtype,
-            qformat=args.qformat,
+            qformat=args.qformat
+            if args.weight_compression is None else args.autoq_format,
             kv_cache_dtype=args.kv_cache_dtype,
             calib_size=args.calib_size,
             batch_size=args.batch_size,
@@ -125,7 +158,8 @@ if __name__ == "__main__":
             max_draft_len=args.max_draft_len,
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
-            quant_medusa_head=args.quant_medusa_head)
+            quant_medusa_head=args.quant_medusa_head,
+            weight_compression=args.weight_compression)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

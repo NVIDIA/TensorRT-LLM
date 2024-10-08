@@ -161,6 +161,19 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         lookaheadParams->attentionPackedMasks = output->lookaheadOutputs->packedMasks;
         setupParams->decodingParams = std::move(lookaheadParams);
     }
+    else if (mDecodingMode.isExternalDraftTokens())
+    {
+        auto externalDraftTokensParams = std::make_shared<tl::ExternalDraftTokensSetupParams>();
+        // signed to unsigned
+        if (mSamplingConfig.topK)
+        {
+            auto const& topK = mSamplingConfig.topK.value();
+            externalDraftTokensParams->runtimeTopK = std::vector<SizeType32>(std::begin(topK), std::end(topK));
+        }
+
+        externalDraftTokensParams->runtimeTopP = mSamplingConfig.topP;
+        setupParams->decodingParams = std::move(externalDraftTokensParams);
+    }
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
     mDecodingLayerWorkspace->setDeviceBatchSlots(batchSlots);
@@ -244,6 +257,27 @@ void prepareMedusaInputs(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void prepareExternalDraftTokensInputs(
+    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto inputParams = std::dynamic_pointer_cast<tl::ExternalDraftTokensInputs>(baseInputs);
+
+    auto const& externalDraftTokensInputs = inputs.externalDraftTokensInputs.value();
+
+    inputParams->draftLogits = externalDraftTokensInputs.draftLogits;
+    inputParams->draftProbs = externalDraftTokensInputs.draftProbs;
+    inputParams->targetProbs = externalDraftTokensInputs.targetProbs;
+    inputParams->numDraftTokens = externalDraftTokensInputs.numDraftTokens;
+    inputParams->draftTokenIds = externalDraftTokensInputs.draftTokenIds;
+    inputParams->constantThreshold = externalDraftTokensInputs.constantThreshold;
+    inputParams->useRandomAcceptanceThreshold = externalDraftTokensInputs.useRandomAcceptanceThreshold;
+    inputParams->step = externalDraftTokensInputs.step;
+    inputParams->useDraftLogits = externalDraftTokensInputs.useDraftLogits;
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -316,6 +350,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams
             = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSlots, input.batchSize);
     }
+    else if (decodingMode.isExternalDraftTokens())
+    {
+        forwardParams = std::make_shared<tl::ExternalDraftTokensInputs>(
+            input.endIds, input.batchSlots, input.step, ite, input.batchSize);
+    }
 
     // No logits for explicit draft tokens
     if (!decodingMode.isExplicitDraftTokens())
@@ -377,6 +416,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     {
         prepareLookaheadInputs(input, maxBatchSize, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
+    }
+
+    if (decodingMode.isExternalDraftTokens())
+    {
+        prepareExternalDraftTokensInputs(input, maxBatchSize, forwardParams);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -593,105 +637,3 @@ namespace tensorrt_llm::runtime
 template class GptDecoder<float>;
 template class GptDecoder<half>;
 } // namespace tensorrt_llm::runtime
-
-void IGptDecoder::acceptDraftTokensByIds(ITensor const& targetTokenIds, ITensor const& draftTokenIds,
-    ITensor const& contextLengths, ITensor const& numDraftTokens, ITensor& sequenceLengths, ITensor const& finishedVec,
-    ITensor& finishedFinal, ITensor& finishedSum, ITensor const& batchSlots, BufferManager::CudaStreamPtr const& stream)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const finishedVecShape = finishedVec.getShape();
-    auto const maxBatchSize = finishedVecShape.d[1];
-    auto const batchSlotsShape = batchSlots.getShape();
-    auto const batchSize = batchSlotsShape.d[0];
-    auto const targetTokenIdsShape = targetTokenIds.getShape();
-    auto const beamWidth = targetTokenIdsShape.d[1];
-    auto const maxSeqLength = targetTokenIdsShape.d[2];
-    auto const maxDraftTokens = draftTokenIds.getDimension<1>();
-
-    TLLM_CHECK_WITH_INFO(beamWidth == 1,
-        common::fmtstr("Beam width (" FMT_DIM ") > 1 is not supported for the speculative decoding", beamWidth));
-
-    TLLM_CHECK_WITH_INFO(batchSize <= maxBatchSize,
-        common::fmtstr("Batch size (" FMT_DIM ") is not smaller or equal to max batch size (" FMT_DIM ")", batchSize,
-            maxBatchSize));
-
-    TLLM_CHECK_WITH_INFO(draftTokenIds.getDimension<0>() == maxBatchSize,
-        common::fmtstr("Draft tokens batch size (" FMT_DIM ") is not equal to target batch size (" FMT_DIM ")",
-            draftTokenIds.getDimension<0>(), maxBatchSize));
-
-    TLLM_CHECK_WITH_INFO(contextLengths.getDimension<0>() == maxBatchSize,
-        common::fmtstr("Context length batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            contextLengths.getDimension<0>(), maxBatchSize));
-
-    TLLM_CHECK_WITH_INFO(numDraftTokens.getDimension<0>() == maxBatchSize,
-        common::fmtstr("Num draft tokens batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            numDraftTokens.getDimension<0>(), maxBatchSize));
-
-    TLLM_CHECK_WITH_INFO(sequenceLengths.getDimension<0>() == maxBatchSize,
-        common::fmtstr("Sequence length batch size (" FMT_DIM ") is not equal to batch size (" FMT_DIM ")",
-            sequenceLengths.getDimension<0>(), maxBatchSize));
-
-    tksd::invokeAcceptDraftTokensByIds(bufferCast<TokenIdType>(draftTokenIds), bufferCast<TokenIdType>(targetTokenIds),
-        bufferCast<SizeType32>(contextLengths), bufferCast<SizeType32>(numDraftTokens),
-        bufferCast<SizeType32>(sequenceLengths),
-        reinterpret_cast<tensorrt_llm::kernels::FinishedState const*>(
-            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedVec)),
-        reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-            bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finishedFinal)),
-        bufferCast<int>(finishedSum), bufferCast<SizeType32>(batchSlots), batchSize, maxBatchSize, beamWidth,
-        maxSeqLength, maxDraftTokens, stream->get());
-
-    sync_check_cuda_error();
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void IGptDecoder::acceptDraftTokensByLogits(ITensor& draftLogits, ITensor const& targetLogits, ITensor& draftProbs,
-    ITensor& targetProbs, ITensor const& numDraftTokens, ITensor& finished, ITensor const& batchSlots,
-    SizeType32 vocabSize, SizeType32 vocabSizePadded, bool useRandomAcceptThreshold, float randomAcceptThreshold,
-    curandState_t* curandState, BufferManager::CudaStreamPtr const& stream)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const draftLogitsShape = draftLogits.getShape();
-    auto const maxBatchSize = draftLogitsShape.d[0];
-    auto const maxTokensPerStep = draftLogitsShape.d[1];
-    auto const batchSlotsShape = batchSlots.getShape();
-    auto const batchSize = batchSlotsShape.d[0];
-    auto constexpr beamWidth = 1;
-
-    TLLM_CHECK_WITH_INFO(
-        beamWidth == 1, common::fmtstr("Beam width (%d) > 1 is not supported for the speculative decoding", beamWidth));
-
-    TLLM_CHECK(draftLogitsShape.d[2] == vocabSize);
-
-    if (draftLogits.getDataType() == nvinfer1::DataType::kFLOAT)
-    {
-        tksd::acceptDraftTokensByLogits(bufferCast<float>(draftLogits),
-            const_cast<float**>(reinterpret_cast<float const* const*>(bufferCast<int64_t>(targetLogits))),
-            bufferCast<float>(draftProbs), bufferCast<float>(targetProbs), bufferCast<SizeType32>(numDraftTokens),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finished)),
-            curandState, bufferCast<SizeType32>(batchSlots), batchSize, maxBatchSize, beamWidth, vocabSize,
-            vocabSizePadded, maxTokensPerStep, useRandomAcceptThreshold, randomAcceptThreshold, stream->get());
-    }
-    else if (draftLogits.getDataType() == nvinfer1::DataType::kHALF)
-    {
-        tksd::acceptDraftTokensByLogits(bufferCast<half>(draftLogits),
-            const_cast<half**>(reinterpret_cast<half const* const*>(bufferCast<int64_t>(targetLogits))),
-            bufferCast<half>(draftProbs), bufferCast<half>(targetProbs), bufferCast<SizeType32>(numDraftTokens),
-            reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
-                bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(finished)),
-            curandState, bufferCast<SizeType32>(batchSlots), batchSize, maxBatchSize, beamWidth, vocabSize,
-            vocabSizePadded, maxTokensPerStep, useRandomAcceptThreshold, randomAcceptThreshold, stream->get());
-    }
-    else
-    {
-        TLLM_THROW("Incorrect logits dtype. Only float32 and float16 are supported");
-    }
-
-    sync_check_cuda_error();
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}

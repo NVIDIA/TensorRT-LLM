@@ -63,7 +63,6 @@ def build_engine(
         f'--max_input_len={max_input_len}',
         f'--max_seq_len={max_seq_len}',
         '--max_beam_width=2',
-        '--builder_opt=0',
         '--kv_cache_type=continuous',
     ]
     legacy_args = [

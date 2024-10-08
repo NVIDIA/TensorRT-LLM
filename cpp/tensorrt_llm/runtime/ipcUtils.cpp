@@ -149,19 +149,24 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         * std::min(
             static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
             utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
+    auto const lamportBufferSize
+        = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * hiddenSize * sizeof(half);
     auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
 
-    for (auto size : {bufferSize, bufferSize, flagsSize, flagsSize})
+    for (auto size :
+        {bufferSize, bufferSize, flagsSize, flagsSize, lamportBufferSize, lamportBufferSize, lamportBufferSize})
     {
         mIpcMemoryHandles.emplace_back(size, manager, worldConfig, isP2pSupported);
     }
 
     mAllReduceCommPtrs
-        = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 1}),
+        = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 2}),
             nvinfer1::DataType::kINT64);
     auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
-    auto const flagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
-    *flagPtr = 0;
+    auto const CustomARFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
+    auto const LamportFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 2));
+    *CustomARFlagPtr = 0;
+    *LamportFlagPtr = 0;
 
     for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
     {
@@ -169,6 +174,20 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         TLLM_CHECK(memCommPtrs.size() == static_cast<std::size_t>(tpSize));
         std::copy(memCommPtrs.begin(), memCommPtrs.end(), commPtrs.begin() + memIdx * tpSize);
     }
+#if ENABLE_MULTI_DEVICE
+    auto rank = worldConfig.getRank();
+    auto tp_rank = worldConfig.getTensorParallelRank();
+    if (rank == tp_rank)
+    {
+        tensorrt_llm::kernels::lamportInitialize(
+            mIpcMemoryHandles[4].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
+        tensorrt_llm::kernels::lamportInitialize(
+            mIpcMemoryHandles[5].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
+        tensorrt_llm::kernels::lamportInitialize(
+            mIpcMemoryHandles[6].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
+        cudaDeviceSynchronize();
+    }
+#endif
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

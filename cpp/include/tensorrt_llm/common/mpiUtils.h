@@ -99,7 +99,6 @@ struct MpiTypeConverter<std::byte>
 };
 
 template <>
-
 struct MpiTypeConverter<half>
 
 {
@@ -387,6 +386,7 @@ public:
     void barrier() const;
 
     void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
+    bool improbe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
 
     //! \brief Returns if a message with the specified source and tag is available
     bool iprobe(int source, int tag, MPI_Status* status) const;

@@ -62,7 +62,7 @@ private:
 
         tk::TopPSamplingKernelParams<T> kernelParams;
         kernelParams.probs = bufferCast<T>(*this->mProbsDevice);
-        kernelParams.outputIds = bufferCast<int*>(*this->mIdsPtrHost);
+        kernelParams.outputIdsPtrs = bufferCast<int*>(*this->mIdsPtrHost);
         kernelParams.workspace = workspaceDevice->data();
         kernelParams.topPs = bufferCast<float>(*this->mTopPsDevice);
         kernelParams.sequenceLength = bufferCast<int32_t>(*this->mSeqLengthsDevice);

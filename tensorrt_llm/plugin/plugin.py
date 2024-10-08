@@ -368,7 +368,7 @@ class CustomAllReduceHelper:
             - Set custom_all_reduce_helper.workspace with the required tensor.
               Then, each instance of allreduce will reference that tensor automatically.
     """
-    POINTERS_PER_RANK = 4
+    POINTERS_PER_RANK = 7
 
     def __init__(self) -> None:
         self.workspace: Optional[Tensor] = None
@@ -377,7 +377,7 @@ class CustomAllReduceHelper:
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
         from ..functional import Tensor
-        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 1
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 2
 
         dim_range = None
         if num_profiles is not None:
@@ -412,16 +412,23 @@ class CustomAllReduceHelper:
         ipc_barriers_out = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
             is_p2p_supported)
+        lamport_buffers_0 = IpcMemory(mapping, size * mapping.tp_size,
+                                      is_p2p_supported)
+        lamport_buffers_1 = IpcMemory(mapping, size * mapping.tp_size,
+                                      is_p2p_supported)
+        lamport_buffers_2 = IpcMemory(mapping, size * mapping.tp_size,
+                                      is_p2p_supported)
         buffers = [
-            ipc_buffers_ping,
-            ipc_buffers_pong,
-            ipc_barriers_in,
-            ipc_barriers_out,
+            ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
+            ipc_barriers_out, lamport_buffers_0, lamport_buffers_1,
+            lamport_buffers_2
         ]
 
         return buffers, torch.tensor(
             ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
-            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() + [0],
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() +
+            lamport_buffers_0.serialize() + lamport_buffers_1.serialize() +
+            lamport_buffers_2.serialize() + [0] + [0],
             dtype=torch.int64,
             device="cpu")
 

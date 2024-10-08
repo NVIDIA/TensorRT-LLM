@@ -14,3 +14,6 @@
 [submodule "3rdparty/ucxx"]
 	path = 3rdparty/ucxx
 	url = https://github.com/GuanLuo/ucxx.git
+[submodule "3rdparty/pybind11"]
+	path = 3rdparty/pybind11
+	url = https://github.com/pybind/pybind11.git

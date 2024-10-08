@@ -127,7 +127,6 @@ def test_llm_build_config():
     # change some building parameters
     build_config.max_batch_size = 129
     build_config.max_beam_width = 4
-    build_config.builder_opt = 3
     build_config.max_num_tokens = 888
     build_config.strongly_typed = True
     build_config.max_seq_len = 333
@@ -148,7 +147,6 @@ def test_llm_build_config():
         build_config1.plugin_config.nccl_plugin = 'float16'
         assert build_config1.max_batch_size == build_config.max_batch_size
         assert build_config1.max_beam_width == build_config.max_beam_width
-        assert build_config1.builder_opt == build_config.builder_opt
         assert build_config1.max_num_tokens == build_config.max_num_tokens
         assert build_config1.strongly_typed == build_config.strongly_typed
         assert build_config1.max_seq_len == build_config.max_seq_len
@@ -806,7 +804,7 @@ def test_llm_build_cache():
                          prompts, ["D E F G H I J K"],
                          sampling_params=sampling_params)
 
-        # the cache should be hitted
+        # the cache should be hit
         assert llm.llm_build_stats.cache_hitted, llm.llm_build_stats.cache_info
         del llm
         release_gc()
