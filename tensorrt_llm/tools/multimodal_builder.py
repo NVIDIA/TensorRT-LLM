@@ -144,7 +144,8 @@ def build_trt_engine(model_type,
 
     config_args = {
         "precision": str(dtype).split('.')[-1],
-        "model_type": model_type
+        "model_type": model_type,
+        "strongly_typed": False
     }
     if num_frames is not None:
         config_args["num_frames"] = num_frames

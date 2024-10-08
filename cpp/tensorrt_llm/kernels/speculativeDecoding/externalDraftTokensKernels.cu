@@ -35,230 +35,281 @@ namespace tensorrt_llm::kernels::speculative_decoding
 {
 namespace
 {
-__global__ void acceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType const* targetIds,
-    SizeType32 const* contextLengths, SizeType32 const* numsDraftTokens, SizeType32* sequenceLengths,
-    FinishedState const* finished, FinishedState* finishedFinal, SizeType32* finishedSum, SizeType32 const* batchSlots,
-    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 maxSeqLen, SizeType32 maxDraftTokens)
+
+template <typename T>
+__global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchSlots, SizeType32 beamWidth,
+    SizeType32 vocabSize, FinishedState const* finishedInput, SizeType32 maxBatchSize, bool const* batchUseDraftLogits,
+    SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds, SizeType32* runtimeTopKDevicePtr, bool* maskBuffer)
 {
-    for (auto batchIdx = static_cast<SizeType32>(threadIdx.x); batchIdx < batchSize; batchIdx += blockDim.x)
+    /**
+     * @brief Masking the selected token to -inf as was done in Huggingface TopK/TopP Logits Warper
+     * https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/generation/logits_process.py#L533
+     */
+
+    auto const bid = blockIdx.x;
+    auto const batchIdx = bid / beamWidth;
+    auto const tid = static_cast<SizeType32>(threadIdx.x);
+    auto const batchSlot = batchSlots[batchIdx];
+
+    constexpr bool IS_HALF = std::is_same<T, half>::value;
+    T const MAX_T_VAL = (IS_HALF) ? HALF_FLT_MAX : FLT_MAX;
+
+    auto targetLogitsBatch = targetLogits + batchIdx * vocabSize;
+    auto& finishedState = finishedInput[batchSlot];
+
+    auto* outputIdsAfterSamplingPtr = outputIdsAfterSampling + batchSlot * vocabSize;
+    auto const useDraftLogits = batchUseDraftLogits[batchSlot];
+
+    if (finishedState.isSkipDecoding())
     {
-        auto const batchSlot = batchSlots[batchIdx];
-        auto const numDraftTokens = numsDraftTokens[batchSlot];
+        return;
+    }
 
-        auto const contextLength = contextLengths[batchSlot];
-        auto& sequenceLength = sequenceLengths[batchSlot];
-        SizeType32 finishedDraftIdx = 0;
-        for (auto ti = contextLength; ti < min(sequenceLength, contextLength + numDraftTokens);
-             ++ti, ++finishedDraftIdx)
-        {
-            auto const draftIdx = ti - contextLength;
-            auto const targetTokenIdx = batchSlot * maxSeqLen + ti;
-            auto const draftTokenIdx = batchSlot * maxDraftTokens + draftIdx;
-            // Check if draft tokens are the same as target tokens
-            bool const accepted = draftIds[draftTokenIdx] == targetIds[targetTokenIdx];
-            if (!accepted)
-            {
-                // Set sequence length to the numAcceptedTokens + 1
-                sequenceLength = min(ti + 1, maxSeqLen);
-                // FIXME(nkorobov): do we need to set endIds here?
-                break;
-            }
+    __shared__ SizeType32 tokensToMask;
+
+    if (tid == 0)
+    {
+        tokensToMask = runtimeTopKDevicePtr[batchSlot];
+    }
+    __syncthreads();
+
+    for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
+    {
+        if (tokensToMask == 0 && outputIdsAfterSamplingPtr[vIdx] == -1)
+        { // we need to find the -1 boundary from returnAllTopP outputIds if topK == 0
+            tokensToMask = vIdx;
         }
-        FinishedState finishState = finished[finishedDraftIdx * maxBatchSize + batchSlot];
-        finishedFinal[batchSlot] = finishState;
+        maskBuffer[vIdx] = false;
+    }
 
-        if (finishedSum)
+    __syncthreads();
+
+    if (!useDraftLogits && tid == 0)
+    {
+        targetOutputIds[batchSlot] = outputIdsAfterSamplingPtr[tokensToMask - 1];
+    }
+
+    for (SizeType32 vIdx = tid; vIdx < tokensToMask; vIdx += static_cast<SizeType32>(blockDim.x))
+    {
+        auto tokenToMask = outputIdsAfterSamplingPtr[vIdx];
+        maskBuffer[tokenToMask] = true;
+    }
+
+    __syncthreads();
+
+    for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
+    {
+        if (!maskBuffer[vIdx])
         {
-            finishedSum[batchSlot] = static_cast<int>(finishState.isFinished());
+            targetLogitsBatch[vIdx] = -MAX_T_VAL;
         }
     }
 }
-} // namespace
 
-void invokeAcceptDraftTokensByIds(TokenIdType const* draftIds, TokenIdType const* targetIds,
-    SizeType32 const* contextLengths, SizeType32 const* numsDraftTokens, SizeType32* sequenceLengths,
-    FinishedState const* finished, FinishedState* finishedFinal, SizeType32* finishedSum, SizeType32 const* batchSlots,
-    SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth, SizeType32 maxSeqLen,
-    SizeType32 maxDraftTokens, cudaStream_t stream)
-{
-    TLLM_CHECK(beamWidth == 1);
-    dim3 block(min(1024, batchSize));
-    dim3 grid(1);
-    acceptDraftTokensByIds<<<grid, block, 0, stream>>>(draftIds, targetIds, contextLengths, numsDraftTokens,
-        sequenceLengths, finished, finishedFinal, finishedSum, batchSlots, batchSize, maxBatchSize, maxSeqLen,
-        maxDraftTokens);
-}
-
-namespace
-{
 template <typename T>
-__global__ void acceptDraftTokensByLogitsKernel(T const* draftProbs, T* targetProbs, SizeType32 const* numsDraftTokens,
-    FinishedState* finished, curandState_t* curandState, SizeType32 const* batchSlots, SizeType32 batchSize,
-    SizeType32 maxBatchSize, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSize,
-    bool randomThreshold, float constantThreshold)
+__global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, SizeType32 const* numsDraftTokens,
+    bool const* batchUseDraftLogits, TokenIdType const* draftIds, FinishedState const* finishedInput,
+    FinishedState* finishedOutput, curandState_t* curandState, SizeType32 const* batchSlots, SizeType32 maxDraftTokens,
+    SizeType32 beamWidth, SizeType32 vocabSize, bool randomThreshold, float constantThreshold, SizeType32 step,
+    bool* batchIsAccepted, SizeType32* targetOutputIds)
 {
     auto const bid = blockIdx.x;
-    auto const draftTokenIdx = blockIdx.y;
+    auto const draftTokenIdx = step;
     auto const batchIdx = bid / beamWidth;
     auto const beamIdx = bid % beamWidth;
     auto const batchSlot = batchSlots[batchIdx];
     auto const batchSlotBeamWidth = batchSlot * beamWidth + beamIdx;
+    auto const tid = static_cast<SizeType32>(threadIdx.x);
 
     auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
+    auto const useDraftLogits = batchUseDraftLogits[batchSlotBeamWidth];
 
-    if (draftTokenIdx >= numDraftTokens)
+    if (draftTokenIdx > numDraftTokens || finishedInput[batchSlot].isSkipDecoding())
     {
+        if (tid == 0)
+        {
+            batchIsAccepted[batchSlot] = true;
+            finishedOutput[batchSlot].setSkipDecoding();
+        }
         return;
     }
 
     auto const logitsOffset = (batchSlot * maxDraftTokens + draftTokenIdx) * beamWidth * vocabSize;
     auto const draftProbsBatch = draftProbs + logitsOffset;
-    auto const targetProbsBatch = targetProbs + logitsOffset;
-    auto const vocabSizePadded = static_cast<SizeType32>((vocabSize + blockDim.x - 1) / blockDim.x) * blockDim.x;
+    auto const targetProbsBatch = targetProbs + (batchIdx * beamWidth * vocabSize);
 
-    struct Candidate candidate;
-    __shared__ float threshold;
-    if (threadIdx.x == 0)
+    __shared__ bool isAccepted;
+    __shared__ T sSumVal;
+    if (tid == 0)
     {
-        threshold = randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold;
-    }
-    __syncthreads();
-
-    for (auto vIdx = static_cast<SizeType32>(threadIdx.x); vIdx < vocabSizePadded;
-         vIdx += static_cast<SizeType32>(blockDim.x))
-    {
-        bool const pred = vIdx < vocabSize;
-        auto const targetProb = pred ? static_cast<float>(targetProbsBatch[vIdx]) : 1.f;
-        auto const draftProb = pred ? static_cast<float>(draftProbsBatch[vIdx]) : 0.f;
-
-        if (draftProb > candidate.maxProb)
+        if (draftTokenIdx < numDraftTokens)
         {
-            candidate.maxProb = draftProb;
-            candidate.rateQP = pred ? targetProb / draftProb : 0.f;
-        }
-    }
-    __syncthreads();
-
-    typedef cub::BlockReduce<Candidate, 1024> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage reduce_buffer;
-    Candidate candidate_global = BlockReduce(reduce_buffer).Reduce(candidate, reduce_op);
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-    {
-        finished[draftTokenIdx * maxBatchSize * beamWidth + batchSlotBeamWidth]
-            = candidate_global.rateQP < threshold ? FinishedState::skipDecoding() : FinishedState::empty();
-    }
-}
-
-template <typename T>
-__global__ void correctAcceptedStatesAndLogits(T const* draftProbs, T* targetProbs, T** targetLogits,
-    SizeType32 const* numsDraftTokens, FinishedState* finished, SizeType32 const* batchSlots, SizeType32 batchSize,
-    SizeType32 maxBatchSize, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSize)
-{
-    auto const bid = blockIdx.x;
-    auto const batchIdx = bid / beamWidth;
-    auto const beamIdx = bid % beamWidth;
-    auto const batchSlot = batchSlots[batchIdx];
-    auto const batchSlotBeamWidth = batchSlot * beamWidth + beamIdx;
-    auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
-
-    __shared__ SizeType32 numAcceptedTokens;
-    if (threadIdx.x == 0)
-    {
-        numAcceptedTokens = numDraftTokens;
-        bool cummulativeSkipDecoding = false;
-        for (SizeType32 ti = 0; ti < numDraftTokens + 1; ++ti)
-        {
-            auto& finishedState = finished[ti * maxBatchSize * beamWidth + batchSlotBeamWidth];
-            bool localSkipDecoding = finishedState.isSkipDecoding();
-            if (cummulativeSkipDecoding == false && localSkipDecoding == true)
+            auto const draftOutputTokenId = draftIds[batchSlot * maxDraftTokens + draftTokenIdx];
+            if (useDraftLogits)
             {
-                numAcceptedTokens = ti;
+                float threshold = randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold;
+                auto const targetProb = static_cast<float>(targetProbsBatch[draftOutputTokenId]);
+                auto const draftProb = static_cast<float>(draftProbsBatch[draftOutputTokenId]);
+                auto rateQP = targetProb / draftProb;
+                if (rateQP < threshold)
+                {
+                    isAccepted = false;
+                    finishedOutput[batchSlot].setSkipDecoding();
+                }
+                else
+                {
+                    isAccepted = true;
+                }
             }
-
-            finishedState = cummulativeSkipDecoding ? FinishedState::skipDecoding() : FinishedState::empty();
-            cummulativeSkipDecoding |= localSkipDecoding;
+            else
+            {
+                // Check if draft tokens are the same as target tokens
+                isAccepted = targetOutputIds[batchSlot] == draftOutputTokenId;
+                if (!isAccepted)
+                {
+                    finishedOutput[batchSlot].setSkipDecoding();
+                }
+            }
         }
+        else
+        {
+            isAccepted = false;
+            finishedOutput[batchSlot].setSkipDecoding();
+        }
+        batchIsAccepted[batchSlot] = isAccepted;
     }
+
     __syncthreads();
 
-    if (numAcceptedTokens < numDraftTokens)
+    if (!isAccepted)
     {
-        auto const logitsIdx = (batchSlot * maxDraftTokens + numAcceptedTokens) * beamWidth * vocabSize;
-        auto const draftProbBatch = draftProbs + logitsIdx;
-        auto targetProbBatch = targetProbs + logitsIdx;
-        auto targetLogitsBatch = targetLogits[bid] + numAcceptedTokens * beamWidth * vocabSize;
-
-        float sumProbs = 0.f;
-        for (SizeType32 vIdx = static_cast<SizeType32>(threadIdx.x); vIdx < vocabSize;
-             vIdx += static_cast<SizeType32>(blockDim.x))
+        T const zeroVal = static_cast<T>(0.0f);
+        T sumVal = zeroVal;
+        for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
         {
-            auto const correctedProb = max(static_cast<float>(targetProbBatch[vIdx] - draftProbBatch[vIdx]), 0.f);
-            sumProbs += correctedProb;
-            targetProbBatch[vIdx] = correctedProb;
+            targetProbsBatch[vIdx]
+                -= (draftTokenIdx < numDraftTokens && useDraftLogits) ? draftProbsBatch[vIdx] : zeroVal;
+            targetProbsBatch[vIdx] = targetProbsBatch[vIdx] >= zeroVal ? targetProbsBatch[vIdx] : zeroVal;
+            sumVal += targetProbsBatch[vIdx];
         }
-
-        __shared__ float sumProbsShared;
-        sumProbs = blockReduceSum<float>((float) sumProbs);
-        if (threadIdx.x == 0)
+        sumVal = blockReduceSum<T>(sumVal);
+        if (tid == 0)
         {
-            sumProbsShared = max(sumProbs, 1e-6f);
+            sSumVal = sumVal;
         }
         __syncthreads();
 
-        for (SizeType32 vIdx = static_cast<SizeType32>(threadIdx.x); vIdx < vocabSize;
-             vIdx += static_cast<SizeType32>(blockDim.x))
+        for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
         {
-            auto const correctedNormProb = static_cast<float>(targetProbBatch[vIdx]) / sumProbsShared;
-            targetLogitsBatch[vIdx] = __logf(correctedNormProb / (1.f - correctedNormProb));
+            targetProbsBatch[vIdx] /= sSumVal;
         }
     }
 }
+
+__global__ void forwardAcceptedTokensKernel(SizeType32 batchSize, SizeType32 const* batchSlots, bool* batchIsAccepted,
+    SizeType32* sequenceLengths, TokenIdType const* draftIds, TokenIdType** idsPtrs, SizeType32 step,
+    SizeType32 maxDraftTokens, TokenIdType const* endIds, FinishedState* finishedOutput)
+{
+    auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (SizeType32 bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
+    {
+        auto const batchSlot = batchSlots[bi];
+        if (batchIsAccepted[batchSlot] && !finishedOutput[batchSlot].isSkipDecoding())
+        {
+            auto const curSeqLen = sequenceLengths[batchSlot];
+            auto const draftTokenIdx = step;
+            auto const draftOutputTokenId = draftIds[batchSlot * maxDraftTokens + draftTokenIdx];
+            auto* outputIdsRequestPtr = idsPtrs[batchSlot];
+            auto const outIdx = curSeqLen;
+            outputIdsRequestPtr[outIdx] = draftOutputTokenId;
+            if (outputIdsRequestPtr[outIdx] == endIds[batchSlot])
+            {
+                finishedOutput[batchSlot].setFinishedEOS();
+                // Do not increase seq len when EOS is generated. Seq len should always contain only tokens to be
+                // outputted
+            }
+            else
+            {
+                // We don't need to set output finished state as it is assumed to be in non finished state
+                sequenceLengths[batchSlot] += 1;
+            }
+        }
+    }
+} // namespace
+
 } // namespace
 
 template <typename T>
-void acceptDraftTokensByLogits(T* draftLogits, T** targetLogits, T* draftProbs, T* targetProbs,
-    SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
-    SizeType32 vocabSize, SizeType32 vocabSizePadded, SizeType32 maxDraftTokens, bool randomThreshold,
-    float constantThreshold, cudaStream_t stream)
+void invokeMaskTargetLogits(SizeType32 batchSize, T* targetLogits, SizeType32 const* batchSlots, SizeType32 beamWidth,
+    SizeType32 vocabSizePadded, FinishedState const* finishedInput, SizeType32 maxBatchSize,
+    bool const* batchUseDraftLogits, SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds,
+    SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(beamWidth == 1);
-    {
-        invokeAddBiasSoftMax(draftLogits, static_cast<T**>(nullptr), draftProbs, static_cast<T*>(nullptr), nullptr,
-            finished, batchSlots, batchSize, maxBatchSize, beamWidth * maxDraftTokens, vocabSize, vocabSizePadded,
-            /* skip softmax */ false,
-            /* batchSlotLogits */ true, stream);
-        invokeAddBiasSoftMax(static_cast<T*>(nullptr), targetLogits, targetProbs, static_cast<T*>(nullptr), nullptr,
-            finished, batchSlots, batchSize, maxBatchSize, beamWidth * maxDraftTokens, vocabSize, vocabSizePadded,
-            /* skip softmax */ false,
-            /* batchSlotLogits */ true, stream);
-    }
-    {
-        dim3 block(1024);
-        dim3 grid(batchSize * beamWidth, maxDraftTokens);
-        acceptDraftTokensByLogitsKernel<<<grid, block, 0, stream>>>(draftProbs, targetProbs, numsDraftTokens, finished,
-            curandState, batchSlots, batchSize, maxBatchSize, maxDraftTokens, beamWidth, vocabSizePadded,
-            randomThreshold, constantThreshold);
-    }
     {
         dim3 block(1024);
         dim3 grid(batchSize * beamWidth);
-        correctAcceptedStatesAndLogits<<<grid, block, 0, stream>>>(draftProbs, targetProbs, targetLogits,
-            numsDraftTokens, finished, batchSlots, batchSize, maxBatchSize, maxDraftTokens, beamWidth, vocabSizePadded);
+        maskTargetLogitsKernel<<<grid, block, 0, stream>>>(targetLogits, batchSlots, beamWidth, vocabSizePadded,
+            finishedInput, maxBatchSize, batchUseDraftLogits, outputIdsAfterSampling, targetOutputIds,
+            runtimeTopKDevicePtr, maskBuffer);
     }
+    sync_check_cuda_error();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-template void acceptDraftTokensByLogits(float* draftLogits, float** targetLogits, float* draftProbs, float* targetProbs,
-    SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
-    SizeType32 vocabSize, SizeType32 vocabSizePadded, SizeType32 maxDraftTokens, bool randomThreshold,
-    float constantThreshold, cudaStream_t stream);
-template void acceptDraftTokensByLogits(half* draftLogits, half** targetLogits, half* draftProbs, half* targetProbs,
-    SizeType32 const* numsDraftTokens, FinishedState* finished, curandState_t* curandState,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 maxBatchSize, SizeType32 beamWidth,
-    SizeType32 vocabSize, SizeType32 vocabSizePadded, SizeType32 maxDraftTokens, bool randomThreshold,
-    float constantThreshold, cudaStream_t stream);
+template <typename T>
+void invokeAcceptDraftTokens(SizeType32 batchSize, T* draftProbs, T* targetProbs, SizeType32 const* numsDraftTokens,
+    bool const* batchUseDraftLogits, TokenIdType const* draftIds, FinishedState const* finishedInput,
+    FinishedState* finishedOutput, curandState_t* curandState, SizeType32 const* batchSlots, SizeType32 maxDraftTokens,
+    SizeType32 beamWidth, SizeType32 vocabSizePadded, bool randomThreshold, float constantThreshold, SizeType32 step,
+    bool* batchIsAccepted, SizeType32* targetOutputIds, cudaStream_t stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_CHECK(beamWidth == 1);
+    {
+        dim3 block(1024);
+        dim3 grid(batchSize * beamWidth);
+        acceptDraftTokensKernel<<<grid, block, 0, stream>>>(draftProbs, targetProbs, numsDraftTokens,
+            batchUseDraftLogits, draftIds, finishedInput, finishedOutput, curandState, batchSlots, maxDraftTokens,
+            beamWidth, vocabSizePadded, randomThreshold, constantThreshold, step, batchIsAccepted, targetOutputIds);
+    }
+    sync_check_cuda_error();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
 
+template void invokeMaskTargetLogits(SizeType32 batchSize, float* targetLogits, SizeType32 const* batchSlots,
+    SizeType32 beamWidth, SizeType32 vocabSizePadded, FinishedState const* finishedInput, SizeType32 maxBatchSize,
+    bool const* batchUseDraftLogits, SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds,
+    SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
+template void invokeMaskTargetLogits(SizeType32 batchSize, half* targetLogits, SizeType32 const* batchSlots,
+    SizeType32 beamWidth, SizeType32 vocabSizePadded, FinishedState const* finishedInput, SizeType32 maxBatchSize,
+    bool const* batchUseDraftLogits, SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds,
+    SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
+
+template void invokeAcceptDraftTokens(SizeType32 batchSize, float* draftProbs, float* targetProbs,
+    SizeType32 const* numsDraftTokens, bool const* batchUseDraftLogits, TokenIdType const* draftIds,
+    FinishedState const* finishedInput, FinishedState* finishedOutput, curandState_t* curandState,
+    SizeType32 const* batchSlots, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSizePadded,
+    bool randomThreshold, float constantThreshold, SizeType32 step, bool* batchIsAccepted, SizeType32* targetOutputIds,
+    cudaStream_t stream);
+template void invokeAcceptDraftTokens(SizeType32 batchSize, half* draftProbs, half* targetProbs,
+    SizeType32 const* numsDraftTokens, bool const* batchUseDraftLogits, TokenIdType const* draftIds,
+    FinishedState const* finishedInput, FinishedState* finishedOutput, curandState_t* curandState,
+    SizeType32 const* batchSlots, SizeType32 maxDraftTokens, SizeType32 beamWidth, SizeType32 vocabSizePadded,
+    bool randomThreshold, float constantThreshold, SizeType32 step, bool* batchIsAccepted, SizeType32* targetOutputIds,
+    cudaStream_t stream);
+
+void invokeForwardAcceptedTokens(SizeType32 batchSize, SizeType32 const* batchSlots, bool* batchIsAccepted,
+    SizeType32* outputSequenceLengths, TokenIdType const* draftIds, TokenIdType** idsPtrs, SizeType32 step,
+    SizeType32 maxDraftTokens, TokenIdType const* endIds, FinishedState* finishedOutput, cudaStream_t stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+    dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+    forwardAcceptedTokensKernel<<<grid, block, 0, stream>>>(batchSize, batchSlots, batchIsAccepted,
+        outputSequenceLengths, draftIds, idsPtrs, step, maxDraftTokens, endIds, finishedOutput);
+    sync_check_cuda_error();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
 } // namespace tensorrt_llm::kernels::speculative_decoding

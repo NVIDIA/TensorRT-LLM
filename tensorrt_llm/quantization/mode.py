@@ -34,6 +34,8 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     FP8 = auto()
     FP8_PER_CHANNEL_PER_TOKEN = auto()
     INT8 = auto()
+    MIXED_PRECISION = auto()
+    NO_QUANT = auto()
 
 
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
@@ -81,6 +83,9 @@ class QuantMode(IntFlag):
     WEIGHTS_AND_ACTIVATIONS = INT4_WEIGHTS | INT8_WEIGHTS | ACTIVATIONS
     # The mask of all valid flags.
     VALID_FLAGS = COUNT - 1
+
+    def __deepcopy__(self, memo):
+        return self
 
     # All the bits set? You can restrict the test to the bits indicated by "mask".
     def _all(self, bits, mask=VALID_FLAGS):
@@ -137,6 +142,9 @@ class QuantMode(IntFlag):
 
     def has_fp8_rowwise(self):
         return self._any(self.FP8_ROWWISE)
+
+    def has_weight_quant(self):
+        return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS)
 
     def has_any_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS
@@ -241,7 +249,7 @@ class QuantMode(IntFlag):
 
     @staticmethod
     def from_quant_algo(
-        quant_algo: Optional[QuantAlgo],
+        quant_algo: Optional[QuantAlgo] = None,
         kv_cache_quant_algo: Optional[QuantAlgo] = None,
     ) -> "QuantMode":
         assert quant_algo is None or quant_algo in QUANT_ALGO_LIST

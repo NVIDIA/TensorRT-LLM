@@ -740,6 +740,7 @@ def main(args):
 
 
 if __name__ == '__main__':
+    # see `add_common_args` for extended list of arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')

@@ -121,6 +121,17 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 
 namespace runtime::kernels
 {
+//! \brief Inserts the running beams into the finished beams stored in the CBA buffers. (beams where the most likely
+//! continuation is the end token get stored separately, and another candidate next token is stored). Then sorts the
+//! beams according to their cumulative log probs. Note: the kernels in gatherTree modify the buffers inplace. When
+//! streaming, we use tmp buffers since beam search kernels expect ungathered data.
+//!
+//! \param decodingOutput contains a slice of the output buffers to gather. Also contains the
+//! DecodingOutput::BeamHypotheses object with the finished beams.
+//! \param decodingInput used for endIds and input lengths.
+//! \param manager the usual buffer manager.
+//! \param samplingConfig the usual buffer samplingConfig.
+
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput, BufferManager const& manager,
     SamplingConfig const& samplingConfig);
 } // namespace runtime::kernels

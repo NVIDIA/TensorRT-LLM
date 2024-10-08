@@ -27,10 +27,11 @@ import tensorrt as trt
 
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
-from ._utils import (bf16_array, bool_array, dim_resolve_negative,
-                     dim_to_trt_axes, dims_array, fp16_array, fp32_array,
-                     int32_array, int64_array, np_dtype_to_trt,
-                     str_dtype_to_trt, trt_dtype_to_np, trt_dtype_to_str)
+from ._utils import (QuantModeWrapper, bf16_array, bool_array,
+                     dim_resolve_negative, dim_to_trt_axes, dims_array,
+                     fp16_array, fp32_array, int32_array, int64_array,
+                     np_dtype_to_trt, str_dtype_to_trt, trt_dtype_to_np,
+                     trt_dtype_to_str)
 from .network import PluginInfo, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
@@ -4579,7 +4580,7 @@ def gpt_attention(
     kv_orig_quant_scale: Optional[Tensor] = None,
     kv_quant_orig_scale: Optional[Tensor] = None,
     attention_output_orig_quant_scale: Optional[Tensor] = None,
-    kv_cache_quant_mode: QuantMode = QuantMode(0),
+    kv_cache_quant_mode: Union[QuantModeWrapper, QuantMode] = QuantMode(0),
     max_context_length: Optional[int] = None,
     mask_type: AttentionMaskType = AttentionMaskType.causal,
     block_sparse_block_size: int = 64,
@@ -4997,6 +4998,9 @@ def gpt_attention(
                               trt.PluginFieldType.INT32)
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                               trt.PluginFieldType.INT32)
+    if isinstance(kv_cache_quant_mode, QuantModeWrapper):
+        # Now in TRT-LLM only use global kv_cache, so it's enough to get the first quant mode from list
+        kv_cache_quant_mode = kv_cache_quant_mode[0]
     kv_cache_quant_mode_field = trt.PluginField(
         "kv_cache_quant_mode", np.array(kv_cache_quant_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -6200,7 +6204,7 @@ def rg_lru(input: Tensor,
 
 
 def topk(input: Tensor,
-         k: int,
+         k: Union[Tensor, int],
          dim: int,
          largest: bool = True) -> Tuple[Tensor, Tensor]:
     '''
@@ -6241,8 +6245,12 @@ def topk(input: Tensor,
     layer = default_trtnet().add_topk(
         input.trt_tensor,
         trt.TopKOperation.MAX if largest else trt.TopKOperation.MIN,
-        k=k,
+        k=k if not isinstance(k, Tensor) else 1,
         axes=axes)
+    if isinstance(k, Tensor):
+        if k.ndim() == 1:
+            k = squeeze(k, 0)
+        layer.set_input(1, k.trt_tensor)
     values = layer.get_output(0)
     indices = layer.get_output(1)
 

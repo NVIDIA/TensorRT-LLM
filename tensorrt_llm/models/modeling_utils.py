@@ -3,6 +3,7 @@ import copy
 import dataclasses
 import json
 import os
+import re
 from enum import IntFlag, auto
 from functools import cached_property
 from pathlib import Path
@@ -14,8 +15,9 @@ import safetensors
 import torch
 
 from .._common import default_net
-from .._utils import (get_init_params, numpy_to_torch, release_gc,
-                      str_dtype_to_torch, str_dtype_to_trt, trt_dtype_to_torch)
+from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
+                      release_gc, str_dtype_to_torch, str_dtype_to_trt,
+                      trt_dtype_to_torch)
 from ..bindings import KVCacheType
 from ..functional import (PositionEmbeddingType, Tensor,
                           gather_last_token_logits, tanh)
@@ -107,7 +109,17 @@ class QuantConfig:
         return self.quant_algo in W8A8_SQ_PLUGIN_LIST
 
     @cached_property
-    def quant_mode(self) -> QuantMode:
+    def quant_mode(self) -> QuantModeWrapper:
+        quant_mode_list = [
+            QuantMode.from_quant_algo(
+                self.quant_algo,
+                self.kv_cache_quant_algo,
+            )
+        ]
+        return QuantModeWrapper(quant_mode_list)
+
+    @cached_property
+    def layer_quant_mode(self) -> QuantMode:
         return QuantMode.from_quant_algo(
             self.quant_algo,
             self.kv_cache_quant_algo,
@@ -124,13 +136,17 @@ class QuantConfig:
     def requires_modelopt_quantization(self):
         if self.quant_algo in [
                 QuantAlgo.W4A16_AWQ, QuantAlgo.FP8,
-                QuantAlgo.W8A8_SQ_PER_CHANNEL, QuantAlgo.W4A8_AWQ
+                QuantAlgo.W8A8_SQ_PER_CHANNEL, QuantAlgo.W4A8_AWQ,
+                QuantAlgo.MIXED_PRECISION
         ]:
             return True
         elif self.quant_algo is None and self.kv_cache_quant_algo == QuantAlgo.FP8:
             return True
         else:
             return False
+
+    def get_quant_cfg(self, module_name=None):
+        return self
 
     def get_modelopt_qformat(self):
         algo_to_modelopt_map = {
@@ -141,6 +157,7 @@ class QuantConfig:
             QuantAlgo.FP8: 'fp8',
             QuantAlgo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
         }
+        assert self.quant_algo != QuantAlgo.MIXED_PRECISION, f"We don't support mixed precision in QuantConfig"
         if self.quant_algo is not None:
             assert self.quant_algo in algo_to_modelopt_map, f"We don't use Modelopt for quantization algorithm {self.quant_algo}, you probably shall not call this"
             return algo_to_modelopt_map[self.quant_algo]
@@ -160,10 +177,100 @@ class QuantConfig:
 
     @classmethod
     def from_dict(cls, config: dict):
-        return cls(**config)
+        obj = cls(**config)
+        return obj
 
     def to_dict(self):
         return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class LayerQuantConfig(QuantConfig):
+    quant_algo: Optional[QuantConfig] = None
+    kv_cache_quant_algo: Optional[QuantConfig] = None
+    quantized_layers: Optional[Dict[str, QuantConfig]] = None
+    exclude_modules: Optional[List[str]] = None
+
+    def __init__(self,
+                 *,
+                 quant_algo: Optional[QuantConfig] = None,
+                 kv_cache_quant_algo: Optional[QuantConfig] = None,
+                 quantized_layers: Optional[Dict[str, QuantConfig]] = None,
+                 exclude_modules: Optional[List[str]] = None,
+                 **kwargs):
+        self.quant_algo = quant_algo
+        self.quantized_layers = quantized_layers
+        self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.exclude_modules = exclude_modules
+        self.auto_quant_mode = {}
+        for name, layer_config in self.quantized_layers.items():
+            self.auto_quant_mode.update({
+                name:
+                QuantMode.from_quant_algo(
+                    layer_config.quant_algo,
+                    self.kv_cache_quant_algo,
+                )
+            })
+        for key in kwargs:
+            logger.warning(
+                f"Warning: Unrecognized parameter '{key}' with value '{kwargs[key]}'"
+            )
+
+    @cached_property
+    def quant_mode(self):
+        quant_mode_list = list(set(self.auto_quant_mode.values()))
+        return QuantModeWrapper(quant_mode_list)
+
+    @property
+    def layer_quant_mode(self) -> Dict[str, QuantMode]:
+        return self.auto_quant_mode
+
+    @cached_property
+    def auto_quant_list(self):
+        quant_list = []
+        for _, layer_config in self.quantized_layers.items():
+            quant_list.append(layer_config.quant_algo)
+        return list(set(quant_list))
+
+    @classmethod
+    def from_dict(cls, config: dict):
+        quantized_layers = config.pop('quantized_layers', {})
+
+        quantized_layers_dict = {
+            layer_name: QuantConfig(**layer_config)
+            for layer_name, layer_config in quantized_layers.items()
+        }
+
+        obj = cls(quantized_layers=quantized_layers_dict, **config)
+        return obj
+
+    def get_quant_cfg(self, module_name):
+        assert module_name in self.quantized_layers.keys(), \
+            "module {module_name} should be included in `quantized_layers` in AutoQuant mode"
+        return self.quantized_layers[module_name]
+
+    def get_modelopt_qformat(self):
+        algo_to_modelopt_map = {
+            QuantAlgo.W4A16_AWQ: "int4_awq",
+            QuantAlgo.W4A8_AWQ: 'w4a8_awq',
+            QuantAlgo.FP8: 'fp8',
+            QuantAlgo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
+        }
+        assert self.quant_algo == QuantAlgo.MIXED_PRECISION, f"We only support mixed precision quantization in LayerQuantConfig"
+        autoq_format = ','.join(
+            [algo_to_modelopt_map[item] for item in self.auto_quant_list])
+        return autoq_format
+
+    def to_dict(self):
+        output = copy.deepcopy(self.__dict__)
+        output.pop('auto_quant_mode', None)
+        output.pop('quant_mode', None)
+        output.pop('exclude_modules', None)
+        for name, per_layer_config in output['quantized_layers'].items():
+            per_layer_config = per_layer_config.to_dict()
+            per_layer_config.pop('exclude_modules')
+            output['quantized_layers'][name] = per_layer_config
+        return output
 
 
 class PretrainedConfig:
@@ -269,6 +376,8 @@ class PretrainedConfig:
 
     @property
     def kv_dtype(self):
+        # TODO: need to align the kv dtype
+        # now assume the kv cache is for all layers
         if self.quant_mode.has_int8_kv_cache():
             return 'int8'
         elif self.quant_mode.has_fp8_kv_cache():
@@ -302,7 +411,17 @@ class PretrainedConfig:
     def from_json_file(cls, config_file: str):
         with open(config_file) as f:
             config = json.load(f)
-        return cls.from_dict(config)
+        obj = cls.from_dict(config)
+        if obj.quantization.quant_algo == QuantAlgo.MIXED_PRECISION:
+            try:
+                layer_config_path = str(config_file).replace(
+                    'config.json', 'quant_cfg.json')
+                obj.to_layer_quant_config(layer_config_path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Encounter error '{e}' for read quantization config '{layer_config_path}'"
+                )
+        return obj
 
     @classmethod
     def from_checkpoint(cls, ckpt_dir: str):
@@ -312,9 +431,21 @@ class PretrainedConfig:
         with open(config_file, 'w') as f:
             json.dump(self.to_dict(), f, indent=4)
 
+    def to_layer_quant_config(self, config_file: str):
+        with open(config_file) as f:
+            config = json.load(f)
+        self.quantization = LayerQuantConfig.from_dict(config)
+
     @property
     def quant_mode(self):
         return self.quantization.quant_mode
+
+    @property
+    def quant_algo(self):
+        return self.quantization.quant_algo
+
+    def get_quant_cfg(self, module_name: str):
+        return self.quantization.get_quant_cfg(module_name)
 
     def set_rank(self, rank):
         self.mapping = Mapping(self.mapping.world_size,
@@ -485,13 +616,14 @@ class PretrainedModel(Module,
 
         assert os.path.isfile(weights_path)
         weights = safetensors.torch.load_file(weights_path)
-
         is_checkpoint_pruned = getattr(config, 'is_pruned', False)
 
         if preprocess_weights_hook is not None:
             weights = preprocess_weights_hook(weights)
 
-        preprocess_weights(weights, config, from_pruned=is_checkpoint_pruned)
+        weights = preprocess_weights(weights,
+                                     config,
+                                     from_pruned=is_checkpoint_pruned)
         model = cls(config)
         model.load(weights, from_pruned=is_checkpoint_pruned)
         return model
@@ -830,11 +962,6 @@ def fuse_gate_mlp(
 ) -> PretrainedModel:
     from ..quantization.quantize import fp8_quantize
 
-    quant_algo = model.config.quantization.quant_algo
-    if quant_algo != QuantAlgo.FP8 and quant_algo is not None:
-        logger.warning("fuse_gate_mlp cannot be done for this model. Skipping.")
-        return model
-
     for name, mlp, layer in model.named_modules_with_parent():
         if isinstance(mlp, GatedMLP):
             init_params = get_init_params(mlp)
@@ -849,9 +976,18 @@ def fuse_gate_mlp(
             init_params["inner_layernorm"] = mlp.inner_layernorm is not None
             fused_layer = FusedGatedMLP(**init_params)
 
-            if quant_algo == QuantAlgo.FP8:
-                fused_layer = fp8_quantize(fused_layer,
-                                           model.config.quantization)
+            fc_name = name + '.fc'
+            layer_quant_cfg = model.config.get_quant_cfg(fc_name)
+            layer_quant_algo = layer_quant_cfg.quant_algo
+            if layer_quant_algo != QuantAlgo.FP8 and layer_quant_algo is not None:
+                continue
+
+            if isinstance(model.config.quantization.exclude_modules, list) \
+                    and fc_name in model.config.quantization.exclude_modules:
+                layer_quant_algo = None
+
+            if layer_quant_algo == QuantAlgo.FP8:
+                fused_layer = fp8_quantize(fused_layer, layer_quant_cfg)
 
                 if isinstance(mlp.dtype, str):
                     dtype = str_dtype_to_torch(mlp.dtype)
@@ -904,7 +1040,7 @@ def fuse_gate_mlp(
                     mlp.gate.activation_scaling_factor.raw_value,
                     mlp.fc.activation_scaling_factor.raw_value,
                 )
-            elif quant_algo is None:
+            elif layer_quant_algo is None:
                 fused_layer.fused_fc.weight.value = np.concatenate(
                     [
                         mlp.gate.weight.raw_value,
@@ -917,7 +1053,7 @@ def fuse_gate_mlp(
                         [mlp.gate.bias.raw_value, mlp.fc.bias.raw_value],
                         axis=0)
             else:
-                raise ValueError(f'Unsupported quant algo: {quant_algo}')
+                raise ValueError(f'Unsupported quant algo: {layer_quant_algo}')
 
             fused_layer.proj = mlp.proj
             fused_layer.inner_layernorm = mlp.inner_layernorm
@@ -963,9 +1099,10 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
                     layer.tp_size * layer.num_attention_kv_heads *
                     layer.attention_head_size,
                 })
-            q = quantize(q, model.config.quantization)
-            k = quantize(k, model.config.quantization)
-            v = quantize(v, model.config.quantization)
+            layer_quant_cfg = model.config.get_quant_cfg(name + '.qkv')
+            q = quantize(q, layer_quant_cfg)
+            k = quantize(k, layer_quant_cfg)
+            v = quantize(v, layer_quant_cfg)
             out_features = q.out_features + k.out_features + v.out_features
             if isinstance(layer.qkv, (
                     WeightOnlyQuantLinear,
@@ -1143,7 +1280,8 @@ def share_embedding(model: PretrainedModel) -> PretrainedModel:
 
 def set_fp8_context_fhma(model: PretrainedModel) -> PretrainedModel:
     for name, layer in model.named_modules():
-        if isinstance(layer, Attention):
+        if isinstance(layer, Attention) and hasattr(
+                layer.dense, 'activation_scaling_factor'):
             scale = [1.0] / layer.dense.activation_scaling_factor.raw_value
             layer.attention_output_orig_quant_scale = Parameter(
                 value=scale.astype(np.float32))
@@ -1193,19 +1331,11 @@ def optimize_model(
     return model
 
 
-def preprocess_weights(weights: Dict[str, torch.Tensor],
-                       model_config: PretrainedConfig,
-                       from_pruned=False) -> None:
-    """This function in-place modifies weights and model_config, making them compatible with each other.
-
-    Note: Typically, it should be called before model creation and weight loading. For example,
-        preprocess_weights(weights, model_config)
-        model = XXXForCausalLM(model_config)
-        model.load(weights)
-    """
-    quant_algo = model_config.quantization.quant_algo
+def preprocess_perlayer_weights(weights,
+                                model_config,
+                                quant_algo,
+                                from_pruned=False):
     exclude_modules = model_config.quantization.exclude_modules
-
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
         preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
@@ -1280,15 +1410,68 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                                             exclude_modules=exclude_modules,
                                             plugin=True)
 
-    # Parallel block rowlinear should not have duplicate bias.
-    elif model_config.architecture == 'GPTJForCausalLM':
-        if model_config.mapping.tp_rank > 0:
-            for name, param in weights.items():
+
+def preprocess_weights(weights: Dict[str, torch.Tensor],
+                       model_config: PretrainedConfig,
+                       from_pruned=False) -> None:
+    """This function in-place modifies weights and model_config, making them compatible with each other.
+
+    Note: Typically, it should be called before model creation and weight loading. For example,
+        preprocess_weights(weights, model_config)
+        model = XXXForCausalLM(model_config)
+        model.load(weights)
+    """
+    quant_config = model_config.quantization
+    quant_algo = quant_config.quant_algo
+
+    pattern_info = ['fc', 'gate', 'proj', 'qkv', 'dense']
+
+    per_layer_weights = {}
+
+    for name, param in weights.items():
+        in_mode = False
+        for info in pattern_info:
+            pattern = rf'(.*?{info}.*?)'
+            pattern_match = re.match(pattern, name)
+            if pattern_match:
+                base_name = pattern_match.group(1)
+                if base_name not in per_layer_weights.keys():
+                    per_layer_weights[base_name] = {}
+                per_layer_weights[base_name][name] = param
+                in_mode = True
+                break
+        if not in_mode:
+            # [lm_head.weight, ln_f.weight, vocab_embedding.weight]
+            base_name = name.rsplit('.', 1)[0]
+            if base_name not in per_layer_weights.keys():
+                per_layer_weights[base_name] = {}
+            per_layer_weights[base_name][name] = param
+
+    new_weights = {}
+    for base_name, layer_weights in per_layer_weights.items():
+        if quant_algo != QuantAlgo.MIXED_PRECISION:
+            layer_quant_algo = quant_algo
+        else:
+            if base_name not in quant_config.quantized_layers.keys():
+                new_weights.update(layer_weights)
+                continue
+            layer_quant_algo = quant_config.quantized_layers[
+                base_name].quant_algo
+
+        preprocess_perlayer_weights(layer_weights, model_config,
+                                    layer_quant_algo, from_pruned)
+        new_weights.update(layer_weights)
+
+    weights = new_weights
+    for name, param in weights.items():
+        if model_config.architecture == 'GPTJForCausalLM':
+            if model_config.mapping.tp_rank > 0:
                 if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
                     weights[name] = torch.zeros_like(param)
 
     # For share_embedding_table
     check_share_embedding(weights, model_config)
+    return weights
 
 
 def check_share_embedding(weights: Dict[str, torch.Tensor],

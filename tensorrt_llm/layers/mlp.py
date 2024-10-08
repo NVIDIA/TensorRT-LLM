@@ -262,7 +262,7 @@ class FusedGatedMLP(Module):
     def fc_gate_plugin(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
-        #   SiLU(FC(x)) + Gate(x)
+        #   SiLU(FC(x)) * Gate(x)
         #
         # into:
         #
@@ -319,7 +319,7 @@ class FusedGatedMLP(Module):
     def fc_gate(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
-        #   SiLU(FC(x)) + Gate(x)
+        #   SiLU(FC(x)) * Gate(x)
         #
         # into:
         #

@@ -128,7 +128,7 @@ class PromptTuningEmbedding(Embedding):
 
         Parameters:
             tokens : Tensor
-                the ids to embbed, size [batch_size, seq_len]
+                the ids to embed, size [batch_size, seq_len]
 
             prompt_embedding_table : Tensor
                 the additional embedding table for prompt-tuned tokens, size [num_tasks * num_tokens_per_task, hidden_size]

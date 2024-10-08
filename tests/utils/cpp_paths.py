@@ -77,3 +77,8 @@ def results_data_path(data_path: _pl.Path) -> _pl.Path:
 @pytest.fixture(scope="module")
 def results_data_path_beam_width_2(data_path: _pl.Path) -> _pl.Path:
     return data_path / f"gpt2/beam_search_2/{get_base_model_spec().get_results_file()}"
+
+
+@pytest.fixture(scope="module")
+def results_data_path_fmhafp32acc(data_path: _pl.Path) -> _pl.Path:
+    return data_path / f"gpt2/sampling/{get_base_model_spec().enable_context_fmha_fp32_acc().get_results_file()}"

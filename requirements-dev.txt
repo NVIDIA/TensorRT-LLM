@@ -11,6 +11,7 @@ pytest-cov
 pytest-forked
 pytest-xdist
 pytest-timeout
+pytest-split
 rouge_score
 cloudpickle
 typing-extensions==4.8.0

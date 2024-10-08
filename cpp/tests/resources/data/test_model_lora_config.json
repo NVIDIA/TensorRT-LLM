@@ -63,7 +63,6 @@
         "gather_context_logits": false,
         "gather_generation_logits": false,
         "strongly_typed": true,
-        "builder_opt": null,
         "profiling_verbosity": "layer_names_only",
         "enable_debug_output": false,
         "max_draft_len": 0,

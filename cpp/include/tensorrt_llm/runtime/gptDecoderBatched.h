@@ -245,7 +245,7 @@ private:
     void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
 
     //! @brief Allocate buffers for speculative decoding.
-    void allocateSpeculativeDecodingBuffers();
+    void allocateSpeculativeDecodingBuffers(nvinfer1::DataType dtype);
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(ModelConfig const& modelConfig);
@@ -300,10 +300,6 @@ private:
     DecodingInputPtr mJointDecodingInput;
     DecodingOutputPtr mJointDecodingOutput;
 
-    std::vector<bool> mAcceptByLogits;
-    TensorPtr mNumDraftTokens;
-    TensorPtr mCurandStates;
-
     std::vector<SizeType32> mNbSteps;
     std::vector<bool> mFinished;
     TensorPtr mFinishedSum;
@@ -313,18 +309,9 @@ private:
 
     TensorPtr mFinishedSteps;     // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
                                   // for each generated token of maxTokensPerStep, on gpu
-    TensorPtr mDraftProbs;        // [batchSize, maxTokensPerEngineStep, beamWidth, vocabPadded], temporary data for
-                                  // speculative decoding accept by logits kernel, on gpu
-    TensorPtr mTargetProbs;       // [batchSize, maxTokensPerEngineStep, beamWidth, vocabPadded], temporary data for
-                                  // speculative decoding accept by logits kernel, on gpu
-    TensorPtr mDraftTokenIds;     // [batchSize, maxTokensPerEngineStep], draft token indices, on gpu
-    TensorPtr mDraftLogits;       // [batchSize, maxTokensPerEngineStep, vocabSizePadded], draft token logits, on gpu
 
     TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mBatchSlotsDecoder; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsAcceptTokens; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsAcceptLogits; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
-    TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
     SizeType32 mMaxSequenceLength{};
     SizeType32 mMaxAttentionWindow{};
     SizeType32 mSinkTokenLength{};

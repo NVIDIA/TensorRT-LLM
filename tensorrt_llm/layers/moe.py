@@ -25,7 +25,7 @@ from tensorrt_llm._utils import (get_init_params, str_dtype_to_torch,
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
-from .._utils import int32_array
+from .._utils import QuantModeWrapper, int32_array
 from ..functional import (AllReduceFusionParams, _add_plugin_info,
                           _create_tensor, allreduce, cast, concat, constant,
                           div, expand, gather_nd, is_gated_activation,
@@ -170,6 +170,10 @@ def _moe_plugin(moe_config,
     p_output_type_id = trt.PluginField(
         "output_type_id", np.array([int(output_dtype)], dtype=np.int32),
         trt.PluginFieldType.INT32)
+
+    if isinstance(quant_mode, QuantModeWrapper):
+        # We only need to get one quant mode here for specific moe layer
+        quant_mode = quant_mode[0]
     p_quant_mode = trt.PluginField("quant_mode",
                                    np.array([int(quant_mode)], dtype=np.int32),
                                    trt.PluginFieldType.INT32)

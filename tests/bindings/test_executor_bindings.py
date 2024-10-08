@@ -478,13 +478,12 @@ def test_get_num_responses_ready(streaming: bool,
 @pytest.mark.parametrize("return_context_logits", [False, True])
 @pytest.mark.parametrize("return_generation_logits", [False, True])
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
-def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
-                          beam_width: int, compute_log_probs: bool,
-                          exclude_input_from_output: bool,
-                          return_context_logits: bool,
-                          return_generation_logits: bool, model_files,
-                          model_path, model_path_return_logits, input_data_path,
-                          results_data_path, results_data_path_beam_width_2):
+def test_token_comparison(
+        batching_type: trtllm.BatchingType, streaming: bool, beam_width: int,
+        compute_log_probs: bool, exclude_input_from_output: bool,
+        return_context_logits: bool, return_generation_logits: bool,
+        model_files, model_path, model_path_return_logits, input_data_path,
+        results_data_path_fmhafp32acc, results_data_path_beam_width_2):
     if streaming and beam_width > 1:
         pytest.skip("Test does not support streaming with beam search")
 
@@ -597,7 +596,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                                executor_config)
 
     # Load test data
-    results_path = results_data_path if beam_width == 1 else results_data_path_beam_width_2
+    results_path = results_data_path_fmhafp32acc if beam_width == 1 else results_data_path_beam_width_2
     given_input, given_input_lengths, max_input_length, test_data = load_test_data(
         input_data_path, results_path)
 

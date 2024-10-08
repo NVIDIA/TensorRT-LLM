@@ -86,11 +86,13 @@ class Parameter:
 
         if self._value is None or (isinstance(self._value, np.ndarray)
                                    and not self._value.flags['C_CONTIGUOUS']):
+            value_old = self._value
+            self._value = np.empty(self._shape, trt_dtype_to_np(self._dtype))
             network._register_unfilled_weights(
                 # use updated self._shape here
                 name,
-                np.empty(self._shape, trt_dtype_to_np(self._dtype)),
-                self._value)
+                self._value,
+                value_old)
         return Tensor(name=name, dtype=self._dtype, shape=shape)
 
     def get_managed_tensor(self,

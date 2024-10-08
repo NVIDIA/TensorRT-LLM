@@ -152,11 +152,6 @@ def parse_arguments():
                         type=str,
                         default='model.cache',
                         help="The file path to write the timing cache.")
-    parser.add_argument('--builder_opt',
-                        type=int,
-                        default=None,
-                        choices=[0, 1, 2, 3, 4, 5],
-                        help="TensorRT builder optimization level.")
     parser.add_argument(
         '--profiling_verbosity',
         type=str,
@@ -330,7 +325,6 @@ def build_model(
     bool = False,  # return the modified BuildConfig without actually building the engine
     **kwargs
 ) -> Union[Engine, BuildConfig]:
-
     model_config = copy.deepcopy(model_config)
 
     logits_dtype = kwargs.get('logits_dtype')
@@ -505,12 +499,12 @@ def main():
     else:
         config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
         ckpt_dir = ckpt_dir_or_model_config
-
     model_config = PretrainedConfig.from_json_file(config_path)
 
     # avoid ValueError if not supported quantization is chosen with use_fused_mlp
     quant_algo = model_config.quantization.quant_algo
-    if quant_algo and quant_algo != QuantAlgo.FP8:
+    if quant_algo and quant_algo not in (QuantAlgo.FP8,
+                                         QuantAlgo.MIXED_PRECISION):
         kwargs['use_fused_mlp'] = False
 
     if args.build_config is None:
@@ -536,7 +530,6 @@ def main():
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
                 'strongly_typed': True,
-                'builder_opt': args.builder_opt,
                 'force_num_profiles': args.builder_force_num_profiles,
                 'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,

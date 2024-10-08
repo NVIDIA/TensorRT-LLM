@@ -228,7 +228,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         }
     }
 
-    // Perpare values for fmha.
+    // Prepare values for fmha.
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
         // Reset fmha tile counter to 0 before launching fmha kernels.

@@ -133,14 +133,14 @@ value for a given parameter, the vector can be limited to a single element
 
 ***General***
 
-|   Name in TRT-LLM   |                         Description                          |   Data type   |                        Range of value                        |                     Default value                     |       Name in HF       |
-| :-----------------: | :----------------------------------------------------------: | :-----------: | :----------------------------------------------------------: | :---------------------------------------------------: | :--------------------: |
-|    `temperature`    |          modulation of logits in sampling workflow           | List\[Float\] |                     \[0.0f, $+\infty$\)                      |                `1.0f` (no modulation)                 |     `temperature`      |
-|     `minLength`     |        lower-bound on the number of tokens generated         |  List\[Int\]  |                       \[0, $+\infty$\)                       | `0` (no effect (the first generated token can be EOS) |      `min_length`      |
-| `repetitionPenalty` | penalize repetitive tokens <br> multiplicative, irrespective of appearances count | List\[Float\] | \[0.0f, $+\infty$\) <br> `< 1.0f` encourages repetition <br> `> 1.0f` discourages it |                  `1.0f` (no effect)                   |  `repetition_penalty`  |
-|  `presencePenalty`  | penalize existed tokens <br> additive, irrespective of appearances count | List\[Float\] | \($-\infty$, $+\infty$\) <br> `< 0.0f` encourages repetition <br> `> 0.0f` discourages it |                  `0.0f` (no effect)                   |           no           |
-| `frequencyPenalty`  | penalize existed tokens <br> additive, dependent on appearances count | List\[Float\] | \($-\infty$, $+\infty$\) <br> `< 0.0f` encourages repetition <br> `> 0.0f` discourages it |                  `0.0f` (no effect)                   |           no           |
-| `noRepeatNgramSize` |                                                              |  List\[Int\]  | \[0, $+\infty$\) <br> `> 0` all ngrams of that size can only occur once |                    `0` (no effect)                    | `no_repeat_ngram_size` |
+|   Name in TRT-LLM   |                                    Description                                    |   Data type   |                                      Range of value                                       |                     Default value                     |       Name in HF       |
+| :-----------------: | :-------------------------------------------------------------------------------: | :-----------: | :---------------------------------------------------------------------------------------: | :---------------------------------------------------: | :--------------------: |
+|    `temperature`    |                     modulation of logits in sampling workflow                     | List\[Float\] |                                    \[0.0f, $+\infty$\)                                    |                `1.0f` (no modulation)                 |     `temperature`      |
+|     `minLength`     |                   lower-bound on the number of tokens generated                   |  List\[Int\]  |                                     \[0, $+\infty$\)                                      | `0` (no effect (the first generated token can be EOS) |      `min_length`      |
+| `repetitionPenalty` | penalize repetitive tokens <br> multiplicative, irrespective of appearances count | List\[Float\] |   \[0.0f, $+\infty$\) <br> `< 1.0f` encourages repetition <br> `> 1.0f` discourages it    |                  `1.0f` (no effect)                   |  `repetition_penalty`  |
+|  `presencePenalty`  |     penalize existed tokens <br> additive, irrespective of appearances count      | List\[Float\] | \($-\infty$, $+\infty$\) <br> `< 0.0f` encourages repetition <br> `> 0.0f` discourages it |                  `0.0f` (no effect)                   |           no           |
+| `frequencyPenalty`  |       penalize existed tokens <br> additive, dependent on appearances count       | List\[Float\] | \($-\infty$, $+\infty$\) <br> `< 0.0f` encourages repetition <br> `> 0.0f` discourages it |                  `0.0f` (no effect)                   |           no           |
+| `noRepeatNgramSize` |                                                                                   |  List\[Int\]  |          \[0, $+\infty$\) <br> `> 0` all ngrams of that size can only occur once          |                    `0` (no effect)                    | `no_repeat_ngram_size` |
 
 * The tokens of input prompt are included during adopting `repetitionPenalty`, `presencePenalty`, and `frequencyPenalty` onto logits.
 
@@ -158,9 +158,9 @@ value for a given parameter, the vector can be limited to a single element
 | `topPResetIds`  |    the decay in the `topP` algorithm    |  List\[Int\]  | \[-1, $+\infty$\) | `-1` (no effect) |     no     |
 
  * If setting `topK = 0` and `topP = 0.0f`, greedy search is performed.
- * If setting `topK > 0` and `topP = 0.0f`, `topK` tokens of highest probilities will become the candidates of sampling (named `TopK sampling` in TRT-LLM).
- * If setting `topK = 0` and `topP > 0.0f`, tokens will be sorted with probility descendly, then the tokens with highest probilities which the accumulated probility larger than `topP` will become the candidates of sampling (named `TopP sampling` in TRT-LLM).
- * If setting `topK > 0` and `topP > 0.0f`, `topK` tokens of highest probilities will be selected, then those selected tokens will be sorted with probility descendly and their probility will be normalized, then the tokens with highest normalized probilities which the accumulated probility larger than `topP` will become the candidates of sampling (named `TopKTopP sampling` in TRT-LLM)
+ * If setting `topK > 0` and `topP = 0.0f`, `topK` tokens of highest probabilities will become the candidates of sampling (named `TopK sampling` in TRT-LLM).
+ * If setting `topK = 0` and `topP > 0.0f`, tokens will be sorted with probability descendly, then the tokens with highest probabilities which the accumulated probability larger than `topP` will become the candidates of sampling (named `TopP sampling` in TRT-LLM).
+ * If setting `topK > 0` and `topP > 0.0f`, `topK` tokens of highest probabilities will be selected, then those selected tokens will be sorted with probability descendly and their probability will be normalized, then the tokens with highest normalized probabilities which the accumulated probability larger than `topP` will become the candidates of sampling (named `TopKTopP sampling` in TRT-LLM)
 
  * If different `topK` values are provided for the different sequences in the batch, the performance of the implementation will depend on the largest value. For efficiency reasons, we recommend to batch requests with similar `topK` values together.
 

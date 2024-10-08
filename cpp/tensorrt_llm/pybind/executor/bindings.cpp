@@ -408,9 +408,12 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal);
 
     py::class_<tle::Response>(m, "Response")
-        .def(py::init<IdType, std::string>(), py::arg("request_id"), py::arg("error_msg"))
-        .def(py::init<IdType, tle::Result>(), py::arg("request_id"), py::arg("result"))
+        .def(py::init<IdType, std::string, std::optional<IdType>>(), py::arg("request_id"), py::arg("error_msg"),
+            py::arg("client_id") = std::nullopt)
+        .def(py::init<IdType, tle::Result, std::optional<IdType>>(), py::arg("request_id"), py::arg("result"),
+            py::arg("client_id") = std::nullopt)
         .def_property_readonly("request_id", &tle::Response::getRequestId)
+        .def_property_readonly("client_id", &tle::Response::getClientId)
         .def("has_error", &tle::Response::hasError)
         .def_property_readonly("error_msg", &tle::Response::getErrorMsg)
         .def_property_readonly("result", &tle::Response::getResult);

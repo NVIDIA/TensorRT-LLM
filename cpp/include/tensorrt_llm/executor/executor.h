@@ -186,11 +186,13 @@ class ExternalDraftTokensConfig
 {
 public:
     explicit ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits = std::nullopt,
-        std::optional<FloatType> const& acceptanceThreshold = std::nullopt);
+        std::optional<FloatType> const& acceptanceThreshold = std::nullopt,
+        std::optional<bool> const& fastLogits = std::nullopt);
 
     [[nodiscard]] VecTokens getTokens() const;
     [[nodiscard]] std::optional<Tensor> getLogits() const;
     [[nodiscard]] std::optional<FloatType> getAcceptanceThreshold() const;
+    [[nodiscard]] std::optional<bool> getFastLogits() const;
 
 private:
     friend class Serialization;
@@ -200,6 +202,8 @@ private:
     std::optional<Tensor> mLogits;
     /// @brief The acceptance threshold. Must be > 0.f and <= 1.f
     std::optional<FloatType> mAcceptanceThreshold;
+    /// @brief Use direct transfer for draft logits
+    std::optional<bool> mFastLogits;
 };
 
 /// @brief Configuration for prompt tuning
@@ -316,6 +320,18 @@ private:
 
     /// @brief Context phase state of this request
     StatePtr mState{nullptr, deleter};
+};
+
+/// @brief Configuration for speculative decoding (both draft and target models)
+class SpeculativeDecodingConfig
+{
+public:
+    explicit SpeculativeDecodingConfig(bool fastLogits);
+
+    bool operator==(SpeculativeDecodingConfig const& other) const;
+
+    /// @brief Send logits tensor directly from draft to target model.
+    bool fastLogits;
 };
 
 /// @brief A class that holds information about the request
@@ -437,6 +453,16 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
+/// @brief Struct that holds the logits information when using direct transfer
+struct SpeculativeDecodingFastLogitsInfo
+{
+    /// @brief Draft request id
+    uint64_t draftRequestId;
+
+    /// @brief MPI world rank of the draft model leader
+    int32_t draftParticipantId;
+};
+
 /// @brief Struct that holds the generation result
 struct Result
 {
@@ -455,10 +481,13 @@ struct Result
     /// @brief The context logits. Size [promptLen, vocabSizePadded]
     std::optional<Tensor> contextLogits;
 
-    /// @brief The context logits. Size [beamSize, maxNewTokens, vocabSizePadded] (non-streaming)
+    /// @brief The generation logits. Size [beamSize, maxNewTokens, vocabSizePadded] (non-streaming)
     /// or [maxNewTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
     /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
     std::optional<Tensor> generationLogits;
+
+    /// @brief Logits information for direct transfer when using fast logits
+    std::optional<SpeculativeDecodingFastLogitsInfo> specDecFastLogitsInfo;
 
     /// @brief The encoder output. Size [encoderLen, hiddenSize]
     std::optional<Tensor> encoderOutput;
@@ -484,8 +513,8 @@ struct Result
 class Response
 {
 public:
-    Response(IdType requestId, std::string errorMsg);
-    Response(IdType requestId, Result Result);
+    Response(IdType requestId, std::string errorMsg, std::optional<IdType> clientId = std::nullopt);
+    Response(IdType requestId, Result Result, std::optional<IdType> clientId = std::nullopt);
 
     ~Response();
     Response(Response const& other);
@@ -495,6 +524,9 @@ public:
 
     /// @brief Get the id of the request for which this response was generated
     [[nodiscard]] IdType getRequestId() const;
+
+    /// @brief Get the client id of the request for which this response was generated
+    [[nodiscard]] std::optional<IdType> getClientId() const;
 
     /// @brief Indicates if this response has an error or not
     [[nodiscard]] bool hasError() const;
@@ -873,7 +905,8 @@ public:
         std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
-        uint64_t maxSeqIdleMicroseconds = 180000000);
+        uint64_t maxSeqIdleMicroseconds = 180000000,
+        std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -895,6 +928,7 @@ public:
     [[nodiscard]] std::optional<DebugConfig> getDebugConfig() const;
     [[nodiscard]] SizeType32 getRecvPollPeriodMs() const;
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
+    [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -916,6 +950,7 @@ public:
     void setDebugConfig(DebugConfig const& debugConfig);
     void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
     void setMaxSeqIdleMicroseconds(uint64_t maxNumTokens);
+    void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
 
 private:
     friend class Serialization;
@@ -978,6 +1013,9 @@ private:
     /// @brief The maximum time in microseconds a scheduled request can remain idle before getting terminated. Default
     /// is 3 minutes.
     uint64_t mMaxSeqIdleMicroseconds;
+
+    /// @brief The speculative decoding configuration
+    std::optional<SpeculativeDecodingConfig> mSpeculativeDecodingConfig;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
@@ -1079,6 +1117,9 @@ public:
 
     /// @brief  Indicates if the current process is allowed to enqueueRequests
     [[nodiscard]] bool canEnqueueRequests() const;
+
+    /// @brief  Indicates if the current process participates in this executor instance
+    [[nodiscard]] bool isParticipant() const;
 
 private:
     class Impl;

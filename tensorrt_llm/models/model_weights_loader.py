@@ -71,7 +71,7 @@ class ModelWeightsLoader:
         """Translate TRT-LLM key into HF key or HF key list (e.g. QKV/MoE/GPTQ)
 
         tllm_key will get translated into HF format section by section.
-        If one section is responeded with multiple hf_keys in a list, \
+        If one section is responded with multiple hf_keys in a list, \
         the translated keys will also get multiplied accordingly.
         tllm_key : "transformer.layers.0.attention.  qkv .weight"
                           |        |   |     |        |     |

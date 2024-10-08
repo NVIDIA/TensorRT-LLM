@@ -446,6 +446,11 @@ public:
         return DecodingMode{kExplicitDraftTokens | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
+    static auto constexpr ExternalDraftTokens()
+    {
+        return DecodingMode{kExternalDraftTokens | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+    }
+
     auto constexpr useTemperature(bool useTemp)
     {
         mState = setBitTo(kUseTemperature, useTemp);
@@ -563,6 +568,11 @@ public:
         return anyBitSet(kExplicitDraftTokens);
     }
 
+    [[nodiscard]] bool constexpr isExternalDraftTokens() const
+    {
+        return anyBitSet(kExternalDraftTokens);
+    }
+
     [[nodiscard]] bool constexpr isUseTemperature() const
     {
         return anyBitSet(kUseTemperature);
@@ -676,6 +686,7 @@ private:
     static UnderlyingType constexpr kMedusa{1u << (kNumFlags + 4)};
     static UnderlyingType constexpr kLookahead{1u << (kNumFlags + 5)};
     static UnderlyingType constexpr kExplicitDraftTokens{1u << (kNumFlags + 6)};
+    static UnderlyingType constexpr kExternalDraftTokens{1u << (kNumFlags + 7)};
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
 
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
@@ -706,6 +717,7 @@ static_assert(!DecodingMode::Auto().isBeamSearch());
 static_assert(!DecodingMode::Auto().isMedusa());
 static_assert(!DecodingMode::Auto().isLookahead());
 static_assert(!DecodingMode::Auto().isExplicitDraftTokens());
+static_assert(!DecodingMode::Auto().isExternalDraftTokens());
 
 static_assert(DecodingMode::TopK().isTopK());
 static_assert(DecodingMode::TopK().isTopKorTopP());
@@ -726,6 +738,7 @@ static_assert(!DecodingMode::TopK().isBeamSearch());
 static_assert(!DecodingMode::TopK().isMedusa());
 static_assert(!DecodingMode::TopK().isLookahead());
 static_assert(!DecodingMode::TopK().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopK().isExternalDraftTokens());
 
 static_assert(DecodingMode::TopP().isTopP());
 static_assert(DecodingMode::TopP().isTopKorTopP());
@@ -739,6 +752,7 @@ static_assert(!DecodingMode::TopP().isBeamSearch());
 static_assert(!DecodingMode::TopP().isMedusa());
 static_assert(!DecodingMode::TopP().isLookahead());
 static_assert(!DecodingMode::TopP().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopP().isExternalDraftTokens());
 
 static_assert(DecodingMode::TopKTopP().isTopK());
 static_assert(DecodingMode::TopKTopP().isTopP());
@@ -752,6 +766,7 @@ static_assert(!DecodingMode::TopKTopP().isBeamSearch());
 static_assert(!DecodingMode::TopKTopP().isMedusa());
 static_assert(!DecodingMode::TopKTopP().isLookahead());
 static_assert(!DecodingMode::TopKTopP().isExplicitDraftTokens());
+static_assert(!DecodingMode::TopKTopP().isExternalDraftTokens());
 
 static_assert(DecodingMode::BeamSearch().isBeamSearch());
 static_assert(DecodingMode::BeamSearch().isUseStopCriteria());
@@ -760,6 +775,7 @@ static_assert(!DecodingMode::BeamSearch().isTopKorTopP());
 static_assert(!DecodingMode::BeamSearch().isMedusa());
 static_assert(!DecodingMode::BeamSearch().isLookahead());
 static_assert(!DecodingMode::BeamSearch().isExplicitDraftTokens());
+static_assert(!DecodingMode::BeamSearch().isExternalDraftTokens());
 
 static_assert(!DecodingMode::Medusa().isAuto());
 static_assert(!DecodingMode::Medusa().isTopK());
@@ -775,6 +791,7 @@ static_assert(DecodingMode::Medusa().isUseStopCriteria());
 static_assert(DecodingMode::Medusa().isUsePenalty());
 static_assert(DecodingMode::Medusa().isUseMinLength());
 static_assert(DecodingMode::Medusa().isMedusa());
+static_assert(!DecodingMode::Medusa().isExternalDraftTokens());
 
 static_assert(!DecodingMode::Lookahead().isAuto());
 static_assert(!DecodingMode::Lookahead().isTopK());
@@ -788,6 +805,7 @@ static_assert(DecodingMode::Lookahead().isUseStopCriteria());
 static_assert(DecodingMode::Lookahead().isUseStopWords());
 static_assert(DecodingMode::Lookahead().isUseExplicitEosStop());
 static_assert(DecodingMode::Lookahead().isLookahead());
+static_assert(!DecodingMode::Lookahead().isExternalDraftTokens());
 
 static_assert(!DecodingMode::ExplicitDraftTokens().isAuto());
 static_assert(!DecodingMode::ExplicitDraftTokens().isTopK());
@@ -801,4 +819,19 @@ static_assert(!DecodingMode::ExplicitDraftTokens().isUsePenalty());
 static_assert(DecodingMode::ExplicitDraftTokens().isUseStopCriteria());
 static_assert(!DecodingMode::ExplicitDraftTokens().isUseBanWords());
 static_assert(DecodingMode::ExplicitDraftTokens().isExplicitDraftTokens());
+static_assert(!DecodingMode::ExplicitDraftTokens().isExternalDraftTokens());
+
+static_assert(!DecodingMode::ExternalDraftTokens().isTopK());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopP());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopKorTopP());
+static_assert(!DecodingMode::ExternalDraftTokens().isTopKandTopP());
+static_assert(DecodingMode::ExternalDraftTokens().isUseBanWords());
+static_assert(DecodingMode::ExternalDraftTokens().isUseOccurrencePenalty());
+static_assert(DecodingMode::ExternalDraftTokens().isUseStopCriteria());
+static_assert(!DecodingMode::ExternalDraftTokens().isAuto());
+static_assert(!DecodingMode::ExternalDraftTokens().isBeamSearch());
+static_assert(!DecodingMode::ExternalDraftTokens().isMedusa());
+static_assert(!DecodingMode::ExternalDraftTokens().isLookahead());
+static_assert(!DecodingMode::ExternalDraftTokens().isExplicitDraftTokens());
+static_assert(DecodingMode::ExternalDraftTokens().isExternalDraftTokens());
 } // namespace tensorrt_llm::executor

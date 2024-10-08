@@ -124,7 +124,7 @@ if __name__ == "__main__":
         default=False,
         action="store_true",
         help=
-        "Exclude input token when writing output toekns. Only has effect for streaming=False since in streaming mode, input tokens are never included in output."
+        "Exclude input token when writing output tokens. Only has effect for streaming=False since in streaming mode, input tokens are never included in output."
     )
     parser.add_argument("--max_tokens",
                         type=int,

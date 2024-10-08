@@ -23,18 +23,20 @@
 #include <torch/extension.h>
 #include <vector>
 
-#include "tensorrt_llm/pybind/batch_manager/gptManager.h"
-#include "tensorrt_llm/pybind/batch_manager/inferenceRequest.h"
-#include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
-#include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
-#include "tensorrt_llm/pybind/executor/bindings.h"
-#include "tensorrt_llm/pybind/utils/pathCaster.h"
-
 #include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/pybind/batch_manager/algorithms.h"
+#include "tensorrt_llm/pybind/batch_manager/bindings.h"
+#include "tensorrt_llm/pybind/batch_manager/gptManager.h"
+#include "tensorrt_llm/pybind/batch_manager/inferenceRequest.h"
+#include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
+#include "tensorrt_llm/pybind/executor/bindings.h"
+#include "tensorrt_llm/pybind/utils/pathCaster.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
@@ -333,6 +335,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     tpb::NamedTensor::initBindings(m);
     tpb::LlmRequest::initBindings(m);
+    tb::kv_cache_manager::KVCacheManagerBindings::initBindings(m);
+    tb::BasePeftCacheManagerBindings::initBindings(m);
+
+    tb::LlmRequestBindings::initBindings(m);
 
     auto tensorNames = m.def_submodule("tensor_names");
     // Input tensor names
@@ -412,8 +418,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState))
         .def("__eq__", &tb::TrtGptModelOptionalParams::operator==);
 
-    tpb::GptManager::initBindings(m);
-
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
         .def_property_readonly("gpu", &tr::MemoryCounters::getGpu)
@@ -447,4 +451,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 auto& world = tensorrt_llm::mpi::MpiComm::world();
                 tensorrt_llm::mpi::MpiComm::setSession(world.split(color, rank));
             });
+
+    auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+
+    tensorrt_llm::pybind::batch_manager::initBindings(mInternal);
+    tensorrt_llm::pybind::batch_manager::algorithms::initBindings(mInternal);
+
+    tpb::GptManager::initBindings(m);
 }

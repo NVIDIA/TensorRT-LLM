@@ -1458,7 +1458,7 @@ std::vector<size_t> CutlassMoeFCRunner<T, WeightType, OutputType, ScaleBiasType,
     size_t const softmax_out_size = num_softmax_outs * sizeof(float);
     size_t const permuted_scales_size = mayHaveFinalizeFused() ? num_moe_inputs * sizeof(float) : 0;
     size_t const glu_inter_size = glu_inter_elems * gemm_output_dtype; // May be an intermediate type for quantization
-    size_t const fc1_result_size = interbuf_elems * sizeof(T);         // Acitvation quantizes so back to sizeof(T)
+    size_t const fc1_result_size = interbuf_elems * sizeof(T);         // Activation quantizes so back to sizeof(T)
     size_t const sorter_size = CubKeyValueSorter::getWorkspaceSize(num_rows, num_experts);
     size_t const fc2_result_size = permuted_elems * gemm_output_dtype; // May be an intermediate type for quantization
 

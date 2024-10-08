@@ -65,6 +65,11 @@ public:
         return ret;
     }
 
+    operator runtime::ITensor::SharedPtr()
+    {
+        return mCurrent;
+    }
+
     [[nodiscard]] bool operator==(BlockIterator const& other) const
     {
         return mIdx == other.mIdx && mPool.get() == other.mPool.get();

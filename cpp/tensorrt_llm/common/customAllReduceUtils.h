@@ -21,7 +21,7 @@
 namespace tensorrt_llm::utils::customAllReduceUtils
 {
 
-constexpr size_t NUM_POINTERS_PER_RANK = 4;
+constexpr size_t NUM_POINTERS_PER_RANK = 7;
 
 // WARNING: MUST BE KEPT IN SYNC with tensorrt_llm/plugin/plugin.py
 inline size_t getMaxRequiredWorkspaceSize(int worldSize) noexcept

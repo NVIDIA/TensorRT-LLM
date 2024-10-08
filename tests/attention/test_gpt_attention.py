@@ -680,7 +680,6 @@ class TestFunctional(unittest.TestCase):
             builder_config = builder.create_builder_config(
                 name=attention_type,
                 precision=dtype,
-                opt_level=0,
                 int8=int8_trt_flag,
                 quant_mode=quant_mode)
 

@@ -42,6 +42,11 @@ def parse_arguments(args=None):
     parser.add_argument('--max_input_length', type=int, default=923)
     parser.add_argument('--max_output_len', type=int, required=True)
     parser.add_argument(
+        '--draft_engine_dir',
+        type=str,
+        default=None,
+        help='Path to engine of draft model in Draft-Target-Model mode.')
+    parser.add_argument(
         '--input_text',
         type=str,
         nargs='+',
@@ -168,6 +173,11 @@ def parse_input(tokenizer,
     batch_input_ids = [
         torch.tensor(x, dtype=torch.int32) for x in batch_input_ids
     ]
+
+    logger.debug(f"Input token ids (batch_size = {len(batch_input_ids)}):")
+    for i, input_ids in enumerate(batch_input_ids):
+        logger.debug(f"Request {i}: {input_ids.tolist()}")
+
     return batch_input_ids
 
 
@@ -233,6 +243,7 @@ def print_output(tokenizer,
                              if num_return_sequences > 1 else
                              f'Text {batch_idx} Beam {beam}')
                 print(f'Output [{index_str}]: \"{output_text}\"')
+                logger.debug(str(outputs))
 
     output_ids = output_ids.reshape((-1, output_ids.size(2)))
 
@@ -288,9 +299,229 @@ def print_output(tokenizer,
         np.save(log_probs_file, log_probs_outputs)
 
 
+def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
+                           stop_words_list, bad_words_list, vocab_size):
+    draft_len, draft_device_list, target_device_list, use_logits = ast.literal_eval(
+        args.draft_target_model_config)
+    logger.info(f"draft_len: {draft_len}")
+    logger.info(f"Device(s) for draft model: {draft_device_list}")
+    logger.info(f"Device(s) for target model: {target_device_list}")
+    logger.info(f"Use logits to accept tokens: {use_logits}")
+    # Variables keeping constant during decoding
+    input_batch_size = len(batch_input_ids)  # Note as `BS`
+    beam_width = args.num_beams  # Note as `BW`
+    is_compute_acceptance_ratio = logger.level == 'verbose'  # Only enable in verbose mode
+    input_lengths = [len(p) for p in batch_input_ids]
+    max_seq_lengths = [i + args.max_output_len for i in input_lengths]
+    # Variables changing during decoding
+    n_iteration = 0
+    prefix = batch_input_ids  # Input for draft model
+    batch_slot = list(range(input_batch_size))  # Index of requests
+    if is_compute_acceptance_ratio:
+        n_draft_token = [0 for _ in range(input_batch_size)]
+        n_accept_token = [0 for _ in range(input_batch_size)]
+
+    # Repack the output like the output of function `generate`
+    outputs = {}
+    outputs["output_ids"] = torch.full(
+        [input_batch_size, beam_width,
+         max(max_seq_lengths)],
+        end_id,
+        dtype=torch.int32)
+    for bs in range(input_batch_size):
+        outputs["output_ids"][bs, :, :input_lengths[bs]] = batch_input_ids[bs]
+    outputs["sequence_lengths"] = torch.full([input_batch_size, beam_width],
+                                             0,
+                                             dtype=torch.int32)
+    outputs["context_logits"] = None
+    outputs["generation_logits"] = torch.full(
+        [input_batch_size, beam_width,
+         max(max_seq_lengths), vocab_size],
+        0,
+        dtype=torch.float16)
+    outputs['cum_log_probs'] = None
+    outputs['log_probs'] = None
+
+    # Model runners
+    common_kwargs = dict(
+        lora_dir=args.lora_dir,
+        rank=runtime_rank,
+        debug_mode=args.debug_mode,
+        lora_ckpt_source=args.lora_ckpt_source,
+        gpu_weights_percent=args.gpu_weights_percent,
+        max_output_len=args.max_output_len,
+        is_enc_dec=False,
+        max_batch_size=input_batch_size,
+        max_input_len=max(input_lengths) + args.max_output_len,
+        max_beam_width=beam_width,
+        max_attention_window_size=args.max_attention_window_size,
+        sink_token_length=args.sink_token_length,
+        max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+        kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+        kv_cache_free_gpu_memory_fraction=args.
+        kv_cache_free_gpu_memory_fraction,
+        enable_chunked_context=args.enable_chunked_context,
+        multi_block_mode=args.multi_block_mode,
+        cuda_graph_mode=args.cuda_graph_mode,
+        enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+    )
+    draft_runner_kwargs = common_kwargs.copy()
+    draft_runner_kwargs.update(
+        engine_dir=args.draft_engine_dir,
+        device_ids=draft_device_list,
+    )
+    draft_runner = ModelRunnerCpp.from_dir(**draft_runner_kwargs)
+    target_runner_kwargs = common_kwargs.copy()
+    target_runner_kwargs.update(
+        engine_dir=args.engine_dir,
+        device_ids=target_device_list,
+    )
+    target_runner = ModelRunnerCpp.from_dir(**target_runner_kwargs)
+
+    common_gen_kwargs = dict(
+        max_attention_window_size=args.max_attention_window_size,
+        sink_token_length=args.sink_token_length,
+        end_id=end_id,
+        pad_id=pad_id,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        num_beams=beam_width,
+        num_return_sequences=args.num_return_sequences,
+        length_penalty=args.length_penalty,
+        early_stopping=args.early_stopping,
+        repetition_penalty=args.repetition_penalty,
+        presence_penalty=args.presence_penalty,
+        frequency_penalty=args.frequency_penalty,
+        stop_words_list=stop_words_list,
+        bad_words_list=bad_words_list,
+        random_seed=args.random_seed,
+        streaming=False,
+        output_sequence_lengths=True,
+        return_dict=True,
+    )
+
+    while True:
+        n_iteration += 1
+        batch_size = len(prefix)
+        prefix_len = [len(prefix[i]) for i in range(batch_size)]
+        # Run draft model
+        draft_generation_kwargs = common_gen_kwargs.copy()
+        draft_generation_kwargs.update(
+            batch_input_ids=prefix,
+            max_new_tokens=draft_len,
+            streaming=False,
+            output_sequence_lengths=True,
+            return_dict=True,
+        )
+        draft = draft_runner.generate(**draft_generation_kwargs)
+        torch.cuda.synchronize()
+
+        # draft["output_ids"].shape -> [BS, BW, maxSL]
+        # draft["sequence_lengths"].shape -> [BS, BW]
+        # draft["generation_logits"].shape -> [BS, BW, draft_len, vocab_size]
+        # `d_*` means variables from draft model
+        # Value of `d_seq_len` includes input part, but `draft_len` doesn't
+        d_seq_len = draft["sequence_lengths"][:, 0].tolist()
+        d_len = [d_seq_len[bs] - prefix_len[bs] for bs in range(batch_size)]
+        d_ids = [None] * batch_size
+        if use_logits:
+            assert "generation_logits" in draft.keys(
+            ), "`--gather_generation_logits` must be specified when building TRT engine."
+            d_logits = [None] * batch_size
+        else:
+            d_logits = None
+
+        for bs in range(batch_size):
+            l = prefix_len[bs]
+            r = d_seq_len[bs]
+            d_ids[bs] = draft["output_ids"][bs, 0, l:r].tolist()
+            if use_logits:
+                d_logits[bs] = draft["generation_logits"][bs, 0, :, :]
+
+        # Run target model
+        target_generation_kwargs = common_gen_kwargs.copy()
+        target_generation_kwargs.update(
+            batch_input_ids=prefix,
+            max_new_tokens=draft_len + 1,
+            draft_tokens_list=d_ids,
+            draft_logits_list=d_logits,
+        )
+        target = target_runner.generate(**target_generation_kwargs)
+        torch.cuda.synchronize()
+
+        # `t_*` means variables from target model
+        # Value of `t_seq_len` and `t_seq_ids` includes input part, but `t_len` or `t_ids` doesn't
+        t_seq_len = target["sequence_lengths"][:, 0].tolist()
+        # t_len = [t_seq_len[bs] - prefix_len[bs] for bs in range(batch_size)]
+        t_seq_ids = [None] * batch_size
+        t_ids = [None] * batch_size
+
+        # Update output and tokens for next iteration
+        for bs in range(batch_size):
+            index = batch_slot[bs]  # Get original index in the input batch
+            l = prefix_len[bs]
+            r = min(t_seq_len[bs], max_seq_lengths[index])
+            t_ids[bs] = target["output_ids"][bs, 0, l:r].tolist()
+            t_seq_ids[bs] = target["output_ids"][bs, 0, :r]
+            outputs["output_ids"][index, 0, l:r] = torch.IntTensor(t_ids[bs])
+            outputs["sequence_lengths"][index, 0] = r
+            if use_logits:
+                outputs["generation_logits"][index, 0, (l - input_lengths[bs]):(r - input_lengths[bs])] = \
+                    target["generation_logits"][bs][0,:(r-l)].detach().cpu()
+            if is_compute_acceptance_ratio:
+                n_draft_token[index] += len(d_ids[bs])
+                n_accept_token[index] += sum(d_ids[bs][i] == t_ids[bs][i] \
+                    for i in range(min(d_len[bs], t_seq_len[bs] - prefix_len[bs], max_seq_lengths[index] - prefix_len[bs])))
+
+        # yield output if using streaming
+        if args.streaming and not n_iteration % args.streaming_interval:
+            yield outputs
+
+        # Evaluate stop criteria and prepare inputs for next iteration
+        prefix_next = []
+        batch_slot_next = []
+        for bs in range(batch_size):
+            # Stop due to output length
+            if len(t_seq_ids[bs]) >= max_seq_lengths[batch_slot[bs]]:
+                continue  # No need to update for the stopped requests
+            # Stop due to the same output. Normally target should return 1 more token.
+            # if (d_ids is not None and np.array_equal(d_ids[bs], t_ids[bs])):
+            #     continue
+            # Stop due to no change (hit early stopping)
+            if np.array_equal(t_seq_ids[bs], prefix[bs]):
+                continue
+            # Stop due to end words
+            if end_id in t_seq_ids[bs]:
+                continue
+            # TODO: Check bad words and stop words criteria
+            prefix_next.append(t_seq_ids[bs])
+            batch_slot_next.append(bs)
+        prefix = prefix_next
+        batch_slot = batch_slot_next
+        if len(prefix) == 0:  # Leave while loop if no request remained
+            break
+
+    if is_compute_acceptance_ratio:
+        logger.debug(f"Count of iteration(s): {n_iteration}")
+        logger.debug(f"Acceptance ratio:")
+        for i, (a, d) in enumerate(zip(n_accept_token, n_draft_token)):
+            logger.debug(f"Request {i}: {a / d * 100 :6.2f}%")
+
+    # Return runner in No-Streaming mode
+    if args.streaming:
+        yield outputs
+    else:
+        yield outputs, target_runner
+
+
 def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
+
+    if args.draft_target_model_config is not None:
+        assert args.draft_engine_dir is not None, "Path to draft engine (--draft_engine_dir) must be specified."
+        assert args.engine_dir is not None, "Path to target engine (--engine_dir) must be specified."
 
     # different handling if encoder-decoder models
     is_enc_dec = {'encoder', 'decoder'}.issubset({
@@ -404,88 +635,107 @@ def main(args):
         )
         args.return_all_generated_tokens = True
 
-    runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-    runner_kwargs = dict(
-        engine_dir=args.engine_dir,
-        lora_dir=args.lora_dir,
-        rank=runtime_rank,
-        debug_mode=args.debug_mode,
-        lora_ckpt_source=args.lora_ckpt_source,
-        gpu_weights_percent=args.gpu_weights_percent,
-        max_output_len=args.max_output_len,
-    )
-    if not args.use_py_session:
-        runner_kwargs.update(is_enc_dec=is_enc_dec)
-    if args.medusa_choices is not None:
-        args.medusa_choices = ast.literal_eval(args.medusa_choices)
-        assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
-        assert args.num_beams == 1, "Medusa should use num_beams == 1"
-        runner_kwargs.update(medusa_choices=args.medusa_choices)
-    if args.lookahead_config is not None:
-        args.lookahead_config = ast.literal_eval(args.lookahead_config)
-        assert len(
-            args.lookahead_config
-        ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
-        runner_kwargs.update(lookahead_config=args.lookahead_config)
-    if not args.use_py_session:
-        runner_kwargs.update(
-            max_batch_size=len(batch_input_ids),
-            max_input_len=max(
-                encoder_input_lengths if is_enc_dec else input_lengths),
-            max_beam_width=args.num_beams,
-            max_attention_window_size=args.max_attention_window_size,
-            sink_token_length=args.sink_token_length,
-            max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
-            kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
-            kv_cache_free_gpu_memory_fraction=args.
-            kv_cache_free_gpu_memory_fraction,
-            enable_chunked_context=args.enable_chunked_context,
-            multi_block_mode=args.multi_block_mode,
-            cuda_graph_mode=args.cuda_graph_mode)
-    runner_kwargs.update(
-        enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
-    runner = runner_cls.from_dir(**runner_kwargs)
+    logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    with torch.no_grad():
-        outputs = runner.generate(
-            batch_input_ids=decoder_input_ids
-            if is_enc_dec else batch_input_ids,
-            encoder_input_ids=encoder_input_ids if is_enc_dec else None,
-            encoder_input_features=encoder_input_features
-            if is_enc_dec else None,
-            encoder_output_lengths=encoder_output_lengths
-            if is_enc_dec else None,
-            max_new_tokens=args.max_output_len,
-            max_attention_window_size=args.max_attention_window_size,
-            sink_token_length=args.sink_token_length,
-            end_id=end_id,
-            pad_id=pad_id,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            num_beams=args.num_beams,
-            num_return_sequences=args.num_return_sequences,
-            length_penalty=args.length_penalty,
-            early_stopping=args.early_stopping,
-            repetition_penalty=args.repetition_penalty,
-            presence_penalty=args.presence_penalty,
-            frequency_penalty=args.frequency_penalty,
-            stop_words_list=stop_words_list,
-            bad_words_list=bad_words_list,
-            output_cum_log_probs=(args.output_cum_log_probs_npy != None),
-            output_log_probs=(args.output_log_probs_npy != None),
-            random_seed=args.random_seed,
-            lora_uids=args.lora_task_uids,
-            prompt_table=args.prompt_table_path,
-            prompt_tasks=args.prompt_tasks,
-            streaming=args.streaming,
-            output_sequence_lengths=True,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            return_dict=True,
-            medusa_choices=args.medusa_choices,
-            return_all_generated_tokens=args.return_all_generated_tokens,
-            input_token_extra_ids=input_token_extra_ids)
-        torch.cuda.synchronize()
+    if args.draft_target_model_config is None:  # Normal run except Draft-Target-Model
+        runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
+        runner_kwargs = dict(
+            engine_dir=args.engine_dir,
+            lora_dir=args.lora_dir,
+            rank=runtime_rank,
+            debug_mode=args.debug_mode,
+            lora_ckpt_source=args.lora_ckpt_source,
+            gpu_weights_percent=args.gpu_weights_percent,
+            max_output_len=args.max_output_len,
+        )
+        if not args.use_py_session:
+            runner_kwargs.update(is_enc_dec=is_enc_dec)
+        if args.medusa_choices is not None:
+            args.medusa_choices = ast.literal_eval(args.medusa_choices)
+            assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
+            assert args.num_beams == 1, "Medusa should use num_beams == 1"
+            runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if args.lookahead_config is not None:
+            args.lookahead_config = ast.literal_eval(args.lookahead_config)
+            assert len(
+                args.lookahead_config
+            ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
+            runner_kwargs.update(lookahead_config=args.lookahead_config)
+        if not args.use_py_session:
+            runner_kwargs.update(
+                max_batch_size=len(batch_input_ids),
+                max_input_len=max(
+                    encoder_input_lengths if is_enc_dec else input_lengths),
+                max_beam_width=args.num_beams,
+                max_attention_window_size=args.max_attention_window_size,
+                sink_token_length=args.sink_token_length,
+                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+                kv_cache_free_gpu_memory_fraction=args.
+                kv_cache_free_gpu_memory_fraction,
+                enable_chunked_context=args.enable_chunked_context,
+                multi_block_mode=args.multi_block_mode,
+                cuda_graph_mode=args.cuda_graph_mode)
+        runner_kwargs.update(
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+        runner = runner_cls.from_dir(**runner_kwargs)
+
+        with torch.no_grad():
+            outputs = runner.generate(
+                batch_input_ids=decoder_input_ids
+                if is_enc_dec else batch_input_ids,
+                encoder_input_ids=encoder_input_ids if is_enc_dec else None,
+                encoder_input_features=encoder_input_features
+                if is_enc_dec else None,
+                encoder_output_lengths=encoder_output_lengths
+                if is_enc_dec else None,
+                max_new_tokens=args.max_output_len,
+                max_attention_window_size=args.max_attention_window_size,
+                sink_token_length=args.sink_token_length,
+                end_id=end_id,
+                pad_id=pad_id,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                num_beams=args.num_beams,
+                num_return_sequences=args.num_return_sequences,
+                length_penalty=args.length_penalty,
+                early_stopping=args.early_stopping,
+                repetition_penalty=args.repetition_penalty,
+                presence_penalty=args.presence_penalty,
+                frequency_penalty=args.frequency_penalty,
+                stop_words_list=stop_words_list,
+                bad_words_list=bad_words_list,
+                output_cum_log_probs=(args.output_cum_log_probs_npy != None),
+                output_log_probs=(args.output_log_probs_npy != None),
+                random_seed=args.random_seed,
+                lora_uids=args.lora_task_uids,
+                prompt_table=args.prompt_table_path,
+                prompt_tasks=args.prompt_tasks,
+                streaming=args.streaming,
+                output_sequence_lengths=True,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                return_dict=True,
+                medusa_choices=args.medusa_choices,
+                return_all_generated_tokens=args.return_all_generated_tokens,
+                input_token_extra_ids=input_token_extra_ids)
+            torch.cuda.synchronize()
+
+    else:  # For Draft-Target-Model
+        if not args.kv_cache_enable_block_reuse:
+            logger.warning(
+                "`--kv_cache_enable_block_reuse` must be specified in Draft-Target-Model."
+            )
+        assert not args.use_py_session, "Only CPP session is supported in Draft-Target-Model."
+        assert not is_enc_dec, "Only decoder model is supported in Draft-Target-Model."
+        assert args.num_beams == 1, "Beam width > 1 is not supported in Draft-Target-Model."
+
+        outputs = run_draft_target_model(batch_input_ids, args, runtime_rank,
+                                         end_id, pad_id, stop_words_list,
+                                         bad_words_list, tokenizer.vocab_size)
+
+        if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
+            outputs, runner = list(outputs)[0]
 
     if args.streaming:
         for curr_outputs in throttle_generator(outputs,

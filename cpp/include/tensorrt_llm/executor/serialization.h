@@ -95,6 +95,11 @@ public:
     static void serialize(Tensor const& tensor, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(Tensor const& tensor);
 
+    // SpeculativeDecodingFastLogitsInfo
+    [[nodiscard]] static SpeculativeDecodingFastLogitsInfo deserializeSpecDecFastLogitsInfo(std::istream& is);
+    static void serialize(SpeculativeDecodingFastLogitsInfo const& info, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(SpeculativeDecodingFastLogitsInfo const& info);
+
     // Result
     [[nodiscard]] static Result deserializeResult(std::istream& is);
     static void serialize(Result const& result, std::ostream& os);

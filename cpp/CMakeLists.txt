@@ -316,6 +316,8 @@ endif()
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
+add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+
 include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
@@ -323,7 +325,8 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include)
+  ${3RDPARTY_DIR}/json/include
+  ${3RDPARTY_DIR}/pybind11/include)
 
 # TRT dependencies
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})

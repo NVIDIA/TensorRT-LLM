@@ -335,6 +335,18 @@ void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) 
 #endif // ENABLE_MULTI_DEVICE
 }
 
+bool MpiComm::improbe(int source, int tag, MPI_Message* msg, MPI_Status* status) const
+{
+#if ENABLE_MULTI_DEVICE
+    int flag{0};
+    MPICHECK(MPI_Improbe(source, tag, mComm, &flag, msg, status));
+    return flag != 0;
+#else
+    TLLM_THROW("Multi device support is disabled.");
+    return false;
+#endif
+}
+
 bool MpiComm::iprobe(int source, int tag, MPI_Status* status) const
 {
 #if ENABLE_MULTI_DEVICE

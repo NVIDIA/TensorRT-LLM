@@ -489,7 +489,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto const maxAttentionWindow = maxSeqLength;
     SizeType32 const sinkTokenLength{0};
 
-    auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
+    auto const decodingMode = tle::DecodingMode::ExternalDraftTokens(); // only supports bw=1
 
     // set up decoder
     auto decoder
@@ -518,13 +518,10 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     decoder.forward(outputs, inputs);
 
     advanceSequenceLengths(expectedLengths, acceptedTokensPerStep, samplingConfigs, batchSize, maxBeamWidth);
-    // WAR: we don't write endId back into outputIds when we rejected tokens,
-    // so we adjust the lengths for verifyResults here
-    advanceSequenceLengths(generatedLengths, advancedTokensPerStep, samplingConfigs, batchSize, maxBeamWidth);
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(false));
 
-    verifyResults(manager, decoder, samplingConfigs, inputLengths, generatedLengths, batchSize, maxBeamWidth,
+    verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
         maxSeqLength, tokenId, padId);
 }
 

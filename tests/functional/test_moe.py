@@ -1022,8 +1022,7 @@ class TestMoE(unittest.TestCase):
                                  network,
                                  precision=trt_dtype_to_str(dtype),
                                  int8=weight_dtype == trt.int8,
-                                 quant_mode=quant_mode,
-                                 opt_level=4)
+                                 quant_mode=quant_mode)
         return session
 
     def generate_reference(self, inputs, k, actfn, weight_dtype, quant_mode,

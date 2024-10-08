@@ -90,7 +90,15 @@ def main(*,
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
 
-    if not (project_dir / "3rdparty/cutlass/.git").exists():
+    # Get all submodules and check their folder exists. If not,
+    # invoke git submodule update
+    with open(project_dir / ".gitmodules", "r") as submodules_f:
+        submodules = [
+            l.split("=")[1].strip() for l in submodules_f.readlines()
+            if "path = " in l
+        ]
+    if any(not (project_dir / submodule / ".git").exists()
+           for submodule in submodules):
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"

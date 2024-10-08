@@ -196,11 +196,11 @@ __device__ void epilogue(SizeType32 batchId, SizeType32 currentStep, SizeType32 
 }
 
 template <typename T, int blockSize>
-__global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenIdType** ids, SizeType32* sequenceLength,
-    FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs,
-    SizeType32 const* beginOffsetBuf, SizeType32 const* offsetBuf, SizeType32 vocabSize, curandState_t* curandState,
-    float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize, bool const* skipDecode,
-    SizeType32 const* batchSlots)
+__global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenIdType* ids, TokenIdType** idsPtrs,
+    SizeType32* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
+    float* outputLogProbs, SizeType32 const* beginOffsetBuf, SizeType32 const* offsetBuf, SizeType32 vocabSize,
+    curandState_t* curandState, float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize,
+    bool const* skipDecode, SizeType32 const* batchSlots, bool returnAllTopP, SizeType32 maxSeqLen)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -235,14 +235,16 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     }
 
     auto const probThreshold = topPs[batchSlot];
-    auto const currentStep = sequenceLength[batchSlot];
+    auto const currentStep = sequenceLength == nullptr ? 0 : sequenceLength[batchSlot];
+    auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
 
     // With P in (0.0; 1.0] we draw a random number P' in range (0.0; P]
     // We will sum all probs moving from the largest probability to the smallest and
     // will choose the token which probability makes cumulative probability sum to exceed P'
     if (threadIdx.x == 0)
     {
-        randNumS = curand_uniform(curandState + blockIdx.x) * probThreshold;
+        // if we want to return all top p indices, we should not do random sampling for probThreshold
+        randNumS = returnAllTopP ? probThreshold : curand_uniform(curandState + blockIdx.x) * probThreshold;
     }
 
     // if beginOffsetBuf and offsetBuf of sorting have same value,
@@ -253,8 +255,15 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
         if (tid == 0)
         {
             auto offset = batchId * vocabSize;
-            epilogue(batchSlot, currentStep, offset, ids, sortedIdVals, sortedProbs, cumLogProbs, outputLogProbs,
-                endIds, sequenceLength, finishedOutput, maxBatchSize);
+            if (returnAllTopP)
+            {
+                outputIdsRequestPtr[currentStep] = sortedIdVals[offset];
+            }
+            else
+            {
+                epilogue(batchSlot, currentStep, offset, idsPtrs, sortedIdVals, sortedProbs, cumLogProbs,
+                    outputLogProbs, endIds, sequenceLength, finishedOutput, maxBatchSize);
+            }
         }
         return;
     }
@@ -267,7 +276,7 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     __syncthreads();
 
     auto offset = batchId * vocabSize;
-    ids[batchSlot][currentStep] = sortedIdVals[offset];
+    outputIdsRequestPtr[currentStep] = sortedIdVals[offset];
     auto end = ((vocabSize + blockSize - 1) / blockSize) * blockSize;
     SizeType32 selectedTokenId = 0;
     // Cumulative sum
@@ -285,11 +294,31 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
         }
     }
 
-    // select first thread exceeded the prob threshold or the last thread in case of P=1.0f
-    if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
+    if (returnAllTopP)
     {
-        epilogue(batchSlot, currentStep, offset + selectedTokenId, ids, sortedIdVals, sortedProbs, cumLogProbs,
-            outputLogProbs, endIds, sequenceLength, finishedOutput, maxBatchSize);
+        __shared__ SizeType32 sharedSelectedTokenId;
+        if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
+        {
+            sharedSelectedTokenId = selectedTokenId;
+        }
+        __syncthreads();
+        for (int vi = tid; vi <= sharedSelectedTokenId; vi += blockSize)
+        {
+            outputIdsRequestPtr[vi] = sortedIdVals[offset + vi];
+        }
+        if (tid == 0 && sharedSelectedTokenId != end - 1)
+        {
+            outputIdsRequestPtr[sharedSelectedTokenId + 1] = -1; // a boundary to record the end of all selected top Ps.
+        }
+    }
+    else
+    {
+        // select first thread exceeded the prob threshold or the last thread in case of P=1.0f
+        if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
+        {
+            epilogue(batchSlot, currentStep, offset + selectedTokenId, idsPtrs, sortedIdVals, sortedProbs, cumLogProbs,
+                outputLogProbs, endIds, sequenceLength, finishedOutput, maxBatchSize);
+        }
     }
 }
 
@@ -371,9 +400,10 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     dim3 grid(params.batchSize);
     // Sample with Top P given sorted tokens
     topPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(sortedProbs, sortedIdVals,
-        params.outputIds, params.sequenceLength, params.finishedInput, params.finishedOutput, params.cumLogProbs,
-        params.outputLogProbs, beginOffsetBuf, offsetBuf + 1, params.vocabSizePadded, params.curandState, params.topPs,
-        params.endIds, params.maxBatchSize, params.skipDecode, params.batchSlots);
+        params.outputIds, params.outputIdsPtrs, params.sequenceLength, params.finishedInput, params.finishedOutput,
+        params.cumLogProbs, params.outputLogProbs, beginOffsetBuf, offsetBuf + 1, params.vocabSizePadded,
+        params.curandState, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode, params.batchSlots,
+        params.returnAllTopP, params.maxSeqLen);
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
