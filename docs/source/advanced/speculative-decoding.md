@@ -304,7 +304,7 @@ For guidance on constructing and executing Medusa with the Python runtime, consu
 
 - TensorRT-LLM supports Medusa only for Vicuna (fine tuned LLaMA).
 However, similar to any new model, you can follow the same approach to define your own Medusa model and deploy with TensorRT-LLM.
-- We match only tokens during the validation phasem that is `medusa_temperature=0`.
+- We match only tokens during the validation phase that is `medusa_temperature=0`.
 - Beam search is **not** compatible with Medusa.
 
 
