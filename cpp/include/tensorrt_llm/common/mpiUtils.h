@@ -28,6 +28,7 @@
 #endif
 
 #include <cstdlib>
+#include <cstdint>
 #include <memory>
 
 #if ENABLE_MULTI_DEVICE
