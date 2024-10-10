@@ -267,4 +267,4 @@ dedicated MPI environment, not the one provided by your Slurm allocation.
 
 For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
 
-It's critical that it's always `-n 1` regardless of how many GPUs are being used. If you'd use `-n 2` for a 2 GPU program it will not work. `mpirun` here isn't being used to orchestration multiple processes, but to invoke the right environment on SLURM.
+It's critical that it's always `-n 1` regardless of how many GPUs are being used. If you'd use `-n 2` for a 2 GPU program it will not work. `mpirun` here isn't being used to orchestrate multiple processes, but to invoke the right environment on SLURM. The internal MPI implementation deals with spawning the additional processes.
