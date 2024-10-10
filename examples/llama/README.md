@@ -48,7 +48,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-  * FP16
+  * BF16/FP16
   * FP8
   * INT8 & INT4 Weight-Only
   * SmoothQuant
