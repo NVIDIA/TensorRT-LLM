@@ -131,6 +131,8 @@ def weight_only_groupwise_quantize(model,
         init_params["zero"] = quant_config.has_zero_point
         init_params[
             "use_w4a8_awq"] = quant_config.quant_algo == QuantAlgo.W4A8_AWQ
+        init_params[
+            "use_int8_weight"] = quant_config.quant_algo == QuantAlgo.W8A16_GPTQ
         init_params["tp_rank"] = model_cfg.mapping.tp_rank
 
     model = quantize_layers(

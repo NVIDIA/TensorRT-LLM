@@ -29,8 +29,9 @@ from .._utils import QuantModeWrapper, int32_array
 from ..functional import (AllReduceFusionParams, _add_plugin_info,
                           _create_tensor, allreduce, cast, concat, constant,
                           div, expand, gather_nd, is_gated_activation,
-                          non_gated_version, nonzero, repeat_interleave,
-                          scatter_nd, shape, softmax, split, sum, topk)
+                          non_gated_version, nonzero, reduce_scatter,
+                          repeat_interleave, scatter_nd, shape, softmax, split,
+                          sum, topk)
 from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -503,7 +504,8 @@ class MixtureOfExperts(Module):
                 hidden_states,
                 finished=None,
                 lora_layer_params=None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+                last_local_layer_residual=None):
         moe_router_lora_params = None
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
@@ -513,7 +515,8 @@ class MixtureOfExperts(Module):
         output = self.forward_experts(hidden_states, routing, finished,
                                       lora_layer_params)
         if self.use_all_reduce:
-            output = self.forward_allreduce(output, reduce_fusion_params)
+            output = self.forward_allreduce(output, reduce_fusion_params,
+                                            last_local_layer_residual)
         return output
 
     def forward_experts(self, hidden_states, routing, finished,
@@ -593,9 +596,25 @@ class MixtureOfExperts(Module):
 
         return output
 
-    def forward_allreduce(
-            self, output,
-            reduce_fusion_params: Optional[AllReduceFusionParams]):
+    def forward_allreduce(self,
+                          output,
+                          reduce_fusion_params: Optional[AllReduceFusionParams],
+                          last_local_layer_residual=None):
+
+        if last_local_layer_residual is not None:
+            if self.mapping.tp_rank == 0:
+                output = output + last_local_layer_residual
+            else:
+                # we need to add this line here to minimize the numerical difference
+                output = output + 0
+            # reshape to (-1)
+            output = output.view(concat([-1]))
+            if self.tp_size > 1 and self.tp_group is not None:
+                output = reduce_scatter(output, self.tp_group)
+            # reshape to (-1, hidden_size // tp_size)
+            output = output.view(concat([-1, self.hidden_size // self.tp_size]))
+            return output
+
         if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
                                self.tp_group,
@@ -852,6 +871,7 @@ class SharedMoE(Module):
                  mapping: Mapping = Mapping(),
                  bias: bool = True,
                  dtype=None,
+                 quant_mode=QuantMode(0),
                  **kwargs):
         super().__init__()
 
@@ -862,6 +882,7 @@ class SharedMoE(Module):
         self.mapping = mapping
         self.bias = bias
         self.dtype = dtype
+        self.quant_mode = quant_mode
 
         self.moe = MOE(hidden_size=self.hidden_size,
                        moe_config=self.moe_config,
@@ -871,7 +892,8 @@ class SharedMoE(Module):
                        dtype=self.dtype,
                        bias=False,
                        tp_group=self.mapping.tp_group,
-                       tp_size=self.mapping.tp_size)
+                       tp_size=self.mapping.tp_size,
+                       quant_mode=self.quant_mode)
         ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
         self.shared_experts = ClsMLP(
             hidden_size=self.hidden_size,
@@ -880,7 +902,8 @@ class SharedMoE(Module):
             bias=False,
             dtype=self.dtype,
             tp_group=self.mapping.tp_group,
-            tp_size=self.mapping.tp_size)
+            tp_size=self.mapping.tp_size,
+            quant_mode=self.quant_mode)
 
     def forward(self, hidden_states):
         if self.moe_config.num_shared_experts > 0:

@@ -48,7 +48,7 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
 
     auto const batchId = bid / BLOCKS_PER_BEAM_; // row id for logProbs
-    auto const batchSlot = batchSlots[batchId];
+    auto const batchSlot = batchSlots == nullptr ? batchId : batchSlots[batchId];
     if (tokensPerStep != nullptr && tokenIdx >= tokensPerStep[batchSlot])
     {
         return;
@@ -63,7 +63,6 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
     auto const logBufIndex = batchId * maxTokensPerStep * vocabSize + tokenIdx * vocabSize;
     auto logProbsSlot
         = logProbsPtrs == nullptr ? logProbs + logBufIndex : logProbsPtrs[batchId * maxTokensPerStep + tokenIdx];
-
     auto const blockLane = bid % BLOCKS_PER_BEAM_;                  // block id for a beam
     auto const k = (topKs != nullptr) ? topKs[batchSlot] : maxTopK; // batchId = batch index
 
@@ -77,7 +76,7 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
 
     if (finished != nullptr && finishState.isFinished())
     {
-        if (tid < k)
+        if (tid < k && endIds != nullptr) // if returnAllSelectedToken, endIds would not be an input
         {
             auto const index = tmpTopKBufIndex + tid;
             if (blockLane == 0 && tid == 0)
@@ -134,7 +133,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType32 vocabSize,
     bool const* skipDecode, SizeType32 const* batchSlots, SizeType32 maxBatchSize, bool normalizeLogProbs,
     bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep, SizeType32 maxSeqLen,
-    bool returnAllTopK)
+    bool returnAllSelectedTokens)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;
     T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
@@ -142,7 +141,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const tid = static_cast<SizeType32>(threadIdx.x);
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
-    auto const batchSlot = batchSlots[batchIdx];
+    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
     FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
     if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
@@ -215,13 +214,16 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
 
     if (tid == 0)
     {
-        auto randNum = static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
+        // if we want to return all top k indices, we should not do random sampling for probThreshold
+        auto randNum = (returnAllSelectedTokens || curandState == nullptr)
+            ? static_cast<float>(probThreshold * sSum)
+            : static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
         auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
         for (SizeType32 ki = 0; ki < k; ki++)
         {
             auto expLogit = sVal2[ki];
             randNum = randNum - expLogit;
-            if (randNum <= 0.0f || ki == k - 1 || returnAllTopK)
+            if (randNum <= 0.0f || ki == k - 1 || returnAllSelectedTokens)
             {
                 auto idx = sId[ki];
                 // If sId is -1 here we force output token to the last from vocabulary to get vivid indicator of smth
@@ -230,10 +232,10 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     ? topKTmpIdBuf[(batchIdx * maxTokensPerStep + tokenIdx) * stride + idx] % vocabSize
                     : vocabSize - 1;
                 auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
-                auto const outIdx = returnAllTopK ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
+                auto const outIdx = returnAllSelectedTokens ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
                 outputIdsRequestPtr[outIdx] = outputId;
-                // cum log prob is not supported with returnAllTopK
-                if (!returnAllTopK)
+                // cum log prob is not supported with returnAllSelectedTokens
+                if (!returnAllSelectedTokens)
                 {
                     if (cumLogProbs != nullptr || outputLogProbs != nullptr)
                     {
@@ -255,9 +257,17 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     }
                     break;
                 }
+                if (returnAllSelectedTokens && randNum <= 0.0f)
+                {
+                    if (ki < k - 1)
+                    { // not the last k, write a -1 to to log top p tokens boundary for external draft token masking
+                        outputIdsRequestPtr[outIdx + 1] = -1;
+                    }
+                    break;
+                }
             }
         }
-        if (maxTokensPerStep == 1 && !returnAllTopK && sequenceLengths != nullptr && finishedOutput != nullptr
+        if (maxTokensPerStep == 1 && !returnAllSelectedTokens && sequenceLengths != nullptr && finishedOutput != nullptr
             && endIds != nullptr)
         {
             auto const seqLen = sequenceLengths[batchSlot];
@@ -297,7 +307,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     params.maxTopK, params.topKs, params.maxTopP, params.topPs, params.curandState, params.endIds,     \
                     params.vocabSizePadded, params.skipDecode, params.batchSlots, params.maxBatchSize,                 \
                     params.normalizeLogProbs, params.logitsHasProbs, params.tokensPerStep, params.maxTokensPerStep,    \
-                    params.maxSeqLen, params.returnAllTopK);                                                           \
+                    params.maxSeqLen, params.returnAllSelectedTokens);                                                 \
         }                                                                                                              \
     } while (0)
 

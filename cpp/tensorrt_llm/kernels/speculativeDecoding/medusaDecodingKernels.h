@@ -26,46 +26,87 @@
 namespace tensorrt_llm::kernels::speculative_decoding
 {
 
+template <typename T>
+struct AcceptDraftTokensByIdsWithPathsParams
+{
+    //! output buffer [maxBatchSize, maxSeqLen], input tokens.
+    runtime::TokenIdType* outputIds{nullptr};
+    //! input buffer [maxBatchSize, maxDecodingTokens], draft tokens
+    runtime::TokenIdType const* draftIds{nullptr};
+    //! input buffer [maxBatchSize, maxDecodingTokens], tokens predicted from the target medusa head
+    runtime::TokenIdType const* targetIds{nullptr};
+    //! input/output buffer [maxBatchSize], optional.
+    //! Length of the data in outputIds without draft tokens.
+    //! If set, incrememnted according to the accepted length.
+    runtime::SizeType32* sequenceLengths{nullptr};
+    //! output buffer [maxBatchSize], length of the data accepted tokens
+    runtime::SizeType32* acceptedLengths{nullptr};
+    //! input buffer [maxBatchSize], optional. Finished states per request
+    FinishedState* finishedFinal{nullptr};
+    //! input buffer [batchSize], optional. Address map from local index
+    //! to global index [0, batchSize] -> [0, maxBatchSize].
+    //! If nullptr, batchIdx is used.
+    runtime::SizeType32 const* batchSlots{nullptr};
+    //! input buffer [maxBatchSize, maxDecodingTokens, maxDraftPathLen+1],
+    //! paths to restore sequences from outputIds and targetIds. Should be filled with -1 for everything that is not
+    //! path.
+    runtime::SizeType32 const* paths{nullptr};
+    //! input buffer [maxBatchSize], optional. EOS ids per request.
+    //! No EOS checks if nullptr.
+    runtime::TokenIdType const* endIds{nullptr};
+    //! input buffer [maxDraftPathLen, maxBatchSize, maxDecodingTokens, vocabSize], optional.
+    //! Pointer to the logits from medusa heads.
+    T const** medusaLogits{nullptr};
+    //! output buffer [batchSize, maxDraftPathLen], optional. Contains pointers to the
+    //! respective rows of the medusaLogits for the next after the accepted token
+    T const** logitsPtrs{nullptr};
+    //! current tokens to compute per step will be updated to
+    //! targetTokensPerStep if curTokensPerStep == 1
+    runtime::SizeType32* curTokensPerStep{nullptr};
+    //! target values of tokens to compute per step
+    runtime::SizeType32 const* targetTokensPerStep{nullptr};
+    //! output buffer [maxBatchSize], indices of the selected paths
+    runtime::SizeType32* bestPathIds{nullptr};
+    //! current batch size
+    runtime::SizeType32 batchSize{0};
+    //! maximum batch size
+    runtime::SizeType32 maxBatchSize{0};
+    //! vocab size
+    runtime::SizeType32 vocabSize{0};
+    //! maximum sequence length of output ids
+    runtime::SizeType32 maxSeqLen{0};
+    //! maximum number of medusa heads
+    runtime::SizeType32 maxDraftPathLen{0};
+    //! maximum number of tokens per step configured in the system
+    runtime::SizeType32 maxDecodingTokens{0};
+    //! stream
+    cudaStream_t stream;
+
+    void checkParams() const
+    {
+        TLLM_CHECK(outputIds);
+        TLLM_CHECK(draftIds);
+        TLLM_CHECK(targetIds);
+        TLLM_CHECK(acceptedLengths);
+        TLLM_CHECK(paths);
+        TLLM_CHECK(bestPathIds);
+        TLLM_CHECK((curTokensPerStep == nullptr) ^ (targetTokensPerStep == nullptr) == 0);
+        TLLM_CHECK((medusaLogits == nullptr) ^ (logitsPtrs == nullptr) == 0);
+
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(batchSize <= maxBatchSize);
+        TLLM_CHECK(vocabSize > 0);
+        TLLM_CHECK(maxSeqLen > 0);
+        TLLM_CHECK(maxDraftPathLen > 0);
+        TLLM_CHECK(maxDecodingTokens > 0);
+    }
+};
+
 //! \brief verifies draft medusa tokens given target tokens. Modifies outputIds tensor accordingly filling it with
 //! accepted tokens. Fills logitsPtrs tensor with the pointers to the respective medusa logits tensor according
 //! to the next after the last accepted token.
-//!
-//! \param outputIds output buffer [maxBatchSize, maxSeqLen], input tokens.
-//! \param draftIds input buffer [maxBatchSize, maxDecodingTokens], draft tokens
-//! \param targetIds input buffer [maxBatchSize, maxDecodingTokens], tokens predicted from the target medusa head
-//! \param sequenceLengths input/output buffer [maxBatchSize], length of the data in outputIds without draft tokens
-//! Incrememnted according to the accepted length
-//! \param acceptedLengths output buffer [maxBatchSize], length of the data accepted tokens
-//! \param finishedFinal input buffer [maxBatchSize], finished states per request
-//! \param batchSlots input buffer [batchSize], address map from local index
-//! to global index [0, batchSize] -> [0, maxBatchSize]
-//! \param paths input buffer [maxBatchSize, maxDecodingTokens, maxNumHeads+1],
-//! paths to restore sequences from outputIds and targetIds. Should be filled with -1 for everything that is not path.
-//! \param endIds input buffer [maxBatchSize], EOS ids per request
-//! \param medusaLogits input buffer [maxNumHeads, maxBatchSize, maxDecodingTokens, vocabSize], pointer
-//! to the logits from medusa heads
-//! \param logitsPtrs output buffer [batchSize, maxNumHeads], contains pointers to the
-//! respective rows of the medusaLogits for the next after the accepted token
-//! \param curTokensPerStep current tokens to compute per step will be updated to
-//! targetTokensPerStep if curTokensPerStep == 1
-//! \param targetTokensPerStep target values of tokens to compute per step
-//! \param bestPathIds output buffer [maxBatchSize], indices of the selected paths
-//! \param batchSize current batch size
-//! \param maxBatchSize maximum batch size
-//! \param vocabSize vocab size
-//! \param maxSeqLen maximum sequence length of output ids
-//! \param maxNumHeads maximum number of medusa heads
-//! \param maxDecodingTokens maximum number of tokens per step configured in the system
-//! \param stream stream
 template <typename T>
-void acceptDraftTokensByIdsWithPaths(runtime::TokenIdType* outputIds, runtime::TokenIdType const* draftIds,
-    runtime::TokenIdType const* targetIds, runtime::SizeType32* sequenceLengths, runtime::SizeType32* acceptedLengths,
-    FinishedState* finishedFinal, runtime::SizeType32 const* batchSlots, runtime::SizeType32 const* paths,
-    runtime::TokenIdType const* endIds, T const** medusaLogits, T const** logitsPtrs,
-    runtime::SizeType32* curTokensPerStep, runtime::SizeType32 const* targetTokensPerStep,
-    runtime::SizeType32* bestPathIds, runtime::SizeType32 batchSize, runtime::SizeType32 maxBatchSize,
-    runtime::SizeType32 vocabSize, runtime::SizeType32 maxSeqLen, runtime::SizeType32 maxNumHeads,
-    runtime::SizeType32 maxDecodingTokens, cudaStream_t stream);
+void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<T> const&);
 
 //! \brief assembles draft tokens to treeDraftIds from sourceDraftIds using indices of treeIds
 //!

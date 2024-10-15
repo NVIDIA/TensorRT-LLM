@@ -147,7 +147,8 @@ class SmoothQuantLinear(Linear):
         x = smooth_quant_gemm(x, self.weight.value, per_token_scale,
                               self.per_channel_scale.value,
                               self.quant_mode.has_per_token_dynamic_scaling(),
-                              self.quant_mode.has_per_channel_scaling())
+                              self.quant_mode.has_per_channel_scaling(),
+                              self.dtype)
 
         if self.bias is not None:
             x = x + self.bias.value
@@ -211,7 +212,8 @@ class SmoothQuantRowLinear(RowLinear):
         x = smooth_quant_gemm(x, self.weight.value, per_token_scale,
                               self.per_channel_scale.value,
                               self.quant_mode.has_per_token_dynamic_scaling(),
-                              self.quant_mode.has_per_channel_scaling())
+                              self.quant_mode.has_per_channel_scaling(),
+                              self.dtype)
 
         if self.tp_size > 1 and self.tp_group is not None:
             need_bias = self.bias is not None
@@ -594,6 +596,7 @@ class WeightOnlyQuantLinear(Linear):
         self.tp_rank = tp_rank
         if self.is_padded:
             self.tp_dim = -1
+        self.quant_mode = quant_mode
 
     def forward(self, x, lora_runtime_params=None):
         # ootb has not supported int4 yet.
@@ -677,6 +680,7 @@ class WeightOnlyQuantRowLinear(RowLinear):
         self.tp_rank = tp_rank
         if self.is_padded:
             self.tp_dim = -1
+        self.quant_mode = quant_mode
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         hidden_state = x
@@ -794,6 +798,7 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         tp_rank=0,
         gather_output=True,
         use_w4a8_awq=False,
+        use_int8_weight=False,
         is_qkv=False,
     ):
         multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
@@ -819,11 +824,17 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         ZERO = 2
         PRE_QUANT_SCALE = 4
         W4A8_AWQ = 8
+        INT8_WEIGHT = 16
 
-        self.quant_algo = use_w4a8_awq * W4A8_AWQ + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
+        self.quant_algo = (use_int8_weight * INT8_WEIGHT +
+                           use_w4a8_awq * W4A8_AWQ +
+                           pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO +
+                           bias * BIAS)
         self.group_size = group_size
+        # packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
+        pack_ratio = 2 if use_int8_weight else 4
         self.weight = Parameter(shape=(self.in_features,
-                                       self.out_features // 4),
+                                       self.out_features // pack_ratio),
                                 dtype=dtype)
 
         scale_shape = (self.in_features // group_size, self.out_features)
@@ -831,6 +842,8 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         self.tp_rank = tp_rank
         if self.is_padded:
             self.tp_dim = -1
+        self.pre_quant_scale = pre_quant_scale
+        self.use_w4a8_awq = use_w4a8_awq
 
         if pre_quant_scale:
             self.prequant_scaling_factor = Parameter(shape=(1,
@@ -898,20 +911,19 @@ WeightOnlyGroupwiseQuantColumnLinear = WeightOnlyGroupwiseQuantLinear
 
 class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
 
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        group_size=128,
-        pre_quant_scale=False,
-        zero=False,
-        bias=False,
-        dtype=None,
-        tp_group=None,
-        tp_size=1,
-        tp_rank=0,
-        use_w4a8_awq=False,
-    ):
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 group_size=128,
+                 pre_quant_scale=False,
+                 zero=False,
+                 bias=False,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 use_w4a8_awq=False,
+                 use_int8_weight=False):
         multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
         self.is_padded = False
         if in_features % multiple > 0:
@@ -932,18 +944,25 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         ZERO = 2
         PRE_QUANT_SCALE = 4
         W4A8_AWQ = 8
+        INT8_WEIGHT = 16
 
-        self.quant_algo = use_w4a8_awq * W4A8_AWQ + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
+        self.quant_algo = (use_int8_weight * INT8_WEIGHT +
+                           use_w4a8_awq * W4A8_AWQ +
+                           pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO +
+                           bias * BIAS)
         self.group_size = group_size
+        # packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
+        pack_ratio = 2 if use_int8_weight else 4
         self.weight = Parameter(shape=(self.in_features,
-                                       self.out_features // 4),
+                                       self.out_features // pack_ratio),
                                 dtype=dtype)
-
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
         self.tp_rank = tp_rank
         if self.is_padded:
             self.tp_dim = -1
+        self.pre_quant_scale = pre_quant_scale
+        self.use_w4a8_awq = use_w4a8_awq
 
         if pre_quant_scale:
             self.prequant_scaling_factor = Parameter(shape=(1,
@@ -1762,10 +1781,7 @@ class SmoothQuantAttention(Module):
         reduce_fusion_params: Optional[AllReduceFusionParams] = None,
     ):
         assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
-        if default_net().plugin_config.smooth_quant_gemm_plugin:
-            qkv = self.qkv(hidden_states)
-        else:
-            raise ValueError("smooth_quant_gemm_plugin is not set")
+        qkv = self.qkv(hidden_states)
 
         alibi_slopes = None
         if self.position_embedding_type == PositionEmbeddingType.alibi:

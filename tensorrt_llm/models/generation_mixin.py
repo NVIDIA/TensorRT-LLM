@@ -519,7 +519,8 @@ class GenerationMixin:
             max_draft_len=0,
             multiple_profiles: bool = False,
             streamingllm: bool = False,
-            opt_batch_size=None):
+            opt_batch_size=None,
+            pp_reduce_scatter: bool = False):
 
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin=use_gpt_attention_plugin,
@@ -581,13 +582,14 @@ class GenerationMixin:
             else:
                 assert dtype is not None
                 assert num_heads is not None
+                pp_hidden_size = hidden_size // mapping.tp_size if pp_reduce_scatter else hidden_size
                 hidden_states = Tensor(
                     name='hidden_states_input',
                     dtype=dtype,
-                    shape=[-1, hidden_size],
+                    shape=[-1, pp_hidden_size],
                     dim_range=OrderedDict([
                         ('num_tokens', num_tokens_range),
-                        ('hidden_size', [hidden_size] * num_profiles),
+                        ('hidden_size', [pp_hidden_size] * num_profiles),
                     ]),
                 )
 

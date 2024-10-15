@@ -13,8 +13,8 @@ from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import (VALID_QUANT_ALGOS, VALID_COMPUTE_DTYPES)
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.hlapi import LLM
-from tensorrt_llm.hlapi.llm_utils import QuantConfig
+from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -250,7 +250,7 @@ def build_command(
         f"Quantization:\t\t\t{quantization}\n"
         "===========================================================\n")
 
-    # Build the LLM engine with the HLAPI.
+    # Build the LLM engine with the LLMAPI.
     logger.set_level("error")
     llm = LLM(bench_env.model,
               tokenizer,
@@ -258,7 +258,8 @@ def build_command(
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,
               build_config=build_config,
-              quant_config=quant_config)
+              quant_config=quant_config,
+              workspace=bench_env.workspace)
     # Save the engine.
     llm.save(engine_dir)
     llm._shutdown()

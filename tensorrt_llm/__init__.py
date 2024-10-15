@@ -45,7 +45,7 @@ from ._utils import (mpi_rank, mpi_world_size, str_dtype_to_trt,
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .functional import Tensor, constant
-from .hlapi.llm import LLM, LlmArgs, SamplingParams
+from .llmapi.llm import LLM, LlmArgs, SamplingParams
 from .logger import logger
 from .mapping import Mapping
 from .models.automodel import AutoConfig, AutoModelForCausalLM

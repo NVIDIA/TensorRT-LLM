@@ -167,13 +167,13 @@ def log_mel_spectrogram(
         assert isinstance(audio,
                           np.ndarray), f"Unsupported audio type: {type(audio)}"
         duration = audio.shape[-1] / SAMPLE_RATE
-        audio = pad_or_trim(audio, N_SAMPLES)
         audio = audio.astype(np.float32)
         audio = torch.from_numpy(audio)
 
     if device is not None:
         audio = audio.to(device)
     if padding > 0:
+        # pad to N_SAMPLES
         audio = F.pad(audio, (0, padding))
     window = torch.hann_window(N_FFT).to(audio.device)
     stft = torch.stft(audio,

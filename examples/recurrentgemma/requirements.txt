@@ -1,5 +1,5 @@
 --extra-index-url https://pypi.nvidia.com
-tensorrt_llm==0.14.0.dev2024100800
+tensorrt_llm==0.15.0.dev2024101500
 git+https://github.com/google-deepmind/recurrentgemma.git
 flax>=0.8.2
 jax~=0.4.23

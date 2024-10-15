@@ -15,9 +15,9 @@ from openai.types.chat import ChatCompletionMessageParam
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 # yapf: disable
-from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig
-from tensorrt_llm.hlapi.llm import RequestOutput
-from tensorrt_llm.hlapi.openai_protocol import (
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.openai_protocol import (
     ChatCompletionLogProbs, ChatCompletionLogProbsContent,
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,

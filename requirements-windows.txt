@@ -20,7 +20,7 @@ tensorrt~=10.4.0
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch==2.4.0+cu124
-nvidia-modelopt~=0.15.0
+nvidia-modelopt[torch]~=0.17.0
 transformers>=4.38.2
 wheel
 optimum

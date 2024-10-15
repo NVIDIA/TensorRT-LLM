@@ -3920,6 +3920,29 @@ def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
     return x
 
 
+def reduce_scatter(tensor: Tensor, group: List[int]) -> Tensor:
+
+    plg_creater = trt.get_plugin_registry().get_plugin_creator(
+        'ReduceScatter', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creater is not None
+
+    p_dtype = default_net().plugin_config.nccl_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    group = trt.PluginField("group", np.array(group, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([group, pf_type])
+
+    reduce_scatter_plug = plg_creater.create_plugin("reduce_scatter", pfc)
+    plug_inputs = [tensor.cast(p_dtype).trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, reduce_scatter_plug)
+    _add_plugin_info(layer, plg_creater, "reduce_scatter", pfc)
+
+    return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
+
+
 def send(tensor: Tensor, tgt: int) -> Tensor:
     '''
     Add an operation that performs a send from a rank to another.

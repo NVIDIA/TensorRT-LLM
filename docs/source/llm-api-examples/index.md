@@ -13,6 +13,7 @@ The LLM API can be used for both offline or online usage. See more examples of t
 * [LLM Generate Async Streaming](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_generate_async_streaming.html)
 * [LLM Quantization](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_quantization.html)
 * [LLM Auto Parallel](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_auto_parallel.html)
+* [LLM Logits Processor](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_logits_processor.html)
 
 For more details on how to fully utilize this API, check out:
 

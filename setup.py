@@ -129,7 +129,7 @@ setup(
             'trtllm-bench=tensorrt_llm.commands.bench:main',
         ],
     },
-    scripts=['tensorrt_llm/hlapi/trtllm-hlapi-launch'],
+    scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
         "benchmarking": [

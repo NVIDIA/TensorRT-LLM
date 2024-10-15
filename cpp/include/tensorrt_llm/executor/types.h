@@ -297,6 +297,8 @@ struct IterationStats
     double iterLatencyMS;
     /// @brief The total time spent in queue by the requests that became active in this iteration (ms)
     double newActiveRequestsQueueLatencyMS;
+    /// @brief Number of new fetched active requests
+    SizeType32 numNewActiveRequests;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
     /// @brief Number of queued requests
@@ -364,6 +366,12 @@ struct RequestStats
     bool paused;
     /// @brief Stats specific to disaggregated serving
     std::optional<DisServingRequestStats> disServingStats;
+    /// @brief Number of total allocated blocks per request
+    SizeType32 allocTotalBlocksPerRequest;
+    /// @brief Number of newly allocated blocks per request
+    SizeType32 allocNewBlocksPerRequest;
+    /// @brief Number of reused blocks per request
+    SizeType32 reusedBlocksPerRequest;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration

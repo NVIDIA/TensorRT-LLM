@@ -1,4 +1,4 @@
-# Apps examples with GenerationExecutor / High-level API
+# Apps examples with GenerationExecutor / LLM API
 ## OpenAI API
 [openai_server.py](./openai_server.py) is an OpenAI compatible server which supports `v1/version`, `v1/completions` and `v1/chat/completions`. [openai_client.py](./openai_client.py) is a simple example using OpenAI client to query your model. To start the server, you can run
 ```

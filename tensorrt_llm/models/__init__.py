@@ -20,10 +20,12 @@ from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
+from .commandr.model import CohereForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .deepseek_v1.model import DeepseekForCausalLM
 from .dit.model import DiT
+from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
@@ -97,6 +99,7 @@ __all__ = [
     'PretrainedModel',
     'WhisperEncoder',
     'MambaForCausalLM',
+    'MambaConfig',
     'MPTForCausalLM',
     'MPTModel',
     'SkyworkForCausalLM',
@@ -107,7 +110,9 @@ __all__ = [
     'RecurrentGemmaForCausalLM',
     'CogVLMConfig',
     'CogVLMForCausalLM',
+    'EagleForCausalLM',
     'SpeculativeDecodingMode',
+    'CohereForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -163,4 +168,6 @@ MODEL_MAP = {
     'DiT': DiT,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
+    'EagleForCausalLM': EagleForCausalLM,
+    'CohereForCausalLM': CohereForCausalLM,
 }

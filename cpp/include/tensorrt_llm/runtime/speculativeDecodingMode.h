@@ -50,6 +50,11 @@ public:
         return SpeculativeDecodingMode{kExplicitDraftTokens};
     }
 
+    static auto constexpr Eagle()
+    {
+        return SpeculativeDecodingMode{kEagle};
+    }
+
     [[nodiscard]] bool constexpr isNone() const
     {
         return anyBitSet(kNone);
@@ -75,29 +80,34 @@ public:
         return anyBitSet(kExplicitDraftTokens);
     }
 
+    [[nodiscard]] bool constexpr isEagle() const
+    {
+        return anyBitSet(kEagle);
+    }
+
     [[nodiscard]] bool constexpr updatesPositionIds() const
     {
-        return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens);
+        return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens | kEagle);
     }
 
     [[nodiscard]] bool constexpr requiresAttentionMask() const
     {
-        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens);
+        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens | kEagle);
     }
 
     [[nodiscard]] bool constexpr predictsDraftTokens() const
     {
-        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens);
+        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens | kEagle);
     }
 
     [[nodiscard]] bool constexpr needsKVCacheRewind() const
     {
-        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens);
+        return anyBitSet(kLookaheadDecoding | kMedusa | kExplicitDraftTokens | kEagle);
     }
 
     [[nodiscard]] bool constexpr variableDraftLength() const
     {
-        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens | kLookaheadDecoding);
+        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens | kLookaheadDecoding | kEagle);
     }
 
     [[nodiscard]] bool constexpr hasDraftLogits() const
@@ -107,7 +117,7 @@ public:
 
     [[nodiscard]] bool constexpr needsDecoderPrologue() const
     {
-        return anyBitSet(kExplicitDraftTokens | kLookaheadDecoding);
+        return anyBitSet(kExplicitDraftTokens | kLookaheadDecoding | kEagle);
     }
 
     using UnderlyingType = std::uint8_t;
@@ -129,6 +139,7 @@ private:
     static UnderlyingType constexpr kMedusa{1U << 2U};
     static UnderlyingType constexpr kLookaheadDecoding{1U << 3U};
     static UnderlyingType constexpr kExplicitDraftTokens{1U << 4U};
+    static UnderlyingType constexpr kEagle{1U << 5U};
 
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
     {
@@ -172,5 +183,12 @@ static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isNone());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isMedusa());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isLookaheadDecoding());
+
+static_assert(SpeculativeDecodingMode::Eagle().isEagle());
+static_assert(!SpeculativeDecodingMode::Eagle().isNone());
+static_assert(!SpeculativeDecodingMode::Eagle().isDraftTokensExternal());
+static_assert(!SpeculativeDecodingMode::Eagle().isMedusa());
+static_assert(!SpeculativeDecodingMode::Eagle().isExplicitDraftTokens());
+static_assert(!SpeculativeDecodingMode::Eagle().isLookaheadDecoding());
 
 } // namespace tensorrt_llm::runtime

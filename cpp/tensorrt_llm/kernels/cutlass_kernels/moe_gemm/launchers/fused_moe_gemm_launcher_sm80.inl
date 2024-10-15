@@ -74,7 +74,6 @@ void sm80_generic_fused_moe_gemm_kernelLauncher(ElementType_ const* A, CutlassWe
     int occupancy = std::min(2, fused_moe::fused_gemm_maximum_active_blocks<GemmType>());
     int const threadblock_count = multi_processor_count * occupancy;
     TLLM_CHECK_WITH_INFO(occupancy > 0, "GPU lacks the shared memory resources to run fused_moe kernel");
-    GemmType gemm;
     using Arguments = typename GemmType::Arguments;
     Arguments args{{const_cast<ElementType_*>(A), const_cast<CutlassWeightType_*>(B), const_cast<ElementType_*>(biases),
                        reinterpret_cast<ElementType_*>(C), total_tokens_including_expert, static_cast<int>(gemm_n),

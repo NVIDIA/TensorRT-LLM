@@ -1,9 +1,11 @@
 import asyncio
 import atexit
 import concurrent.futures
+import copy
 import datetime
 import io
 import json
+import os
 import secrets
 import time
 import traceback
@@ -22,11 +24,12 @@ import torch
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
 from .builder import ConfigEncoder, Engine, EngineConfig
-from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
-                                external_mpi_comm_available, find_free_port,
-                                need_spawn_mpi_workers)
-from .hlapi.utils import ManagedThread, SamplingParams
+from .llmapi.mpi_session import (MpiPoolSession, MpiSession,
+                                 external_mpi_comm_available, find_free_port,
+                                 need_spawn_mpi_workers)
+from .llmapi.utils import ManagedThread, SamplingParams
 from .lora_manager import LoraManager
+from .prompt_adapter_manager import PromptAdapterManager
 from .runtime import ModelConfig
 from .runtime.model_runner import _engine_config_to_model_config
 
@@ -46,7 +49,8 @@ class LoRARequest:
     lora_path: str = ""
 
     def __post_init__(self):
-        assert self.lora_path, "lora_path cannot be empty"
+        if not os.path.exists(self.lora_path):
+            raise RuntimeError(f"lora_path ({self.lora_path}) does not exist.")
 
     @property
     def adapter_id(self):
@@ -61,6 +65,34 @@ class LoRARequest:
         return self.lora_path
 
 
+@dataclass(slots=True)
+class PromptAdapterRequest:
+    """
+    Request for a Prompt adapter.
+    """
+    prompt_adapter_name: str
+    prompt_adapter_id: int
+    prompt_adapter_local_path: str = ""
+
+    def __post_init__(self):
+        if not os.path.exists(self.prompt_adapter_local_path):
+            raise RuntimeError(
+                f"prompt_adapter_local_path ({self.prompt_adapter_local_path}) does not exist."
+            )
+
+    @property
+    def adapter_id(self):
+        return self.prompt_adapter_id
+
+    @property
+    def name(self):
+        return self.prompt_adapter_name
+
+    @property
+    def local_path(self):
+        return self.prompt_adapter_local_path
+
+
 class GenerationRequest:
 
     def __init__(
@@ -68,6 +100,7 @@ class GenerationRequest:
         prompt_token_ids: Union[torch.Tensor, np.ndarray, list],
         sampling_params: SamplingParams,
         lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
     ):
         if isinstance(prompt_token_ids, list):
@@ -81,6 +114,7 @@ class GenerationRequest:
 
         self.sampling_params = sampling_params
         self.lora_request = lora_request
+        self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
         self.id = -1
 
@@ -445,6 +479,7 @@ class GenerationExecutor(ABC):
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
         lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
@@ -456,6 +491,7 @@ class GenerationExecutor(ABC):
             GenerationRequest(prompt_token_ids,
                               sampling_params=sampling_params,
                               lora_request=lora_request,
+                              prompt_adapter_request=prompt_adapter_request,
                               streaming=streaming))
         return result
 
@@ -464,6 +500,8 @@ class GenerationExecutor(ABC):
         prompt_token_ids: Union[List[int], List[List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]],
         lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
+        prompt_adapter_request: Optional[Union[
+            PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -483,9 +521,14 @@ class GenerationExecutor(ABC):
                 lora_req = lora_request[i]
             else:
                 lora_req = lora_request
+            if isinstance(prompt_adapter_request, list):
+                pa_req = prompt_adapter_request[i]
+            else:
+                pa_req = prompt_adapter_request
             future = self.generate_async(p,
                                          sampling_params=sp,
                                          lora_request=lora_req,
+                                         prompt_adapter_request=pa_req,
                                          streaming=False)
             futures.append(future)
 
@@ -640,20 +683,19 @@ class ExecutorBindingsWorker(GenerationExecutor):
             engine = engine[self.rank]
 
         if isinstance(engine, Engine):
-            engine.regularize_managed_weights()
             self.engine = tllm.Executor(engine.engine,
                                         json.dumps(engine.config.to_dict(),
                                                    cls=ConfigEncoder),
                                         tllm.ModelType.DECODER_ONLY,
                                         executor_config=executor_config,
-                                        managed_weights=engine.managed_weights
-                                        or {})
+                                        managed_weights=engine.managed_weights)
         else:
             self.engine = tllm.Executor(engine,
                                         tllm.ModelType.DECODER_ONLY,
                                         executor_config=executor_config)
 
         self._lora_manager: Optional[LoraManager] = None
+        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
         if self.rank == 0:
             if isinstance(engine, Engine):
@@ -661,10 +703,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
             else:
                 engine_config = EngineConfig.from_json_file(
                     f"{engine}/config.json")
+            self._runtime_model_config = _engine_config_to_model_config(
+                engine_config)
             if engine_config.build_config.plugin_config.lora_plugin:
-                self._runtime_model_config = _engine_config_to_model_config(
-                    engine_config)
                 self._lora_manager = LoraManager()
+            if engine_config.build_config.max_prompt_embedding_table_size > 0:
+                self._prompt_adapter_manager = PromptAdapterManager()
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
@@ -790,10 +834,17 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
-            [lora_request.lora_path],
+            [lora_request.path],
             model_config=self._runtime_model_config,
             runtime_mapping=None,
             uids=[str(lora_request.adapter_id)])
+
+    def _load_prompt_adapter(self,
+                             prompt_adapter_request: PromptAdapterRequest):
+        self._prompt_adapter_manager.load_from_ckpt(
+            [prompt_adapter_request.local_path],
+            model_config=self._runtime_model_config,
+            uids=[str(prompt_adapter_request.adapter_id)])
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         if self._lora_manager is not None and request.lora_request is not None:
@@ -806,8 +857,21 @@ class ExecutorBindingsWorker(GenerationExecutor):
         else:
             lora_config = None
 
+        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        if request.prompt_adapter_request is not None:
+            self._load_prompt_adapter(request.prompt_adapter_request)
+            uid = str(request.prompt_adapter_request.adapter_id)
+            prompt_tuning_config = tllm.PromptTuningConfig(
+                self._prompt_adapter_manager.uid_to_weights[uid])
+            vocab_size = self._runtime_model_config.vocab_size
+            pa_length = prompt_tuning_config.embedding_table.size(0)
+            prompt_token_ids = list(range(
+                vocab_size, vocab_size + pa_length)) + prompt_token_ids
+        else:
+            prompt_tuning_config = None
+
         executor_request = tllm.Request(
-            input_token_ids=request.prompt_token_ids,
+            input_token_ids=prompt_token_ids,
             max_tokens=request.sampling_params.max_tokens,
             max_new_tokens=request.sampling_params.max_new_tokens,
             streaming=request.streaming,
@@ -820,8 +884,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
             embedding_bias=request.sampling_params.embedding_bias,
             external_draft_tokens_config=request.sampling_params.
             external_draft_tokens_config,
-            prompt_tuning_config=request.sampling_params.prompt_tuning_config,
             lora_config=lora_config,
+            prompt_tuning_config=prompt_tuning_config,
             logits_post_processor_name=request.sampling_params.
             logits_post_processor_name,
         )

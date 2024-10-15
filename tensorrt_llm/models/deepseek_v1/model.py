@@ -60,18 +60,14 @@ class DeepseekDecoderLayer(Module):
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
-            tp_rank=config.mapping.tp_rank)
+            tp_rank=config.mapping.tp_rank,
+            quant_mode=config.quant_mode)
 
         ClsMLP = GatedMLP
-
-        moe_config = MoeConfig(num_experts=config.moe_num_experts,
-                               moe_intermediate_size=config.moe_inter_size,
-                               num_shared_experts=config.moe_num_shared_experts,
-                               top_k=config.moe_top_k,
-                               normalization_mode=config.moe_renorm_mode)
+        moe_config = MoeConfig.from_dict(config.moe)
 
         mlp_kwargs = {}
-        if config.moe_num_experts > 0 and layer_idx > 0:
+        if moe_config.num_experts > 0 and layer_idx > 0:
             mlp_hidden_size = moe_config.num_shared_experts * moe_config.moe_intermediate_size
             hidden_act = config.hidden_act
             ClsMLP = SharedMoE
@@ -89,6 +85,7 @@ class DeepseekDecoderLayer(Module):
                           bias=False,
                           tp_group=config.mapping.tp_group,
                           tp_size=config.mapping.tp_size,
+                          quant_mode=config.quant_mode,
                           **mlp_kwargs)
 
         ### Pose layernorm in Deepseek v1 is same as Llama             )

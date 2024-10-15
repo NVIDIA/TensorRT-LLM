@@ -116,6 +116,24 @@ For pure C++ runtime, there is no example given yet. Please check the [`Executor
 
 For pure Python runtime, you can simply add the `--use_py_session` option.
 
+#### Advanced Usage
+
+`--padding_strategy`
+OpenAI's official Whisper models accept WAV files of up to 30 seconds in length. For files shorter than 30 seconds, padding is required to reach the 30-second mark, which may not be efficient. Currently, three padding strategies are supported:
+
+1. **max (default)**: Pads to 30 seconds.
+2. **longest**: Pads according to the longest duration in the current batch.
+3. **zero**: No padding is applied. You will need to fine-tune the Whisper model to maintain accuracy. See [examples](https://github.com/k2-fsa/icefall/blob/master/egs/aishell/ASR/whisper/whisper_encoder_forward_monkey_patch.py#L15).
+
+`--text_prefix`
+You can modify the input prompt for the Whisper decoder. For example, use `<|startoftranscript|><|en|><|zh|><|transcribe|><|notimestamps|>` to perform code-switching ASR between Chinese and English.
+
+`--compute_cer`
+Calculates the character error rate (CER) instead of the word error rate (WER) for languages such as Chinese and Japanese.
+
+`--dataset`, `--dataset_name`, and `--dataset_split`
+These options allow you to select different decoding audio datasets from Hugging Face.
+
 ### Distil-Whisper
 TensorRT-LLM also supports using [distil-whisper's](https://github.com/huggingface/distil-whisper) different models by first converting their params and weights from huggingface's naming format to [openai whisper](https://github.com/openai/whisper) naming format.
 You can do so by running the script [distil_whisper/convert_from_distil_whisper.py](./convert_from_distil_whisper.py) as follows:

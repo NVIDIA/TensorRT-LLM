@@ -161,11 +161,6 @@ def parse_arguments():
         "The profiling verbosity for the generated TensorRT engine. Setting to detailed allows inspecting tactic choices and kernel parameters."
     )
     parser.add_argument(
-        '--builder_force_num_profiles',
-        type=int,
-        default=None,
-        help="If specified, force to use the number of profiles.")
-    parser.add_argument(
         '--strip_plan',
         default=False,
         action='store_true',
@@ -217,6 +212,10 @@ def parse_arguments():
         help=
         "Run through the build process except the actual Engine build for debugging."
     )
+    parser.add_argument('--monitor_memory',
+                        default=False,
+                        action='store_true',
+                        help="Enable memory monitor during Engine build.")
 
     logits_parser = parser.add_argument_group("Logits arguments")
     logits_parser.add_argument('--logits_dtype',
@@ -273,10 +272,8 @@ def parse_arguments():
     spec_parser.add_argument('--speculative_decoding_mode',
                              default=None,
                              choices=[
-                                 "draft_tokens_external",
-                                 "lookahead_decoding",
-                                 "medusa",
-                                 "explicit_draft_tokens",
+                                 "draft_tokens_external", "lookahead_decoding",
+                                 "medusa", "explicit_draft_tokens", "eagle"
                              ],
                              help="Mode of speculative decoding.")
     spec_parser.add_argument(
@@ -334,6 +331,8 @@ def build_model(
     architecture = model_config.architecture
     assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
         "StreamingLLM is only supported in the llama model."
+    assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
+        "PP reduce scatter is only supported in the mixtral model."
     real_rank = rank
 
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
@@ -517,6 +516,18 @@ def main():
         else:
             cluster_config = infer_cluster_config()
 
+        # This should only be used for debugging.
+        # The env var BUILDER_FORCE_NUM_PROFILES should override the number of
+        # optimization profiles during TRT build.
+        # BUILDER_FORCE_NUM_PROFILES must be less than or equal to the number of
+        # optimization profiles set by model's prepare_inputs().
+        force_num_profiles_from_env = os.environ.get(
+            "BUILDER_FORCE_NUM_PROFILES", None)
+        if force_num_profiles_from_env is not None:
+            logger.warning(
+                f"Overriding # of builder profiles <= {force_num_profiles_from_env}."
+            )
+
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
@@ -530,7 +541,7 @@ def main():
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
                 'strongly_typed': True,
-                'force_num_profiles': args.builder_force_num_profiles,
+                'force_num_profiles': force_num_profiles_from_env,
                 'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,
                 'enable_debug_output': args.enable_debug_output,
@@ -556,6 +567,7 @@ def main():
                 'visualize_network': args.visualize_network,
                 'max_encoder_input_len': args.max_encoder_input_len,
                 'weight_streaming': args.weight_streaming,
+                'monitor_memory': args.monitor_memory,
             },
             plugin_config=plugin_config)
 

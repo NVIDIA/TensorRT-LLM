@@ -15,7 +15,7 @@
 import os
 import sys
 import unittest
-from itertools import product
+from itertools import chain, product
 
 import _utils
 import numpy as np
@@ -37,7 +37,8 @@ class TestSmoothQuantGemm(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    def _sq_gemm(self, m, n, k, dtype, per_token_scaling, per_channel_scaling):
+    def _sq_gemm(self, m, n, k, dtype, per_token_scaling, per_channel_scaling,
+                 use_plugin):
         # Init operands for multiplication in int32
         shape1 = (m, k)
         mat1 = torch.randint(-128, 128, shape1, dtype=torch.int8)
@@ -60,11 +61,11 @@ class TestSmoothQuantGemm(unittest.TestCase):
 
         # Create builder
         builder = tensorrt_llm.Builder()
-        builder.strongly_typed = False  # Test need to run in weekly typed mode
         # Create empty network
         network = builder.create_network()
         # Allow SQ plugin of dtype type
-        network.plugin_config.smooth_quant_gemm_plugin = dtype
+        if use_plugin:
+            network.plugin_config.smooth_quant_gemm_plugin = dtype
         with tensorrt_llm.net_guard(network):
             # Init TensorRT-LLM tensor for mat1
             x = Tensor(name='x',
@@ -75,18 +76,13 @@ class TestSmoothQuantGemm(unittest.TestCase):
                        shape=mat2.shape,
                        dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
             # Init TensorRT-LLM tensor for per token scaling
-            scale_a = Tensor(
-                name='scale_a',
-                shape=scale_a_torch.shape,
-                dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+            scale_a = tensorrt_llm.functional.constant(scale_a_torch.numpy())
             # Init TensorRT-LLM tensor for per channel scaling
-            scale_b = Tensor(
-                name='scale_b',
-                shape=scale_b_torch.shape,
-                dtype=tensorrt_llm._utils.str_dtype_to_trt("float32"))
+            scale_b = tensorrt_llm.functional.constant(scale_b_torch.numpy())
             # Get output tensor for SQ gemm
             output = smooth_quant_gemm(x, y, scale_a, scale_b,
-                                       per_token_scaling, per_channel_scaling)
+                                       per_token_scaling, per_channel_scaling,
+                                       dtype)
             output.mark_output('output', dtype)
 
         # TODO: When dtype=int32, per_token_scaling=False, per_channel_scaling=False,
@@ -95,19 +91,14 @@ class TestSmoothQuantGemm(unittest.TestCase):
         engine = EngineFromNetwork(
             (builder.trt_builder, network.trt_network),
             config=CreateConfig(
-                int8=True,
-                fp16=(dtype == "float16"),
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
 
         # Infer engine
         with TrtRunner(engine) as runner:
-            outputs = runner.infer(
-                feed_dict={
-                    'x': mat1.numpy(),
-                    'y': mat2.numpy(),
-                    'scale_a': scale_a_torch.numpy(),
-                    'scale_b': scale_b_torch.numpy()
-                })
+            outputs = runner.infer(feed_dict={
+                'x': mat1.numpy(),
+                'y': mat2.numpy(),
+            })
 
         ref = _utils.gt_matmul_smooth_quant(mat1,
                                             mat2,
@@ -118,34 +109,25 @@ class TestSmoothQuantGemm(unittest.TestCase):
 
         np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
 
-    @parameterized.expand(product(["float16", "float32", "int32"],
-                                  [True, False], [True, False]),
+    @parameterized.expand(chain(
+        product(["float16", "float32", "int32"], [True, False], [True, False],
+                [True]),
+        product(["float16", "float32"], [True, False], [True, False], [False])),
                           name_func=unittest_name_func)
     @skip_pre_ampere  # SmoothQuant is not supported in pre-Ampere
-    def test_matmul(self, dtype, per_token_scaling, per_channel_scaling):
+    def test_matmul(self, dtype, per_token_scaling, per_channel_scaling,
+                    use_plugin):
         bs = 2
         inseq = 16
         hidden_size = 768
 
         # qkv_gemm
         self._sq_gemm(bs * inseq, 3 * hidden_size, hidden_size, dtype,
-                      per_token_scaling, per_channel_scaling)
+                      per_token_scaling, per_channel_scaling, use_plugin)
 
         # mlp_gemm_1
         self._sq_gemm(bs * inseq, 4 * hidden_size, hidden_size, dtype,
-                      per_channel_scaling, per_token_scaling)
-
-    def test_sq_matmul_no_plugin(self):
-        # Create builder
-        builder = tensorrt_llm.Builder()
-        # Create empty network
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-            # SQ Gemm ootb should fail
-            with self.assertRaisesRegex(
-                    TypeError,
-                    "Smooth Quant GEMM is only supported with plugin"):
-                smooth_quant_gemm(None, None, None, None, False, False)
+                      per_channel_scaling, per_token_scaling, use_plugin)
 
 
 if __name__ == '__main__':

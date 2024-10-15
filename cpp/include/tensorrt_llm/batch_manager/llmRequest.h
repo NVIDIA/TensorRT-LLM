@@ -201,6 +201,7 @@ public:
         , mDecodingIter(0)
         , mPriority(req.getPriority())
         , mFinishReasons(mSamplingConfig.beamWidth)
+        , mEncoderInputFeatures(std::nullopt)
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mInputTokenExtraIds(std::nullopt)
@@ -263,7 +264,8 @@ public:
         auto pTuningConfig = req.getPromptTuningConfig();
         if (pTuningConfig)
         {
-            mPromptEmbeddingTable = executor::detail::toITensor(pTuningConfig.value().getEmbeddingTable());
+            mPromptEmbeddingTable = tensorrt_llm::runtime::ITensor::view(
+                executor::detail::toITensor(pTuningConfig.value().getEmbeddingTable()));
             TLLM_CHECK(mPromptEmbeddingTable.value()->getShape().nbDims == 2);
             mPromptVocabSize = mPromptEmbeddingTable.value()->getShape().d[0];
             mPromptEmbeddingTable.value()->unsqueeze(0);
@@ -1438,6 +1440,36 @@ public:
             0.0, std::chrono::duration<double, std::milli>(mKvCacheTransferEnd - mKvCacheTransferStart).count());
     }
 
+    void updateAllocTotalBlocksPerRequest(SizeType32 allocTotalBlocksPerRequest)
+    {
+        mAllocTotalBlocksPerRequest += allocTotalBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getAllocTotalBlocksPerRequest() const
+    {
+        return mAllocTotalBlocksPerRequest;
+    }
+
+    void updateAllocNewBlocksPerRequest(SizeType32 allocNewBlocksPerRequest)
+    {
+        mAllocNewBlocksPerRequest += allocNewBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getAllocNewBlocksPerRequest() const
+    {
+        return mAllocNewBlocksPerRequest;
+    }
+
+    void updateReusedBlocksPerRequest(SizeType32 reusedBlocksPerRequest)
+    {
+        mReusedBlocksPerRequest += reusedBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getReusedBlocksPerRequest() const
+    {
+        return mReusedBlocksPerRequest;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1544,6 +1576,10 @@ protected:
 
     std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferStart;
     std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferEnd;
+
+    SizeType32 mAllocTotalBlocksPerRequest{0};
+    SizeType32 mAllocNewBlocksPerRequest{0};
+    SizeType32 mReusedBlocksPerRequest{0};
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)

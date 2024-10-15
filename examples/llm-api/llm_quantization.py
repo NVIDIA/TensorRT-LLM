@@ -4,7 +4,7 @@ import logging
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.hlapi import QuantAlgo, QuantConfig
+from tensorrt_llm.llmapi import QuantAlgo, QuantConfig
 
 major, minor = torch.cuda.get_device_capability()
 post_ada = major > 8 or (major == 8 and minor >= 9)

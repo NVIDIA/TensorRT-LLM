@@ -79,7 +79,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4', 'int4_gptq', 'int4_awq'],
+        choices=['int8', 'int4', 'int8_gptq', 'int4_gptq', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -254,15 +254,36 @@ def parse_arguments():
     return args
 
 
+def precision_to_config(precision, group_size, quant_config) -> QuantConfig:
+    '''update config dict for weight-only quantization
+    '''
+    quant_config = QuantConfig()
+    precision_to_algo = {
+        'int8': QuantAlgo.W8A16,
+        'int4': QuantAlgo.W4A16,
+        'int8_gptq': QuantAlgo.W8A16_GPTQ,
+        'int4_gptq': QuantAlgo.W4A16_GPTQ,
+        'int4_awq': QuantAlgo.W4A16_AWQ
+    }
+    quant_config.quant_algo = precision_to_algo.get(precision)
+    if precision in {'int4_gptq', 'int8_gptq'}:
+        quant_config.group_size = group_size
+        quant_config.has_zero_point = True
+        quant_config.pre_quant_scale = False
+    elif precision == 'int4_awq':
+        quant_config.group_size = group_size
+        quant_config.has_zero_point = False
+        quant_config.pre_quant_scale = True
+    return quant_config
+
+
 def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
     if args.use_weight_only:
-        if args.weight_only_precision == 'int8':
-            quant_config.quant_algo = QuantAlgo.W8A16
-        elif args.weight_only_precision == 'int4':
-            quant_config.quant_algo = QuantAlgo.W4A16
+        quant_config = precision_to_config(args.weight_only_precision,
+                                           args.group_size, quant_config)
     elif args.use_fp8:
         quant_config.quant_algo = QuantAlgo.FP8
     elif args.smoothquant:
@@ -287,18 +308,6 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
 
     if args.fp8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-
-    if args.weight_only_precision == 'int4_gptq':
-        quant_config.group_size = args.group_size
-        quant_config.has_zero_point = True
-        quant_config.pre_quant_scale = False
-        quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
-
-    if args.weight_only_precision == 'int4_awq':
-        quant_config.group_size = args.group_size
-        quant_config.has_zero_point = False
-        quant_config.pre_quant_scale = True
-        quant_config.quant_algo = QuantAlgo.W4A16_AWQ
 
     return quant_config
 
@@ -443,11 +452,13 @@ def convert_and_save_hf(args):
                 load_by_shard=load_by_shard,
                 **override_fields,
             )
-            print(f'Total time of reading and converting {time.time()-tik} s')
+            print(
+                f'Total time of reading and converting: {time.time()-tik:.3f} s'
+            )
             tik = time.time()
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
-            print(f'Total time of saving checkpoint {time.time()-tik} s')
+            print(f'Total time of saving checkpoint: {time.time()-tik:.3f} s')
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
         release_gc()
@@ -505,7 +516,7 @@ def main():
         assert args.model_dir is not None
         assert (
             args.quant_ckpt_path is not None
-            and args.weight_only_precision == 'int4_gptq'
+            and args.weight_only_precision in {'int4_gptq', 'int8_gptq'}
         ) or args.quant_ckpt_path is None, "only gptq weights only needs this option"
         convert_and_save_hf(args)
 

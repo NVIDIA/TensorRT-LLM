@@ -25,7 +25,7 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
-                                     slice, transpose)
+                                     transpose, unsqueeze)
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
                                  AttentionParams, BertAttention, ColumnLinear,
                                  Conv1d, Embedding, FusedGatedMLP, GatedMLP,
@@ -1887,11 +1887,9 @@ class WhisperEncoder(PretrainedModel):
                             stride=2,
                             padding=1,
                             dtype=self._conv_dtype)
-        self.downsample_factor = 2
-
-        self.positional_embedding = Parameter(shape=(config.n_audio_ctx,
-                                                     config.hidden_size),
-                                              dtype=self._dtype)
+        self.position_embedding = Embedding(self.config.max_position_embeddings,
+                                            self.config.hidden_size,
+                                            dtype=self.config.dtype)
         self.encoder_layers = ModuleList([
             EncoderLayer(
                 hidden_size=config.hidden_size,
@@ -1899,7 +1897,6 @@ class WhisperEncoder(PretrainedModel):
                 num_attention_heads=config.num_attention_heads,
                 num_kv_heads=config.num_attention_heads,
                 head_size=config.hidden_size // config.num_attention_heads,
-                max_position_embeddings=3000,
                 q_scaling=1.0,
                 has_attention_qkvo_bias=True,
                 has_mlp_bias=True,
@@ -1909,14 +1906,15 @@ class WhisperEncoder(PretrainedModel):
 
         self.ln_post = LayerNorm(config.hidden_size, dtype=self._dtype)
         self.max_audio_feature_seq_len = 3000
+        self.downsample_factor = 2
 
-    def forward(self, input_features: Tensor, input_lengths=None):
+    def forward(self,
+                input_features: Tensor,
+                input_lengths=None,
+                position_ids=None):
         if default_net().plugin_config.remove_input_padding:
-            # BXT,D -> B,T,D -> B,D,T
-            input_features = input_features.view([
-                input_lengths.shape[0], self.max_audio_feature_seq_len,
-                self.config.n_mels
-            ])
+            # BXT,D -> 1,BxT,D -> 1,D,BxT
+            input_features = unsqueeze(input_features, 0)
             input_features = transpose(input_features, 1, 2)
         # Encoder conv needs to run in fp32 on Volta/Turing
         x_type = input_features.dtype
@@ -1927,14 +1925,8 @@ class WhisperEncoder(PretrainedModel):
         x = cast(x, x_type)
         x = gelu(x)
         x = transpose(x, 2, 1)
-        x = x + cast(
-            slice(input=self.positional_embedding.value,
-                  starts=[0, 0],
-                  sizes=[
-                      self.max_audio_feature_seq_len // self.downsample_factor,
-                      self.positional_embedding.shape[1]
-                  ],
-                  strides=[1, 1]), x.dtype)
+        x = x + cast(self.position_embedding(position_ids), x.dtype)
+
         if default_net().plugin_config.remove_input_padding:
             #B,T,D -> BxT,D
             x = x.view([-1, self.config.hidden_size])
@@ -1952,23 +1944,44 @@ class WhisperEncoder(PretrainedModel):
     def prepare_inputs(self, max_batch_size=16):
 
         bs_range = [1, (max_batch_size + 1) // 2, max_batch_size]
-        # You may change max_audio_feature_seq_len here for distill-whisper models.
-        max_audio_feature_seq_len = self.max_audio_feature_seq_len
+        min_feat_len, optimal_feat_len = 10, 1000  # 100ms, 10s
+        inlen_range = [
+            min_feat_len, optimal_feat_len, self.max_audio_feature_seq_len
+        ]
+        inlen_range_after_downsample = [
+            min_feat_len // self.downsample_factor,
+            optimal_feat_len // self.downsample_factor,
+            self.max_audio_feature_seq_len // self.downsample_factor
+        ]
         if not default_net().plugin_config.remove_input_padding:
-            x = Tensor(
-                name="input_features",
-                dtype=self._dtype,
-                shape=[-1, self.config.n_mels, max_audio_feature_seq_len],
-                dim_range=OrderedDict([
-                    ("batch_size", [bs_range]),
-                    ("feature_dim", [self.config.n_mels]),
-                    ("feature_len_range", [max_audio_feature_seq_len]),
-                ]))
+            x = Tensor(name="input_features",
+                       dtype=self._dtype,
+                       shape=[-1, self.config.n_mels, -1],
+                       dim_range=OrderedDict([
+                           ("batch_size", [bs_range]),
+                           ("feature_dim", [self.config.n_mels]),
+                           ("feature_len_range", [inlen_range]),
+                       ]))
+            position_ids = Tensor(
+                name='position_ids',
+                dtype=trt.int32,
+                shape=[-1, -1],
+                dim_range=OrderedDict([('batch_size', [bs_range]),
+                                       ('feature_len_downsample_range',
+                                        [inlen_range_after_downsample])]),
+            )
         else:
             batch_seqlen_range = [
                 1,
-                (max_audio_feature_seq_len * max_batch_size + 1) // 2,
-                max_audio_feature_seq_len * max_batch_size,
+                (self.max_audio_feature_seq_len * max_batch_size + 1) // 2,
+                self.max_audio_feature_seq_len * max_batch_size,
+            ]
+            batch_seqlen_downsample_range = [
+                1,
+                (self.max_audio_feature_seq_len // self.downsample_factor *
+                 max_batch_size + 1) // 2,
+                self.max_audio_feature_seq_len // self.downsample_factor *
+                max_batch_size,
             ]
             x = Tensor(name="input_features",
                        dtype=self._dtype,
@@ -1977,6 +1990,13 @@ class WhisperEncoder(PretrainedModel):
                            ("batch_seqlen_range", [batch_seqlen_range]),
                            ("feature_dim", [self.config.n_mels]),
                        ]))
+            position_ids = Tensor(
+                name='position_ids',
+                dtype=trt.int32,
+                shape=[-1],
+                dim_range=OrderedDict([('batch_seqlen_downsample_range',
+                                        [batch_seqlen_downsample_range])]),
+            )
         input_lengths = Tensor(
             name="input_lengths",
             dtype=trt.int32,
@@ -1984,7 +2004,11 @@ class WhisperEncoder(PretrainedModel):
             dim_range=OrderedDict([("batch_size", [bs_range])]),
         )
 
-        return {'input_features': x, 'input_lengths': input_lengths}
+        return {
+            'input_features': x,
+            'input_lengths': input_lengths,
+            'position_ids': position_ids
+        }
 
     def precompute_relative_attention_bias(self, build_config):
         pass

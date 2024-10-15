@@ -28,12 +28,15 @@ class FalconConfig(PretrainedConfig):
                  *,
                  bias: bool = False,
                  parallel_attention: bool = False,
+                 num_ln_in_parallel_attn: int | None = None,
                  new_decoder_architecture: bool = False,
+                 rotary_base: float = 10000.0,
                  **kwargs):
         self.bias = bias
         self.parallel_attention = parallel_attention
+        self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
         self.new_decoder_architecture = new_decoder_architecture
-
+        self.rotary_base = rotary_base
         super().__init__(**kwargs)
 
     def to_dict(self):
@@ -114,10 +117,14 @@ class FalconConfig(PretrainedConfig):
                    hidden_act='gelu',
                    bias=hf_config.bias,
                    parallel_attention=hf_config.parallel_attn,
+                   num_ln_in_parallel_attn=getattr(hf_config,
+                                                   'num_ln_in_parallel_attn',
+                                                   None),
                    new_decoder_architecture=hf_config.new_decoder_architecture,
                    max_position_embeddings=getattr(hf_config,
                                                    'max_position_embeddings',
                                                    2048),
+                   rotary_base=getattr(hf_config, 'rope_theta', 10000.0),
                    intermediate_size=getattr(hf_config, 'ffn_hidden_size',
                                              None),
                    mapping=mapping,

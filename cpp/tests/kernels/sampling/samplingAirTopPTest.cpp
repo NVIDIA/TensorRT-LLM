@@ -91,54 +91,59 @@ TYPED_TEST_SUITE(AirTopPSamplingKernelTest, FloatAndHalfTypes);
 
 TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessSmallP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.2f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.2f));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessLargeP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.9f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.9f));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessAncestral)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(1.0f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(1.0f));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessLargeVocabSmallP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.2f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.2f));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, NondeterministicCorrectnessLargeVocabLargeP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.9f));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessSmallP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.2f).setDeterministicTopP(true));
+    this->runTest(
+        SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.2f).setDeterministicTopP(true));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessLargeP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.9f).setDeterministicTopP(true));
+    this->runTest(
+        SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.9f).setDeterministicTopP(true));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessAncestral)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(1.0f).setDeterministicTopP(true));
+    this->runTest(
+        SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(1.0f).setDeterministicTopP(true));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessLargeVocabSmallP)
 {
     this->runTest(
-        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.2f).setDeterministicTopP(true));
+        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.2f).setDeterministicTopP(
+            true));
 };
 
 TYPED_TEST(AirTopPSamplingKernelTest, DeterministicCorrectnessLargeVocabLargeP)
 {
     this->runTest(
-        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f).setDeterministicTopP(true));
+        SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.9f).setDeterministicTopP(
+            true));
 };
 
 class AirTopPSamplingKernelUtilsTest : public SamplingKernelTest<float>

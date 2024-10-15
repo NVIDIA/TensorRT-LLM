@@ -80,7 +80,7 @@ struct TopPSamplingKernelParams
     runtime::SizeType32 vocabSizePadded{-1};
     runtime::SizeType32 maxSeqLen{-1};
 
-    bool returnAllTopP{false};
+    bool returnAllSelectedTokens{false};
 
     void checkParams() const
     {
@@ -91,7 +91,7 @@ struct TopPSamplingKernelParams
         TLLM_CHECK(probs);
         TLLM_CHECK(outputIds || outputIdsPtrs);
         TLLM_CHECK(workspace);
-        TLLM_CHECK((sequenceLength != nullptr) || returnAllTopP);
+        TLLM_CHECK((sequenceLength != nullptr) || returnAllSelectedTokens);
         TLLM_CHECK(curandState);
         TLLM_CHECK(topPs);
 

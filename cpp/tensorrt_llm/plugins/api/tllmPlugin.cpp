@@ -39,6 +39,9 @@
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/cumsumLastDimPlugin/cumsumLastDimPlugin.h"
+#include "tensorrt_llm/plugins/eaglePlugin/eagleDecodeDraftTokensPlugin.h"
+#include "tensorrt_llm/plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.h"
+#include "tensorrt_llm/plugins/eaglePlugin/eagleSampleAndAcceptDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
@@ -201,6 +204,10 @@ extern "C"
         static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
         static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
         static tensorrt_llm::plugins::LowLatencyGemmPluginCreator lowLatencyGemmPluginCreator;
+        static tensorrt_llm::plugins::EagleDecodeDraftTokensPluginCreator eagleDecodeDraftTokensPluginCreator;
+        static tensorrt_llm::plugins::EagleSampleAndAcceptDraftTokensPluginCreator
+            eagleSampleAndAcceptDraftTokensPluginCreator;
+        static tensorrt_llm::plugins::EaglePrepareDrafterInputsPluginCreator eaglePrepareDrafterInputsPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -231,6 +238,9 @@ extern "C"
                   creatorPtr(lruPluginCreator),
                   creatorPtr(cumsumLastDimPluginCreator),
                   creatorPtr(lowLatencyGemmPluginCreator),
+                  creatorPtr(eagleDecodeDraftTokensPluginCreator),
+                  creatorPtr(eagleSampleAndAcceptDraftTokensPluginCreator),
+                  creatorPtr(eaglePrepareDrafterInputsPluginCreator),
               };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();

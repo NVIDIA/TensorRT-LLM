@@ -54,7 +54,8 @@ set(PLUGIN_LISTS
     mambaConv1dPlugin
     lruPlugin
     cumsumLastDimPlugin
-    lowLatencyGemmPlugin)
+    lowLatencyGemmPlugin
+    eaglePlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})

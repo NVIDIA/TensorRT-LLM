@@ -64,12 +64,15 @@ private:
         kernelParams.finishedOutput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
         kernelParams.skipDecode = bufferCast<bool>(*this->mSkipDecodeDevice);
-        kernelParams.cumLogProbs = bufferCast<float>(*this->mCumLogProbsDevice);
-        kernelParams.outputLogProbs = bufferCast<float>(*this->mOutputLogProbsDevice);
+        kernelParams.cumLogProbs
+            = params.returnAllSelectedTokens ? nullptr : bufferCast<float>(*this->mCumLogProbsDevice);
+        kernelParams.outputLogProbs
+            = params.returnAllSelectedTokens ? nullptr : bufferCast<float>(*this->mOutputLogProbsDevice);
         kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
         kernelParams.batchSize = params.batchSize;
         kernelParams.maxBatchSize = maxBatchSize;
         kernelParams.vocabSizePadded = params.vocabSize;
+        kernelParams.returnAllSelectedTokens = params.returnAllSelectedTokens;
 
         // Perform batched TopP sampling
         tk::invokeBatchTopPSampling<T>(kernelParams, this->mStream->get());
@@ -80,26 +83,36 @@ TYPED_TEST_SUITE(TopPSamplingKernelTest, FloatAndHalfTypes);
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessSmallP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.2f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.2f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(0.9f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(0.9f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessAncestral)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopP(1.0f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(6).setVocabSize(4).setTopK(0).setTopP(1.0f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeVocabSmallP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.2f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.2f));
 };
 
 TYPED_TEST(TopPSamplingKernelTest, CorrectnessLargeVocabLargeP)
 {
-    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopP(0.9f));
+    this->runTest(SamplingKernelTestParam().setBatchSize(32).setVocabSize(51200).setTopK(0).setTopP(0.9f));
+};
+
+TYPED_TEST(TopPSamplingKernelTest, CorrectnessReturnAllSelectedTokens)
+{
+    this->runTest(SamplingKernelTestParam()
+                      .setBatchSize(16)
+                      .setVocabSize(50)
+                      .setTopK(0)
+                      .setTopP(0.8f)
+                      .setReturnAllSelectedTokens());
 };
 } // end of namespace

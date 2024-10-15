@@ -75,7 +75,8 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 
 The following table shows the supported hardware for TensorRT-LLM.
 
-If a GPU is not listed, it is important to note that TensorRT-LLM is expected to work on GPUs based on the Volta, Turing, Ampere, Hopper, and Ada Lovelace architectures. Certain limitations may, however, apply.
+If a GPU architecture is not listed, the TensorRT-LLM team does not develop or test the software on the architecture and support is limited to community support.
+In addition, older architectures can have limitations for newer software releases.
 
 ```{list-table}
 :header-rows: 1
@@ -90,8 +91,6 @@ If a GPU is not listed, it is important to note that TensorRT-LLM is expected to
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
     - [NVIDIA Ada Lovelace Architecture](https://www.nvidia.com/en-us/technologies/ada-architecture/)
     - [NVIDIA Ampere Architecture](https://www.nvidia.com/en-us/data-center/ampere-architecture/)
-    - [NVIDIA Turing Architecture](https://www.nvidia.com/en-us/geforce/turing/)
-    - [NVIDIA Volta Architecture](https://www.nvidia.com/en-us/data-center/volta-gpu-architecture/) (experimental)
 ```
 
 (support-matrix-software)=
@@ -114,13 +113,7 @@ The following table shows the supported software for TensorRT-LLM.
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]
-    - Turing (SM75) - FP32, FP16, INT8[^smooth], INT4
-    - Volta (SM70) - FP32, FP16, INT8[^smooth], INT4[^smlt75]
 ```
-
-[^smooth]: INT8 SmoothQuant is not supported on SM70 and SM75.
-
-[^smlt75]: INT4 AWQ and GPTQ are not supported on SM < 75.
 
 [^smgte89]: INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 

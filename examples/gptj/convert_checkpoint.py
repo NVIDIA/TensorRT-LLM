@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
-from tensorrt_llm.hlapi import QuantConfig
+from tensorrt_llm.llmapi import QuantConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import GPTJConfig, GPTJForCausalLM
 from tensorrt_llm.quantization import QuantAlgo

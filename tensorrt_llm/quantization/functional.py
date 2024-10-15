@@ -20,9 +20,10 @@ import torch
 import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
-from .._utils import str_dtype_to_np, str_dtype_to_trt
+from .._utils import str_dtype_to_np, str_dtype_to_trt, trt_dtype_to_np
 from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
-                          constant, matmul, repeat_interleave, round)
+                          constant, flatten, layer_norm, matmul,
+                          repeat_interleave, rms_norm, round, view)
 from ..layers.linear import ColumnLinear
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .mode import QuantMode
@@ -30,9 +31,32 @@ from .mode import QuantMode
 
 def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
                       scales_b: Tensor, per_token_scaling: bool,
-                      per_channel_scaling: bool) -> Tensor:
+                      per_channel_scaling: bool, dtype: str) -> Tensor:
     if not default_net().plugin_config.smooth_quant_gemm_plugin:
-        raise TypeError("Smooth Quant GEMM is only supported with plugin")
+        if per_token_scaling and input.size(0) == -1:
+            # WAR for DQ per-token scaling doesn't support dynamic shapes
+
+            scale_one = constant(np.array(1.0, dtype=np.float32))
+            input = dequantize(input, scale_one, 0, 'float32')
+            weights = dequantize(weights, scale_one, 0, 'float32')
+            result = matmul(input, weights, False, True, False)
+            scales = matmul(scales_a, scales_b, False, False, False)
+            result = result * scales
+            result = cast(result, dtype)
+            return result
+        else:
+            if not per_token_scaling:
+                scales_a = view(scales_a, [])
+            else:
+                scales_a = flatten(scales_a)
+            if not per_channel_scaling:
+                scales_b = view(scales_b, [])
+            else:
+                scales_b = flatten(scales_b)
+            input = dequantize(input, scales_a, 0, dtype)
+            weights = dequantize(weights, scales_b, 0, dtype)
+            result = matmul(input, weights, False, True, False)
+            return result
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'SmoothQuantGemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -119,7 +143,6 @@ def weight_only_quant_matmul(input: Tensor,
                              dtype: str = 'float16',
                              transa: bool = False,
                              transb: bool = False) -> Tensor:
-
     if not default_net(
     ).plugin_config.weight_only_quant_matmul_plugin or transa or transb:
         scale_axis = 0 if transb else 1
@@ -166,7 +189,6 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
                                        quant_algo: int,
                                        group_size: int,
                                        dtype: str = 'float16') -> Tensor:
-
     if not default_net(
     ).plugin_config.weight_only_groupwise_quant_matmul_plugin:
         scales = repeat_interleave(scales, group_size, 0)
@@ -211,12 +233,12 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
 
         matmul_plug = plg_creator.create_plugin("woq_groupwise_matmul", pfc)
 
-        # quant_algo = fp8_alpha * 8 + pre_quant_scale * 4 + zero * 2 + bias
+        # quant_algo = use_int8_weight * 16 + fp8_alpha * 8 + pre_quant_scale * 4 + zero * 2 + bias
         plug_inputs = [input.trt_tensor]
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
-        # quant_algo = fp8_alpha * FP8_ALPHA + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
-        # Here pre_quant_scale, zero and bias are boolean type
+        # quant_algo = use_int8_weight * INT8_WEIGHT + fp8_alpha * FP8_ALPHA + pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO + bias * BIAS
+        # Here use_int8_weight, pre_quant_scale, zero and bias are boolean type
         BIAS = 1
         ZERO = 2
         PRE_QUANT_SCALE = 4
@@ -249,7 +271,17 @@ def smooth_quant_layer_norm(input: Tensor,
                             use_diff_of_squares: bool = True,
                             dynamic_act_scaling: bool = False) -> Tensor:
     if not default_net().plugin_config.layernorm_quantization_plugin:
-        raise TypeError("Smooth Quant Layer Norm is only supported with plugin")
+        dtype = trt_dtype_to_np(input.dtype)
+        if weight is None:
+            weight = constant(np.ones(normalized_shape, dtype=dtype))
+        if bias is None:
+            bias = constant(np.zeros(normalized_shape, dtype=dtype))
+        result = layer_norm(input, normalized_shape, weight, bias, eps,
+                            use_diff_of_squares)
+        if not dynamic_act_scaling:
+            return quantize_tensor(result, scale)
+        else:
+            return quantize_per_token(result)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'LayernormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -308,7 +340,13 @@ def smooth_quant_rms_norm(input: Tensor,
                           eps: float = 1e-05,
                           dynamic_act_scaling: bool = False) -> Tensor:
     if not default_net().plugin_config.rmsnorm_quantization_plugin:
-        raise TypeError("Smooth Quant Rms Norm is only supported with plugin")
+        result = rms_norm(input, normalized_shape, 1, weight, eps)
+        if bias is not None:
+            result += bias
+        if not dynamic_act_scaling:
+            return quantize_tensor(result, scale)
+        else:
+            return quantize_per_token(result)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'RmsnormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -568,11 +606,15 @@ def quantize_fp8_per_token(x: Tensor,
 
 def quantize_tensor(x, scale):
     if not default_net().plugin_config.quantize_tensor_plugin:
+        if scale.dtype == str_dtype_to_trt('float32'):
+            x = cast(x, 'float32')
         scaled = x * scale
         rounded = round(scaled)
         clipped = clip(rounded, -128, 127)
         quantized = cast(clipped, 'int8')
     else:
+        scale = cast(scale, 'float32')
+
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'QuantizeTensor', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert plg_creator is not None
@@ -710,6 +752,7 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
     USE_GPTQ = layer.prequant_scaling_factor is None and use_autoawq is None
     USE_HF_AWQ = layer.prequant_scaling_factor is None and use_autoawq is not None
     USE_MODELOPT_AWQ = layer.prequant_scaling_factor is not None
+    USE_INT8_WEIGHT = layer.quant_algo & 16
 
     tp_dim = 1 if isinstance(layer, ColumnLinear) else 0
     is_qkv = layer.is_qkv if hasattr(layer, "is_qkv") else False
@@ -756,30 +799,45 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
             weights = change_qkv_leading_dim(weights, num_heads)
         results = {tllm_key: weights}
     elif tllm_key.endswith("weight"):
-        if USE_GPTQ:
-            qweight = unpack_int32_into_int8(weights[0].T).T - 8
-        elif USE_HF_AWQ:
-            qweight = unpack_int32_into_int8(weights[0]) - 8
+        if not USE_INT8_WEIGHT:
+            # 4 bit quantization
+            if USE_GPTQ:
+                qweight = unpack_int32_into_int8(weights[0].T).T - 8
+            elif USE_HF_AWQ:
+                qweight = unpack_int32_into_int8(weights[0]) - 8
+            else:
+                qweight = unpack_int32_into_int8(weights.T)
+            qweight[qweight < 0] += 16
+            qweight = qweight.view(torch.uint8)
+        elif USE_INT8_WEIGHT and USE_GPTQ:
+            # 8 bit quantization (only consider INT8 GPTQ here)
+            qweight = (
+                weights[0].T.contiguous().view(torch.uint8).T.contiguous() -
+                128).to(torch.int8)
         else:
-            qweight = unpack_int32_into_int8(weights.T)
-        qweight[qweight < 0] += 16
-        qweight = qweight.view(torch.uint8)
+            warnings.warn("Unsupported quantization mode for weight.")
+
         if using_head_as_leading_dim:
             qweight = change_qkv_leading_dim(qweight, num_heads)
         if layer.is_padded:
             qweight = torch.split(qweight, layer.out_features,
                                   tp_dim)[layer.tp_rank]
             qweight = pad_like(qweight, (layer.in_features, layer.out_features))
-        qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+        # pack int8 tensor to packed int4
+        if not USE_INT8_WEIGHT:
+            qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+        weight_type = torch.int8 if USE_INT8_WEIGHT else torch.quint4x2
         qweight = torch.ops.trtllm.preprocess_weights_for_mixed_gemm(
-            qweight.contiguous(), torch.quint4x2,
-            torch.float16).view(torch_dtype)
+            qweight.contiguous(), weight_type, torch.float16).view(torch_dtype)
         results = {tllm_key: qweight}
 
         # scales and zeros for GPTQ and HF-AWQ
         if USE_GPTQ or USE_HF_AWQ:
             scales = weights[1].to(torch_dtype)
-            qzeros = unpack_int32_into_int8(weights[2])
+            if USE_INT8_WEIGHT:
+                qzeros = weights[2].view(torch.uint8)
+            else:
+                qzeros = unpack_int32_into_int8(weights[2])
             if using_head_as_leading_dim:
                 scales = change_qkv_leading_dim(scales, num_heads)
                 qzeros = change_qkv_leading_dim(qzeros, num_heads)
@@ -792,7 +850,10 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
                                      layer.weights_scaling_factor.shape[tp_dim],
                                      tp_dim)[layer.tp_rank]
                 qzeros = pad_like(qzeros, layer.zero.shape, 7)
-            zeros_x_scales = (-qzeros + 8 - 1 * USE_GPTQ) * scales
+            if USE_INT8_WEIGHT:
+                zeros_x_scales = (-qzeros + 128 - 1 * USE_GPTQ) * scales
+            else:
+                zeros_x_scales = (-qzeros + 8 - 1 * USE_GPTQ) * scales
             zeros_x_scales = zeros_x_scales.to(torch_dtype)
             results.update({
                 tllm_key.replace("weight", "weights_scaling_factor"):

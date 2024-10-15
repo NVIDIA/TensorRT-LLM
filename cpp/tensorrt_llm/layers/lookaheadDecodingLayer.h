@@ -70,6 +70,7 @@ private:
 
         TensorPtr mOutputIds;
         TensorPtr mPathsOffsets;
+        TensorPtr mPathsOffsetsBatch;
         TensorPtr mNumNewTokens;
         TensorPtr mNumNewTokensCumSum;
         TensorPtr mNewTokens;

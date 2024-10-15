@@ -504,8 +504,10 @@ def load_weights_from_xai(*, config, mapping, model):
     assert quant_algo == QuantAlgo.W8A16
     plugin_weight_only_quant_type = torch.int8
 
-    moe_config = MoeConfig(config['moe_num_experts'], config['moe_top_k'],
-                           config['moe_normalization_mode']).validate()
+    moe_config = MoeConfig(
+        num_experts=config['moe_num_experts'],
+        top_k=config['moe_top_k'],
+        normalization_mode=config['moe_normalization_mode']).validate()
 
     use_weight_only = quant_algo in [QuantAlgo.W8A16]
 

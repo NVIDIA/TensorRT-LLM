@@ -34,8 +34,8 @@ struct TopKSamplingKernelParams
     //! Log probabilities of each token in the vocab. If logitsHasProbs is true,
     //! logProbs must contain **just** probabilities instead of log probabilities.
     T const* logProbs{nullptr};
-    //! input buffer [batchSize][vocabSizePadded] array of pointers to logits.
-    //! If nullptr, logProbs is used. Only maxTokensPerStep == 1 is supported.
+    //! input buffer [batchSize][tokensPerStep, vocabSizePadded] array of pointers to logits.
+    //! If nullptr, logProbs is used.
     T const* const* logProbsPtrs{nullptr};
 
     //! output buffer [maxBatchSize][maxSeqLen], optional. Contains pointers to rows
@@ -82,7 +82,8 @@ struct TopKSamplingKernelParams
     //! Ignored if nullptr.
     float* outputLogProbs{nullptr};
 
-    //! input buffer [maxBatchSize]. Initialized curand states
+    //! input buffer [maxBatchSize], optional. Initialized curand states.
+    //! If nullptr, 1 is always used.
     curandState_t* curandState{nullptr};
     //! input buffer [maxBatchSize]. K for topK sampling per request.
     //! Supported K is in range [1; 1024]. Where K=1 is greedy search.
@@ -106,8 +107,8 @@ struct TopKSamplingKernelParams
     bool normalizeLogProbs{false};
     //! flag to highlight that logProbs contains probabilities
     bool logitsHasProbs{false};
-    //! flag to return all selectedTopK results
-    bool returnAllTopK{false};
+    //! flag to return all selected TopK results
+    bool returnAllSelectedTokens{false};
 
     void checkParams() const
     {
@@ -131,13 +132,12 @@ struct TopKSamplingKernelParams
         }
 
         TLLM_CHECK(workspace);
-        TLLM_CHECK(curandState);
 
-        TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || sequenceLengths);
-        TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || endIds);
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || sequenceLengths);
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || endIds);
         if (cumLogProbs != nullptr || outputLogProbs != nullptr)
         {
-            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllTopK);
+            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllSelectedTokens);
         }
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
 

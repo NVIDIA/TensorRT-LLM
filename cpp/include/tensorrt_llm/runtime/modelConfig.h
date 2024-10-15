@@ -127,6 +127,7 @@ public:
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
+        , mPpReduceScatter{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
         , mUseCrossAttention(false)
@@ -468,6 +469,16 @@ public:
         return mUseXQA;
     }
 
+    void constexpr setPpReduceScatter(bool ppReduceScatter) noexcept
+    {
+        mPpReduceScatter = ppReduceScatter;
+    }
+
+    [[nodiscard]] bool constexpr getPpReduceScatter() const noexcept
+    {
+        return mPpReduceScatter;
+    }
+
     [[nodiscard]] bool constexpr useLoraPlugin() const noexcept
     {
         return mUseLoraPlugin;
@@ -759,6 +770,7 @@ private:
     bool mContextFMHA;
     bool mPagedContextFMHA;
     bool mUseXQA;
+    bool mPpReduceScatter;
 
     bool mUseLoraPlugin;
     std::vector<LoraModule> mLoraModules;

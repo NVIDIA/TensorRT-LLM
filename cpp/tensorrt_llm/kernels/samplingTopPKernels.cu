@@ -200,7 +200,7 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     SizeType32* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
     float* outputLogProbs, SizeType32 const* beginOffsetBuf, SizeType32 const* offsetBuf, SizeType32 vocabSize,
     curandState_t* curandState, float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize,
-    bool const* skipDecode, SizeType32 const* batchSlots, bool returnAllTopP, SizeType32 maxSeqLen)
+    bool const* skipDecode, SizeType32 const* batchSlots, bool returnAllSelectedTokens, SizeType32 maxSeqLen)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -244,7 +244,7 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     if (threadIdx.x == 0)
     {
         // if we want to return all top p indices, we should not do random sampling for probThreshold
-        randNumS = returnAllTopP ? probThreshold : curand_uniform(curandState + blockIdx.x) * probThreshold;
+        randNumS = returnAllSelectedTokens ? probThreshold : curand_uniform(curandState + blockIdx.x) * probThreshold;
     }
 
     // if beginOffsetBuf and offsetBuf of sorting have same value,
@@ -255,7 +255,7 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
         if (tid == 0)
         {
             auto offset = batchId * vocabSize;
-            if (returnAllTopP)
+            if (returnAllSelectedTokens)
             {
                 outputIdsRequestPtr[currentStep] = sortedIdVals[offset];
             }
@@ -294,7 +294,7 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
         }
     }
 
-    if (returnAllTopP)
+    if (returnAllSelectedTokens)
     {
         __shared__ SizeType32 sharedSelectedTokenId;
         if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
@@ -403,7 +403,7 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
         params.outputIds, params.outputIdsPtrs, params.sequenceLength, params.finishedInput, params.finishedOutput,
         params.cumLogProbs, params.outputLogProbs, beginOffsetBuf, offsetBuf + 1, params.vocabSizePadded,
         params.curandState, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode, params.batchSlots,
-        params.returnAllTopP, params.maxSeqLen);
+        params.returnAllSelectedTokens, params.maxSeqLen);
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

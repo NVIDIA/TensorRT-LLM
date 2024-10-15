@@ -115,7 +115,6 @@ public:
         std::optional<SizeType32> genMicroBatchSize = std::nullopt;
         std::optional<executor::DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
-        std::optional<std::filesystem::path> enginePath;
     };
 
     //! @brief Optional profiler class to profile the generation phase of an inference request
