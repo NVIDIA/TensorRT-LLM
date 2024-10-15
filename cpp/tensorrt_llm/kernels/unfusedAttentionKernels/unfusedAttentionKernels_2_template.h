@@ -507,15 +507,12 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 VecType k_to_cache = params.position_shift_enabled ? k_wo_pos : k;
 
                 auto const dst_q_idx = static_cast<size_t>(global_token_idx) * params.q_hidden_size + hidden_idx;
-                QuantizedEltType* quantized_q_ptr = STORE_QKV
-                    ? reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_q_idx
-                    : reinterpret_cast<QuantizedEltType*>(params.Q) + dst_q_idx;
                 VecType* q_ptr = STORE_QKV ? reinterpret_ptr<T, VecType>(params.QKV, src_q_idx)
                                            : reinterpret_ptr<T, VecType>(params.Q, dst_q_idx);
 
                 // Cast float scale to dst data type.
                 using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
-                TScale scaleOrigQuant;
+                [[maybe_unused]] TScale scaleOrigQuant;
                 if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
                 {
                     mmha::convert_from_float(
@@ -525,6 +522,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 if constexpr (FP8_OUTPUT)
                 {
                     // Quant the vec to fp8 vec with the scale.
+                    QuantizedEltType* quantized_q_ptr = STORE_QKV
+                        ? reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_q_idx
+                        : reinterpret_cast<QuantizedEltType*>(params.Q) + dst_q_idx;
                     mmha::store_8bits_vec(quantized_q_ptr, q, 0, scaleOrigQuant);
                 }
                 else
@@ -813,15 +813,12 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         if (valid_token)
         {
             auto const dst_q_idx = static_cast<size_t>(global_token_idx) * params.q_hidden_size + hidden_idx;
-            QuantizedEltType* quantized_q_ptr = STORE_QKV
-                ? reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_q_idx
-                : reinterpret_cast<QuantizedEltType*>(params.Q) + dst_q_idx;
             VecT* q_ptr = STORE_QKV ? reinterpret_ptr<T, VecT>(params.QKV, src_q_idx)
                                     : reinterpret_ptr<T, VecT>(params.Q, dst_q_idx);
 
             // Cast float scale to dst data type.
             using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
-            TScale scaleOrigQuant;
+            [[maybe_unused]] TScale scaleOrigQuant;
             if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
             {
                 mmha::convert_from_float(&scaleOrigQuant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
@@ -830,6 +827,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             if constexpr (FP8_OUTPUT)
             {
                 // Quant the vec to fp8 vec with the scale.
+                QuantizedEltType* quantized_q_ptr = STORE_QKV
+                    ? reinterpret_cast<QuantizedEltType*>(params.QuantizedQKV) + src_q_idx
+                    : reinterpret_cast<QuantizedEltType*>(params.Q) + dst_q_idx;
                 mmha::store_8bits_vec(quantized_q_ptr, q, 0, scaleOrigQuant);
             }
             else

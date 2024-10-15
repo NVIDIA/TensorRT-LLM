@@ -76,6 +76,8 @@ LookaheadDecodingLayer<T>::CpuAlgorithmResources::CpuAlgorithmResources(DecoderD
         ITensor::makeShape({maxTokensPerStep, maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
     mPathsOffsets
         = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
+    mPathsOffsetsBatch
+        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
     mNumNewTokens = BufferManager::cpu(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mNumNewTokensCumSum = BufferManager::cpu(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
     mNextDraftTokens = BufferManager::cpu(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
@@ -220,7 +222,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.batchSize = batchSize;
     params.maxTopK = 1;
-    params.returnAllTopK = true;
+    params.returnAllSelectedTokens = true;
     params.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     params.maxSeqLen = mDecoderDomain.getMaxDecodingTokens();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
@@ -321,6 +323,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     BufferRange<SizeType32> nextDraftLengthsRange(*mCpuAlgo->mNextDraftLengths);
     BufferRange<SizeType32> sequenceLengthsRange(*mCpuAlgo->mSequenceLengths);
     BufferLocation<SizeType32> pathsOffsetLocation(*mCpuAlgo->mPathsOffsets);
+    BufferLocation<SizeType32> pathsOffsetBatchLocation(*mCpuAlgo->mPathsOffsetsBatch);
     BufferLocation<TokenIdType> outputIdsLocation(*mCpuAlgo->mOutputIds);
 
     mBufferManager->setZero(*mCpuAlgo->mPathsOffsets);
@@ -394,20 +397,22 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
             D(accepted).values().c_str(), D(draft).values().c_str());
     }
 
-    numNewTokensCumSumRange[0] = 0;
     SizeType32 pi = 0;
-    for (SizeType32 bi = 0; bi < numNewTokensRange.size(); bi++)
+    numNewTokensCumSumRange[0] = 0;
+    for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
-        SizeType32 acceptedDraftLen = numNewTokensRange[bi] <= 1 ? 0 : (numNewTokensRange[bi] - 1);
+        SizeType32 gbi = batchSlotsRange[bi];
+        SizeType32 acceptedDraftLen = numNewTokensRange[gbi] <= 1 ? 0 : (numNewTokensRange[gbi] - 1);
         numNewTokensCumSumRange[bi + 1] = numNewTokensCumSumRange[bi] + acceptedDraftLen;
         for (SizeType32 tj = 0; tj < acceptedDraftLen; tj++)
         {
-            pathsOffsetLocation[pi++] = pathsOffsetLocation.at(bi, tj);
+            pathsOffsetBatchLocation[pi++] = pathsOffsetLocation.at(gbi, tj);
         }
     }
-    for (; pi < pathsOffsetLocation.size(); pi++)
+
+    for (; pi < pathsOffsetBatchLocation.size(); pi++)
     {
-        pathsOffsetLocation[pi++] = 0;
+        pathsOffsetBatchLocation[pi++] = 0;
     }
 
     TLLM_CHECK(outputs->numNewTokens);
@@ -415,8 +420,8 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     mBufferManager->copy(*mCpuAlgo->mSequenceLengths, *outputs->sequenceLength.value());
     mBufferManager->copy(*mCpuAlgo->mNewTokens, *outputs->newTokens);
 
-    mBufferManager->copy(*mCpuAlgo->mPathsOffsets, *outputs->pathsOffsets);
     mBufferManager->copy(*mCpuAlgo->mNumNewTokens, *outputs->numNewTokens.value());
+    mBufferManager->copy(*mCpuAlgo->mPathsOffsetsBatch, *outputs->pathsOffsets);
     mBufferManager->copy(*mCpuAlgo->mNumNewTokensCumSum, *outputs->numNewTokensCumSum); //
     mBufferManager->copy(*mCpuAlgo->mNextDraftTokens, *outputs->nextDraftTokens);
 

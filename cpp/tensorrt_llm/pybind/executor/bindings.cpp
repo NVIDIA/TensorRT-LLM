@@ -140,6 +140,7 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("iter", &tle::IterationStats::iter)
         .def_readwrite("iter_latency_ms", &tle::IterationStats::iterLatencyMS)
         .def_readwrite("new_active_requests_queue_latency_ms", &tle::IterationStats::newActiveRequestsQueueLatencyMS)
+        .def_readwrite("num_new_active_requests", &tle::IterationStats::numNewActiveRequests)
         .def_readwrite("num_active_requests", &tle::IterationStats::numActiveRequests)
         .def_readwrite("num_queued_requests", &tle::IterationStats::numQueuedRequests)
         .def_readwrite("num_completed_requests", &tle::IterationStats::numCompletedRequests)
@@ -180,6 +181,9 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("scheduled", &tle::RequestStats::scheduled)
         .def_readwrite("paused", &tle::RequestStats::paused)
         .def_readwrite("dis_serving_stats", &tle::RequestStats::disServingStats)
+        .def_readwrite("alloc_total_blocks_per_request", &tle::RequestStats::allocTotalBlocksPerRequest)
+        .def_readwrite("alloc_new_blocks_per_request", &tle::RequestStats::allocNewBlocksPerRequest)
+        .def_readwrite("reused_blocks_per_request", &tle::RequestStats::reusedBlocksPerRequest)
         .def("to_json_str",
             [](tle::RequestStats const& iterationStats) { return tle::JsonSerialization::toJsonStr(iterationStats); });
 

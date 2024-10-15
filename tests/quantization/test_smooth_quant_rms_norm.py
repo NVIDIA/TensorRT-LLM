@@ -34,11 +34,16 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float16', False), ('float16', True),
-                           ('bfloat16', False), ('bfloat16', True),
-                           ('float32', False), ('float32', True)],
+    @parameterized.expand([('float16', False, True), ('float16', True, True),
+                           ('bfloat16', False, True), ('bfloat16', True, True),
+                           ('float32', False, True), ('float32', True, True),
+                           ('float16', False, False), ('float16', True, False),
+                           ('bfloat16', False, False),
+                           ('bfloat16', True, False), ('float32', False, False),
+                           ('float32', True, False)],
                           name_func=unittest_name_func)
-    def test_smooth_quant_rms_norm_plugin(self, dtype, dynamic_act_scaling):
+    def test_smooth_quant_rms_norm(self, dtype, dynamic_act_scaling,
+                                   use_plugin):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -77,7 +82,8 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         builder.strongly_typed = False  # Test need to run in weekly typed mode
         network = builder.create_network()
-        network.plugin_config.rmsnorm_quantization_plugin = dtype
+        if use_plugin:
+            network.plugin_config.rmsnorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
@@ -117,19 +123,6 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
                                        outputs['dynamic_scales'],
                                        atol=1e-2,
                                        rtol=1e-2)
-
-    def test_sq_rms_norm_no_plugin(self):
-        # Create builder
-        builder = tensorrt_llm.Builder()
-        builder.strongly_typed = False  # Test need to run in weekly typed mode
-        # Create empty network
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-            # SQ Rmsnorm ootb should fail.
-            with self.assertRaisesRegex(
-                    TypeError,
-                    "Smooth Quant Rms Norm is only supported with plugin"):
-                smooth_quant_rms_norm(None, 0, None, None, None, 0)
 
 
 if __name__ == '__main__':

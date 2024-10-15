@@ -101,6 +101,9 @@ def add_parallel_info(report, parallel):
     document.write(report, encoding="UTF-8", xml_declaration=True)
 
 
+default_test_parallel = 2
+
+
 def parallel_run_ctest(
     command: _tp.Sequence[str],
     cwd: _pl.Path,
@@ -108,7 +111,7 @@ def parallel_run_ctest(
     shell=False,
     env=None,
     timeout=None,
-    parallel=2,
+    parallel=default_test_parallel,
 ) -> None:
     if parallel == 1:
         return run_command(command,
@@ -576,7 +579,16 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Encoder")
     excluded_tests.append("EncDec")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+    parallel = default_test_parallel
+    if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):
+        parallel = int(parallel_override)
+
+    parallel_run_ctest(ctest,
+                       cwd=build_dir,
+                       env=cpp_env,
+                       timeout=timeout,
+                       parallel=parallel)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path,
@@ -634,7 +646,17 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+        parallel = default_test_parallel
+        if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
+                                                None):
+            parallel = int(parallel_override)
+
+        parallel_run_ctest(ctest,
+                           cwd=build_dir,
+                           env=cpp_env,
+                           timeout=timeout,
+                           parallel=parallel)
     if run_gpt:
         xml_output_file = build_dir / "results-single-gpu-disagg-executor_gpt.xml"
         trt_model_test = produce_mpirun_command(

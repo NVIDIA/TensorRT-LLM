@@ -54,6 +54,7 @@ class TestFalcon(unittest.TestCase):
                           num_kv_heads: Optional[int] = None,
                           use_alibi: bool = True,
                           parallel_attention: bool = False,
+                          num_ln_in_parallel_attn: int = 2,
                           new_decoder_architecture: bool = False):
         if isinstance(dtype, str):
             dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
@@ -80,6 +81,7 @@ class TestFalcon(unittest.TestCase):
             new_decoder_architecture=new_decoder_architecture,
             multi_query=multi_query,
             parallel_attn=parallel_attention,
+            num_ln_in_parallel_attn=num_ln_in_parallel_attn,
             num_kv_heads=num_kv_heads,
             pad_token_id=1,
             eos_token_id=0,
@@ -185,20 +187,25 @@ class TestFalcon(unittest.TestCase):
     def load_test_cases():
         test_cases = [
             # TC for Falcon-1B arch: MHA + ALiBi
-            ('MHA', True, False, False, False, False, True, False,
+            ('MHA', True, False, 1, False, False, False, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('MHA', True, False, False, False, False, True, False,
+            ('MHA', True, False, 1, False, False, False, True, False,
              ContextFMHAType.disabled, 'float32'),
             # TC for Falcon-7B arch: MQA + RoPE + parallel_attention
-            ('MQA', False, True, False, False, True, True, False,
+            ('MQA', False, True, 1, False, False, True, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('MQA', False, True, False, False, True, True, False,
+            ('MQA', False, True, 1, False, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
             # TC for Falcon-40B arch: GQA + RoPE + parallel_attention + new_decoder_architecture
-            ('GQA', False, True, True, False, True, True, False,
+            ('GQA', False, True, 2, True, False, True, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('GQA', False, True, True, False, True, True, False,
+            ('GQA', False, True, 2, True, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
+            # TC for Falcon2-11B arch: GQA + RoPE + parallel_attention (1 or 2 layernorm) + new_decoder_architecture
+            ('GQA', False, True, 1, True, False, True, True, False,
+             ContextFMHAType.disabled, 'float32'),
+            ('GQA', False, True, 2, True, False, True, True, False,
+             ContextFMHAType.disabled, 'float32')
         ]
         return test_cases
 
@@ -245,8 +252,8 @@ class TestFalcon(unittest.TestCase):
 
     @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_falcon(self, query_type, use_alibi, parallel_attention,
-                    new_decoder_architecture, use_refit,
-                    use_gpt_attengion_plugin, use_gemm_plugin,
+                    num_ln_in_parallel_attn, new_decoder_architecture,
+                    use_refit, use_gpt_attengion_plugin, use_gemm_plugin,
                     remove_input_padding, context_fmha_type, dtype):
         self.skip_test_case(query_type, use_alibi, parallel_attention,
                             new_decoder_architecture, use_refit,
@@ -266,6 +273,7 @@ class TestFalcon(unittest.TestCase):
             dtype,
             use_alibi=use_alibi,
             parallel_attention=parallel_attention,
+            num_ln_in_parallel_attn=num_ln_in_parallel_attn,
             new_decoder_architecture=new_decoder_architecture,
             query_type=query_type)
         runtime, _ = self.generate_trtllm_runtime(
@@ -480,8 +488,8 @@ class TestFalcon(unittest.TestCase):
 
     @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, query_type, use_alibi, parallel_attention,
-                           new_decoder_architecture, use_refit,
-                           use_gpt_attengion_plugin, use_gemm_plugin,
+                           num_ln_in_parallel_attn, new_decoder_architecture,
+                           use_refit, use_gpt_attengion_plugin, use_gemm_plugin,
                            remove_input_padding, context_fmha_type, dtype):
 
         self.skip_test_case(query_type, use_alibi, parallel_attention,
@@ -504,6 +512,7 @@ class TestFalcon(unittest.TestCase):
             query_type=query_type,
             use_alibi=use_alibi,
             parallel_attention=parallel_attention,
+            num_ln_in_parallel_attn=num_ln_in_parallel_attn,
             new_decoder_architecture=new_decoder_architecture)
         _, engine_buffer = self.generate_trtllm_runtime(
             model_name=model_name,

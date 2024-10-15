@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
+from tensorrt_llm.models.qwen.model import QWenForCausalLM
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
@@ -21,6 +22,7 @@ from ...functional import ACT2FN, stack
 from ...layers import ColumnLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
+from ..modeling_utils import PretrainedModel
 from .config import MedusaConfig
 
 
@@ -80,65 +82,89 @@ class MedusaHead(Module):
         return self.lm_head(hidden_states)
 
 
-class MedusaForCausalLm(LLaMAForCausalLM):
+# MedusaForCausalLm is a thin wrapper that picks parent class for GenericMedusaForCausalLM.
+# All medusa functionality is defined in GenericMedusaForCausalLM.
+class MedusaForCausalLm(PretrainedModel):
     config_class = MedusaConfig
 
     def __init__(self, config: MedusaConfig):
-
         super().__init__(config)
-        self.num_medusa_heads = config.num_medusa_heads
-        self.num_medusa_layers = config.num_medusa_layers
-        self.hidden_size = config.hidden_size
-        self.vocab_size = config.vocab_size
-        vocab_size_padded = pad_vocab_size(self.vocab_size,
-                                           config.mapping.tp_size)
-        self.medusa_heads = ModuleList([
-            MedusaHead(num_layers=self.num_medusa_layers,
-                       hidden_size=config.hidden_size,
-                       vocab_size=vocab_size_padded,
-                       hidden_act=config.hidden_act,
-                       dtype=config.dtype,
-                       mapping=config.mapping)
-            for _ in range(self.num_medusa_heads)
-        ])
-        self.max_medusa_token_len = config.max_draft_len
+        BaseLM = QWenForCausalLM if "qwen" in config.model_type else LLaMAForCausalLM
 
-    def forward(self, *args, **kwargs):
-        output_original = True
-        hidden_states = super().forward(*args, **kwargs)
+        class GenericMedusaForCausalLM(BaseLM):
 
-        if kwargs['use_cache']:
-            if default_net().plugin_config.paged_kv_cache:
-                lm_logits, hidden_states = hidden_states
-            else:
-                lm_logits, presents, hidden_states = hidden_states
+            def __init__(self, config: MedusaConfig):
+                super().__init__(config)
+                self.num_medusa_heads = config.num_medusa_heads
+                self.num_medusa_layers = config.num_medusa_layers
+                self.hidden_size = config.hidden_size
+                self.vocab_size = config.vocab_size
+                vocab_size_padded = pad_vocab_size(self.vocab_size,
+                                                   config.mapping.tp_size)
+                self.medusa_heads = ModuleList([
+                    MedusaHead(num_layers=self.num_medusa_layers,
+                               hidden_size=config.hidden_size,
+                               vocab_size=vocab_size_padded,
+                               hidden_act=config.hidden_act,
+                               dtype=config.dtype,
+                               mapping=config.mapping)
+                    for _ in range(self.num_medusa_heads)
+                ])
+                self.max_medusa_token_len = config.max_draft_len
 
-        if self.mapping.is_last_pp_rank():
-            medusa_logits = []
-            for i in range(self.num_medusa_heads):
-                medusa_logits.append(self.medusa_heads[i](hidden_states))
-            # [num_medusa_heads, batch_size, num_medusa_tokens + 1, padded_vocab_size].
-            # Remove padding [num_medusa_heads, batch_size * num_medusa_tokens + 1, padded_vocab_size].
-            medusa_logits = stack(medusa_logits, dim=0)
-            medusa_logits.mark_output('medusa_logits', self.config.logits_dtype)
+            def forward(self, *args, **kwargs):
+                output_original = True
+                hidden_states = super().forward(*args, **kwargs)
+
+                if kwargs['use_cache']:
+                    if default_net().plugin_config.paged_kv_cache:
+                        lm_logits, hidden_states = hidden_states
+                    else:
+                        lm_logits, presents, hidden_states = hidden_states
+
+                if self.mapping.is_last_pp_rank():
+                    medusa_logits = []
+                    for i in range(self.num_medusa_heads):
+                        medusa_logits.append(
+                            self.medusa_heads[i](hidden_states))
+                    # [num_medusa_heads, batch_size, num_medusa_tokens + 1, padded_vocab_size].
+                    # Remove padding [num_medusa_heads, batch_size * num_medusa_tokens + 1, padded_vocab_size].
+                    medusa_logits = stack(medusa_logits, dim=0)
+                    medusa_logits.mark_output('medusa_logits',
+                                              self.config.logits_dtype)
+                else:
+                    hidden_states.mark_output('hidden_states_output',
+                                              self.config.dtype)
+
+                if kwargs['use_cache'] and default_net(
+                ).plugin_config.paged_kv_cache == False:
+                    if self.mapping.is_last_pp_rank():
+                        if output_original:
+                            return (medusa_logits, lm_logits, presents)
+                        return (medusa_logits, presents)
+                    return (hidden_states, presents)
+                else:
+                    if self.mapping.is_last_pp_rank():
+                        if output_original:
+                            return medusa_logits, lm_logits
+                        return medusa_logits
+                    return hidden_states
+
+            def prepare_inputs(self, *args, **kwargs):
+                kwargs['speculative_decoding_draft_tokens_external'] = False
+                kwargs['max_draft_len'] = self.max_medusa_token_len
+                return super().prepare_inputs(*args, **kwargs)
+
+        self.model = GenericMedusaForCausalLM(config)
+
+    # Specialization to redirect accesses to self.model
+    def __getattribute__(self, name):
+        if name == 'model' or '__' in name:
+            return object.__getattribute__(self, name)
         else:
-            hidden_states.mark_output('hidden_states_output', self.config.dtype)
+            model = object.__getattribute__(self, 'model')
+            return model.__getattribute__(name)
 
-        if kwargs['use_cache'] and default_net(
-        ).plugin_config.paged_kv_cache == False:
-            if self.mapping.is_last_pp_rank():
-                if output_original:
-                    return (medusa_logits, lm_logits, presents)
-                return (medusa_logits, presents)
-            return (hidden_states, presents)
-        else:
-            if self.mapping.is_last_pp_rank():
-                if output_original:
-                    return medusa_logits, lm_logits
-                return medusa_logits
-            return hidden_states
-
-    def prepare_inputs(self, *args, **kwargs):
-        kwargs['speculative_decoding_draft_tokens_external'] = False
-        kwargs['max_draft_len'] = self.max_medusa_token_len
-        return super().prepare_inputs(*args, **kwargs)
+    # Override specialized __setattr__ defined in Module
+    def __setattr__(self, name, value) -> None:
+        object.__setattr__(self, name, value)

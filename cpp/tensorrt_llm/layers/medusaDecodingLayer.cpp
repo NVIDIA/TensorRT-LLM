@@ -329,11 +329,33 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(SpeculativeDecodingOutputs const&
     auto medusaInputLogitsPtrsPtr = reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs));
     auto medusaSelectedLogitsPtrsDevicePtr
         = const_cast<T const**>(bufferCastOrNull<T const*>(mMedusaSelectedLogitsPtrsDevice));
-    acceptDraftTokensByIdsWithPaths(outputIds, draftIds, targetTokensDevicePtr, sequenceLengths, numNewTokens,
-        finishedStatesPtr, workspace->getDeviceBatchSlotsPtr(), paths, endIds, medusaInputLogitsPtrsPtr,
-        medusaSelectedLogitsPtrsDevicePtr, curTokensPerStepDevice, targetTokensPerStepDevice, bestPathIdsDevicePtr,
-        batchSize, mDecoderDomain.getVocabSize(), mDecoderDomain.getBatchSize(), maxSeqLen, maxDraftPathLen,
-        mDecoderDomain.getMaxDecodingTokens(), getStream());
+
+    AcceptDraftTokensByIdsWithPathsParams<T> params;
+    params.outputIds = outputIds;
+    params.draftIds = draftIds;
+    params.targetIds = targetTokensDevicePtr;
+    params.sequenceLengths = sequenceLengths;
+    params.acceptedLengths = numNewTokens;
+    params.finishedFinal = finishedStatesPtr;
+    params.batchSlots = workspace->getDeviceBatchSlotsPtr();
+    params.paths = paths;
+    params.endIds = endIds;
+    params.medusaLogits = medusaInputLogitsPtrsPtr;
+    params.logitsPtrs = medusaSelectedLogitsPtrsDevicePtr;
+    params.curTokensPerStep = curTokensPerStepDevice;
+    params.targetTokensPerStep = targetTokensPerStepDevice;
+    params.bestPathIds = bestPathIdsDevicePtr;
+    params.batchSize = batchSize;
+    params.maxBatchSize = mDecoderDomain.getBatchSize();
+    params.vocabSize = mDecoderDomain.getVocabSize();
+    params.maxSeqLen = maxSeqLen;
+    params.maxDraftPathLen = maxDraftPathLen;
+    params.maxDecodingTokens = mDecoderDomain.getMaxDecodingTokens();
+    params.stream = getStream();
+
+    params.checkParams();
+
+    acceptDraftTokensByIdsWithPaths(params);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -390,7 +412,7 @@ void MedusaDecodingLayer<T>::sampleNewDraftTokens(SpeculativeDecodingOutputs con
     params.maxBatchSize = maxBatchSizeHeadNums;
     params.maxTokensPerStep = 1;
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.returnAllTopK = true;
+    params.returnAllSelectedTokens = true;
 
     invokeBatchTopKSampling(params, getStream());
 

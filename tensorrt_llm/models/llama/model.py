@@ -20,7 +20,7 @@ import transformers
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
-                           non_gated_version, recv, send)
+                           allgather, concat, non_gated_version, recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
@@ -43,13 +43,17 @@ class LLaMADecoderLayer(Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
+        self.mapping = config.mapping
 
-        self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
-                                       eps=config.norm_epsilon,
-                                       dtype=config.dtype)
+        if (self.config.use_input_layernorm_in_first_layer
+                and self.layer_idx == 0) or self.layer_idx > 0:
+            self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
+                                           eps=config.norm_epsilon,
+                                           dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         self.local_layer_idx = layer_idx - layers_range[0]
+        self.is_last_local_layer = layer_idx == layers_range[-1]
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
             hidden_size=config.hidden_size,
@@ -134,7 +138,9 @@ class LLaMADecoderLayer(Module):
             hidden_states, residual = hidden_states
         else:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            if (self.config.use_input_layernorm_in_first_layer
+                    and self.layer_idx == 0) or self.layer_idx > 0:
+                hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
@@ -190,9 +196,17 @@ class LLaMADecoderLayer(Module):
                         norm_weight=next_layer_input_layernorm_args[0],
                         eps=next_layer_input_layernorm_args[1]))
             else:
-                hidden_states = self.mlp(hidden_states,
-                                         lora_layer_params=lora_layer_params)
-                hidden_states = residual + hidden_states
+                if default_net(
+                ).plugin_config.pp_reduce_scatter and self.is_last_local_layer and not self.mapping.is_last_pp_rank(
+                ):
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        lora_layer_params=lora_layer_params,
+                        last_local_layer_residual=residual)
+                else:
+                    hidden_states = self.mlp(
+                        hidden_states, lora_layer_params=lora_layer_params)
+                    hidden_states = residual + hidden_states
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -204,12 +218,22 @@ class LLaMAModel(Module):
         super().__init__()
 
         self.mapping = config.mapping
+        self.hidden_size = config.hidden_size
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
                                              dtype=config.dtype)
 
         self.layers = DecoderLayerList(LLaMADecoderLayer, config)
+
+        if config.fc_after_embed:
+            self.fc = ColumnLinear(2 * config.hidden_size,
+                                   config.hidden_size,
+                                   bias=True,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=False)
 
         if self.mapping.is_last_pp_rank():
             self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
@@ -225,6 +249,7 @@ class LLaMAModel(Module):
                 kv_cache_params=None,
                 attention_params=None,
                 hidden_states=None,
+                hidden_states_for_embed=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
@@ -238,6 +263,18 @@ class LLaMAModel(Module):
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
+            if default_net().plugin_config.pp_reduce_scatter:
+                hidden_states = allgather(hidden_states,
+                                          self.mapping.tp_group,
+                                          gather_dim=0)
+                # reshape to (-1, hidden_size)
+                hidden_states = hidden_states.view(
+                    concat([-1, self.hidden_size]))
+
+        if hidden_states_for_embed is not None:
+            hidden_states = concat([hidden_states, hidden_states_for_embed],
+                                   dim=-1)
+            hidden_states = self.fc(hidden_states)
 
         hidden_states = self.layers.forward(
             hidden_states,

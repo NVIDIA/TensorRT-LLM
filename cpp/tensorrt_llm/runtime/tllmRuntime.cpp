@@ -408,9 +408,7 @@ void TllmRuntime::loadManagedWeights(RawEngine const& rawEngine, int localRank)
         {
             TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
             auto iTensor = tensorrt_llm::executor::detail::toITensor(weight);
-            auto weightsDevice = std::shared_ptr<ITensor>{
-                manager.allocate(MemoryType::kGPU, iTensor->getShape(), iTensor->getDataType())};
-            manager.copy(iTensor->data(), *weightsDevice, MemoryType::kCPU);
+            auto weightsDevice = std::shared_ptr<ITensor>{manager.copyFrom(*iTensor, MemoryType::kGPU)};
             mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
         }
     }

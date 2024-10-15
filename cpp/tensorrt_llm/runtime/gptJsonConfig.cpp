@@ -266,6 +266,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
         ? ModelConfig::ManageWeightsType::kEnabled
         : ModelConfig::ManageWeightsType::kDisabled;
+    auto const ppReduceScatter = parseJsonFieldOr<bool>(pluginConfig, "pp_reduce_scatter", false);
 
     TLLM_CHECK_WITH_INFO(
         !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
@@ -283,6 +284,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
     modelConfig.setManageWeightsType(manageWeightsType);
+    modelConfig.setPpReduceScatter(ppReduceScatter);
 }
 
 void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginConfig, bool engineVersionNone,

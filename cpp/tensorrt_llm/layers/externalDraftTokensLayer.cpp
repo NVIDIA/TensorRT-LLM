@@ -431,7 +431,7 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingOutput
     params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.maxTokensPerStep = 1;
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.returnAllTopK = true;
+    params.returnAllSelectedTokens = true;
     params.maxSeqLen = mDecoderDomain.getVocabSizePadded(); // workaround for returning all topKs with outputIds
     params.logitsHasProbs = inputs->probsComputed;
 
@@ -475,7 +475,7 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingOutput
     params.batchSize = batchSize;
     params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.returnAllTopP = true;
+    params.returnAllSelectedTokens = true;
     params.maxSeqLen = mDecoderDomain.getVocabSizePadded();
 
     invokeBatchTopPSampling<T>(params, getStream());

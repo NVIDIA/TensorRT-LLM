@@ -26,7 +26,8 @@ import numpy as np
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import np_bfloat16, np_float8, str_dtype_to_trt, to_json_file
+from ._utils import (np_bfloat16, np_float8, str_dtype_to_trt, to_json_file,
+                     trt_gte)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .bindings import KVCacheType
@@ -223,6 +224,13 @@ class Builder():
         weight_sparsity = kwargs.get("weight_sparsity", False)
         if weight_sparsity:
             config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+
+        # TODO(Junyi): remove this constraint after trt 10.6 is integrated
+        if trt_gte(10, 6):
+            # set monitor memory
+            monitor_memory = kwargs.get("monitor_memory", False)
+            if monitor_memory:
+                config.set_flag(trt.BuilderFlag.MONITOR_MEMORY)
 
         return BuilderConfig()._init(config,
                                      precision=precision,
@@ -494,6 +502,7 @@ class BuildConfig:
     use_fused_mlp: bool = False
     dry_run: bool = False
     visualize_network: bool = False
+    monitor_memory: bool = False
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
@@ -578,7 +587,7 @@ class BuildConfig:
             config.get('auto_parallel_config', {}))
         max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
         weight_streaming = config.pop('weight_streaming', False)
-
+        use_fused_mlp = config.pop('use_fused_mlp', True)
         use_strip_plan = config.pop('use_strip_plan', False)
 
         if plugin_config is None:
@@ -588,6 +597,7 @@ class BuildConfig:
 
         dry_run = config.pop('dry_run', False)
         visualize_network = config.pop('visualize_network', False)
+        monitor_memory = config.pop('monitor_memory', False)
 
         return cls(
             max_input_len=max_input_len,
@@ -616,9 +626,11 @@ class BuildConfig:
             max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
             weight_streaming=weight_streaming,
+            use_fused_mlp=use_fused_mlp,
             plugin_config=plugin_config,
             dry_run=dry_run,
-            visualize_network=visualize_network)
+            visualize_network=visualize_network,
+            monitor_memory=monitor_memory)
 
     @classmethod
     def from_json_file(cls, config_file, plugin_config=None):
@@ -682,13 +694,11 @@ class Engine:
         self,
         config: EngineConfig,
         engine: Union[trt.IHostMemory, None],
-        managed_weights: dict[str, np.ndarray] = None,
+        managed_weights: dict[str, np.ndarray] = {},
     ):
         self.config = config
         self.engine = engine
         self.managed_weights = managed_weights
-
-    def regularize_managed_weights(self):
         if self.managed_weights is None:
             self.managed_weights = {}
         for name, value in self.managed_weights.items():
@@ -1081,6 +1091,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         use_strip_plan=build_config.use_strip_plan,
         weight_sparsity=build_config.weight_sparsity,
         weight_streaming=build_config.weight_streaming,
+        monitor_memory=build_config.monitor_memory,
     )
 
     network = builder.create_network()
@@ -1099,7 +1110,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             network.plugin_config.weight_only_groupwise_quant_matmul_plugin = model.config.dtype
         else:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
-    if use_smooth_quant and model.config.quantization.use_plugin_sq:
+    if use_smooth_quant and model.config.quantization.use_plugin_sq and build_config.plugin_config.smooth_quant_plugins:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
     if use_fp8_rowwise:
         network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
@@ -1154,7 +1165,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_batch_size": build_config.max_batch_size,
             }
 
-        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING or build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
 

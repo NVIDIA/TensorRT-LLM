@@ -5,7 +5,7 @@
 TensorRT-LLM can quantize the Hugging Face model automatically. By setting the appropriate flags in the `LLM` instance. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization. Please refer to complete list of [supported flags](https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/quantization/mode.html#QuantAlgo) and acceptable values.
 
 ``` python
-from tensorrt_llm.hlapi import QuantConfig, QuantAlgo
+from tensorrt_llm.llmapi import QuantConfig, QuantAlgo
 
 quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
 
@@ -14,12 +14,12 @@ llm = LLM(<model-dir>, quant_config=quant_config)
 
 ## Sampling
 
-SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and [others](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/hlapi/utils.py#L55-L76).
+SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and [others](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/utils.py#L55-L76).
 
 As an example, to enable beam search with a beam size of 4, set the `sampling_params` as follows:
 
 ```python
-from tensorrt_llm.hlapi import LLM, SamplingParams, BuildConfig
+from tensorrt_llm.llmapi import LLM, SamplingParams, BuildConfig
 
 build_config = BuildConfig()
 build_config.max_beam_width = 4
@@ -38,7 +38,7 @@ for output in llm.generate(<prompt>, sampling_params=sampling_params):
 * [SamplingConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE)
 * [OutputConfig](https://nvidia.github.io/TensorRT-LLM/_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12OutputConfigE)
 
-Refer to the [class documentation](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.hlapi.SamplingParams) for more details.
+Refer to the [class documentation](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.llmapi.SamplingParams) for more details.
 
 ## Build Configuration
 
@@ -55,11 +55,11 @@ Refer to the [buildconfig documentation](https://github.com/NVIDIA/TensorRT-LLM/
 
 ## Runtime Customization
 
-Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other [arguments](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/hlapi/llm_utils.py#L186-L223) borrowed from the lower-level APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:
+Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other [arguments](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_utils.py#L186-L223) borrowed from the lower-level APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:
 
 
 ```python
-from tensorrt_llm.hlapi import LLM, KvCacheConfig
+from tensorrt_llm.llmapi import LLM, KvCacheConfig
 
 llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(

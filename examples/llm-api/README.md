@@ -1,10 +1,10 @@
-# High-level API
-We are working on a Python high-level API(HLAPI) for LLM workflow, which is still in incubation and may change later.
+# LLM API
+We are working on a Python high-level API(LLMAPI) for LLM workflow, which is still in incubation and may change later.
 Here we show you a preview of how it works and how to use it.
 
 Note that the APIs are not stable and we appreciate your patience and understanding as we improve this API.
 
-## HLAPI Supported Model
+## LLM API Supported Model
 * LLaMA (including variants Mistral, Mixtral, InternLM)
 * GPT (including variants Starcoder-1/2, Santacoder)
 * Gemma-1/2
@@ -23,7 +23,7 @@ Please install the required packages first:
 pip install -r requirements.txt
 ```
 
-Here is a simple example to show how to use the HLAPI:
+Here is a simple example to show how to use the LLMAPI:
 
 Firstly, import the `LLM` and `SamplingParams` from the `tensorrt_llm` package, and create an LLM object with a HuggingFace (HF) model directly. Here we use the TinyLlama model as an example, `LLM` will download the model from the HuggingFace model hub automatically. You can also specify local models, either in HF format, TensorRT-LLM engine format or TensorRT-LLM checkpoint format.
 
@@ -65,16 +65,16 @@ The `LLM` class supports four kinds of model inputs:
 
 1. **HuggingFace model name**: triggers a download from the HuggingFace model hub, e.g. `TinyLlama/TinyLlama-1.1B-Chat-v1.0` in the quickstart.
 1. **Local HuggingFace models**: uses a locally stored HuggingFace model.
-2. **Local TensorRT-LLM engine**: built by `trtllm-build` tool or saved by the HLAPI
+2. **Local TensorRT-LLM engine**: built by `trtllm-build` tool or saved by the LLMAPI
 3. **Local TensorRT-LLM checkpoints**: converted by `convert_checkpoint.py` script in the examples
 
-All kinds of the model inputs can be seamlessly integrated with the HLAPI, and the `LLM(model=<any-model-path>)` construcotr can accommodate models in any of the above formats.
+All kinds of the model inputs can be seamlessly integrated with the LLMAPI, and the `LLM(model=<any-model-path>)` construcotr can accommodate models in any of the above formats.
 
 Let's delve into the preparation of the three kinds of local model formats.
 
 ### Option 1: From HuggingFace models
 
-Given its popularity, the TRT-LLM HLAPI chooses to support HuggingFace format as one of the start points, to use the HLAPI on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
+Given its popularity, the TRT-LLM LLMAPI chooses to support HuggingFace format as one of the start points, to use the LLMAPI on LLaMA models, you need to run the following conversion script provided in [transformers/llama](https://huggingface.co/docs/transformers/main/model_doc/llama) or [transformers/llama2](https://huggingface.co/docs/transformers/main/model_doc/llama2) to convert the Meta checkpoint to HuggingFace format.
 
 For instance, when targeting the LLaMA2 7B model, the official way to retrieve the model is to visit the [LLaMA2 model page](https://huggingface.co/docs/transformers/main/en/model_doc/llama2), normally you need to submit a request for the model file.
 
@@ -91,13 +91,13 @@ python <transformers-dir>/src/transformers/models/llama/convert_llama_weights_to
     --input_dir Llama-2-7b --model_size 7B --output_dir llama-hf-7b
 ```
 
-That should produce a HuggingFace format model in `./llama-hf-7b`, which could be used by the HLAPI.
+That should produce a HuggingFace format model in `./llama-hf-7b`, which could be used by the LLMAPI.
 
 ### Option 2: From TensorRT-LLM engine
 There are two ways to build the TensorRT-LLM engine:
 
 1. You can build the TensorRT-LLM engine from the HuggingFace model directly with the `trtllm-build` tool, and save the engine to disk for later use.  Please consult the LLaMA's [README](../llama/README.md).
-2. Use the HLAPI to save one:
+2. Use the LLMAPI to save one:
 
 ```python
 llm = LLM(<model-path>)
@@ -108,7 +108,7 @@ llm.save(<engine-dir>)
 
 ### Option 3: From TensorRT-LLM checkpoint
 In each model example, there is a `convert_checkpoint.py` to convert third-party models to TensorRT-LLM checkpoint for further usage.
-The HLAPI could seamlessly accept the checkpoint, and build the engine in the backend.
+The LLMAPI could seamlessly accept the checkpoint, and build the engine in the backend.
 For step-by-step guidance on checkpoint conversion, please refer to the LLaMA's [README](../llama/README.md).
 
 
@@ -156,7 +156,7 @@ By simply setting several flags in the `LLM`, TensorRT-LLM can quantize the Hugg
 
 
 ``` python
-from tensorrt_llm.hlapi import QuantConfig, QuantAlgo
+from tensorrt_llm.llmapi import QuantConfig, QuantAlgo
 
 quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
 
@@ -166,17 +166,17 @@ llm = LLM(<model-dir>, quant_config=quant_config)
 ## Parallelism
 
 ### Tensor Parallelism
-It is easy to enable Tensor Parallelism in the HLAPI. For example, setting `parallel_config.tp_size=2` to perform a 2-way parallelism:
+It is easy to enable Tensor Parallelism in the LLMAPI. For example, setting `parallel_config.tp_size=2` to perform a 2-way parallelism:
 
 ```python
-from tensorrt_llm.hlapi import LLM
+from tensorrt_llm.llmapi import LLM
 
 llm = LLM(<llama_model_path>,
           tensor_parallel_size=2)
 ```
 
 ### Pipeline Parallelism
-Similar to Tensor Parallelism, you can enable Pipeline Parallelism in the HLAPI with following code:
+Similar to Tensor Parallelism, you can enable Pipeline Parallelism in the LLMAPI with following code:
 
 ```python
 llm = LLM(<llama_model_path>,
@@ -236,7 +236,7 @@ With SamplingParams, you can customize the sampling strategy, such as beam searc
 To enable beam search with a beam size of 4, set the `sampling_params` as follows:
 
 ```python
-from tensorrt_llm.hlapi import LLM, SamplingParams, BuildConfig
+from tensorrt_llm.llmapi import LLM, SamplingParams, BuildConfig
 
 build_config = BuildConfig()
 build_config.max_beam_width = 4
@@ -269,12 +269,23 @@ llm = LLM(<model-path>,
             max_beam_width=4))
 ```
 
+### Fast build
+The `fast_build` is an experimental feature that speeds up engine building. It can be enabled by setting argument `fast_build` to `True`. For example:
+
+```python
+llm = LLM(<model-path>,
+          fast_build=True)
+```
+
+Notice that `fast_build` currently does not work with int8/int4 quantization.
+
+
 ### Runtime customization
 Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other arguments borrowed from the lower-level APIs. For example:
 
 
 ```python
-from tensorrt_llm.hlapi import LLM, KvCacheConfig
+from tensorrt_llm.llmapi import LLM, KvCacheConfig
 
 llm = LLM(<llama_model_path>,
           kv_cache_config=KvCacheConfig(
@@ -317,11 +328,11 @@ RequestOutput(request_id=1, prompt=None, prompt_token_ids=[1, 15043, 29892, 590,
 Note that the `text` field in `CompletionOutput` is empty since the tokenizer is deactivated.
 
 ### Build caching
-Although the HLAPI runs the engine building in the background, you can also cache the built engine to disk and load it in the next run to save the engine building time.
+Although the LLMAPI runs the engine building in the background, you can also cache the built engine to disk and load it in the next run to save the engine building time.
 
 To enable the build cache, there are two ways to do it:
 
-1. Use the environment variable: `export TLLM_HLAPI_BUILD_CACHE=1` to enable the build cache globally, and optionally export `TLLM_HLAPI_BUILD_CACHE_ROOT` to specify the cache root directory.
+1. Use the environment variable: `export TLLM_LLMAPI_BUILD_CACHE=1` to enable the build cache globally, and optionally export `TLLM_LLMAPI_BUILD_CACHE_ROOT` to specify the cache root directory.
 2. Pass the `enable_build_cache` to the `LLM` constructor
 
 The build cache will reuse the built engine if all the building settings are the same, or it will rebuild the engine.

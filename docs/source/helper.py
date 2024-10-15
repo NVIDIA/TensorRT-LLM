@@ -93,13 +93,13 @@ def generate_llmapi():
     doc_dir.mkdir(exist_ok=True)
     doc_path = doc_dir / "index.rst"
 
-    hlapi_all_file = root_dir / "tensorrt_llm/hlapi/__init__.py"
-    public_classes_names = extract_all_and_eval(hlapi_all_file)['__all__']
+    llmapi_all_file = root_dir / "tensorrt_llm/llmapi/__init__.py"
+    public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
 
     content = underline("API Reference", "-") + "\n\n"
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
-        content += (f".. autoclass:: tensorrt_llm.hlapi.{cls_name}\n"
+        content += (f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
                     "    :members:\n"
                     "    :undoc-members:\n"
                     "    :special-members: __init__\n"

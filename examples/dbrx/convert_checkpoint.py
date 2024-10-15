@@ -545,6 +545,7 @@ if __name__ == '__main__':
         kv_cache_quant_algo = QuantAlgo.INT8
 
     hf_config = None
+
     if args.model_dir is not None:
         hf_config = AutoConfig.from_pretrained(args.model_dir,
                                                trust_remote_code=True)
@@ -563,8 +564,10 @@ if __name__ == '__main__':
         args.clip_qkv = hf_config.attn_config.clip_qkv
         args.hidden_act = 'swiglu'
         args.rotary_base = hf_config.attn_config.rope_theta
-    args.moe_config = MoeConfig(args.moe_num_experts, args.moe_top_k,
-                                args.moe_renorm_mode).validate()
+    args.moe_config = MoeConfig(
+        num_experts=args.moe_num_experts,
+        top_k=args.moe_top_k,
+        normalization_mode=args.moe_renorm_mode).validate()
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,

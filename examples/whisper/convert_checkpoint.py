@@ -35,6 +35,7 @@ def parse_arguments():
                         type=str,
                         default="large-v3",
                         choices=[
+                            "large-v3-turbo",
                             "large-v3",
                             "large-v2",
                             "medium",
@@ -94,8 +95,9 @@ def get_encoder_config(model_metadata: dict, dtype: str,
         'num_hidden_layers': model_metadata['n_audio_layer'],
         'num_attention_heads': model_metadata['n_audio_head'],
         'hidden_size': model_metadata['n_audio_state'],
+        'max_position_embeddings': model_metadata['n_audio_ctx'],
+        'has_position_embedding': True,
         'n_mels': model_metadata['n_mels'],
-        'n_audio_ctx': model_metadata['n_audio_ctx'],
         'vocab_size': model_metadata['n_vocab'],
         'hidden_act': "gelu",
         'num_languages': num_languages,
@@ -167,7 +169,7 @@ def convert_openai_whisper_encoder(
                           torch.cos(scaled_time)],
                          dim=1)
 
-    weights['positional_embedding'] = sinusoids(
+    weights['position_embedding.weight'] = sinusoids(
         model_metadata['n_audio_ctx'],
         model_metadata['n_audio_state']).contiguous()
 
@@ -393,6 +395,8 @@ if __name__ == '__main__':
     print(f"Loaded model from {model_path}")
     model_metadata = model['dims']
     model_state_dict = model['model_state_dict']
+    for param_tensor in model_state_dict:
+        model_state_dict[param_tensor] = model_state_dict[param_tensor].half()
 
     def convert_and_save(component: str = "encoder"):
         # call get_encoder_config or get_decoder_config according to component

@@ -1,2 +1,2 @@
-9485cfa635b17378f23d1624b3acfbaf tensorrt_llm_batch_manager_static.lib
-4dbf696ae9b74a26829d120b67ab8443d70c8e58 commit
+afac175cfda36b14d76e17517bad8b24 tensorrt_llm_batch_manager_static.lib
+3eeadd9a4a9ca2558b3a2f2089419f8d285744e5 commit

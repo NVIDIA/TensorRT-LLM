@@ -179,13 +179,13 @@ All published functionality in the Release Notes has been fully tested and verif
     - Moved the most commonly used options in the explicit arg-list, and hidden the expert options in the kwargs.
     - Exposed `model` to accept either HuggingFace model name or local HuggingFace model/TensorRT-LLM checkpoint/TensorRT-LLM engine.
     - Support downloading model from HuggingFace model hub, currently only Llama variants are supported.
-    - Support build cache to reuse the built TensorRT-LLM engines by setting environment variable `TLLM_HLAPI_BUILD_CACHE=1` or passing `enable_build_cache=True` to `LLM` class.
+    - Support build cache to reuse the built TensorRT-LLM engines by setting environment variable `TLLM_LLMAPI_BUILD_CACHE=1` or passing `enable_build_cache=True` to `LLM` class.
     - Exposed low-level options including `BuildConfig`, `SchedulerConfig` and so on in the kwargs, ideally you should be able to configure details about the build and runtime phase.
   - Refactored `LLM.generate()` and `LLM.generate_async()` API.
     - Removed `SamplingConfig`.
-    - Added `SamplingParams` with more extensive parameters, see `tensorrt_llm/hlapi/utils.py`.
+    - Added `SamplingParams` with more extensive parameters, see `tensorrt_llm/llmapi/utils.py`.
       - The new `SamplingParams` contains and manages fields from Python bindings of `SamplingConfig`, `OutputConfig`, and so on.
-    - Refactored `LLM.generate()` output as `RequestOutput`, see `tensorrt_llm/hlapi/llm.py`.
+    - Refactored `LLM.generate()` output as `RequestOutput`, see `tensorrt_llm/llmapi/llm.py`.
   - Updated the `apps` examples, specially by rewriting both `chat.py` and `fastapi_server.py` using the `LLM` APIs, please refer to the `examples/apps/README.md` for details.
     - Updated the `chat.py` to support multi-turn conversation, allowing users to chat with a model in the terminal.
     - Fixed the `fastapi_server.py` and eliminate the need for `mpirun` in multi-GPU scenarios.
@@ -481,7 +481,7 @@ All published functionality in the Release Notes has been fully tested and verif
 Refer to the {ref}`support-matrix-software` section for a list of supported models.
 
 * API
-  - Add a set of High-level APIs for end-to-end generation tasks (see examples/high-level-api/README.md)
+  - Add a set of LLM APIs for end-to-end generation tasks (see examples/llm-api/README.md)
   - **[BREAKING CHANGES]** Migrate models to the new build workflow, including LLaMA, Mistral, Mixtral, InternLM, ChatGLM, Falcon, GPT-J, GPT-NeoX, Medusa, MPT, Baichuan and Phi (see docs/source/new_workflow.md)
   - **[BREAKING CHANGES]** Deprecate `LayerNorm` and `RMSNorm` plugins and removed corresponding build parameters
   - **[BREAKING CHANGES]** Remove optional parameter `maxNumSequences` for GPT manager

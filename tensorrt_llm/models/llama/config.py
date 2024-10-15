@@ -57,6 +57,8 @@ class LLaMAConfig(PretrainedConfig):
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
         self.remove_duplicated_kv_heads = remove_duplicated_kv_heads
+        self.fc_after_embed = False
+        self.use_input_layernorm_in_first_layer = True
 
         super().__init__(**kwargs)
 
@@ -70,6 +72,9 @@ class LLaMAConfig(PretrainedConfig):
         output['residual_mlp'] = self.residual_mlp
         output[
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
+        output['fc_after_embed'] = self.fc_after_embed
+        output[
+            'use_input_layernorm_in_first_layer'] = self.use_input_layernorm_in_first_layer
         output['moe'] = self.moe.to_dict()
         return output
 

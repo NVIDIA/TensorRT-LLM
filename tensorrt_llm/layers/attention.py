@@ -323,6 +323,7 @@ class Attention(Module):
                  attention_head_size=None,
                  qk_layernorm=False,
                  layernorm_type=LayerNormType.LayerNorm,
+                 layernorm_share=True,
                  inner_layernorm=False,
                  eps=1e-05,
                  attention_mask_type=AttentionMaskType.padding,
@@ -474,16 +475,38 @@ class Attention(Module):
             self.rel_attn_table = Parameter(shape=(num_attention_heads //
                                                    tp_size, num_buckets),
                                             dtype=dtype)
+
+        # qk layernorm
         self.qk_layernorm = qk_layernorm
         self.layernorm_type = layernorm_type
+        self.layernorm_share = layernorm_share
         ln_type = layernorm_map[layernorm_type]
         if self.qk_layernorm:
-            self.q_layernorm = ln_type(self.attention_head_size,
-                                       eps=eps,
-                                       dtype=dtype)
-            self.k_layernorm = ln_type(self.attention_head_size,
-                                       eps=eps,
-                                       dtype=dtype)
+            # layernorm_share indicates whether all the QK head in one layer shares the same norm parameters or not
+            if layernorm_share:
+                self.q_layernorm = ln_type(self.attention_head_size,
+                                           eps=eps,
+                                           dtype=dtype)
+                self.k_layernorm = ln_type(self.attention_head_size,
+                                           eps=eps,
+                                           dtype=dtype)
+            else:
+                assert ln_type == LayerNorm
+                self.q_layernorm = ln_type(
+                    (self.num_attention_heads, self.attention_head_size),
+                    eps=eps,
+                    dtype=dtype,
+                    bias=False,
+                    tp_size=tp_size,
+                    tp_dim=0)
+                self.k_layernorm = ln_type(
+                    (self.num_attention_kv_heads, self.attention_head_size),
+                    eps=eps,
+                    dtype=dtype,
+                    bias=False,
+                    tp_size=tp_size,
+                    tp_dim=0)
+
         self.inner_layernorm = ln_type(self.hidden_size, dtype=dtype,
                                        eps=eps) if inner_layernorm else None
         if clip_qkv is not None:
@@ -741,25 +764,38 @@ class Attention(Module):
         if self.qk_layernorm:
             base_shape = shape(qkv, 0) if qkv.ndim() == 2 else concat(
                 [shape(qkv, 0), shape(qkv, 1)])
-            # here we assume that q, k and v have the same number of attention heads
-            # TODO: allow different number of attention heads for q, k and v.
-            qkv = qkv.view(
-                concat([
-                    base_shape, self.num_attention_heads, 3,
+            qkv_sections = [
+                self.num_attention_heads, self.num_attention_kv_heads,
+                self.num_attention_kv_heads
+            ]
+            total_heads = sum(qkv_sections)
+            if self.num_attention_heads != self.num_attention_kv_heads:
+                qkv = qkv.view(
+                    concat([base_shape, total_heads, self.attention_head_size]))
+                query, key, value = split(qkv, qkv_sections, dim=qkv.ndim() - 2)
+            else:
+                qkv = qkv.view(
+                    concat([
+                        base_shape, self.num_attention_heads, 3,
+                        self.attention_head_size
+                    ]))
+                query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)
+                q_shape = concat([
+                    base_shape, self.num_attention_heads,
                     self.attention_head_size
-                ]))
-            query, key, value = split(qkv, 1, dim=qkv.ndim() - 2)
-            q_shape = concat([
-                base_shape, self.num_attention_heads, self.attention_head_size
-            ])
-            query = query.view(q_shape)
-            key = key.view(q_shape)
-            value = value.view(q_shape)
+                ])
+                query = query.view(q_shape)
+                key = key.view(q_shape)
+                value = value.view(q_shape)
 
-            query = self.q_layernorm(query)
-            key = self.k_layernorm(key)
+            normalized_shape = None
+            if not self.layernorm_share:
+                normalized_shape = self.attention_head_size
+            query = self.q_layernorm(query, normalized_shape=normalized_shape)
+            key = self.k_layernorm(key, normalized_shape=normalized_shape)
             qkv = concat([query, key, value], dim=query.ndim() - 2)
-            qkv = qkv.view(concat([base_shape, self.attention_hidden_size * 3]))
+            qkv = qkv.view(
+                concat([base_shape, total_heads * self.attention_head_size]))
         if self.position_embedding_type == PositionEmbeddingType.chatglm:
             qkv = RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm(
                 qkv,

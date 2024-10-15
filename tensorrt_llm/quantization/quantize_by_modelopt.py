@@ -126,7 +126,9 @@ MODEL_NAME_PATTERN_MAP = {
     "Starcoder2ForCausalLM": "gptnext",
     "GPTBigCodeForCausalLM": "gptnext",
     "GLM": "glm",
+    "Exaone": "exaone",
     "DeciLMForCausalLM": "deci",
+    "DeepseekForCausalLM": "deepseek",
 }
 
 
@@ -570,6 +572,8 @@ def quantize_and_export(*,
 
         with open(f"{export_path}/config.json", "r") as f:
             tensorrt_llm_config = json.load(f)
+
+        tensorrt_llm_config["model_type"] = model_type
 
         # Workaround for wo quantization
         if qformat in ["int8_wo", "int4_wo", "full_prec"]:

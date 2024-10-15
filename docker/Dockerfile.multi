@@ -62,7 +62,7 @@ COPY benchmarks benchmarks
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY 3rdparty 3rdparty
-COPY setup.py requirements.txt requirements-dev.txt ./
+COPY .gitmodules setup.py requirements.txt requirements-dev.txt ./
 
 # Create cache directories for pip and ccache
 RUN mkdir -p /root/.cache/pip /root/.cache/ccache

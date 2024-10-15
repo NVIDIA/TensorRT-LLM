@@ -152,3 +152,7 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                            --temperature 1.0 \
                            --batch_size 1
 ```
+
+### Medusa with Qwen2
+
+To use Medusa with Qwen2 models, specify `--model_type qwen2` to `convert_checkpoint.py`. You have to provide a Qwen2 model checkpoint and the medusa heads. After TRT-LLM checkpoint is generated, trllm-build and `../run.py` use the same arguments as for LLaMA models.

@@ -67,11 +67,13 @@ def create_trt_config_from_hf(model_dir,
         'rotary_base': rotary_base,
         'norm_epsilon': rms_norm_eps,
         'rotary_scaling': rotary_scaling,
-        'moe_num_experts': moe_num_experts,
-        'moe_top_k': moe_top_k,
-        'moe_renorm_mode': moe_renorm_mode,
-        'moe_num_shared_experts': moe_num_shared_experts,
-        'moe_inter_size': moe_inter_size,
+        'moe': {
+            'num_experts': moe_num_experts,
+            'top_k': moe_top_k,
+            'normalization_mode': moe_renorm_mode,
+            'num_shared_experts': moe_num_shared_experts,
+            'moe_intermediate_size': moe_inter_size,
+        },
         'mapping': {
             'world_size': mapping.tp_size * mapping.pp_size,
             'tp_size': mapping.tp_size,
@@ -82,11 +84,7 @@ def create_trt_config_from_hf(model_dir,
     }
     config.update(override_fields)
 
-    moe_config = MoeConfig(num_experts=config['moe_num_experts'],
-                           moe_intermediate_size=config['moe_inter_size'],
-                           num_shared_experts=config['moe_num_shared_experts'],
-                           top_k=config['moe_top_k'],
-                           normalization_mode=config['moe_renorm_mode'])
+    moe_config = MoeConfig.from_dict(config['moe'])
     moe_config.validate()
 
     return config
@@ -151,11 +149,7 @@ def convert_deepseek(hf_model,
     mapping.tp_size
     model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
-    moe_config = MoeConfig(num_experts=config['moe_num_experts'],
-                           moe_intermediate_size=config['moe_inter_size'],
-                           num_shared_experts=config['moe_num_shared_experts'],
-                           top_k=config['moe_top_k'],
-                           normalization_mode=config['moe_renorm_mode'])
+    moe_config = MoeConfig.from_dict(config['moe'])
 
     layers_range = mapping.pp_layers(config['num_hidden_layers'])
 

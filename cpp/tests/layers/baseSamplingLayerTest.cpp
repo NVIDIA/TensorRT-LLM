@@ -73,6 +73,8 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     trk::invokeFill(*mCumLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mOutputLogProbsDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mEndIdsDevice, int32_t{mEndId}, *mStream);
+    tk::invokeCurandInitialize(reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice)), nullptr,
+        mMaxBatchSize, seed, mStream->get());
 
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)

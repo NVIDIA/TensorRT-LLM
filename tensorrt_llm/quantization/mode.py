@@ -25,6 +25,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A16 = auto()
     W4A16_AWQ = auto()
     W4A8_AWQ = auto()
+    W8A16_GPTQ = auto()
     W4A16_GPTQ = auto()
     W8A8_SQ_PER_CHANNEL = auto()
     W8A8_SQ_PER_TENSOR_PLUGIN = auto()
@@ -103,6 +104,9 @@ class QuantMode(IntFlag):
 
     def is_weight_only(self):
         return self.is_int4_weight_only() or self.is_int8_weight_only()
+
+    def is_int8_weight_only_per_group(self):
+        return self.is_int8_weight_only() and self._any(self.PER_GROUP)
 
     def is_int4_weight_only_per_group(self):
         return self.is_int4_weight_only() and self._any(self.PER_GROUP)
@@ -266,6 +270,9 @@ class QuantMode(IntFlag):
                                                    per_group=True)
         elif quant_algo == QuantAlgo.W4A16_GPTQ:
             quant_mode = QuantMode.use_weight_only(use_int4_weights=True,
+                                                   per_group=True)
+        elif quant_algo == QuantAlgo.W8A16_GPTQ:
+            quant_mode = QuantMode.use_weight_only(use_int4_weights=False,
                                                    per_group=True)
         elif quant_algo == QuantAlgo.W8A8_SQ_PER_CHANNEL:
             quant_mode = QuantMode.use_smooth_quant(per_token=False,

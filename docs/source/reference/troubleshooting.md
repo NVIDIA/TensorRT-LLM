@@ -258,8 +258,13 @@ SLURM, depending upon the SLURM version you are using:
 Please configure as appropriate and try again.
 --------------------------------------------------------------------------
 ```
+
+You may experience other problems like hanging on the program startup.
+
 As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
 node, prefix your commands with `mpirun -n 1` to run TensorRT-LLM in a
 dedicated MPI environment, not the one provided by your Slurm allocation.
 
 For example: `mpirun -n 1 python3 examples/gpt/build.py ...`
+
+It's critical that it's always `-n 1` regardless of how many GPUs are being used. If you'd use `-n 2` for a 2 GPU program it will not work. `mpirun` here isn't being used to orchestrate multiple processes, but to invoke the right environment on SLURM. The internal MPI implementation deals with spawning the additional processes.

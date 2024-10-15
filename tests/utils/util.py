@@ -11,7 +11,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
-from tensorrt_llm.hlapi.utils import get_total_gpu_memory
+from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import Session, TensorInfo

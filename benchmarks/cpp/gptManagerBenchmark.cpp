@@ -426,11 +426,17 @@ public:
     void initialize()
     {
         mStart = std::chrono::steady_clock::now();
+        mRequestsQueueingLatencies.clear();
     }
 
     void finalize()
     {
         mEnd = std::chrono::steady_clock::now();
+    }
+
+    void recordQueueLatency(std::vector<float> const& latencies)
+    {
+        mRequestsQueueingLatencies.insert(mRequestsQueueingLatencies.end(), latencies.begin(), latencies.end());
     }
 
     void recordStart(std::shared_ptr<InferenceRequest> request, uint64_t requestId)
@@ -677,6 +683,16 @@ public:
                 mMaxGenT2TLatency = genT2TLatencies.back();
                 mMinGenT2TLatency = genT2TLatencies.front();
             }
+
+            mAvgReqQueueingLatency
+                = std::accumulate(mRequestsQueueingLatencies.begin(), mRequestsQueueingLatencies.end(), 0.F)
+                / mRequestsQueueingLatencies.size();
+            std::sort(mRequestsQueueingLatencies.begin(), mRequestsQueueingLatencies.end());
+            mP99ReqQueueingLatency = calcPercentile(mRequestsQueueingLatencies, 99);
+            mP90ReqQueueingLatency = calcPercentile(mRequestsQueueingLatencies, 90);
+            mP50ReqQueueingLatency = calcPercentile(mRequestsQueueingLatencies, 50);
+            mMaxReqQueueingLatency = mRequestsQueueingLatencies.back();
+            mMinReqQueueingLatency = mRequestsQueueingLatencies.front();
         }
     }
 
@@ -713,6 +729,13 @@ public:
             printf("[BENCHMARK] p99_inter_token_latency(ms) %.2f\n", mP99GenT2TLatency);
             printf("[BENCHMARK] p90_inter_token_latency(ms) %.2f\n", mP90GenT2TLatency);
             printf("[BENCHMARK] p50_inter_token_latency(ms) %.2f\n\n", mP50GenT2TLatency);
+
+            printf("[BENCHMARK] avg_request_queueing_latency(ms) %.2f\n", mAvgReqQueueingLatency);
+            printf("[BENCHMARK] max_request_queueing_latency(ms) %.2f\n", mMaxReqQueueingLatency);
+            printf("[BENCHMARK] min_request_queueing_latency(ms) %.2f\n", mMinReqQueueingLatency);
+            printf("[BENCHMARK] p99_request_queueing_latency(ms) %.2f\n", mP99ReqQueueingLatency);
+            printf("[BENCHMARK] p90_request_queueing_latency(ms) %.2f\n", mP90ReqQueueingLatency);
+            printf("[BENCHMARK] p50_request_queueing_latency(ms) %.2f\n\n", mP50ReqQueueingLatency);
         }
     }
 
@@ -820,6 +843,13 @@ private:
     float mP50GenT2TLatency{};
     float mMaxGenT2TLatency{};
     float mMinGenT2TLatency{};
+    float mAvgReqQueueingLatency{};
+    float mP99ReqQueueingLatency{};
+    float mP90ReqQueueingLatency{};
+    float mP50ReqQueueingLatency{};
+    float mMaxReqQueueingLatency{};
+    float mMinReqQueueingLatency{};
+    std::vector<float> mRequestsQueueingLatencies{};
 
     std::string mOpCsvFile;
     bool mStreaming;
@@ -846,6 +876,7 @@ public:
         , mActiveCount(0)
         , mNumFinished(0)
         , mShutdown(false)
+        , mLogIterationData(logIterationData)
     {
 
         texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy);
@@ -899,7 +930,9 @@ public:
             TLLM_LOG_ERROR("not a supported executor model type in executor server.");
         }
 
-        if (logIterationData)
+        auto const& world = tensorrt_llm::mpi::MpiComm::world();
+        auto worldRank = world.getRank();
+        if (worldRank == 0)
         {
             mCollectStatsThread = std::thread(&ExecutorServer::collectStats, this);
         }
@@ -988,7 +1021,18 @@ public:
             auto iterStats = mExecutor->getLatestIterationStats();
             for (auto const& iterStat : iterStats)
             {
-                TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(iterStat));
+                SizeType32 numNewActiveRequests = iterStat.numNewActiveRequests;
+                if (numNewActiveRequests > 0)
+                {
+                    float avgQueueingTime
+                        = static_cast<float>(iterStat.newActiveRequestsQueueLatencyMS / numNewActiveRequests);
+                    std::vector<float> requestsQueueLatencyMS(numNewActiveRequests, avgQueueingTime);
+                    mRecorder->recordQueueLatency(requestsQueueLatencyMS);
+                }
+                if (mLogIterationData)
+                {
+                    TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(iterStat));
+                }
             }
             auto const waitSleep = std::chrono::milliseconds(50);
             std::this_thread::sleep_for(waitSleep);
@@ -1005,6 +1049,7 @@ private:
     std::atomic<uint64_t> mActiveCount;
     std::atomic<uint64_t> mNumFinished;
     std::atomic<bool> mShutdown;
+    bool mLogIterationData;
 }; // class ExecutorServer
 
 class GptServer

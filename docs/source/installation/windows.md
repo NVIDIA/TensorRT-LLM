@@ -71,3 +71,7 @@ We recommend checking out the [v0.13.0 tag](https://github.com/NVIDIA/TensorRT-L
 This may be caused by an outdated Microsoft Visual C++ Redistributable Version. Please install
 [the latest MSVC](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version)
 and retry. Check the system path to make sure the latest version installed in `System32` is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package `pyarrow` might contain an outdated MSCV DLL).
+
+2. OSError: [WinError 126] The specified module could not be found. Error loading “...\Lib\site-packages\torch\lib\fbgemm.dll” or one of its dependencies.
+
+Installing the latest [Build Tools for Visual Studio 2022] (https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) will resolve the issue.

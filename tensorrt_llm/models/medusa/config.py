@@ -14,9 +14,12 @@
 # limitations under the License.
 
 from ..llama.config import LLaMAConfig
+from ..qwen.config import QWenConfig
 
 
-class MedusaConfig(LLaMAConfig):
+# MedusaConfig is a thin wrapper that picks parent class for GenericMedusaConfig
+# Medusa-specific config is stored and retrieved from GenericMedusaConfig.
+class MedusaConfig():
 
     def __init__(self,
                  *,
@@ -24,15 +27,33 @@ class MedusaConfig(LLaMAConfig):
                  num_medusa_layers: int = 1,
                  max_draft_len: int = 63,
                  **kwargs):
-        self.num_medusa_heads = num_medusa_heads
-        self.num_medusa_layers = num_medusa_layers
-        self.max_draft_len = max_draft_len
-        super().__init__(**kwargs)
+        BaseConfig = QWenConfig if "qwen" in kwargs[
+            'model_type'] else LLaMAConfig
 
-    def to_dict(self):
-        output = super().to_dict()
-        # Serialize the fields added in MedusaConfig
-        output['num_medusa_heads'] = self.num_medusa_heads
-        output['num_medusa_layers'] = self.num_medusa_layers
-        output['max_draft_len'] = self.max_draft_len
-        return output
+        class GenericMedusaConfig(BaseConfig):
+
+            def __init__(self, num_medusa_heads, num_medusa_layers,
+                         max_draft_len, **kwargs):
+                self.num_medusa_heads = num_medusa_heads
+                self.num_medusa_layers = num_medusa_layers
+                self.max_draft_len = max_draft_len
+                super().__init__(**kwargs)
+
+            def to_dict(self):
+                output = super().to_dict()
+                # Serialize the fields added in MedusaConfig
+                output['num_medusa_heads'] = self.num_medusa_heads
+                output['num_medusa_layers'] = self.num_medusa_layers
+                output['max_draft_len'] = self.max_draft_len
+                return output
+
+        self.config = GenericMedusaConfig(num_medusa_heads, num_medusa_layers,
+                                          max_draft_len, **kwargs)
+
+    # Specialization to redirect accesses to self.config
+    def __getattribute__(self, name):
+        if name == 'config' or '__' in name:
+            return object.__getattribute__(self, name)
+        else:
+            config = object.__getattribute__(self, 'config')
+            return config.__getattribute__(name)

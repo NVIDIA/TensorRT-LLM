@@ -68,8 +68,10 @@ class GrokDecoderLayer(Module):
         mlp_kwargs = {}
         assert config.moe_num_experts > 1, "Grok model is a MoE model."
         ClsMLP = MOE
-        moe_config = MoeConfig(config.moe_num_experts, config.moe_top_k,
-                               config.moe_normalization_mode).validate()
+        moe_config = MoeConfig(
+            num_experts=config.moe_num_experts,
+            top_k=config.moe_top_k,
+            normalization_mode=config.moe_normalization_mode).validate()
         mlp_kwargs = {
             "moe_config": moe_config,
             "mapping": config.mapping,

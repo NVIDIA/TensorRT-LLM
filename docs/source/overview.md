@@ -30,7 +30,8 @@ TensorRT-LLM consists of pre– and post-processing steps and multi-GPU multi-no
 
 ### Latest GPU Support
 
-TensorRT-LLM supports GPUs based on the NVIDIA Hopper, NVIDIA Ada Lovelace, NVIDIA Ampere, NVIDIA Turing, and NVIDIA Volta architectures. Certain limitations may, however, apply. Refer to the {ref}`support-matrix` for more information.
+TensorRT-LLM supports GPUs based on the NVIDIA Hopper, NVIDIA Ada Lovelace, and NVIDIA Ampere architectures.
+Certain limitations might apply. Refer to the {ref}`support-matrix` for more information.
 
 ### Native Windows Support
 

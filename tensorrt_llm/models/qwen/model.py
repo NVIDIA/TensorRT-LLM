@@ -127,6 +127,7 @@ class QWenDecoderLayer(Module):
         hidden_states: Tensor,
         attention_mask=None,
         use_cache=False,
+        spec_decoding_params=None,
         kv_cache_params=None,
         attention_params=None,
         lora_layer_params=None,
@@ -137,6 +138,7 @@ class QWenDecoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
@@ -198,6 +200,7 @@ class QWenModel(Module):
                 input_ids: Tensor,
                 position_ids=None,
                 use_cache=False,
+                spec_decoding_params=None,
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
@@ -216,12 +219,14 @@ class QWenModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        hidden_states = self.layers.forward(hidden_states,
-                                            use_cache=use_cache,
-                                            attention_mask=attention_mask,
-                                            kv_cache_params=kv_cache_params,
-                                            attention_params=attention_params,
-                                            lora_params=lora_params)
+        hidden_states = self.layers.forward(
+            hidden_states,
+            use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_params=lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states

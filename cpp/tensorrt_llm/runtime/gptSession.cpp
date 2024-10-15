@@ -72,7 +72,6 @@ auto const kProfileMbIdxs = populateMicrobatchIndexes();
 GptSession::Config setPath(GptSession::Config const& original, std::string const& path)
 {
     GptSession::Config config = original;
-    config.enginePath = std::filesystem::path(path);
     return config;
 }
 

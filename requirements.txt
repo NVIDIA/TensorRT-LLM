@@ -18,10 +18,9 @@ h5py==3.10.0
 StrEnum
 sentencepiece>=0.1.99
 tensorrt~=10.4.0
-# https://github.com/pytorch/pytorch/blob/v2.4.0/version.txt uses 2.4.0a0.
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-07.html#rel-24-07 uses 2.4.0a0.
 torch>=2.4.0a0,<=2.4.0
-nvidia-modelopt~=0.15.0
+nvidia-modelopt[torch]~=0.17.0
 transformers>=4.38.2,<=4.42.4
 pillow==10.3.0
 wheel

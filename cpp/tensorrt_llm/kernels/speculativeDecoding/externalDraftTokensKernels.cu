@@ -60,7 +60,7 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
     auto* outputIdsAfterSamplingPtr = outputIdsAfterSampling + batchSlot * vocabSize;
     auto const useDraftLogits = batchUseDraftLogits[batchSlot];
 
-    if (finishedState.isSkipDecoding())
+    if (finishedState.isSkipDecoding() || finishedState.isFinished())
     {
         return;
     }
@@ -75,8 +75,8 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
 
     for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
     {
-        if (tokensToMask == 0 && outputIdsAfterSamplingPtr[vIdx] == -1)
-        { // we need to find the -1 boundary from returnAllTopP outputIds if topK == 0
+        if (outputIdsAfterSamplingPtr[vIdx] == -1)
+        { // we need to find the -1 boundary from returnAllTopP outputIds if topK == 0 or number of topP indices < topK
             tokensToMask = vIdx;
         }
         maskBuffer[vIdx] = false;
@@ -124,12 +124,21 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
     auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
     auto const useDraftLogits = batchUseDraftLogits[batchSlotBeamWidth];
 
-    if (draftTokenIdx > numDraftTokens || finishedInput[batchSlot].isSkipDecoding())
+    if (draftTokenIdx > numDraftTokens || finishedInput[batchSlot].isSkipDecoding()
+        || finishedInput[batchSlot].isFinished())
     {
         if (tid == 0)
         {
             batchIsAccepted[batchSlot] = true;
+
+            // either finished or skip decode in previous step, this step don't need decoding
             finishedOutput[batchSlot].setSkipDecoding();
+
+            // if previous step is finished, write the state to next step too
+            if (finishedInput[batchSlot].isFinished())
+            {
+                finishedOutput[batchSlot] = finishedInput[batchSlot];
+            }
         }
         return;
     }
@@ -214,7 +223,8 @@ __global__ void forwardAcceptedTokensKernel(SizeType32 batchSize, SizeType32 con
     for (SizeType32 bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
         auto const batchSlot = batchSlots[bi];
-        if (batchIsAccepted[batchSlot] && !finishedOutput[batchSlot].isSkipDecoding())
+        if (batchIsAccepted[batchSlot] && !finishedOutput[batchSlot].isSkipDecoding()
+            && !finishedOutput[batchSlot].isFinished())
         {
             auto const curSeqLen = sequenceLengths[batchSlot];
             auto const draftTokenIdx = step;

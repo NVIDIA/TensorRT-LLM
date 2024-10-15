@@ -32,7 +32,7 @@ from tensorrt_llm.network import net_guard
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
-from examples.mamba.convert_checkpoint import (convert_from_hf_checkpoint,
+from tensorrt_llm.models.mamba.convert import (convert_from_hf_checkpoint,
                                                convert_hf_mamba)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -74,13 +74,12 @@ class TestMamba(unittest.TestCase):
                 'pp_size': 1
             },
         }
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         if load_mode == 'from_checkpoint':
             weights = convert_from_hf_checkpoint(mamba_config=config,
-                                                 model_dir=hf_path,
-                                                 dtype=dtype)
+                                                 model_dir=hf_path)
         else:
-            weights = convert_hf_mamba(hf_mamba, rank=0, dtype=dtype)
-        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
+            weights = convert_hf_mamba(hf_mamba, dtype=dtype)
         tensorrt_llm_mamba = tensorrt_llm.models.MambaForCausalLM(config)
         tensorrt_llm_mamba.load(weights)
         return tensorrt_llm_mamba

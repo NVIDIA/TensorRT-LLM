@@ -207,7 +207,7 @@ TEST(LookaheadRandomllm, gpuSampling)
     kernelParams.vocabSizePadded = vocabSize;
     kernelParams.normalizeLogProbs = false;
     kernelParams.logitsHasProbs = false;
-    kernelParams.returnAllTopK = false;
+    kernelParams.returnAllSelectedTokens = false;
 
     PRINT_TOKENS(mEndIds);
     PRINT_VALUES(mTokensPerStep);
