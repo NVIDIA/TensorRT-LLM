@@ -204,6 +204,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
     auto const maxSeqLen = baseOutputs->outputIds->getDimension<-1>();
     auto const& endIds = params->endIds;
+    auto const& minPs = params->minPs;
 
     std::shared_ptr<BaseDecodingOutputs> preparedOutputs;
     std::shared_ptr<BaseDecodingInputs> preparedInputs;
@@ -226,7 +227,8 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         // sentences once.
         TensorConstPtr logitsSlice = ITensor::slice(*params->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
-        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, params->batchSlots, step, ite, localBatchSize);
+        TensorConstPtr minPSlice = ITensor::slice(minPs, 0, localBatchSize);
+        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, minPSlice, params->batchSlots, step, ite, localBatchSize);
 
         decodeInputs->finished = params->finished;
 
@@ -274,8 +276,9 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         // sentences once.
         TensorConstPtr logitsSlice = ITensor::slice(*externalDraftTokenParams->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
+        TensorConstPtr minPSlice = ITensor::slice(minPs, 0, localBatchSize);
         auto decodeInputs = std::make_shared<ExternalDraftTokensInputs>(
-            endIdSlice, externalDraftTokenParams->batchSlots, step, ite, localBatchSize);
+            endIdSlice, minPSlice, externalDraftTokenParams->batchSlots, step, ite, localBatchSize);
 
         decodeInputs->finished = externalDraftTokenParams->finished;
 
