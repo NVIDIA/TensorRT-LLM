@@ -208,6 +208,7 @@ def convert_and_save_hf(args):
             quant_config=quant_config,
             device='cpu' if args.load_model_on_cpu else 'cuda',
             calib_dataset=args.calib_dataset,
+            gpt_variant=args.gpt_variant,
             **override_fields)
     else:
         hf_model = load_hf_gpt(model_dir, load_model_on_cpu)
