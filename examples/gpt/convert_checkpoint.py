@@ -221,6 +221,7 @@ def convert_and_save_hf(args):
                                                      args.dtype,
                                                      mapping=mapping,
                                                      quant_config=quant_config,
+                                                     gpt_variant=args.gpt_variant,
                                                      **override_fields)
             model.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del model
