@@ -107,6 +107,7 @@ def main(args):
             dataset_name = f"{args.dataset_dir}/{dataset_name}"
     dataset = load_dataset(dataset_name,
                            dataset_revision,
+                           trust_remote_code=True,
                            cache_dir=args.dataset_cache_dir,
                            split=dataset_split)
 

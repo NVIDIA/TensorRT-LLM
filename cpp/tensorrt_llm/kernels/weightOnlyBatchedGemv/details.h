@@ -53,7 +53,7 @@ struct ColumnMajor
     using DetailsA = TypeDetailsA;
     using DetailsW = TypeDetailsW;
     using AccessTypeA = float4;
-    using AccessTypeW = int;
+    using AccessTypeW = typename std::conditional<TypeDetailsW::kElemBits == 8, int2, int>::type;
     static constexpr int kAccessSize = 128;
     static constexpr int kStepK = kAccessSize / TypeDetailsA::kElemBits;
     static constexpr int kTileSize = TileSizeK;
@@ -112,6 +112,22 @@ struct KernelDetails
     static constexpr int kThreadsPerInterleavedTile = LayoutDetails::kTileSize / kStepK;
     static constexpr int kElemsPerByteW = 8 / TypeDetailsW::kElemBits;
     static constexpr bool kUseInterleavedConverter = UseInterleavedConverter;
+};
+
+template <bool GtoShStrided_, int ShStep_, int ShStride_, int Elements_, int Continuous_, typename TVec_, typename T_>
+struct ShMemOptimizer
+{
+    using T = T_;
+    using TVec = TVec_;
+    static constexpr bool GtoShStrided = GtoShStrided_;
+    static constexpr int ShStep = ShStep_;
+    static constexpr int ShStride = ShStride_;
+    static constexpr int Elements = Elements_;
+    static constexpr int Continuous = Continuous_;
+    static constexpr int VecSize = sizeof(TVec) / sizeof(T);
+    static constexpr int c_sh = Elements_ * sizeof(T) / (Elements_ < VecSize ? 1 : sizeof(TVec));
+    static constexpr int c_load = Continuous_ / VecSize;
+
 };
 
 } // namespace weight_only

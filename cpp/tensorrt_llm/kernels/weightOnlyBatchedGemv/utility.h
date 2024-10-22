@@ -301,11 +301,150 @@ public:
         }
     }
 
+    __device__ __forceinline__ void copy_to_shmem(int iter)
+    {
+        // Do nothing
+    }
+
 private:
     T* addr_;
     int step_;
     int stride_;
 };
+
+template <bool Enable, int Grouped, typename ShTraits>
+class SHMemIterator
+{
+    using T = typename ShTraits::T;
+    using TVec = typename ShTraits::TVec;
+
+public:
+    __device__ __forceinline__  SHMemIterator(T* g_addr, int g_offset, T* sh_addr, int sh_offset,
+    int g_step, int g_stride, float k_max_iter)
+        : g_addr_(Enable ? (g_addr + g_offset) : nullptr)
+        , sh_addr_(Enable ? sh_addr : nullptr)
+        , sh_offset_(sh_offset)
+        , g_step_(g_step)
+        , g_stride_(g_stride)
+        , k_max_iter_(k_max_iter)
+    {
+    }
+
+    __device__ __forceinline__ void copy_to_shmem(int iter, int ii = 0)
+    // __pipeline_memcpy_async will use synced version in sm < 80
+    {
+        if constexpr (Enable)
+        {
+            if constexpr (Grouped == 0)
+            {   // Grouped == 0 is for weight / act case
+                int const i = threadIdx.x;
+                if constexpr (ShTraits::GtoShStrided)
+                { // W, A
+                    __pipeline_memcpy_async(
+                        reinterpret_cast<TVec*>(sh_addr_ + ii * sh_stride_) + i,
+                        reinterpret_cast<TVec*>(g_addr_ + iter * g_step_ + ii * g_stride_) + i,
+                        sizeof(TVec)
+                    );
+                }
+                else
+                { // As
+                    __pipeline_memcpy_async(
+                        reinterpret_cast<TVec*>(sh_addr_) + i,
+                        reinterpret_cast<TVec*>(g_addr_ + iter * g_step_) + i,
+                        sizeof(TVec)
+                    );
+                }
+            }
+            else
+            {   // Grouped != 0 is for scale / zero
+                if constexpr (Elements < VecSize)
+                {   // Uncommon slow case
+                    static_assert(c_sh % 4 == 0);
+                    int const s = threadIdx.x % Grouped;
+                    if (s + iter <= k_max_iter_)
+                    {
+                        static_assert(!ShTraits::GtoShStrided);
+                        __pipeline_memcpy_async(
+                            sh_addr_ + s * sh_step_,
+                            g_addr_  + (iter + s) * g_step_,
+                            c_sh
+                        );
+                    }
+                }
+                else
+                {
+                    // s should be float to compare with k_max_iter_
+                    if (threadIdx.x % Grouped / c_sh + iter <= k_max_iter_)
+                    {
+                        int const s = threadIdx.x % Grouped / c_sh;
+                        int const i = threadIdx.x % c_sh;
+                        static_assert(!ShTraits::GtoShStrided);
+                        __pipeline_memcpy_async(
+                            reinterpret_cast<TVec*>(sh_addr_ + s * sh_step_) + i,
+                            reinterpret_cast<TVec*>(g_addr_ + (iter + s) * g_step_) + i,
+                            sizeof(TVec)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    __device__ __forceinline__ void load(void* dst, int ii = 0, int iter = 0)
+    {
+        if constexpr (Enable) {
+            if constexpr (Continuous < VecSize)
+            {
+#pragma unroll
+                for (int jj = 0; jj < Continuous; ++jj)
+                {
+                    reinterpret_cast<T*>(dst)[jj] = sh_addr_[iter * sh_step_ + ii * sh_stride_ + sh_offset_ + jj];
+                }
+            }
+            else
+            {
+                static_assert(Continuous % VecSize == 0);
+#pragma unroll
+                for (int jj = 0; jj < c_load; ++jj)
+                {
+                    if constexpr (sh_step_ == 0)
+                    {
+                        if constexpr (sh_stride_ == 0)
+                        {
+                            reinterpret_cast<TVec*>(dst)[jj] = reinterpret_cast<TVec*>(sh_addr_ + sh_offset_)[jj];
+                        }
+                        else
+                        {
+                            reinterpret_cast<TVec*>(dst)[jj] = reinterpret_cast<TVec*>(sh_addr_ + ii * sh_stride_ + sh_offset_)[jj];
+                        }
+                    }
+                    else 
+                    {
+                    reinterpret_cast<TVec*>(dst)[jj] = reinterpret_cast<TVec*>(sh_addr_ + iter * sh_step_ + ii * sh_stride_ + sh_offset_)[jj];
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    T* g_addr_;
+    T* sh_addr_;
+    int sh_offset_;
+    int g_step_;
+    int g_stride_;
+    // Decimal value represents that the last k iteration will only use a few warps
+    float k_max_iter_;
+
+    static constexpr int VecSize = ShTraits::VecSize;
+    static constexpr int c_sh = ShTraits::c_sh;
+    static constexpr int c_load = ShTraits::c_load;
+    static constexpr int Continuous = ShTraits::Continuous;
+    static constexpr int Elements = ShTraits::Elements;
+    static constexpr int sh_step_ = ShTraits::ShStep;
+    static constexpr int sh_stride_ = ShTraits::ShStride;
+};
+
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm
