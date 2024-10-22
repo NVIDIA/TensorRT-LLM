@@ -77,6 +77,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList,
@@ -89,7 +90,7 @@ public:
             draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
-            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength,
+            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength, crossAttentionMask,
             tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),

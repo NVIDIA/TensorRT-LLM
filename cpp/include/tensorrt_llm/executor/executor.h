@@ -64,11 +64,13 @@ public:
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
-        std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt);
+        std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
+        std::optional<SizeType32> const& numReturnSequences = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
     [[nodiscard]] SizeType32 getBeamWidth() const;
+    [[nodiscard]] SizeType32 getNumReturnBeams() const;
     [[nodiscard]] std::optional<SizeType32> getTopK() const;
     [[nodiscard]] std::optional<FloatType> getTopP() const;
     [[nodiscard]] std::optional<FloatType> getTopPMin() const;
@@ -86,6 +88,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
+    [[nodiscard]] std::optional<SizeType32> getNumReturnSequences() const;
 
     void setBeamWidth(SizeType32 beamWidth);
     void setTopK(std::optional<SizeType32> const& topK);
@@ -105,6 +108,7 @@ public:
     void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
+    void setNumReturnSequences(std::optional<SizeType32> const& numReturnSequences);
 
 private:
     static SizeType32 checkBeamWidth(SizeType32 beamWidth);
@@ -119,6 +123,10 @@ private:
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
+    static std::optional<SizeType32> const& checkNumReturnSequences(
+        std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
+
+    void updateNumReturnBeams();
 
     friend class Serialization;
 
@@ -158,6 +166,12 @@ private:
     std::optional<SizeType32> mEarlyStopping;
     /// @brief Controls how many repeat ngram size are acceptable. Default is 1 << 30.
     std::optional<SizeType32> mNoRepeatNgramSize;
+    /// @brief The number of return sequences or beams. In beam search, the value should be less than or equal to
+    /// mBeamWidth. In sampling, it specifies the total number of independently generated sequences.
+    std::optional<SizeType32> mNumReturnSequences;
+    /// @brief The number of beams to return. It is equal to beamWidth unless numReturnSequences is set.
+    /// If beamWidth > 1 and numReturnSequences is set, then numReturnBeams is equal to numReturnSequences.
+    SizeType32 mNumReturnBeams;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -365,6 +379,7 @@ public:
     /// @param encoderInputFeatures Encoder input features for multimodal models.
     /// @param encoderOutputLength Encoder output length if encoder input and output have different lengths (due to
     /// convolution down-sampling, etc.)
+    /// @param crossAttentionMask Cross attention mask.
     /// @param type Indicate the request type for disaggregated serving mode.
     /// @param contextPhaseParams Generated token ID  from context only executor.
     /// @param numReturnSequences The number of returning sequences.
@@ -385,7 +400,8 @@ public:
         RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
-        std::optional<SizeType32> encoderOutputLength = std::nullopt, SizeType32 numReturnSequences = 1);
+        std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -420,6 +436,7 @@ public:
     [[nodiscard]] std::optional<ContextPhaseParams> const& getContextPhaseParams() const;
     [[nodiscard]] std::optional<Tensor> getEncoderInputFeatures() const;
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
+    [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
     [[nodiscard]] SizeType32 getNumReturnSequences() const;
 
@@ -445,6 +462,7 @@ public:
     void setContextPhaseParams(ContextPhaseParams contextPhaseParams);
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
+    void setCrossAttentionMask(Tensor crossAttentionMask);
     void setNumReturnSequences(SizeType32 numReturnSequences);
 
 private:
@@ -502,10 +520,13 @@ struct Result
     /// @brief The decoding iterations it takes.
     SizeType32 decodingIter{0};
 
-    /// @brief The index of the output sequence where 0 <= sequenceIndex < numReturnSequences
+    /// @brief The index of the output sequence of this result where 0 <= sequenceIndex < numReturnSequences.
+    /// In beam search (beamWidth > 1), this index will be always zero because all beams to be returned are included
+    /// in this result.
     SizeType32 sequenceIndex{0};
 
     /// @brief Indicates if this is the final result for a given sequence in the request
+    /// In beam search (beamWidth > 1), the value will always equal to the value of isFinal.
     bool isSequenceFinal;
 };
 

@@ -428,8 +428,15 @@ def get_tllm_linear_sq_weight(vals,
 
 
 def load_hf_qwen(model_dir: str, load_model_on_cpu: bool = False):
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(
+    config_path = os.path.join(model_dir, 'config.json')
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    if config['architectures'] == ['Qwen2ForSequenceClassification']:
+        from transformers import Qwen2ForSequenceClassification as model_cls
+    else:
+        from transformers import AutoModelForCausalLM as model_cls
+
+    model = model_cls.from_pretrained(
         model_dir,
         device_map='auto' if not load_model_on_cpu else 'cpu',
         torch_dtype='auto',
@@ -867,6 +874,10 @@ def convert_hf_qwen(hf_model,
     if mapping.is_last_pp_rank():
         ln_f_w = get_weight(model_params, key_list[8], dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
+
+    if hasattr(hf_model, 'score'):
+        score = get_weight(model_params, 'score', dtype)
+        weights['lm_head.weight'] = score
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

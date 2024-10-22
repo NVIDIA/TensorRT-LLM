@@ -1599,6 +1599,9 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
     if mapping.is_last_pp_rank():
         v = load(param_name_map["lm_head"], -1, 1) if pad_vocab else load(
             param_name_map["lm_head"], 0, 1)  # lm_head
+        if v is None:
+            v = load(param_name_map["vocab_embedding"], -1 if pad_vocab else 0,
+                     1)
         if pad_vocab:
             v = torch.nn.functional.pad(
                 v, (0, 0, 0, vocab_size_padded - vocab_size), 'constant', 0)
@@ -2121,7 +2124,7 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
                                ((0, pad_width), (0, 0)),
                                'constant',
                                constant_values=0))
-                weights['lm_head.weight'] = v
+                weights['lm_head.weight'] = v.detach().clone()
         elif k == "norm.weight":
             if mapping.is_last_pp_rank():
                 weights['transformer.ln_f.weight'] = v

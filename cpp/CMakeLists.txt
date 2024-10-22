@@ -543,7 +543,7 @@ endif()
 
 # Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
 # need to be built to have aligned symbols
-set_ifndef(ENABLE_UCX 0)
+set_ifndef(ENABLE_UCX 1)
 if(ENABLE_UCX)
   # Only enable UCX related features if the system has UCX library
   find_package(ucx)

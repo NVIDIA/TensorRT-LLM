@@ -81,6 +81,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto loraConfig = from_torch(mLoraConfig);
     auto draftLogits = from_torch(mDraftLogits);
     auto encoderInputFeatures = from_torch(mEncoderInputFeatures);
+    auto crossAttentionMask = from_torch(mCrossAttentionMask);
 
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
@@ -88,8 +89,8 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         loraWeights, loraConfig, mLookaheadConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits,
         mDraftTokens, draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor),
         mApplyLogitsPostProcessorBatched, mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority,
-        encoderInputFeatures, mEncoderOutputLength, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        mInputTokenExtraIds, mNumReturnSequences);
+        encoderInputFeatures, mEncoderOutputLength, crossAttentionMask,
+        tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, mInputTokenExtraIds, mNumReturnSequences);
 }
 
 void LlmRequest::initBindings(py::module_& m)
@@ -105,8 +106,8 @@ void LlmRequest::initBindings(py::module_& m)
                  std::optional<LlmRequest::VecTokens>, std::optional<LlmRequest::TensorPtr>, bool,
                  std::optional<LlmRequest::LogitsPostProcessor>, bool, std::optional<LlmRequest::VecTokens>, bool,
                  std::optional<RequestIdType>, executor::PriorityType, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::VecTokenExtraIds>,
-                 LlmRequest::SizeType32>(),
+                 std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::TensorPtr>,
+                 std::optional<LlmRequest::VecTokenExtraIds>, LlmRequest::SizeType32>(),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
@@ -121,7 +122,8 @@ void LlmRequest::initBindings(py::module_& m)
             py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
             py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority,
             py::arg("encoder_input_features") = std::nullopt, py::arg("encoder_output_length") = std::nullopt,
-            py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1)
+            py::arg("cross_attention_mask") = std::nullopt, py::arg("input_token_extra_ids") = std::nullopt,
+            py::arg("num_return_sequences") = 1)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
         .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))

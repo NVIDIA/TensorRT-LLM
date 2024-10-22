@@ -76,11 +76,12 @@ trtllm-build \
 cd examples/llama
 
 python3 ../run.py \
-    --tokenizer_dir gpt2-medium \
+    --tokenizer_dir <Path To Llama-v2-7B repo> \
     --draft_engine_dir ./draft-engine \
     --engine_dir ./target-engine \
     --draft_target_model_config="[4,[0],[1],True]" \
     --kv_cache_free_gpu_memory_fraction=0.4 \
     --max_output_len=256 \
+    --kv_cache_enable_block_reuse \
     --input_text="How does Draft-Sampling work?"
 ```

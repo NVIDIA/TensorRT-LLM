@@ -6,7 +6,7 @@ import pytest
 sys.path.append(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples",
                  "apps"))
-from chat import LLM, AutoTokenizer, LlmConsole, SamplingParams
+from chat import LLM, AutoTokenizer, BuildConfig, LlmConsole, SamplingParams
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import llama_model_path
@@ -16,7 +16,10 @@ from test_llm import llama_model_path
 def interactive_console():
     model_dir = llama_model_path
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    llm = LLM(model_dir)
+    build_config = BuildConfig()
+    build_config.max_batch_size = 8
+    build_config.max_seq_len = 512
+    llm = LLM(model_dir, build_config=build_config)
 
     sampling_params = SamplingParams()
 

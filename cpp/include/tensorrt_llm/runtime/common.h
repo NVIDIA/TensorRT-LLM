@@ -30,6 +30,7 @@ namespace tensorrt_llm::runtime
 // Note that we use signed size types as recommended by TensorRT:
 // https://github.com/NVIDIA/TensorRT/blob/main/CODING-GUIDELINES.md#signed-vs-unsigned-integers
 using SizeType32 = std::int32_t;
+using SizeType64 = std::int64_t;
 
 // Token ID type
 using TokenIdType = std::int32_t;

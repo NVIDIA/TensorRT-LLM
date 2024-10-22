@@ -16,7 +16,8 @@ from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from .. import profiler
 from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
-                      supports_inflight_batching, trt_dtype_to_torch)
+                      supports_inflight_batching, torch_dtype_to_trt,
+                      trt_dtype_to_torch)
 from ..logger import logger
 from .enc_dec_model_runner import EncDecModelRunner
 from .model_runner import ModelRunner
@@ -188,6 +189,19 @@ class MultimodalModelRunner:
             self.llm_name = AutoConfig.from_pretrained(
                 self.args.hf_model_dir).text_config._name_or_path
 
+        if self.model_type == "mllama":
+            self.vision_input_names = [
+                "pixel_values",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+            ]
+            self.vision_output_names = [
+                "output",
+            ]
+        else:
+            self.vision_input_names = ["input"]
+            self.vision_output_names = ["output"]
+
         if self.decoder_llm:
             if not supports_inflight_batching(self.args.llm_engine_dir):
                 logger.warning(
@@ -205,12 +219,6 @@ class MultimodalModelRunner:
             if args.debug_mode and not self.args.use_py_session:
                 logger.warning(
                     "Debug mode is not supported in C++ session for now, fallback to Python session."
-                )
-                self.args.use_py_session = True
-
-            if self.model_type != 'cogvlm' and not self.args.use_py_session:
-                logger.warning(
-                    "Only the cogvlm is supported in C++ session for now, fallback to Python session."
                 )
                 self.args.use_py_session = True
 
@@ -301,6 +309,7 @@ class MultimodalModelRunner:
     def init_llm(self):
         if self.decoder_llm:
             if self.use_py_session:
+                logger.info(f'Running LLM with Python runner')
                 self.model = ModelRunner.from_dir(
                     self.args.llm_engine_dir,
                     rank=tensorrt_llm.mpi_rank(),
@@ -310,12 +319,16 @@ class MultimodalModelRunner:
                     enable_context_fmha_fp32_acc)
                 self.model_config = self.model.session._model_config
             else:
+                logger.info(f'Running LLM with C++ runner')
                 self.model = ModelRunnerCpp.from_dir(
                     self.args.llm_engine_dir,
                     rank=tensorrt_llm.mpi_rank(),
                     debug_mode=False,
+                    enable_chunked_context=self.args.enable_chunked_context,
                     enable_context_fmha_fp32_acc=self.args.
-                    enable_context_fmha_fp32_acc)
+                    enable_context_fmha_fp32_acc,
+                    kv_cache_free_gpu_memory_fraction=self.args.
+                    kv_cache_free_gpu_memory_fraction)
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
         else:
@@ -369,7 +382,8 @@ class MultimodalModelRunner:
             self.vision_precision))  # [num_frames, 3, H, W]
         return media_tensors.unsqueeze(0)  #[1, num_frames, 3, H, W]
 
-    def preprocess(self, warmup, pre_prompt, post_prompt, image):
+    def preprocess(self, warmup, pre_prompt, post_prompt, image,
+                   other_vision_inputs):
         if self.model_type == 'kosmos-2':
             input_ids = image['input_ids'].clone()
             image_mask = image["image_embeds_position_mask"]
@@ -394,8 +408,8 @@ class MultimodalModelRunner:
             profiler.start("Vision")
 
         visual_features, visual_atts = self.get_visual_features(
-            torch.stack(image['image_patches'], dim=0) if self.model_type ==
-            'fuyu' else image)
+            torch.stack(image['image_patches'], dim=0)
+            if self.model_type == 'fuyu' else image, other_vision_inputs)
 
         if not warmup:
             profiler.stop("Vision")
@@ -487,6 +501,12 @@ class MultimodalModelRunner:
             input_ids = self.ptuning_setup_llava_next(visual_features,
                                                       pre_prompt, post_prompt)
             length = input_ids.shape[1]
+        elif self.model_type == 'mllama':
+            pre_input_ids = self.tokenizer(pre_prompt,
+                                           return_tensors="pt",
+                                           padding=True).input_ids
+            length = pre_input_ids.shape[1]
+            post_input_ids = None
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -588,16 +608,23 @@ class MultimodalModelRunner:
                  image,
                  decoder_input_ids,
                  max_new_tokens,
-                 warmup=False):
+                 warmup=False,
+                 other_vision_inputs={},
+                 other_decoder_inputs={}):
         if not warmup:
             profiler.start("Generate")
 
         input_ids, input_lengths, ptuning_args, visual_features = self.preprocess(
-            warmup, pre_prompt, post_prompt, image)
+            warmup, pre_prompt, post_prompt, image, other_vision_inputs)
         if warmup: return None
 
+        # use prompt tuning to pass multimodal features
+        # model.generate() expects the following params (see layers/embedding.py):
+        # args[0]: prompt embedding table, [batch_size, multimodal_len, hidden_size], later flattened to [batch_size * multimodal_len, hidden_size]
+        # args[1]: prompt task ids, [batch_size]. in multimodal case, arange(batch_size), i.e. in VILA batching mode 2, each image is treated separately in the batch instead of concated together (although the prompt embedding table has to be concated)
+        # args[2]: prompt task vocab size, [1]. assuming all table has the same length, which in multimodal case equals to multimodal_len
         profiler.start("LLM")
-        if self.decoder_llm:
+        if self.decoder_llm and self.model_type != "mllama":
             end_id = self.tokenizer.eos_token_id
             if 'opt' in self.model_type and 'blip2' in self.model_type:
                 # For BLIP2-OPT, model outputs a "\n" at the end.
@@ -605,23 +632,24 @@ class MultimodalModelRunner:
                 end_id = self.tokenizer.encode("\n",
                                                add_special_tokens=False)[0]
 
-            ptuning_args[0] = torch.stack([ptuning_args[0]])
             if self.model_type == 'cogvlm':
                 input_position_ids = self.prepare_position_ids_for_cogvlm(
                     input_ids)
-                batch_size = len(input_ids)
-                if not self.use_py_session:
-                    prompt_tasks = ",".join(np.arange(batch_size).astype(str))
-                    ptuning_args[0] = ptuning_args[0].view(
-                        batch_size, ptuning_args[2].cpu().item(), -1)
+
+            batch_size = len(input_ids)
+            prompt_tasks = ",".join(
+                np.arange(batch_size, dtype=np.int32).astype(str))
+            prompt_table = torch.stack([ptuning_args[0]])
+            prompt_table = prompt_table.view(batch_size, -1,
+                                             prompt_table.shape[-1])
 
             output_ids = self.model.generate(
                 input_ids,
                 input_position_ids=input_position_ids
                 if self.model_type == 'cogvlm' else None,
                 sampling_config=None,
-                prompt_table=ptuning_args[0],
-                prompt_tasks=prompt_tasks if not self.use_py_session else None,
+                prompt_table=prompt_table,
+                prompt_tasks=prompt_tasks,
                 max_new_tokens=max_new_tokens,
                 end_id=end_id,
                 pad_id=self.tokenizer.pad_token_id
@@ -634,6 +662,83 @@ class MultimodalModelRunner:
                 num_beams=self.args.num_beams,
                 output_sequence_lengths=False,
                 return_dict=False)
+        elif self.model_type == "mllama":
+            visual_features = visual_features.to(torch.bfloat16).chunk(
+                self.args.batch_size, dim=0)
+            encoder_input_features = []
+            cross_attention_masks = []
+            encoder_output_lengths = []
+            for batch_idx in range(self.args.batch_size):
+                visual_feature = visual_features[batch_idx]
+                num_vision_tokens = visual_feature.shape[3]
+                visual_feature = visual_feature.reshape(
+                    [-1, visual_feature.shape[-1]])
+                encoder_max_input_length = visual_feature.shape[0]
+                encoder_input_lengths = torch.IntTensor(
+                    [encoder_max_input_length]).to(visual_feature.device)
+
+                # prepare cross_attention_mask of context phase
+                cross_attention_mask = other_decoder_inputs[
+                    'cross_attention_mask']
+                batch_size, text_total_length, *_ = cross_attention_mask.shape
+                cross_attention_mask = cross_attention_mask.repeat_interleave(
+                    num_vision_tokens, dim=3)
+                cross_attention_mask = cross_attention_mask.view(
+                    batch_size, text_total_length, -1)
+                cross_attention_mask = cross_attention_mask.unsqueeze(1)
+                cross_attention_mask = cross_attention_mask.to(
+                    visual_feature.device).to(torch.bool).reshape(
+                        [-1, cross_attention_mask.shape[-1]])
+
+                # prepare cross_attention_mask for generation phase and concat them
+                tmp_mask = [cross_attention_mask] + [
+                    cross_attention_mask[-1:, :] for _ in range(max_new_tokens)
+                ]
+                cross_attention_mask = torch.concat(tmp_mask)
+
+                encoder_input_features.append(visual_feature)
+                cross_attention_masks.append(cross_attention_mask)
+                encoder_output_lengths.append(encoder_input_lengths)
+
+            outputs = self.model.generate(
+                batch_input_ids=input_ids,
+                encoder_input_ids=None,
+                encoder_input_features=encoder_input_features,
+                encoder_output_lengths=encoder_output_lengths,
+                cross_attention_masks=cross_attention_masks,
+                max_new_tokens=max_new_tokens,
+                # max_attention_window_size=args.max_attention_window_size,
+                # sink_token_length=args.sink_token_length,
+                end_id=self.tokenizer.eos_token_id,
+                pad_id=self.tokenizer.pad_token_id,
+                temperature=self.args.temperature,
+                top_k=self.args.top_k,
+                top_p=self.args.top_p,
+                num_beams=self.args.num_beams,
+                # length_penalty=args.length_penalty,
+                # early_stopping=args.early_stopping,
+                repetition_penalty=self.args.repetition_penalty,
+                # presence_penalty=args.presence_penalty,
+                # frequency_penalty=args.frequency_penalty,
+                # stop_words_list=stop_words_list,
+                # bad_words_list=bad_words_list,
+                # output_cum_log_probs=(args.output_cum_log_probs_npy != None),
+                # output_log_probs=(args.output_log_probs_npy != None),
+                # random_seed=args.random_seed,
+                # lora_uids=args.lora_task_uids,
+                # prompt_table=args.prompt_table_path,
+                # prompt_tasks=args.prompt_tasks,
+                # streaming=args.streaming,
+                output_sequence_lengths=True,
+                # no_repeat_ngram_size=self.args.no_repeat_ngram_size,
+                return_dict=True,
+                # medusa_choices=args.medusa_choices,
+                # return_all_generated_tokens=args.return_all_generated_tokens,
+                # input_token_extra_ids=input_token_extra_ids,
+                encoder_max_input_length=encoder_max_input_length,
+            )
+            if mpi_rank() == 0:
+                output_ids = outputs["output_ids"]
         else:
             if self.model_type in ['nougat', 'pix2struct']:
                 # Trim encoder input_ids to match visual features shape
@@ -680,14 +785,21 @@ class MultimodalModelRunner:
             profiler.stop("Generate")
             return None
 
-    def get_visual_features(self, image):
+    def get_visual_features(self, image, other_vision_inputs):
         visual_features = {
-            'input': image.to(str_dtype_to_torch(self.vision_precision))
+            self.vision_input_names[0]:
+            image.to(str_dtype_to_torch(self.vision_precision)),
         }
+        for key, tensor in other_vision_inputs.items():
+            visual_features.update({key: tensor})
+
         tensor_info = [
-            TensorInfo('input', str_dtype_to_trt(self.vision_precision),
-                       image.shape)
+            TensorInfo(self.vision_input_names[0],
+                       str_dtype_to_trt(self.vision_precision), image.shape),
         ]
+        for key, tensor in other_vision_inputs.items():
+            tensor_info.append(
+                TensorInfo(key, torch_dtype_to_trt(tensor.dtype), tensor.shape))
 
         visual_output_info = self.visual_encoder_session.infer_shapes(
             tensor_info)
@@ -704,7 +816,7 @@ class MultimodalModelRunner:
         assert ok, "Runtime execution failed for vision encoder session"
         self.stream.synchronize()
 
-        image_embeds = visual_outputs['output']
+        image_embeds = visual_outputs[self.vision_output_names[0]]
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
@@ -732,7 +844,7 @@ class MultimodalModelRunner:
                 fake_prompt_counter += visual_feature.shape[0]
                 fake_prompt_id = fake_prompt_id.unsqueeze(0)
                 input_ids.append(fake_prompt_id)
-                # in case no post prompt
+                # in case no inter or post prompt
                 if len(split_input_ids) > idx + 1:
                     input_ids.append(split_input_ids[idx + 1])
 
@@ -743,7 +855,6 @@ class MultimodalModelRunner:
                 fake_prompt_id = torch.arange(
                     fake_prompt_counter,
                     fake_prompt_counter + visual_feature.shape[0])
-                fake_prompt_counter += visual_feature.shape[0]
                 fake_prompt_id = fake_prompt_id.unsqueeze(0)
                 input_ids.append(fake_prompt_id)
                 if len(split_input_ids) > 1:
@@ -789,6 +900,8 @@ class MultimodalModelRunner:
             input_ids = torch.cat(
                 [pre_input_ids[:, 0:1], fake_prompt_id, pre_input_ids[:, 1:]],
                 dim=1).contiguous().to(torch.int32)
+        elif self.model_type == 'mllama':
+            input_ids = pre_input_ids.contiguous().to(torch.int32)
         else:
             if post_input_ids is not None:
                 input_ids = [pre_input_ids, fake_prompt_id, post_input_ids]
@@ -796,7 +909,8 @@ class MultimodalModelRunner:
                 input_ids = [fake_prompt_id, pre_input_ids]
             input_ids = torch.cat(input_ids, dim=1).contiguous().to(torch.int32)
 
-        if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
+        if (self.decoder_llm or self.runtime_mapping.is_first_pp_rank()
+            ) and self.model_type != "mllama":
             ptuning_args = self.ptuning_setup(visual_features, input_ids,
                                               input_lengths)
         else:
@@ -885,72 +999,66 @@ class MultimodalModelRunner:
         return [prompt_table, tasks, task_vocab_size]
 
     def load_test_image(self):
+
+        def load_images(image_paths):
+            if isinstance(image_paths, str):
+                image_paths = [image_paths]
+            images = []
+            for image_path in image_paths:
+                if image_path.startswith("http") or image_path.startswith(
+                        "https"):
+                    logger.info(f"downloading image from url {image_path}")
+                    response = requests.get(image_path, timeout=5)
+                    image = Image.open(BytesIO(response.content)).convert("RGB")
+                else:
+                    image = Image.open(image_path).convert("RGB")
+                images.append(image)
+            return images if len(images) > 1 else images[0]
+
         if "vila" in self.model_type:
             if self.args.image_path is None:
-                img_url = 'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png'
-                self.args.image_path = img_url
-                image = Image.open(
-                    requests.get(img_url, stream=True,
-                                 timeout=5).raw).convert('RGB')
-                return [image] * self.args.batch_size
+                img_urls = [
+                    'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png',
+                    'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+                ] * 4
+                img_urls = img_urls[:self.args.batch_size]
+                self.args.image_path = ",".join(img_urls)
+                images = load_images(img_urls)
             else:
+                images = load_images(
+                    self.args.image_path.split(self.args.path_sep))
 
-                def load_image(image_path):
-                    if image_path.startswith("http") or image_path.startswith(
-                            "https"):
-                        logger.info(f"downloading image from url {image_path}")
-                        response = requests.get(image_path, timeout=5)
-                        image = Image.open(BytesIO(
-                            response.content)).convert("RGB")
-                    else:
-                        image = Image.open(image_path).convert("RGB")
-                    return image
-
-                out = []
-                image_paths = self.args.image_path.split(self.args.path_sep)
-                for image_path in image_paths:
-                    image = load_image(image_path)
-                    out.append(image)
-                return out
         elif "nougat" in self.model_type:
             filepath = hf_hub_download(
                 repo_id="hf-internal-testing/fixtures_docvqa",
                 filename="nougat_paper.png",
                 repo_type="dataset")
-            image = Image.open(filepath)
+            images = Image.open(filepath)
         elif "fuyu" in self.model_type:
             filepath = hf_hub_download(repo_id="adept/fuyu-8b",
                                        filename="skateboard.png",
                                        repo_type='model')
-            image = Image.open(filepath)
+            images = Image.open(filepath)
         elif "kosmos" in self.model_type:
-            img_url = 'https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png'
-            image = Image.open(
-                requests.get(img_url, stream=True,
-                             timeout=5).raw).convert('RGB')
+            if self.args.image_path is None:
+                self.args.image_path = 'https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png'
+            images = load_images(self.args.image_path)
         elif "pix2struct" in self.model_type:
-            img_url = 'https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png'
-            image = Image.open(
-                requests.get(img_url, stream=True,
-                             timeout=5).raw).convert('RGB')
+            if self.args.image_path is None:
+                self.args.image_path = 'https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png'
+            images = load_images(self.args.image_path)
         elif "video-neva" in self.model_type:
-            image = self.args.video_path
+            images = self.args.video_path
         else:
-            img_url = self.args.image_path
-            if img_url is None:
-                img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
-
-            if img_url.startswith("http") or img_url.startswith("https"):
-                image = Image.open(
-                    requests.get(img_url, stream=True,
-                                 timeout=5).raw).convert('RGB')
-            else:
-                image = Image.open(img_url).convert("RGB")
-
-        return image
+            if self.args.image_path is None:
+                self.args.image_path = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+            images = load_images(self.args.image_path)
+        return images
 
     def setup_inputs(self, input_text, raw_image):
         from torchvision import transforms
+        other_vision_inputs = {}
+        other_decoder_inputs = {}
         if 'blip2' in self.model_type:
             from transformers import Blip2Processor
             processor = Blip2Processor.from_pretrained(self.args.hf_model_dir)
@@ -1107,6 +1215,8 @@ class MultimodalModelRunner:
                 vision_tower = model.get_vision_tower()
                 image_processor = vision_tower.image_processor
                 from llava.mm_utils import process_images
+                if not isinstance(raw_image, list):
+                    raw_image = [raw_image]
                 image = process_images(raw_image, image_processor,
                                        model.config).to(model.device,
                                                         dtype=torch.float16)
@@ -1121,6 +1231,27 @@ class MultimodalModelRunner:
                     image = processor(text=input_text,
                                       images=raw_image,
                                       return_tensors="pt")['pixel_values']
+        elif self.model_type in ['mllama']:
+            processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
+            image = Image.open(self.args.image_path)
+            inputs = processor(images=image, return_tensors="pt")
+
+            other_vision_inputs = {
+                "aspect_ratio_ids":
+                inputs["aspect_ratio_ids"].to(self.device).expand(
+                    self.args.batch_size, -1).contiguous(),
+                "aspect_ratio_mask":
+                inputs["aspect_ratio_mask"].to(self.device).expand(
+                    self.args.batch_size, -1, -1).contiguous(),
+            }
+            cross_attention_mask = processor(
+                image, input_text, return_tensors="pt")['cross_attention_mask']
+            other_decoder_inputs = {
+                "cross_attention_mask": cross_attention_mask.to(self.device),
+            }
+            pre_prompt = input_text
+            post_prompt = None
+            image = inputs["pixel_values"]
 
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
@@ -1131,6 +1262,9 @@ class MultimodalModelRunner:
         ]:
             if image.dim() == 5:
                 image = image.expand(self.args.batch_size, -1, -1, -1,
+                                     -1).contiguous()
+            elif image.dim() == 6:
+                image = image.expand(self.args.batch_size, -1, -1, -1, -1,
                                      -1).contiguous()
             else:
                 image = image.expand(self.args.batch_size, -1, -1,
@@ -1154,17 +1288,18 @@ class MultimodalModelRunner:
             decoder_input_ids = decoder_input_ids.repeat(
                 (self.args.batch_size, 1))
 
-        return input_text, pre_prompt, post_prompt, image, decoder_input_ids
+        return input_text, pre_prompt, post_prompt, image, decoder_input_ids, other_vision_inputs, other_decoder_inputs
 
     def run(self, input_text, input_image, max_new_tokens):
-        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids = self.setup_inputs(
+        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, other_vision_inputs, other_decoder_inputs = self.setup_inputs(
             input_text, input_image)
-
         output_text = self.generate(pre_prompt,
                                     post_prompt,
                                     processed_image,
                                     decoder_input_ids,
                                     max_new_tokens,
-                                    warmup=False)
+                                    warmup=False,
+                                    other_vision_inputs=other_vision_inputs,
+                                    other_decoder_inputs=other_decoder_inputs)
 
         return input_text, output_text

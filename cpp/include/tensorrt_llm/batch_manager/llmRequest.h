@@ -106,6 +106,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
         SizeType32 numReturnSequences = 1)
@@ -150,6 +151,7 @@ public:
         , mFinishReasons(samplingConfig.beamWidth)
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
+        , mCrossAttentionMask(std::move(crossAttentionMask))
         , mLlmRequestType(llmRequestType)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
@@ -205,7 +207,7 @@ public:
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mInputTokenExtraIds(std::nullopt)
-        , mNumReturnSequences(req.getNumReturnSequences())
+        , mNumReturnSequences(1)
         , mSequenceIndex(0)
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -243,7 +245,8 @@ public:
 
         if (req.getEmbeddingBias())
         {
-            mEmbeddingBias = executor::detail::toITensor(req.getEmbeddingBias().value());
+            mEmbeddingBias
+                = tensorrt_llm::runtime::ITensor::view(executor::detail::toITensor(req.getEmbeddingBias().value()));
             // Add leading 1 dimension since that's what IFB code expects
             mEmbeddingBias.value()->unsqueeze(0);
         }
@@ -324,6 +327,16 @@ public:
             mEncoderInputFeatures = std::nullopt;
         }
 
+        auto const& crossAttentionMask = req.getCrossAttentionMask();
+        if (crossAttentionMask.has_value())
+        {
+            mCrossAttentionMask = executor::detail::toITensor(crossAttentionMask.value());
+        }
+        else
+        {
+            mCrossAttentionMask = std::nullopt;
+        }
+
         switch (req.getRequestType())
         {
         case executor::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION:
@@ -393,15 +406,6 @@ public:
             mMaxNewTokens = maxNewTokens;
         }
 
-        if (mNumReturnSequences > 1 && mSamplingConfig.beamWidth > 1)
-        {
-            TLLM_THROW(
-                "Using mNumReturnSequences (%d) > 1 with beam search is currently disabled, since TensorRT-LLM returns "
-                "a total of mNumReturnSequences x beamWidth beams, rather than limiting the number of returned beams "
-                "to mNumReturnSequences. This restriction will be removed once the issue is resolved.",
-                mNumReturnSequences);
-        }
-
         TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
 
         // validate extra ids when enabling kv cache reuse with prompt table
@@ -452,7 +456,18 @@ public:
     /// @return  The number of sequences to return.
     [[nodiscard]] SizeType32 getNumReturnSequences() const
     {
+        TLLM_LOG_WARNING(
+            "mNumReturnSequences in the LlmRequest class is deprecated. Please use numReturnSequences in "
+            "SamplingConfig directly.");
         return mNumReturnSequences;
+    }
+
+    /// @brief Get the number of subrequests, the expected number of responses under non-streaming mode. In sampling
+    /// mode, it will be equal to mSamplingConfig.numReturnSequences, while it will be equal to 1 in beam search.
+    /// @return  The number of subrequests in total  request size.
+    [[nodiscard]] SizeType32 getNumSubRequests() const
+    {
+        return mSamplingConfig.beamWidth == 1 ? mSamplingConfig.numReturnSequences.value_or(1) : 1;
     }
 
     /// @brief Get child requests spawned by this req.
@@ -661,8 +676,8 @@ public:
         TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
             "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
             numReturnSequences, mChildRequests.size());
-        mNumReturnSequences = numReturnSequences;
-        mSequenceFinalVec->resize(mNumReturnSequences);
+        mSamplingConfig.numReturnSequences = numReturnSequences;
+        mSequenceFinalVec->resize(numReturnSequences);
     }
 
     [[nodiscard]] bool constexpr isChild() const noexcept
@@ -1021,6 +1036,11 @@ public:
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
+    [[nodiscard]] TensorPtr const getCrossAttentionMask() const
+    {
+        return mCrossAttentionMask.value_or(nullptr);
+    }
+
     [[nodiscard]] bool constexpr isStreaming() const noexcept
     {
         return mIsStreaming;
@@ -1267,6 +1287,12 @@ public:
         return mPriority;
     }
 
+    /// Get the counter of decoding iterations.
+    SizeType32 getDecodingIter()
+    {
+        return mDecodingIter;
+    }
+
     /// Increment the counter of decoding iterations.
     void advanceDecodingIter()
     {
@@ -1307,7 +1333,6 @@ public:
             result.isFinal = std::all_of(mSequenceFinalVec->begin(), mSequenceFinalVec->end(),
                 [](bool isSequenceFinal) { return isSequenceFinal; });
 
-            auto const nbBeams = mSamplingConfig.beamWidth;
             auto const maxNbTokens = getMaxBeamNumTokens();
 
             if (isDisaggContextTransmissionState() && isContextOnlyRequest())
@@ -1335,6 +1360,8 @@ public:
 
             auto const maxNbTokensOut = calculateNbTokensOut(maxNbTokens);
 
+            auto const nbBeams = mSamplingConfig.getNumReturnBeams();
+
             result.outputTokenIds.resize(nbBeams);
 
             auto const startTokenPos = maxNbTokens - maxNbTokensOut;
@@ -1359,10 +1386,13 @@ public:
                     }
                 }
 
+                auto sliceBeams = [&nbBeams](auto beams)
+                { return std::vector<typename decltype(beams)::value_type>(beams.begin(), beams.begin() + nbBeams); };
+
                 if (returnLogProbs())
                 {
-                    result.cumLogProbs = getCumLogProbs();
-                    result.logProbs = getLogProbs();
+                    result.cumLogProbs = sliceBeams(getCumLogProbs());
+                    result.logProbs = sliceBeams(getLogProbs());
                 }
 
                 if (getReturnContextLogits())
@@ -1372,7 +1402,8 @@ public:
 
                 if (getReturnGenerationLogits())
                 {
-                    if (isStreaming())
+                    bool hasDraftTokens = (mDraftTokens && mDraftTokens->size() > 0) ? true : false;
+                    if (isStreaming() && !hasDraftTokens)
                     {
                         auto startGenTokenPos = startTokenPos - getOrigPromptLen();
                         TensorPtr generationLogitsHostCurrentStep
@@ -1386,7 +1417,8 @@ public:
                     }
                     else
                     {
-                        result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
+                        result.generationLogits = executor::detail::ofITensor(
+                            runtime::ITensor::slice(getGenerationLogitsHost(), 0, nbBeams));
                     }
                 }
 
@@ -1395,7 +1427,7 @@ public:
                     result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
                 }
 
-                result.finishReasons = mFinishReasons;
+                result.finishReasons = sliceBeams(mFinishReasons);
                 result.decodingIter = mDecodingIter;
 
                 // Update position of last sent response
@@ -1560,6 +1592,7 @@ protected:
     std::optional<SizeType32>
         mEncoderOutputLength; // For some models like Whisper, encoder output shape cannot be inferred from encoder
                               // input shape due to downsampling. Thus this is needed for setting buffer sizes correctly
+    std::optional<TensorPtr> mCrossAttentionMask; // Input cross attention mask
     LlmRequestType mLlmRequestType;
     std::optional<executor::ContextPhaseParams> mContextPhaseParams;
 
@@ -1644,10 +1677,30 @@ private:
 
         setReturnLogProbs(outputLogProbs);
 
+        // Handling the backward compatibility of numReturnSequences.
+        if (mNumReturnSequences > 1)
+        {
+            if (!mSamplingConfig.numReturnSequences)
+            {
+                TLLM_LOG_WARNING(
+                    "In the Executor class, mNumReturnSequences is deprecated. Please set numReturnSequences in "
+                    "SamplingConfig directly.");
+            }
+            else if (mSamplingConfig.numReturnSequences
+                && mSamplingConfig.numReturnSequences.value() != mNumReturnSequences)
+            {
+                TLLM_THROW(
+                    "In the Executor class, both mSamplingConfig.numReturnSequences (%d) and mNumReturnSequences (%d) "
+                    "are provided but unmatched. Please use numReturnSequences in SamplingConfig directly.",
+                    mSamplingConfig.numReturnSequences.value(), mNumReturnSequences);
+            }
+            mSamplingConfig.numReturnSequences = mNumReturnSequences;
+        }
+
         if (!isChild())
         {
             // Initialize result states unless it is a child and a child request should share parent's one.
-            mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumReturnSequences(), false);
+            mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumSubRequests(), false);
         }
     }
 
@@ -1715,6 +1768,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
         SizeType32 numReturnSequences = 1)
@@ -1724,8 +1778,8 @@ public:
             std::move(lookaheadConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
             std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            std::move(encoderInputFeatures), std::move(encoderOutputLength), llmRequestType,
-            std::move(inputTokenExtraIds), numReturnSequences)
+            std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
+            llmRequestType, std::move(inputTokenExtraIds), numReturnSequences)
     {
     }
 
@@ -1742,8 +1796,8 @@ public:
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId)
     {
         TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
-        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumReturnSequences()),
-            "Cannot create child requests more than the number of return sequences (%d)", getNumReturnSequences());
+        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumSubRequests()),
+            "Cannot create child requests more than the number of return sequences (%d)", getNumSubRequests());
         auto childReq = std::make_shared<LlmRequest>(*this);
         childReq->mRequestId = requestId;
         childReq->mSequenceIndex = mChildRequests.size() + 1;

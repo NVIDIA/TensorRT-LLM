@@ -2,21 +2,23 @@
 
 # Troubleshooting
 
-This document describes how to debug in TensorRT-LLM.
+This document describes some of the frequently asked questions and their solutions in TensorRT-LLM, including problems of installation, model-building, model-execution, and input / output size.
 
-Usually, we want to print the intermediate tensor values when debugging a TensorRT-LLM model.
-TensorRT-LLM obeys define-and-run paradigm, we should mark the interested intermediate tensors as the network outputs.
-Then, we print the values at runtime.
+## Installation Errors
 
-## Build Errors
+During compilation and installation of TensorRT-LLM, many build errors can be resolved by simply deleting the build tree and rebuilding again.
 
-Many build errors can be resolved by simply deleting the build tree. Try running the build script with `--clean` or running `rm -r cpp/build`.
+In most occasions, these problems are caused by the workflow like: an old compilation -> some code change (update of the repo or users' writing) -> a later compilation.
+
+Solution: try running build script with `--clean`, or try running `rm -r build cpp/build` before running build script again.
 
 ## cuDNN Linking Errors
 
-If you encounter errors such as "Entry Point Not Found" (see for example [#1062](https://github.com/NVIDIA/TensorRT-LLM/issues/1062)) the issue might be a mismatch in the `cuDNN` libraries shipped from `torch` and `tensorrt`. To rectify this, please try the following steps
+Errors such as "Entry Point Not Found" (for example [#1062](https://github.com/NVIDIA/TensorRT-LLM/issues/1062)).
 
-```
+Solution: the issue might be a mismatch in the `cuDNN` libraries shipped from `torch` and `tensorrt`. To rectify this, please try the following steps
+
+```bash
 python -m pip uninstall -y tensorrt_llm
 python -m pip install --upgrade pip
 python -m pip install nvidia-cudnn-cu11==8.9.4.25 --no-cache-dir
@@ -25,38 +27,31 @@ python -m pip uninstall -y nvidia-cudnn-cu11
 python -m pip install tensorrt_llm  --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://download.pytorch.org/whl/cu121
 ```
 
+## Model Debug
+
+When debugging a TensorRT-LLM model, we usually want to print the value of the intermediate tensors.
+
+We should mark the interested intermediate tensors as the network outputs, then print their values at runtime, since TensorRT-LLM obeys define-and-run paradigm.
 
 ## Debug on Unit Tests
 
-1. Register the intermediate tensors as the network outputs with `register_network_output` API.
+Here is an example to print the values of the MLP output tensor in the a unit test ([full example](../../../tests/test_debugging_api.py)).
 
+1. Register the intermediate tensors as the network outputs with `register_network_output` API.
 
 ```python
 class MLP(Module):
 
-    def __init__(self,
-                 hidden_size,
-                 ffn_hidden_size,
-                 bias=True,
-                 tp_group=None,
-                 tp_size=1):
+    def __init__(self, ...):
         super().__init__()
-        self.fc = tensorrt_llm.layers.ColumnLinear(hidden_size,
-                                                   ffn_hidden_size,
-                                                   bias=bias,
-                                                   tp_group=tp_group,
-                                                   tp_size=tp_size,
-                                                   gather_output=False)
-        self.proj = tensorrt_llm.layers.RowLinear(ffn_hidden_size,
-                                                  hidden_size,
-                                                  bias=bias,
-                                                  tp_group=tp_group,
-                                                  tp_size=tp_size)
+        # Do not modify the definition in `__init__` method
+        self.fc = ...
+        self.proj = ...
 
     def forward(self, hidden_states):
         inter = self.fc(hidden_states)
         inter = tensorrt_llm.functional.relu(inter)
-        # Here, we want to print the tensor value after relu
+        # Here register the tensor `inter` as our debug output tensor
         self.register_network_output('inter', inter)
         output = self.proj(inter)
         return output
@@ -76,15 +71,11 @@ print(outputs.keys())
 print(outputs['inter'])
 ```
 
-Here is the [full example](source:tests/test_debugging_api.py).
-
-
 ## Debug on E2E Models
 
 Here is an example to print the values of the MLP output tensor in the GPT model.
 
-
-1. In `tensorrt_llm/models/gpt/model.py`, we register the MLP output tensor:
+1. Register the MLP output tensor in `tensorrt_llm/models/gpt/model.py`.
 
 ```python
         hidden_states = residual + attention_output.data
@@ -93,7 +84,7 @@ Here is an example to print the values of the MLP output tensor in the GPT model
         hidden_states = self.post_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
-        # register as model output
+        # Register as model output
         # ------------------------------------------------------
         self.register_network_output('mlp_output', hidden_states)
         # ------------------------------------------------------
@@ -101,9 +92,9 @@ Here is an example to print the values of the MLP output tensor in the GPT model
         hidden_states = residual + hidden_states
 ```
 
-2. Build the TensorRT engine of the model:
+2. Build the TensorRT engine of the model.
 
-When building engines with `trtllm-build`, enable the `--enable_debug_output` option.
+Enable the `--enable_debug_output` option when building engines with `trtllm-build`
 
 ```bash
 cd examples/gpt
@@ -113,21 +104,21 @@ rm -rf gpt2 && git clone https://huggingface.co/gpt2-medium gpt2
 pushd gpt2 && rm pytorch_model.bin model.safetensors && wget -q https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin && popd
 
 # Convert to TensorRT-LLM checkpoint
-python3 convert_checkpoint.py --model_dir gpt2 \
-        --dtype float16 \
-        --output_dir gpt2/trt_ckpt/fp16/1-gpu
+python3 convert_checkpoint.py \
+    --model_dir gpt2 \
+    --dtype float16 \
+    --output_dir gpt2/trt_ckpt/fp16/1-gpu
 
 # Build TensorRT-LLM engines with --enable_debug_output
-trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/1-gpu \
-        --gpt_attention_plugin float16 \
-        --remove_input_padding enable \
-        --enable_debug_output \
-        --output_dir gpt2/trt_engines/fp16/1-gpu
+trtllm-build \
+    --checkpoint_dir gpt2/trt_ckpt/fp16/1-gpu \
+    --enable_debug_output \
+    --output_dir gpt2/trt_engines/fp16/1-gpu
 ```
 
-3. Print the intermediate output tensors:
+3. Print the intermediate output tensors.
 
-In `tensorrt_llm/runtime/generation.py`, we print the debug info:
+Add debug info in `tensorrt_llm/runtime/generation.py`.
 
 ```python
         stream = torch.cuda.current_stream().cuda_stream
@@ -154,19 +145,20 @@ In `tensorrt_llm/runtime/generation.py`, we print the debug info:
             # -------------------------------------------
 ```
 
-Then, run `../run.py` with `--debug_mode` and `--use_py_session`:
+4. Run `../run.py` with `--debug_mode` and `--use_py_session`.
 
 ```bash
-python3 ../run.py --engine_dir gpt2/trt_engines/fp16/1-gpu \
-        --tokenizer_dir gpt2 \
-        --max_output_len 8 \
-        --debug_mode \
-        --use_py_session
+python3 ../run.py \
+    --engine_dir gpt2/trt_engines/fp16/1-gpu \
+    --tokenizer_dir gpt2 \
+    --max_output_len 8 \
+    --debug_mode \
+    --use_py_session
 ```
 
-We will see the tensor values:
+5. See the value of the tensor.
 
-```
+```txt
 ......
 dict_keys(['context_lengths', 'cache_indirection', 'position_ids', 'logits', 'last_token_ids', 'input_ids', 'kv_cache_block_pointers', 'host_kv_cache_block_pointers', 'sequence_length', 'host_past_key_value_lengths', 'host_sink_token_length', 'host_request_types', 'host_max_attention_window_sizes', 'host_context_lengths', 'transformer.layers.0.mlp_output', 'transformer.layers.1.mlp_output', 'transformer.layers.2.mlp_output', 'transformer.layers.3.mlp_output', 'transformer.layers.4.mlp_output', 'transformer.layers.5.mlp_output', 'transformer.layers.6.mlp_output', 'transformer.layers.7.mlp_output', 'transformer.layers.8.mlp_output', 'transformer.layers.9.mlp_output', 'transformer.layers.10.mlp_output', 'transformer.layers.11.mlp_output', 'transformer.layers.12.mlp_output', 'transformer.layers.13.mlp_output', 'transformer.layers.14.mlp_output', 'transformer.layers.15.mlp_output', 'transformer.layers.16.mlp_output', 'transformer.layers.17.mlp_output', 'transformer.layers.18.mlp_output', 'transformer.layers.19.mlp_output', 'transformer.layers.20.mlp_output', 'transformer.layers.21.mlp_output', 'transformer.layers.22.mlp_output', 'transformer.layers.23.mlp_output'])
 Step: 0
@@ -205,13 +197,68 @@ Output [Text 0 Beam 0]: " chef before moving to London in the early"
 
 ## Debug Execution Errors
 
-- If you use plugins, use can set the environment variable `CUDA_LAUNCH_BLOCKING=1` so that kernels are launch synchronously, with their return status checked immediately.
-- If you see memory errors, make sure that the engine inputs respect the build-time shapes and that they reside **on the correct device** (CPU/GPU).
+If problems come from plugins, try setting the environment variable `CUDA_LAUNCH_BLOCKING=1` to make kernels launch synchronously with their return status checked immediately.
 
-## Installation Errors
+If problems come from runtime-shape of the input tensors, double-check the shape (rank and length of each rank) and location (CPU / GPU) of input tensors for the engine obey the build-time setting.
 
-Many build errors can be resolved by simply deleting the build tree. Try running the build script with `--clean` or running `rm -r cpp/build`.
+For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users' rewrting), too large or too small input shape, etc..
 
+```txt
+unexpected shape for input 'XXX' for model 'YYY'. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.
+
+[TensorRT-LLM][ERROR] Assertion failed: Tensor 'input_ids' has invalid shape (8192), expected (-1) (/code/tensorrt_llm/cpp/tensorrt_llm/runtime/tllmRuntime.cpp:149)
+
+RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 8192 but got size 1024 for tensor number 1 in the list.
+```
+
+By setting environment variable `export TLLM_LOG_LEVEL=TRACE`, we can get more information about the TensorRT engine at runtime, which contains the shapes of each input / output tensors, and all allowed ranges of every input shapes.
+
+```txt
+[TensorRT-LLM][TRACE] =====================================================================
+[TensorRT-LLM][TRACE]              Name              |I/O|Location|DataType|    Shape     |
+[TensorRT-LLM][TRACE] ---------------------------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] position_ids                   | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] last_token_ids                 | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | I |  GPU   | INT32  |(1, -1, 2, -1)|
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | I |  GPU   | INT32  |(1, -1, 2, -1)|
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    | I |  GPU   | INT64  |    (1, 2)    |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     | I |  GPU   | INT32  |     (28)     |
+[TensorRT-LLM][TRACE] sequence_length                | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_request_types             | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] context_lengths                | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        | I |  GPU   | INT64  |     (16)     |
+[TensorRT-LLM][TRACE] host_context_lengths           | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes| I |  GPU   | INT32  |     (28)     |
+[TensorRT-LLM][TRACE] host_sink_token_length         | I |  GPU   | INT32  |     (1)      |
+[TensorRT-LLM][TRACE] cache_indirection              | I |  GPU   | INT32  | (-1, 1, -1)  |
+[TensorRT-LLM][TRACE] logits                         | O |  GPU   |  FP32  | (-1, 65024)  |
+[TensorRT-LLM][TRACE] =====================================================================
+[TensorRT-LLM][TRACE] Information of optimization profile.
+[TensorRT-LLM][TRACE] Optimization Profile 0:
+[TensorRT-LLM][TRACE] =============================================================================
+[TensorRT-LLM][TRACE]              Name              |     Min      |     Opt      |     Max      |
+[TensorRT-LLM][TRACE] -----------------------------------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      |     (1)      |     (8)      |    (8192)    |
+[TensorRT-LLM][TRACE] position_ids                   |     (1)      |     (8)      |    (8192)    |
+[TensorRT-LLM][TRACE] last_token_ids                 |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | (1, 1, 2, 1) |(1, 4, 2, 16) |(1, 8, 2, 32) |
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | (1, 1, 2, 1) |(1, 4, 2, 16) |(1, 8, 2, 32) |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    |    (1, 2)    |    (1, 2)    |    (1, 2)    |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     |     (28)     |     (28)     |     (28)     |
+[TensorRT-LLM][TRACE] sequence_length                |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_request_types             |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] context_lengths                |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        |     (16)     |     (16)     |     (16)     |
+[TensorRT-LLM][TRACE] host_context_lengths           |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes|     (28)     |     (28)     |     (28)     |
+[TensorRT-LLM][TRACE] host_sink_token_length         |     (1)      |     (1)      |     (1)      |
+[TensorRT-LLM][TRACE] cache_indirection              |  (1, 1, 1)   | (4, 1, 1024) | (8, 1, 2048) |
+[TensorRT-LLM][TRACE] logits                         |  (1, 65024)  |  (4, 65024)  |  (8, 65024)  |
+[TensorRT-LLM][TRACE] =============================================================================
+```
 
 ## Tips
 

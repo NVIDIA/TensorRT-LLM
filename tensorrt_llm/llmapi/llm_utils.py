@@ -195,6 +195,10 @@ LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
         The name or path of a HuggingFace Transformers tokenizer, or the loaded tokenizer.
         Default is None.
 
+    tokenizer_mode (Literal['auto', 'slow'], default='auto'): The tokenizer mode.
+        'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer.
+        The fast tokenizer is based on Huggingface's Rust library tokenizers, which achieves a significant speed-up compared to its slow counterpart.
+
     skip_tokenizer_init (bool):
         If true, skip initialization of tokenizer and detokenizer. LLM.generate and
         LLM.generate_async will accept prompt token ids as input only.
@@ -294,6 +298,8 @@ class LlmArgs:
     tokenizer: Optional[Union[str, Path, TokenizerBase,
                               PreTrainedTokenizerBase]] = None
 
+    tokenizer_mode: Literal['auto', 'slow'] = 'auto'
+
     skip_tokenizer_init: bool = False
 
     tokenizer_revision: Optional[str] = None
@@ -323,9 +329,9 @@ class LlmArgs:
 
     fast_build: Optional[bool] = False
 
-    quant_config: QuantConfig = field(default_factory=QuantConfig)
+    quant_config: Optional[QuantConfig] = None
 
-    calib_config: CalibConfig = field(default_factory=CalibConfig)
+    calib_config: Optional[CalibConfig] = None
 
     # A handful of options from PretrainedConfig
     embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
@@ -373,7 +379,10 @@ class LlmArgs:
         if self.skip_tokenizer_init:
             self.tokenizer = None
         else:
-            self.tokenizer = tokenizer_factory(self.tokenizer)
+            self.tokenizer = tokenizer_factory(
+                self.tokenizer,
+                rust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
 
         if torch.cuda.get_device_properties(0).major < 8:
             if self.dtype == 'auto':
@@ -468,12 +477,19 @@ class LlmArgs:
         else:
             self.model_format = _ModelFormatKind.HF
 
+        self.quant_config = self.quant_config or QuantConfig()
+
+        self.calib_config = self.calib_config or CalibConfig()
+
         self.build_config = self.build_config or BuildConfig()
 
         # TODO(xiweny): remove the checker when manage weights support all data types
         if self.fast_build and (self.quant_config.quant_algo is QuantAlgo.FP8
                                 or self.quant_config.quant_algo is None):
             self._update_plugin_config("manage_weights", True)
+
+        if self.parallel_config._world_size == 1:
+            self.build_config.plugin_config.nccl_plugin = None
 
         if self.enable_lora:
             self.build_config.plugin_config.lora_plugin = 'auto'
@@ -1244,16 +1260,19 @@ class ModelLoader:
         return Namespace(**build_config)
 
     @staticmethod
-    def load_hf_tokenizer(model_dir,
-                          trust_remote_code) -> Optional[TransformersTokenizer]:
+    def load_hf_tokenizer(
+            model_dir,
+            trust_remote_code: bool = True,
+            use_fast: bool = True) -> Optional[TransformersTokenizer]:
         try:
+
             return TransformersTokenizer.from_pretrained(
                 model_dir,
                 legacy=False,
                 padding_side='left',
                 truncation_side='left',
                 trust_remote_code=trust_remote_code,
-                use_fast=True)
+                use_fast=use_fast)
         except Exception as e:
             logger.error(f"Failed to load tokenizer from {model_dir}: {e}")
             return None

@@ -119,10 +119,6 @@ else()
   )
 endif()
 
-set_target_properties(
-  ${PLUGIN_SHARED_TARGET} PROPERTIES VERSION ${TRT_VERSION} SOVERSION
-                                                            ${TRT_SOVERSION})
-
 set_property(TARGET ${PLUGIN_SHARED_TARGET} PROPERTY CUDA_STANDARD 17)
 
 target_link_libraries(

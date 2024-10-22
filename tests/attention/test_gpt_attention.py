@@ -404,7 +404,7 @@ class TestFunctional(unittest.TestCase):
         def _construct_execution(
                 session, input_tensor, weight, bias, past_key_value,
                 host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping, packed_mask_for_fmha,
+                host_kv_cache_pool_mapping, attention_packed_mask,
                 sequence_length, host_past_key_value_lengths,
                 host_max_attention_window_sizes, host_sink_token_length,
                 context_lengths, host_context_lengths, cache_indirection,
@@ -438,11 +438,11 @@ class TestFunctional(unittest.TestCase):
                 x_tensor = Tensor(name='input',
                                   shape=tuple(input_tensor.shape),
                                   dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-                context_fmha_custom_mask_tensor = None
-                if packed_mask_for_fmha is not None:
-                    context_fmha_custom_mask_tensor = Tensor(
-                        name='context_fmha_custom_mask',
-                        shape=tuple(packed_mask_for_fmha.shape),
+                attention_packed_mask_tensor = None
+                if attention_packed_mask is not None:
+                    attention_packed_mask_tensor = Tensor(
+                        name='attention_packed_mask',
+                        shape=tuple(attention_packed_mask.shape),
                         dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 sequence_length_tensor = Tensor(
                     name='sequence_length',
@@ -584,7 +584,7 @@ class TestFunctional(unittest.TestCase):
                 ) if position_embedding_type.is_rope() else None
                 outputs = tensorrt_llm.functional.gpt_attention(
                     qkv=qkv,
-                    context_fmha_custom_mask=context_fmha_custom_mask_tensor,
+                    attention_packed_mask=attention_packed_mask_tensor,
                     past_key_value=past_key_value_tensor,
                     sequence_length=sequence_length_tensor,
                     host_past_key_value_lengths=
@@ -646,8 +646,8 @@ class TestFunctional(unittest.TestCase):
                 'host_request_types': host_request_types,
                 'host_runtime_perf_knobs': host_runtime_perf_knobs
             }
-            if packed_mask_for_fmha is not None:
-                inputs['context_fmha_custom_mask'] = packed_mask_for_fmha
+            if attention_packed_mask is not None:
+                inputs['attention_packed_mask'] = attention_packed_mask
             if paged_kv_cache:
                 inputs['kv_cache_block_offsets'] = kv_cache_block_offsets
                 inputs[
@@ -1140,14 +1140,14 @@ class TestFunctional(unittest.TestCase):
                         dtype=str_dtype_to_torch(dtype),
                         device='cuda',
                         past_key_values_length=0)
-                    packed_mask_for_fmha = torch.ops.tensorrt_llm.pack_fmha_mask_by_input(
+                    attention_packed_mask = torch.ops.tensorrt_llm.pack_fmha_mask_by_input(
                         full_attention_mask_for_fmha.squeeze(), input_lengths,
                         input_lengths, 0.0)
                     # Note that you can also build the packed mask based on the attention mask type as shown below:
-                    # packed_mask_for_fmha = torch.ops.tensorrt_llm.pack_fmha_mask_by_type(
+                    # attention_packed_mask = torch.ops.tensorrt_llm.pack_fmha_mask_by_type(
                     #     input_lengths, input_lengths, AttentionMaskType.causal, batch_size, in_len, in_len)
                 else:
-                    packed_mask_for_fmha = None
+                    attention_packed_mask = None
                 if attention_type == 'gpt2_attention':
                     torch_output, torch_present = attention(
                         input_tensor,
@@ -1215,7 +1215,7 @@ class TestFunctional(unittest.TestCase):
                     session, input_tensor, weight_plugin, bias_plugin,
                     present_key_value, kv_cache_block_offsets,
                     host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
-                    packed_mask_for_fmha, sequence_length,
+                    attention_packed_mask, sequence_length,
                     host_past_key_value_lengths,
                     host_max_attention_window_sizes, host_sink_token_length,
                     input_lengths, host_context_lengths, cache_indirection,

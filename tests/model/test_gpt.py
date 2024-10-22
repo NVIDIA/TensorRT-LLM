@@ -18,9 +18,12 @@ import random
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from itertools import product
+from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 # isort: off
 import torch
@@ -42,7 +45,11 @@ from tensorrt_llm.runtime.kv_cache_manager import GenerationSequence
 from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+from examples.gpt.convert_checkpoint import convert_and_save_hf
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.llm_data import llm_models_root
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
 
 from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
@@ -1039,6 +1046,38 @@ class TestGPT(unittest.TestCase):
                 layer_i].attention.rotary_embedding_scale_type == RotaryScalingType.linear
             assert tensorrt_llm_gpt.transformer.layers[
                 layer_i].attention.position_embedding_type == PositionEmbeddingType.rope_gpt_neox
+
+    def test_gpt_variant_is_overridden(self):
+        model_root = llm_models_root()
+        if model_root is None:
+            pytest.skip("Skipping since real weights are unavailable.")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            cli_args = Namespace(tp_size=1,
+                                 pp_size=1,
+                                 model_dir=f"{model_root}/starcoder2-3b",
+                                 output_dir=tempdir,
+                                 gpt_variant="starcoder2",
+                                 dtype="float16",
+                                 load_model_on_cpu=False,
+                                 use_parallel_embedding=False,
+                                 embedding_sharding_dim=0,
+                                 use_embedding_sharing=False,
+                                 use_weight_only=False,
+                                 int8_kv_cache=False,
+                                 smoothquant=None,
+                                 workers=1)
+
+            def check_gpt_variant(*args, **kwargs):
+                self.assertEqual(kwargs.get("gpt_variant", ""),
+                                 cli_args.gpt_variant)
+                return from_hugging_face(*args, **kwargs)
+
+            from_hugging_face = tensorrt_llm.models.GPTConfig.from_hugging_face
+
+            with patch('tensorrt_llm.models.GPTConfig.from_hugging_face',
+                       side_effect=check_gpt_variant):
+                convert_and_save_hf(cli_args)
 
 
 if __name__ == '__main__':

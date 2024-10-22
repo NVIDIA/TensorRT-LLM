@@ -146,6 +146,16 @@ def test_sync_generation(llama_7b_path: Path):
                 future.result().outputs[0].token_ids) == expected_output
 
 
+def test_invalid_sampling_params():
+    with pytest.raises(ValueError):
+        # n > 1 does not allow greedy decoding, which is deterministic.
+        SamplingParams(max_tokens=4, n=4, top_k=1, top_p=0.0)
+    with pytest.raises(ValueError):
+        # n > beam_width is not possible because n exceeds the number of beam
+        # search results
+        SamplingParams(max_tokens=4, n=4, beam_width=3)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
                     reason="Must run on 2 MPI ranks with at least 2 GPUs")
 def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):

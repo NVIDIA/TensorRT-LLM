@@ -66,11 +66,24 @@ def parse_arguments():
                         action='store_true',
                         default=None,
                         help="Enable FMHA runner FP32 accumulation.")
-    parser.add_argument('--use_py_session',
-                        default=False,
-                        action='store_true',
-                        help="Whether or not to use Python runtime session")
-
+    parser.add_argument(
+        '--enable_chunked_context',
+        action='store_true',
+        help='Enables chunked context (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--use_py_session',
+        default=False,
+        action='store_true',
+        help=
+        "Whether or not to use Python runtime session. By default C++ runtime session is used for the LLM."
+    )
+    parser.add_argument(
+        '--kv_cache_free_gpu_memory_fraction',
+        default=0.9,
+        type=float,
+        help='Specify the free gpu memory fraction.',
+    )
     return parser.parse_args()
 
 
@@ -89,9 +102,13 @@ def print_result(model, input_text, output_text, args):
     if args.check_accuracy:
         if model.model_type != 'nougat':
             if model.model_type == "vila":
-                if len(args.image_path.split(args.path_sep)) == 1:
-                    assert output_text[0][0].lower(
-                    ) == "the image captures a bustling city intersection teeming with life. from the perspective of a car's dashboard camera, we see"
+                for i in range(len(args.image_path.split(args.path_sep))):
+                    if i % 2 == 0:
+                        assert output_text[i][0].lower(
+                        ) == "the image captures a bustling city intersection teeming with life. from the perspective of a car's dashboard camera, we see"
+                    else:
+                        assert output_text[i][0].lower(
+                        ) == "the image captures the iconic merlion statue in singapore, a renowned worldwide landmark. the merlion, a mythical"
             elif model.model_type == 'fuyu':
                 assert output_text[0][0].lower() == '4'
             elif model.model_type == "pix2struct":

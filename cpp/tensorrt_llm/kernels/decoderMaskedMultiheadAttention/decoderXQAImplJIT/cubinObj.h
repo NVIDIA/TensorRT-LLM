@@ -52,6 +52,11 @@ public:
     size_t getSerializationSize() const noexcept;
     void serialize(void* buffer, size_t buffer_size) const noexcept;
 
+    bool isInitialized() const
+    {
+        return mInitialized;
+    }
+
 private:
     static constexpr char const* kFuncName = "kernel_mha";
     static constexpr char const* kSmemName = "smemSize";

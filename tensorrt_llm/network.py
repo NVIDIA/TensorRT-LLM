@@ -17,11 +17,14 @@ import contextlib
 import hashlib
 import inspect
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Set, Tuple
+from typing import (Any, Dict, Iterable, List, Optional, OrderedDict, Set,
+                    Tuple, Union)
 
 import numpy as np
+import onnx
+import onnx_graphsurgeon as gs
 import tensorrt as trt
 
 from tensorrt_llm.module import Module
@@ -533,6 +536,292 @@ class Network(object):
         if format == "text":
             return dot.source
         dot.save(path)
+
+    def to_onnx(self, path=None) -> None:
+        '''
+        Export the network into a "ONNX-like" file for visualization.
+
+        Parameters:
+            path: the path to the output file
+        '''
+        trt_network = self.trt_network
+
+        def layer_type_to_class(layer: trt.ILayer = None) -> trt.ILayer:
+            layer_type_name = str(layer.type)[10:]
+            if layer_type_name == "ELEMENTWISE":  # Some special cases
+                return trt.IElementWiseLayer
+            if layer_type_name == "LRN":
+                return trt.ILRNLayer
+            if layer_type_name == "NMS":
+                return trt.INMSLayer
+            if layer_type_name == "PARAMETRIC_RELU":
+                return trt.IParametricReLULayer
+            if layer_type_name == "PLUGIN":
+                return None  # IPluginLayer is not supported any more
+            if layer_type_name == "RAGGED_SOFTMAX":
+                return trt.IRaggedSoftMaxLayer
+            if layer_type_name == "SOFTMAX":
+                return trt.ISoftMaxLayer
+            if layer_type_name == "TOPK":
+                return trt.ITopKLayer
+
+            # e.g. MATRIX_MULTIPLY -> MatrixMultiply
+            name = "".join(name[0] + name[1:].lower()
+                           for name in layer_type_name.split("_"))
+            return trt.__builtins__["getattr"](trt, f"I{name}Layer")
+
+        def convert_type_to_onnx(node_type: str = "",
+                                 attribution: OrderedDict = OrderedDict()):
+            if node_type == "ACTIVATION":
+                convert_list = {
+                    "RELU": "Relu",
+                    "SIGMOID": "Sigmoid",
+                    "TANH": "Tanh",
+                    "LEAKY_RELU": "LeakyRelu",
+                    "ELU": "Elu",
+                    "SELU": "Selu",
+                    "SOFTSIGN": "Softsign",
+                    "SOFTPLUS": "Softplus",
+                    "CLIP": "Clip",
+                    "HARD_SIGMOID": "HardSigmoid",
+                    "SCALED_TANH": "ScaledTanh",
+                    "THRESHOLDED_RELU": "ThresholdedRelu",
+                }
+                # No corresponding operator for GELU_ERF, GELU_TANH
+                if "algo-type" in attribution.keys() and attribution[
+                        "algo-type"].split(".")[-1] in convert_list.keys():
+                    return convert_list[attribution["algo-type"].split(".")[-1]]
+                return node_type
+            if node_type == "CAST":
+                return "Cast"
+            if node_type == "CONCATENATION":
+                return "Concat"
+            if node_type == "CONSTANT":
+                return "Constant"
+            if node_type == "CONVOLUTION":
+                return "Conv"
+            if node_type == "DECONVOLUTION":
+                return "Deconv"
+            if node_type == "ELEMENTWISE":
+                convert_list = {
+                    "SUM": "Add",
+                    "PROD": "Mul",
+                    "MAX": "Max",
+                    "MIN": "Min",
+                    "SUB": "Sub",
+                    "DIV": "Div",
+                    "POW": "Pow",
+                    "AND": "And",
+                    "OR": "Or",
+                    "XOR": "Xor",
+                    "EQUAL": "Equal",
+                    "GREATER": "Greater",
+                    "LESS": "Less",
+                }
+                if "op" in attribution.keys() and attribution["op"].split(
+                        ".")[-1] in convert_list.keys():
+                    return convert_list[attribution["op"].split(".")[-1]]
+                return node_type
+            if node_type == "GATHER":
+                return "Gather"
+            if node_type == "LOOP":
+                return "Loop"
+            if node_type == "MATRIX_MULTIPLY":
+                return "Gemm"
+            if node_type == "POOLING":
+                convert_list = {"MAX": "MaxPool", "AVERAGE": "AveragePool"}
+                if "algo-type" in attribution.keys() and attribution[
+                        "algo-type"].split(".")[-1] in convert_list.keys():
+                    return convert_list[attribution["algo-type"].split(".")[-1]]
+                return node_type
+            if node_type == "REDUCE":
+                convert_list = {
+                    "SUM": "ReduceSum",
+                    "PROD": "ReduceProd",
+                    "MAX": "ReduceMax",
+                    "MIN": "ReduceMin",
+                    "AVG": "ReduceMean",
+                }
+                if "op" in attribution.keys() and attribution["op"].split(
+                        ".")[-1] in convert_list.keys():
+                    return convert_list[attribution["op"].split(".")[-1]]
+                return node_type
+            if node_type == "SELECT":
+                return "Where"
+            if node_type == "SHUFFLE":
+                return "Reshape"
+            if node_type == "SHAPE":
+                return "Shape"
+            if node_type == "SLICE":
+                return "Slice"
+            if node_type == "SOFTMAX":
+                return "Softmax"
+            if node_type == "TOPK":
+                return "TopK"
+            if node_type == "UNARY":
+                convert_list = {"SQRT": "Sqrt", "NOT": "Not"}
+                if "op" in attribution.keys() and attribution["op"].split(
+                        ".")[-1] in convert_list.keys():
+                    return convert_list[attribution["op"].split(".")[-1]]
+                return node_type
+            return node_type
+
+        def add_node_for_trt_network(
+            graph: gs.Graph = None,
+            node_name: str = "",
+            node_type: str = "",
+            input_list: List[gs.Variable] = [],
+            attribution: OrderedDict = OrderedDict(),
+            name_list: Union[str, List[str]] = "",
+            datatype_list: Union[np.dtype, List[np.dtype]] = [],
+            shape_list: Union[list, List[list]] = [],
+            number: int = 0,
+            b_onnx_type: bool = False,
+        ) -> Tuple[gs.Variable, int]:
+            """
+            Simplify version of function `add_node`, and we do some beautify to it.
+            """
+
+            if isinstance(name_list, list) or isinstance(
+                    datatype_list, list) or isinstance(
+                        shape_list, list):  # Case of multi-output
+                assert len(name_list) == len(datatype_list)
+                assert len(name_list) == len(shape_list)
+            else:  # Case of single-output
+                name_list = [name_list]
+                datatype_list = [datatype_list]
+                shape_list = [shape_list]
+
+            n_output = len(name_list)
+            output_list = []
+            for i in range(n_output):
+                tensor = gs.Variable(name_list[i], datatype_list[i],
+                                     shape_list[i])
+                output_list.append(tensor)
+
+            if b_onnx_type:
+                node_type = convert_type_to_onnx(node_type, attribution)
+
+            node = gs.Node(node_type,
+                           node_name,
+                           inputs=input_list,
+                           outputs=output_list,
+                           attrs=attribution)
+            graph.nodes.append(node)  # Update graph inside `add_node`
+
+            if len(output_list) == 1:  # Case of single-output
+                output_list = output_list[0]
+            return output_list, number + 1
+
+        def export_network_as_onnx(
+            network,
+            export_onnx_file: Path = None,
+            b_onnx_type: bool = False,
+        ):
+            graph = gs.Graph(nodes=[], inputs=[], outputs=[])
+            graph.name = "" if network.name == "Unnamed Network 0" else network.name
+            n = 0
+
+            global_tensor_map = {
+            }  # mapping from TRT tensor (trt.ITensor) to GS tensor (gs.Variable)
+            for i in range(network.num_inputs):
+                trt_tensor = network.get_input(i)
+                gs_tensor = gs.Variable(trt_tensor.name,
+                                        trt.nptype(trt_tensor.dtype),
+                                        trt_tensor.shape)
+                global_tensor_map[trt_tensor] = gs_tensor
+                if gs_tensor not in graph.inputs:
+                    graph.inputs.append(gs_tensor)
+
+            for i in range(network.num_layers):
+                layer = network.get_layer(i)
+
+                input_tensor_list = []
+                for j in range(layer.num_inputs):
+                    trt_tensor = layer.get_input(j)
+                    if trt_tensor is None:  # Useful for constant layer
+                        gs_tensor = None
+                    elif trt_tensor in global_tensor_map.keys(
+                    ):  # already in the map
+                        gs_tensor = global_tensor_map[trt_tensor]
+                    else:
+                        logger.debug(
+                            f"[ExportONNX]Layer input tensor not in global_tensor_map: {trt_tensor.name}"
+                        )  # ■
+                        gs_tensor = gs.Variable(trt_tensor.name,
+                                                trt.nptype(trt_tensor.dtype),
+                                                trt_tensor.shape)
+                        global_tensor_map[trt_tensor] = gs_tensor
+                    input_tensor_list.append(gs_tensor)
+
+                output_name_list = []
+                output_datatype_list = []
+                output_shape_list = []
+                for i in range(layer.num_outputs):
+                    trt_tensor = layer.get_output(i)
+                    # Don't do this check because we need this trt_tensor to overwrite the placeholder tensor in ■
+                    # if trt_tensor in global_tensor_map.keys():
+                    #     gs_tensor = global_tensor_map[trt_tensor]
+                    output_name_list.append(trt_tensor.name)
+                    output_datatype_list.append(trt.nptype(trt_tensor.dtype))
+                    output_shape_list.append(trt_tensor.shape)
+
+                attr = OrderedDict()
+                # Set attribution of ILayer
+                for key in dir(layer):
+                    if not (key.startswith("_")
+                            or callable(layer.__getattribute__(key))):
+                        attr[key] = str(layer.__getattribute__(key))
+                # Set attribution of exact layer type
+                layer.__class__ = layer_type_to_class(layer)
+                for key in dir(layer):
+                    if key in dir(trt.ILayer) and key != "type":
+                        continue
+                    if key == "type" and not isinstance(layer.type,
+                                                        trt.LayerType):
+                        attr["algo-type"] = str(layer.type)
+                        continue
+                    value = layer.__getattribute__(key)
+                    if isinstance(
+                            value, np.ndarray
+                    ):  # Convert all attributions into string besides weights
+                        value = value.astype(np.float32)  # In case of overflow
+                        ss = f"shape={value.shape}, SumAbs={np.sum(abs(value)):.5e}, Var={np.var(value):.5f}, "
+                        ss += f"Max={np.max(value):.5f}, Min={np.min(value):.5f}, SAD={np.sum(np.abs(np.diff(value.reshape(-1)))):.5f}, "
+                        ss += f"[:5]={value.reshape(-1)[:5]}, [-5:]={value.reshape(-1)[-5:]}"
+                        attr[key] = ss
+                    else:
+                        attr[key] = str(value)
+
+                output_tensor_list, n = add_node_for_trt_network(graph, layer.name, attr["type"][10:], input_tensor_list, attr, \
+                    output_name_list, output_datatype_list, output_shape_list, n, b_onnx_type)
+
+                if layer.num_outputs == 1:
+                    global_tensor_map[layer.get_output(0)] = output_tensor_list
+                else:
+                    for i in range(layer.num_outputs):
+                        global_tensor_map[layer.get_output(
+                            i)] = output_tensor_list[i]
+
+            for i in range(network.num_outputs):
+                gs_tensor = global_tensor_map[network.get_output(i)]
+                if gs_tensor not in graph.outputs:
+                    graph.outputs.append(gs_tensor)
+
+            onnx_model = gs.export_onnx(graph)
+            onnx.save(
+                onnx_model,
+                export_onnx_file,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=export_onnx_file.split('/')[-1] + ".weight",
+            )
+            logger.debug(
+                f"Export {export_onnx_file.split('/')[-1]}: {len(graph.nodes):5d} Nodes, {len(graph.tensors().keys()):5d} tensors"
+            )
+
+        export_network_as_onnx(trt_network, path, True)
+        return
 
     def _get_graph(self) -> "Network._GraphState":
         '''

@@ -74,10 +74,10 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                                             device="cuda")
         paths = torch.tensor(
             [[
-                [0, 1, 2, 3],  # Draft seq [0, 1, 2],  Target seq [0, 1, 2, 3]
-                [0, 1, 2, 4],  # Draft seq [0, 1, 3],  Target seq [0, 1, 2, 3]
-                [0, 5, -1, -1],  # Draft seq [4],        Target seq [0, 2]
-                [0, 6, 7, -1],  # Draft seq [5, 6],     Target seq [0, 1, 0]
+                [0, 1, 4, 6],  # Draft seq [0, 3, 5],  Target seq [0, 1, 3, 1]
+                [0, 1, 4, 7],  # Draft seq [0, 3, 6],  Target seq [0, 1, 3, 0]
+                [0, 2, -1, -1],  # Draft seq [1],        Target seq [0, 2]
+                [0, 3, 5, -1],  # Draft seq [2, 4],     Target seq [0, 3, 2]
                 [-1, -1, -1, -1],
                 [-1, -1, -1, -1],
                 [-1, -1, -1, -1],
@@ -86,36 +86,49 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = True
-        ref_accepted_tokens = torch.tensor([[0, 1, 2, 3]],
+        ref_accepted_tokens = torch.tensor([[0, 1]],
                                            dtype=torch.int32,
                                            device="cuda")
-        ref_num_accepted_tokens = torch.tensor([4],
+        ref_num_accepted_tokens = torch.tensor([2],
                                                dtype=torch.int32,
                                                device="cuda")
         ref_accepted_paths = torch.tensor([0], dtype=torch.int32, device="cuda")
-        ref_last_accepted_tokens = torch.tensor([3],
-                                                dtype=torch.int32,
-                                                device="cuda")
-        ref_cum_last_accepted_idxs = torch.tensor([3],
-                                                  dtype=torch.int32,
-                                                  device="cuda")
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths,
-            ref_last_accepted_tokens, ref_cum_last_accepted_idxs
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 1 ##########################
         # BS=1, greedy sampling, gen request
         # 7 draft tokens
+        logits = torch.tensor(
+            [
+                [-100, -100, 0, -100, -100, -100, -100, -100
+                 ],  # t0: Top1 id = 0
+                [-100, 0, -100, -100, -100, -100, -100, -100
+                 ],  # t1: Top1 id = 1
+                [-100, -100, 0, -100, -100, -100, -100, -100
+                 ],  # t2: Top1 id = 2
+                [-100, -100, -100, -100, -100, 0, -100, -100
+                 ],  # t3: Top1 id = 5
+                [-100, -100, -100, 0, -100, -100, -100, -100
+                 ],  # t4: Top1 id = 3
+                [-100, -100, 0, -100, -100, -100, -100, -100
+                 ],  # t5: Top1 id = 2
+                [-100, -100, -100, -100, -100, -100, 0, -100
+                 ],  # t6: Top1 id = 6
+                [-100, -100, -100, -100, -100, -100, -100, 0]  # t7: Top1 id = 7
+            ],
+            dtype=torch.float32,
+            device="cuda")
         paths = torch.tensor(
             [[
-                [0, 4, 5, -1],  # Draft seq [3, 4],  Target seq [0, 3, 2]
-                [0, 1, -1, -1],  # Draft seq [0],     Target seq [0, 1, 2]
-                [0, 1, 2, -1],  # Draft seq [0, 1],  Target seq [0, 1, 2]
-                [0, 6, 7, -1],  # Draft seq [5, 6],  Target seq [0, 1, 0]
+                [0, 1, 4, -1],  # Draft seq [0, 3],  Target seq [2, 1, 3]
+                [0, 2, 5, -1],  # Draft seq [1, 4],  Target seq [2, 2, 2]
+                [0, 3, 6, 7],  # Draft seq [2, 5, 6],  Target seq [2, 5, 6, 7]
+                [-1, -1, -1, -1],
                 [-1, -1, -1, -1],
                 [-1, -1, -1, -1],
                 [-1, -1, -1, -1],
@@ -124,30 +137,43 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = True
-        ref_accepted_tokens = torch.tensor([[0, 1, 2, -1]],
+        ref_accepted_tokens = torch.tensor([[2, 5, 6, 7]],
                                            dtype=torch.int32,
                                            device="cuda")
-        ref_num_accepted_tokens = torch.tensor([3],
+        ref_num_accepted_tokens = torch.tensor([4],
                                                dtype=torch.int32,
                                                device="cuda")
         ref_accepted_paths = torch.tensor([2], dtype=torch.int32, device="cuda")
-        ref_last_accepted_tokens = torch.tensor([2],
-                                                dtype=torch.int32,
-                                                device="cuda")
-        ref_cum_last_accepted_idxs = torch.tensor([2],
-                                                  dtype=torch.int32,
-                                                  device="cuda")
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths,
-            ref_last_accepted_tokens, ref_cum_last_accepted_idxs
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 2 ##########################
         # BS=2, greedy sampling, gen request
         # 3 draft tokens
+        logits = torch.tensor(
+            [
+                [0, -100, -100, -100, -100, -100, -100, -100
+                 ],  # t0: Top1 id = 0
+                [-100, 0, -100, -100, -100, -100, -100, -100
+                 ],  # t1: Top1 id = 1
+                [-100, -100, 0, -100, -100, -100, -100, -100
+                 ],  # t2: Top1 id = 2
+                [-100, -100, -100, 0, -100, -100, -100, -100
+                 ],  # t3: Top1 id = 3
+                [-100, -100, -100, 0, -100, -100, -100, -100
+                 ],  # t4: Top1 id = 3
+                [-100, -100, 0, -100, -100, -100, -100, -100
+                 ],  # t5: Top1 id = 2
+                [-100, 0, -100, -100, -100, -100, -100, -100
+                 ],  # t6: Top1 id = 1
+                [0, -100, -100, -100, -100, -100, -100, -100]  # t7: Top1 id = 0
+            ],
+            dtype=torch.float32,
+            device="cuda")
         draft_tokens = torch.tensor([[0, 1, -1, -1], [2, 3, 4, 5]],
                                     dtype=torch.int32,
                                     device="cuda")
@@ -161,8 +187,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         paths = torch.tensor(
             [
                 [
-                    [0, 2, -1, -1],  # Draft seq [1],  Target seq [0, 2]
                     [0, 1, -1, -1],  # Draft seq [0],  Target seq [0, 1]
+                    [0, 2, -1, -1],  # Draft seq [1],  Target seq [0, 2]
                     [-1, -1, -1, -1],
                     [-1, -1, -1, -1],
                     [-1, -1, -1, -1]
@@ -184,21 +210,14 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         ref_num_accepted_tokens = torch.tensor([2, 2],
                                                dtype=torch.int32,
                                                device="cuda")
-        ref_accepted_paths = torch.tensor([1, 1],
+        ref_accepted_paths = torch.tensor([0, 1],
                                           dtype=torch.int32,
                                           device="cuda")
-        ref_last_accepted_tokens = torch.tensor([1, 2],
-                                                dtype=torch.int32,
-                                                device="cuda")
-        ref_cum_last_accepted_idxs = torch.tensor([1, 5],
-                                                  dtype=torch.int32,
-                                                  device="cuda")
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths,
-            ref_last_accepted_tokens, ref_cum_last_accepted_idxs
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 3 ##########################
@@ -255,18 +274,11 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         ref_accepted_paths = torch.tensor([0, 0, 2],
                                           dtype=torch.int32,
                                           device="cuda")
-        ref_last_accepted_tokens = torch.tensor([0, 1, 2],
-                                                dtype=torch.int32,
-                                                device="cuda")
-        ref_cum_last_accepted_idxs = torch.tensor([0, 1, 5],
-                                                  dtype=torch.int32,
-                                                  device="cuda")
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths,
-            ref_last_accepted_tokens, ref_cum_last_accepted_idxs
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
         return test_cases
 
@@ -274,12 +286,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
     def test_sample_accept_draft_tokens_plugin(
             self, logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths,
-            ref_last_accepted_tokens, ref_cum_last_accepted_idxs):
-        # test data
-        torch.get_default_device()
-        torch.set_default_device("cuda")
-
+            ref_num_accepted_tokens, ref_accepted_paths):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
@@ -310,16 +317,15 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                 rand_data_validation_t,
                 TreeParams(paths=paths_t),
                 greedy_sampling=greedy_sampling)
-            accepted_tokens, num_accepted_tokens, accepted_paths, \
-                last_accepted_tokens, cum_last_accepted_idxs, next_draft_tokens, next_draft_lens = output
+            accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, next_draft_lens, hidden_size_batch_level_starts = output
 
             accepted_tokens.mark_output('accepted_tokens')
             num_accepted_tokens.mark_output('num_accepted_tokens')
             accepted_paths.mark_output('accepted_paths')
-            last_accepted_tokens.mark_output('last_accepted_tokens')
-            cum_last_accepted_idxs.mark_output('cum_last_accepted_idxs')
             next_draft_tokens.mark_output('next_draft_tokens')
             next_draft_lens.mark_output('next_draft_lens')
+            hidden_size_batch_level_starts.mark_output(
+                'hidden_size_batch_level_starts')
 
         # trt run
         session = create_session(builder, network, precision='float32')
@@ -348,17 +354,11 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                                    outputs["accepted_paths"],
                                    rtol=0,
                                    atol=0)
-        torch.testing.assert_close(ref_last_accepted_tokens,
-                                   outputs["last_accepted_tokens"],
-                                   rtol=0,
-                                   atol=0)
-        torch.testing.assert_close(ref_cum_last_accepted_idxs,
-                                   outputs["cum_last_accepted_idxs"],
-                                   rtol=0,
-                                   atol=0)
 
         self.assertEqual(outputs["next_draft_tokens"].shape, draft_tokens.shape)
         self.assertEqual(outputs["next_draft_lens"].shape, draft_lens.shape)
+        self.assertEqual(outputs["hidden_size_batch_level_starts"].shape[0],
+                         batch_size * (paths.shape[2] - 1) + 1)
 
 if __name__ == "__main__":
     unittest.main()

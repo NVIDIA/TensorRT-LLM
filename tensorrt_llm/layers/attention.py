@@ -132,6 +132,19 @@ def compute_relative_bias(query_length,
     return values
 
 
+class AttentionMaskParams(object):
+
+    def __init__(self,
+                 self_attention_mask: Tensor = None,
+                 self_attention_packed_mask: Tensor = None,
+                 cross_attention_mask: Tensor = None,
+                 cross_attention_packed_mask: Tensor = None):
+        self.self_attention_mask = self_attention_mask
+        self.self_attention_packed_mask = self_attention_packed_mask
+        self.cross_attention_mask = cross_attention_mask
+        self.cross_attention_packed_mask = cross_attention_packed_mask
+
+
 class AttentionParams(object):
 
     def __init__(self,
@@ -659,6 +672,7 @@ class Attention(Module):
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
+                attention_packed_mask=None,
                 use_cache=False,
                 spec_decoding_params=None,
                 kv_cache_params=None,
@@ -867,6 +881,46 @@ class Attention(Module):
             else:
                 cross_qkv = compute_cross_qkv(encoder_output)
 
+            if self.qk_layernorm:
+                base_shape = shape(
+                    cross_qkv, 0) if cross_qkv.ndim() == 2 else concat(
+                        [shape(cross_qkv, 0),
+                         shape(cross_qkv, 1)])
+
+                cross_qkv = cross_qkv.view(
+                    concat([
+                        base_shape, self.num_attention_heads +
+                        2 * self.num_attention_kv_heads,
+                        self.attention_head_size
+                    ]))
+                query, key, value = split(cross_qkv, [
+                    self.num_attention_heads, self.num_attention_kv_heads,
+                    self.num_attention_kv_heads
+                ],
+                                          dim=cross_qkv.ndim() - 2)
+                q_shape = concat([
+                    base_shape, self.num_attention_heads,
+                    self.attention_head_size
+                ])
+                kv_shape = concat([
+                    base_shape, self.num_attention_kv_heads,
+                    self.attention_head_size
+                ])
+
+                query = query.view(q_shape)
+                key = key.view(kv_shape)
+                value = value.view(kv_shape)
+
+                key = self.k_layernorm(key)
+                cross_qkv = concat([query, key, value], dim=query.ndim() - 2)
+                cross_qkv = cross_qkv.view(
+                    concat([
+                        base_shape,
+                        (self.num_attention_heads +
+                         2 * self.num_attention_kv_heads) *
+                        self.attention_head_size
+                    ]))
+
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):
                 past_key_value = kv_cache_params.past_key_value[1]
@@ -935,6 +989,10 @@ class Attention(Module):
                 rotary_cos_sin = getattr(attention_params,
                                          "embed_positions_for_gpt_attention",
                                          None)
+            if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
+                rotary_inv_freq = None
+                rotary_cos_sin = None
+
             # check if the cache is provided.
             if self.position_embedding_type.is_rope():
                 assert (rotary_inv_freq is not None) and (
@@ -944,6 +1002,8 @@ class Attention(Module):
             context, past_key_value = gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value,
+                attention_mask=attention_mask,
+                attention_packed_mask=attention_packed_mask,
                 sequence_length=attention_params.sequence_length,
                 host_past_key_value_lengths=kv_cache_params.
                 host_past_key_value_lengths,

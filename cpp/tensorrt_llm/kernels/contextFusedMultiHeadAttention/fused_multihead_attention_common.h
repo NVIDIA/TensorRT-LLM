@@ -43,6 +43,8 @@ static constexpr int FLASH_ATTEN_PACKED_MASK_MMA_N = 64;
 // The flash attention always uses 4x1 warp layout.
 static constexpr int FLASH_ATTEN_WARPS_M = 4;
 static constexpr int FLASH_ATTEN_WARPS_N = 1;
+// The number of positions in one uint32_t.
+static constexpr int NUM_POSITIONS_IN_UINT32 = 32;
 // The number of threads per warp group.
 static constexpr int NUM_THREADS_PER_WARP_GROUP = FLASH_ATTEN_WARPS_M * FLASH_ATTEN_WARPS_N * 32;
 // The number of core mmas_n in one uint32_t packed mask.

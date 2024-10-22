@@ -226,7 +226,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
             for (SizeType32 headIt = 0; headIt < qHeadNum; ++headIt)
             {
                 auto const currOffset = tokenIt * tokenSize + headIt * sizePerHead;
-                auto const currPtr = params.QKV + currOffset;
+                auto const currPtr = params.qkv_input + currOffset;
 
                 applyRopeToBuffer<fpType>(currPtr, tmpResultPtr, currentCosSinPtr, rotaryEmbeddingDim);
                 memcpy(currPtr, tmpResultPtr, rotaryEmbeddingDim * sizeof(fpType));
@@ -236,7 +236,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
             for (SizeType32 headIt = 0; headIt < kvHeadNum; ++headIt)
             {
                 auto const currOffset = tokenIt * tokenSize + headIt * sizePerHead + qHiddenSize;
-                auto const currPtr = params.QKV + currOffset;
+                auto const currPtr = params.qkv_input + currOffset;
 
                 applyRopeToBuffer<fpType>(currPtr, tmpResultPtr, currentCosSinPtr, rotaryEmbeddingDim);
                 memcpy(currPtr, tmpResultPtr, rotaryEmbeddingDim * sizeof(fpType));
@@ -253,7 +253,7 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
             for (SizeType32 headIt = 0; headIt < kvHeadNum; ++headIt)
             {
                 auto const currOffset = tokenIt * tokenSize + headIt * sizePerHead + qHiddenSize + kvHiddenSize;
-                auto const currPtr = params.QKV + currOffset;
+                auto const currPtr = params.qkv_input + currOffset;
 
                 auto token_kv_idx = kvCache.getKVTokenIdx(contextIt);
                 auto vCachePtr = reinterpret_cast<fpType*>(kvCache.getVBlockPtr(batchIt, token_kv_idx));
@@ -522,14 +522,17 @@ protected:
         attention_input = bufferCast<fpType>(*attention_input_buf);
         this->fillRandomNormal(attention_input, qkv_size);
 
-        preprocessingParams.QKV = const_cast<fpType*>(attention_input);
-        preprocessingParams.QuantizedQKV = nullptr; // Assuming this is the correct member for 'O'
-        preprocessingParams.Q = nullptr;
+        preprocessingParams.qkv_input = const_cast<fpType*>(attention_input);
+        preprocessingParams.cross_qkv_input = nullptr;
+        preprocessingParams.quantized_qkv_output = nullptr; // Assuming this is the correct member for 'O'
+        preprocessingParams.q_output = nullptr;
         preprocessingParams.kv_cache_buffer = keyValueCache;
         preprocessingParams.qkv_bias = qkv_bias;
         preprocessingParams.seq_lens = q_seq_lengths;
         preprocessingParams.cache_seq_lens = kv_seq_lengths;
+        preprocessingParams.encoder_seq_lens = nullptr;
         preprocessingParams.cu_seq_lens = cu_q_seqlens;
+        preprocessingParams.cu_kv_seq_lens = nullptr; // Only used by cross attention.
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = rotary_cos_sin;
         preprocessingParams.kvScaleOrigQuant = kv_scale_orig_quant;
@@ -553,7 +556,7 @@ protected:
         preprocessingParams.position_embedding_type = mPositionEmbeddingType;
         preprocessingParams.position_shift_enabled = mPosShiftEnabled;
         preprocessingParams.cache_type = cache_type;
-        preprocessingParams.enable_paged_kv_fmha = enablePagedKVContextFMHA;
+        preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA || mCrossAttention;
         preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
         preprocessingParams.multi_processor_count = mMultiProcessorCount;
         TLLM_CHECK_WITH_INFO(sink_token_length == 0, "sink_token_length != 0 is not supported in the RoPE test.");
@@ -654,7 +657,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
     invokeQKVPreprocessing(this->preprocessingParams, this->mStream->get());
     cudaDeviceSynchronize();
 
-    this->preprocessingParams.QKV = const_cast<fpType*>(reference_qkv);
+    this->preprocessingParams.qkv_input = const_cast<fpType*>(reference_qkv);
     this->preprocessingParams.kv_cache_buffer = this->keyValueCacheReference;
     TLLM_LOG_DEBUG("Kernel finished, calling reference");
 

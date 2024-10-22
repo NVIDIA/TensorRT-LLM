@@ -61,7 +61,7 @@ void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
 }
 
 // template instantiation
-template void invokeFill(IBuffer&, std::int64_t, CudaStream const&);
+template void invokeFill(IBuffer&, SizeType64, CudaStream const&);
 template void invokeFill(IBuffer&, std::int32_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::int8_t, CudaStream const&);
 template void invokeFill(IBuffer&, std::uint8_t, CudaStream const&);
@@ -116,19 +116,19 @@ template void invokeFillBatch<std::int32_t>(IBuffer&, IBuffer const&, std::size_
 namespace
 {
 template <typename VecT>
-__global__ void copyBatch(uint8_t const* srcData, uint8_t* dstData, std::int32_t const* srcOffsets,
-    std::int32_t const* dstOffsets, std::int32_t const* sizes, std::int32_t const dataTypeSize)
+__global__ void copyBatch(uint8_t const* srcData, uint8_t* dstData, SizeType64 const* srcOffsets,
+    SizeType64 const* dstOffsets, SizeType64 const* sizes, SizeType64 const dataTypeSize)
 {
     constexpr auto VEC_ELTS = static_cast<int32_t>(sizeof(VecT));
-    auto const srcStartIdx = srcOffsets[blockIdx.y] * dataTypeSize;
-    auto const dstStartIdx = dstOffsets[blockIdx.y] * dataTypeSize;
-    auto const size = sizes[blockIdx.y] * dataTypeSize;
-    auto const tidx = (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * VEC_ELTS;
-    auto const stride = static_cast<std::size_t>(blockDim.x) * gridDim.x * VEC_ELTS;
-    auto const srcEndIdx = srcStartIdx + size;
+    SizeType64 const srcStartIdx = srcOffsets[blockIdx.y] * dataTypeSize;
+    SizeType64 const dstStartIdx = dstOffsets[blockIdx.y] * dataTypeSize;
+    SizeType64 const size = sizes[blockIdx.y] * dataTypeSize;
+    SizeType64 const tidx = (static_cast<SizeType64>(blockIdx.x) * blockDim.x + threadIdx.x) * VEC_ELTS;
+    SizeType64 const stride = static_cast<SizeType64>(blockDim.x) * gridDim.x * VEC_ELTS;
+    SizeType64 const srcEndIdx = srcStartIdx + size;
 
-    auto srcIdx = srcStartIdx + tidx;
-    auto dstIdx = dstStartIdx + tidx;
+    SizeType64 srcIdx = srcStartIdx + tidx;
+    SizeType64 dstIdx = dstStartIdx + tidx;
 
     for (; srcIdx < srcEndIdx; srcIdx += stride, dstIdx += stride)
     {
@@ -142,9 +142,9 @@ void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const
 {
     auto srcDataPtr = reinterpret_cast<uint8_t const*>(srcBuffer.data());
     auto dstDataPtr = reinterpret_cast<uint8_t*>(dstBuffer.data());
-    auto srcOffsetsPtr = bufferCast<std::int32_t>(srcOffsets);
-    auto dstOffsetsPtr = bufferCast<std::int32_t>(dstOffsets);
-    auto sizesPtr = bufferCast<std::int32_t>(sizes);
+    auto srcOffsetsPtr = bufferCast<SizeType64>(srcOffsets);
+    auto dstOffsetsPtr = bufferCast<SizeType64>(dstOffsets);
+    auto sizesPtr = bufferCast<SizeType64>(sizes);
     auto numSlots = srcOffsets.getSize();
     auto const size = maxStride;
     auto const dataTypeSize = BufferDataType(srcBuffer.getDataType()).getSize();
@@ -178,7 +178,7 @@ void invokeCopyBatch(IBuffer const& srcBuffer, IBuffer& dstBuffer, IBuffer const
     std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
     dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), static_cast<std::uint32_t>(numSlots)};
     copyBatchInvocation<<<gridSize, blockSize, 0, stream.get()>>>(
-        srcDataPtr, dstDataPtr, srcOffsetsPtr, dstOffsetsPtr, sizesPtr, static_cast<int32_t>(dataTypeSize));
+        srcDataPtr, dstDataPtr, srcOffsetsPtr, dstOffsetsPtr, sizesPtr, static_cast<SizeType64>(dataTypeSize));
 }
 
 namespace

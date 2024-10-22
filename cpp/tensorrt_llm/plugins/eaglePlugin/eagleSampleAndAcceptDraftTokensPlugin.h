@@ -82,20 +82,18 @@ private:
 
     enum class OutputIdxEntry : int32_t
     {
-        //! [batch_size, max_draft_path_len]
+        //! [batch_size, max_path_len]
         ACCEPTED_TOKENS = 0,
         //! [batch_size]
-        ACCEPTED_LEN,
+        ACCEPTED_LENS,
         //! [batch_size]
         BEST_ACCEPTED_PATHS,
-        //! [batch_size]
-        LAST_ACCEPTED_TOKEN_IDS,
-        //! [batch_size]
-        EXCLUSIVE_SUM_LAST_TOKEN_INDICES,
         //! [batch_size, max_decoding_draft_tokens]
         NEXT_DRAFT_TOKEN_IDS,
         //! [batch_size]
-        NEXT_DRAFT_LENS
+        NEXT_DRAFT_LENS,
+        //! [max_draft_path_len * batch_size]
+        HIDDEN_SIZE_BATCH_LEVEL_STARTS,
     };
 
     int32_t getIdx(InputIdxEntry idx) const
@@ -125,10 +123,6 @@ private:
     template <typename T>
     void doGreedy(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
-
-    void selectLastAccTokenAndComputeIndicesCumSum(nvinfer1::PluginTensorDesc const* inputDesc,
-        nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
-        cudaStream_t stream) noexcept;
 
     template <typename T>
     void enqueueType(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,

@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 sys.path.append(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples",
                  "apps"))
-from fastapi_server import LLM, KvCacheConfig, LlmServer
+from fastapi_server import LLM, BuildConfig, KvCacheConfig, LlmServer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import llama_model_path
@@ -15,7 +15,10 @@ from test_llm import llama_model_path
 
 @pytest.fixture(scope="module")
 def client():
-    llm = LLM(llama_model_path)
+    build_config = BuildConfig()
+    build_config.max_batch_size = 8
+    build_config.max_seq_len = 512
+    llm = LLM(llama_model_path, build_config=build_config)
     kv_cache_config = KvCacheConfig()
 
     app_instance = LlmServer(llm, kv_cache_config)

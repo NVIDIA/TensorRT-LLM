@@ -27,6 +27,7 @@
 #include <cuda_bf16.h>
 #endif
 
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 
