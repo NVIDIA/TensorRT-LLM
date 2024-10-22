@@ -117,23 +117,25 @@ if __name__ == "__main__":
         "You can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq)."
         "Notice: fp8 and int8_sq can't be used at the same time.")
     parser.add_argument(
-        '--weight_compression',
+        '--auto_quantize_bits',
         type=float,
         default=None,
-        help="Percent of compression size when using mix precision quantization."
-        "The range is [0.0, 1.0], if you only indicate the autoq_format, it will be default to the lowest possible value."
+        help="Effective bits constraint for auto quantization. If not set, "
+        "regular quantization without auto quantization search will be applied."
+        "You can't set it lower than the num_bits of most aggressive quantization format."
+        "For example, if 'int4_awq' is in autoq_format, it can't be lower than 4.0."
     )
 
     args = parser.parse_args()
 
-    # weight_compression check
+    # auto_quantize_bits check
     if args.autoq_format:
-        lower_bound = 0.25 if '4' in args.autoq_format else 0.5
-        if args.weight_compression is None or args.weight_compression < lower_bound:
+        lower_bound, upper_bound = 4 if '4' in args.autoq_format else 8, 16
+        if args.auto_quantize_bits is None or args.auto_quantize_bits < lower_bound or args.auto_quantize_bits > upper_bound:
             print(
-                f"invalid weight_compression value, will be set to {lower_bound}"
+                f"invalid auto_quantize_bits value, will be set to {lower_bound}"
             )
-            args.weight_compression = lower_bound
+            args.auto_quantize_bits = lower_bound
 
     if args.model_dir is not None:
         quantize_and_export(
@@ -142,7 +144,7 @@ if __name__ == "__main__":
             calib_dataset=args.calib_dataset,
             dtype=args.dtype,
             qformat=args.qformat
-            if args.weight_compression is None else args.autoq_format,
+            if args.auto_quantize_bits is None else args.autoq_format,
             kv_cache_dtype=args.kv_cache_dtype,
             calib_size=args.calib_size,
             batch_size=args.batch_size,
@@ -159,7 +161,7 @@ if __name__ == "__main__":
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
             quant_medusa_head=args.quant_medusa_head,
-            weight_compression=args.weight_compression)
+            auto_quantize_bits=args.auto_quantize_bits)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

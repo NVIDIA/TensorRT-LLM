@@ -41,4 +41,6 @@ inline nvtx3::color nextColor()
 
 } // namespace tensorrt_llm::common::nvtx
 
-#define NVTX3_SCOPED_RANGE(range) ::nvtx3::scoped_range range##_range(::tensorrt_llm::common::nvtx::nextColor(), #range)
+#define NVTX3_SCOPED_RANGE_WITH_NAME(range, name)                                                                      \
+    ::nvtx3::scoped_range range(::tensorrt_llm::common::nvtx::nextColor(), name)
+#define NVTX3_SCOPED_RANGE(range) NVTX3_SCOPED_RANGE_WITH_NAME(range##_range, #range)

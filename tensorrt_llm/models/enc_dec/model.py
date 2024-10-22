@@ -26,11 +26,12 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
                                      transpose, unsqueeze)
-from tensorrt_llm.layers import (MLP, Attention, AttentionMaskType,
-                                 AttentionParams, BertAttention, ColumnLinear,
-                                 Conv1d, Embedding, FusedGatedMLP, GatedMLP,
-                                 GroupNorm, KeyValueCacheParams, LayerNorm,
-                                 LoraParams, PromptTuningEmbedding, RmsNorm)
+from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
+                                 AttentionMaskType, AttentionParams,
+                                 BertAttention, ColumnLinear, Conv1d, Embedding,
+                                 FusedGatedMLP, GatedMLP, GroupNorm,
+                                 KeyValueCacheParams, LayerNorm, LoraParams,
+                                 PromptTuningEmbedding, RmsNorm)
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
                                        use_lora)
@@ -406,8 +407,7 @@ class DecoderLayer(Module):
     def forward(self,
                 hidden_states: Tensor,
                 encoder_output: Optional[Tensor] = None,
-                attention_mask=None,
-                cross_attention_mask=None,
+                attention_mask_params=None,
                 use_cache=False,
                 kv_cache_params=None,
                 attention_params=None,
@@ -427,7 +427,7 @@ class DecoderLayer(Module):
 
         attention_output = self.self_attention(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_params.self_attention_mask,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
@@ -455,7 +455,9 @@ class DecoderLayer(Module):
 
         attention_output = self.cross_attention(
             hidden_states=hidden_states,
-            attention_mask=cross_attention_mask,
+            attention_mask=attention_mask_params.cross_attention_mask,
+            attention_packed_mask=attention_mask_params.
+            cross_attention_packed_mask,
             encoder_output=encoder_output,
             use_cache=use_cache,
             kv_cache_params=kv_cache_params,
@@ -1104,8 +1106,7 @@ class DecoderModel(PretrainedModel):
                 position_ids=None,
                 token_type_ids=None,
                 use_cache=False,
-                attention_mask=None,
-                cross_attention_mask=None,
+                attention_mask_params=None,
                 last_token_ids=None,
                 kv_cache_params=None,
                 attention_params=None,
@@ -1142,8 +1143,7 @@ class DecoderModel(PretrainedModel):
             hidden_states = decoder_layer(
                 hidden_states,
                 encoder_output=encoder_output,
-                attention_mask=attention_mask,
-                cross_attention_mask=cross_attention_mask,
+                attention_mask_params=attention_mask_params,
                 use_cache=use_cache,
                 kv_cache_params=KeyValueCacheParams(
                     past_key_value=past,
@@ -1286,12 +1286,27 @@ class DecoderModel(PretrainedModel):
             (max_encoder_input_len + 1) // 2,
             max_encoder_input_len
         ]
+        max_cross_packed_mask_dim0 = max_batch_size * (
+            (max_decoder_input_len + 128 - 1) // 128) * 128
+        max_cross_packed_mask_dim1 = (
+            (max_encoder_input_len + 256 - 1) // 256) * 256 // 32
+        cross_packed_mask_dim0_range = [
+            1, (max_cross_packed_mask_dim0 + 1) // 2, max_cross_packed_mask_dim0
+        ]
+        cross_packed_mask_dim1_range = [
+            0,  # 0 for generation phase, >0 for context phase
+            (max_cross_packed_mask_dim1 + 1) // 2,
+            max_cross_packed_mask_dim1
+        ]
+
         past_key_value = []
         sequence_length = None
         host_past_key_value_lengths = None
         runtime_perf_knobs = None
         attention_mask = None
         cross_attention_mask = None
+        cross_attention_packed_mask = None
+        attention_mask_params = AttentionMaskParams()
         use_gpt_attention_plugin = default_net(
         ).plugin_config.gpt_attention_plugin
         remove_input_padding = default_net().plugin_config.remove_input_padding
@@ -1484,9 +1499,36 @@ class DecoderModel(PretrainedModel):
                 dim_range=OrderedDict([
                     ('batch_size_beam_width', [bb_range]),
                     ('query_len', [1]),
-                    ('encoder_input_len', [encoder_input_len_range]),
+                    ('encoder_input_len_2', [encoder_input_len_range]),
                 ]),
             )
+        else:
+            cross_attention_mask = Tensor(
+                name='cross_attention_mask',
+                dtype=trt.bool,
+                shape=[-1, -1],
+                dim_range=OrderedDict([
+                    ('decoder_num_tokens_2',
+                     [decoder_num_tokens_range
+                      ]),  # TODO (bhsueh) should use same name as input_ids
+                    ('encoder_input_len_2', [encoder_input_len_range]),
+                ]),
+            )
+
+            cross_attention_packed_mask = Tensor(
+                name='cross_attention_packed_mask',
+                dtype=trt.int32,
+                shape=[-1, -1],
+                dim_range=OrderedDict([
+                    ('cross_packed_mask_dim0', [cross_packed_mask_dim0_range]),
+                    ('cross_packed_mask_dim1', [cross_packed_mask_dim1_range]),
+                ]),
+            )
+
+        # create the attention_mask_params.
+        attention_mask_params = AttentionMaskParams(
+            attention_mask, None, cross_attention_mask,
+            cross_attention_packed_mask)
 
         cache_indirection = Tensor(
             name='cache_indirection',
@@ -1824,8 +1866,7 @@ class DecoderModel(PretrainedModel):
             'position_ids': position_ids,
             'token_type_ids': token_type_ids,
             'use_cache': True,
-            'attention_mask': attention_mask,
-            'cross_attention_mask': cross_attention_mask,
+            'attention_mask_params': attention_mask_params,
             'last_token_ids': last_token_ids,
             'kv_cache_params': kv_cache_params,
             'attention_params': attention_params,

@@ -80,10 +80,11 @@ class RmsNorm(Module):
         self.eps = eps
         self.dtype = dtype
 
-    def forward(self, x):
+    def forward(self, x, normalized_shape=None):
         weight = None if self.weight is None else self.weight.value
-        return rms_norm(x, self.normalized_shape, self.num_groups, weight,
-                        self.eps)
+        if normalized_shape is None:
+            normalized_shape = self.normalized_shape
+        return rms_norm(x, normalized_shape, self.num_groups, weight, self.eps)
 
 
 class GroupNorm(Module):

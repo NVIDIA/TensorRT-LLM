@@ -73,11 +73,14 @@ struct QKVPreprocessingParams
 {
     // Buffers.
     // source buffer
-    // also acts as a dst buffer based on if !params.enable_paged_kv_fmha
-    T* QKV{nullptr};
+    // also acts as a dst buffer based on if separate_q_kv_output
+    T* qkv_input{nullptr};
+    // The cross attention qkv (= qkv_project(encoder_output)).
+    T* cross_qkv_input{nullptr};
     // Only used by fp8 quantized output currently.
-    void* QuantizedQKV{nullptr};
-    T* Q{nullptr};
+    void* quantized_qkv_output{nullptr};
+    // The separate q output.
+    T* q_output{nullptr};
     // the classes used for this template are either KVLinearBuffer, KVBlockArray
     // for more details, refer to kvCacheUtils.h
     KVCacheBuffer kv_cache_buffer{};
@@ -85,9 +88,14 @@ struct QKVPreprocessingParams
     // list of sequence lengths, of shape {batch_size + 1}
     int const* seq_lens{nullptr};
     // list sequence lengths for the cache, of shape {batch_size + 1}
+    // this is normally used to indicate if chunked context is used (i.e. cache_seqlen > input_seqlen).
     int const* cache_seq_lens{nullptr};
+    // list sequence lengths for the encoder, of shape {batch_size + 1}
+    int const* encoder_seq_lens{nullptr};
     // list of cumulative sequence lengths, of shape {batch_size + 1}
     int const* cu_seq_lens{nullptr};
+    // list of cumulative KV sequence lengths, of shape {batch_size + 1}, used by cross attention only.
+    int const* cu_kv_seq_lens{nullptr};
     // inverse frequencies (angle raised at various powers) from the RoPE formula
     // shape of {batch_size , rotaryEmbeddingDim / 2}
     float const* rotary_embedding_inv_freq{nullptr};
@@ -105,6 +113,7 @@ struct QKVPreprocessingParams
     int sink_token_len{0};
     int token_num{0};
     bool remove_padding{true};
+    bool cross_attention{false};
     int head_num{0};
     int kv_head_num{0};
     int qheads_per_kv_head{0};
@@ -118,7 +127,7 @@ struct QKVPreprocessingParams
     PositionEmbeddingType position_embedding_type{};
     bool position_shift_enabled{false};
     KvCacheDataType cache_type{};
-    bool enable_paged_kv_fmha{false};
+    bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
@@ -142,9 +151,10 @@ struct QKVPreprocessingParams
         std::stringstream ss;
 
         ss << "QKVPreprocessingParams ====================" << std::endl;
-        ss << "QKV: " << QKV << std::endl;
-        ss << "QuantizedQKV: " << QuantizedQKV << std::endl;
-        ss << "Q: " << Q << std::endl;
+        ss << "qkv_input: " << qkv_input << std::endl;
+        ss << "cross_qkv_input: " << cross_qkv_input << std::endl;
+        ss << "quantized_qkv_output: " << quantized_qkv_output << std::endl;
+        ss << "q_output: " << q_output << std::endl;
         ss << "kv_cache_buffer: " << kv_cache_buffer.data << std::endl;
         ss << "qkv_bias: " << qkv_bias << std::endl;
         ss << "seq_lens: "
@@ -153,9 +163,15 @@ struct QKVPreprocessingParams
         ss << "cache_seq_lens: "
            << *(runtime::ITensor::wrap(
                   (void*) cache_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        ss << "encoder_seq_lens: "
+           << *(runtime::ITensor::wrap(
+                  (void*) encoder_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         ss << "cu_seq_lens: "
            << *(runtime::ITensor::wrap(
                   (void*) cu_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        ss << "cu_kv_seq_lens: "
+           << *(runtime::ITensor::wrap(
+                  (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         ss << "rotary_embedding_inv_freq: "
            << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
                   runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
@@ -168,6 +184,8 @@ struct QKVPreprocessingParams
         ss << "cyclic_kv_cache_len: " << cyclic_kv_cache_len << std::endl;
         ss << "sink_token_len: " << sink_token_len << std::endl;
         ss << "token_num: " << token_num << std::endl;
+        ss << "remove_padding: " << remove_padding << std::endl;
+        ss << "cross_attention: " << cross_attention << std::endl;
         ss << "head_num: " << head_num << std::endl;
         ss << "kv_head_num: " << kv_head_num << std::endl;
         ss << "qheads_per_kv_head: " << qheads_per_kv_head << std::endl;
@@ -180,7 +198,7 @@ struct QKVPreprocessingParams
         ss << "position_embedding_type: " << static_cast<int>(position_embedding_type) << std::endl;
         ss << "position_shift_enabled: " << std::boolalpha << position_shift_enabled << std::endl;
         ss << "cache_type: " << static_cast<int>(cache_type) << std::endl;
-        ss << "enable_paged_kv_fmha: " << std::boolalpha << enable_paged_kv_fmha << std::endl;
+        ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 

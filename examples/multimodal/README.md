@@ -423,7 +423,7 @@ Currently, CogVLM only support bfloat16 precision.
         --max_batch_size 1 \
         --max_input_len 4096 \
         --max_seq_len 5120 \
-        --max_num_tokens 4096 \  # 1 (max_batch_size) * 4096 (max_input_len)
+        --max_num_tokens 4096 \
         --max_multimodal_len 4096 # 1 (max_batch_size) * 4096 (max_input_len)
 
     # for VILA
@@ -443,7 +443,7 @@ Currently, CogVLM only support bfloat16 precision.
     ```bash
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # for LLaVA
 
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_next --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_next --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
 
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
@@ -463,7 +463,7 @@ Currently, CogVLM only support bfloat16 precision.
     wget -O av.png https://raw.githubusercontent.com/Efficient-Large-Model/VILA/main/demo_images/av.png
 
     python run.py  \
-        --max_new_tokens 100 \
+        --max_new_tokens 30 \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
@@ -472,13 +472,14 @@ Currently, CogVLM only support bfloat16 precision.
         --batch_size=1 # for VILA mode 1
 
     python run.py  \
-        --max_new_tokens 100 \
+        --max_new_tokens 30 \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --image_path=av.png,https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png \
         --input_text="<image>\n Please elaborate what you see in the images?" \
-        --batch_size=2 # for VILA mode 2
+        --batch_size=2 \
+        --check_accuracy # for VILA mode 2
     ```
 
     Note that VILA can support different modes in terms of batching:

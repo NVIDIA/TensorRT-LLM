@@ -795,7 +795,8 @@ def test_sampling_config():
         "presence_penalty": 1.0,
         "frequency_penalty": 1.0,
         "length_penalty": 1.0,
-        "early_stopping": 5
+        "early_stopping": 5,
+        "num_return_sequences": 2,
     }
     config = trtllm.SamplingConfig(beam_width, **kwargs)
     for k, v in kwargs.items():
@@ -932,7 +933,6 @@ def test_request():
         "lora_config": trtllm.LoraConfig(1),
         "logits_post_processor_name": "my_logits_pp",
         "client_id": 1234,
-        "num_return_sequences": 2,
     }
     request = trtllm.Request(**kwargs)
     for k, v in kwargs.items():
@@ -947,7 +947,6 @@ def test_request():
     assert (request.prompt_tuning_config.embedding_table == torch.ones(
         100, 64)).all()
     assert isinstance(request.lora_config, trtllm.LoraConfig)
-    assert request.num_return_sequences == 2
 
 
 def test_request_deprecated_args():

@@ -474,7 +474,8 @@ class EncDecModelRunner:
         # `cross_attention_mask` in context phase [batch_size, query_len, encoder_input_len]
         # where query_len happens to be 1 in current cases, but not necessarily always, and
         # `cross_attention_mask` in generation phase [batch_size, 1, encoder_input_len] where
-        # the query_len is always 1 since we have kv cache.
+        # the query_len is always 1 since we have kv cache. But we use
+        # cross_attention_mask[:, step, :] during generation
         cross_attention_mask = None
         if attention_mask is not None:
             cross_attention_mask = torch.tensor(attention_mask,
@@ -482,6 +483,8 @@ class EncDecModelRunner:
                                                 device=self.device).reshape(
                                                     attention_mask.shape[0], 1,
                                                     attention_mask.shape[1])
+            cross_attention_mask = cross_attention_mask.repeat(
+                [1, decoder_max_input_length + max_new_tokens, 1])
 
         # generation config
         sampling_config = SamplingConfig(end_id=eos_token_id,

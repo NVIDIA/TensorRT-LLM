@@ -74,29 +74,29 @@ def parse_arguments():
     parser.add_argument(
         '--max_batch_size',
         type=int,
-        default=2048,
+        default=BuildConfig.max_batch_size,
         help="Maximum number of requests that the engine can schedule.")
     parser.add_argument('--max_input_len',
                         type=int,
-                        default=1024,
+                        default=BuildConfig.max_input_len,
                         help="Maximum input length of one request.")
     parser.add_argument(
         '--max_seq_len',
         '--max_decoder_seq_len',
         dest='max_seq_len',
         type=int,
-        default=None,
+        default=BuildConfig.max_seq_len,
         help="Maximum total length of one request, including prompt and outputs. "
         "If unspecified, the value is deduced from the model config.")
     parser.add_argument(
         '--max_beam_width',
         type=int,
-        default=1,
+        default=BuildConfig.max_beam_width,
         help="Maximum number of beams for beam search decoding.")
     parser.add_argument(
         '--max_num_tokens',
         type=int,
-        default=8192,
+        default=BuildConfig.max_num_tokens,
         help=
         "Maximum number of batched input tokens after padding is removed in each batch. "
         "Currently, the input padding is removed by default; "
@@ -105,7 +105,7 @@ def parse_arguments():
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
-        default=None,
+        default=BuildConfig.opt_num_tokens,
         help=
         "Optimal number of batched input tokens after padding is removed in each batch "
         "It equals to ``max_batch_size * max_beam_width`` by default, set this "
@@ -114,7 +114,7 @@ def parse_arguments():
     parser.add_argument(
         '--max_encoder_input_len',
         type=int,
-        default=1024,
+        default=BuildConfig.max_encoder_input_len,
         help="Maximum encoder input length for enc-dec models. "
         "Set ``max_input_len`` to 1 to start generation from decoder_start_token_id of length 1."
     )
@@ -122,7 +122,7 @@ def parse_arguments():
         '--max_prompt_embedding_table_size',
         '--max_multimodal_len',
         type=int,
-        default=0,
+        default=BuildConfig.max_prompt_embedding_table_size,
         help=
         "Maximum prompt embedding table size for prompt tuning, or maximum multimodal input size for multimodal models. "
         "Setting a value > 0 enables prompt tuning or multimodal input.")
@@ -144,36 +144,36 @@ def parse_arguments():
     parser.add_argument(
         '--input_timing_cache',
         type=str,
-        default=None,
+        default=BuildConfig.input_timing_cache,
         help=
         "The file path to read the timing cache. This option is ignored if the file does not exist."
     )
     parser.add_argument('--output_timing_cache',
                         type=str,
-                        default='model.cache',
+                        default=BuildConfig.output_timing_cache,
                         help="The file path to write the timing cache.")
     parser.add_argument(
         '--profiling_verbosity',
         type=str,
-        default='layer_names_only',
+        default=BuildConfig.profiling_verbosity,
         choices=['layer_names_only', 'detailed', 'none'],
         help=
         "The profiling verbosity for the generated TensorRT engine. Setting to detailed allows inspecting tactic choices and kernel parameters."
     )
     parser.add_argument(
         '--strip_plan',
-        default=False,
+        default=BuildConfig.use_strip_plan,
         action='store_true',
         help=
         "Enable stripping weights from the final TensorRT engine under the assumption that the refit weights are identical to those provided at build time."
     )
     parser.add_argument('--weight_sparsity',
-                        default=False,
+                        default=BuildConfig.weight_sparsity,
                         action='store_true',
                         help="Enable weight sparsity.")
     parser.add_argument(
         '--weight_streaming',
-        default=False,
+        default=BuildConfig.weight_streaming,
         action='store_true',
         help=
         "Enable offloading weights to CPU and streaming loading at runtime.",
@@ -196,18 +196,18 @@ def parse_arguments():
                         choices=severity_map.keys(),
                         help="The logging level.")
     parser.add_argument('--enable_debug_output',
-                        default=False,
+                        default=BuildConfig.enable_debug_output,
                         action='store_true',
                         help="Enable debug output.")
     parser.add_argument(
         '--visualize_network',
-        default=False,
+        default=BuildConfig.visualize_network,
         action='store_true',
         help=
         "Export TensorRT Networks to ONNX prior to Engine build for debugging.")
     parser.add_argument(
         '--dry_run',
-        default=False,
+        default=BuildConfig.dry_run,
         action='store_true',
         help=
         "Run through the build process except the actual Engine build for debugging."
@@ -367,7 +367,6 @@ def build_model(
             lora_config.lora_target_modules = kwargs['lora_target_modules']
         build_config.lora_config = lora_config
 
-    build_config.use_fused_mlp = kwargs.get('use_fused_mlp', False)
     # tells the low level build api to only build rank-th shard of the model
     if build_config.auto_parallel_config.enabled:
         model.config.mapping.rank = real_rank

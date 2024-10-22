@@ -249,6 +249,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
         else:
             return ContextFMHAType.disabled
 
+    def is_context_fmha_enabled(self):
+        return self.context_fmha_type != ContextFMHAType.disabled
+
     @context_fmha_type.setter
     def context_fmha_type(self, value):
         if value == ContextFMHAType.disabled:

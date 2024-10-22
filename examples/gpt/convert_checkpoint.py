@@ -192,6 +192,7 @@ def convert_and_save_hf(args):
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'share_embedding_table': args.use_embedding_sharing,
+        'gpt_variant': args.gpt_variant,
     }
 
     quant_config = args_to_quant_config(args)

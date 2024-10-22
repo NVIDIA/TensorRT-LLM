@@ -15,8 +15,8 @@ from multiprocessing.connection import Client, Listener
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from queue import Queue
-from typing import (Any, Dict, Generator, List, Literal, NamedTuple, Optional,
-                    Tuple, Union)
+from typing import (Any, Callable, Dict, Generator, List, Literal, NamedTuple,
+                    Optional, Tuple, Union)
 
 import numpy as np
 import torch
@@ -97,7 +97,8 @@ class GenerationRequest:
 
     def __init__(
         self,
-        prompt_token_ids: Union[torch.Tensor, np.ndarray, list],
+        prompt_token_ids: Union[torch.Tensor, np.ndarray,
+                                Union[List[int], List[List[int]]]],
         sampling_params: SamplingParams,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -136,6 +137,8 @@ class CompletionOutput:
         finish_reason (Literal['stop', 'length']): The reason why the sequence is finished.
         stop_reason (Union[int, str]): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason.
         generation_logits (torch.Tensor): The logits on the generated output token ids.
+
+    Properties:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (List[float]): Logprobs of newly generated tokens.
@@ -149,31 +152,28 @@ class CompletionOutput:
     finish_reason: Optional[Literal['stop', 'length']] = None
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
-    _last_text: str = field(default="", init=False, repr=False)
-    _last_logprobs_len: int = field(default=0, init=False, repr=False)
+    _last_text_len: int = field(default=0, init=False, repr=False)
     _last_token_ids_len: int = field(default=0, init=False, repr=False)
+    _last_logprobs_len: int = field(default=0, init=False, repr=False)
+    _incremental_states: Optional[dict] = field(default=None,
+                                                init=False,
+                                                repr=False)
 
     @property
     def length(self):
         return len(self.token_ids)
 
     @property
+    def text_diff(self) -> str:
+        return self.text[self._last_text_len:]
+
+    @property
     def token_ids_diff(self) -> List[int]:
-        diff = self.token_ids[self._last_token_ids_len:]
-        self._last_token_ids_len = len(self.token_ids)
-        return diff
+        return self.token_ids[self._last_token_ids_len:]
 
     @property
     def logprobs_diff(self) -> List[float]:
-        diff = self.logprobs[self._last_logprobs_len:]
-        self._last_logprobs_len = len(self.logprobs)
-        return diff
-
-    @property
-    def text_diff(self) -> str:
-        diff = self.text[len(self._last_text):]
-        self._last_text = self.text
-        return diff
+        return self.logprobs[self._last_logprobs_len:]
 
 
 class _SyncQueue:
@@ -201,6 +201,32 @@ class _SyncQueue:
                                              self._loop)
         else:
             raise AsyncQueue.EventLoopShutdownError
+
+    def put_nowait(self, item) -> None:
+        ''' Put item without notify the event. '''
+        self._q.put_nowait(item)
+
+    @staticmethod
+    def notify_events(loop: asyncio.AbstractEventLoop,
+                      events: List[asyncio.Event]) -> None:
+        ''' Notify the events in the loop. '''
+
+        async def _set_events(events):
+            for event in events:
+                event.set()
+
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_set_events(events), loop)
+        else:
+            raise AsyncQueue.EventLoopShutdownError
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        return self._loop
+
+    @property
+    def event(self) -> asyncio.Event:
+        return self._event
 
     def full(self) -> bool:
         return self._q.full()
@@ -260,7 +286,7 @@ class GenerationResult:
 
     def __init__(self,
                  generation_request: GenerationRequest,
-                 background_error_handler: Optional[callable] = None) -> None:
+                 background_error_handler: Optional[Callable] = None) -> None:
         self._done = False
         self._cancelled = False
         self._generation_request = generation_request
@@ -273,8 +299,12 @@ class GenerationResult:
             self.queue = Queue()
             self.aqueue = None
 
-        self.outputs: List[CompletionOutput] = [
-            CompletionOutput(i) for i in range(self.beam_width)
+        # In Sampling mode, the Executor runtime will return best_of sequences
+        # in total, which the LLM API will select the n-best sequences among
+        # them based on their cumulative log probabilities.
+        self._outputs: List[CompletionOutput] = [
+            CompletionOutput(i)
+            for i in range(self._generation_request.sampling_params.best_of)
         ]
         self.context_logits: Optional[torch.Tensor] = None
 
@@ -297,8 +327,64 @@ class GenerationResult:
         return self._generation_request.streaming
 
     @property
-    def beam_width(self):
-        return self._generation_request.sampling_params.beam_width
+    def outputs(self) -> List[CompletionOutput]:
+        sampling_param = self._generation_request.sampling_params
+        if (sampling_param.use_beam_search
+                or sampling_param.n == sampling_param.best_of):
+            return self._outputs[:sampling_param.n]
+        # Pick the top-n outputs, sorted by cumulative log probs.
+        sorted_outputs = sorted(
+            self._outputs,
+            key=lambda x:
+            (x.cumulative_logprob
+             if x.cumulative_logprob is not None else float('-inf')),
+            reverse=True)
+        # Reindex the sequence.
+        for i, sorted_out in enumerate(sorted_outputs):
+            sorted_out.index = i
+        return sorted_outputs[:sampling_param.n]
+
+    def handle_sequence(self, response: "GenerationExecutor.Response",
+                        sequence_index: int):
+        """ Handle a single sequence in the response. """
+
+        tensors = response.tensors
+        assert tensors is not None
+
+        beam_search = self._generation_request.sampling_params.use_beam_search
+        seq_idx = sequence_index
+        src_idx = sequence_index if beam_search else 0
+
+        output = self._outputs[seq_idx]
+
+        output._last_token_ids_len = len(output.token_ids)
+        output.token_ids.extend(tensors.output_token_ids[src_idx])
+        if tensors.cum_log_probs is not None:
+            output.cumulative_logprob = tensors.cum_log_probs[src_idx]
+        if tensors.log_probs is not None:
+            output._last_logprobs_len = len(output.logprobs)
+            output.logprobs = tensors.log_probs[src_idx]
+            assert len(output.logprobs) == output.length
+        if tensors.generation_logits is not None:
+            output.generation_logits = tensors.generation_logits[
+                src_idx, :output.length]
+
+        if self.finished:
+            if response.finish_reasons[src_idx] == tllm.FinishReason.END_ID:
+                output.finish_reason = 'stop'
+            elif response.finish_reasons[
+                    src_idx] == tllm.FinishReason.STOP_WORDS:
+                output.finish_reason = 'stop'
+                sampling_params = self._generation_request.sampling_params
+                for stop_reason, stop_ids in sampling_params._get_stop_reasons_and_words(
+                ):
+                    if output.token_ids[-len(stop_ids):] == stop_ids:
+                        output.stop_reason = stop_reason
+                        if not sampling_params.include_stop_str_in_output:
+                            output.token_ids = output.token_ids[:-len(stop_ids)]
+                        break
+            elif response.finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
+                output.finish_reason = 'length'
 
     def handle_response(self, response: "GenerationExecutor.Response"):
 
@@ -312,34 +398,12 @@ class GenerationResult:
 
         tensors = response.tensors
 
-        for i, beam_ids in enumerate(tensors.output_token_ids):
-            self.outputs[i].token_ids.extend(beam_ids)
-            if tensors.cum_log_probs is not None:
-                self.outputs[i].cumulative_logprob = tensors.cum_log_probs[i]
-            if tensors.log_probs is not None:
-                self.outputs[i].logprobs = tensors.log_probs[i]
-                assert len(self.outputs[i].logprobs) == self.outputs[i].length
-            if tensors.generation_logits is not None:
-                self.outputs[i].generation_logits = tensors.generation_logits[
-                    i, :self.outputs[i].length]
-
-        if self.finished:
-            for i, beam_output in enumerate(self.outputs):
-                if response.finish_reasons[i] == tllm.FinishReason.END_ID:
-                    beam_output.finish_reason = 'stop'
-                elif response.finish_reasons[i] == tllm.FinishReason.STOP_WORDS:
-                    beam_output.finish_reason = 'stop'
-                    sampling_params = self._generation_request.sampling_params
-                    for stop_reason, stop_ids in sampling_params._get_stop_reasons_and_words(
-                    ):
-                        if beam_output.token_ids[-len(stop_ids):] == stop_ids:
-                            beam_output.stop_reason = stop_reason
-                            if not sampling_params.include_stop_str_in_output:
-                                beam_output.token_ids = beam_output.token_ids[:-len(
-                                    stop_ids)]
-                            break
-                elif response.finish_reasons[i] == tllm.FinishReason.LENGTH:
-                    beam_output.finish_reason = 'length'
+        # output_token_ids = (beams, tokens)
+        if self._generation_request.sampling_params.use_beam_search:
+            for beam_idx, _ in enumerate(tensors.output_token_ids):
+                self.handle_sequence(response, beam_idx)
+        else:
+            self.handle_sequence(response, response.sequence_index)
 
         if tensors.context_logits is not None:
             self.context_logits = tensors.context_logits
@@ -435,7 +499,7 @@ class GenerationExecutor(ABC):
     PENDING_REQ_ID_TIMEOUT = 2  # second
 
     class ResponseTensors(NamedTuple):
-        output_token_ids: list
+        output_token_ids: List[List[int]]
         # context_logits is a tensor or a string denoting the path to the shared memory.
         context_logits: Optional[torch.Tensor | str]
         # generation_logits is a tensor or a string denoting the path to the shared memory.
@@ -449,6 +513,7 @@ class GenerationExecutor(ABC):
         tensors: Optional["GenerationExecutor.ResponseTensors"]
         finish_reasons: Optional[List[tllm.FinishReason]]
         is_final: Optional[bool]
+        sequence_index: Optional[int]
         # error is either str from cpp-executor or a Exception from Python threads/processes
         error: Optional[str | Exception]
 
@@ -580,10 +645,13 @@ class GenerationExecutor(ABC):
                             f"Request ID {req_id} not found in the results queue."
                         )
                 else:
+                    is_done = False
                     for response in responses:
+                        is_done = is_done or response.response.is_final
                         self._results[req_id].queue.put(
                             response.response)  # dispatch
-                    done_req_ids.add(req_id)
+                    if is_done:
+                        done_req_ids.add(req_id)
 
             for req_id in done_req_ids:
                 self._pending_responses.pop(req_id, None)
@@ -763,6 +831,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def await_response_task(self) -> bool:
         # Get responses and place in queue.
 
+        async_events = []
+        event_loop = None
         for response in self.engine.await_responses(timeout=datetime.timedelta(
                 milliseconds=100)):
             req_id = response.request_id
@@ -772,6 +842,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     tensors=None,
                     finish_reasons=response.result.finish_reasons,
                     is_final=None,
+                    sequence_index=None,
                     error=response.error_msg)
             else:
                 tensors = self.ResponseTensors(
@@ -785,6 +856,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     tensors,
                     finish_reasons=response.result.finish_reasons,
                     is_final=response.result.is_final,
+                    sequence_index=response.result.sequence_index,
                     error=None)
 
             if self._to_delay_response(rsp):
@@ -793,20 +865,29 @@ class ExecutorBindingsWorker(GenerationExecutor):
             self._cleanup_pending_responses(nowait=True)
 
             queue = self.return_queue(req_id)
-            bck_error = self._error_queue.get_nowait(
-            ) if not self._error_queue.empty() else None
-
-            if bck_error is not None:
+            if not self._error_queue.empty():
+                bck_error = self._error_queue.get_nowait()
                 rsp = self.Response(req_id,
                                     tensors=None,
                                     finish_reasons=None,
                                     is_final=None,
+                                    sequence_index=None,
                                     error=bck_error)
 
-            queue.put(rsp)
+            # For AsyncQueue.sync_q, we will batch the events to avoid too many notifications, thus put without
+            # notification here.
+            if isinstance(queue, _SyncQueue):
+                queue.put_nowait(rsp)
+                async_events.append(queue.event)
+                event_loop = queue.loop if event_loop is None else event_loop  # all the loops are identical
+            else:
+                queue.put(rsp)
 
             if response.result.is_final:
                 self._results.pop(req_id)
+
+        if async_events:
+            _SyncQueue.notify_events(event_loop, async_events)
 
         return True  # success
 
@@ -876,7 +957,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
             max_new_tokens=request.sampling_params.max_new_tokens,
             streaming=request.streaming,
             sampling_config=request.sampling_params._get_sampling_config(),
-            end_id=request.sampling_params.end_id,
+            end_id=-1 if request.sampling_params.ignore_eos else
+            request.sampling_params.end_id,
             pad_id=request.sampling_params.pad_id,
             output_config=request.sampling_params._get_output_config(),
             bad_words=request.sampling_params._get_bad_words(),
@@ -1003,6 +1085,7 @@ class IpcQueue:
                                               tensors=tensors,
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
+                                              sequence_index=obj.sequence_index,
                                               error=obj.error)
 
         self.conn.send(obj)
@@ -1018,6 +1101,7 @@ class IpcQueue:
                                               tensors=tensors,
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
+                                              sequence_index=obj.sequence_index,
                                               error=obj.error)
         return obj
 

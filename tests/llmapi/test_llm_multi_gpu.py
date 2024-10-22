@@ -82,14 +82,10 @@ def test_llm_loading_from_ckpt_for_tp2(
 
 
 @skip_single_gpu
-def test_llm_generate_tp2(engine_from_checkpoint):
-    model_dir = engine_from_checkpoint.name
-    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
-
-    llm_test_harness(model_dir,
+def test_llm_generate_tp2():
+    llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=8),
-                     tokenizer=tokenizer,
                      tensor_parallel_size=2,
                      kv_cache_config=global_kv_cache_config)
 

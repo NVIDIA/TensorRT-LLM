@@ -177,8 +177,8 @@ inline void syncAndCheck(char const* const file, int const line)
 {
     if (doCheckError())
     {
+        cudaDeviceSynchronize();
         check(cudaGetLastError(), "cudaGetLastError", file, line);
-        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize", file, line);
     }
 }
 

@@ -70,44 +70,46 @@ nvinfer1::DimsExprs EagleSampleAndAcceptDraftTokensPlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     TLLM_CHECK(nbInputs == 6);
-    TLLM_CHECK(outputIndex < 7);
+    TLLM_CHECK(outputIndex < 6);
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[0];
     auto const maxDecodingDraftTokensExpr = inputs[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)].d[1];
     auto const maxPathLenExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[2];
 
     nvinfer1::DimsExprs ret;
-    switch (outputIndex)
+    if (outputIndex == getIdx(OutputIdxEntry::ACCEPTED_TOKENS))
     {
-    case 0: // accepted_tokens
         ret.nbDims = 2;
         ret.d[0] = batchSizeExpr;
         ret.d[1] = maxPathLenExpr;
-        break;
-    case 1: // num_accepted_tokens
+    }
+    else if (outputIndex == getIdx(OutputIdxEntry::ACCEPTED_LENS))
+    {
         ret.nbDims = 1;
         ret.d[0] = batchSizeExpr;
-        break;
-    case 2: // accepted_paths
+    }
+    else if (outputIndex == getIdx(OutputIdxEntry::BEST_ACCEPTED_PATHS))
+    {
         ret.nbDims = 1;
         ret.d[0] = batchSizeExpr;
-        break;
-    case 3: // last_accepted_tokens
-        ret.nbDims = 1;
-        ret.d[0] = batchSizeExpr;
-        break;
-    case 4: // exclusive_sum_last_accepted_indices
-        ret.nbDims = 1;
-        ret.d[0] = batchSizeExpr;
-        break;
-    case 5: // next_draft_tokens
+    }
+    else if (outputIndex == getIdx(OutputIdxEntry::NEXT_DRAFT_TOKEN_IDS))
+    {
         ret.nbDims = 2;
         ret.d[0] = batchSizeExpr;
         ret.d[1] = maxDecodingDraftTokensExpr;
-        break;
-    case 6: // next_draft_lens
+    }
+    else if (outputIndex == getIdx(OutputIdxEntry::NEXT_DRAFT_LENS))
+    {
         ret.nbDims = 1;
         ret.d[0] = batchSizeExpr;
-        break;
+    }
+    else if (outputIndex == getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS))
+    {
+        ret.nbDims = 1;
+        ret.d[0] = exprBuilder.operation(DimensionOperation::kSUM, *exprBuilder.constant(1),
+            *exprBuilder.operation(DimensionOperation::kPROD,
+                *exprBuilder.operation(DimensionOperation::kSUB, *maxPathLenExpr, *exprBuilder.constant(1)),
+                *batchSizeExpr));
     }
     return ret;
 }
@@ -272,7 +274,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
     params.outputIds = reinterpret_cast<TokenIdType*>(outputs[getIdx(OutputIdxEntry::ACCEPTED_TOKENS)]);
     params.draftIds = reinterpret_cast<TokenIdType const*>(inputs[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)]);
     params.targetIds = outputIds;
-    params.acceptedLengths = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::ACCEPTED_LEN)]);
+    params.acceptedLengths = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::ACCEPTED_LENS)]);
     params.paths = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::PATHS)]);
     params.bestPathIds = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::BEST_ACCEPTED_PATHS)]);
     params.batchSize = batchSize;
@@ -308,35 +310,6 @@ void EagleSampleAndAcceptDraftTokensPlugin::doGreedy(nvinfer1::PluginTensorDesc 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void EagleSampleAndAcceptDraftTokensPlugin::selectLastAccTokenAndComputeIndicesCumSum(
-    nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const batchSize = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[0];
-    auto const maxDecodingTokens = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[1];
-    auto const maxPathLen = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[2];
-
-    auto lastAcceptedTokenIds
-        = reinterpret_cast<TokenIdType*>(outputs[getIdx(OutputIdxEntry::LAST_ACCEPTED_TOKEN_IDS)]);
-    auto exclusiveSumLastAcceptedIndices
-        = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::EXCLUSIVE_SUM_LAST_TOKEN_INDICES)]);
-    auto prevDraftLens = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::DRAFT_LENS)]);
-    auto acceptedTokenIds = reinterpret_cast<TokenIdType const*>(outputs[getIdx(OutputIdxEntry::ACCEPTED_TOKENS)]);
-    auto acceptedLengths = reinterpret_cast<SizeType32 const*>(outputs[getIdx(OutputIdxEntry::ACCEPTED_LEN)]);
-    auto bestPathIds = reinterpret_cast<SizeType32 const*>(outputs[getIdx(OutputIdxEntry::BEST_ACCEPTED_PATHS)]);
-    auto paths = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::PATHS)]);
-
-    invokeSelectLastAccTokenAndComputeIndicesCumSum(lastAcceptedTokenIds, exclusiveSumLastAcceptedIndices,
-        prevDraftLens, acceptedTokenIds, acceptedLengths, bestPathIds, paths, batchSize, maxDecodingTokens, maxPathLen,
-        stream);
-
-    sync_check_cuda_error();
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
 template <typename T>
 void EagleSampleAndAcceptDraftTokensPlugin::enqueueType(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
@@ -354,9 +327,6 @@ void EagleSampleAndAcceptDraftTokensPlugin::enqueueType(nvinfer1::PluginTensorDe
         // TODO fill me
         TLLM_CHECK_WITH_INFO(false, "Non-greedy sampling is not supported yet");
     }
-
-    // Find last accepted tokens and do cumulative sum of accepted indices.
-    selectLastAccTokenAndComputeIndicesCumSum(inputDesc, outputDesc, inputs, outputs, workspace, stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -386,7 +356,7 @@ int EagleSampleAndAcceptDraftTokensPlugin::enqueue(nvinfer1::PluginTensorDesc co
 nvinfer1::DataType EagleSampleAndAcceptDraftTokensPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    TLLM_CHECK(index < 7);
+    TLLM_CHECK(index < 6);
     // input 1 is draft tokens now of int32 type. All outputs are int32_t as well.
     return inputTypes[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)];
 }
@@ -405,7 +375,7 @@ char const* EagleSampleAndAcceptDraftTokensPlugin::getPluginVersion() const noex
 
 int EagleSampleAndAcceptDraftTokensPlugin::getNbOutputs() const noexcept
 {
-    return 7;
+    return 6;
 }
 
 int EagleSampleAndAcceptDraftTokensPlugin::initialize() noexcept

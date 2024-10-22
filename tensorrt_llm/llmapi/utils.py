@@ -54,7 +54,14 @@ class SamplingParams:
         external_draft_tokens_config (ExternalDraftTokensConfig): The speculative decoding configuration.
         logits_post_processor_name (str): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig.
 
-        beam_width (int): The beam width. Default is 1 which disables beam search.
+
+        n (int): Number of sequences to generate.
+        best_of (int): Number of sequences to consider for best output.
+        use_beam_search (bool): Whether to use beam search.
+
+        beam_width (int): The beam width. Default is 1 which disables beam search. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead.
+        num_return_sequences (int): The number of sequences to return. If set to None, it defaults to the value of `beam_width`. The default is None. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead.
+
         top_k (int): Controls number of logits to sample from. Default is 0 (all logits).
         top_p (float): Controls the top-P probability to sample from. Default is 0.f
         top_p_min (float): Controls decay in the top-P algorithm. topPMin is lower-bound. Default is 1.e-6.
@@ -79,7 +86,12 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
 
-        add_special_tokens (bool): Whether to add special tokens to the prompt.
+        ignore_eos (bool, default=False): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated.
+        detokenize (bool, default=True): Whether to detokenize the output.
+        add_special_tokens (bool, default=True): Whether to add special tokens to the prompt.
+        truncate_prompt_tokens (Optional[int], default=None): If set to an integer k, will use only the last k tokens from the prompt (i.e., left truncation).
+        skip_special_tokens (bool, default=True): Whether to skip special tokens in the output.
+        spaces_between_special_tokens (bool, default=True): Whether to add spaces between special tokens in the output.
     """
     # [TO DEVELOPER] This class provides an interface to LLMAPI users.
     # Internally, it manages and dispatches fields to Python bindings of C++ objects, currently including:
@@ -112,8 +124,13 @@ class SamplingParams:
         tllme.ExternalDraftTokensConfig] = None
     logits_post_processor_name: Optional[str] = None
 
-    # Keep the below fields in sync with tllme.SamplingConfig
+    n: int = 1
+    best_of: Optional[int] = None
+    use_beam_search: bool = False
+
+    # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
     beam_width: int = 1
+    num_return_sequences: Optional[int] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
     top_p_min: Optional[float] = None
@@ -140,11 +157,90 @@ class SamplingParams:
     return_encoder_output: bool = False
 
     # Tokenizer-related configs
+    ignore_eos: bool = False
+    detokenize: bool = True
     add_special_tokens: bool = True
+    truncate_prompt_tokens: Optional[int] = None
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
 
     def __post_init__(self):
         if self.pad_id is None:
             self.pad_id = self.end_id
+
+        # Handle the compatibility between OpenAI and HF style-parameters.
+        hf_style = self.beam_width > 1 or self.num_return_sequences
+        openai_style = self.n > 1 or self.best_of or self.use_beam_search
+
+        if hf_style and openai_style:
+            ambiguous_params = {
+                'beam_width': self.beam_width,
+                'num_return_sequences': self.num_return_sequences,
+                'n': self.n,
+                'best_of': self.best_of,
+                'use_beam_search': self.use_beam_search,
+            }
+            raise ValueError(
+                'Got ambiguous parameters. Please specify either Hugging Face '
+                'style parameters (beam_width or num_return_sequences) or '
+                'OpenAI style parameters (n, best_of, or use_beam_search), '
+                f'but not both: {ambiguous_params}. It is recommended to use '
+                'OpenAI style parameters (n, best_of, use_beam_search).')
+
+        if hf_style:
+            logger.warning(
+                "Please use 'n' and 'best_of' for the LLM API. The use of "
+                "'beam_width' and 'num_return_sequences' will be deprecated "
+                "in a future release.")
+            self.n = self.beam_width
+            self.best_of = self.num_return_sequences
+            self.use_beam_search = self.beam_width > 1
+
+        self.best_of = self.best_of or self.n
+
+        if (not self.use_beam_search and self.n < self.best_of
+                and not self.return_log_probs):
+            logger.info(
+                f"Enable 'return_log_probs' to trim the {self.n}-best among "
+                f"{self.best_of} outputs under sampling decoding.")
+            self.return_log_probs = True
+
+        self._validate()
+
+    def _validate(self):
+        ''' Verify the sampling parameters.
+
+        This function verifies the sampling parameters in the LLM API, which
+        may have stricter requirements than the Executor class of C++ runtime.
+        For instance, while the greedy decoding with n > 1 is capable in the
+        Executor class of C++ runtime, the LLM API disallows such combination.
+        '''
+        if self.best_of is not None:
+            if self.best_of > 1 and self.best_of < self.n:
+                raise ValueError(
+                    f'In beam search, beam_width ({self.beam_width}) must be '
+                    f'greater than or equal to num_return_sequences '
+                    f'({self.num_return_sequences}).')
+
+            if (self.best_of > 1 and self.greedy_decoding and
+                    not os.environ.get('TLLM_ALLOW_N_GREEDY_DECODING', None)):
+                raise ValueError(
+                    f'Greedy decoding in the LLM API does not allow multiple '
+                    f'returns. Please set to best_of=1, got best_of={self.best_of}. '
+                    f'Please set to best_of=1 or set an environment variable '
+                    f'TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 '
+                    f'under the greedy decoding.')
+
+        if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
+            raise ValueError(
+                f"truncate_prompt_tokens must be >= 1, got {self.truncate_prompt_tokens}"
+            )
+
+    @property
+    def greedy_decoding(self) -> bool:
+        return (not self.use_beam_search
+                and (self.top_k is None or self.top_k == 1)
+                and (self.top_p is None or self.top_p == 0.0))
 
     def setup(self,
               tokenizer,
@@ -218,24 +314,53 @@ class SamplingParams:
         return list(zip(stop_reasons, stop_words))
 
     def _get_sampling_config(self) -> tllme.SamplingConfig:
-        expected_fields = [
+        expected_fields = {
             "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
             "top_p_decay", "seed", "random_seed", "temperature", "min_tokens",
             "min_length", "beam_search_diversity_rate", "repetition_penalty",
             "presence_penalty", "frequency_penalty", "length_penalty",
-            "early_stopping", "no_repeat_ngram_size"
-        ]
-        found_fields = [
-            f for f in dir(tllme.SamplingConfig) if not f.startswith('__')
-        ]
-        if set(found_fields) != set(expected_fields):
+            "early_stopping", "no_repeat_ngram_size", "num_return_sequences"
+        }
+        found_fields = {
+            f
+            for f in dir(tllme.SamplingConfig) if not f.startswith('__')
+        }
+
+        if found_fields != expected_fields:
             raise RuntimeError(
                 "Found fields in `tllme.SamplingConfig` different than expected; "
                 f"if `tllme.SamplingConfig` is changed, please update {self.__class__.__name__} accordingly. "
                 "See [TO DEVELOPER] comments for detailed instructions.")
-        return tllme.SamplingConfig(
-            **{f: getattr(self, f)
-               for f in expected_fields})
+
+        # A map from the SamplingConfig fields of the LLM API to their
+        # corresponding field names of the Executor of TRT-LLM C++ runtime.
+        # In sampling, there is no parameter that directly matches 'best_of',
+        # so outputs must be trimmed during postprocessing.
+        #               |     LLM API     |    TRT-LLM Executor    |
+        # --------------|-----------------|------------------------|
+        # | Beam search | use_beam_search | beam_width > 1         |
+        # | Beam search | n               | num_return_sequences   |
+        # | Beam search | best_of         | beam_width             |
+        # |-------------|-----------------|------------------------|
+        # | Sampling    | use_beam_search | beam_width == 1        |
+        # | Sampling    | n               | num_return_sequences   |
+        # | Sampling    | best_of         | no corresponding param |
+        unmatched_params = [
+            'num_return_sequences', 'beam_width', 'n', 'best_of',
+            'use_beam_search'
+        ]
+        llmapi_to_rt_param_map = {
+            f: getattr(self, f)
+            for f in expected_fields if f not in unmatched_params
+        }
+        if self.use_beam_search:
+            llmapi_to_rt_param_map['num_return_sequences'] = self.n
+            llmapi_to_rt_param_map['beam_width'] = self.best_of
+        else:
+            llmapi_to_rt_param_map['num_return_sequences'] = self.best_of
+            llmapi_to_rt_param_map['beam_width'] = 1
+
+        return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
         expected_fields = [
@@ -257,7 +382,7 @@ class SamplingParams:
 
 
 def print_colored(message,
-                  color: str = None,
+                  color: Optional[str] = None,
                   writer: io.TextIOWrapper = sys.stderr):
     colors = dict(
         grey="\x1b[38;20m",

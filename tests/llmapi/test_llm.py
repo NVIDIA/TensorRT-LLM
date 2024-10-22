@@ -1,12 +1,14 @@
 import asyncio
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
 import time
 from typing import List, Optional, Union
 
+import datasets
 import pytest
 import torch
 import transformers
@@ -118,6 +120,8 @@ llama_model_path = get_model_path(default_model_name)
 llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
 
 cnn_dailymail_path = str(llm_models_root() / "datasets" / "cnn_dailymail")
+alpaca_chinese_path = str(llm_models_root() / "datasets" / "silk-road" /
+                          "alpaca-data-gpt4-chinese")
 
 prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
@@ -258,6 +262,64 @@ def test_llm_without_tokenizer():
         assert not output.outputs[0].text, \
             "The output should be empty since the tokenizer is missing"
         print(output)
+
+
+@pytest.mark.parametrize(
+    'tokenizer_dir, threshold',
+    [
+        (get_model_path('gpt2'), 0.95),  # BPE
+        (get_model_path('bert/bert-base-uncased'), 0.95),  # WordPiece
+        (get_model_path('t5-small'), 0.95),  # SentencePiece
+        (get_model_path('opt-125m'), 0.95),
+        (get_model_path('starcoder2-3b'), 0.95),
+        (get_model_path('gpt-j-6b'), 0.95),
+        (get_model_path('bloom-560m'), 0.95),
+        (get_model_path('mpt-7b'), 0.95),
+        (get_model_path('falcon-7b-instruct'), 0.95),
+        (get_model_path('llama-models-v2/llama-v2-7b-hf'), 0.95),
+        (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), 0.95),
+        (llama_model_path, 0.95),
+        (get_model_path(mixtral_model_name), 0.95)
+    ])
+def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
+    random.seed(42)
+
+    num_samples = 100
+    cnn_dailymail = datasets.load_dataset(cnn_dailymail_path,
+                                          name='3.0.0',
+                                          split='train')
+    alpaca_chinese = datasets.load_dataset(alpaca_chinese_path, split='train')
+    dataset = cnn_dailymail['article'][:num_samples // 2] + alpaca_chinese[
+        'output_zh'][:num_samples // 2]
+
+    tokenizer = TransformersTokenizer.from_pretrained(tokenizer_dir,
+                                                      legacy=False,
+                                                      padding_side='left',
+                                                      truncation_side='left',
+                                                      trust_remote_code=True,
+                                                      use_fast=True)
+
+    num_perfect = 0
+    for text in dataset:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        seq_len = len(token_ids)
+        prompt_len = random.randint(1, seq_len // 2)
+        decoded_text, states = tokenizer.decode_incrementally(
+            token_ids[:prompt_len])
+        for i in range(prompt_len, len(token_ids)):
+            decoded_text, states = tokenizer.decode_incrementally(
+                [token_ids[i]], decoded_text, states)
+
+        if tokenizer_dir.endswith('bert-base-uncased'):
+            decoded_text = tokenizer.clean_up_tokenization(decoded_text)
+        reference = tokenizer.decode(token_ids)
+        if decoded_text == reference:
+            num_perfect += 1
+        else:
+            # For non-perfect matching cases, decoded_text should also be very similar to the reference
+            assert similar(decoded_text, reference, 0.99)
+    print(f"Perfect matching ratio: {num_perfect / num_samples * 100}%")
+    assert num_perfect / num_samples >= threshold
 
 
 # TODO[chunweiy]: Move mixtral test to the e2e test
@@ -428,6 +490,11 @@ def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
                        min_tokens=5),
         # early stopping
         SamplingParams(max_tokens=6, early_stopping=5),
+        # n-returns
+        SamplingParams(max_tokens=6, n=2, top_k=2),
+        SamplingParams(max_tokens=6, n=2, top_k=2, best_of=3),
+        SamplingParams(max_tokens=6, n=3, use_beam_search=True),
+        SamplingParams(max_tokens=6, n=2, best_of=3, use_beam_search=True),
     ])
 def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
                                       sampling_params: SamplingParams):
@@ -435,6 +502,7 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
+        assert len(output.outputs) == sampling_params.n
 
 
 @force_ampere
@@ -456,6 +524,8 @@ def test_generate_with_streaming_llm():
     # TODO[chunweiy]: Test with larger size when the underlying support is ready
     build_config = BuildConfig()
     build_config.plugin_config.streamingllm = True
+    build_config.max_batch_size = 8
+    build_config.max_seq_len = 512
     kv_cache_config = KvCacheConfig(max_attention_window=[64],
                                     sink_token_length=4)
 
@@ -604,6 +674,69 @@ def test_generate_with_bad_words():
                      prompts, ["D E F G H I K L M N O P Q R S"],
                      sampling_params=SamplingParams(max_tokens=15,
                                                     bad=["F E", "I J"]))
+
+
+@force_ampere
+def test_generate_with_sampling_params_misc():
+    llm = LLM(
+        model=llama_model_path,
+        tokenizer_mode='slow',
+        kv_cache_config=global_kvcache_config,
+    )
+
+    fake_end_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
+
+    llm_check_output(llm,
+                     prompts, ["D E F G H I J K L M"],
+                     sampling_params=SamplingParams(max_tokens=15,
+                                                    end_id=fake_end_id))
+
+    llm_check_output(llm,
+                     prompts, ["D E F G H I K L M N O P Q R S"],
+                     sampling_params=SamplingParams(max_tokens=15,
+                                                    end_id=fake_end_id,
+                                                    ignore_eos=True))
+
+    llm_check_output(llm,
+                     prompts, [""],
+                     sampling_params=SamplingParams(max_tokens=15,
+                                                    end_id=fake_end_id,
+                                                    detokenize=False))
+
+    outputs = llm.generate(prompts)
+    assert outputs[0].prompt_token_ids == [1, 319, 350, 315]
+
+    outputs = llm.generate(prompts, SamplingParams(add_special_tokens=False))
+    assert outputs[0].prompt_token_ids == [319, 350, 315]
+
+    outputs = llm.generate(prompts, SamplingParams(truncate_prompt_tokens=2))
+    assert outputs[0].prompt_token_ids == [1, 315]
+
+    # Use embedding bias to force the output tokens to be special tokens
+    unk_id = llm.tokenizer.encode('<unk>', add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[unk_id] = torch.finfo(torch.float32).max
+
+    outputs = llm.generate(
+        prompts, SamplingParams(max_tokens=5, embedding_bias=embedding_bias))
+    assert outputs[0].outputs[0].text == ""
+
+    outputs = llm.generate(
+        prompts,
+        SamplingParams(max_tokens=5,
+                       embedding_bias=embedding_bias,
+                       skip_special_tokens=False,
+                       spaces_between_special_tokens=False))
+    assert outputs[0].outputs[0].text == "<unk><unk><unk><unk><unk>"
+
+    outputs = llm.generate(
+        prompts,
+        SamplingParams(max_tokens=5,
+                       embedding_bias=embedding_bias,
+                       skip_special_tokens=False,
+                       spaces_between_special_tokens=True))
+    assert outputs[0].outputs[0].text == "<unk> <unk> <unk> <unk> <unk>"
 
 
 @force_ampere

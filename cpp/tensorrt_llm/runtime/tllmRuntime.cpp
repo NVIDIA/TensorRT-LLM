@@ -180,6 +180,13 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
     }
     auto& context = *mContexts.back();
     context.setDeviceMemoryV2(mEngineBuffer->data(), static_cast<int64_t>(mEngineBuffer->getCapacity()));
+
+    if (tensorrt_llm::common::Logger::getLogger()->isEnabled(tensorrt_llm::common::Logger::TRACE)
+        && mContexts.size() == 1)
+    {
+        printEngineInfo();
+    }
+
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
     // If nvtx verbosity is DETAILED, print an info about potential perf overhead.
     if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
@@ -188,6 +195,158 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
             "The engine was built with kDETAILED profiling verbosity, which may result in small overheads at runtime.");
     }
     return context;
+}
+
+void TllmRuntime::printEngineInfo()
+{
+    auto& context = *(mContexts[0]);
+    int const nIO = mEngine->getNbIOTensors();            // Count of Input / Output tensor
+    int const nOP = mEngine->getNbOptimizationProfiles(); // Count of Optimization Profile
+    std::size_t mwn = 0;                                  // Maximum Width of tensor Name
+    std::size_t mws = 0;                                  // Maximum Width of tensor Shape
+
+    // Get information of engine input / output
+    std::vector<std::string> tensorNameList{};
+    for (int i = 0; i < nIO; ++i)
+    {
+        tensorNameList.push_back(std::string(mEngine->getIOTensorName(i)));
+    }
+    std::vector<std::map<std::string, std::string>> tiv(nIO);          // Tensor Information Vector
+    std::vector<std::vector<std::vector<nvinfer1::Dims64>>> topv(nIO); // Tensor Optimization Profile Vector
+    for (int i = 0; i < nIO; ++i)
+    {
+        std::string name{tensorNameList[i]};
+        char const* nameC{name.c_str()}; // name of C-style
+        mwn = std::max(mwn, name.size());
+        tiv[i]["mode"] = mEngine->getTensorIOMode(nameC) == nvinfer1::TensorIOMode::kINPUT ? "I" : "O";
+        tiv[i]["location"] = mEngine->getTensorLocation(nameC) == nvinfer1::TensorLocation::kDEVICE ? "GPU" : "CPU";
+        tiv[i]["data_type"] = dataTypeToString(mEngine->getTensorDataType(nameC));
+        tiv[i]["build_shape"] = shapeToString(mEngine->getTensorShape(nameC));
+        mws = std::max(mws, tiv[i]["build_shape"].size());
+        if (tiv[i]["mode"] == "I")
+        {
+            std::vector<std::vector<nvinfer1::Dims64>> topPerTensor(nOP);
+            for (int k = 0; k < nOP; ++k)
+            {
+                if (tiv[i]["location"] == std::string("GPU"))
+                {
+                    std::vector<nvinfer1::Dims64> top(3);
+                    top[0] = mEngine->getProfileShape(nameC, k, nvinfer1::OptProfileSelector::kMIN);
+                    top[1] = mEngine->getProfileShape(nameC, k, nvinfer1::OptProfileSelector::kOPT);
+                    top[2] = mEngine->getProfileShape(nameC, k, nvinfer1::OptProfileSelector::kMAX);
+                    topPerTensor[k] = top;
+                    mws = std::max(mws, shapeToString(top[2]).size());
+                }
+                else
+                {
+                    // Shape input tensor, not used in TRT-LLM support yet
+                    std::vector<nvinfer1::Dims64> top(3);
+                    int const nDim = mEngine->getTensorShape(nameC).nbDims;
+                    nvinfer1::Dims64 tensorShape{nDim, {-1}};
+                    int const* pos = nullptr;
+                    pos = mEngine->getProfileTensorValues(nameC, k, nvinfer1::OptProfileSelector::kMIN);
+                    std::copy(pos, pos + nDim, tensorShape.d);
+                    top[0] = tensorShape;
+                    pos = mEngine->getProfileTensorValues(nameC, k, nvinfer1::OptProfileSelector::kOPT);
+                    std::copy(pos, pos + nDim, tensorShape.d);
+                    top[1] = tensorShape;
+                    pos = mEngine->getProfileTensorValues(nameC, k, nvinfer1::OptProfileSelector::kMAX);
+                    std::copy(pos, pos + nDim, tensorShape.d);
+                    top[2] = tensorShape;
+                    topPerTensor[k] = top;
+                }
+            }
+            topv[i] = topPerTensor;
+        }
+        else
+        {
+            topv[i] = std::vector<std::vector<nvinfer1::Dims64>>(nOP);
+        }
+    }
+    // Set input shape to get output shape
+    for (int k = 0; k < nOP; ++k)
+    {
+        for (int j = 0; j < 3; ++j) // Min, Opt, Max
+        {
+            for (int i = 0; i < nIO; ++i)
+            {
+                std::string name = tensorNameList[i];
+                char const* nameC = name.c_str();
+                if (tiv[i]["mode"] == "I")
+                {
+                    if (tiv[i]["location"] == std::string("GPU"))
+                    {
+                        context.setInputShape(nameC, topv[i][k][j]);
+                    }
+                    else
+                    {
+                        // Shape input tensor, not used in TRT-LLM support yet
+                        context.setInputTensorAddress(nameC, topv[i][k][j].d);
+                    }
+                }
+                else
+                {
+                    TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
+                    TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
+                    if (tiv[i]["location"] == std::string("GPU"))
+                    {
+                        topv[i][k].push_back(context.getTensorShape(nameC));
+                    }
+                    else
+                    {
+                        // Shape input tensor, not used in TRT-LLM support yet
+                        int const nDim = mEngine->getTensorShape(nameC).nbDims;
+                        nvinfer1::Dims64 tensorShape{nDim, {}};
+                        int const* pos = reinterpret_cast<int const*>(context.getTensorAddress(nameC));
+                        std::copy(pos, pos + nDim, tensorShape.d);
+                        topv[i][k].push_back(tensorShape);
+                    }
+                }
+            }
+        }
+    }
+
+    // Print information of engine input / output
+    std::string info;
+    TLLM_LOG_TRACE("Information of engine input / output.");
+    TLLM_LOG_TRACE(std::string(mwn + mws + 24, '='));
+    info = alignText("Name", mwn) + "|I/O|Location|DataType|" + alignText("Shape", mws) + "|";
+    TLLM_LOG_TRACE(info.c_str());
+    TLLM_LOG_TRACE(std::string(mwn + mws + 24, '-'));
+    for (int i = 0; i < nIO; ++i)
+    {
+        info = alignText(tensorNameList[i], mwn, false) + "|";
+        info += alignText(tiv[i]["mode"], 3) + "|";
+        info += alignText(tiv[i]["location"], 8) + "|";
+        info += alignText(tiv[i]["data_type"], 8) + "|";
+        info += alignText(tiv[i]["build_shape"], mws) + "|";
+        TLLM_LOG_TRACE(info.c_str());
+    }
+    TLLM_LOG_TRACE(std::string(mwn + mws + 24, '='));
+    // Print information of optimization profile
+    TLLM_LOG_TRACE("Information of optimization profile.");
+    for (int k = 0; k < nOP; ++k)
+    {
+        TLLM_LOG_TRACE("Optimization Profile %d:", k);
+        TLLM_LOG_TRACE(std::string(mwn + mws * 3 + 4, '='));
+        info = alignText("Name", mwn) + "|";
+        info += alignText("Min", mws) + "|";
+        info += alignText("Opt", mws) + "|";
+        info += alignText("Max", mws) + "|";
+        TLLM_LOG_TRACE(info.c_str());
+        TLLM_LOG_TRACE(std::string(mwn + mws * 3 + 4, '-'));
+        for (int i = 0; i < nIO; ++i)
+        {
+            auto const& top = topv[i][k];
+            info = alignText(tensorNameList[i], mwn, false) + "|";
+            info += alignText(shapeToString(top[0]), mws) + "|";
+            info += alignText(shapeToString(top[1]), mws) + "|";
+            info += alignText(shapeToString(top[2]), mws) + "|";
+            TLLM_LOG_TRACE(info.c_str());
+        }
+        TLLM_LOG_TRACE(std::string(mwn + mws * 3 + 4, '='));
+    }
+    return;
 }
 
 void TllmRuntime::clearContexts()

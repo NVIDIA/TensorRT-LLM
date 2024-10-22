@@ -42,6 +42,7 @@ from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
+from .mllama.model import MLLaMAModel
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
@@ -113,6 +114,7 @@ __all__ = [
     'EagleForCausalLM',
     'SpeculativeDecodingMode',
     'CohereForCausalLM',
+    'MLLaMAModel',
 ]
 
 MODEL_MAP = {
@@ -159,6 +161,7 @@ MODEL_MAP = {
     'QWenForCausalLM': QWenForCausalLM,
     'Qwen2ForCausalLM': QWenForCausalLM,
     'Qwen2MoeForCausalLM': QWenForCausalLM,
+    'Qwen2ForSequenceClassification': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
@@ -170,4 +173,5 @@ MODEL_MAP = {
     'DeciLMForCausalLM': DeciLMForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
+    'MllamaForConditionalGeneration': MLLaMAModel,
 }

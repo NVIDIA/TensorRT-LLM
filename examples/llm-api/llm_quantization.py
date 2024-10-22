@@ -4,29 +4,37 @@ import logging
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import QuantAlgo, QuantConfig
+from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 
 major, minor = torch.cuda.get_device_capability()
 post_ada = major > 8 or (major == 8 and minor >= 9)
 
-quant_configs = [
-    QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ),
-]
+quant_and_calib_configs = []
+
+# Example 1: Specify int4 AWQ quantization to QuantConfig.
+# We can skip specifying CalibConfig or leave a None as the default value.
+quant_and_calib_configs.append(
+    (QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ), None))
 
 if post_ada:
-    quant_configs.append(
-        QuantConfig(quant_algo=QuantAlgo.FP8,
-                    kv_cache_quant_algo=QuantAlgo.FP8))
+    # Example 2: Specify FP8 quantization to QuantConfig.
+    # We can create a CalibConfig to specify the calibration dataset and other details.
+    # Note that the calibration dataset could be either HF dataset name or a path to local HF dataset.
+    quant_and_calib_configs.append(
+        (QuantConfig(quant_algo=QuantAlgo.FP8,
+                     kv_cache_quant_algo=QuantAlgo.FP8),
+         CalibConfig(calib_dataset='cnn_dailymail',
+                     calib_batches=256,
+                     calib_max_seq_length=256)))
 else:
     logging.error(
         "FP8 quantization only works on post-ada GPUs, skipped in the example.")
 
-for quant_config in quant_configs:
-
-    llm = LLM(
-        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        # define the quantization config to trigger built-in end-to-end quantization.
-        quant_config=quant_config)
+for quant_config, calib_config in quant_and_calib_configs:
+    # The built-in end-to-end quantization is triggered according to the passed quant_config.
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+              quant_config=quant_config,
+              calib_config=calib_config)
 
     # Sample prompts.
     prompts = [

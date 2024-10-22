@@ -28,7 +28,7 @@ namespace tensorrt_llm::plugins
 class EagleDecodeDraftTokensPlugin : public BasePlugin
 {
 public:
-    EagleDecodeDraftTokensPlugin(nvinfer1::DataType type, int32_t layerIdx);
+    EagleDecodeDraftTokensPlugin(nvinfer1::DataType type, int32_t layerIdx, bool topKSampling);
 
     EagleDecodeDraftTokensPlugin(void const* data, size_t length);
 
@@ -62,8 +62,56 @@ public:
     void destroy() noexcept override;
 
 private:
-    nvinfer1::DataType mDtype;
-    int32_t mLayerIdx;
+    enum class InputIdxEntry : int32_t
+    {
+        // [num_input_logits, vocab_size_padded]
+        LOGITS = 0,
+        // [num_input_logits]
+        RAND_SAMPLE,
+        // [batch_size, max_decoding_tokens, max_path_len]
+        PATHS,
+
+        // [batch_size, max_decoding_draft_tokens]
+        INPUT_DRAFT_TOKEN_IDS,
+        // [batch_size]
+        INPUT_DRAFT_LENS
+    };
+
+    enum class OutputIdxEntry : int32_t
+    {
+        // [batch_size, max_decoding_draft_tokens]
+        OUTPUT_DRAFT_TOKEN_IDS = 0,
+        // [batch_size]
+        OUTPUT_DRAFT_LENS
+    };
+
+    int32_t getIdx(InputIdxEntry idx) const
+    {
+        return static_cast<int32_t>(idx);
+    }
+
+    int32_t getIdx(OutputIdxEntry idx) const
+    {
+        return static_cast<int32_t>(idx);
+    }
+
+private:
+    template <typename T>
+    size_t getWorkspaceSizeType(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
+        nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept;
+
+    template <typename T>
+    void enqueueType(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
+
+    template <typename T>
+    void doTopKSampling(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
+
+private:
+    nvinfer1::DataType mDtype; // Logit datatype
+    int32_t mLayerIdx{-1};     // Index of eagle layer
+    bool mTopKSampling;        // Use TopK sampling or multinomial sampling
 };
 
 class EagleDecodeDraftTokensPluginCreator : public BaseCreator

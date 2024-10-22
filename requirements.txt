@@ -8,6 +8,7 @@ lark
 mpi4py
 numpy<2
 onnx>=1.12.0
+onnx_graphsurgeon>=0.5.2
 openai==1.39.0
 polygraphy
 psutil

@@ -41,7 +41,7 @@ struct RuntimeOptions
     bool excludeInputFromOutput;
     tle::SizeType32 maxNewTokens;
     tle::SizeType32 beamWidth;
-    tle::SizeType32 numReturnSequences;
+    std::optional<tle::SizeType32> numReturnSequences;
     tle::SizeType32 timeoutMs;
 
     bool useOrchestratorMode;
@@ -55,7 +55,7 @@ RuntimeOptions parseArgs(int argc, char* argv[]);
 std::vector<tle::IdType> enqueueRequests(RuntimeOptions const& runtimeOpts, tle::Executor& executor);
 
 // Function that waits for responses and stores output tokens
-std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> waitForResponses(
+std::unordered_map<tle::IdType, tle::BeamTokens> waitForResponses(
     RuntimeOptions const& runtimeOpts, std::vector<tle::IdType> const& requestIds, tle::Executor& executor);
 
 // Utility function to read input tokens from csv file
@@ -63,7 +63,9 @@ std::vector<tle::VecTokens> readInputTokens(std::string const& path);
 
 // Utility function to write output tokens from csv file
 void writeOutputTokens(std::string const& path, std::vector<tle::IdType>& requestIds,
-    std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> const& outputTokens, tle::SizeType32 beamWidth);
+    std::unordered_map<tle::IdType, tle::BeamTokens> const& outputTokens, tle::SizeType32 beamWidth);
+
+tle::SizeType32 getNumSequencesPerRequest(RuntimeOptions const& runtimeOpts);
 
 // Main
 int main(int argc, char* argv[])
@@ -96,7 +98,8 @@ int main(int argc, char* argv[])
 
         // Write output tokens csv file
         TLLM_LOG_INFO("Writing output tokens to %s", runtimeOpts.outputTokensCsvFile.c_str());
-        writeOutputTokens(runtimeOpts.outputTokensCsvFile, requestIds, outputTokens, runtimeOpts.beamWidth);
+        auto numSequences = getNumSequencesPerRequest(runtimeOpts);
+        writeOutputTokens(runtimeOpts.outputTokensCsvFile, requestIds, outputTokens, numSequences);
     }
     TLLM_LOG_INFO("Exiting.");
     return 0;
@@ -110,8 +113,8 @@ RuntimeOptions parseArgs(int argc, char* argv[])
     options.add_options()("h,help", "Print usage");
     options.add_options()("engine_dir", "Directory that store the engines.", cxxopts::value<std::string>());
     options.add_options()("beam_width", "The beam width", cxxopts::value<int>()->default_value("1"));
-    options.add_options()("num_return_sequences", "The number of return sequences per request.",
-        cxxopts::value<int>()->default_value("1"));
+    options.add_options()(
+        "num_return_sequences", "The number of return sequences per request.", cxxopts::value<std::optional<int>>());
     options.add_options()("streaming", "Operate in streaming mode", cxxopts::value<bool>()->default_value("false"));
     options.add_options()("exclude_input_from_output",
         "Exclude input tokens when writing output tokens. Only has effect for streaming = false. For streaming = true, "
@@ -165,7 +168,10 @@ RuntimeOptions parseArgs(int argc, char* argv[])
     runtimeOpts.excludeInputFromOutput = parsedOptions["exclude_input_from_output"].as<bool>();
     runtimeOpts.maxNewTokens = parsedOptions["max_new_tokens"].as<int>();
     runtimeOpts.beamWidth = parsedOptions["beam_width"].as<int>();
-    runtimeOpts.numReturnSequences = parsedOptions["num_return_sequences"].as<int>();
+    if (parsedOptions.count("num_return_sequences") > 0)
+    {
+        runtimeOpts.numReturnSequences = parsedOptions["num_return_sequences"].as<std::optional<int>>();
+    }
     runtimeOpts.timeoutMs = parsedOptions["timeout_ms"].as<int>();
     runtimeOpts.outputTokensCsvFile = parsedOptions["output_tokens_csv_file"].as<std::string>();
 
@@ -180,10 +186,11 @@ std::vector<tle::IdType> enqueueRequests(RuntimeOptions const& runtimeOpts, tle:
     tle::OutputConfig outputConfig;
     outputConfig.excludeInputFromOutput = runtimeOpts.excludeInputFromOutput;
     tle::SamplingConfig samplingConfig(runtimeOpts.beamWidth);
-    if (runtimeOpts.numReturnSequences > 1 && runtimeOpts.beamWidth == 1)
+    if (runtimeOpts.numReturnSequences && runtimeOpts.beamWidth == 1)
     {
         samplingConfig.setTopP(0.9);
     }
+    samplingConfig.setNumReturnSequences(runtimeOpts.numReturnSequences);
 
     TLLM_LOG_INFO("Reading input tokens from %s", runtimeOpts.inputTokensCsvFile.c_str());
     auto inputTokens = readInputTokens(runtimeOpts.inputTokensCsvFile);
@@ -193,10 +200,8 @@ std::vector<tle::IdType> enqueueRequests(RuntimeOptions const& runtimeOpts, tle:
     for (auto& tokens : inputTokens)
     {
         TLLM_LOG_INFO("Creating request with %d input tokens", tokens.size());
-        tle::Request request(
+        requests.emplace_back(
             std::move(tokens), runtimeOpts.maxNewTokens, runtimeOpts.streaming, samplingConfig, outputConfig);
-        request.setNumReturnSequences(runtimeOpts.numReturnSequences);
-        requests.emplace_back(std::move(request));
     }
 
     // Enqueue the requests
@@ -205,20 +210,15 @@ std::vector<tle::IdType> enqueueRequests(RuntimeOptions const& runtimeOpts, tle:
     return requestIds;
 }
 
-std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> waitForResponses(
+std::unordered_map<tle::IdType, tle::BeamTokens> waitForResponses(
     RuntimeOptions const& runtimeOpts, std::vector<tle::IdType> const& requestIds, tle::Executor& executor)
 {
     // Map that will be used to store output tokens for requests
-    std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> outputTokens;
+    std::unordered_map<tle::IdType, tle::BeamTokens> outputTokens;
+    auto numSequences = getNumSequencesPerRequest(runtimeOpts);
     for (auto requestId : requestIds)
     {
-        std::vector<tle::BeamTokens> tokens;
-        tokens.reserve(runtimeOpts.numReturnSequences);
-        for (tle::SizeType32 seqIdx = 0; seqIdx < runtimeOpts.numReturnSequences; ++seqIdx)
-        {
-            tokens.emplace_back(runtimeOpts.beamWidth);
-        }
-        outputTokens[requestId] = std::move(tokens);
+        outputTokens[requestId] = tle::BeamTokens(numSequences);
     }
 
     tle::SizeType32 numFinished{0};
@@ -230,6 +230,18 @@ std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> waitForResponses(
         std::chrono::milliseconds waitTime(1);
         // Wait for any response
         auto responses = executor.awaitResponses(waitTime);
+
+        auto insertResponseTokens
+            = [&outputTokens](tle::IdType requestId, tle::SizeType32 seqIdx, tle::VecTokens const& respTokens)
+        {
+            TLLM_LOG_INFO("Got %d tokens for seqIdx %d for requestId %d", respTokens.size(), seqIdx, requestId);
+
+            // Store the output tokens for that request id
+            auto& outTokens = outputTokens.at(requestId).at(seqIdx);
+            outTokens.insert(outTokens.end(), std::make_move_iterator(respTokens.begin()),
+                std::make_move_iterator(respTokens.end()));
+        };
+
         // Loop over the responses
         for (auto const& response : responses)
         {
@@ -237,20 +249,17 @@ std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> waitForResponses(
             if (!response.hasError())
             {
                 auto result = response.getResult();
-                auto seqIdx = result.sequenceIndex;
                 numFinished += result.isFinal;
-
-                for (tle::SizeType32 beam = 0; beam < runtimeOpts.beamWidth; ++beam)
+                if (runtimeOpts.beamWidth > 1)
                 {
-                    auto& respTokens = result.outputTokenIds.at(beam);
-
-                    TLLM_LOG_INFO("Got %d tokens for seqIdx %d beam %d for requestId %d", respTokens.size(), seqIdx,
-                        beam, requestId);
-
-                    // Store the output tokens for that request id
-                    auto& outTokens = outputTokens.at(requestId).at(seqIdx).at(beam);
-                    outTokens.insert(outTokens.end(), std::make_move_iterator(respTokens.begin()),
-                        std::make_move_iterator(respTokens.end()));
+                    for (tle::SizeType32 beam = 0; beam < numSequences; ++beam)
+                    {
+                        insertResponseTokens(requestId, beam, result.outputTokenIds.at(beam));
+                    }
+                }
+                else
+                {
+                    insertResponseTokens(requestId, result.sequenceIndex, result.outputTokenIds.at(0));
                 }
                 if (result.isFinal)
                 {
@@ -321,7 +330,7 @@ std::vector<tle::VecTokens> readInputTokens(std::string const& path)
 }
 
 void writeOutputTokens(std::string const& path, std::vector<tle::IdType>& requestIds,
-    std::unordered_map<tle::IdType, std::vector<tle::BeamTokens>> const& outputTokens, tle::SizeType32 beamWidth)
+    std::unordered_map<tle::IdType, tle::BeamTokens> const& outputTokens, tle::SizeType32 beamWidth)
 {
     std::ofstream file(path);
 
@@ -333,23 +342,27 @@ void writeOutputTokens(std::string const& path, std::vector<tle::IdType>& reques
 
     for (auto requestId : requestIds)
     {
-        for (auto const& outTokens : outputTokens.at(requestId))
+        auto const& outTokens = outputTokens.at(requestId);
+        for (tle::SizeType32 beam = 0; beam < beamWidth; ++beam)
         {
-            for (tle::SizeType32 beam = 0; beam < beamWidth; ++beam)
+            auto const& beamTokens = outTokens.at(beam);
+            for (size_t i = 0; i < beamTokens.size(); ++i)
             {
-                auto const& beamTokens = outTokens.at(beam);
-                for (size_t i = 0; i < beamTokens.size(); ++i)
+                file << beamTokens[i];
+                if (i < beamTokens.size() - 1)
                 {
-                    file << beamTokens[i];
-                    if (i < beamTokens.size() - 1)
-                    {
-                        file << ", ";
-                    }
+                    file << ", ";
                 }
-                file << "\n";
             }
+            file << "\n";
         }
     }
 
     file.close();
+}
+
+tle::SizeType32 getNumSequencesPerRequest(RuntimeOptions const& runtimeOpts)
+{
+    auto numReturnSequences = runtimeOpts.numReturnSequences.value_or(runtimeOpts.beamWidth);
+    return runtimeOpts.beamWidth > 1 ? std::min(numReturnSequences, runtimeOpts.beamWidth) : numReturnSequences;
 }

@@ -133,11 +133,56 @@ public:
     std::string getLayerProfileInfo() const;
     void reportToProfiler(SizeType32 contextId);
     void loadManagedWeights(RawEngine const& rawEngine, int localRank);
+    void printEngineInfo();
 
 private:
     void cacheTensorNames();
 
     void setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss);
+
+    // Tool functions for `printEngineInfo()`.
+    std::string const shapeToString(nvinfer1::Dims64 const& dim)
+    {
+        std::string output("(");
+        if (dim.nbDims == 0)
+        {
+            return output + ")";
+        }
+        for (int i = 0; i < dim.nbDims - 1; ++i)
+        {
+            output += std::to_string(dim.d[i]) + ", ";
+        }
+        output += std::to_string(dim.d[dim.nbDims - 1]) + ")";
+        return output;
+    }
+
+    std::string const dataTypeToString(nvinfer1::DataType type)
+    {
+        switch (type)
+        {
+        case nvinfer1::DataType::kINT64: return std::string("INT64");
+        case nvinfer1::DataType::kINT32: return std::string("INT32");
+        case nvinfer1::DataType::kFLOAT: return std::string("FP32");
+        case nvinfer1::DataType::kBF16: return std::string("BF16");
+        case nvinfer1::DataType::kHALF: return std::string("FP16");
+        case nvinfer1::DataType::kBOOL: return std::string("BOOL");
+        case nvinfer1::DataType::kUINT8: return std::string("UINT8");
+        case nvinfer1::DataType::kINT8: return std::string("INT8");
+        case nvinfer1::DataType::kFP8: return std::string("FP8");
+        case nvinfer1::DataType::kINT4: return std::string("INT4");
+        default: return std::string("UNKNOWN");
+        }
+        return "";
+    }
+
+    std::string const alignText(
+        std::string const text, int const width, bool const bCenter = true, char const blank = ' ')
+    {
+        int textLen = text.size(), padLeft = 0, padRight = 0;
+        padLeft = bCenter ? (width - textLen) / 2 : 0;
+        padRight = width - padLeft - textLen;
+        return std::string(padLeft, blank) + text + std::string(padRight, blank);
+    }
 
     BufferManager::CudaStreamPtr mStream;
     BufferManager mBufferManager;
@@ -150,8 +195,8 @@ private:
     std::unique_ptr<LayerProfiler> mLayerProfiler;
     bool mUseShapeInference;
     TensorMap mManagedWeightsMap;
-    // List of input tensor names. Names of static tensors are removed from this list when setStaticInputTensors is
-    // called.
+    // List of input tensor names.
+    // Names of static tensors are removed from this list when setStaticInputTensors is called.
     std::vector<std::string> mInputTensorNames;
     std::vector<std::string> mOutputTensorNames;
 };

@@ -41,7 +41,7 @@ from utils.util import (skip_bf16_pre_ampere, skip_fp32_accum_pre_ampere,
                         unittest_name_func)
 
 
-class TestMistral(unittest.TestCase):
+class TestMistralAndArctic(unittest.TestCase):
     EOS_TOKEN = 2
     PAD_TOKEN = 2
 
@@ -49,6 +49,7 @@ class TestMistral(unittest.TestCase):
                                   mistral_config: MistralConfig, batch_size,
                                   beam_width, input_len, output_len, dtype,
                                   rank, tensor_parallel):
+        is_arctic = hf_mistral is None
         list(range(tensor_parallel))
 
         with net_guard(network):
@@ -72,6 +73,7 @@ class TestMistral(unittest.TestCase):
                 'rotary_scaling': getattr(mistral_config, 'rotary_scaling',
                                           None),
                 'norm_epsilon': mistral_config.rms_norm_eps,
+                'residual_mlp': mistral_config.residual_mlp,
                 'mapping': {
                     'world_size': tensor_parallel,
                     'tp_size': tensor_parallel,
@@ -85,12 +87,25 @@ class TestMistral(unittest.TestCase):
                     "normalization_mode": 1,
                 },
             }
+            if is_arctic:
+                config.update({
+                    'mapping': {
+                        'world_size': tensor_parallel,
+                        'tp_size': tensor_parallel,
+                        'moe_tp_size': 1,
+                        'moe_ep_size': tensor_parallel,
+                        'rank': rank,
+                    }
+                })
+                config.update({'use_fused_mlp': False})
 
             # Initialize model
             config = PretrainedConfig.from_dict(config)
             tensorrt_llm_mistral = tensorrt_llm.models.LLaMAForCausalLM(config)
-            weights = load_weights_from_hf_model(hf_mistral, config)
-            tensorrt_llm_mistral.load(weights)
+            if not is_arctic:
+                weights = load_weights_from_hf_model(hf_mistral, config)
+                tensorrt_llm_mistral.load(weights)
+
             # Prepare
             network.set_named_parameters(
                 tensorrt_llm_mistral.named_parameters())
@@ -179,16 +194,15 @@ class TestMistral(unittest.TestCase):
             engine_buffer, mapping)
         return runtime, engine_buffer
 
-    def load_test_cases():
-        test_cases = list(
-            product([False], [False, True],
-                    [ContextFMHAType.disabled, ContextFMHAType.enabled],
-                    [False, True], ['float16', 'bfloat16'], [2, 4]))
-        return test_cases
-
-    @parameterized.expand(load_test_cases, name_func=unittest_name_func)
-    def test_mistral(self, use_refit, fast_building, context_fmha_flag,
-                     enable_remove_input_padding, dtype, num_kv_heads):
+    def _test_moe_base(self,
+                       use_refit,
+                       fast_building,
+                       context_fmha_flag,
+                       enable_remove_input_padding,
+                       dtype,
+                       num_kv_heads,
+                       residual_mlp,
+                       is_arctic=False):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
         skip_fp32_accum_pre_ampere(context_fmha_flag)
@@ -210,7 +224,7 @@ class TestMistral(unittest.TestCase):
         mistral_config.num_hidden_layers = 2
         mistral_config.max_position_embeddings = 64
         mistral_config.vocab_size = 128
-        mistral_config.num_attention_heads = 2 * num_kv_heads
+        mistral_config.num_attention_heads = num_kv_heads if is_arctic else 2 * num_kv_heads
         mistral_config.hidden_size = mistral_config.num_attention_heads * head_size
         mistral_config.intermediate_size = ((
             (mistral_config.hidden_size * 4 * 2 // 3) + head_size - 1) //
@@ -220,9 +234,13 @@ class TestMistral(unittest.TestCase):
                 mistral_config.num_key_value_heads) == 0
         mistral_config.pad_token_id = self.PAD_TOKEN
         mistral_config.eos_token_id = self.EOS_TOKEN
+        mistral_config.residual_mlp = residual_mlp
         seed_idx = random.randint(0, len(PRECHECKED_GOOD_RANDOM_SEEDS) - 1)
         torch.manual_seed(PRECHECKED_GOOD_RANDOM_SEEDS[seed_idx])
-        hf_mistral = MistralForCausalLM(mistral_config).cuda()
+        if is_arctic:
+            hf_mistral = None
+        else:
+            hf_mistral = MistralForCausalLM(mistral_config).cuda()
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, dtype, world_size, rank, mistral_config, hf_mistral,
             model, use_plugin, batch_size, beam_width, input_len, output_len,
@@ -260,10 +278,11 @@ class TestMistral(unittest.TestCase):
         # and it will be added one after each step.
         sequence_length_buffer = ctx_context_lengths.detach().clone()
 
-        with torch.no_grad():
-            hf_outputs = hf_mistral.forward(ctx_ids)
-        torch.cuda.synchronize()
-        ref = hf_outputs.logits[:, -1, :]
+        if hf_mistral:
+            with torch.no_grad():
+                hf_outputs = hf_mistral.forward(ctx_ids)
+            torch.cuda.synchronize()
+            ref = hf_outputs.logits[:, -1, :]
 
         if enable_remove_input_padding:
             ctx_ids = ctx_ids.view([batch_size * input_len])
@@ -333,9 +352,10 @@ class TestMistral(unittest.TestCase):
         torch.cuda.synchronize()
         res = ctx_buffer['logits']
 
-        np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
-                                   res.to(torch.float32).cpu().numpy(),
-                                   atol=0.12)
+        if hf_mistral:
+            np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
+                                       res.to(torch.float32).cpu().numpy(),
+                                       atol=0.12)
 
         # compare generation
         step = 1
@@ -346,13 +366,14 @@ class TestMistral(unittest.TestCase):
         gen_host_request_types = torch.tensor([1] * batch_size,
                                               dtype=torch.int32)
 
-        with torch.no_grad():
-            hf_outputs = hf_mistral.forward(
-                step1_id,
-                past_key_values=hf_outputs.past_key_values,
-                use_cache=True)
-        torch.cuda.synchronize()
-        ref = hf_outputs.logits[:, -1, :]
+        if hf_mistral:
+            with torch.no_grad():
+                hf_outputs = hf_mistral.forward(
+                    step1_id,
+                    past_key_values=hf_outputs.past_key_values,
+                    use_cache=True)
+            torch.cuda.synchronize()
+            ref = hf_outputs.logits[:, -1, :]
 
         if enable_remove_input_padding:
             step1_id = step1_id.view([batch_size])
@@ -404,9 +425,34 @@ class TestMistral(unittest.TestCase):
         torch.cuda.synchronize()
         res = step1_buffer['logits']
 
-        np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
-                                   res.to(torch.float32).cpu().numpy(),
-                                   atol=0.12)
+        if hf_mistral:
+            np.testing.assert_allclose(ref.to(torch.float32).cpu().numpy(),
+                                       res.to(torch.float32).cpu().numpy(),
+                                       atol=0.12)
+
+    def load_test_cases_mistral():
+        test_cases = list(
+            product([False], [False, True],
+                    [ContextFMHAType.disabled, ContextFMHAType.enabled],
+                    [False, True], ['float16', 'bfloat16'], [2, 4], [False]))
+        return test_cases
+
+    @parameterized.expand(load_test_cases_mistral, name_func=unittest_name_func)
+    def test_mistral(self, *args):
+        self._test_moe_base(*args)
+
+    def load_test_cases_arctic():
+        test_cases = []
+        test_cases.append((False, True, ContextFMHAType.disabled, False,
+                           'bfloat16', 56, True))  # arctic MHA
+        return test_cases
+
+    @parameterized.expand(load_test_cases_arctic, name_func=unittest_name_func)
+    def test_arctic(self, *args):
+        # Simplified from Mistral test
+        # - Arctic is not officially supported in HuggingFace yet, so skipping results comparison
+        # - Skip model loader tests
+        self._test_moe_base(*args, is_arctic=True)
 
     def get_loader_test_cases():
         test_cases = []

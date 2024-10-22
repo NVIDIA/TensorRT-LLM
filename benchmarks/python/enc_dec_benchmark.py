@@ -225,7 +225,8 @@ class EncDecBenchmark(BaseBenchmark):
         self.decoder_session.runtime._set_weight_streaming(gpu_weights_percent)
 
     def prepare_inputs(self, config):
-        batch_size, encoder_input_len = config[0], config[1]
+        batch_size, encoder_input_len, output_len = config[0], config[
+            1], config[2]
         attention_mask = None
         whisper_decoder_encoder_input_lengths = None
         outputs = {}
@@ -271,7 +272,8 @@ class EncDecBenchmark(BaseBenchmark):
                                                  dtype=torch.int32,
                                                  device='cuda')
             cross_attention_mask = torch.ones([
-                outputs['encoder_output'].shape[0], 1,
+                outputs['encoder_output'].shape[0],
+                decoder_input_lengths.max() + output_len,
                 outputs['encoder_output'].shape[1]
             ]).int().cuda()
         else:
@@ -297,8 +299,11 @@ class EncDecBenchmark(BaseBenchmark):
                 (batch_size, encoder_input_len)).int().cuda()
             # cross attention mask, always set 1 as if all are valid tokens
             # [batch_size, query_len, encoder_input_len] currently, use query_len=1
-            cross_attention_mask = torch.ones(
-                (batch_size, 1, encoder_input_len)).int().cuda()
+            cross_attention_mask = [
+                torch.ones(decoder_input_lengths.max() + output_len,
+                           encoder_input_len).int().cuda()
+                for _ in range(batch_size)
+            ]
 
             hidden_size = (self.encoder_model_config.hidden_size *
                            self.world_size)  # tp_size
@@ -395,8 +400,6 @@ class EncDecBenchmark(BaseBenchmark):
             max_attention_window_size=None,
             encoder_max_input_length=encoder_max_input_length,
         )
-
-        cross_attention_mask = None if self.decoder_model_config.gpt_attention_plugin else cross_attention_mask
 
         self.decoder_session.decode(
             decoder_input_ids,

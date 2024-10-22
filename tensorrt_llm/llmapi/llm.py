@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -47,9 +48,32 @@ class RequestOutput(GenerationResult):
     def handle_response(self, response):
         super().handle_response(response)
 
-        if self.tokenizer is not None:
+        sampling_params = self._generation_request.sampling_params
+        kwargs = {
+            'skip_special_tokens':
+            sampling_params.skip_special_tokens,
+            'spaces_between_special_tokens':
+            sampling_params.spaces_between_special_tokens
+        }
+        if sampling_params.detokenize and self.tokenizer is not None:
             for beam_output in self.outputs:
-                beam_output.text = self.tokenizer.decode(beam_output.token_ids)
+                beam_output._last_text_len = len(beam_output.text)
+                if hasattr(self.tokenizer, 'decode_incrementally'):
+                    if self.streaming and not sampling_params.use_beam_search:
+                        beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
+                            beam_output.token_ids_diff,
+                            prev_text=beam_output.text,
+                            states=beam_output._incremental_states,
+                            flush=self.finished,
+                            **kwargs)
+                    else:
+                        beam_output.text, _ = self.tokenizer.decode_incrementally(
+                            beam_output.token_ids,
+                            flush=self.finished,
+                            **kwargs)
+                else:
+                    beam_output.text = self.tokenizer.decode(
+                        beam_output.token_ids, **kwargs)
 
     def _repr_fields(self):
         return [
@@ -279,8 +303,16 @@ class LLM:
                                   sampling_params: SamplingParams) -> List[int]:
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
-        return self.tokenizer.encode(
-            prompt, add_special_tokens=sampling_params.add_special_tokens)
+
+        if sampling_params.truncate_prompt_tokens is None:
+            return self.tokenizer.encode(
+                prompt, add_special_tokens=sampling_params.add_special_tokens)
+        else:
+            return self.tokenizer.encode(
+                prompt,
+                add_special_tokens=sampling_params.add_special_tokens,
+                truncation=True,
+                max_length=sampling_params.truncate_prompt_tokens)
 
     def _prepare_sampling_params(
             self,
@@ -308,9 +340,15 @@ class LLM:
                          sampling_params: SamplingParams) -> None:
 
         build_config = self.args.build_config
+
+        built_enging_cfg_file = self.args.model / 'config.json'
+        with open(built_enging_cfg_file) as f:
+            built_enging_cfg = json.load(f)
+
         prompt_len = len(prompt_token_ids)
 
-        if prompt_len + sampling_params.max_tokens > build_config.max_seq_len:
+        if prompt_len + sampling_params.max_tokens > built_enging_cfg[
+                'build_config']['max_seq_len']:
             raise ValueError(
                 f"The sum of prompt length ({prompt_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
@@ -378,8 +416,10 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
-        return ModelLoader.load_hf_tokenizer(self.args.model_dir,
-                                             self.args.trust_remote_code)
+        return ModelLoader.load_hf_tokenizer(
+            self.args.model_dir,
+            trust_remote_code=self.args.trust_remote_code,
+            use_fast=self.args.tokenizer_mode != 'slow')
 
     @property
     def tokenizer(self) -> Optional[TokenizerBase]:

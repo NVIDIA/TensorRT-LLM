@@ -272,8 +272,10 @@ class WhisperDecoding:
                                              device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
-        cross_attention_mask = torch.ones(
-            [batch_size, 1, encoder_max_input_length]).int().cuda()
+        cross_attention_mask = torch.ones([
+            batch_size, decoder_max_input_length + max_new_tokens,
+            encoder_max_input_length
+        ]).int().cuda()
 
         # generation config
         sampling_config = SamplingConfig(end_id=eot_id,

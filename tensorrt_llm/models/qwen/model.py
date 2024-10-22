@@ -250,13 +250,22 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
 
         if config.mapping.is_last_pp_rank():
-            lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded,
-                                   bias=False,
-                                   dtype=config.dtype,
-                                   tp_group=config.mapping.tp_group,
-                                   tp_size=config.mapping.tp_size,
-                                   gather_output=True)
+            if config.architecture == 'Qwen2ForSequenceClassification':
+                lm_head = ColumnLinear(config.hidden_size,
+                                       config.num_labels,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
+            else:
+                lm_head = ColumnLinear(config.hidden_size,
+                                       vocab_size_padded,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode
@@ -345,6 +354,10 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "shared_expert": "mlp.shared_expert",
                     "shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
+                }
+            elif config.architecture == "Qwen2ForSequenceClassification":
+                custom_dict = {
+                    "lm_head": "score",
                 }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             if config.share_embedding_table:

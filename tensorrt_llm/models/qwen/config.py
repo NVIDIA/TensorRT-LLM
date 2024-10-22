@@ -32,12 +32,14 @@ class QWenConfig(PretrainedConfig):
                  rotary_scaling: Optional[dict] = None,
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
+                 num_labels: int = 1,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
         self.rotary_base = rotary_base
         self.rotary_scaling = rotary_scaling
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
+        self.num_labels = num_labels
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -104,6 +106,10 @@ class QWenConfig(PretrainedConfig):
             rms_norm_eps = hf_config.rms_norm_eps
             rotary_base = getattr(hf_config, "rope_theta", 100000.0)
 
+        num_labels = 1
+        if hf_config.architectures[0] == "Qwen2ForSequenceClassification":
+            num_labels = hf_config.num_labels
+
         moe_num_experts = getattr(hf_config, "num_experts", 0)
         moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", 0)
@@ -149,4 +155,5 @@ class QWenConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            num_labels=num_labels,
             **kwargs)

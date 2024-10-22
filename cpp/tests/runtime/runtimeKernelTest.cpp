@@ -920,7 +920,7 @@ TEST_F(RuntimeKernelTest, TileInplaceInt8Large)
 
 namespace
 {
-void testCopyBatch(SizeType32 stride, BufferManager& manager, CudaStream& stream)
+void testCopyBatch(SizeType64 stride, BufferManager& manager, CudaStream& stream)
 {
     SizeType32 constexpr rows{8};
     SizeType32 constexpr numIndices{rows / 2};
@@ -929,9 +929,9 @@ void testCopyBatch(SizeType32 stride, BufferManager& manager, CudaStream& stream
     auto const indicesShape = ITensor::makeShape({numIndices});
     auto srcBufferHost = BufferManager::cpu(bufferShape, nvinfer1::DataType::kINT32);
     auto dstBufferDevice = manager.gpu(bufferShape, nvinfer1::DataType::kINT32);
-    auto srcOffsets = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT32);
-    auto dstOffsets = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT32);
-    auto sizes = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT32);
+    auto srcOffsets = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT64);
+    auto dstOffsets = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT64);
+    auto sizes = BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT64);
     kernels::invokeFill(*dstBufferDevice, 0, stream);
 
     auto srcBufferHostPtr = bufferCast<std::int32_t>(*srcBufferHost);
@@ -944,9 +944,9 @@ void testCopyBatch(SizeType32 stride, BufferManager& manager, CudaStream& stream
         }
     }
 
-    auto srcOffsetsPtr = bufferCast<std::int32_t>(*srcOffsets);
-    auto dstOffsetsPtr = bufferCast<std::int32_t>(*dstOffsets);
-    auto sizesPtr = bufferCast<std::int32_t>(*sizes);
+    auto srcOffsetsPtr = bufferCast<SizeType64>(*srcOffsets);
+    auto dstOffsetsPtr = bufferCast<SizeType64>(*dstOffsets);
+    auto sizesPtr = bufferCast<SizeType64>(*sizes);
     for (SizeType32 idx = 0; idx < numIndices; ++idx)
     {
         // Copy rows 0, 2, 4, etc to 0, 1, 2, 3...
@@ -965,7 +965,7 @@ void testCopyBatch(SizeType32 stride, BufferManager& manager, CudaStream& stream
     auto dstBufferHostPtr = bufferCast<std::int32_t>(*dstBufferHost);
     for (SizeType32 idx = 0; idx < rows; ++idx)
     {
-        for (SizeType32 ci = 0; ci < stride; ++ci)
+        for (SizeType64 ci = 0; ci < stride; ++ci)
         {
             if (idx < numIndices && ci < sizesPtr[idx])
             {

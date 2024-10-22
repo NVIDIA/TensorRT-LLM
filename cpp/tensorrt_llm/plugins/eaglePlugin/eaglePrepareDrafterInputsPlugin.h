@@ -28,7 +28,7 @@ namespace tensorrt_llm::plugins
 class EaglePrepareDrafterInputsPlugin : public BasePlugin
 {
 public:
-    EaglePrepareDrafterInputsPlugin(nvinfer1::DataType type, int32_t layerIdx);
+    EaglePrepareDrafterInputsPlugin(int32_t layerIdx);
 
     EaglePrepareDrafterInputsPlugin(void const* data, size_t length);
 
@@ -62,7 +62,82 @@ public:
     void destroy() noexcept override;
 
 private:
-    nvinfer1::DataType mDtype;
+    enum class InputIdxEntry : int32_t
+    {
+        //! [batch_size]
+        SEQUENCE_LENGTHS = 0,
+        //! [batch_size]
+        CONTEXT_LENGTHS,
+        //! [num_tokens]
+        INPUT_IDS,
+        //! [batch_size, max_path_len]
+        ACCEPTED_TOKENS,
+        //! [batch_size]
+        ACCEPTED_LENS,
+        //! [batch_size]
+        ACCEPTED_PATHS,
+        //! [batch_size, max_decoding_draft_tokens]
+        NEXT_DRAFT_TOKENS,
+        //! [batch_size]
+        NEXT_DRAFT_LENS,
+        //! [batch_size, max_decoding_tokens, max_path_len]
+        NEXT_DRAFT_PATHS,
+        //! [batch_size]
+        PREV_DRAFT_LENS,
+        //! [batch_size, max_decoding_tokens, max_path_len]
+        PREV_DRAFT_PATHS,
+        //! [(max_path_len - 1) * batch_size + 1]
+        HIDDEN_SIZE_BATCH_LEVEL_STARTS,
+    };
+
+    enum class OutputIdxEntry : int32_t
+    {
+        //! [batch_size]
+        SEQUENCE_LENGTHS = 0,
+        //! [batch_size]
+        CONTEXT_LENGTHS,
+        //! [batch_size]
+        SPEC_DECODING_GENERATION_LENGTHS,
+        //! [batch_size, max_decoding_tokens]
+        SPEC_DECODING_POSITION_OFFSETS,
+        //! [batchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
+        SPEC_DECODING_PACKED_MASK,
+        //! [NUM_OUTPUT_TOKENS]
+        OUTPUT_IDS,
+        //! [NUM_OUTPUT_TOKENS]
+        POSITION_IDS,
+        //! [NUM_OUTPUT_TOKENS]
+        HIDDEN_STATES_INDICES,
+        //! [NUM_LAST_TOKEN_INDICES]
+        LAST_TOKEN_INDICES,
+        //! [1]
+        NUM_OUTPUT_TOKENS,
+        //! [1]
+        NUM_LAST_TOKEN_INDICES,
+        //! [(max_path_len - 1) * batch_size + 1]
+        HIDDEN_SIZE_BATCH_LEVEL_STARTS,
+    };
+
+    int32_t getIdx(InputIdxEntry idx) const
+    {
+        return static_cast<int32_t>(idx);
+    }
+
+    int32_t getIdx(OutputIdxEntry idx) const
+    {
+        return static_cast<int32_t>(idx);
+    }
+
+private:
+    void prepareCtxEagleNetData(nvinfer1::PluginTensorDesc const* inputDesc,
+        nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
+        cudaStream_t stream) noexcept;
+
+    void prepareGenEagleNetData(nvinfer1::PluginTensorDesc const* inputDesc,
+        nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
+        cudaStream_t stream) noexcept;
+
+private:
     int32_t mLayerIdx;
 };
 

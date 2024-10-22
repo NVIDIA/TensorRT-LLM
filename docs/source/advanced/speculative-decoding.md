@@ -334,7 +334,7 @@ def max_draft_len(windows_size, ngram_size, verification_set_size):
 ```
 
 2. *The TensorRT-LLM runtime program*.
-When TensorRT-LLM starts, it needs to reserve resources according to an `executor_lookahead_config`. The configuration should be equal to the config in the engine-building phase. The executor lookahead configuration is noted as `(W, N, G)`.
+When TensorRT-LLM starts, it needs to reserve resources according to an `executor_lookahead_config`. The configuration should be equal to the config in the engine-building phase. The executor lookahead configuration is noted as `(W, N, G)`. It is required that `--max_draft_len` == `max_draft_len(W, N, G)`
 
 3. *The request*.
 Each request can be assigned a specific lookahead configuration when input to the execution engine, noted as `(w, n, g)`. If none is assigned, the executor config is used. The request lookahead config is valid and fixed along the request lifecycle. The minimum Lookahead config is `(1, 1, 0)`, meaning only one Jacobi window, ngram size one, and no verification candidates, which is automatically degenerated to normal mode. The meaningful minimum configuration is `(2, 2, 1)`. It is required that the request lookahead config and executor config satisfy `w <= W, n <= N, g <= G`.

@@ -51,9 +51,9 @@ public:
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
-        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
-        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
-        int32_t spec_decoding_max_generation_length = 1);
+        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool has_full_attention_mask = false,
+        bool use_cache = true, bool is_spec_decoding_enabled = false,
+        bool spec_decoding_is_generation_length_variable = false, int32_t spec_decoding_max_generation_length = 1);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -90,13 +90,15 @@ protected:
     size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length,
         int32_t max_num_tokens) const noexcept;
 
-    template <typename T, typename KVCacheBuffer>
+    template <typename T>
     struct EnqueueContextParams
     {
         T const* attention_input;
         T const* qkv_bias;
-        // Context FMHA custom mask buffer.
-        uint32_t const* fmha_custom_mask;
+        // Attention mask input.
+        bool const* attention_mask;
+        // Attention packed mask input (used by context FMHA).
+        uint32_t const* attention_packed_mask;
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq;
         // Rotary cos sin cache buffer to avoid re-computing.
@@ -125,6 +127,7 @@ protected:
         int32_t batch_size;
         int32_t num_tokens;
         int32_t max_blocks_per_sequence;
+        int32_t const* host_context_lengths;
         void* workspace;
         // optional when relative position
         T const* relative_attention_bias = nullptr;
@@ -144,7 +147,8 @@ protected:
 
             ss << "attention_input: " << attention_input << std::endl;
             ss << "qkv_bias: " << qkv_bias << std::endl;
-            ss << "fmha_custom_mask: " << fmha_custom_mask << std::endl;
+            ss << "attention_mask: " << attention_mask << std::endl;
+            ss << "attention_packed_mask: " << attention_packed_mask << std::endl;
             ss << "rotary_inv_freq: " << rotary_inv_freq << std::endl;
             ss << "rotary_cos_sin: " << rotary_cos_sin << std::endl;
             ss << "input_seq_length: " << input_seq_length << std::endl;
@@ -185,13 +189,15 @@ protected:
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueContext(EnqueueContextParams<T, KVCacheBuffer> const& params, cudaStream_t stream);
+    int enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream);
 
-    template <typename T, typename KVCacheBuffer>
+    template <typename T>
     struct EnqueueGenerationParams
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Attention mask input, which has shape of [batch_size, attention_mask_stride].
+        bool const* attention_mask;
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq;
         // NOTE: input_seq_length might be larger than one in the medusa mode.
@@ -209,6 +215,8 @@ protected:
         kernels::KVBlockArray::DataType* block_offsets;
         void* host_primary_pool_pointer;
         void* host_secondary_pool_pointer;
+        // Attention mask has shape of [batch_size, attention_mask_stride].
+        int32_t attention_mask_stride;
         // By default, max_attention_window == cyclic_attention_window_size
         // unless each layer has different cyclic kv cache length.
         // Max cache capacity (used to allocate KV cache)
@@ -240,15 +248,15 @@ protected:
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params, cudaStream_t stream);
+    int enqueueGeneration(EnqueueGenerationParams<T> const& params, cudaStream_t stream);
 
     // Called in configurePlugin().
     template <typename T, typename KVCacheBuffer>
-    void prepareEnqueueGeneration(EnqueueGenerationParams<T, KVCacheBuffer> const& params);
+    void prepareEnqueueGeneration(EnqueueGenerationParams<T> const& params);
 
     template <typename T, typename KVCacheBuffer>
     bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
-        EnqueueGenerationParams<T, KVCacheBuffer> const& generationsParams, bool forConfigurePlugin);
+        EnqueueGenerationParams<T> const& generationsParams, bool forConfigurePlugin);
 
     bool isRelativePosition() const
     {
@@ -278,6 +286,11 @@ protected:
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
     }
 
+    bool isUnfusedCrossAttention() const
+    {
+        return !mEnableContextFMHA && mCrossAttention;
+    }
+
     bool isCrossAttention() const
     {
         return mCrossAttention;
@@ -291,6 +304,16 @@ protected:
     bool useCustomMask() const
     {
         return mMaskType == tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK;
+    }
+
+    bool useFullCustomMask() const
+    {
+        return useCustomMask() && mHasFullAttentionMask;
+    }
+
+    bool usePackedCustomMask() const
+    {
+        return useCustomMask() && mEnableContextFMHA;
     }
 
     void reserveSemaphoreArray(int32_t size);
@@ -341,6 +364,7 @@ protected:
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
+    bool mHasFullAttentionMask = false;
     bool mIsSpecDecodingEnabled = false;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;

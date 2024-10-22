@@ -211,7 +211,7 @@ class OpenaiServer:
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
-                    if delta_text:
+                    if len(output.token_ids_diff) > 0:
                         # Send token-by-token response for each request.n
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -450,6 +450,7 @@ class OpenaiServer:
 @click.option("--host", type=str, default=None)
 @click.option("--port", type=int, default=8000)
 @click.option("--max_beam_width", type=int, default=1)
+@click.option("--max_seq_len", type=int, default=512)
 @click.option("--tp_size", type=int, default=1)
 @click.option("--pp_size", type=int, default=1)
 def entrypoint(model_dir: str,
@@ -457,13 +458,14 @@ def entrypoint(model_dir: str,
                host: Optional[str] = None,
                port: int = 8000,
                max_beam_width: int = 1,
+               max_seq_len: int = 512,
                tp_size: int = 1,
                pp_size: int = 1):
     host = host or "0.0.0.0"
     port = port or 8000
     logging.info(f"Starting server at {host}:{port}")
 
-    build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
+    build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width, max_seq_len=max_seq_len)
 
     llm = LLM(model_dir,
               tokenizer,

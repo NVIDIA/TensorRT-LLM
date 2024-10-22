@@ -60,21 +60,22 @@ namespace tensorrt_llm::plugins
 //     9.  kv_cache_quantization_scale [1] (optional)
 //     10. kv_cache_dequantization_scale [1] (optional)
 //     11. attention_output_quantization_scale [1] (on device, optional)
-//     12. context_fmha_custom_mask [num_tokens, kv_seqlen / 32] (on device, uint32_t, optional)
+//     12. attention_mask [num_tokens, kv_seqlen] (on device, bool, optional)
+//     13. attention_packed_mask [num_tokens, kv_seqlen / 32] (on device, uint32_t, optional)
 //          - pack masks by encoding multiple mask positions into a single 32-bit unsigned integer.
 //          - see kernels/contextMultiHeadAttention/fmhaPackedMask.cpp for more details.
-//     13. rotary_inv_freq [head_size / 2] or [head_size] (longrope type) (float) (on device, optional)
-//     14. rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
-//     15. alibi_slopes [num_heads] (optional for ALiBi position embedding)
-//     16. relative_attention_bias [num_heads] (optional for ALiBi position embedding)
-//     17. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
-//     18. qkv_bias (optional) [local_hidden_size * 3]
-//     19. spec_decoding_generation_lengths (optional, required when medusa is enabled) (int32_t) [batch_size]
-//     20. spec_decoding_packed_mask (optional, required when medusa is enabled) (int32_t) [num_tokens, packed_mask_dim]
+//     14. rotary_inv_freq [head_size / 2] or [head_size] (longrope type) (float) (on device, optional)
+//     15. rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
+//     16. alibi_slopes [num_heads] (optional for ALiBi position embedding)
+//     17. relative_attention_bias [num_heads] (optional for ALiBi position embedding)
+//     18. host_context_lengths [batch_size] int32. (optional, required when remove_input_padding is true)
+//     19. qkv_bias (optional) [local_hidden_size * 3]
+//     20. spec_decoding_generation_lengths (optional, required when medusa is enabled) (int32_t) [batch_size]
+//     21. spec_decoding_packed_mask (optional, required when medusa is enabled) (int32_t) [num_tokens, packed_mask_dim]
 //                                    packed_mask_dim = divUp(max_num_spec_decoding_tokens + 1, 32)
-//     21. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
+//     22. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
 //     max_num_spec_decoding_tokens + 1]
-//     22. host_runtime_perf_knobs (int64)
+//     23. host_runtime_perf_knobs (int64)
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
@@ -98,9 +99,9 @@ public:
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
-        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
-        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
-        int spec_decoding_max_generation_length = 1);
+        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool has_full_attention_mask = false,
+        bool use_cache = true, bool is_spec_decoding_enabled = false,
+        bool spec_decoding_is_generation_length_variable = false, int spec_decoding_max_generation_length = 1);
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -171,7 +172,8 @@ private:
         QKV_TENSOR,
         K_TENSOR,
         V_TENSOR,
-        CONTEXT_FMHA_CUSTOM_MASK,
+        ATTENTION_MASK,
+        ATTENTION_PACKED_MASK,
         SEQUENCE_LENGTH,
         HOST_PAST_KEY_VALUE_LENGTHS,
         HOST_MAX_ATTENTION_WINDOW,
@@ -203,6 +205,7 @@ private:
         ENUM_SIZE,
     };
 
+    std::string toString(IdxEntry const& entry) const;
     bool isEntryUsed(IdxEntry const& entry) const;
     void initEntryIdx();
     IndexType getIdx(IdxEntry const& entry) const;

@@ -306,8 +306,9 @@ public:
 #ifdef ENABLE_BF16
         if (std::is_same_v<DataType, nv_bfloat16>)
             return nvinfer1::DataType::kBF16;
-#endif
+#else
         TLLM_THROW("Unrecognised format");
+#endif
     };
 
     template <class T>

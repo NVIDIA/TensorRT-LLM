@@ -219,9 +219,12 @@ def test_llm_gemma_2b_int4weight_only():
 
 @force_ampere
 def test_llm_gemma_2_9b_it():
+    build_config = BuildConfig()
+    build_config.max_batch_size = 512
     llm_test_harness(gemma_2_9b_it_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
+                     build_config=build_config,
                      sampling_params=sampling_params)
 
 
@@ -310,10 +313,13 @@ def test_llm_qwen1_5():
 
 @skip_pre_ampere
 def test_llm_qwen2():
+    build_config = BuildConfig()
+    build_config.max_batch_size = 512
     llm_test_harness(qwen2_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,
+                     build_config=build_config,
                      trust_remote_code=True)
 
 
@@ -347,6 +353,7 @@ def test_llm_qwen2_fp8():
 def test_llm_mamba2_370m():
     build_config = BuildConfig()
     build_config.plugin_config._paged_kv_cache = False
+    build_config.max_batch_size = 8
     llm_test_harness(mamba2_370m_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
@@ -375,11 +382,11 @@ def test_llm_commandr_v01_int8_weight_only():
 
 
 if __name__ == '__main__':
-    test_llm_gptj()
-    test_llm_phi_1_5()
-    test_llm_phi_2()
-    test_llm_phi_3_mini_4k()
-    test_llm_phi_3_small_8k()
+    # test_llm_gptj()
+    # test_llm_phi_1_5()
+    # test_llm_phi_2()
+    # test_llm_phi_3_mini_4k()
+    # test_llm_phi_3_small_8k()
     test_llm_glm()
     test_llm_commandr_v01()
     test_llm_commandr_v01_int8_weight_only()

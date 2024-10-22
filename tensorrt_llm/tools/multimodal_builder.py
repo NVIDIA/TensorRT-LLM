@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import tarfile
+from pathlib import Path
 from time import time
 
 import yaml
@@ -9,6 +10,7 @@ import yaml
 # isort: off
 import torch
 import tensorrt as trt
+from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.builder import Builder
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForVision2Seq, AutoProcessor,
@@ -32,7 +34,7 @@ def add_multimodal_arguments(parser):
                         choices=[
                             'blip2', 'llava', 'llava_next', 'vila', 'nougat',
                             'cogvlm', 'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision'
+                            'video-neva', 'phi-3-vision', 'mllama'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -96,6 +98,8 @@ class VisionEngineBuilder:
             build_kosmos_engine(args)
         elif args.model_type == 'phi-3-vision':
             build_phi_engine(args)
+        elif args.model_type == 'mllama':
+            build_mllama_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -143,7 +147,7 @@ def build_trt_engine(model_type,
     profile = builder.create_optimization_profile()
 
     config_args = {
-        "precision": str(dtype).split('.')[-1],
+        "precision": torch_dtype_to_str(dtype),
         "model_type": model_type,
         "strongly_typed": False
     }
@@ -167,18 +171,32 @@ def build_trt_engine(model_type,
     nOptBS = max(nMinBS, int(max_batch_size / 2))
     nMaxBS = max_batch_size
 
-    inputT = network.get_input(0)
-
     # input sizes can be:
     # - integer list, when inputs are constant size images. e.g. [3, H, W]
     # - list of integer lists, when inputs are dynamic size images. e.g. [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]]
+    # - list of list of integer lists, when there are many inputs and each input have dynamic size. e.g.
+    #   [[[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]], [[1, 1], [1, 1], [1,1]]]
     assert isinstance(input_sizes, list), "input_sizes must be a list"
     if isinstance(input_sizes[0], int):
         logger.log(trt.Logger.INFO, f"Processed input sizes {input_sizes}")
+        inputT = network.get_input(0)
         inputT.shape = [nBS, *input_sizes]
         min_size = opt_size = max_size = input_sizes
+        profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
+                          [nMaxBS, *max_size])
+    elif isinstance(input_sizes[0], list) and isinstance(
+            input_sizes[0][0], list):
+        for idx, input_size in enumerate(input_sizes):
+            assert len(input_size) == 3
+            inputT = network.get_input(idx)
+            min_size, opt_size, max_size = input_size
+            profile.set_shape(inputT.name, [nMinBS, *min_size],
+                              [nOptBS, *opt_size], [nMaxBS, *max_size])
     elif len(input_sizes) == 3 and isinstance(input_sizes[0], list):
+        inputT = network.get_input(0)
         min_size, opt_size, max_size = input_sizes
+        profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
+                          [nMaxBS, *max_size])
         logger.log(
             trt.Logger.INFO,
             f"Processed min/opt/max input sizes {min_size}/{opt_size}/{max_size}"
@@ -186,8 +204,6 @@ def build_trt_engine(model_type,
     else:
         raise ValueError(f"invalid input sizes: {input_sizes}")
 
-    profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
-                      [nMaxBS, *max_size])
     config.add_optimization_profile(profile)
 
     t0 = time()
@@ -790,3 +806,62 @@ def build_phi_engine(args):
                      [image.shape[1], image.shape[2], image.shape[3]],
                      f'{args.output_dir}/onnx', args.output_dir,
                      args.max_batch_size * (num_crops + 1))
+
+
+def build_mllama_engine(args):
+
+    class MLLaMAVisionWrapper(torch.nn.Module):
+
+        def __init__(self, vision_model, output_proj):
+            super().__init__()
+            self.vision_model = vision_model
+            self.output_proj = output_proj
+
+        def forward(self, pixel_values, aspect_ratio_ids, aspect_ratio_mask):
+            out = self.vision_model(pixel_values, aspect_ratio_ids,
+                                    aspect_ratio_mask).last_hidden_state
+            out = self.output_proj(out)
+            return out
+
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    # MllamaForConditionalGeneration requires transformers >= 4.45, which is
+    # conflict with limitation of other multimodal models.
+    from transformers import MllamaForConditionalGeneration
+    model = MllamaForConditionalGeneration.from_pretrained(args.model_path,
+                                                           torch_dtype='auto',
+                                                           device_map='auto')
+    wrapper = MLLaMAVisionWrapper(model.vision_model,
+                                  model.multi_modal_projector)
+    model_dtype = model.dtype
+    image = Image.new('RGB', [2048, 2688])  # dummy image
+    inputs = processor(images=image,
+                       return_tensors="pt").to(model_dtype).to(model.device)
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    part_name = 'visual_encoder'
+    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
+
+    # inputs["pixel_values"]: torch.Size([1, 1, 4, 3, 448, 448])
+    # inputs["aspect_ratio_ids"]: torch.Size([1, 1])
+    # inputs["aspect_ratio_mask"]: torch.Size([1, 1, 4])
+    export_onnx(
+        wrapper,
+        input=tuple([value for key, value in inputs.items()]),
+        onnx_dir=onnx_dir,
+        input_names=[key for key in inputs],
+        output_names=['output'],
+        dynamic_axes={key: {
+            0: "batch"
+        }
+                      for key in inputs},
+    )
+
+    build_trt_engine(
+        args.model_type,
+        [[list(inputs[key].shape[1:]) for _ in range(3)] for key in inputs],
+        onnx_dir,
+        args.output_dir,
+        args.max_batch_size,
+        model_dtype,
+        engine_name=f"{part_name}.engine",
+    )

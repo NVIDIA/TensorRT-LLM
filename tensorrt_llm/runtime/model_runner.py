@@ -271,6 +271,9 @@ def _engine_config_to_model_config(engine_config: EngineConfig,
         if hasattr(pretrained_config, 'redrafter_draft_len_per_beam') else 0,
         kv_cache_type=getattr(build_config, 'kv_cache_type',
                               KVCacheType.CONTINUOUS),
+        cross_attention=getattr(pretrained_config, 'cross_attention', False),
+        has_position_embedding=getattr(pretrained_config,
+                                       'has_position_embedding', True),
         **kwargs)
 
 
@@ -441,7 +444,10 @@ class ModelRunnerMixin:
 
         if prompt_table is not None:
             prompt_table_data = self._prepare_embedding_table(prompt_table)
-            _, task_vocab_size, hidden_size = prompt_table_data.size()
+            if len(prompt_table_data.size()) == 3:
+                _, task_vocab_size, hidden_size = prompt_table_data.size()
+            elif len(prompt_table_data.size()) == 2:
+                task_vocab_size, hidden_size = prompt_table_data.size()
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
@@ -773,6 +779,10 @@ class ModelRunner(ModelRunnerMixin):
                  stopping_criteria: Optional[StoppingCriteria] = None,
                  logits_processor: Optional[LogitsProcessor] = None,
                  medusa_choices: Optional[List[List[int]]] = None,
+                 encoder_max_input_length: int = None,
+                 encoder_input_features: List[torch.Tensor] = None,
+                 encoder_output_lengths: List[torch.Tensor] = None,
+                 cross_attention_masks: List[torch.Tensor] = None,
                  **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -830,8 +840,8 @@ class ModelRunner(ModelRunnerMixin):
 
         self._check_inputs(batch_input_ids, sampling_config)
 
-        if kwargs.get('num_return_sequences', 1) > 1:
-            logger.warning(
+        if kwargs.get('num_return_sequences', None) is not None:
+            raise ValueError(
                 'num_return_sequences will be ignored since '
                 'num_return_sequences > 1 is not supported on python runtime. '
                 'Please use C++ runtime.')
@@ -840,12 +850,28 @@ class ModelRunner(ModelRunnerMixin):
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
 
-        if sampling_config.bad_words_list is not None:
-            sampling_config.bad_words_list = to_word_list_format(
-                sampling_config.bad_words_list)
-        if sampling_config.stop_words_list is not None:
-            sampling_config.stop_words_list = to_word_list_format(
-                sampling_config.stop_words_list)
+        def maybe_convert_to_words_list_format(
+            words_list: Optional[Union[list, np.ndarray, torch.Tensor]]
+        ) -> Optional[np.ndarray]:
+            if words_list is None or isinstance(words_list, np.ndarray):
+                return words_list
+            elif isinstance(words_list, torch.Tensor):
+                return words_list.numpy()
+            elif isinstance(words_list, list):
+                return to_word_list_format(words_list)
+            else:
+                raise TypeError(
+                    f"Unexpected words_list type={type(words_list)}. Only list, np.ndarray, and torch.Tensor are supported."
+                )
+
+        if cross_attention_masks is not None:
+            encoder_input_features = torch.concat(encoder_input_features)
+            encoder_output_lengths = torch.concat(encoder_output_lengths)
+
+        sampling_config.bad_words_list = maybe_convert_to_words_list_format(
+            sampling_config.bad_words_list)
+        sampling_config.stop_words_list = maybe_convert_to_words_list_format(
+            sampling_config.stop_words_list)
 
         if not self.kv_cache_type and sampling_config.max_new_tokens > 1:
             raise RuntimeError(
@@ -861,7 +887,9 @@ class ModelRunner(ModelRunnerMixin):
             lora_manager=self.lora_manager,
             lora_uids=lora_uids,
             medusa_choices=medusa_choices,
-            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
+            encoder_max_input_length=encoder_max_input_length,
+        )
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
@@ -879,6 +907,9 @@ class ModelRunner(ModelRunnerMixin):
             stopping_criteria=stopping_criteria,
             logits_processor=logits_processor,
             position_ids=position_ids,
+            encoder_output=encoder_input_features,
+            encoder_input_lengths=encoder_output_lengths,
+            cross_attention_mask=cross_attention_masks,
             **ptuning_kwargs)
         if sampling_config.return_dict:
             if streaming:

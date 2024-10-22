@@ -31,6 +31,9 @@ python quantize.py --model_dir $MODEL_PATH --qformat int4_awq --awq_block_size 6
 # INT8 SQ with INT8 kv cache.
 python quantize.py --model_dir $MODEL_PATH --qformat int8_sq --kv_cache_dtype int8 --output_dir $OUTPUT_PATH
 
+# Auto quantization(e.g. fp8 + int4_awq + w4a8_awq) using average weights bits 5
+python quantize.py --model_dir $MODEL_PATH  --autoq_format fp8,int4_awq,w4a8_awq  --output_dir $OUTPUT_PATH --auto_quantize_bits 5 --tp_size 2
+
 # FP8 quantization for NeMo model.
 python quantize.py --nemo_ckpt_path nemotron-3-8b-base-4k/Nemotron-3-8B-Base-4k.nemo \
                    --dtype bfloat16 \
@@ -62,7 +65,9 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
     - int8_wo: Actually nothing is applied to weights. Weights are quantized to INT8 channel wise when TRTLLM building the engine.
     - int4_wo: Same as int8_wo but in INT4.
     - full_prec: No quantization.
-- output_dir Path to save the quantized checkpoint.
+- autoq_format: Specific quantization algorithms will be searched in auto quantization. The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq'] and you can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq).
+- auto_quantize_bits: Effective bits constraint for auto quantization. If not set, regular quantization without auto quantization search will be applied. Note: it must be set within correct range otherwise it will be set by lowest value if possible.
+- output_dir: Path to save the quantized checkpoint.
 - dtype: Specify data type of model when loading from Hugging Face.
 - kv_cache_dtype: Specify kv cache data type.
     - int8: Use int8 kv cache.
@@ -121,7 +126,7 @@ FP_O * output_scale = FP8_O
 
 ## APIs
 
-[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT-LLM checkpoints. Each TensorRT-LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). The checkpoints can be directly used by `trtllm-build` command to build TensorRT-LLM engines. See this [`doc`](../../docs/source/architecture/checkpoint.md) for more details on the TensorRT-LLM checkpoint format.
+[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT-LLM checkpoints. Each TensorRT-LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). It will produce one another quantization config for per-layer's information when setting auto quantization. The checkpoints can be directly used by `trtllm-build` command to build TensorRT-LLM engines. See this [`doc`](../../docs/source/architecture/checkpoint.md) for more details on the TensorRT-LLM checkpoint format.
 
 > *This quantization step may take a long time to finish and requires large GPU memory. Please use a server grade GPU if a GPU out-of-memory error occurs*
 
@@ -136,24 +141,39 @@ PTQ can be achieved with simple calibration on a small set of training or evalua
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
-import modelopt.torch.quantization as atq
+import modelopt.torch.quantization as mtq
+import modelopt.torch.utils.dataset_utils as dataset_utils
 
 model = AutoModelForCausalLM.from_pretrained(...)
 
 # Select the quantization config, for example, FP8
-config = atq.FP8_DEFAULT_CFG
-
+config = mtq.FP8_DEFAULT_CFG
 
 # Prepare the calibration set and define a forward loop
 calib_dataloader = DataLoader(...)
-def calibrate_loop():
-    for data in calib_dataloader:
-        model(data)
-
+calibrate_loop = dataset_utils.create_forward_loop(
+    calib_dataloader, dataloader=calib_dataloader
+)
 
 # PTQ with in-place replacement to quantized modules
 with torch.no_grad():
-    atq.quantize(model, config, forward_loop=calibrate_loop)
+    mtq.quantize(model, config, forward_loop=calibrate_loop)
+
+# or PTQ with auto quantization
+with torch.no_grad():
+    model, search_history = mtq.auto_quantize(
+        model,
+        data_loader=calib_dataloader,
+        loss_func=lambda output, batch: output.loss,
+        constraints={"effective_bits": auto_quantize_bits}, # The average bits of quantized weights
+        forward_step=lambda model, batch: model(**batch),
+        quantization_formats=[quant_algo1, quant_algo2,...] + [None],
+        num_score_steps=min(
+        num_calib_steps=len(calib_dataloader),
+            len(calib_dataloader), 128 // batch_size
+        ),  # Limit the number of score steps to avoid long calibration time
+        verbose=True,
+    )
 ```
 
 ### Export Quantized Model

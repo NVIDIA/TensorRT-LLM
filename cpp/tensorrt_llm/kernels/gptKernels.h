@@ -75,9 +75,10 @@ struct BlockSparseParams
     int num_local_blocks; // Sliding window blocks
     int vertical_stride;
 
-    __device__ bool computeMask(int row_idx, int col_idx, int seq_length, int num_heads, int head_idx) const
+    __device__ bool computeMask(
+        int row_idx, int col_idx, int q_seq_length, int kv_seq_length, int num_heads, int head_idx) const
     {
-        bool causal_mask = row_idx < seq_length && col_idx < seq_length && col_idx <= row_idx;
+        bool causal_mask = row_idx < q_seq_length && col_idx < kv_seq_length && col_idx <= row_idx;
 
         // Mask 1/0 decision is made at block_size granularity
         int block_row_idx = row_idx / block_size;
@@ -90,6 +91,11 @@ struct BlockSparseParams
 
         bool is_valid = causal_mask && (block_local_mask || block_vertical_stride_mask);
         return is_valid;
+    }
+
+    __device__ bool computeMask(int row_idx, int col_idx, int seq_length, int num_heads, int head_idx) const
+    {
+        return computeMask(row_idx, col_idx, seq_length, seq_length, num_heads, head_idx);
     }
 };
 

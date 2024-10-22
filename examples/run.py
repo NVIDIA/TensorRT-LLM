@@ -364,19 +364,22 @@ def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
         multi_block_mode=args.multi_block_mode,
         cuda_graph_mode=args.cuda_graph_mode,
         enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        is_orchestrator_mode=True,
     )
-    draft_runner_kwargs = common_kwargs.copy()
-    draft_runner_kwargs.update(
-        engine_dir=args.draft_engine_dir,
-        device_ids=draft_device_list,
-    )
-    draft_runner = ModelRunnerCpp.from_dir(**draft_runner_kwargs)
+
     target_runner_kwargs = common_kwargs.copy()
     target_runner_kwargs.update(
         engine_dir=args.engine_dir,
         device_ids=target_device_list,
     )
     target_runner = ModelRunnerCpp.from_dir(**target_runner_kwargs)
+
+    draft_runner_kwargs = common_kwargs.copy()
+    draft_runner_kwargs.update(
+        engine_dir=args.draft_engine_dir,
+        device_ids=draft_device_list,
+    )
+    draft_runner = ModelRunnerCpp.from_dir(**draft_runner_kwargs)
 
     common_gen_kwargs = dict(
         max_attention_window_size=args.max_attention_window_size,
@@ -422,9 +425,10 @@ def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
         # draft["generation_logits"].shape -> [BS, BW, draft_len, vocab_size]
         # `d_*` means variables from draft model
         # Value of `d_seq_len` includes input part, but `draft_len` doesn't
+        d_logits = [None] * batch_size
         d_seq_len = draft["sequence_lengths"][:, 0].tolist()
         d_len = [d_seq_len[bs] - prefix_len[bs] for bs in range(batch_size)]
-        d_ids = [None] * batch_size
+        d_ids = [[end_id]] * batch_size
         if use_logits:
             assert "generation_logits" in draft.keys(
             ), "`--gather_generation_logits` must be specified when building TRT engine."
@@ -435,9 +439,12 @@ def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
         for bs in range(batch_size):
             l = prefix_len[bs]
             r = d_seq_len[bs]
-            d_ids[bs] = draft["output_ids"][bs, 0, l:r].tolist()
-            if use_logits:
-                d_logits[bs] = draft["generation_logits"][bs, 0, :, :]
+            if l < r:
+                d_ids[bs] = (
+                    [end_id] +
+                    draft["output_ids"][bs, 0, l:r].tolist())[-draft_len:]
+                if use_logits:
+                    d_logits[bs] = draft["generation_logits"][bs, 0, :, :]
 
         # Run target model
         target_generation_kwargs = common_gen_kwargs.copy()
@@ -453,9 +460,10 @@ def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
         # `t_*` means variables from target model
         # Value of `t_seq_len` and `t_seq_ids` includes input part, but `t_len` or `t_ids` doesn't
         t_seq_len = target["sequence_lengths"][:, 0].tolist()
-        # t_len = [t_seq_len[bs] - prefix_len[bs] for bs in range(batch_size)]
+        # t_len = [t_seq_len[bs] - prefix_len[bs] for bs in range(batch_size)]  # Useless yet
         t_seq_ids = [None] * batch_size
         t_ids = [None] * batch_size
+        stop_hit = [False] * batch_size
 
         # Update output and tokens for next iteration
         for bs in range(batch_size):
@@ -466,6 +474,9 @@ def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
             t_seq_ids[bs] = target["output_ids"][bs, 0, :r]
             outputs["output_ids"][index, 0, l:r] = torch.IntTensor(t_ids[bs])
             outputs["sequence_lengths"][index, 0] = r
+            if l == r:
+                stop_hit[bs] = True
+
             if use_logits:
                 outputs["generation_logits"][index, 0, (l - input_lengths[bs]):(r - input_lengths[bs])] = \
                     target["generation_logits"][bs][0,:(r-l)].detach().cpu()
@@ -489,10 +500,10 @@ def run_draft_target_model(batch_input_ids, args, runtime_rank, end_id, pad_id,
             # if (d_ids is not None and np.array_equal(d_ids[bs], t_ids[bs])):
             #     continue
             # Stop due to no change (hit early stopping)
-            if np.array_equal(t_seq_ids[bs], prefix[bs]):
+            if stop_hit[bs]:
                 continue
             # Stop due to end words
-            if end_id in t_seq_ids[bs]:
+            if end_id in t_seq_ids[bs][prefix_len[bs]:]:
                 continue
             # TODO: Check bad words and stop words criteria
             prefix_next.append(t_seq_ids[bs])
@@ -637,7 +648,22 @@ def main(args):
 
     logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    if args.draft_target_model_config is None:  # Normal run except Draft-Target-Model
+    if args.draft_target_model_config is not None:  # For Draft-Target-Model speculative decoding
+        if not args.kv_cache_enable_block_reuse:
+            logger.warning(
+                "`--kv_cache_enable_block_reuse` must be specified in Draft-Target-Model."
+            )
+        assert not args.use_py_session, "Only CPP session is supported in Draft-Target-Model."
+        assert not is_enc_dec, "Only decoder model is supported in Draft-Target-Model."
+        assert args.num_beams == 1, "Beam width > 1 is not supported in Draft-Target-Model."
+
+        outputs = run_draft_target_model(batch_input_ids, args, runtime_rank,
+                                         end_id, pad_id, stop_words_list,
+                                         bad_words_list, tokenizer.vocab_size)
+        if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
+            outputs, runner = list(outputs)[0]
+
+    else:  # Normal run
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(
             engine_dir=args.engine_dir,
@@ -721,22 +747,7 @@ def main(args):
                 input_token_extra_ids=input_token_extra_ids)
             torch.cuda.synchronize()
 
-    else:  # For Draft-Target-Model
-        if not args.kv_cache_enable_block_reuse:
-            logger.warning(
-                "`--kv_cache_enable_block_reuse` must be specified in Draft-Target-Model."
-            )
-        assert not args.use_py_session, "Only CPP session is supported in Draft-Target-Model."
-        assert not is_enc_dec, "Only decoder model is supported in Draft-Target-Model."
-        assert args.num_beams == 1, "Beam width > 1 is not supported in Draft-Target-Model."
-
-        outputs = run_draft_target_model(batch_input_ids, args, runtime_rank,
-                                         end_id, pad_id, stop_words_list,
-                                         bad_words_list, tokenizer.vocab_size)
-
-        if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
-            outputs, runner = list(outputs)[0]
-
+    # Receive output, print to screen or save to file
     if args.streaming:
         for curr_outputs in throttle_generator(outputs,
                                                args.streaming_interval):
@@ -790,7 +801,8 @@ def main(args):
                          output_cum_log_probs_npy=args.output_cum_log_probs_npy,
                          output_log_probs_npy=args.output_log_probs_npy)
 
-    if args.run_profiling:  # support profiling
+    # Profiling
+    if args.run_profiling:
         ite = 10
         # warmup
         for _ in range(ite):
