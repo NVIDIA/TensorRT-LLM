@@ -146,6 +146,7 @@ class Builder():
                               profiling_verbosity: str = "layer_names_only",
                               use_strip_plan: bool = False,
                               weight_streaming: bool = False,
+                              precision_constraints: Optional[str] = "obey",
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
             @param precision: one of allowed precisions, defined in Builder._ALLOWED_PRECISIONS
@@ -170,16 +171,18 @@ class Builder():
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
             if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
                 config.set_flag(trt.BuilderFlag.INT8)
-
             if fp8:
                 config.set_flag(trt.BuilderFlag.FP8)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
