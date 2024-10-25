@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import (Any, Dict, Iterable, List, Optional, OrderedDict, Set,
                     Tuple, Union)
 
+from pathlib import Path
 import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
