@@ -212,11 +212,15 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpu_tp8 \
 Same instructions can be applied to fine-tuned versions of the LLaMA v2 models (e.g. 7Bf or llama-2-7b-chat).
 
 #### LLaMA v3 Updates
-The LLaMA v3 models with 8B and 70b are compatible with the LLaMA v2 implementation. The above
+The LLaMA 3.0 models with 8B and 70b are compatible with the LLaMA v2 implementation. The above
 commands still work.
 
 Note that the `rope_theta` and `vocab_size` are larger in LLaMA v3 models and these values are now inferred
 or pickup up from the `params.json` when using the `meta_ckpt_dir`.
+
+The transformers library needs to be upgraded to run Llama 3.1. After installing TensorRT-LLM, run `pip install transformers==4.43.2` before converting the checkpoint.
+
+Llama 3.2 VLM support is coming soon
 
 ```bash
 # Build LLaMA v3 8B TP=1 using HF checkpoints directly.
