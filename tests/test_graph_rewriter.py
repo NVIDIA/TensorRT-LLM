@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -289,7 +290,11 @@ class TestNetworkForGraphRewrite(unittest.TestCase):
     def test_to_dot(self):
         dot_code = self.network.to_dot()
         self.assertTrue('digraph' in dot_code)
-
+    
+    def test_to_onnx(self):
+        output_path = Path('./rank0.onnx')
+        self.network.to_onnx(str(output_path))
+        self.assertTrue(output_path.exists())
 
 class TestLayer(unittest.TestCase):
 
