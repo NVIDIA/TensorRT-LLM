@@ -2552,10 +2552,9 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int,
         'Lookup', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
 
-    p_dtype = default_net().plugin_config.lookup_plugin
-    pf_type = trt.PluginField(
-        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
-        trt.PluginFieldType.INT32)
+    p_dtype = per_token_scale.dtype
+    pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                              trt.PluginFieldType.INT32)
 
     rank = trt.PluginField("rank", np.array([int(rank)], np.int32),
                            trt.PluginFieldType.INT32)
@@ -2632,6 +2631,10 @@ def embedding(input: Tensor,
         The tensor produced by the embedding lookup layer.
     '''
 
+    # Per token scale is only supported by lookup plugin so if per_token_scale is not None, we must use lookup plugin
+    # Otherwise, we prefer to use ootb
+    use_lookup_plugin = per_token_scale is not None
+
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
@@ -2639,7 +2642,7 @@ def embedding(input: Tensor,
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
-            if default_net().plugin_config.lookup_plugin:
+            if use_lookup_plugin:
                 x = _lookup_plugin(input, weight, tp_rank, per_token_scale)
                 x = allreduce(x, tp_group)
             else:
@@ -2683,7 +2686,7 @@ def embedding(input: Tensor,
 
     # Store embedding lookup table as a whole
     else:
-        if default_net().plugin_config.lookup_plugin:
+        if use_lookup_plugin:
             x = _lookup_plugin(input,
                                weight,
                                rank=0,

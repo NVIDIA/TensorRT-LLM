@@ -88,12 +88,13 @@ class DatasetMetadata(BaseModel):
     num_requests: int
 
     def get_summary_for_print(self) -> str:
-        return ("===========================================================\n"
-                "= DATASET DETAILS\n"
-                "===========================================================\n"
-                f"Max Input Sequence Length:\t{self.max_isl}\n"
-                f"Max Output Sequence Length:\t{self.max_osl}\n"
-                f"Max Sequence Length:\t{self.max_sequence_length}\n"
-                f"Number of Sequences:\t{self.num_requests}\n"
-                "===========================================================\n"
-                f"\n")
+        return (
+            "\n===========================================================\n"
+            "= DATASET DETAILS\n"
+            "===========================================================\n"
+            f"Max Input Sequence Length:\t{self.max_isl}\n"
+            f"Max Output Sequence Length:\t{self.max_osl}\n"
+            f"Max Sequence Length:\t{self.max_sequence_length}\n"
+            f"Number of Sequences:\t{self.num_requests}\n"
+            "===========================================================\n"
+            f"\n")

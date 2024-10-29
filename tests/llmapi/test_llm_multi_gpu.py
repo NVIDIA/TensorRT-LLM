@@ -266,7 +266,7 @@ class DummyExecutorProxy(ExecutorBindingsProxy):
 
         self.request_queue.put(request)
 
-        req_id = self.request_id_queue.get()
+        req_id = self.rid_or_err_queue.get()
         request.set_id(req_id)
 
         result = GenerationResult(
@@ -406,7 +406,7 @@ def test_executor_handle_background_error():
 
 
 # TODO[chunweiy]: This test is not stable, need to investigate
-def _test_executor_handle_background_error_in_worker():
+def test_executor_handle_background_error_in_worker():
     llm = LLM(model=llama_model_path,
               executor_cls=DummyExecutor2,
               kv_cache_config=global_kv_cache_config)
@@ -427,5 +427,6 @@ def _test_executor_handle_background_error_in_worker():
 if __name__ == '__main__':
     #test_llama_v2_13b_lora_tp2()
     #test_llm_end2end_tp2({'embedding_parallel_mode': 'NONE'})
-    test_llm_return_context_logits_tp2()
-    test_llm_return_generation_logits_tp2()
+    #test_llm_return_context_logits_tp2()
+    #test_llm_return_generation_logits_tp2()
+    test_executor_handle_background_error_in_worker()

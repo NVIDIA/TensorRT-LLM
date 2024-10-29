@@ -161,7 +161,6 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _rmsnorm_quantization_plugin: Optional[str] = field(default=None,
                                                         init=False)
     _nccl_plugin: Optional[str] = field(default="auto", init=False)
-    _lookup_plugin: Optional[str] = field(default=None, init=False)
     _lora_plugin: Optional[str] = field(default=None, init=False)
     _weight_only_groupwise_quant_matmul_plugin: Optional[str] = field(
         default=None, init=False)
@@ -303,7 +302,6 @@ cli_plugin_args = [
     "gemm_plugin",
     "gemm_swiglu_plugin",
     "fp8_rowwise_gemm_plugin",
-    "lookup_plugin",
     "lora_plugin",
     "moe_plugin",
     "mamba_conv1d_plugin",

@@ -2,6 +2,9 @@
 import asyncio
 import json
 import logging
+import signal
+from contextlib import asynccontextmanager
+from http import HTTPStatus
 from typing import AsyncGenerator, Optional
 
 import click
@@ -9,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from tensorrt_llm.executor import CppExecutorError, RequestError
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -16,11 +20,16 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
 class LlmServer:
 
-    def __init__(self, llm: LLM, kv_cache_config: KvCacheConfig):
+    def __init__(self, llm: LLM):
         self.llm = llm
-        self.kv_cache_config = kv_cache_config
 
-        self.app = FastAPI()
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # terminate rank0 worker
+            yield
+            self.llm._shutdown()
+
+        self.app = FastAPI(lifespan=lifespan)
         self.register_routes()
 
     def register_routes(self):
@@ -50,20 +59,27 @@ class LlmServer:
 
         sampling_params = SamplingParams(**request_dict)
 
-        promise = self.llm.generate_async(prompt,
-                                          streaming=streaming,
-                                          sampling_params=sampling_params)
+        try:
+            promise = self.llm.generate_async(prompt,
+                                              streaming=streaming,
+                                              sampling_params=sampling_params)
 
-        async def stream_results() -> AsyncGenerator[bytes, None]:
-            async for output in promise:
-                yield output.outputs[0].text_diff.encode("utf-8")
+            async def stream_results() -> AsyncGenerator[bytes, None]:
+                async for output in promise:
+                    yield output.outputs[0].text_diff.encode("utf-8")
 
-        if streaming:
-            return StreamingResponse(stream_results())
+            if streaming:
+                return StreamingResponse(stream_results())
 
-        # Non-streaming case
-        await promise.aresult()
-        return JSONResponse({"text": promise.outputs[0].text})
+            # Non-streaming case
+            await promise.aresult()
+            return JSONResponse({"text": promise.outputs[0].text})
+        except RequestError as e:
+            return JSONResponse(content=str(e),
+                                status_code=HTTPStatus.BAD_REQUEST)
+        except CppExecutorError:
+            # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
 
     async def __call__(self, host, port):
         config = uvicorn.Config(self.app,
@@ -82,28 +98,32 @@ class LlmServer:
 @click.option("--max_beam_width", type=int, default=1)
 @click.option("--tp_size", type=int, default=1)
 @click.option("--pp_size", type=int, default=1)
+@click.option("--kv_cache_free_gpu_memory_fraction", type=float, default=0.8)
 def entrypoint(model_dir: str,
                tokenizer: Optional[str] = None,
                host: Optional[str] = None,
                port: int = 8000,
                max_beam_width: int = 1,
                tp_size: int = 1,
-               pp_size: int = 1):
+               pp_size: int = 1,
+               kv_cache_free_gpu_memory_fraction: float = 0.8):
     host = host or "0.0.0.0"
     port = port or 8000
     logging.info(f"Starting server at {host}:{port}")
 
     build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width)
 
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
+
     llm = LLM(model_dir,
               tokenizer,
               tensor_parallel_size=tp_size,
               pipeline_parallel_size=pp_size,
-              build_config=build_config)
+              build_config=build_config,
+              kv_cache_config=kv_cache_config)
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
-
-    server = LlmServer(llm=llm, kv_cache_config=kv_cache_config)
+    server = LlmServer(llm=llm)
 
     asyncio.run(server(host, port))
 

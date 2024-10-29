@@ -15,6 +15,7 @@
 
 import copy
 import math
+import os
 import platform
 from collections import Counter
 from dataclasses import dataclass, field
@@ -46,6 +47,10 @@ from ..plugin.plugin import CustomAllReduceHelper
 from ..quantization import QuantMode
 from .kv_cache_manager import GenerationSequence, KVCacheUpdater
 from .session import _scoped_stream
+
+# When variable is set, this will disable torch.cuda.set_device(...) calls
+# Useful in situations where device is already assigned by another library, i.e., megatron.
+DISABLE_TORCH_DEVICE_SET = os.environ.get("DISABLE_TORCH_DEVICE_SET", False)
 
 
 def decode_words_list(word_dict: List[List[str]],
@@ -249,8 +254,11 @@ class _Runtime(object):
     def __prepare(self, mapping: Mapping, engine_buffer):
         self.runtime_rank = mapping.rank
         local_rank = self.runtime_rank % mapping.gpus_per_node
-        torch.cuda.set_device(local_rank)
-        CUASSERT(cudart.cudaSetDevice(local_rank))
+        if DISABLE_TORCH_DEVICE_SET:
+            CUASSERT(cudart.cudaSetDevice(torch.cuda.current_device()))
+        else:
+            torch.cuda.set_device(local_rank)
+            CUASSERT(cudart.cudaSetDevice(local_rank))
 
         self.runtime = trt.Runtime(logger.trt_logger)
         self.engine = self.runtime.deserialize_cuda_engine(engine_buffer)
@@ -602,6 +610,7 @@ class ModelConfig:
     redrafter_num_beams: int = 0
     redrafter_draft_len_per_beam: int = 0
     num_kv_heads_per_layer: Optional[List[int]] = None
+    num_kv_heads_per_cross_attn_layer: Optional[List[int]] = None
 
 
 @dataclass
@@ -781,9 +790,12 @@ class GenerationSession(object):
         self._model_config = model_config
         self.mapping = mapping
         self.runtime = _Runtime(engine_buffer, mapping)
-        self.device = torch.device(
-            f'cuda:{self.runtime.runtime_rank % mapping.gpus_per_node}')
-        torch.cuda.set_device(self.device)
+        if DISABLE_TORCH_DEVICE_SET:
+            self.device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        else:
+            self.device = torch.device(
+                f'cuda:{self.runtime.runtime_rank % mapping.gpus_per_node}')
+            torch.cuda.set_device(self.device)
         # dynamic_decoder currently use torch's current stream, so must let TRT enqueue use same stream here
         self.stream = stream
         if self.stream is None:
@@ -1399,7 +1411,7 @@ class GenerationSession(object):
 
         assert scfg.end_id is not None, "end_id cannot be none"
         assert scfg.pad_id is not None, 'pad_id cannot be none'
-        self.end_ids = torch.full((batch_size * scfg.num_beams, ),
+        self.end_ids = torch.full((batch_size, ),
                                   scfg.end_id,
                                   dtype=torch.int32,
                                   device=self.device)
@@ -1817,8 +1829,14 @@ class GenerationSession(object):
                         num_blocks=cross_num_blocks,
                         tokens_per_block=self.tokens_per_block,
                         head_size=self.head_size)
+                    if self._model_config.num_kv_heads_per_cross_attn_layer is None:
+                        num_kv_heads_per_cross_attn_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
+                            self.get_num_heads_kv(), self.num_attn_layers)
+                    else:
+                        num_kv_heads_per_cross_attn_layer = self._model_config.num_kv_heads_per_cross_attn_layer
+
                     self._cross_memory_pool_allocator.allocate(
-                        kv_cache_type, num_kv_heads_per_layer)
+                        kv_cache_type, num_kv_heads_per_cross_attn_layer)
 
             elif self.has_attn_layers:
                 for i in range(self.first_layer, self.last_layer):
@@ -4061,7 +4079,7 @@ class GenerationSession(object):
                     f'host_cross_kv_cache_pool_mapping'] = self._cross_memory_pool_allocator.pool_mapping
 
                 self.cross_pools_kv_cache_manager = PoolsKVCacheManager(
-                    self._memory_pool_allocator.pools_metadata,
+                    self._cross_memory_pool_allocator.pools_metadata,
                     max_cross_blocks_per_seq,
                     cross_num_blocks,
                     self.tokens_per_block,

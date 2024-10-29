@@ -54,6 +54,8 @@ public:
 
     void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) override;
 
+    void setupEagle(EagleBuffers::Inputs eagleBuffers) override;
+
     void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) override;
 
     void newBatch(
@@ -270,11 +272,17 @@ private:
     //! @brief Setups decoder internal tensors for new Explicit draft tokens request
     void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
 
+    //! @brief Setups decoder internal tensors for new Eagle request
+    void newRequestEagle(SizeType32 batchIdx, decoder_batch::Request const& request);
+
     //! @brief Updates finished state on host for all active requests
     void updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent);
 
     //! @brief Sets inputs for explicit draft tokens.
     void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
+
+    //! @brief Sets inputs for eagle decoding.
+    void setEagleInputs(decoder_batch::Input const& input);
 
     //! @brief Calls decoders for tokens per engine step
     void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);

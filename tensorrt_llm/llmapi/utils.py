@@ -592,10 +592,17 @@ class ManagedThread(threading.Thread):
                 if not self.task(**self.kwargs):
                     break
             except Exception as e:
-                logger.error(f"Error in thread {self.name}: {e}")
+                logger.error(
+                    f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
+                )
                 self.error_queue.put(e)
 
         logger.info(f"Thread {self.name} stopped.")
 
     def stop(self):
         self.stop_event.set()
+
+
+def enable_llm_debug() -> bool:
+    ''' Tell whether to enable the debug mode for LLM class.  '''
+    return os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"

@@ -21,6 +21,7 @@ set(SRCS
     bufferManager.cpp
     cudaMemPool.cpp
     decodingLayerWorkspace.cpp
+    eagleBuffers.cpp
     explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
     layerProfiler.cpp

@@ -827,7 +827,7 @@ class TestFunctional(unittest.TestCase):
                 #       See input_lengths below.
                 configuration.max_position_embeddings = (
                     in_len // 2) + out_len - (out_len // 2)
-        attention = AttentionCls(configuration).cuda().eval()
+        attention = AttentionCls(configuration, layer_idx=0).cuda().eval()
         if attention_type == 'gpt2_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
                 data=weight.clone().detach(), requires_grad=False)
@@ -995,25 +995,30 @@ class TestFunctional(unittest.TestCase):
                                        device='cuda')
 
         def get_kv_quant_scale(torch_present):
-
-            torch_kv = torch.cat((torch_present[0], torch_present[1]))
-            kv_dequant_scale = torch.tensor([torch.max(torch_kv).item() / 127],
-                                            dtype=torch.float32,
-                                            device='cuda').reshape(
-                                                shape_dict['kv_dequant_scale'])
-
-            # fp8 kv cache uses 1.0f scale.
-            if not use_int8_kv_cache:
+            if torch_present is None:
                 kv_dequant_scale = torch.tensor(
                     [1.0], dtype=torch.float32,
                     device='cuda').reshape(shape_dict['kv_dequant_scale'])
+                kv_quant_scale = 1.0 / kv_dequant_scale
+            else:
+                torch_kv = torch.cat((torch_present[0], torch_present[1]))
+                kv_dequant_scale = torch.tensor(
+                    [torch.max(torch_kv).item() / 127],
+                    dtype=torch.float32,
+                    device='cuda').reshape(shape_dict['kv_dequant_scale'])
 
-            kv_quant_scale = 1.0 / kv_dequant_scale
+                # fp8 kv cache uses 1.0f scale.
+                if not use_int8_kv_cache:
+                    kv_dequant_scale = torch.tensor(
+                        [1.0], dtype=torch.float32,
+                        device='cuda').reshape(shape_dict['kv_dequant_scale'])
+
+                kv_quant_scale = 1.0 / kv_dequant_scale
             return kv_dequant_scale, kv_quant_scale
 
         def verify_kv_cache(torch_present):
             # If enable streamingllm, kv_cache stores keys and values that with no positional embedding applied
-            if streamingllm:
+            if streamingllm or torch_present is None:
                 return
 
             if not use_int8_kv_cache and not use_fp8_kv_cache and num_kv_heads == num_heads and beam_width == 1:

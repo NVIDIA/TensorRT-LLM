@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::mpi
@@ -348,6 +349,71 @@ public:
     bool fastLogits;
 };
 
+using RetentionPriority = SizeType32;
+
+/// @brief Configuration for the request's retention in the KV Cache
+class KvCacheRetentionConfig
+{
+
+public:
+    static constexpr RetentionPriority kMinRetentionPriority = 0;
+    static constexpr RetentionPriority kMaxRetentionPriority = 100;
+    static constexpr RetentionPriority kDefaultRetentionPriority = 35;
+
+    /// @brief A single entry to set block priorities over a token range. Earlier ranges always take priority over later
+    /// ones. For example, with a block size of 16, a range of [0, 17] would be applied to the first two blocks.
+    struct TokenRangeRetentionPriority
+    {
+    public:
+        explicit TokenRangeRetentionPriority(SizeType32 tokenStart, std::optional<SizeType32> tokenEnd = std::nullopt,
+            RetentionPriority priority = KvCacheRetentionConfig::kDefaultRetentionPriority)
+            : tokenStart{tokenStart}
+            , tokenEnd{tokenEnd}
+            , priority{priority}
+        {
+            TLLM_CHECK_WITH_INFO(priority >= KvCacheRetentionConfig::kMinRetentionPriority
+                    && priority <= KvCacheRetentionConfig::kMaxRetentionPriority,
+                "Invalid priority value. Must be between %d and %d", KvCacheRetentionConfig::kMinRetentionPriority,
+                KvCacheRetentionConfig::kMaxRetentionPriority);
+        };
+
+        /// @brief The first token of this range.
+        SizeType32 tokenStart;
+        /// @brief The final token of this range. The end is not included in the range. This can be set to std::nullopt
+        /// to extend the range to the end of the sequence.
+        std::optional<SizeType32> tokenEnd;
+        /// @brief The priority of this token range. Higher priorities are less likely to be evicted or offloaded.
+        RetentionPriority priority;
+
+        bool operator==(TokenRangeRetentionPriority const& other) const
+        {
+            return tokenStart == other.tokenStart && tokenEnd == other.tokenEnd && priority == other.priority;
+        }
+    };
+
+    explicit KvCacheRetentionConfig()
+        : KvCacheRetentionConfig({}, kDefaultRetentionPriority)
+    {
+    }
+
+    KvCacheRetentionConfig(std::vector<TokenRangeRetentionPriority> const& tokenRangeRetentionPriorities,
+        RetentionPriority decodeRetentionPriority);
+
+    [[nodiscard]] std::vector<TokenRangeRetentionPriority> getTokenRangeRetentionPriorities() const;
+    [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
+
+    /// @brief Convert the token range data into an entry per kv cache block for a given seqLen
+    std::vector<std::optional<RetentionPriority>> getPerBlockEvictionPolicy(SizeType32 blockSize, SizeType32 seqLen);
+
+private:
+    /// @brief The token ranges and priority levels to update. Ranges must be non-overlapping. For example [(0, 64),
+    /// (100, 128), (70, 80)] is valid, whereas
+    /// [(0, 64), (60, 128)] is not.
+    std::vector<TokenRangeRetentionPriority> mTokenRangeRetentionPriorities;
+    /// @brief The priority level to assign to blocks allocated in the decode phase
+    RetentionPriority mDecodeRetentionPriority;
+};
+
 /// @brief A class that holds information about the request
 class Request
 {
@@ -371,6 +437,7 @@ public:
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
+    /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
     /// name provided to the ExecutorConfig.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
     /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
@@ -394,6 +461,7 @@ public:
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
@@ -428,6 +496,7 @@ public:
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const;
+    [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
     [[nodiscard]] std::optional<IdType> getClientId() const;
@@ -453,6 +522,7 @@ public:
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
+    void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
     void setClientId(IdType clientId);
@@ -598,23 +668,29 @@ public:
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
-        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true);
+        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
+        std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
+        std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getMaxAttentionWindowVec() const;
     [[nodiscard]] std::optional<SizeType32> getSinkTokenLength() const;
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
+    [[nodiscard]] std::optional<FloatType> getCrossKvCacheFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
     [[nodiscard]] bool getOnboardBlocks() const;
+    [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setMaxTokens(SizeType32 maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
+    void setCrossKvCacheFraction(FloatType crossKvCacheFraction);
     void setHostCacheSize(size_t hostCacheSize);
     void setOnboardBlocks(bool onboardBlocks);
+    void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
 
 private:
     friend class Serialization;
@@ -641,12 +717,21 @@ private:
     /// allocated.
     std::optional<FloatType> mFreeGpuMemoryFraction;
 
+    /// @brief The fraction of the KV Cache memory should be reserved for cross attention
+    /// If set to p, self attention will use 1-p of KV Cache memory and cross attention
+    /// will use p of KV Cache memory. Default is 50%.
+    /// Should only be set when using encoder-decoder model.
+    std::optional<FloatType> mCrossKvCacheFraction;
+
     /// @brief Size of secondary memory pool in bytes. Default is 0.
     /// Having a secondary memory pool increases KV cache block reuse potential.
     std::optional<size_t> mHostCacheSize;
 
     /// @brief Controls whether offloaded blocks should be onboarded back into primary memory before being reused.
     bool mOnboardBlocks;
+
+    /// @brief Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory.
+    std::optional<RetentionPriority> mSecondaryOffloadMinPriority;
 };
 
 /// @brief Configuration class for the runtime perf knobs

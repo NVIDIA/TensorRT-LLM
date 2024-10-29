@@ -86,10 +86,10 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
         embeddingBias, badWordsList, stopWordsList, mPositionIds, promptEmbeddingTable, mPromptVocabSize, mLoraTaskId,
-        loraWeights, loraConfig, mLookaheadConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits,
-        mDraftTokens, draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor),
-        mApplyLogitsPostProcessorBatched, mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority,
-        encoderInputFeatures, mEncoderOutputLength, crossAttentionMask,
+        loraWeights, loraConfig, mLookaheadConfig, mKvCacheRetentionConfig, returnLogProbs(), mReturnContextLogits,
+        mReturnGenerationLogits, mDraftTokens, draftLogits, mExcludeInputFromOutput,
+        callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched, mEncoderTokens, mReturnEncoderOutput,
+        mClientId, mPriority, encoderInputFeatures, mEncoderOutputLength, crossAttentionMask,
         tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, mInputTokenExtraIds, mNumReturnSequences);
 }
 
@@ -102,8 +102,8 @@ void LlmRequest::initBindings(py::module_& m)
                  std::optional<LlmRequest::TensorPtr>, std::optional<std::vector<LlmRequest::SizeType32>>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::SizeType32>, std::optional<uint64_t>,
                  std::optional<LlmRequest::TensorPtr>, std::optional<LlmRequest::TensorPtr>,
-                 std::optional<executor::LookaheadDecodingConfig>, bool, bool, bool,
-                 std::optional<LlmRequest::VecTokens>, std::optional<LlmRequest::TensorPtr>, bool,
+                 std::optional<executor::LookaheadDecodingConfig>, std::optional<executor::KvCacheRetentionConfig>,
+                 bool, bool, bool, std::optional<LlmRequest::VecTokens>, std::optional<LlmRequest::TensorPtr>, bool,
                  std::optional<LlmRequest::LogitsPostProcessor>, bool, std::optional<LlmRequest::VecTokens>, bool,
                  std::optional<RequestIdType>, executor::PriorityType, std::optional<LlmRequest::TensorPtr>,
                  std::optional<LlmRequest::SizeType32>, std::optional<LlmRequest::TensorPtr>,
@@ -115,15 +115,15 @@ void LlmRequest::initBindings(py::module_& m)
             py::arg("prompt_embedding_table") = std::nullopt, py::arg("prompt_vocab_size") = std::nullopt,
             py::arg("lora_task_id") = std::nullopt, py::arg("lora_weights") = std::nullopt,
             py::arg("lora_config") = std::nullopt, py::arg("lookahead_config") = std::nullopt,
-            py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
-            py::arg("return_generation_logits") = false, py::arg("draft_tokens") = std::nullopt,
-            py::arg("draft_logits") = std::nullopt, py::arg("exclude_input_from_output") = false,
-            py::arg("logits_post_processor") = std::nullopt, py::arg("apply_logits_post_processor_batched") = false,
-            py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
-            py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority,
-            py::arg("encoder_input_features") = std::nullopt, py::arg("encoder_output_length") = std::nullopt,
-            py::arg("cross_attention_mask") = std::nullopt, py::arg("input_token_extra_ids") = std::nullopt,
-            py::arg("num_return_sequences") = 1)
+            py::arg("kv_cache_retention_config") = std::nullopt, py::arg("return_log_probs") = false,
+            py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
+            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt,
+            py::arg("exclude_input_from_output") = false, py::arg("logits_post_processor") = std::nullopt,
+            py::arg("apply_logits_post_processor_batched") = false, py::arg("encoder_input_tokens") = std::nullopt,
+            py::arg("return_encoder_output") = false, py::arg("client_id") = std::nullopt,
+            py::arg("priority") = executor::Request::kDefaultPriority, py::arg("encoder_input_features") = std::nullopt,
+            py::arg("encoder_output_length") = std::nullopt, py::arg("cross_attention_mask") = std::nullopt,
+            py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1)
         .def("get_num_tokens", &LlmRequest::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &LlmRequest::getMaxBeamNumTokens)
         .def("get_token", &LlmRequest::getToken, py::arg("beam"), py::arg("pos"))

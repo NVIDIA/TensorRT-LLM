@@ -60,12 +60,13 @@ using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 
 struct BlockKey
 {
+    bool hasLora;
     LoraTaskIdType loraTaskId;
     VecUniqueTokens uniqueTokens;
 
     bool operator==(BlockKey const& other) const noexcept
     {
-        return (loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
+        return (hasLora == other.hasLora && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
     }
 };
 
@@ -97,8 +98,14 @@ struct BlockKeyHasher
         c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
         c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
         c = c ^ (c >> 31);
-
         seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+
+        uint32_t d = static_cast<uint32_t>(blockKey.hasLora);
+        d = ((d >> 16) ^ d) * 0x45d9f3b;
+        d = ((d >> 16) ^ d) * 0x45d9f3b;
+        d = (d >> 16) ^ d;
+        seed ^= d + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+
         return seed;
     }
 };
@@ -107,13 +114,24 @@ using NextBlockMap = std::unordered_map<BlockKey, BlockPtr, BlockKeyHasher>;
 
 struct KvCacheStats
 {
+    // Number of maximum available blocks in the primary memory pool. This is determined and set by available primary
+    // memory. See calculateMaxNumBlocks for details.
     SizeType32 maxNumBlocks;
+    // Number of free blocks in the primary memory pool.
     SizeType32 freeNumBlocks;
+    // Number of used blocks in the primary memory pool. usedNumBlocks = maxNumBlocks - freeNumBlocks.
     SizeType32 usedNumBlocks;
     SizeType32 toksPerBlock;
+    // Total number of blocks allocated by all requests.
     SizeType32 allocTotalBlocks;
+    // Number of new blocks that were allocated.
     SizeType32 allocNewBlocks;
+    // Number of blocks that were matched and reused.
     SizeType32 reusedBlocks;
+    // Number of blocks that were not matched and not reused.
+    SizeType32 missedBlocks;
+    // Measuring the KV Cache reuse rate. cacheHitRate = reusedBlocks / (reusedBlocks + missedBlocks).
+    float cacheHitRate;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -152,6 +170,8 @@ public:
 
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
+    BlockPtr getPrevBlock() const;
+
     void setPrevBlock(BlockPtr prevBlock);
 
     void addNextBlock(BlockKey const& blockKey, BlockPtr block);
@@ -166,6 +186,10 @@ public:
     [[nodiscard]] bool isFull() const;
 
     [[nodiscard]] bool isShared() const;
+
+    void setPriority(executor::RetentionPriority priority);
+
+    executor::RetentionPriority getPriority() const;
 
 private:
     // Linear ID of block independent of pool
@@ -195,6 +219,9 @@ private:
 
     // Flag indicating if block is full
     bool mIsFull;
+
+    // Priority of the block
+    executor::RetentionPriority mPriority;
 };
 
 class GenerationRequest
@@ -203,14 +230,17 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit GenerationRequest(LlmRequest::RequestIdType requestId, SizeType32 numTokens, SizeType32 beamWidth,
-        SizeType32 maxBlocks, SizeType32 numPools = 1)
+        SizeType32 maxBlocks, SizeType32 numPools = 1,
+        executor::RetentionPriority decodeRetentionPriority
+        = executor::KvCacheRetentionConfig::kDefaultRetentionPriority)
         : mRequestId(requestId)
         , mNumTokens(numTokens)
         , mBeamWidth(beamWidth)
         , mCacheBlockIds(beamWidth)
-        , mCacheBlockIndices{
-              runtime::BufferManager::cpu(runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
-                  runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value)}
+        , mCacheBlockIndices{runtime::BufferManager::cpu(
+              runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
+              runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value)}
+        , mDecodeRetentionPriority(decodeRetentionPriority)
     {
         auto cacheBlockIdsRange = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices);
         std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
@@ -286,6 +316,11 @@ public:
         }
     }
 
+    [[nodiscard]] executor::RetentionPriority getDecodeRetentionPriority() const
+    {
+        return mDecodeRetentionPriority;
+    }
+
 private:
     // Request id of the sequence
     LlmRequest::RequestIdType mRequestId;
@@ -297,6 +332,8 @@ private:
     std::vector<std::vector<KVCacheBlock::IdType>> mCacheBlockIds;
     // Tensor of block indices allocated for each beam of the sequence
     runtime::ITensor::SharedPtr mCacheBlockIndices;
+    // The retention priority to assign to decode blocks
+    executor::RetentionPriority mDecodeRetentionPriority;
 };
 
 // attach metadata to a pool pointer
@@ -344,7 +381,8 @@ public:
     explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
         SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks,
-        CacheType cacheType = CacheType::kSELF);
+        CacheType cacheType = CacheType::kSELF,
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt);
 
     ~BlockManager();
 
@@ -394,6 +432,11 @@ public:
     [[nodiscard]] SizeType32 getNumAllocatedBlocks() const noexcept
     {
         return getMaxNumBlocks() - getNumFreeBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumMissedBlocks() const noexcept
+    {
+        return mMissedBlocks;
     }
 
     [[nodiscard]] bool hasFreeBlocks(SizeType32 numRequired = 1) const noexcept
@@ -494,20 +537,23 @@ private:
     //! \brief Store blocks in cached blocks.
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
-    void storeBlocks(std::list<BlockKey> blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
+    //! \param isChunkedContext Whether these blocks are being stored for chunked context.
+    void storeBlocks(std::list<BlockKey> blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
+        bool isChunkedContext = false);
 
     //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
     //! \param blockKeys Key of each block.
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(
-        std::list<BlockKey> const& blockKeys, SizeType32 numContextBlocks, GenerationRequest& sequence);
+    SizeType32 loadOrAllocateBlocks(std::list<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
+        GenerationRequest& sequence, std::vector<std::optional<executor::RetentionPriority>> blockPriorities);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
-    [[nodiscard]] BlockPtr getFreeBlock();
+    [[nodiscard]] BlockPtr getFreeBlock(
+        executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
 
     //! \brief Free block from previous block and claim it from free blocks list.
-    void claimLeafBlock(KVCacheBlock& block);
+    void claimLeafBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority = std::nullopt);
 
     //! \brief Compute pointer to raw KV block (K & V, all layers).
     [[nodiscard]] runtime::ITensor::SharedPtr computeBlockPointer(
@@ -546,12 +592,23 @@ private:
     std::vector<BlockPtr> mAllBlocksById;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
-    // Statistics for block allocations/reuse
-    std::size_t mAllocTotalBlocks, mAllocNewBlocks, mReusedBlocks;
     // KV cache type (self or cross)
     CacheType mCacheType;
     // Eviction Policy
     std::shared_ptr<BaseEvictionPolicy> mEvictionPolicy;
+
+    // Statistics for block allocations/reuse
+    // Total number of blocks allocated by all requests
+    SizeType32 mAllocTotalBlocks;
+    // Number of new blocks that were allocated
+    SizeType32 mAllocNewBlocks;
+    // Number of blocks that were reused
+    SizeType32 mReusedBlocks;
+    // Number of unique blocks that were reused
+    SizeType32 mReusedUniqueBlocks;
+    // Number of blocks that were not reused
+    SizeType32 mMissedBlocks;
+    std::set<KVCacheBlock::IdType> reusedBlockIds;
 
 private:
     friend class KVCacheManager;
@@ -570,13 +627,15 @@ public:
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, bool useOneMoreBlock,
         CudaStreamPtr stream, bool enableBlockReuse = false, bool onboardBlocks = true,
-        CacheType cacheType = CacheType::kSELF);
+        CacheType cacheType = CacheType::kSELF,
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, bool useOneMoreBlock,
         CudaStreamPtr stream, bool enableBlockReuse = true, bool onboardBlocks = true,
-        CacheType cacheType = CacheType::kSELF);
+        CacheType cacheType = CacheType::kSELF,
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt);
 
     void allocatePools(nvinfer1::DataType dtype, bool useUvm = false);
 
@@ -617,6 +676,11 @@ public:
         return mBlockManager.getNumReusedBlocks();
     }
 
+    [[nodiscard]] SizeType32 getNumMissedBlocks() const noexcept
+    {
+        return mBlockManager.getNumMissedBlocks();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const
     {
         KvCacheStats kvCacheStats;
@@ -627,7 +691,10 @@ public:
         kvCacheStats.allocTotalBlocks = getNumAllocTotalBlocks();
         kvCacheStats.allocNewBlocks = getNumAllocNewBlocks();
         kvCacheStats.reusedBlocks = getNumReusedBlocks();
-
+        kvCacheStats.missedBlocks = getNumMissedBlocks();
+        kvCacheStats.cacheHitRate = kvCacheStats.reusedBlocks == 0 ? 0
+                                                                   : static_cast<float>(kvCacheStats.reusedBlocks)
+                / static_cast<float>(kvCacheStats.reusedBlocks + kvCacheStats.missedBlocks);
         return kvCacheStats;
     }
 
@@ -689,14 +756,14 @@ public:
         runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const;
 
     // Sum of numLayers * 2 * numKvHeads * sizePerHead for each pool
-    [[nodiscard]] static SizeType32 calculateCacheSizePerToken(
-        tensorrt_llm::runtime::ModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig)
+    [[nodiscard]] static SizeType32 calculateCacheSizePerToken(tensorrt_llm::runtime::ModelConfig const& modelConfig,
+        tensorrt_llm::runtime::WorldConfig const& worldConfig, bool isCrossAttention = false)
     {
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
         // consider only local layers for the calculation
         return modelConfig.getSumLocalKvHeads(
-                   worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank())
+                   worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank(), isCrossAttention)
             * 2 * modelConfig.getSizePerHead();
     }
 

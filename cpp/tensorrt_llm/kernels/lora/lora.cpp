@@ -127,12 +127,10 @@ size_t LoraImpl::getWorkspaceSize(
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     auto const typeSize = tensorrt_llm::common::getDTypeSize(type);
-    TLLM_CHECK_WITH_INFO(
-        numTokens >= numReqs, fmtstr("num tokens %ld should be greater than num reqs %ld", numTokens, numReqs));
 
     return (size_t) getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices)
         + getLowRankWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, typeSize)
-        + getGemmParamsWorkSpaceSize(numReqs * mNumLoraModules);
+        + getGemmParamsWorkSpaceSize(std::min(numReqs, numTokens) * mNumLoraModules);
 }
 
 void LoraImpl::setBestTactic(std::optional<Config> config)
@@ -163,7 +161,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
     setGemmConfig();
 
     int64_t GemmWorkSpaceSize = getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices);
-    int64_t groupGemmParamsWorkSpaceSize = getGemmParamsWorkSpaceSize(numReqs * mNumLoraModules);
+    int64_t groupGemmParamsWorkSpaceSize = getGemmParamsWorkSpaceSize(std::min(numReqs, numTokens) * mNumLoraModules);
     void* gemmWorkSpace = workspace; // [gemmWorkSpace, lowrankWorkSpace, groupGemmParamsWorkSpace]
     void* lowRankWorkSpace = static_cast<char*>(gemmWorkSpace) + GemmWorkSpaceSize;
     void* groupGemmParamsWorkSpace = static_cast<char*>(lowRankWorkSpace)

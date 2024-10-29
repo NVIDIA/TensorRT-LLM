@@ -6,12 +6,30 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm.bench.run.dataclasses import (BenchmarkStatistics,
-                                                PercentileStats, RequestRecord)
+from tensorrt_llm.bench.benchmark.dataclasses import (BenchmarkStatistics,
+                                                      PercentileStats,
+                                                      RequestRecord)
 from tensorrt_llm.bindings import InferenceRequest
 
 ResponseTuple = namedtuple(
     "ResponseTuple", ["timestamp", "request_id", "final", "error", "tokens"])
+
+
+def get_executor_requests(
+    requests: List[InferenceRequest],
+    streaming: bool,
+) -> List[trtllm.Request]:
+    executor_requests = []
+    while requests:
+        request = requests.pop()
+        executor_requests.append(
+            get_executor_request(request,
+                                 pad_id=-1,
+                                 eos_id=-1,
+                                 streaming=streaming))
+        del request
+
+    return executor_requests
 
 
 def get_executor_request(request: InferenceRequest,
@@ -62,6 +80,8 @@ def get_settings_from_engine(
         "world_config": world_config,
     })
 
+    runtime_config["performance_options"] = {}
+    runtime_config["decoding_config"] = {}
     return runtime_config, engine_build_cfg
 
 
@@ -74,7 +94,7 @@ class StatsKeeper:
     def register_request(
         self,
         request_id: int,
-        timestamp: float,
+        timestamp: int,
         num_tokens: int,
     ) -> None:
         record = self.requests[request_id]
@@ -96,6 +116,7 @@ class StatsKeeper:
         end_time = -1
 
         request_latencies = []
+        generation_latencies = []
         intertoken_avg_latencies = []
         ttft_times = []
         last_queue_time = 0.0
@@ -108,6 +129,7 @@ class StatsKeeper:
             last_queue_time = entry.start_timestamp
 
             request_latencies.append(entry.end_to_end_latency)
+            generation_latencies.append(entry.generation_time)
             ttft_times.append(entry.time_to_first_token)
             intertoken_avg_latencies.append(entry.intertoken_latency)
 
@@ -117,6 +139,7 @@ class StatsKeeper:
         stats = BenchmarkStatistics(
             num_requests=num_requests,
             total_latency_ns=end_time - start_time,
+            total_generation_latency_ns=sum(generation_latencies),
             total_output_tokens=total_output_tokens,
             total_input_tokens=total_input_tokens,
             request_percentiles=PercentileStats.from_iterable(
@@ -124,6 +147,8 @@ class StatsKeeper:
             itl_percentiles=PercentileStats.from_iterable(
                 intertoken_avg_latencies),
             ttft_percentiles=PercentileStats.from_iterable(ttft_times),
+            generation_percentiles=PercentileStats.from_iterable(
+                generation_latencies),
             issue_rate_ns=queue_time_total / num_requests)
 
         return stats

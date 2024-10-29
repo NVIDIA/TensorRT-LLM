@@ -465,11 +465,10 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'].to(torch.float32).numpy(),
                                    atol=atols[dtype])
 
-    @parameterized.expand(list(product([True, False], [True, False])),
+    @parameterized.expand(list(product([True, False])),
                           name_func=unittest_name_func)
     @skip_pre_ampere  # Skip tests that are not supported in pre-ampere architecture
-    def test_prompt_tuning_embedding(self, enable_lookup_plugin,
-                                     remove_padding):
+    def test_prompt_tuning_embedding(self, remove_padding):
         torch.random.manual_seed(0)
         dtype = "bfloat16"
         trt_dtype = tensorrt_llm.str_dtype_to_trt(dtype)
@@ -510,9 +509,6 @@ class TestLayer(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
-
-        if enable_lookup_plugin:
-            net.plugin_config.lookup_plugin = dtype
 
         with tensorrt_llm.net_guard(net):
             ids_tensor = Tensor(name='ids',

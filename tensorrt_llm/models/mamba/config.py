@@ -33,15 +33,13 @@ class CheckpointType(str, Enum):
 
 
 def get_ckpt_type(model_path):
-    try:
-        hf_config = transformers.AutoConfig.from_pretrained(
-            model_path, trust_remote_code=True)
-        if hasattr(hf_config, "ssm_cfg") and hf_config.ssm_cfg:
-            return CheckpointType.state_spaces
-        return CheckpointType.hf
-    except OSError:
-        if os.path.exists(os.path.join(model_path, "params.json")):
-            return CheckpointType.mistral_inference
+    hf_config = transformers.AutoConfig.from_pretrained(model_path,
+                                                        trust_remote_code=True)
+    if hasattr(hf_config, "ssm_cfg") and hf_config.ssm_cfg:
+        return CheckpointType.state_spaces
+    if os.path.exists(os.path.join(model_path, "params.json")):
+        return CheckpointType.mistral_inference
+    return CheckpointType.hf
 
 
 class MambaConfig(PretrainedConfig):

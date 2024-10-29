@@ -426,6 +426,10 @@ public:
         TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput->lengths), 0, 1)};
         mBufferManager->copy(len.data(),*inputLengths);
 
+        std::vector<SizeType32> eid = {0};
+        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput->endIds), 0, 1)};
+        mBufferManager->copy(eid.data(),*endIds);
+
         std::vector<std::vector<float>> logProbs =
         {
             {-2.96689, -1.63675, -2.31329, -0.0377979, -2.2442, -1.57552, -0.310524, -0.696636, -2.41985},
@@ -554,6 +558,10 @@ public:
         std::vector<SizeType32> len = {3, 3, 3, 3, 3};
         TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput->lengths), 0, 1)};
         mBufferManager->copy(len.data(),*inputLengths);
+
+        std::vector<SizeType32> eid = {0};
+        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput->endIds), 0, 1)};
+        mBufferManager->copy(eid.data(),*endIds);
 
         std::vector<std::vector<float> >logProbs =
         {

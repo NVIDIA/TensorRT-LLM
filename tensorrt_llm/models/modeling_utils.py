@@ -1317,6 +1317,9 @@ def optimize_model(
     if use_parallel_embedding:
         model = parallelize_embedding(model)
     if share_embedding_table:
+        # if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt
+        # this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor
+        # however even if share_embedding_table is not enabled, trt would still only keep one copy of the table if the weights are identical
         model = share_embedding(model)
 
     # After weight loading

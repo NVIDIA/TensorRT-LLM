@@ -2,9 +2,10 @@ from pathlib import Path
 
 import click
 
+from tensorrt_llm.bench.benchmark.low_latency import latency_command
+from tensorrt_llm.bench.benchmark.throughput import throughput_command
 from tensorrt_llm.bench.build.build import build_command
 from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
-from tensorrt_llm.bench.run.run import run_command
 
 
 @click.group(name="trtllm-bench", context_settings={'show_default': True})
@@ -36,7 +37,8 @@ def main(
 
 
 main.add_command(build_command)
-main.add_command(run_command)
+main.add_command(throughput_command)
+main.add_command(latency_command)
 
 if __name__ == "__main__":
     main()

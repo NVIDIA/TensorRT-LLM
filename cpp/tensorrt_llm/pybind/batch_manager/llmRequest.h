@@ -68,8 +68,9 @@ public:
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
-        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
@@ -83,8 +84,8 @@ public:
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList,
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            promptEmbeddingTable, promptVocabSize, loraTaskId, loraWeights, loraConfig, lookaheadConfig, returnLogProbs,
-            returnContextLogits, returnGenerationLogits,
+            promptEmbeddingTable, promptVocabSize, loraTaskId, loraWeights, loraConfig, lookaheadConfig,
+            kvCacheRetentionConfig, returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,

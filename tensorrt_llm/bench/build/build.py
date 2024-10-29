@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from select import select
-from sys import stdin
 from typing import Dict, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup, RequiredMutuallyExclusiveOptionGroup
@@ -170,15 +168,12 @@ def build_command(
     # Dataset options
     dataset_path: Path = params.pop("dataset")
     max_seq_len: int = params.pop("max_seq_length")
-    data_on_stdin: bool = bool(len(select([
-        stdin,
-    ], [], [], 0.0)[0]))
+    # Initialize the HF tokenizer for the specified model.
+    tokenizer = initialize_tokenizer(bench_env.model)
 
     # If we are receiving data from a path or stdin, parse and gather metadata.
     if dataset_path:
         logger.info("Found dataset.")
-        # Initialize the HF tokenizer for the specified model.
-        tokenizer = initialize_tokenizer(bench_env.model)
         # Dataset Loading and Preparation
         with open(dataset_path, "r") as dataset:
             metadata, _ = create_dataset_from_stream(

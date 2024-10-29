@@ -584,6 +584,11 @@ class TestFunctional(unittest.TestCase):
                 configuration.max_position_embeddings = (
                     in_len // 2) + out_len - (out_len // 2)
         attention = AttentionCls(configuration).cuda().eval()
+        if isinstance(attention, LlamaAttention):
+            from transformers.models.llama.modeling_llama import \
+                LlamaRotaryEmbedding
+            attention.rotary_emb = LlamaRotaryEmbedding(config=configuration,
+                                                        device="cuda")
         if attention_type == 'gpt2_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
                 data=weight.clone().detach(), requires_grad=False)

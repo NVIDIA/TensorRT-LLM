@@ -17,6 +17,8 @@ class RuntimeConfig(BaseModel):
     sw_version: str
     settings_config: ExecutorSettingsConfig
     world_config: ExecutorWorldConfig
+    decoding_config: DecodingConfig
+    performance_options: PerformanceOptions
 
     def get_config(self) -> trtllm.ExecutorConfig:
         return trtllm.ExecutorConfig(
@@ -29,7 +31,45 @@ class RuntimeConfig(BaseModel):
             max_batch_size=self.settings_config.max_batch_size,
             max_num_tokens=self.settings_config.max_num_tokens,
             enable_chunked_context=self.settings_config.chunking,
+            extended_runtime_perf_knob_config=self.performance_options.
+            get_perf_config(),
+            decoding_config=self.decoding_config.get_decoding_config(),
         )
+
+    @model_validator(mode="after")
+    def validate_full_config(self) -> RuntimeConfig:
+        # TODO: Check engine to make sure it can support Medusa.
+        return self
+
+
+class PerformanceOptions(BaseModel):
+    cuda_graphs: bool = False
+    multi_block_mode: bool = False
+    cuda_graph_cache_size: int = 1000
+
+    def get_perf_config(self) -> trtllm.ExtendedRuntimePerfKnobConfig:
+        config = trtllm.ExtendedRuntimePerfKnobConfig()
+        config.cuda_graph_mode = self.cuda_graphs
+        config.multi_block_mode = self.multi_block_mode
+        config.cuda_graph_cache_size = self.cuda_graph_cache_size
+
+        return config
+
+
+class DecodingConfig(BaseModel):
+    medusa_choices: Optional[List[List[int]]] = None
+
+    def get_decoding_config(self) -> trtllm.DecodingConfig:
+        config = None
+        if self.medusa_choices is not None:
+            config = trtllm.DecodingConfig(
+                decoding_mode=trtllm.DecodingMode.Medusa(),
+                medusa_choices=self.medusa_choices,
+            )
+        else:
+            config = trtllm.DecodingConfig()
+
+        return config
 
 
 class ExecutorWorldConfig(BaseModel):
@@ -124,7 +164,7 @@ class RequestRecord(BaseModel):
 
     @computed_field
     def generation_time(self) -> int:
-        return self.end_timestamp - self.time_to_first_token
+        return self.end_to_end_latency - self.time_to_first_token
 
     @computed_field
     def time_to_first_token(self) -> int:
@@ -145,7 +185,7 @@ class RequestRecord(BaseModel):
 
     @computed_field
     def output_token_throughput(self) -> float:
-        return self.num_output_tokens / self.generation_time
+        return self.num_generated_tokens / self.generation_time
 
 
 class PercentileStats(BaseModel):
@@ -171,20 +211,36 @@ class PercentileStats(BaseModel):
 
 
 class BenchmarkStatistics(BaseModel):
+    # Time-related Properties
     total_latency_ns: float
+    total_generation_latency_ns: float
+
+    # Token-related Properties
     total_output_tokens: int
     total_input_tokens: int
+
+    # General Information
     num_requests: int
     issue_rate_ns: float
 
+    # Percentile-related Statistics
     request_percentiles: Optional[PercentileStats] = None
     token_percentiles: Optional[PercentileStats] = None
     itl_percentiles: Optional[PercentileStats] = None
     ttft_percentiles: Optional[PercentileStats] = None
+    generation_percentiles: Optional[PercentileStats] = None
+
+    @computed_field
+    def generation_tokens(self) -> int:
+        return int(self.total_output_tokens - self.num_requests)
 
     @computed_field
     def token_throughput_ns(self) -> float:
         return float(self.total_output_tokens) / self.total_latency_ns
+
+    @computed_field
+    def generation_token_throughput_ns(self) -> float:
+        return float(self.generation_tokens) / self.total_generation_latency_ns
 
     @computed_field
     def request_throughput_ns(self) -> float:

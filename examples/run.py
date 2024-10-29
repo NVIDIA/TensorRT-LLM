@@ -674,8 +674,6 @@ def main(args):
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
         )
-        if not args.use_py_session:
-            runner_kwargs.update(is_enc_dec=is_enc_dec)
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -689,6 +687,7 @@ def main(args):
             runner_kwargs.update(lookahead_config=args.lookahead_config)
         if not args.use_py_session:
             runner_kwargs.update(
+                is_enc_dec=is_enc_dec,
                 max_batch_size=len(batch_input_ids),
                 max_input_len=max(
                     encoder_input_lengths if is_enc_dec else input_lengths),
@@ -699,6 +698,8 @@ def main(args):
                 kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
                 kv_cache_free_gpu_memory_fraction=args.
                 kv_cache_free_gpu_memory_fraction,
+                cross_kv_cache_fraction=args.cross_kv_cache_fraction
+                if is_enc_dec else None,
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
                 cuda_graph_mode=args.cuda_graph_mode)

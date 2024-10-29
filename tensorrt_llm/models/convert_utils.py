@@ -67,14 +67,14 @@ def get_weight(params: Dict[str, torch.Tensor], prefix: str,
                dtype: torch.dtype) -> torch.Tensor:
     if f'{prefix}.weight' not in params:
         return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
+    return params[f'{prefix}.weight'].to(dtype).detach().cpu().contiguous()
 
 
 def get_bias(params: Dict[str, torch.Tensor], prefix: str,
              dtype: torch.dtype) -> torch.Tensor:
     if f'{prefix}.bias' not in params:
         return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
+    return params[f'{prefix}.bias'].to(dtype).detach().cpu().contiguous()
 
 
 def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,

@@ -417,6 +417,13 @@ def add_common_args(parser):
         help='Specify the free gpu memory fraction.',
     )
     parser.add_argument(
+        '--cross_kv_cache_fraction',
+        default=0.5,
+        type=float,
+        help=
+        'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
+    )
+    parser.add_argument(
         '--enable_chunked_context',
         action='store_true',
         help='Enables chunked context (only available with cpp session).',

@@ -154,6 +154,18 @@ public:
     static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
     static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
 
+    // KvCacheRetentionConfig
+    static KvCacheRetentionConfig deserializeKvCacheRetentionConfig(std::istream& is);
+    static void serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os);
+    static size_t serializedSize(KvCacheRetentionConfig const& kvCacheRetentionConfig);
+
+    // TokenRangeRetentionPriority
+    static KvCacheRetentionConfig::TokenRangeRetentionPriority deserializeTokenRangeRetentionPriority(std::istream& is);
+    static void serialize(
+        KvCacheRetentionConfig::TokenRangeRetentionPriority const& tokenRangeRetentionPriority, std::ostream& os);
+    static size_t serializedSize(
+        KvCacheRetentionConfig::TokenRangeRetentionPriority const& tokenRangeRetentionPriority);
+
     // DecodingConfig
     static DecodingConfig deserializeDecodingConfig(std::istream& is);
     static void serialize(DecodingConfig const& decodingConfig, std::ostream& os);

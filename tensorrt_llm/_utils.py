@@ -260,6 +260,29 @@ def torch_dtype_to_np(dtype):
     return ret
 
 
+_np_to_torch_dtype_dict = {
+    np.bool_: torch.bool,
+    np.uint8: torch.uint8,
+    np.int8: torch.int8,
+    np.int16: torch.int16,
+    np.int32: torch.int32,
+    np.int64: torch.int64,
+    np.float16: torch.float16,
+    np_bfloat16: torch.bfloat16,
+    np_float8: torch.float8_e4m3fn,
+    np.float32: torch.float32,
+    np.float64: torch.float64,
+    np.complex64: torch.complex64,
+    np.complex128: torch.complex128,
+}
+
+
+def np_dtype_to_torch(dtype):
+    ret = _np_to_torch_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 _trt_to_torch_dtype_dict = {
     trt.float16: torch.float16,
     trt.float32: torch.float32,
@@ -304,6 +327,25 @@ _torch_to_trt_dtype_dict = {
 
 def torch_dtype_to_trt(dtype):
     ret = _torch_to_trt_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
+_torch_dtype_to_np_typestr_dict = {
+    torch.float16: "<f2",
+    torch.float32: "<f4",
+    torch.int64: "<i8",
+    torch.int32: "<i4",
+    torch.int8: "|i1",
+    torch.float8_e4m3fn: "<f1",
+    torch.qint8: "|u1",
+    torch.bool: "|b1",
+    torch.bfloat16: "<f2",
+}
+
+
+def torch_dtype_to_np_typestr(dtype):
+    ret = _torch_dtype_to_np_typestr_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
 

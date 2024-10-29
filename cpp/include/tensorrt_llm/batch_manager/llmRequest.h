@@ -95,8 +95,9 @@ public:
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
-        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -134,6 +135,7 @@ public:
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(std::move(lookaheadConfig))
+        , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mContextChunkSize{mPromptLen}
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
@@ -188,6 +190,7 @@ public:
         , mLoraWeights(std::nullopt)
         , mLoraConfig(std::nullopt)
         , mLookaheadConfig(std::nullopt)
+        , mKvCacheRetentionConfig(std::nullopt)
         , mContextChunkSize{mPromptLen}
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
@@ -825,6 +828,16 @@ public:
     void setLookaheadConfig(executor::LookaheadDecodingConfig config)
     {
         mLookaheadConfig = config;
+    }
+
+    [[nodiscard]] std::optional<executor::KvCacheRetentionConfig> getKvCacheRetentionConfig() const
+    {
+        return mKvCacheRetentionConfig;
+    }
+
+    void setKvCacheRetentionConfig(executor::KvCacheRetentionConfig config)
+    {
+        mKvCacheRetentionConfig = config;
     }
 
     void clearLookaheadConfig()
@@ -1502,6 +1515,23 @@ public:
         return mReusedBlocksPerRequest;
     }
 
+    void updateMissedBlocksPerRequest(SizeType32 missedBlocksPerRequest)
+    {
+        mMissedBlocksPerRequest += missedBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getMissedBlocksPerRequest() const
+    {
+        return mMissedBlocksPerRequest;
+    }
+
+    [[nodiscard]] float getKVCacheHitRatePerRequest() const
+    {
+        return mReusedBlocksPerRequest == 0 ? 0
+                                            : static_cast<float>(mReusedBlocksPerRequest)
+                / (static_cast<float>(mReusedBlocksPerRequest + mMissedBlocksPerRequest));
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1552,6 +1582,7 @@ protected:
     std::optional<TensorPtr> mLoraConfig;
     std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig;
 
+    std::optional<executor::KvCacheRetentionConfig> mKvCacheRetentionConfig;
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
     // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
     // of null value is that the context is not chunked.
@@ -1613,6 +1644,7 @@ protected:
     SizeType32 mAllocTotalBlocksPerRequest{0};
     SizeType32 mAllocNewBlocksPerRequest{0};
     SizeType32 mReusedBlocksPerRequest{0};
+    SizeType32 mMissedBlocksPerRequest{0};
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
@@ -1757,8 +1789,9 @@ public:
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
-        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -1775,11 +1808,11 @@ public:
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
-            std::move(lookaheadConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
-            std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
-            applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
-            llmRequestType, std::move(inputTokenExtraIds), numReturnSequences)
+            std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
+            returnGenerationLogits, std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput,
+            std::move(logitsPostProcessor), applyLogitsPostProcessorBatched, std::move(encoderInputTokens),
+            returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), std::move(encoderOutputLength),
+            std::move(crossAttentionMask), llmRequestType, std::move(inputTokenExtraIds), numReturnSequences)
     {
     }
 
@@ -1791,6 +1824,7 @@ public:
         mLogitsPostProcessor = std::move(logitsPostProcessor);
         mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
         mLookaheadConfig = request.getLookaheadConfig();
+        mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
     }
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId)

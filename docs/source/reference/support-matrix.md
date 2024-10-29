@@ -105,9 +105,9 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [24.07](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [24.09](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.4](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.5](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4

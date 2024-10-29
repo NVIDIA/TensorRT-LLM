@@ -1,26 +1,36 @@
+(perf-benchmarking)=
+
 # TensorRT-LLM Benchmarking
 
-> [!WARNING] Work in Progress
-> This benchmarking suite is a current work in progress and is prone to large changes.
+```{important}
+This benchmarking suite is a work in progress.
+Expect breaking API changes.
+```
 
-TensorRT-LLM provides a packaged benchmarking utility that is accessible via the `trtllm-bench` CLI tool.
+TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility.
 
 #### Supported Networks for Benchmarking
 
-- [`tiiuae/falcon-180B`](https://huggingface.co/tiiuae/falcon-180B)
-- [`meta-llama/Llama-2-7b-hf`](https://huggingface.co/meta-llama/Llama-2-7b-hf)
-- [`meta-llama/Llama-2-70b-hf`](https://huggingface.co/meta-llama/Llama-2-70b-hf)
-- [`meta-llama/Meta-Llama-3-8B`](https://huggingface.co/meta-llama/Meta-Llama-3-8B)
-- [`meta-llama/Meta-Llama-3-70B`](https://huggingface.co/meta-llama/Meta-Llama-3-70B)
-- [`EleutherAI/gpt-j-6b`](https://huggingface.co/EleutherAI/gpt-j-6b)
-- [`mistralai/Mistral-7B-v0.1`](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [`mistralai/Mixtral-8x7B-v0.1`](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
+- [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
+- [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b-hf)
+- [tiiuae/falcon-180B](https://huggingface.co/tiiuae/falcon-180B)
+- [EleutherAI/gpt-j-6b](https://huggingface.co/EleutherAI/gpt-j-6b)
+- [meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B)
+- [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B)
+- [meta-llama/Meta-Llama-3-70B](https://huggingface.co/meta-llama/Meta-Llama-3-70B)
+- [meta-llama/Llama-3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70B)
+- [meta-llama/Llama-3.1-405B](https://huggingface.co/meta-llama/Llama-3.1-405B)
+- [mistralai/Mixtral-8x7B-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
+- [mistralai/Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)
+- [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+- [meta-llama/Llama-3.1-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct)
+- [meta-llama/Llama-3.1-405B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct)
+- [mistralai/Mixtral-8x7B-v0.1-Instruct](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct)
 
 
 #### Support Quantization Modes
 
-TensorRT-LLM supports a number of quanization modes. For more information about quantization, see the
-[documentation](https://nvidia.github.io/TensorRT-LLM/reference/precision.html).
+TensorRT-LLM supports a number of quantization modes:
 
 - None (no quantization applied)
 - W8A16
@@ -31,7 +41,8 @@ TensorRT-LLM supports a number of quanization modes. For more information about 
 - FP8
 - INT8
 
-> [!NOTE] Please see the supported quantization methods for each network [here](https://nvidia.github.io/TensorRT-LLM/reference/precision.html#support-matrix)
+For more information about quantization, refer to [](../reference/precision.md) and
+the [support matrix](../reference/precision.md#support-matrix) of the supported quantization methods for each network.
 
 
 ## Inflight Benchmarking with a Dataset
@@ -41,9 +52,10 @@ This section covers how to benchmark TensorRT-LLM using inflight batching.
 
 ### Quickstart
 
-For this quick start guide, we will focus on running a short max throughput benchmark on
+This quick start focuses on running a short max throughput benchmark on
 `meta-llama/Llama-2-7b-hf` on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
-of 128:128. In order to run the benchmark from start to finish simply run the following commands:
+of 128:128.
+To run the benchmark from start to finish, run the following commands:
 
 ```shell
 python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000 > /tmp/synthetic_128_128.txt
@@ -51,7 +63,8 @@ trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128
 trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
 ```
 
-And that's it! Once the benchmark completes, a summary will be printed with summary metrics.
+And that's it!
+After the benchmark completes, `trtllm-bench` prints a summary with summary metrics.
 
 ```shell
 ===========================================================
@@ -108,28 +121,31 @@ straightforward to specify requests. The schema is defined as follows:
 | `logits`        |    N*    | List[Integer] | List of logits that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
 
-> [!NOTE] Prompt and logits are mutually exclusive*
-> While having both `prompt` and `logits` is not required, at least one is required.
-> If `logits` are specified, the `prompt` entry is ignored for request generation.
+Prompt and logits are mutually exclusive, but one of `prompt` or `logits` is required.
+If you specify `logits`, the `prompt` entry is ignored for request generation.
 
-Examples of valid entries for the inflight benchmark are:
+Refer to the following examples of valid entries for the inflight benchmark:
 
 - Entries with a human-readable prompt and no logits.
-```json
-{"task_id": 1, "prompt": "Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend.", "output_tokens": 1000}
-{"task_id": 2, "prompt": "Generate an infinite response to the following: Na, na, na, na", "output_tokens": 1000}
-```
+
+  ```json
+  {"task_id": 1, "prompt": "Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend.", "output_tokens": 1000}
+  {"task_id": 2, "prompt": "Generate an infinite response to the following: Na, na, na, na", "output_tokens": 1000}
+  ```
 
 - Entries which contain logits.
-```json
-{"task_id":0,"logits":[863,22056,25603,11943,8932,13195,3132,25032,21747,22213],"output_tokens":128}
-{"task_id":1,"logits":[14480,13598,15585,6591,1252,8259,30990,26778,7063,30065,21764,11023,1418],"output_tokens":128}
-```
 
-> [!INFO] A whole entry is on a line!
-> To make the passing of data simpler, a complete JSON entry is on each line so that the benchmarker
-> can simply read a line and assume a complete entry. When creating a dataset, be sure that a complete
-> JSON entry is on every line.
+  ```json
+  {"task_id":0,"logits":[863,22056,25603,11943,8932,13195,3132,25032,21747,22213],"output_tokens":128}
+  {"task_id":1,"logits":[14480,13598,15585,6591,1252,8259,30990,26778,7063,30065,21764,11023,1418],"output_tokens":128}
+  ```
+
+```{tip}
+Specify each entry on one line.
+To simplify passing the data, a complete JSON entry is on each line so that the benchmarker
+can simply read a line and assume a complete entry. When creating a dataset, be sure that a complete
+JSON entry is on every line.
+```
 
 #### Using `prepare_dataset` to Create Synthetic Datasets
 
@@ -162,12 +178,12 @@ trtllm-bench --model meta-llama/Llama-2-7b-hf build --max_seq_len 256 --quantiza
 
 > [!NOTE] `trtllm-bench build` reproduces benchmark engines for performance study. These engine
 configurations are not guaranteed to be optimal for all cases and should be viewed as reproducers
-for the benchmark data we provide on our [Performance Overview](../docs/source/performance/perf-overview.md).
+for the benchmark data we provide on our [Performance Overview](./perf-overview.md).
 
 Looking a little closer, the `build` sub-command
 will perform a lookup and build an engine using those reference settings. The
 look up table directly corresponds to the performance table found in our
-[Performance Overview](../docs/source/performance/perf-overview.md#throughput-measurements). The
+[Performance Overview](./perf-overview.md#throughput-measurements). The
 output of the `build` sub-command looks similar to the snippet below (for `meta-llama/Llama-2-7b-hf`):
 
 ```shell
@@ -236,16 +252,17 @@ upper bound throughput number.
 
 #### How the Benchmarker Works
 
-The benchmarker will read in a data file or standard input (stdin) as a stream where a single line contains
-a complete JSON request entry. The process that the benchmarker is as follows:
+The benchmarker reads a data file where a single line contains
+a complete JSON request entry as specified in [](#preparing-a-dataset).
+The process that the benchmarker is as follows:
 
 1. Iterate over all input requests. If `logits` is specified, construct the request using the specified
 list of logits. Otherwise, tokenize the `prompt` with as specified by `--model $HF_MODEL_NAME`.
-3. Submit the dataset to the TensorRT-LLM `Executor` API at as fast of a rate as possible (offline mode).
-4. Wait for all requests to return, compute statistics, then report out results.
+1. Submit the dataset to the TensorRT-LLM `Executor` API as fast as possible (offline mode).
+1. Wait for all requests to return, compute statistics, and then report results.
 
-To run the benchmarker, run the following with the [engine](#building-a-benchmark-engine) and
-[dataset](#preparing-a-dataset) generated above:
+To run the benchmarker, run the following commands with the [engine](#building-a-benchmark-engine) and
+[dataset](#preparing-a-dataset) generated from previous steps:
 
 ```shell
 trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
@@ -316,16 +333,157 @@ Total Latency (seconds):        20.331645167
 [TensorRT-LLM][INFO] Refreshed the MPI local session
 ```
 
+## Low Latency Benchmark
+
+The low latency benchmark follows a similar workflow to the [throughput benchmark](#running-a-max-throughput-benchmark)
+but requires building the engine separately from `trtllm-bench`. Low latency benchmarks has the following modes:
+
+- A single-request low-latency engine
+- A Medusa-enabled speculative-decoding engine
+
+### Low Latency TensorRT-LLM Engine for Llama-3 70B
+
+To build a low-latency engine for the latency benchmark, run the following quantize and build commands.
+The `$checkpoint_dir` is the path to the [meta-llama/Meta-Llama-3-70B](https://huggingface.co/meta-llama/Meta-Llama-3-70B) Hugging Face checkpoint in your cache or downloaded to a specific location with the [huggingface-cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
+To prepare a dataset, follow the same process as specified in [](#preparing-a-dataset).
+
+#### Benchmarking a non-Medusa Low Latency Engine
+
+To quantize the checkpoint:
+
+```shell
+cd tensorrt_llm/examples/llama
+python ../quantization/quantize.py \
+    --model_dir $checkpoint_dir \
+    --dtype bfloat16 \
+    --qformat fp8 \
+    --kv_cache_dtype fp8 \
+    --output_dir /tmp/meta-llama/Meta-Llama-3-70B/checkpoint \
+    --calib_size 512 \
+    --tp_size $tp_size
+```
+
+then build,
+
+```shell
+trtllm-build \
+    --checkpoint_dir /tmp/meta-llama/Meta-Llama-3-70B/checkpoint \
+    --use_fused_mlp enable \
+    --gpt_attention_plugin bfloat16 \
+    --output_dir /tmp/meta-llama/Meta-Llama-3-70B/engine \
+    --max_batch_size 1 \
+    --max_seq_len $(($isl+$osl)) \
+    --reduce_fusion enable \
+    --gemm_plugin fp8 \
+    --workers $tp_size \
+    --use_fp8_context_fmha enable \
+    --max_num_tokens $isl \
+    --use_paged_context_fmha disable \
+    --multiple_profiles enable
+```
+
+After the engine is built, run the low-latency benchmark:
+
+```shell
+env TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG=1 \
+  TRTLLM_MMHA_KERNEL_BLOCK_SIZE=256 \
+  TRTLLM_MMHA_BLOCKS_PER_SEQUENCE=32 \
+  FORCE_MULTI_BLOCK_MODE=ON \
+  TRTLLM_ENABLE_FDL=1 \
+  trtllm-bench --model meta-llama/Meta-Llama-3-70B \
+  latency \
+  --dataset $DATASET_PATH \
+  --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/engine
+```
+
+#### Building a Medusa Low-Latency Engine
+
+To build a Medusa-enabled engine requires checkpoints that contain Medusa heads.
+NVIDIA provides TensorRT-LLM checkpoints on the [NVIDIA](https://huggingface.co/nvidia) page on Hugging Face.
+The checkpoints are pre-quantized and can be directly built after downloading them with the
+[huggingface-cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
+After you download the checkpoints, run the following command and specify the `$tp_size` supported by your Medusa checkpoint:
+
+```shell
+trtllm-build --checkpoint_dir $checkpoint_dir \
+    --speculative_decoding_mode medusa \
+    --max_batch_size 1 \
+    --gpt_attention_plugin bfloat16 \
+    --max_seq_len $(($isl+$osl)) \
+    --output_dir /tmp/meta-llama/Meta-Llama-3-70B/medusa/engine \
+    --use_fused_mlp enable \
+    --paged_kv_cache enable \
+    --use_paged_context_fmha disable \
+    --multiple_profiles enable \
+    --reduce_fusion enable \
+    --use_fp8_context_fmha enable \
+    --workers $tp_size \
+    --low_latency_gemm_plugin fp8
+```
+
+After the engine is built, you need to define the Medusa choices.
+The choices are specify with a YAML file like the following example (`medusa.yaml`):
+
+```yaml
+- [0]
+- [0, 0]
+- [1]
+- [0, 1]
+- [2]
+- [0, 0, 0]
+- [1, 0]
+- [0, 2]
+- [3]
+- [0, 3]
+- [4]
+- [0, 4]
+- [2, 0]
+- [0, 5]
+- [0, 0, 1]
+```
+
+To run the Medusa-enabled engine, run the following command:
+
+```shell
+env TRTLLM_ENABLE_PDL=1 \
+  UB_ONESHOT=1 \
+  UB_TP_SIZE=$tp_size \
+  TRTLLM_ENABLE_PDL=1 \
+  TRTLLM_PDL_OVERLAP_RATIO=0.15 \
+  TRTLLM_PREFETCH_RATIO=-1 \
+  trtllm-bench --model meta-llama/Meta-Llama-3-70B \
+  latency \
+  --dataset $DATASET_PATH \
+  --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/medusa/engine \
+  --medusa_choices medusa.yml
+```
+
 ## Summary
 
-In summary, the general process for reproducing a benchmark point is as follows:
+The following table summarizes the commands needed for running benchmarks:
 
-- Prepare a dataset: `python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH`
-- Build engine: `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH`
-- Benchmark engine: trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR`
+| Scenario | Phase | Command |
+| - | - | - |
+| Dataset | Preparation | `python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH` |
+| Throughput | Build | `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH` |
+| Throughput | Benchmark | `trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
+| Latency | Build | See [section about building low latency engines](#low-latency-tensorrt-llm-engine-for-llama-3-70b) |
+| Non-Medusa Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
+| Medusa Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR --medusa_choices $MEDUSA_CHOICES` |
 
 where,
-- `$HF_MODEL` is the Huggingface name of a model.
-- `$NUM_REQUESTS` is the number of requests to generate.
-- `$DATASET_PATH` is the path where the dataset was written when preparing the dataset.
-- `$ENGINE_DIR` the engine directory as printed by `trtllm-bench build`.
+
+`$HF_MODEL`
+: The Hugging Face name of a model.
+
+`$NUM_REQUESTS`
+: The number of requests to generate.
+
+`$DATASET_PATH`
+: The path where the dataset was written when preparing the dataset.
+
+`$ENGINE_DIR`
+: The engine directory as printed by `trtllm-bench build`.
+
+`$MEDUSA_CHOICES`
+: A YAML config representing the Medusa tree for the benchmark.

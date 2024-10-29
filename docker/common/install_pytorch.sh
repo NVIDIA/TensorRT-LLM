@@ -4,12 +4,8 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-07.html#rel-24-07
-TORCH_VERSION="2.4.0"
-# Check the compatible torchvision from
-# https://github.com/pytorch/vision/tree/main?tab=readme-ov-file#installation
-# and also confirm with https://pypi.org/pypi/torchvision/0.19.0/json
-TORCHVISION_VERSION="0.19.0"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-09.html#rel-24-09
+TORCH_VERSION="2.4.1"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -61,6 +57,9 @@ install_from_source() {
     python3 setup.py install
     cd /tmp && rm -rf /tmp/pytorch
 
+    # Get torchvision version by dry run
+    TORCHVISION_VERSION=$(pip3 install --dry-run torch==${TORCH_VERSION} torchvision | grep "Would install" | tr ' ' '\n' | grep torchvision | cut -d "-" -f 2)
+
     export PYTORCH_VERSION=${PYTORCH_BUILD_VERSION}
     export FORCE_CUDA=1
     export BUILD_VERSION=${TORCHVISION_VERSION}
@@ -76,7 +75,7 @@ install_from_source() {
 
 install_from_pypi() {
     pip3 uninstall -y torch torchvision
-    pip3 install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION}
+    pip3 install torch==${TORCH_VERSION} torchvision
 }
 
 case "$1" in

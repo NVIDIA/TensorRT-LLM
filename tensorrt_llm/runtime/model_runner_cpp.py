@@ -91,6 +91,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         max_attention_window_size: Optional[list[int]] = None,
         sink_token_length: Optional[int] = None,
         kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+        cross_kv_cache_fraction: Optional[float] = None,
         medusa_choices: list[list[int]] | None = None,
         lookahead_config: list[int] | None = None,
         debug_mode: bool = False,
@@ -139,6 +140,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The sink token length, default=0.
             kv_cache_free_gpu_memory_fraction (float) :
                 Free GPU memory fraction that KV cache used.
+            cross_kv_cache_fraction (float) :
+                KV Cache fraction reserved for cross attention, should only be used with enc-dec models.
             debug_mode (bool):
                 Whether or not to turn on the debug mode.
             medusa_choices (List[List[int]]):
@@ -201,8 +204,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             profiler.start('load tensorrt_llm engine')
 
             kv_cache_config = trtllm.KvCacheConfig(
-                free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction /
-                2,  # hardcoded as half self kv & half cross kv for now
+                free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+                cross_kv_cache_fraction=cross_kv_cache_fraction,
                 max_attention_window=max_attention_window_size,
                 sink_token_length=sink_token_length)
 
@@ -234,6 +237,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
         use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
+        if not model_config.use_cross_attention:
+            assert cross_kv_cache_fraction is None, "cross_kv_cache_fraction should only be used with enc-dec models."
 
         if not use_kv_cache:
             assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
@@ -306,7 +311,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             max_attention_window=max_attention_window_size,
             sink_token_length=sink_token_length,
             max_tokens=max_tokens_in_paged_kv_cache,
-            enable_block_reuse=kv_cache_enable_block_reuse)
+            enable_block_reuse=kv_cache_enable_block_reuse,
+            cross_kv_cache_fraction=cross_kv_cache_fraction,
+        )
 
         decoding_config = trtllm.DecodingConfig()
         if medusa_choices is not None:

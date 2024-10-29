@@ -114,13 +114,8 @@ def convert_hf_model(model_dir, dtype, out_dir):
     with open(f"{model_dir}/adapter_config.json", "r") as f:
         config = json.load(f)
 
-    rank = config.get("r")
     alpha = config.get("lora_alpha")
     use_rslora = config.get("use_rslora", False)
-    if use_rslora:
-        scale = alpha / np.sqrt(rank)
-    else:
-        scale = alpha / rank
 
     lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
     lora_model = preprocess_lora_weights(lora_model)
@@ -148,6 +143,10 @@ def convert_hf_model(model_dir, dtype, out_dir):
                     adapter_size = dim0
                     w = w.transpose(1, 0)
                 if inout == "out":
+                    if use_rslora:
+                        scale = alpha / np.sqrt(adapter_size)
+                    else:
+                        scale = alpha / adapter_size
                     w = w * scale
                 w = w.contiguous().flatten().to(dtype=str_dtype_to_torch(dtype))
                 in_out_weights.append(w)

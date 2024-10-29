@@ -785,7 +785,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         = mEnableContextFMHA ? 0 : sizeof(T) * params.batch_size * params.input_seq_length * kv_seq_length;
     size_t const cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
     size_t const rotary_inv_freq_size = sizeof(float) * params.batch_size * mRotaryEmbeddingDim / 2;
-    size_t const q_buf_2_size = mFMHARunner->isSeparateQAndKvInput() || !mEnableContextFMHA
+    size_t const q_buf_2_size = !mEnableContextFMHA || mFMHARunner->isSeparateQAndKvInput()
         ? sizeof(T) * params.batch_size * params.input_seq_length * local_hidden_units_qo
         : 0;
     size_t const k_buf_2_size

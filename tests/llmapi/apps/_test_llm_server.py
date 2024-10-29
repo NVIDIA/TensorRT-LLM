@@ -19,9 +19,9 @@ def client():
     build_config.max_batch_size = 8
     build_config.max_seq_len = 512
     llm = LLM(llama_model_path, build_config=build_config)
-    kv_cache_config = KvCacheConfig()
+    KvCacheConfig()
 
-    app_instance = LlmServer(llm, kv_cache_config)
+    app_instance = LlmServer(llm)
     client = TestClient(app_instance.app)
     yield client
 

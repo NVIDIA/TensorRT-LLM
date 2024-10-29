@@ -84,6 +84,13 @@ def parse_arguments():
         type=float,
         help='Specify the free gpu memory fraction.',
     )
+    parser.add_argument(
+        '--cross_kv_cache_fraction',
+        default=0.5,
+        type=float,
+        help=
+        'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
+    )
     return parser.parse_args()
 
 
@@ -122,6 +129,9 @@ def print_result(model, input_text, output_text, args):
                 assert 'robot' in output_text[0][0].lower()
             elif model.model_type == 'kosmos-2':
                 assert 'snowman' in output_text[0][0].lower()
+            elif model.model_type == "mllama":
+                assert "it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a" in output_text[
+                    0][0]
             else:
                 assert output_text[0][0].lower() == 'singapore'
 

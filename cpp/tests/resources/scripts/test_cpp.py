@@ -139,7 +139,8 @@ def parallel_run_ctest(
             # Some catastrophic fail happened that there's no report generated
             raise
 
-        parallel_report = 'parallel-' + report
+        # Avoid .xml extension to prevent CI from reading failures from it
+        parallel_report = 'parallel-' + report + ".intermediate"
         _os.rename(cwd / report, cwd / parallel_report)
 
         try:
@@ -153,7 +154,7 @@ def parallel_run_ctest(
                 # Use parallel result as final report
                 _os.rename(cwd / parallel_report, cwd / report)
             else:
-                retry_report = 'retry-' + report
+                retry_report = 'retry-' + report + ".intermediate"
                 _os.rename(cwd / report, cwd / retry_report)
                 merge_report(cwd / parallel_report, cwd / retry_report,
                              cwd / report)
@@ -472,6 +473,12 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         model_cache_arg=model_cache_arg,
                         only_multi_gpu_arg=only_multi_gpu_arg)
 
+    prepare_model_tests(model_name="llama",
+                        python_exe=python_exe,
+                        root_dir=root_dir,
+                        resources_dir=resources_dir,
+                        model_cache_arg=model_cache_arg)
+
     prepare_model_tests(model_name="t5",
                         python_exe=python_exe,
                         root_dir=root_dir,
@@ -704,6 +711,19 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
+    # Cache transceiver tests
+    cache_trans_test_8_proc = [
+        "mpirun",
+        "-n",
+        "8",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test_8_proc,
+                cwd=tests_dir,
+                env=cpp_env,
+                timeout=600)
+
     # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
     if _os.path.exists(
             _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
@@ -836,6 +856,19 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=6,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    new_env = copy.copy(cpp_env)
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-8-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=8,
         local_commands=[
             "executor/executorTest",
             "--gtest_filter=*DisaggAsymmetricExecutorTest*"

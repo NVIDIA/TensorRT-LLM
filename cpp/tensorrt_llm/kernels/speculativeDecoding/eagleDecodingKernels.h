@@ -295,4 +295,103 @@ struct PrepareGenEagleNetInputsParams
 //! \brief Prepares inputs for the gen stage EagleNet itearion (layerIdx > 0).
 //! For input/output examples visit test/model/eagle/test_prepare_drafter_inputs_plugin.py (gen Eagle Net examples)
 void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params);
+
+struct PackEagleParams
+{
+    runtime::SizeType32 batchSize{0};
+    runtime::SizeType32 maxNumPaths{0};
+    runtime::SizeType32 maxDecodingTokens{0};
+    runtime::SizeType32 maxPathLength{0};
+    runtime::SizeType32 numContextRequests{0};
+    runtime::SizeType32 numGenerationRequests{0};
+
+    //! inputs
+    //! [batchSize]
+    runtime::SizeType32 const* batchSlots{nullptr};
+
+    //! [maxBatchSize]
+    float const* inputTemperatures{nullptr};
+    //! [maxBatchSize]
+    float const* inputRandomDataSample{nullptr};
+    //! [maxBatchSize]
+    float const* inputRandomDataValidation{nullptr};
+    //! [maxBatchSize, maxDecodingDraftTokens]
+    runtime::TokenIdType const* inputNextDraftTokens{nullptr};
+    //! [maxBatchSize]
+    runtime::SizeType32 const* inputNextDraftLens{nullptr};
+    //! [maxBatchSize, maxDecodingTokens, maxPathLen]
+    runtime::SizeType32 const* inputNextDraftPaths{nullptr};
+    //! [maxBatchSize]
+    runtime::SizeType32 const* inputSpecDecodingGenerationLengths{nullptr};
+    //! [maxBatchSize]
+    runtime::SizeType32 const* inputSpecDecodingPositionOffsets{nullptr};
+    //! [maxBatchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
+    int32_t const* inputSpecDecodingPackedMasks{nullptr};
+
+    //! outputs
+    //! [batchSize]
+    float* outputTemperatures{nullptr};
+    //! [batchSize]
+    float* outputRandomDataSample{nullptr};
+    //! [batchSize]
+    float* outputRandomDataValidation{nullptr};
+    //! [batchSize, maxDecodingDraftTokens]
+    runtime::TokenIdType* outputNextDraftTokens{nullptr};
+    //! [batchSize]
+    runtime::SizeType32* outputNextDraftLens{nullptr};
+    //! [batchSize, maxDecodingTokens, maxPathLen]
+    runtime::SizeType32* outputNextDraftPaths{nullptr};
+    //! [batchSize]
+    runtime::SizeType32* outputSpecDecodingGenerationLengths{nullptr};
+    //! [batchSize]
+    runtime::SizeType32* outputSpecDecodingPositionOffsets{nullptr};
+    //! [maxBatchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
+    int32_t* outputSpecDecodingPackedMasks{nullptr};
+
+    // workspace
+    //! [1]
+    runtime::SizeType32* maxGenerationLength{nullptr};
+    //! [batchSize + 1]
+    runtime::SizeType32* cumSumGenerationLengths{nullptr};
+
+    void checkParams()
+    {
+        TLLM_CHECK(batchSlots);
+
+        TLLM_CHECK(inputTemperatures);
+        TLLM_CHECK(inputRandomDataSample);
+        TLLM_CHECK(inputRandomDataValidation);
+        TLLM_CHECK(inputNextDraftTokens);
+        TLLM_CHECK(inputNextDraftLens);
+        TLLM_CHECK(inputNextDraftPaths);
+        TLLM_CHECK(inputSpecDecodingGenerationLengths);
+        TLLM_CHECK(inputSpecDecodingPositionOffsets);
+        TLLM_CHECK(inputSpecDecodingPackedMasks);
+
+        TLLM_CHECK(outputTemperatures);
+        TLLM_CHECK(outputRandomDataSample);
+        TLLM_CHECK(outputRandomDataValidation);
+        TLLM_CHECK(outputNextDraftTokens);
+        TLLM_CHECK(outputNextDraftLens);
+        TLLM_CHECK(outputNextDraftPaths);
+        TLLM_CHECK(outputSpecDecodingGenerationLengths);
+        TLLM_CHECK(outputSpecDecodingPositionOffsets);
+        TLLM_CHECK(outputSpecDecodingPackedMasks);
+
+        TLLM_CHECK(maxGenerationLength);
+        TLLM_CHECK(cumSumGenerationLengths);
+
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(batchSize == numContextRequests + numGenerationRequests);
+        TLLM_CHECK(maxDecodingTokens > 0);
+        TLLM_CHECK(maxPathLength > 0);
+        TLLM_CHECK(maxNumPaths > 0);
+    }
+};
+
+//! \brief packs outputSpecDecodingGenerationLengths from batch slots positions to continuous memory.
+void invokePackEagleGenerationLengths(PackEagleParams const& params, cudaStream_t stream);
+//! \brief packs the rest of the output tensors from batch slots positions to continuous memory.
+void invokePackEagle(PackEagleParams const& params, cudaStream_t stream);
+
 } // namespace tensorrt_llm::kernels::speculative_decoding

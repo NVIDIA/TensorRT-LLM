@@ -149,24 +149,16 @@ only supported for the llama model. It is recommended to enable this feature whe
 The embedding parallelism feature enables the sharding of the embedding table
 across multiple GPUs, so that the memory usage could be reduced and the
 throughput improved. The embedding sharing feature enables the sharing of the
-embedding table between `look_up` and `lm_head` layers.
+embedding table between `look_up` and `lm_head` layers to reduced memory usage.
 
-The look-up plugin implements the embedding sharing feature and is required to
-enable the aforementioned features for now (until TensorRT native layers
-support embedding sharing).
+It is recommended to enable embedding parallelism to improve throughput with `--use_parallel_embedding` and `--embedding_sharding_dim` in `convert_checkpoint.py`.
 
-It is recommended to enable the embedding parallelism and sharing features to
-improve throughput. However, the following conditions have to be satisfied:
+Embedding sharing is by default enabled if following conditions are met:
+1. `look_up` and `lm_head` layers have identical weights.
+2. `--gemm_plugin` is not used when building the engine.
+3. For tensor parallelism cases, `-embedding_sharding_dim 0` must be set. In other words, we must enable embedding parallelism along the vocab dimension,
 
-1. The model shares the embedding table between `look_up` and `lm_head` layers,
-2. Both look_up plugin and gemm plugin are enabled,
-3. The sharding dimension of the embedding lookup table is set correctly.
-
-To enable the features, use the `--use_parallel_embedding`, `--embedding_sharding_dim` and
-`--use_embedding_sharing` arguments in `convert_checkpoint.py`, and use the
-`--lookup_plugin`, `--gemm_plugin` arguments in `trtllm-build` command. See those
-[Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism-and-sharing)
-for details.
+See those [Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism) for details.
 
 ### Horizontal Fusion in Gated-MLP
 

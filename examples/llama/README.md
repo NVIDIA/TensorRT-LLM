@@ -67,7 +67,7 @@ The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF
 Please install required packages first to make sure the example uses matched `tensorrt_llm` version:
 
 ```bash
-pip install -r requirements.txt
+pip install --upgrade -r requirements.txt
 ```
 
 Need to prepare the HF LLaMA checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
