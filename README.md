@@ -17,11 +17,18 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/10/22] New 📝 Step-by-step instructions on how to
+✅ Optimize LLMs with NVIDIA TensorRT-LLM,
+✅ Deploy the optimized models with Triton Inference Server,
+✅ Autoscale LLMs deployment in a Kubernetes environment.
+🙌 Technical Deep Dive:
+[➡️ link](https://nvda.ws/3YgI8UT)
+<div align="center">
+<img src="docs/source/media/image-10-22-2024.png" width="50%">
+<div align="left">
+
 * [2024/10/07] 🚀🚀🚀Optimizing Microsoft Bing Visual Search with NVIDIA Accelerated Libraries
 [➡️ link](https://developer.nvidia.com/blog/optimizing-microsoft-bing-visual-search-with-nvidia-accelerated-libraries/)
-<div align="center">
-<img src="docs/source/media/image-10-07-2024.png" width="50%">
-<div align="left">
 
 * [2024/09/29] 🌟 AI at Meta PyTorch + TensorRT v2.4 🌟 ⚡TensorRT 10.1 ⚡PyTorch 2.4 ⚡CUDA 12.4 ⚡Python 3.12
 [➡️ link](https://github.com/pytorch/TensorRT/releases/tag/v2.4.0)
