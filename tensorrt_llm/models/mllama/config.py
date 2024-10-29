@@ -51,6 +51,29 @@ class MLLaMAConfig(PretrainedConfig):
         super().__init__(**kwargs)
         self.embed_vocab_size = self.vocab_size + 8  #FIXME The vocab_size of embedding contains the special tokens for image
 
+        num_kv_heads_per_layer = [
+            self.num_key_value_heads for _ in range(self.num_hidden_layers)
+        ]
+        num_kv_heads_per_cross_attn_layer = [
+            0 for _ in range(self.num_hidden_layers)
+        ]
+        for layer_idx in self.cross_attention_layers:
+            num_kv_heads_per_layer[layer_idx] = 0
+            num_kv_heads_per_cross_attn_layer[
+                layer_idx] = self.num_key_value_heads
+
+        # adjust num heads according to tp size
+        num_kv_heads_per_layer = [
+            (nheads + self.mapping.tp_size - 1) // self.mapping.tp_size
+            for nheads in num_kv_heads_per_layer
+        ]
+        num_kv_heads_per_cross_attn_layer = [
+            (nheads + self.mapping.tp_size - 1) // self.mapping.tp_size
+            for nheads in num_kv_heads_per_cross_attn_layer
+        ]
+        self.num_kv_heads_per_layer = num_kv_heads_per_layer
+        self.num_kv_heads_per_cross_attn_layer = num_kv_heads_per_cross_attn_layer
+
     def to_dict(self):
         output = super().to_dict()
         # Serialize the fields added in MLLaMAConfig
@@ -65,6 +88,9 @@ class MLLaMAConfig(PretrainedConfig):
         output['cross_attention_layers'] = self.cross_attention_layers
         output['embed_vocab_size'] = self.embed_vocab_size
         output['vision_output_dim'] = self.vision_output_dim
+        output['num_kv_heads_per_layer'] = self.num_kv_heads_per_layer
+        output[
+            'num_kv_heads_per_cross_attn_layer'] = self.num_kv_heads_per_cross_attn_layer
         return output
 
     @classmethod

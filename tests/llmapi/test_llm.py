@@ -14,9 +14,10 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import release_gc
+from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (ExecutorBindingsWorker, GenerationRequest,
                                    GenerationResult, LoRARequest,
-                                   PromptAdapterRequest)
+                                   PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, KvCacheConfig,
                                  SamplingParams)
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, _ParallelConfig
@@ -310,7 +311,8 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
             decoded_text, states = tokenizer.decode_incrementally(
                 [token_ids[i]], decoded_text, states)
 
-        if tokenizer_dir.endswith('bert-base-uncased'):
+        if tokenizer_dir.endswith(
+                'bert-base-uncased') and tokenizer.clean_up_tokenization_spaces:
             decoded_text = tokenizer.clean_up_tokenization(decoded_text)
         reference = tokenizer.decode(token_ids)
         if decoded_text == reference:
@@ -1106,7 +1108,7 @@ def test_executor_process_background_error():
 
     # test in streaming mode
     async def task():
-        with pytest.raises(DummyError):
+        with pytest.raises(RequestError):
             async for output in llm.generate_async(
                     prompts[0], streaming=True,
                     sampling_params=sampling_params):
@@ -1172,4 +1174,51 @@ def test_llm_return_generation_logits():
     check_llm_return_generation_logits(tp_size=1)
 
 
+class DummyExecutorWorker3(ExecutorBindingsWorker):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.counter = 0
+
+    def _engine_response_callback(self, response: tllm.Response):
+        return tllm.Response(request_id=response.request_id,
+                             error_msg="Test error")
+
+
+DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
+                                   worker_cls=DummyExecutorWorker3)
+
+
+def test_llm_handling_per_requeust_error():
+    llm = LLM(model=llama_model_path,
+              executor_cls=DummyExecutor3,
+              kv_cache_config=global_kvcache_config)
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    # test in streaming mode
+    async def task():
+        with pytest.raises(RequestError):
+            # 10 requests, each request will get error, while the whole LLM instance is still alive
+            for i in range(10):
+                async for output in llm.generate_async(
+                        prompts[0], streaming=True,
+                        sampling_params=sampling_params):
+                    print(output)
+
+    asyncio.run(task())
+
+    def batch_task():
+        with pytest.raises(RequestError):
+            for output in llm.generate(prompts,
+                                       sampling_params=sampling_params):
+                print(output)
+
+    batch_task()
+
+
 # TODO[chunweiy]: Add test for loading inmemory model
+
+if __name__ == '__main__':
+    test_executor_process_background_error()

@@ -24,6 +24,8 @@ from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import (OMPI_COMM_TYPE_HOST, mpi_barrier, mpi_comm,
+                                 mpi_rank, mpi_world_size)
 from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
@@ -416,13 +418,15 @@ def parallel_build(model_config: PretrainedConfig,
     else:
         world_size = model_config.mapping.world_size
 
-    if workers == 1:
+    use_mpi = mpi_world_size() > 1
+
+    if not use_mpi and workers == 1:
         for rank in range(world_size):
             passed = build_and_save(rank, rank % workers, ckpt_dir,
                                     build_config, output_dir, log_level,
                                     model_config, model_cls, **kwargs)
             assert passed, "Engine building failed, please check error log."
-    else:
+    elif not use_mpi:
         with ProcessPoolExecutor(mp_context=get_context('spawn'),
                                  max_workers=workers) as p:
             futures = [
@@ -439,6 +443,25 @@ def parallel_build(model_config: PretrainedConfig,
                     exceptions.append(e)
             assert len(exceptions
                        ) == 0, "Engine building failed, please check error log."
+    else:
+        mpi_local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+        mpi_local_rank = mpi_local_comm.Get_rank()
+        node_gpu_count = torch.cuda.device_count()
+        exceptions = []
+        for engine_rank in range(world_size):
+            if engine_rank % mpi_world_size() != mpi_rank():
+                continue
+            try:
+                build_and_save(engine_rank, mpi_local_rank % node_gpu_count,
+                               ckpt_dir, build_config, output_dir, log_level,
+                               model_config, model_cls, **kwargs)
+            except Exception as e:
+                traceback.print_exc()
+                exceptions.append(e)
+        mpi_barrier()
+        if len(exceptions) != 0:
+            print("Engine building failed, please check error log.", flush=True)
+            mpi_comm().Abort()
 
 
 def main():
@@ -457,7 +480,7 @@ def main():
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+        os.makedirs(args.output_dir, exist_ok=True)
 
     model_cls = None
     if args.model_cls_file is not None:

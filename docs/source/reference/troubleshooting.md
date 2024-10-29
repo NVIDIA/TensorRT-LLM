@@ -12,27 +12,6 @@ In most occasions, these problems are caused by the workflow like: an old compil
 
 Solution: try running build script with `--clean`, or try running `rm -r build cpp/build` before running build script again.
 
-## cuDNN Linking Errors
-
-Errors such as "Entry Point Not Found" (for example [#1062](https://github.com/NVIDIA/TensorRT-LLM/issues/1062)).
-
-Solution: the issue might be a mismatch in the `cuDNN` libraries shipped from `torch` and `tensorrt`. To rectify this, please try the following steps
-
-```bash
-python -m pip uninstall -y tensorrt_llm
-python -m pip install --upgrade pip
-python -m pip install nvidia-cudnn-cu11==8.9.4.25 --no-cache-dir
-python -m pip install --pre --extra-index-url https://pypi.nvidia.com/ tensorrt==9.2.0.post12.dev5 --no-cache-dir
-python -m pip uninstall -y nvidia-cudnn-cu11
-python -m pip install tensorrt_llm  --extra-index-url https://pypi.nvidia.com/ --extra-index-url https://download.pytorch.org/whl/cu121
-```
-
-## Model Debug
-
-When debugging a TensorRT-LLM model, we usually want to print the value of the intermediate tensors.
-
-We should mark the interested intermediate tensors as the network outputs, then print their values at runtime, since TensorRT-LLM obeys define-and-run paradigm.
-
 ## Debug on Unit Tests
 
 Here is an example to print the values of the MLP output tensor in the a unit test ([full example](../../../tests/test_debugging_api.py)).

@@ -224,7 +224,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property("compute_generation_logits",
             py::overload_cast<>(&tr::ModelConfig::computeGenerationLogits, py::const_),
             py::overload_cast<bool>(&tr::ModelConfig::computeGenerationLogits))
-        .def_property("model_variant", &tr::ModelConfig::getModelVariant, &tr::ModelConfig::setModelVariant);
+        .def_property("model_variant", &tr::ModelConfig::getModelVariant, &tr::ModelConfig::setModelVariant)
+        .def_property(
+            "use_cross_attention", &tr::ModelConfig::useCrossAttention, &tr::ModelConfig::setUseCrossAttention);
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, std::optional<std::vector<SizeType32>> const&>(),

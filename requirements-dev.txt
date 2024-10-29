@@ -20,3 +20,4 @@ jsonlines==4.0.0
 jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
+setuptools==69.5.1

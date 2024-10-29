@@ -341,8 +341,10 @@ def build_llava_engine(args):
                 features = all_hidden_states[self.feature_layer][:, 1:]
                 return self.projector(features)
 
+        hf_config = AutoConfig.from_pretrained(args.model_path)
+        hf_config.vision_config._attn_implementation = "eager"
         model = LlavaForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16)
+            args.model_path, torch_dtype=torch.float16, config=hf_config)
         wrapper = LlavaVisionWrapper(
             model.vision_tower.to(args.device),
             model.multi_modal_projector.to(args.device),
@@ -368,8 +370,10 @@ def build_llava_engine(args):
                 image_features = self.projector(selected_image_feature)
                 return image_features  # (bs, 576, c)
 
+        hf_config = AutoConfig.from_pretrained(args.model_path)
+        hf_config.vision_config._attn_implementation = "eager"
         model = LlavaNextForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16)
+            args.model_path, torch_dtype=torch.float16, config=hf_config)
         wrapper = LlavaNextVisionWrapper(
             model.vision_tower.vision_model.to(args.device),
             model.multi_modal_projector.to(args.device),
@@ -660,7 +664,8 @@ def build_video_neva_engine(args):
 
     encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
                                         torch_dtype=torch.bfloat16,
-                                        trust_remote_code=True)
+                                        trust_remote_code=True,
+                                        attn_implementation="eager")
     vision_encoder = encoder.vision_model
     hf_config = encoder.config
     dtype = hf_config.torch_dtype

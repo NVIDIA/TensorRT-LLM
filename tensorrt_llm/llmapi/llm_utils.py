@@ -1403,7 +1403,7 @@ class CachedModelLoader:
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
                 model_loader_kwargs = {
                     'llm_args': self.llm_args,
-                    'workspace': self.workspace.name,
+                    'workspace': str(self.workspace),
                     'llm_build_stats': self.llm_build_stats,
                 }
 

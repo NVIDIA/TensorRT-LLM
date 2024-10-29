@@ -157,4 +157,42 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvUseUCXKvCache()
+{
+    static bool init = false;
+    static bool useUCXKVCache = false;
+    if (!init)
+    {
+        init = true;
+        {
+            char const* use_ucx_kv_cache = std::getenv("TRTLLM_USE_UCX_KVCACHE");
+            if (use_ucx_kv_cache)
+            {
+                if (use_ucx_kv_cache[0] == '1' && use_ucx_kv_cache[1] == '\0')
+                {
+                    useUCXKVCache = true;
+                }
+            }
+        }
+    }
+    return useUCXKVCache;
+}
+
+std::string getEnvUCXInterface()
+{
+    static bool init = false;
+    static std::string ucxInterface;
+    if (!init)
+    {
+        init = true;
+        {
+            char const* ucx_interface = std::getenv("TRTLLM_UCX_INTERFACE");
+            if (ucx_interface)
+            {
+                ucxInterface = ucx_interface;
+            }
+        }
+    }
+    return ucxInterface;
+}
 } // namespace tensorrt_llm::common

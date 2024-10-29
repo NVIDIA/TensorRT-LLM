@@ -160,6 +160,8 @@ ModelConfig createModelConfig(
     auto numKvHeadsPerAttentionLayer
         = parseJsonFieldOr<std::vector<SizeType32>>(config, "num_kv_heads_per_layer", std::vector<SizeType32>());
 
+    auto numKvHeadsPerCrossAttentionLayer = parseJsonFieldOr<std::vector<SizeType32>>(
+        config, "num_kv_heads_per_cross_attn_layer", std::vector<SizeType32>());
     auto modelConfig
         = ModelConfig{vocabSize, numLayers, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
 
@@ -167,12 +169,26 @@ ModelConfig createModelConfig(
     {
         std::transform(numKvHeadsPerAttentionLayer.cbegin(), numKvHeadsPerAttentionLayer.cend(),
             numKvHeadsPerAttentionLayer.begin(),
-            [tensorParallelism](SizeType32 const numKvHeads) { return std::max(numKvHeads / tensorParallelism, 1); });
+            [tensorParallelism](SizeType32 const numKvHeads)
+            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
         modelConfig.setNumKvHeadsPerLayer(numKvHeadsPerAttentionLayer);
     }
     else
     {
         modelConfig.setNbKvHeads(numKvHeads);
+    }
+
+    if (!numKvHeadsPerCrossAttentionLayer.empty())
+    {
+        std::transform(numKvHeadsPerCrossAttentionLayer.cbegin(), numKvHeadsPerCrossAttentionLayer.cend(),
+            numKvHeadsPerCrossAttentionLayer.begin(),
+            [tensorParallelism](SizeType32 const numKvHeads)
+            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
+        modelConfig.setNumKvHeadsPerCrossLayer(numKvHeadsPerCrossAttentionLayer);
+    }
+    else
+    {
+        modelConfig.setNbCrossKvHeads(numKvHeads);
     }
 
     modelConfig.setSizePerHead(sizePerHead);

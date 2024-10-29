@@ -135,6 +135,11 @@ class GPTConfig(PretrainedConfig):
             hf_config.rotary_base = hf_config.rope_theta
             hf_config.rotary_pct = getattr(hf_config, 'partial_rotary_factor',
                                            1.0)
+            try:
+                # only for persimmon, not starcoder2
+                hf_config.vocab_size = hf_config.text_config.vocab_size
+            except AttributeError:
+                pass
         elif gpt_variant == "kosmos-2":
             hf_config.n_embd = hf_config.text_config.embed_dim
             hf_config.n_inner = hf_config.text_config.ffn_dim

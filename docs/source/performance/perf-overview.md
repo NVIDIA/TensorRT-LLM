@@ -226,7 +226,7 @@ The performance numbers below were collected using the steps described in this d
 > [!NOTE] The only models supported in this workflow are those listed in the table above.
 
 The following tables are references for commands that are used as part of the benchmarking process. For a more detailed
-description of this benchmarking workflow, see the [Benchmarking Suite README](../../../benchmarks/Suite.md).
+description of this benchmarking workflow, see the [benchmarking suite documentation](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html).
 
 ### Commands
 

@@ -46,6 +46,12 @@ myst_url_schemes = {
     "https://github.com/NVIDIA/TensorRT-LLM/tree/" + branch_name + "/{{path}}",
 }
 
+myst_heading_anchors = 4
+
+myst_enable_extensions = [
+    "deflist",
+]
+
 autosummary_generate = True
 copybutton_exclude = '.linenos, .gp, .go'
 copybutton_prompt_text = ">>> |$ |# "

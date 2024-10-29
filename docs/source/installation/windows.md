@@ -4,7 +4,7 @@
 
 ```{note}
 The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the [v0.13.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.13.0) for the most stable experience.
+We recommend checking out the [v0.14.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.14.0) for the most stable experience.
 ```
 
 **Prerequisites**
@@ -52,7 +52,7 @@ We recommend checking out the [v0.13.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.13.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/
+  pip install tensorrt_llm==0.14.0 --extra-index-url https://pypi.nvidia.com --extra-index-url https://download.pytorch.org/whl/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.
@@ -70,7 +70,7 @@ We recommend checking out the [v0.13.0 tag](https://github.com/NVIDIA/TensorRT-L
 
 This may be caused by an outdated Microsoft Visual C++ Redistributable Version. Please install
 [the latest MSVC](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version)
-and retry. Check the system path to make sure the latest version installed in `System32` is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package `pyarrow` might contain an outdated MSCV DLL).
+and retry. Check the system path to make sure the latest version installed in `System32` is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package `pyarrow` might contain an outdated MSVC DLL).
 
 2. OSError: [WinError 126] The specified module could not be found. Error loading “...\Lib\site-packages\torch\lib\fbgemm.dll” or one of its dependencies.
 

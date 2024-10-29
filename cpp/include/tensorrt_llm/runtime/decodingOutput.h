@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
@@ -121,6 +122,8 @@ public:
     std::optional<ExplicitDraftTokensBuffers::Inputs> explicitDraftTokensBuffers;
 
     std::optional<LookaheadDecodingBuffers> lookaheadOutputs;
+
+    std::optional<EagleBuffers::Inputs> eagleBuffers;
 };
 
 } // namespace tensorrt_llm::runtime

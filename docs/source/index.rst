@@ -111,7 +111,8 @@ Welcome to TensorRT-LLM's Documentation!
    :name: Performance
 
    performance/perf-overview.md
-   performance/perf-best-practices.md
+   Benchmarking <performance/perf-benchmarking.md>
+   Best Practices <performance/perf-best-practices.md>
    performance/perf-analysis.md
 
 

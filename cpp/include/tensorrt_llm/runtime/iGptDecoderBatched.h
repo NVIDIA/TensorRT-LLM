@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -100,6 +101,9 @@ public:
 
     //! @brief Setup buffers for ExplicitDraftTokens decoding.
     virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
+
+    //! @brief Setup buffers for Eagle decoding.
+    virtual void setupEagle(EagleBuffers::Inputs eagleBuffers) = 0;
 
     //! @brief Setup buffers for Lookahead decoding.
     virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;

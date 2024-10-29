@@ -1033,4 +1033,104 @@ void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime:
         batchSize, numInputLogits, maxDecodingDraftTokens);
 }
 
+namespace
+{
+__global__ void packEagleGenerationLengths(PackEagleParams params)
+{
+    auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
+    auto const batchSlot = params.batchSlots[batchIdx];
+
+    auto const isGenerationRequest = batchIdx >= params.numContextRequests;
+    auto const genIdx = batchIdx - params.numContextRequests;
+
+    if (threadIdx.x == 0 && isGenerationRequest)
+    {
+        params.outputSpecDecodingGenerationLengths[genIdx] = params.inputNextDraftLens[batchSlot];
+    }
+}
+
+__global__ void packEagleTensors(PackEagleParams params)
+{
+    auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
+    auto const batchSlot = params.batchSlots[batchIdx];
+
+    auto const isGenerationRequest = batchIdx >= params.numContextRequests;
+    auto const genIdx = batchIdx - params.numContextRequests;
+
+    // Copy data that is 1 elem per request
+    if (threadIdx.x == 0)
+    {
+        params.outputRandomDataSample[batchIdx] = params.inputRandomDataSample[batchSlot];
+        params.outputTemperatures[batchIdx] = params.inputTemperatures[batchSlot];
+        // FIXME we need 1 value per draft token
+        params.outputRandomDataValidation[batchIdx] = params.inputRandomDataValidation[batchSlot];
+
+        // 0 for ctx request and actual draft len for gen requests.
+        params.outputNextDraftLens[batchIdx] = isGenerationRequest ? params.inputNextDraftLens[batchSlot] : 0;
+    }
+
+    // Copy draft paths
+    auto const numPathElts = params.maxNumPaths * params.maxPathLength;
+    auto outputNextDraftPaths = params.outputNextDraftPaths + batchIdx * numPathElts;
+    auto const inputNextDraftPaths = params.inputNextDraftPaths + batchSlot * numPathElts;
+    for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < numPathElts; ti += static_cast<SizeType32>(blockDim.x))
+    {
+        outputNextDraftPaths[ti] = inputNextDraftPaths[ti];
+    }
+
+    if (isGenerationRequest)
+    {
+        // Copy draft tokens. We do it only for gen requests as for ctx requests outputNextDraftLens is 0.
+        auto const maxDecodingDraftTokens = params.maxDecodingTokens - 1;
+        auto outputNextDraftTokens = params.outputNextDraftTokens + batchIdx * maxDecodingDraftTokens;
+        auto const inputNextDraftTokens = params.inputNextDraftTokens + batchSlot * maxDecodingDraftTokens;
+
+        for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < maxDecodingDraftTokens;
+             ti += static_cast<SizeType32>(blockDim.x))
+        {
+            outputNextDraftTokens[ti] = inputNextDraftTokens[ti];
+        }
+
+        auto const maxGenerationLength = params.maxGenerationLength[0];
+        auto const numPackedMasks = divUp(params.maxDecodingTokens, 32);
+        auto const outputStartId = (genIdx == 0) ? 0 : params.cumSumGenerationLengths[genIdx - 1];
+        auto const numTokens = (genIdx == 0)
+            ? params.cumSumGenerationLengths[0]
+            : params.cumSumGenerationLengths[genIdx] - params.cumSumGenerationLengths[genIdx - 1];
+        // Copy packed masks.
+        // Masks are placed next to each other with offsets of cumSumGenerationLengths[bi-1]
+        auto const inputPackedMask
+            = params.inputSpecDecodingPackedMasks + batchSlot * numPackedMasks * params.maxDecodingTokens;
+        auto outputPackedMask = params.outputSpecDecodingPackedMasks + outputStartId * numPackedMasks;
+        for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < numTokens * numPackedMasks;
+             ti += static_cast<SizeType32>(blockDim.x))
+        {
+            outputPackedMask[ti] = inputPackedMask[ti];
+        }
+
+        // Copy pos offsets. Copy only for maxGenerationLength
+        auto const inputPositionOffsets
+            = params.inputSpecDecodingPositionOffsets + batchSlot * params.maxDecodingTokens;
+        auto outputPositionOffsets = params.outputSpecDecodingPositionOffsets + genIdx * maxGenerationLength;
+        for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < maxGenerationLength;
+             ti += static_cast<SizeType32>(blockDim.x))
+        {
+            outputPositionOffsets[ti] = inputPositionOffsets[ti];
+        }
+    }
+}
+} // namespace
+
+void invokePackEagleGenerationLengths(PackEagleParams const& params, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 32;
+    packEagleGenerationLengths<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
+}
+
+void invokePackEagle(PackEagleParams const& params, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    packEagleTensors<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
+}
+
 } // namespace tensorrt_llm::kernels::speculative_decoding

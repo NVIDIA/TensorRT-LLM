@@ -14,8 +14,7 @@ import safetensors
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
-                          MptForCausalLM)
+from transformers import AutoTokenizer, MptConfig, MptForCausalLM
 from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
@@ -675,7 +674,7 @@ def convert_hf_mpt_legacy(hf_model,
 
 
 def convert_hf_mpt(hf_model: MptForCausalLM,
-                   hf_config: AutoConfig,
+                   hf_config: MptConfig,
                    mapping: Mapping,
                    dtype: str = 'float32',
                    use_parallel_embedding: bool = False,
@@ -691,8 +690,8 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
     dtype = getattr(torch, dtype)
     num_hidden_layers = hf_config.n_layers
     num_head = hf_config.n_heads
-    num_kv_heads = hf_config.attn_config['kv_n_heads'] if 'kv_n_heads' in hf_config.attn_config \
-        else hf_config.n_heads
+    num_kv_heads = getattr(hf_config.attn_config, 'kv_n_heads',
+                           hf_config.n_heads)
     hidden_size = hf_config.d_model
     vocab_size = hf_config.vocab_size
 
@@ -816,10 +815,10 @@ if __name__ == '__main__':
     else:
         kv_cache_quant_algo = None
 
-    hf_config = AutoConfig.from_pretrained(args.model_dir,
-                                           trust_remote_code=True)
-    num_kv_heads = hf_config.attn_config['kv_n_heads'] if 'kv_n_heads' in hf_config.attn_config \
-        else hf_config.n_heads
+    hf_config = MptConfig.from_pretrained(args.model_dir,
+                                          trust_remote_code=True)
+    num_kv_heads = getattr(hf_config.attn_config, 'kv_n_heads',
+                           hf_config.n_heads)
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,
@@ -845,18 +844,17 @@ if __name__ == '__main__':
             'pp_size': args.pp_size,
         },
         'bias': (not hf_config.no_bias),
-        'clip_qkv': hf_config.attn_config['clip_qkv'],
-        'alibi_bias_max': hf_config.attn_config['alibi_bias_max']
+        'clip_qkv': hf_config.attn_config.clip_qkv,
+        'alibi_bias_max': hf_config.attn_config.alibi_bias_max
     }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
-    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir,
-                                                    trust_remote_code=True,
-                                                    device_map="auto",
-                                                    torch_dtype=getattr(
-                                                        torch, args.dtype))
+    hf_model = MptForCausalLM.from_pretrained(args.model_dir,
+                                              device_map="auto",
+                                              torch_dtype=getattr(
+                                                  torch, args.dtype))
 
     act_range = {}
     mpt_qkv_para = {}

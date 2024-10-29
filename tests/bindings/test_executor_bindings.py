@@ -1040,23 +1040,29 @@ def test_kv_cache_config():
     assert config.max_attention_window is None
     assert config.sink_token_length is None
     assert config.free_gpu_memory_fraction is None
+    assert config.cross_kv_cache_fraction is None
     assert config.host_cache_size is None
     assert config.onboard_blocks == True
+    assert config.secondary_offload_min_priority == None
 
     config.enable_block_reuse = True
     config.max_tokens = 1
     config.max_attention_window = [2]
     config.sink_token_length = 3
     config.free_gpu_memory_fraction = 0.5
+    config.cross_kv_cache_fraction = 0.5
     config.host_cache_size = 4
     config.onboard_blocks = False
+    config.secondary_offload_min_priority = 50
     assert config.enable_block_reuse == True
     assert config.max_tokens == 1
     assert config.max_attention_window == [2]
     assert config.sink_token_length == 3
     assert config.free_gpu_memory_fraction == 0.5
+    assert config.cross_kv_cache_fraction == 0.5
     assert config.host_cache_size == 4
     assert config.onboard_blocks == False
+    assert config.secondary_offload_min_priority == 50
 
     kwargs = {
         "enable_block_reuse": True,
@@ -1064,6 +1070,7 @@ def test_kv_cache_config():
         "max_attention_window": [10],
         "sink_token_length": 2,
         "free_gpu_memory_fraction": 0.5,
+        "cross_kv_cache_fraction": 0.5,
         "host_cache_size": 1024,
         "onboard_blocks": False,
     }
@@ -1092,6 +1099,41 @@ def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(**kwargs)
     for k, v in kwargs.items():
         assert getattr(config, k) == v
+
+
+def test_kv_cache_retention_config():
+
+    TokenRangeRetentionPriority = trtllm.KvCacheRetentionConfig.TokenRangeRetentionPriority
+
+    config = trtllm.KvCacheRetentionConfig(
+        [TokenRangeRetentionPriority(0, 2, 30)], 80)
+    assert len(config.token_range_retention_priorities) == 1
+    assert config.token_range_retention_priorities[0].token_start == 0
+    assert config.token_range_retention_priorities[0].token_end == 2
+    assert config.token_range_retention_priorities[0].priority == 30
+    assert config.decode_retention_priority == 80
+
+    config = trtllm.KvCacheRetentionConfig([
+        TokenRangeRetentionPriority(0, 64, 80),
+        TokenRangeRetentionPriority(64, 100, 10)
+    ], 10)
+
+    assert len(config.token_range_retention_priorities) == 2
+    assert config.token_range_retention_priorities[0].token_start == 0
+    assert config.token_range_retention_priorities[0].token_end == 64
+    assert config.token_range_retention_priorities[0].priority == 80
+
+    assert config.token_range_retention_priorities[1].token_start == 64
+    assert config.token_range_retention_priorities[1].token_end == 100
+    assert config.token_range_retention_priorities[1].priority == 10
+
+    assert config.decode_retention_priority == 10
+
+    with pytest.raises(Exception):
+        trtllm.KvCacheRetentionConfig([
+            TokenRangeRetentionPriority(0, 64, 10),
+            TokenRangeRetentionPriority(32, 128, 50)
+        ], 50)
 
 
 def test_decoding_mode():
@@ -1487,12 +1529,14 @@ def test_kv_cache_config_pickle():
     config = trtllm.KvCacheConfig()
     config.enable_block_reuse = True
     config.free_gpu_memory_fraction = 0.3
+    config.cross_kv_cache_fraction = 0.5
     config_copy = pickle.loads(pickle.dumps(config))
     assert config.enable_block_reuse == config_copy.enable_block_reuse
     assert config.max_tokens == config_copy.max_tokens
     assert config.max_attention_window == config_copy.max_attention_window
     assert config.sink_token_length == config_copy.sink_token_length
     assert config.free_gpu_memory_fraction == config_copy.free_gpu_memory_fraction
+    assert config.cross_kv_cache_fraction == config_copy.cross_kv_cache_fraction
     assert config.host_cache_size == config_copy.host_cache_size
     assert config.onboard_blocks == config_copy.onboard_blocks
 

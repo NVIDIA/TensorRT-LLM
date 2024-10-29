@@ -24,10 +24,9 @@ This document explains how to build the [GPT](https://huggingface.co/gpt2) model
     - [INT8 KV Cache](#int8-kv-cache)
     - [Weight Only Quantization](#weight-only-quantization)
     - [FP8 Quantization](#fp8-quantization)
-  - [Embedding Parallelism and Sharing](#embedding-parallelism-and-sharing)
+  - [Embedding Parallelism](#embedding-parallelism)
     - [1. Embedding parallelism](#1-embedding-parallelism)
     - [2. The sharding dimension for embedding parallelism](#2-the-sharding-dimension-for-embedding-parallelism)
-    - [3. Embedding sharing](#3-embedding-sharing)
   - [GPT Variant - SantaCoder](#gpt-variant---santacoder)
   - [GPT Variant - StarCoder (v1 and v2)](#gpt-variant---starcoder-v1-and-v2)
     - [Run StarCoder2 with LoRA](#run-starcoder2-with-lora)
@@ -496,7 +495,7 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp8/1-gpu \
         --output_dir gpt2/trt_engines/fp8/1-gpu
 ```
 
-## Embedding Parallelism and Sharing
+## Embedding Parallelism
 Since the embedding lookup table can be several gigabytes in size. We can distribute this weight across multiple GPUs in order to reduce the memory consumption per GPU.
 
 ### 1. Embedding parallelism
@@ -532,38 +531,7 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --embedding_sharding_dim 0 \
         --output_dir gpt2/trt_ckpt/fp16/2-gpu
 
-# It is optional to add --lookup_plugin
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
-        --lookup_plugin auto \
-        --output_dir gpt2/trt_engines/fp16/2-gpu
-```
-
-### 3. Embedding sharing
-In some models, the embedding weight is used in both the embedding layer and lm_head (language modeling head) layer. In this case, sharing the embedding weight can reduce memory consumption.
-
-With flag `--use_embedding_sharing` for `convert_checkpoint.py`, we will try to enable this feature. However it only takes effect when the following criteria are met:
-- The embedding weight is shared between the embedding and lm_head layers. If not, we should not enable this feature.
-- For tensor parallelism cases, `--use_parallel_embedding --embedding_sharding_dim 0` must be set. In other words, we must enable embedding parallelism along the vocab dimension, which minimizes the overall communication cost.
-- For TensorRT 9.0 version, the engine size is expected to be reduced when the lookup and gemm plugin are enabled.
-
-Here is an example for using embedding parallelism and sharing feature:
-
-
-```bash
-# 2-way tensor parallelism with embedding sharing
-# It requires enabling embedding parallelism along vocab dimension
-python3 convert_checkpoint.py --model_dir gpt2 \
-        --dtype float16 \
-        --tp_size 2 \
-        --use_embedding_sharing \
-        --use_parallel_embedding \
-        --embedding_sharding_dim 0 \
-        --output_dir gpt2/trt_ckpt/fp16/2-gpu
-
-# It is recommended to add --lookup_plugin and --gemm_plugin
-trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
-        --lookup_plugin auto \
-        --gemm_plugin auto \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 ```
 

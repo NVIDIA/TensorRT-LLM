@@ -233,6 +233,16 @@ void GptDecoderBatched::setupLookahead(LookaheadDecodingBuffers lookaheadDecodin
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void GptDecoderBatched::setupEagle(EagleBuffers::Inputs eagleBuffers)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(mSpeculativeDecodingMode.isEagle());
+    mJointDecodingOutput->eagleBuffers = std::move(eagleBuffers);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
     SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
@@ -628,6 +638,10 @@ void GptDecoderBatched::newRequestSpeculativeDecoding(
     {
         newRequestExplicitDraftTokens(batchIdx, request);
     }
+    else if (mSpeculativeDecodingMode.isEagle())
+    {
+        newRequestEagle(batchIdx, request);
+    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -739,6 +753,17 @@ void GptDecoderBatched::newRequestExplicitDraftTokens(SizeType32 batchIdx, decod
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void GptDecoderBatched::newRequestEagle(SizeType32 batchIdx, decoder_batch::Request const& request)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    TLLM_CHECK(mJointDecodingOutput->eagleBuffers);
+
+    // TODO fill me
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void GptDecoderBatched::setExplicitDraftTokensInputs(decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -763,6 +788,15 @@ void GptDecoderBatched::setExplicitDraftTokensInputs(decoder_batch::Input const&
     explicitDraftTokensInputs.maxGenLengthDevice = input.explicitDraftTokensInputs->maxGenToken;
     explicitDraftTokensInputs.seqSlots = input.seqSlots;
     mJointDecodingInput->explicitDraftTokensInputs = explicitDraftTokensInputs;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatched::setEagleInputs(decoder_batch::Input const& input)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    // TODO fill me
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -853,6 +887,10 @@ void GptDecoderBatched::forwardDecoder(
     if (mSpeculativeDecodingMode.isExplicitDraftTokens())
     {
         setExplicitDraftTokensInputs(input);
+    }
+    else if (mSpeculativeDecodingMode.isEagle())
+    {
+        setEagleInputs(input);
     }
 
     bool const async = forwardType == ForwardType::kASYNC;

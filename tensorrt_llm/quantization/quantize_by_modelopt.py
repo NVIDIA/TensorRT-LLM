@@ -26,6 +26,7 @@ import time
 import numpy as np
 import safetensors
 import torch
+from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
@@ -603,6 +604,9 @@ def quantize_and_export(*,
 
         export_path = output_dir
         start_time = time.time()
+
+        # Move meta tensor back to device before exporting.
+        remove_hook_from_module(model, recurse=True)
 
         QUANT_ALGO = {
             "int8": "INT8",

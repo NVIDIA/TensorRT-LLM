@@ -52,6 +52,7 @@ from .models.automodel import AutoConfig, AutoModelForCausalLM
 from .module import Module
 from .network import Network, net_guard
 from .parameter import Parameter
+from .python_plugin import PluginBase
 from .version import __version__
 
 __all__ = [
@@ -71,6 +72,7 @@ __all__ = [
     'net_guard',
     'Network',
     'Mapping',
+    'PluginBase',
     'Builder',
     'BuilderConfig',
     'build',

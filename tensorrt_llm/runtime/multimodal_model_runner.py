@@ -308,6 +308,9 @@ class MultimodalModelRunner:
 
     def init_llm(self):
         if self.decoder_llm:
+            cross_kv_cache_fraction = None
+            if self.model_type == 'mllama':
+                cross_kv_cache_fraction = self.args.cross_kv_cache_fraction
             if self.use_py_session:
                 logger.info(f'Running LLM with Python runner')
                 self.model = ModelRunner.from_dir(
@@ -328,7 +331,8 @@ class MultimodalModelRunner:
                     enable_context_fmha_fp32_acc=self.args.
                     enable_context_fmha_fp32_acc,
                     kv_cache_free_gpu_memory_fraction=self.args.
-                    kv_cache_free_gpu_memory_fraction)
+                    kv_cache_free_gpu_memory_fraction,
+                    cross_kv_cache_fraction=cross_kv_cache_fraction)
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
         else:
@@ -1233,7 +1237,7 @@ class MultimodalModelRunner:
                                       return_tensors="pt")['pixel_values']
         elif self.model_type in ['mllama']:
             processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
-            image = Image.open(self.args.image_path)
+            image = self.load_test_image()
             inputs = processor(images=image, return_tensors="pt")
 
             other_vision_inputs = {

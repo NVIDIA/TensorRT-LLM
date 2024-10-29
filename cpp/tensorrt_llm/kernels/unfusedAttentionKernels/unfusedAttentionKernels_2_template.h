@@ -1063,7 +1063,7 @@ void kernelV2DispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, c
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T, typename TCache, typename KVCacheBuffer, int BLOCK_SIZE, int Dh>
+template <typename T, typename TCache, typename KVCacheBuffer, int BLOCK_SIZE, int Dh, bool FP8_OUTPUT>
 __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCacheBuffer> params)
 {
     // For cross-attention,
@@ -1121,6 +1121,14 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     int const src_k_offset = params.q_hidden_size;
     int const src_v_offset = src_k_offset + params.kv_hidden_size;
 
+    // Cast float scale to dst data type.
+    using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
+    [[maybe_unused]] TScale scale_orig_quant;
+    if constexpr (sizeof(TCache) == 1 || FP8_OUTPUT)
+    {
+        mmha::convert_from_float(&scale_orig_quant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+    }
+
     // For loop in the sequence length dimension.
     // There might be multiple blocks (blockIdx.x) that process the same sequence in order to fully utilize
     for (int token_idx = blockIdx.x * TOKENS_PER_BLOCK + (threadIdx.x / VECS_PER_HEAD); token_idx < max_seq_len;
@@ -1139,8 +1147,18 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
             // Only load Q tokens from decoder qkv input.
             auto q = *reinterpret_cast<VecT const*>(params.qkv_input + src_q_idx);
 
-            // Store it to a separate q output.
-            *reinterpret_cast<VecT*>(params.q_output + dst_q_idx) = q;
+            // Quantize the output to fp8.
+            if constexpr (FP8_OUTPUT)
+            {
+                using OutputType = __nv_fp8_e4m3;
+                OutputType* quantized_q_ptr = reinterpret_cast<OutputType*>(params.q_output) + dst_q_idx;
+                mmha::store_8bits_vec(quantized_q_ptr, q, 0, scale_orig_quant);
+            }
+            else
+            {
+                // Store it to a separate q output.
+                *reinterpret_cast<VecT*>(params.q_output + dst_q_idx) = q;
+            }
         }
 
         // Encoder tokens (i.e. KV tokens).
@@ -1175,10 +1193,6 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
             {
                 // The element index inside the block.
                 auto block_elt_idx = block_vec_idx * ELTS_PER_VEC;
-                // Cast float scale to dst data type.
-                using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
-                TScale scale_orig_quant;
-                mmha::convert_from_float(&scale_orig_quant, params.kvScaleOrigQuant[0]);
                 // Store 8bits kv cache.
                 mmha::store_8bits_vec(k_cache_block_ptr, k, block_elt_idx, scale_orig_quant);
                 mmha::store_8bits_vec(v_cache_block_ptr, v, block_elt_idx, scale_orig_quant);
@@ -1217,7 +1231,16 @@ void invokeUpdateKvCacheForCrossAttention(QKVPreprocessingParams<T, KVCacheBuffe
     dim3 grid(num_seq_blocks, params.head_num, params.batch_size);
 
     // Launch the kernel.
-    updateKVCacheForCrossAttention<T, TCache, KVCacheBuffer, BLOCK_SIZE, Dh><<<grid, block, 0, stream>>>(params);
+    if (params.quantized_fp8_output)
+    {
+        updateKVCacheForCrossAttention<T, TCache, KVCacheBuffer, BLOCK_SIZE, Dh, true>
+            <<<grid, block, 0, stream>>>(params);
+    }
+    else
+    {
+        updateKVCacheForCrossAttention<T, TCache, KVCacheBuffer, BLOCK_SIZE, Dh, false>
+            <<<grid, block, 0, stream>>>(params);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

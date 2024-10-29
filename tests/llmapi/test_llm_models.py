@@ -228,6 +228,10 @@ def test_llm_gemma_2_9b_it():
                      sampling_params=sampling_params)
 
 
+@pytest.mark.skip(
+    reason=
+    "Require further transformers update https://github.com/THUDM/ChatGLM3/issues/1324"
+)
 def test_llm_glm():
     print('test GLM....')
     llm_test_harness(glm_model_path,

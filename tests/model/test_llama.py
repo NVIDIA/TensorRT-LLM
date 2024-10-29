@@ -244,6 +244,7 @@ class TestLLaMA(unittest.TestCase):
         llama_config.vocab_size = 128
         llama_config.num_attention_heads = 2 if num_kv_heads <= 1 else 2 * num_kv_heads
         llama_config.hidden_size = llama_config.num_attention_heads * head_size
+        llama_config.head_dim = head_size
         llama_config.intermediate_size = ((
             (llama_config.hidden_size * 4 * 2 // 3) + head_size - 1) //
                                           head_size) * head_size
@@ -256,7 +257,7 @@ class TestLLaMA(unittest.TestCase):
         llama_config.eos_token_id = self.EOS_TOKEN
         seed_idx = random.randint(0, len(PRECHECKED_GOOD_RANDOM_SEEDS) - 1)
         torch.manual_seed(PRECHECKED_GOOD_RANDOM_SEEDS[seed_idx])
-        hf_llama = LlamaForCausalLM(llama_config).cuda()
+        hf_llama = LlamaForCausalLM(llama_config).cuda().eval()
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, dtype, world_size, rank, llama_config, hf_llama, model,
             use_plugin, batch_size, beam_width, input_len, output_len,

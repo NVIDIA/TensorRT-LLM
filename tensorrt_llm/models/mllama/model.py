@@ -90,6 +90,7 @@ class CrossAttentionTransformerBlock(Module):
         use_implicit_relative_attention=False,
         rotary_embedding_base=None,
         rotary_embedding_scaling=None,
+        layer_idx_in_cache_pool=None,
     ):
         super().__init__()
         self.local_layer_idx = local_layer_idx
@@ -123,6 +124,7 @@ class CrossAttentionTransformerBlock(Module):
             skip_cross_qkv=skip_cross_qkv,
             qk_layernorm=True,
             layernorm_type=layernorm_type,
+            layer_idx_in_cache_pool=layer_idx_in_cache_pool,
         )
 
         self.input_layernorm = ln_type(normalized_shape=hidden_size,
@@ -281,6 +283,7 @@ class TransformerBlock(Module):
         use_implicit_relative_attention=False,
         rotary_embedding_base=None,
         rotary_embedding_scaling=None,
+        layer_idx_in_cache_pool=None,
     ):
         super().__init__()
         self.local_layer_idx = local_layer_idx
@@ -313,6 +316,7 @@ class TransformerBlock(Module):
             use_implicit_relative_attention=use_implicit_relative_attention,
             rotary_embedding_base=rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
+            layer_idx_in_cache_pool=layer_idx_in_cache_pool,
         )
 
         self.input_layernorm = ln_type(normalized_shape=hidden_size,
@@ -428,6 +432,7 @@ class TransformerBlock(Module):
 class MLLaMAModel(PretrainedModel):
 
     def __init__(self, config: PretrainedConfig):
+        config = MLLaMAConfig(**config.to_dict())
         self.check_config(config)
         super().__init__(config)
         Attention.create_attention_const_params(self, config)
@@ -489,61 +494,48 @@ class MLLaMAModel(PretrainedModel):
                 tp_rank=self.mapping.tp_rank)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
+        nheads_tp = (num_kv_heads + self.mapping.tp_size -
+                     1) // self.mapping.tp_size
         _layers = []
         for layer_idx in layers_range:
+            local_layer_idx = layer_idx - layers_range[0]
+            args = {
+                "local_layer_idx": local_layer_idx,
+                "hidden_size": self.config.hidden_size,
+                "ffn_hidden_size": self.config.intermediate_size,
+                "num_attention_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "head_size": self.head_size,
+                "max_position_embeddings": self.config.max_position_embeddings,
+                "layernorm_position": self.config.layernorm_position,
+                "layernorm_eps": self.config.norm_epsilon,
+                "layernorm_type": self.config.layernorm_type,
+                "hidden_act": self.config.hidden_act,
+                "mlp_type": self.mlp_type,
+                "mapping": self.mapping,
+                "dtype": self._dtype,
+                "residual_scaling": self.config.residual_scaling,
+                "max_distance": self.config.max_distance,
+                "num_buckets": self.config.num_buckets,
+                "fp16_clamping": self.fp16_clamping,
+                "skip_cross_qkv": self.skip_cross_qkv,
+                "rotary_embedding_base": self.config.rotary_base,
+                "rotary_embedding_scaling": self.config.rotary_scaling,
+            }
             if layer_idx in self.cross_attention_layers:
                 assert layers_range[0] == 0, "not support PP now"
                 _layers.append(
                     CrossAttentionTransformerBlock(
-                        local_layer_idx=layer_idx - layers_range[0],
-                        hidden_size=self.config.hidden_size,
-                        ffn_hidden_size=self.config.intermediate_size,
-                        num_attention_heads=self.num_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                        max_position_embeddings=self.config.
-                        max_position_embeddings,
-                        layernorm_position=self.config.layernorm_position,
-                        layernorm_eps=self.config.norm_epsilon,
-                        layernorm_type=self.config.layernorm_type,
-                        hidden_act=self.config.hidden_act,
-                        mlp_type=self.mlp_type,
-                        mapping=self.mapping,
-                        dtype=self._dtype,
-                        residual_scaling=self.config.residual_scaling,
-                        max_distance=self.config.max_distance,
-                        num_buckets=self.config.num_buckets,
-                        fp16_clamping=self.fp16_clamping,
-                        skip_cross_qkv=self.skip_cross_qkv,
-                        rotary_embedding_base=self.config.rotary_base,
-                        rotary_embedding_scaling=self.config.rotary_scaling,
-                    ))
+                        **args,
+                        layer_idx_in_cache_pool=self.config.
+                        num_kv_heads_per_cross_attn_layer[:local_layer_idx].
+                        count(nheads_tp)))
             else:
                 _layers.append(
-                    TransformerBlock(
-                        local_layer_idx=layer_idx - layers_range[0],
-                        hidden_size=self.config.hidden_size,
-                        ffn_hidden_size=self.config.intermediate_size,
-                        num_attention_heads=self.num_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                        max_position_embeddings=self.config.
-                        max_position_embeddings,
-                        layernorm_position=self.config.layernorm_position,
-                        layernorm_eps=self.config.norm_epsilon,
-                        layernorm_type=self.config.layernorm_type,
-                        hidden_act=self.config.hidden_act,
-                        mlp_type=self.mlp_type,
-                        mapping=self.mapping,
-                        dtype=self._dtype,
-                        residual_scaling=self.config.residual_scaling,
-                        max_distance=self.config.max_distance,
-                        num_buckets=self.config.num_buckets,
-                        fp16_clamping=self.fp16_clamping,
-                        skip_cross_qkv=self.skip_cross_qkv,
-                        rotary_embedding_base=self.config.rotary_base,
-                        rotary_embedding_scaling=self.config.rotary_scaling,
-                    ))
+                    TransformerBlock(**args,
+                                     layer_idx_in_cache_pool=self.config.
+                                     num_kv_heads_per_layer[:local_layer_idx].
+                                     count(nheads_tp)))
 
         self.decoder_layers = ModuleList(_layers)
         if self.mapping.is_last_pp_rank():
@@ -1184,7 +1176,7 @@ class MLLaMAModel(PretrainedModel):
                     x for x in max_cross_blocks_per_seq_range[0]
                 ]]
 
-                num_kv_cache_pools = 1
+                num_kv_cache_pools = 2
 
                 kv_cache_block_offsets = Tensor(
                     name=f'kv_cache_block_offsets',

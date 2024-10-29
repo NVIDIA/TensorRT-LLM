@@ -74,7 +74,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 ```
 
@@ -266,7 +265,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_seq_len 3100 \
              --enable_xqa enable \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -313,7 +311,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_input_len 3000 \
                  --max_seq_len 3100 \
                  --enable_xqa enable \
-                 --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -356,7 +353,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_seq_len 3100 \
              --enable_xqa enable \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -401,7 +397,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -445,7 +440,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -487,7 +481,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_seq_len 3100 \
              --enable_xqa enable \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -539,7 +532,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_input_len 3000 \
                  --max_seq_len 3100 \
                  --enable_xqa enable \
-                 --lookup_plugin bfloat16 \
                  --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -581,7 +573,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_seq_len 3100 \
              --enable_xqa enable \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -628,7 +619,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin bfloat16 \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -672,7 +662,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 ```
 
@@ -685,7 +674,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_input_len 3000 \
              --max_seq_len 3100 \
              --enable_xqa enable \
-             --lookup_plugin float16 \
              --output_dir ${ENGINE_PATH}
 ```
 

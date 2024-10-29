@@ -27,6 +27,7 @@ from tqdm import tqdm
 from transformers import LlamaConfig, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       LlamaDecoderLayer,
+                                                      LlamaRotaryEmbedding,
                                                       apply_rotary_pos_emb,
                                                       repeat_kv)
 from transformers.pytorch_utils import Conv1D
@@ -380,7 +381,8 @@ class LlamaAttentionExtend(LlamaAttention):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim,
                                 self.hidden_size,
                                 bias=False)
-        self._init_rope()
+        self.config.head_dim = self.head_dim
+        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
     def forward(
         self,

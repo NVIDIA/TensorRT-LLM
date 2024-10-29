@@ -15,10 +15,11 @@
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 
-from .._utils import set_obj_attrs, str_dtype_to_torch
-from ..functional import embedding, unsqueeze, where
+from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
+from ..functional import concat, constant, embedding, unsqueeze, where
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -57,21 +58,36 @@ class Embedding(Module):
         self.tp_dim = sharding_dim
 
         if sharding_dim == 1:
-            self.weight = Parameter(shape=(self.num_embeddings,
-                                           self.embedding_dim // self.tp_size),
-                                    dtype=dtype)
+            shape = (self.num_embeddings, self.embedding_dim // self.tp_size)
         elif sharding_dim == 0:
-            self.weight = Parameter(shape=(math.ceil(
-                self.num_embeddings / self.tp_size), self.embedding_dim),
-                                    dtype=dtype)
+            shape = (math.ceil(self.num_embeddings / self.tp_size),
+                     self.embedding_dim)
+
+        self.weight = Parameter(shape=shape, dtype=dtype)
+
+        self.weight_padding_size = ((8 - shape[0] % 8) % 8, shape[1])
 
         set_obj_attrs(self.weight, {
             "weight_loader": self.weight_loader,
         })
 
     def forward(self, x):
+        # The embedding weight is padded to the multiple of 8.
+        # The reason is that when lm_head and vocab_embedding are using the same embedding weight,
+        # previously weights can't be depulicated in the engine because gemm will pad the weight to the multiple of 8.
+        # If we also pad the embedding weight to the multiple of 8, the weights can be successfully deduplicated.
+        # This will not affect the input and output of the gather op and perf impact is negligible.
+        if self.weight_padding_size[0] != 0:
+            padding_values = np.zeros(self.weight_padding_size,
+                                      dtype=trt_dtype_to_np(
+                                          self.weight.value.dtype))
+            padding = constant(padding_values)
+            padded_weight = concat([self.weight.value, padding], dim=0)
+        else:
+            padded_weight = self.weight.value
+
         return embedding(x,
-                         self.weight.value,
+                         padded_weight,
                          tp_size=self.tp_size,
                          tp_group=self.tp_group,
                          sharding_dim=self.sharding_dim,

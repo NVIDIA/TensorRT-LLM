@@ -60,7 +60,7 @@ th::Tensor gatherTree(                                    // BS: batch_size, BM:
     {
         int32_t* final_output_ids_ptr = get_ptr<int32_t>(final_output_ids);
         tk::invokeInitializeOutput(
-            final_output_ids_ptr, get_ptr<int32_t>(end_ids), batch_size * beam_width, max_seq_len, stream);
+            final_output_ids_ptr, get_ptr<int32_t>(end_ids), batch_size, beam_width, max_seq_len, stream);
 
         tk::BeamHypotheses bh;
         bh.nBatchSize = batch_size;

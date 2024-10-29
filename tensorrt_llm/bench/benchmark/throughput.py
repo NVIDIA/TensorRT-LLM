@@ -13,13 +13,13 @@ import click
 from click_option_group import optgroup
 
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm.bench.benchmark.dataclasses import (BenchmarkStatistics,
+                                                      RuntimeConfig)
+from tensorrt_llm.bench.benchmark.utils import (ResponseTuple, StatsKeeper,
+                                                get_executor_requests,
+                                                get_settings_from_engine)
 from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.bench.enums import IFBSchedulingPolicy
-from tensorrt_llm.bench.run.dataclasses import (BenchmarkStatistics,
-                                                RuntimeConfig)
-from tensorrt_llm.bench.run.utils import (ResponseTuple, StatsKeeper,
-                                          get_executor_request,
-                                          get_settings_from_engine)
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
 from tensorrt_llm.logger import logger
@@ -93,7 +93,7 @@ from tensorrt_llm.logger import logger
     help="Enable streaming mode for requests.",
 )
 @click.pass_obj
-def run_command(
+def throughput_command(
     bench_env: BenchmarkEnvironment,
     **params,
 ) -> None:
@@ -114,6 +114,13 @@ def run_command(
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
     engine_max_seq_len = build_cfg["max_seq_len"]
+
+    # Check that we are not using a low latency engine
+    # Right now, this is based on max batch size.
+    if engine_bs == 1:
+        raise ValueError(
+            "An engine with a batch size greater than 1 should be used for "
+            "throughput benchmarking. Exiting.")
 
     # Runtime Options
     runtime_max_bs = params.pop("max_batch_size")
@@ -148,15 +155,13 @@ def run_command(
             "dataset contains a maximum sequence of "
             f"{metadata.max_sequence_length}. Please rebuild a new engine to"
             "support this dataset.")
-    executor_requests = []
-    while requests:
-        request = requests.pop()
-        executor_requests.append(
-            get_executor_request(request,
-                                 pad_id=-1,
-                                 eos_id=-1,
-                                 streaming=streaming))
-        del request
+
+    # Dataset Loading and Preparation
+    executor_requests = get_executor_requests(
+        requests,
+        streaming,
+    )
+    del requests
 
     logger.info("Setting up benchmarker and infrastructure.")
     new_request_queue = mp.Queue()
@@ -170,7 +175,7 @@ def run_command(
         response_queue=response_queue,
         streaming=streaming,
     )
-    logger.set_level("info")
+
     try:
         logger.info("Ready to start benchmark.")
         benchmark.start_benchmark()
@@ -200,15 +205,22 @@ class ExecutorManager:
         logger.info("Initializing Executor.")
         # Runtime related properties.
         self.runtime_config: RuntimeConfig = runtime_cfg
+        # Runtime tracking and multiprocessing.
+        self.responses = response_queue
+        self._shutdown = Event()
+        self.backend_ready = Event()
+        self._resp_daemon_finished = Event()
         self.executor = trtllm.Executor(
             self.runtime_config.engine_dir,
             trtllm.ModelType.DECODER_ONLY,
             executor_config=self.runtime_config.get_config())
 
-        # Runtime tracking and multiprocessing.
-        self.responses = response_queue
-        self._shutdown = Event()
-        self._resp_daemon_finished = Event()
+        logger.info("WAITING ON EXECUTOR...")
+        while not self.executor.can_enqueue_requests():
+            logger.info("Waiting for executor to stand up...")
+            sleep(1)
+
+        self.backend_ready.set()
 
         self.response_thread = Thread(target=self.response_daemon)
         self.response_thread.start()
@@ -287,7 +299,8 @@ class ThroughputBenchmark:
             response_queue (mp.Queue): Process-safe queue for passing request
             responses to main process.
         """
-        logger.info(f"Initializing Throughput Benchmark. [rate=%d req/s]")
+        logger.info(
+            f"Initializing Throughput Benchmark. [rate={request_rate} req/s]")
         # Dataset and input properties.
         self.requests = dataset
         self.delay_func = lambda x: sleep(
@@ -318,8 +331,9 @@ class ThroughputBenchmark:
 
     def enqueue_process(self) -> None:
         """Method for starting enqueueing requests."""
+        logger.info("WAITING ON BACKEND TO BE READY...")
+        self.executor.backend_ready.wait()
         logger.info("Request serving started.")
-
         request_generator = self.executor.enqueue(*self.requests)
         # Iterate the generator until we run out of requests.
         # Note the walrus operator.
