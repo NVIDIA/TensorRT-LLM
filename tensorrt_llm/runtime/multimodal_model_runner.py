@@ -33,6 +33,90 @@ if PYTHON_BINDINGS:
     from .model_runner_cpp import ModelRunnerCpp
 
 
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+def build_transform(input_size):
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD)
+    ])
+    return transform
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+        i * j <= max_num and i * j >= min_num)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    logger.info('[TIME] Start resize image...')
+    resized_img = image.resize((target_width, target_height))
+    logger.info('[TIME] End resize image.')
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        # split the image
+        split_img = resized_img.crop(box)
+        # split_img = image.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+def load_image(image_file, input_size=448, max_num=12):
+    image = Image.open(image_file).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    logger.info('[TIME] Start dynamic_preprocess...')
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    logger.info('[TIME] End dynamic_preprocess.')
+    logger.info('[TIME] Start transform...')
+    pixel_values = [transform(image) for image in images]
+    logger.info('[TIME] End transform.')
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
+
 class LlavaNextUtils:
     # https://github.com/haotian-liu/LLaVA/blob/main/llava/mm_utils.py
 
@@ -505,6 +589,25 @@ class MultimodalModelRunner:
             input_ids = self.ptuning_setup_llava_next(visual_features,
                                                       pre_prompt, post_prompt)
             length = input_ids.shape[1]
+        elif self.model_type == 'internvl2':
+            pre_input_ids = self.tokenizer(pre_prompt,
+                                           return_tensors="pt",
+                                           padding=True).input_ids
+            if post_prompt[0] is not None:
+                post_input_ids = self.tokenizer(post_prompt,
+                                                return_tensors="pt",
+                                                padding=True).input_ids
+                if self.model_type == 'video-neva':
+                    length = pre_input_ids.shape[1] + post_input_ids.shape[
+                        1] + visual_atts.shape[2] * visual_atts.shape[1]
+                else:
+                    length = pre_input_ids.shape[1] + post_input_ids.shape[
+                        1] + visual_atts.shape[1]
+                input_ids = self.ptuning_setup_llava_next(visual_features, pre_prompt, post_prompt)
+                length = input_ids.shape[1]
+            else:
+                post_input_ids = None
+                length = pre_input_ids.shape[1] + visual_atts.shape[1]
         elif self.model_type == 'mllama':
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -533,7 +636,7 @@ class MultimodalModelRunner:
             torch.int32)
 
         if self.model_type in [
-                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next'
+                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next', 'internvl2'
         ]:
             return input_ids, input_lengths, [visual_features], visual_features
 
@@ -1053,6 +1156,11 @@ class MultimodalModelRunner:
             images = load_images(self.args.image_path)
         elif "video-neva" in self.model_type:
             images = self.args.video_path
+        elif "internvl2" in self.model_type:
+            if self.args.image_path is None:
+                self.args.image_path = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+            # images = load_image(self.args.image_path, max_num=1).to(torch.bfloat16).cuda()
+            images = load_image(self.args.image_path, max_num=1)
         else:
             if self.args.image_path is None:
                 self.args.image_path = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
@@ -1183,9 +1291,13 @@ class MultimodalModelRunner:
                               images=raw_image,
                               return_tensors="pt")
 
-        elif self.model_type in ['llava', 'vila', 'fuyu', 'kosmos-2']:
+        elif self.model_type in ['llava', 'vila', 'fuyu', 'kosmos-2', 'internvl2']:
             # LLaVA and VILA
             if self.model_type == "llava":
+                pre_prompt = "USER:\n"
+                if input_text is None:
+                    input_text = "Question: which city is this? Answer:"
+            elif self.model_type == "internvl2":
                 pre_prompt = "USER:\n"
                 if input_text is None:
                     input_text = "Question: which city is this? Answer:"
@@ -1231,6 +1343,8 @@ class MultimodalModelRunner:
                     image = processor(text=input_text,
                                       images=raw_image,
                                       return_tensors='pt')
+                elif self.model_type in ['internvl2']:
+                    image = raw_image
                 else:
                     image = processor(text=input_text,
                                       images=raw_image,

@@ -26,6 +26,84 @@ import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import save_file
 
+import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+def build_transform(input_size):
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD)
+    ])
+    return transform
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+        i * j <= max_num and i * j >= min_num)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        # split the image
+        split_img = resized_img.crop(box)
+        # split_img = image.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+def load_image(raw_image, input_size=448, max_num=12):
+    image = raw_image.convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
+
 
 def add_multimodal_arguments(parser):
     parser.add_argument('--model_type',
@@ -34,7 +112,7 @@ def add_multimodal_arguments(parser):
                         choices=[
                             'blip2', 'llava', 'llava_next', 'vila', 'nougat',
                             'cogvlm', 'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'mllama'
+                            'video-neva', 'phi-3-vision', 'mllama', 'internvl2'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -100,6 +178,8 @@ class VisionEngineBuilder:
             build_phi_engine(args)
         elif args.model_type == 'mllama':
             build_mllama_engine(args)
+        elif args.model_type == 'internvl2':
+            build_internvl2_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -205,6 +285,110 @@ def build_trt_engine(model_type,
         raise ValueError(f"invalid input sizes: {input_sizes}")
 
     config.add_optimization_profile(profile)
+
+    t0 = time()
+    engine_string = builder.build_serialized_network(network, config)
+    t1 = time()
+    if engine_string is None:
+        raise RuntimeError("Failed building %s" % (engine_file))
+    else:
+        logger.log(trt.Logger.INFO,
+                   "Succeeded building %s in %d s" % (engine_file, t1 - t0))
+        os.makedirs(engine_dir, exist_ok=True)
+        with open(engine_file, 'wb') as f:
+            f.write(engine_string)
+
+        # Clear onnx files since we no longer need them after a successful engine build
+        if delete_onnx:
+            shutil.rmtree(onnx_dir)
+
+    Builder.save_config(config_wrapper, config_file)
+
+def build_internvl2_trt_engine(model_type,
+                     input_sizes,
+                     onnx_dir,
+                     engine_dir,
+                     max_batch_size,
+                     dtype=torch.float16,
+                     num_frames=None,
+                     onnx_name='model.onnx',
+                     engine_name='model.engine',
+                     delete_onnx=True,
+                     logger=trt.Logger(trt.Logger.INFO)):
+    onnx_file = f'{onnx_dir}/{onnx_name}'
+    engine_file = f'{engine_dir}/{engine_name}'
+    config_file = f'{engine_dir}/config.json'
+    logger.log(trt.Logger.INFO, f"Building TRT engine to {engine_file}")
+
+    builder = trt.Builder(logger)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    profile = builder.create_optimization_profile()
+
+    config_args = {
+        "precision": torch_dtype_to_str(dtype),
+        "model_type": model_type,
+        "strongly_typed": False
+    }
+    if num_frames is not None:
+        config_args["num_frames"] = num_frames
+
+    config_wrapper = Builder().create_builder_config(**config_args)
+    config = config_wrapper.trt_builder_config
+
+    parser = trt.OnnxParser(network, logger)
+
+    with open(onnx_file, 'rb') as model:
+        if not parser.parse(model.read(), os.path.abspath(onnx_file)):
+            logger.log(trt.Logger.ERROR, "Failed parsing %s" % onnx_file)
+            for error in range(parser.num_errors):
+                logger.log(trt.Logger.ERROR, parser.get_error(error))
+        logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
+
+    nBS = -1
+    nMinBS = 1
+    nOptBS = max(nMinBS, int(max_batch_size / 2))
+    nMaxBS = max_batch_size
+
+    # input sizes can be:
+    # - integer list, when inputs are constant size images. e.g. [3, H, W]
+    # - list of integer lists, when inputs are dynamic size images. e.g. [[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]]
+    # - list of list of integer lists, when there are many inputs and each input have dynamic size. e.g.
+    #   [[[1, 1, 2700], [1, 500, 2700], [1, 4096, 2700]], [[1, 1], [1, 1], [1,1]]]
+    assert isinstance(input_sizes, list), "input_sizes must be a list"
+    if isinstance(input_sizes[0], int):
+        logger.log(trt.Logger.INFO, f"Processed input sizes {input_sizes}")
+        inputT = network.get_input(0)
+        inputT.shape = [nBS, *input_sizes]
+        min_size = opt_size = max_size = input_sizes
+        profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
+                          [nMaxBS, *max_size])
+    elif isinstance(input_sizes[0], list) and isinstance(
+            input_sizes[0][0], list):
+        for idx, input_size in enumerate(input_sizes):
+            assert len(input_size) == 3
+            inputT = network.get_input(idx)
+            min_size, opt_size, max_size = input_size
+            profile.set_shape(inputT.name, [nMinBS, *min_size],
+                              [nOptBS, *opt_size], [nMaxBS, *max_size])
+    elif len(input_sizes) == 3 and isinstance(input_sizes[0], list):
+        inputT = network.get_input(0)
+        min_size, opt_size, max_size = input_sizes
+        profile.set_shape(inputT.name, [nMinBS, *min_size], [nOptBS, *opt_size],
+                          [nMaxBS, *max_size])
+        logger.log(
+            trt.Logger.INFO,
+            f"Processed min/opt/max input sizes {min_size}/{opt_size}/{max_size}"
+        )
+    else:
+        raise ValueError(f"invalid input sizes: {input_sizes}")
+
+    config.add_optimization_profile(profile)
+
+    # 获取输入层并设置数据类型为float16
+    for i in range(network.num_inputs):
+        input_tensor = network.get_input(i)
+        input_tensor.dtype = trt.float16  # 设置输入层的精度为float16
 
     t0 = time()
     engine_string = builder.build_serialized_network(network, config)
@@ -381,6 +565,84 @@ def build_llava_engine(args):
 
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
+        args.output_dir,
+        args.max_batch_size)
+    if args.model_type == "llava_next":
+        image_newline = model.image_newline.data
+        tensor_img_newline = {"image_newline": image_newline}
+        save_file(tensor_img_newline,
+                  os.path.join(args.output_dir, "image_newlines.safetensors"))
+        
+def build_internvl2_engine(args):
+    raw_image = Image.new('RGB', [100, 100])  # dummy image
+    image = load_image(raw_image, max_num=1)
+
+    class LlavaVisionWrapper(torch.nn.Module):
+        def __init__(self, tower):
+            super().__init__()
+            self.tower = tower
+            # vit_hidden_size = config.vision_config.hidden_size
+            vit_hidden_size = 1024
+            # llm_hidden_size = config.llm_config.hidden_size
+            llm_hidden_size = 4096
+            # self.downsample_ratio = config.downsample_ratio
+            self.downsample_ratio = 0.5
+            # self.ps_version = config.ps_version
+            self.ps_version = "v2"
+            self.mlp1 = torch.nn.Sequential(
+                torch.nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio) ** 2),
+                torch.nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio) ** 2, llm_hidden_size),
+                torch.nn.GELU(),
+                torch.nn.Linear(llm_hidden_size, llm_hidden_size)
+            )
+
+        def pixel_shuffle(self, x, scale_factor=0.5):
+            n, w, h, c = x.size()
+            # N, W, H, C --> N, W, H * scale, C // scale
+            x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+            # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+            x = x.permute(0, 2, 1, 3).contiguous()
+            # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+            x = x.view(n, int(h * scale_factor), int(w * scale_factor),
+                    int(c / (scale_factor * scale_factor)))
+            if self.ps_version == 'v1':
+                warnings.warn("In ps_version 'v1', the height and width have not been swapped back, "
+                            'which results in a transposed image.')
+            else:
+                x = x.permute(0, 2, 1, 3).contiguous()
+            return x
+
+        def forward(self, image):
+            vit_embeds = self.tower(image).last_hidden_state
+            vit_embeds = vit_embeds[:, 1:, :]
+            h = w = int(vit_embeds.shape[1] ** 0.5)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+            vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+            vit_embeds = self.mlp1(vit_embeds)
+            return vit_embeds
+        
+    # model = LlavaForConditionalGeneration.from_pretrained(
+    #     args.model_path, torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(
+                args.model_path,
+                device_map="cuda",
+                # torch_dtype=torch.float16,
+                torch_dtype=torch.float32,
+                # fp16=True,
+                trust_remote_code=True,
+            ).eval()
+    wrapper = LlavaVisionWrapper(
+        model.vision_model.cpu())
+    # wrapper = model.vision_model
+    # wrapper.eval()
+    
+
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_internvl2_trt_engine(
         args.model_type,
         [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
         f'{args.output_dir}/onnx',
