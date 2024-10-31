@@ -63,7 +63,7 @@ namespace
 {
 
 template <typename T>
-void safeInsert(th::optional<th::Tensor>& tensor, std::optional<std::vector<T>>& arg)
+void safeInsert(std::optional<th::Tensor>& tensor, std::optional<std::vector<T>>& arg)
 {
     using valueType = T;
     if (tensor.has_value())
@@ -76,7 +76,7 @@ void safeInsert(th::optional<th::Tensor>& tensor, std::optional<std::vector<T>>&
 }
 
 template <typename T>
-void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tr::ITensor::SharedPtr>& arg)
+void safeUpdate(std::optional<th::Tensor>& tensor, std::optional<tr::ITensor::SharedPtr>& arg)
 {
     if (tensor.has_value())
     {
@@ -85,7 +85,7 @@ void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tr::ITensor::Sha
 }
 
 template <typename T>
-void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tr::ITensor::SharedConstPtr>& arg)
+void safeUpdate(std::optional<th::Tensor>& tensor, std::optional<tr::ITensor::SharedConstPtr>& arg)
 {
     if (tensor.has_value())
     {
@@ -94,7 +94,7 @@ void safeUpdate(th::optional<th::Tensor>& tensor, std::optional<tr::ITensor::Sha
 }
 
 template <typename T>
-void safeUpdateScalar(th::optional<th::Tensor>& tensor, std::optional<T>& arg, std::string const& name)
+void safeUpdateScalar(std::optional<th::Tensor>& tensor, std::optional<T>& arg, std::string const& name)
 {
     if (tensor.has_value())
     {
@@ -105,7 +105,7 @@ void safeUpdateScalar(th::optional<th::Tensor>& tensor, std::optional<T>& arg, s
 }
 
 template <typename T>
-void safeUpdatePtr(th::optional<th::Tensor>& tensor, T*& ptr)
+void safeUpdatePtr(std::optional<th::Tensor>& tensor, T*& ptr)
 {
     if (tensor.has_value())
     {
@@ -117,14 +117,14 @@ void safeUpdatePtr(th::optional<th::Tensor>& tensor, T*& ptr)
 
 template <typename T>
 void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
-    th::optional<th::Tensor> runtime_top_k_opt, th::optional<th::Tensor> runtime_top_p_opt,
-    th::optional<th::Tensor> temperature_opt, th::optional<th::Tensor> repetition_penalty_opt,
-    th::optional<th::Tensor> presence_penalty_opt, th::optional<th::Tensor> frequency_penalty_opt,
-    th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
-    th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
-    th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
-    th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
-    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
+    std::optional<th::Tensor> runtime_top_k_opt, std::optional<th::Tensor> runtime_top_p_opt,
+    std::optional<th::Tensor> temperature_opt, std::optional<th::Tensor> repetition_penalty_opt,
+    std::optional<th::Tensor> presence_penalty_opt, std::optional<th::Tensor> frequency_penalty_opt,
+    std::optional<th::Tensor> min_length_opt, std::optional<th::Tensor> length_penalty_opt,
+    std::optional<th::Tensor> early_stopping_opt, std::optional<th::Tensor> beam_search_diversity_rate_opt,
+    std::optional<th::Tensor> random_seed_opt, std::optional<th::Tensor> top_p_decay_opt,
+    std::optional<th::Tensor> top_p_min_opt, std::optional<th::Tensor> top_p_reset_ids_opt,
+    std::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     mBeamWidth = beam_width;
@@ -179,20 +179,20 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
 template <typename T>
 void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int const maxInputLength,
     int const maxAttentionWindow, int const sinkTokenLength, uint64_t const ite, int const localBatchSize,
-    th::Tensor endId, th::optional<th::Tensor> embeddingBiasOpt, th::optional<th::Tensor> inputLengthsOpt,
-    th::optional<th::Tensor> sequenceLimitLengthOpt, th::optional<th::Tensor> stopWordsListPtrsOpt,
-    th::optional<th::Tensor> stopWordsLensOpt, int32_t const maxStopWordsLen,
-    th::optional<th::Tensor> badWordsListPtrsOpt, th::optional<th::Tensor> badWordsLensOpt,
-    int32_t const maxBadWordsLen, th::optional<th::Tensor> srcCacheIndirectionOpt, th::Tensor& outputTokenIds,
-    th::Tensor& newTokens, th::Tensor& shouldStop, th::optional<th::Tensor> finishedInput,
-    th::optional<th::Tensor> finishedOutput, th::optional<th::Tensor> sequenceLengthsOpt,
-    th::optional<th::Tensor> cumLogProbsOpt, th::optional<th::Tensor> outputLogProbsOpt,
-    th::optional<th::Tensor> outputLogProbsTiledOpt, th::optional<th::Tensor> parentIdsOpt,
-    th::optional<th::Tensor> tgtCacheIndirectionOpt, th::optional<th::Tensor> beamHypsOutputIdsCbaOpt,
-    th::optional<th::Tensor> beamHypsSeqLenCbaOpt, th::optional<th::Tensor> beamHypsCumLogProbsCbaOpt,
-    th::optional<th::Tensor> beamHypsNormedScoresCbaOpt, th::optional<th::Tensor> beamHypsLogProbsCbaOpt,
-    th::optional<th::Tensor> beamHypsMinNormedScoresOpt, th::optional<th::Tensor> beamHypsNumBeamsOpt,
-    th::optional<th::Tensor> beamHypsIsDoneOpt, bool const useBeamHyps)
+    th::Tensor endId, std::optional<th::Tensor> embeddingBiasOpt, std::optional<th::Tensor> inputLengthsOpt,
+    std::optional<th::Tensor> sequenceLimitLengthOpt, std::optional<th::Tensor> stopWordsListPtrsOpt,
+    std::optional<th::Tensor> stopWordsLensOpt, int32_t const maxStopWordsLen,
+    std::optional<th::Tensor> badWordsListPtrsOpt, std::optional<th::Tensor> badWordsLensOpt,
+    int32_t const maxBadWordsLen, std::optional<th::Tensor> srcCacheIndirectionOpt, th::Tensor& outputTokenIds,
+    th::Tensor& newTokens, th::Tensor& shouldStop, std::optional<th::Tensor> finishedInput,
+    std::optional<th::Tensor> finishedOutput, std::optional<th::Tensor> sequenceLengthsOpt,
+    std::optional<th::Tensor> cumLogProbsOpt, std::optional<th::Tensor> outputLogProbsOpt,
+    std::optional<th::Tensor> outputLogProbsTiledOpt, std::optional<th::Tensor> parentIdsOpt,
+    std::optional<th::Tensor> tgtCacheIndirectionOpt, std::optional<th::Tensor> beamHypsOutputIdsCbaOpt,
+    std::optional<th::Tensor> beamHypsSeqLenCbaOpt, std::optional<th::Tensor> beamHypsCumLogProbsCbaOpt,
+    std::optional<th::Tensor> beamHypsNormedScoresCbaOpt, std::optional<th::Tensor> beamHypsLogProbsCbaOpt,
+    std::optional<th::Tensor> beamHypsMinNormedScoresOpt, std::optional<th::Tensor> beamHypsNumBeamsOpt,
+    std::optional<th::Tensor> beamHypsIsDoneOpt, bool const useBeamHyps)
 {
     TLLM_CHECK_WITH_INFO(mBeamWidth.has_value(), "Beam width is not set. setup() must be called before forward()");
     auto const isBeamSearch = mBeamWidth.value() > 1;
@@ -325,14 +325,14 @@ void DynamicDecodeOp::createInstance()
     }
 }
 
-void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th::optional<th::Tensor> runtimeTopKOpt,
-    th::optional<th::Tensor> runtimeTopPOpt, th::optional<th::Tensor> temperatureOpt,
-    th::optional<th::Tensor> repetitionPenaltyOpt, th::optional<th::Tensor> presencePenaltyOpt,
-    th::optional<th::Tensor> frequencyPenaltyOpt, th::optional<th::Tensor> minLengthOpt,
-    th::optional<th::Tensor> lengthPenaltyOpt, th::optional<th::Tensor> earlyStoppingOpt,
-    th::optional<th::Tensor> beamSearchDiversityRateOpt, th::optional<th::Tensor> randomSeedOpt,
-    th::optional<th::Tensor> topPDecayOpt, th::optional<th::Tensor> topPMinOpt,
-    th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt, bool outputLogProbs,
+void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, std::optional<th::Tensor> runtimeTopKOpt,
+    std::optional<th::Tensor> runtimeTopPOpt, std::optional<th::Tensor> temperatureOpt,
+    std::optional<th::Tensor> repetitionPenaltyOpt, std::optional<th::Tensor> presencePenaltyOpt,
+    std::optional<th::Tensor> frequencyPenaltyOpt, std::optional<th::Tensor> minLengthOpt,
+    std::optional<th::Tensor> lengthPenaltyOpt, std::optional<th::Tensor> earlyStoppingOpt,
+    std::optional<th::Tensor> beamSearchDiversityRateOpt, std::optional<th::Tensor> randomSeedOpt,
+    std::optional<th::Tensor> topPDecayOpt, std::optional<th::Tensor> topPMinOpt,
+    std::optional<th::Tensor> topPResetIdsOpt, std::optional<th::Tensor> noRepeatNgramSizeOpt, bool outputLogProbs,
     bool cumLogProbs)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
@@ -361,44 +361,44 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
 
 th::Tensor DynamicDecodeOp::forward(
     // Inputs  BS: batchSize, BM: beamWidth, MSL: maxSeqLength, V: vocabSize, VP: vocabSizePadded
-    th::Tensor const& logits,                        // [BS, BM, VP], T, variables for input
-    int64_t const step,                              //
-    int64_t const maxInputLength,                    //
-    int64_t const maxAttentionWindow,                //
-    int64_t const sinkTokenLength,                   //
-    int64_t const ite,                               //
-    int64_t const localBatchSize,                    //
-    th::Tensor const endId,                          // [BS*BM], int
-    th::optional<th::Tensor> embeddingBiasOpt,       // [VP], T
-    th::optional<th::Tensor> inputLengthsOpt,        // [BS*BM], int, length of input contexts
-    th::optional<th::Tensor> sequenceLimitLengthOpt, // [BS, 1], int
-    th::optional<th::Tensor> stopWordsListPtrsOpt,   // [BS][2, stopWordsLength], int64
-    th::optional<th::Tensor> stopWordsLensOpt,       // [BS], int
-    int64_t const maxStopWordsLen,                   //
-    th::optional<th::Tensor> badWordsListPtrsOpt,    // [BS][2, badWordsLength], int64
-    th::optional<th::Tensor> badWordsLensOpt,        // [BS], int
-    int64_t const maxBadWordsLen,                    //
-    th::optional<th::Tensor> srcCacheIndirectionOpt, // [localBS, BM, MSL], int
+    th::Tensor const& logits,                         // [BS, BM, VP], T, variables for input
+    int64_t const step,                               //
+    int64_t const maxInputLength,                     //
+    int64_t const maxAttentionWindow,                 //
+    int64_t const sinkTokenLength,                    //
+    int64_t const ite,                                //
+    int64_t const localBatchSize,                     //
+    th::Tensor const endId,                           // [BS*BM], int
+    std::optional<th::Tensor> embeddingBiasOpt,       // [VP], T
+    std::optional<th::Tensor> inputLengthsOpt,        // [BS*BM], int, length of input contexts
+    std::optional<th::Tensor> sequenceLimitLengthOpt, // [BS, 1], int
+    std::optional<th::Tensor> stopWordsListPtrsOpt,   // [BS][2, stopWordsLength], int64
+    std::optional<th::Tensor> stopWordsLensOpt,       // [BS], int
+    int64_t const maxStopWordsLen,                    //
+    std::optional<th::Tensor> badWordsListPtrsOpt,    // [BS][2, badWordsLength], int64
+    std::optional<th::Tensor> badWordsLensOpt,        // [BS], int
+    int64_t const maxBadWordsLen,                     //
+    std::optional<th::Tensor> srcCacheIndirectionOpt, // [localBS, BM, MSL], int
     // Outputs
-    th::Tensor outputTokenIds,                           // [BS, BM, MSL], variables for output
-    th::Tensor newTokens,                                // [BS, BM, 1], int
-    th::optional<th::Tensor> finishedInput,              // [BS, BM], uint8
-    th::optional<th::Tensor> finishedOutput,             // [BS, BM], uint8
-    th::optional<th::Tensor> sequenceLengthsOpt,         // [BS*BM], int, length of the current sequences
-    th::optional<th::Tensor> cumLogProbsOpt,             // [BS, BM], float
-    th::optional<th::Tensor> outputLogProbsOpt,          // [BS, BM, MSL], float
-    th::optional<th::Tensor> outputLogProbsTiledOpt,     // [MSL, BS, BM], float, transpose of outputLogProbsOpt
-    th::optional<th::Tensor> parentIdsOpt,               // [BS, BM, MSL], int
-    th::optional<th::Tensor> tgtCacheIndirectionOpt,     // [localBS, BM, MSL], int
-    th::optional<th::Tensor> beamHypsOutputIdsCbaOpt,    // [BS, BM*2, MSL], int
-    th::optional<th::Tensor> beamHypsSeqLenCbaOpt,       // [BS, BM*2], int
-    th::optional<th::Tensor> beamHypsCumLogProbsCbaOpt,  // [BS, BM*2], float
-    th::optional<th::Tensor> beamHypsNormedScoresCbaOpt, // [BS, BM*2], float
-    th::optional<th::Tensor> beamHypsLogProbsCbaOpt,     // [BS, BM*2, MSL], float
-    th::optional<th::Tensor> beamHypsMinNormedScoresOpt, // [BS], float
-    th::optional<th::Tensor> beamHypsNumBeamsOpt,        // [BS], int
-    th::optional<th::Tensor> beamHypsIsDoneOpt,          // [BS], bool
-    bool const useBeamHyps                               //
+    th::Tensor outputTokenIds,                            // [BS, BM, MSL], variables for output
+    th::Tensor newTokens,                                 // [BS, BM, 1], int
+    std::optional<th::Tensor> finishedInput,              // [BS, BM], uint8
+    std::optional<th::Tensor> finishedOutput,             // [BS, BM], uint8
+    std::optional<th::Tensor> sequenceLengthsOpt,         // [BS*BM], int, length of the current sequences
+    std::optional<th::Tensor> cumLogProbsOpt,             // [BS, BM], float
+    std::optional<th::Tensor> outputLogProbsOpt,          // [BS, BM, MSL], float
+    std::optional<th::Tensor> outputLogProbsTiledOpt,     // [MSL, BS, BM], float, transpose of outputLogProbsOpt
+    std::optional<th::Tensor> parentIdsOpt,               // [BS, BM, MSL], int
+    std::optional<th::Tensor> tgtCacheIndirectionOpt,     // [localBS, BM, MSL], int
+    std::optional<th::Tensor> beamHypsOutputIdsCbaOpt,    // [BS, BM*2, MSL], int
+    std::optional<th::Tensor> beamHypsSeqLenCbaOpt,       // [BS, BM*2], int
+    std::optional<th::Tensor> beamHypsCumLogProbsCbaOpt,  // [BS, BM*2], float
+    std::optional<th::Tensor> beamHypsNormedScoresCbaOpt, // [BS, BM*2], float
+    std::optional<th::Tensor> beamHypsLogProbsCbaOpt,     // [BS, BM*2, MSL], float
+    std::optional<th::Tensor> beamHypsMinNormedScoresOpt, // [BS], float
+    std::optional<th::Tensor> beamHypsNumBeamsOpt,        // [BS], int
+    std::optional<th::Tensor> beamHypsIsDoneOpt,          // [BS], bool
+    bool const useBeamHyps                                //
 )
 {
     CHECK_INPUT(logits, scalarType_);

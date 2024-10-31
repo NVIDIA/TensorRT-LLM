@@ -29,11 +29,12 @@ namespace torch_ext
 void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsTensor,
     torch::Tensor packedAcceptedDraftTokensIndicesTensor, torch::Tensor pastKeyValueLengthsTensor, bool usePagedKVCache,
     int64_t layerCount, int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount,
-    int64_t maxKVCacheLen, th::optional<torch::Tensor> rewindDraftTokenTensor,
-    th::optional<std::vector<torch::Tensor>> pastKeyValueListOpt = th::nullopt,
-    th::optional<torch::Tensor> pointerArrayOpt = th::nullopt, th::optional<torch::Tensor> offsetArrayOpt = th::nullopt,
-    th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt, th::optional<int64_t> tokensPerBlockOpt = th::nullopt,
-    th::optional<int64_t> stream_ptr = th::nullopt)
+    int64_t maxKVCacheLen, std::optional<torch::Tensor> rewindDraftTokenTensor,
+    std::optional<std::vector<torch::Tensor>> pastKeyValueListOpt = std::nullopt,
+    std::optional<torch::Tensor> pointerArrayOpt = std::nullopt,
+    std::optional<torch::Tensor> offsetArrayOpt = std::nullopt,
+    std::optional<int64_t> maxBlocksPerSeqOpt = std::nullopt, std::optional<int64_t> tokensPerBlockOpt = std::nullopt,
+    std::optional<int64_t> stream_ptr = std::nullopt)
 {
     TLLM_CHECK_WITH_INFO(
         at::cuda::is_available(), "update_kv_cache_draft_token_location should be called with cuda enabled.");

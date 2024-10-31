@@ -42,7 +42,7 @@ namespace
 {
 // Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] ExplicitDraftTokensLayer<T>::setup
 void initializeDeviceCurandStates(
-    uint64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
+    uint64_t batchSize, th::Tensor& curandState, std::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
 {
     auto* curandStatePtr = get_ptr<curandState_t>(curandState);
     tr::SizeType32* batchSlotsPtr = nullptr;
@@ -77,12 +77,12 @@ void initializeDeviceCurandStates(
 
 void prepareRandomTensors(th::Tensor& curandState, // [maxBatchSize, 48], uint8_t
     th::Tensor& randDataSample,                    // [maxBatchSize], dtype (float or half)
-    th::Tensor& randDataValidation,       // [maxBatchSize, maxNumPaths, maxPathDraftLength], dtype (float or half)
-    th::optional<th::Tensor> randomSeeds, // [1] or [maxBatchSize], uint64_t
-    int64_t const batchSize,              //
-    int64_t const numPaths,               //
-    int64_t const draftLength,            //
-    bool const initialize                 //
+    th::Tensor& randDataValidation,        // [maxBatchSize, maxNumPaths, maxPathDraftLength], dtype (float or half)
+    std::optional<th::Tensor> randomSeeds, // [1] or [maxBatchSize], uint64_t
+    int64_t const batchSize,               //
+    int64_t const numPaths,                //
+    int64_t const draftLength,             //
+    bool const initialize                  //
 )
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
