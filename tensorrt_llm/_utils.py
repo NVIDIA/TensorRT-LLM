@@ -518,3 +518,31 @@ def supports_inflight_batching(engine_dir):
     json_config = GptJsonConfig.parse_file(config_path)
     model_config = json_config.model_config
     return model_config.supports_inflight_batching
+
+
+class QuantModeWrapper:
+
+    def __init__(self, objs):
+        self.objs = objs
+
+    def __getattr__(self, name):
+
+        def method_wrapper(*args, **kwargs):
+            result = False
+            for obj in self.objs:
+                attr = getattr(obj, name)
+                if callable(attr):
+                    result = result | attr(*args, **kwargs)
+            return result
+
+        return method_wrapper
+
+    def __repr__(self):
+        return f"QuantModeWrapper: ({self.objs})"
+
+    def __str__(self):
+        obj_strs = [str(obj) for obj in self.objs]
+        return f"[{', '.join(obj_strs)}]"
+
+    def __getitem__(self, index):
+        return self.objs[index]

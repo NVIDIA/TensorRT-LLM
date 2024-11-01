@@ -487,7 +487,8 @@ def main(args):
                 kv_cache_free_gpu_memory_fraction=args.
                 kv_cache_free_gpu_memory_fraction,
                 enable_chunked_context=args.enable_chunked_context,
-                multi_block_mode=args.multi_block_mode)
+                multi_block_mode=args.multi_block_mode,
+                cuda_graph_mode=args.cuda_graph_mode)
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         runner = runner_cls.from_dir(**runner_kwargs)
@@ -739,6 +740,7 @@ def main(args):
 
 
 if __name__ == '__main__':
+    # see `add_common_args` for extended list of arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_hf', action='store_true')
     parser.add_argument('--test_trt_llm', action='store_true')

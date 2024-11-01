@@ -56,6 +56,8 @@ std::vector<ITensor::SharedPtr> createBufferVector(
 
 void reshapeBufferVector(std::vector<ITensor::SharedPtr>& vector, nvinfer1::Dims const& shape);
 
+void assertNoVGQA(ModelConfig const& modelConfig, WorldConfig const& worldConfig);
+
 std::vector<ITensor::SharedPtr> sliceBufferVector(
     std::vector<ITensor::SharedPtr> const& vector, SizeType32 offset, SizeType32 size);
 

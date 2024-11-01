@@ -42,7 +42,7 @@ python ./llama_quantize.py --hf_model_dir <hf llama path> --cache_dir ./llama.aw
 
 ## AutoModelForCausalLM
 
-The API `tensorrt_llm.AutoModelForCausalLM` can read from a Hugging Face model directory, find the correct TRT-LLM model class and dispatch the `from_hugging_face` mothod to the correct TRT-LLM class.
+The API `tensorrt_llm.AutoModelForCausalLM` can read from a Hugging Face model directory, find the correct TRT-LLM model class and dispatch the `from_hugging_face` method to the correct TRT-LLM class.
 
 The following code snippets demonstrated the usage of the `AutoModelForCausalLM` class.
 

@@ -106,8 +106,8 @@ struct TopKSamplingKernelParams
     bool normalizeLogProbs{false};
     //! flag to highlight that logProbs contains probabilities
     bool logitsHasProbs{false};
-    //! flag to return all selectedTopK results
-    bool returnAllTopK{false};
+    //! flag to return all selected TopK results
+    bool returnAllSelectedTokens{false};
 
     void checkParams() const
     {
@@ -133,11 +133,11 @@ struct TopKSamplingKernelParams
         TLLM_CHECK(workspace);
         TLLM_CHECK(curandState);
 
-        TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || sequenceLengths);
-        TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || endIds);
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || sequenceLengths);
+        TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || endIds);
         if (cumLogProbs != nullptr || outputLogProbs != nullptr)
         {
-            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllTopK);
+            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllSelectedTokens);
         }
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
 

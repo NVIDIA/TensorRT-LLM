@@ -21,6 +21,7 @@
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
+#include <tuple>
 
 namespace tensorrt_llm::layers
 {
@@ -35,24 +36,7 @@ public:
     //! @brief Currently the resource management is to be aligned with batch manager.
     //! @param w, n, g is the Jacobi window, n-gram level and guess set size respectively.
     LookaheadAlgorithm(
-        runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id = 0)
-        : mMaxW(maxW)
-        , mMaxN(maxN)
-        , mMaxG(maxG)
-        , mFilling(0)
-        , mPoolManager(maxG)
-        , mId(id)
-        , mGoldenTokensMax(
-              runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), nvinfer1::DataType::kINT32))
-        , mPrefillsMax(runtime::BufferManager::cpu(
-              runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), nvinfer1::DataType::kINT32))
-        , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), nvinfer1::DataType::kINT32))
-        , mPastTokensMax(
-              runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), nvinfer1::DataType::kINT32))
-        , mGuessTokensMax(
-              runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxG * (maxN - 1)}), nvinfer1::DataType::kINT32))
-    {
-    }
+        runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id = 0);
 
     //! @brief setup per request, fill internal states from @param prompt.
     void setup(TensorConstPtr const& prompt, runtime::SizeType32 w, runtime::SizeType32 n, runtime::SizeType32 g);
@@ -62,43 +46,55 @@ public:
     void accept(TensorConstPtr const& generatedTokens);
 
     //! @brief combine lookahead and guess to prepare the tensors.
-    //! input @param offsetPtr is position id of the last golden token, in a TensorPtr.
+    //! input @param lastPositionIdPtr is position id of the last golden token, in a TensorPtr.
     //! input @param lastTokenPtr the last golden token for searching in the pool, in a TensorPtr.
-    //! output @param draftTokens, positionIds, samplingMask; including the golden token, the lookahead
-    //! and the verification branch information. @param length holds the draft tokens length.
-    void prepare(TensorPtr const& draftTokens, TensorPtr const& positionIds, TensorPtr const& samplingMask,
-        TensorPtr const& length, TensorConstPtr const& offsetPtr, TensorConstPtr const& lastTokenPtr);
+    //! output @param draftTokens, positionIds includes the lookahead and the verification branch information.
+    //! output @param draftLengthPtr holds the draft tokens length.
+    //! output @param attentionMask holds the draft tokens dependency mask, and attentionMaskOffset is the index offset
+    //! in attentionMask.
+    void prepare(TensorPtr const& draftTokens, TensorPtr const& positionIds, TensorPtr const& draftLengthPtr,
+        TensorPtr const& attentionMask, runtime::SizeType32 attentionMaskOffset,
+        TensorConstPtr const& lastPositionIdPtr, TensorConstPtr const& lastTokenPtr);
 
     //! @brief update the internal states and generate accepted tokens from @param outputTokens.
-    //! input @param sampledTokens is the all the tokens from the language model. The position at samplingMask=1 is
-    //! valid. input @param endToken is the end token for `verify` early quit.
-    //! output @param acceptedTokens, acceptedOffsets ind @param acceptedLength.
+    //! input @param sampledTokens is the all the tokens from the language model.
+    //! input @param endToken is the end token for `verify` early quit.
+    //! output @param acceptedTokens, acceptedOffsets in @param acceptedLength.
     void update(TensorPtr const& acceptedTokens, TensorPtr const& acceptedOffsets, TensorPtr const& acceptedLength,
         TensorConstPtr const& sampledTokens, TensorConstPtr const& endToken);
 
+    //! generate attention @param mask from @param posIds.
+    static void posIdsToMask(TensorPtr const& mask, TensorConstPtr const& posIds);
+
+    //! inplace encode the @param tokens and @param posIds according to attention @param masks, and record the offsets
+    //! in @param encodeMap.
+    static runtime::SizeType32 treeEncode(
+        TensorPtr const& tokens, TensorPtr const& posIds, TensorPtr const& masks, TensorPtr const& encodeMap);
+
 private:
     //! @brief generate lookahead branch information.
-    //! input @param offset the position id of the last golden token.
-    //! output @param draftTokens, positionIds, samplingMask of the lookahead branch.
+    //! input @param startPosId is the first position id of the draftTokens.
+    //! output @param draftTokens, positionIds of the lookahead branch.
     //! @return the actual filled lookahead length.
-    runtime::SizeType32 lookahead(TensorPtr const& draftTokens, TensorPtr const& positionIds,
-        TensorPtr const& samplingMask, runtime::SizeType32 offset);
+    runtime::SizeType32 lookahead(
+        TensorPtr const& draftTokens, TensorPtr const& positionIds, runtime::SizeType32 startPosId);
 
     //! @brief generate verification branch information. Also save the guessed tokens for future verification.
-    //! input @param offset the position id of the last golden token.
+    //! input @param startPosId the first position id.
     //! input @param lastToken the last golden token for searching in the pool.
-    //! output @param guessTokens, guessIds, samplingMask of the verification branch.
+    //! output @param guessTokens, guessIds of the verification branch.
     //! @return the actual filled guess length.
-    runtime::SizeType32 guess(TensorPtr const& guessTokens, TensorPtr const& guessIds, TensorPtr const& samplingMask,
-        runtime::SizeType32 offset, runtime::TokenIdType lastToken);
+    runtime::SizeType32 guess(TensorPtr const& guessTokens, TensorPtr const& guessIds, runtime::SizeType32 startPosId,
+        runtime::TokenIdType lastToken);
 
     //! @brief verify the guessed tokens results and generate the longest accepted tokens.
     //! input @param newLastToken is the new-generated last golden token.
-    //! input @param goldenTokens is the guessed token results from the language model.
+    //! input @param sampledTokens is the generated token results from the language model.
     //! input @param endToken is the end token for early quit detection.
-    //! output @param accepted, acceptedOffsets in @param acceptedLength, .
+    //! output @param accepted in @param acceptedLength, including the first golden one.
+    //! output @param acceptedOffsets is the offsets of draft tokens, excluding the first golden one.
     void verify(TensorPtr const& accepted, TensorPtr const& acceptedOffsets, TensorPtr const& acceptedLength,
-        runtime::TokenIdType newLastToken, TensorConstPtr const& goldenTokens, TensorConstPtr const& endToken);
+        runtime::TokenIdType newLastToken, TensorConstPtr const& sampledTokens, TensorConstPtr const& endToken);
 
 private:
     LookaheadPoolManager mPoolManager;
@@ -117,6 +113,13 @@ private:
     //! the same guess tokens from `guess` and used in `verify`
     TensorPtr mGuessTokensMax; // shape [mMaxG*(mMaxN-1)]
     TensorPtr mGuessTokens;    // shape [mG*(mN-1)]
+    TensorPtr mDraftTokensMax;
+    TensorPtr mDraftTokens;
+    TensorPtr mAttentionMask;
+    TensorPtr mEncodeMapMax;
+    TensorPtr mEncodeMap;
+    TensorPtr mSampledTokensMax;
+    TensorPtr mSampledTokens;
 
     //! look ahead algorithm parameters, Window size, Level and Guess set size.
     //! max for reserving resources and current for current request.
@@ -127,6 +130,7 @@ private:
     runtime::SizeType32 mN{0};
     runtime::SizeType32 mG{0};
     runtime::SizeType32 mRuntimeMaxDraftLen{0};
+    runtime::SizeType32 mRuntimeMaxDraftPathLen{0};
     //! in prefilling mode when mFilling < mN-1.
     runtime::SizeType32 mFilling;
 

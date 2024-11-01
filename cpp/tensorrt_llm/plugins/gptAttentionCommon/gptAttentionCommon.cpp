@@ -164,7 +164,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     memset(&xqaParams, 0, sizeof(XQAParams));
     xqaParams.data_type = ConvertMMHAToXQAParamsHelper<T, KVCacheBuffer>::data_type;
 
-    xqaParams.layer_idx = mLayerIdx;
+    xqaParams.layer_idx = mLayerIdxInCachePool;
     xqaParams.num_q_heads = mNumHeads;
     xqaParams.num_kv_heads = mNumKVHeads;
     xqaParams.head_size = mHeadSize;
@@ -376,13 +376,13 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
 
 #define INSTANTIATE_MMHA_DISPATCH(T_MMHA, T)                                                                           \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, false>&,                       \
-        const FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer>&, cudaStream_t stream);                         \
+        FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer> const&, cudaStream_t stream);                         \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, true>&,                        \
-        const FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer>&, cudaStream_t stream);                         \
+        FusedQKVMaskedAttentionDispatchParams<T, KVLinearBuffer> const&, cudaStream_t stream);                         \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, false>&,                       \
-        const FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray>&, cudaStream_t stream);                           \
+        FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray> const&, cudaStream_t stream);                           \
     template void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, true>&,                        \
-        const FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray>&, cudaStream_t stream);
+        FusedQKVMaskedAttentionDispatchParams<T, KVBlockArray> const&, cudaStream_t stream);
 INSTANTIATE_MMHA_DISPATCH(float, float)
 INSTANTIATE_MMHA_DISPATCH(uint16_t, half)
 #ifdef ENABLE_BF16
@@ -391,8 +391,8 @@ INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 #undef INSTANTIATE_MMHA_DISPATCH
 
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length,
-    int num_kv_heads, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
-    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    int num_kv_heads, int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
+    float qk_tanh_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
@@ -411,6 +411,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mVisionStart(vision_start)
     , mVisionLength(vision_length)
     , mNumKVHeads(num_kv_heads)
+    , mLayerIdxInCachePool(layer_idx_in_cache_pool)
     , mHeadSize(head_size)
     , mUnidirectional(unidirectional)
     , mQScaling(q_scaling)
@@ -525,6 +526,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mVisionStart);
     read(d, mVisionLength);
     read(d, mNumKVHeads);
+    read(d, mLayerIdxInCachePool);
     read(d, mHeadSize);
     read(d, mUnidirectional);
     read(d, mQScaling);
@@ -721,7 +723,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T, KVCacheBuff
 
     KVCacheBuffer kv_cache_buffer;
     auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
-    auto const sizePerToken = num_kv_heads * head_size * elemSize;
+    auto sizePerToken = num_kv_heads * head_size * elemSize;
     KVBlockArray::DataType* hostKvCacheBlockOffsets = nullptr;
     if (useKVCache())
     {
@@ -1751,13 +1753,13 @@ void GPTAttentionPluginCommon::destroy() noexcept
 size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
 {
     return sizeof(mLayerIdx) + sizeof(mNumHeads) + +sizeof(mVisionStart) + sizeof(mVisionLength) + sizeof(mNumKVHeads)
-        + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling) + sizeof(mQKTanhScale)
-        + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim) + sizeof(mRotaryEmbeddingBase)
-        + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale) + sizeof(mRotaryEmbeddingShortMscale)
-        + sizeof(mRotaryEmbeddingLongMscale) + sizeof(mRotaryEmbeddingMaxPositions)
-        + sizeof(mRotaryEmbeddingOriginalMaxPositions) + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA)
-        + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode) + sizeof(mEnableXQA)
-        + sizeof(unsigned int) // mKVCacheQuantMode
+        + sizeof(mLayerIdxInCachePool) + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling)
+        + sizeof(mQKTanhScale) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
+        + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale)
+        + sizeof(mRotaryEmbeddingShortMscale) + sizeof(mRotaryEmbeddingLongMscale)
+        + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mRotaryEmbeddingOriginalMaxPositions) + sizeof(mTpSize)
+        + sizeof(mTpRank) + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode)
+        + sizeof(mEnableXQA) + sizeof(unsigned int) // mKVCacheQuantMode
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mBlockSparseParams) + sizeof(mPagedKVCache)
         + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
@@ -1776,6 +1778,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mVisionStart);
     write(d, mVisionLength);
     write(d, mNumKVHeads);
+    write(d, mLayerIdxInCachePool);
     write(d, mHeadSize);
     write(d, mUnidirectional);
     write(d, mQScaling);

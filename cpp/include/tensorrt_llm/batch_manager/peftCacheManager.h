@@ -51,6 +51,8 @@ public:
 class BasePeftCacheManager
 {
 public:
+    friend class BasePeftCacheManagerBindings;
+
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
     using PeftTable = std::map<uint64_t, std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>>;

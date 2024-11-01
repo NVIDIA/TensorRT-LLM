@@ -19,6 +19,7 @@
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
+#include "tensorrt_llm/layers/externalDraftTokensLayer.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
 #include "tensorrt_llm/layers/medusaDecodingLayer.h"
@@ -96,6 +97,10 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     {
         mDecodingLayer = std::make_unique<ExplicitDraftTokensLayer<T>>(decoderDomain, mBufferManager);
     }
+    else if (mDecodingMode.isExternalDraftTokens())
+    {
+        mDecodingLayer = std::make_unique<ExternalDraftTokensLayer<T>>(mDecodingMode, decoderDomain, mBufferManager);
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(false,
@@ -142,6 +147,12 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     {
         TLLM_CHECK_WITH_INFO(
             beamWidth == 1, "Decoding mode is ExplicitDraftTokens, but beamWidth != 1 (%d != 1)", beamWidth);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
+    }
+    else if (mDecodingMode.isExternalDraftTokens())
+    {
+        TLLM_CHECK_WITH_INFO(
+            beamWidth == 1, "Decoding mode is external draft tokens, but beamWidth != 1 (%d != 1)", beamWidth);
         mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else
@@ -247,6 +258,45 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         // TODO(nkorobov) add explicit draft tokens layer param prep
         // Simply forward params for now
         preparedInputs = baseInputs;
+        preparedOutputs = baseOutputs;
+    }
+    else if (mDecodingMode.isExternalDraftTokens())
+    {
+        auto externalDraftTokenParams = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
+        auto const ite = externalDraftTokenParams->ite;
+        auto const step = externalDraftTokenParams->step;
+        auto const localBatchSize = static_cast<int64_t>(externalDraftTokenParams->localBatchSize);
+
+        TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
+            "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
+
+        // In sampling, we have supported batch sampling. So, we always compute all
+        // sentences once.
+        TensorConstPtr logitsSlice = ITensor::slice(*externalDraftTokenParams->logits, 0, localBatchSize);
+        TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
+        auto decodeInputs = std::make_shared<ExternalDraftTokensInputs>(
+            endIdSlice, externalDraftTokenParams->batchSlots, step, ite, localBatchSize);
+
+        decodeInputs->finished = externalDraftTokenParams->finished;
+
+        decodeInputs->logits = logitsSlice;
+
+        if (externalDraftTokenParams->inputLengths)
+        {
+            auto& inputLengths = externalDraftTokenParams->inputLengths.value();
+            decodeInputs->inputLengths = ITensor::slice(inputLengths, 0, localBatchSize);
+        }
+        decodeInputs->draftLogits = externalDraftTokenParams->draftLogits;
+        decodeInputs->draftProbs = externalDraftTokenParams->draftProbs;
+        decodeInputs->targetProbs = externalDraftTokenParams->targetProbs;
+        decodeInputs->numDraftTokens = externalDraftTokenParams->numDraftTokens;
+        decodeInputs->draftTokenIds = externalDraftTokenParams->draftTokenIds;
+        decodeInputs->constantThreshold = externalDraftTokenParams->constantThreshold;
+        decodeInputs->useRandomAcceptanceThreshold = externalDraftTokenParams->useRandomAcceptanceThreshold;
+        decodeInputs->step = externalDraftTokenParams->step;
+        decodeInputs->useDraftLogits = externalDraftTokenParams->useDraftLogits;
+
+        preparedInputs = decodeInputs;
         preparedOutputs = baseOutputs;
     }
     else

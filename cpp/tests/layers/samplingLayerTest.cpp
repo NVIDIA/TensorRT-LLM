@@ -51,7 +51,7 @@ class SamplingLayerTest : public BaseSamplingLayerTest<T>
         }
 
         auto const decodingDomain
-            = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
+            = tensorrt_llm::layers::DecoderDomain(this->maxBatchSize(), 1, this->mVocabSize, this->mVocabSizePadded);
         this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::SamplingLayer<T>>(
             decodingMode, decodingDomain, this->mBufferManager);
     }

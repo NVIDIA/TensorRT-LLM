@@ -316,6 +316,8 @@ endif()
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
+add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+
 include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
@@ -323,7 +325,8 @@ include_directories(
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include)
+  ${3RDPARTY_DIR}/json/include
+  ${3RDPARTY_DIR}/pybind11/include)
 
 # TRT dependencies
 set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
@@ -381,7 +384,7 @@ endif()
 # set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE} -DENABLE_UCX=${ENABLE_UCX}"
+    "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
 )
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
@@ -561,6 +564,7 @@ if(ENABLE_UCX)
                  NO_DEFAULT_PATH)
   endif()
 endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=${ENABLE_UCX}")
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")

@@ -16,8 +16,10 @@
  */
 
 #pragma once
+
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/pybind/common/opaqueBindings.h"
 #include <pybind11/pybind11.h>
 
 namespace tle = tensorrt_llm::executor;
@@ -101,6 +103,11 @@ public:
     std::deque<tle::RequestStatsPerIteration> getLatestRequestStats()
     {
         return mExecutor->getLatestRequestStats();
+    }
+
+    std::deque<tle::DebugTensorsPerIteration> getLatestDebugTensors()
+    {
+        return mExecutor->getLatestDebugTensors();
     }
 
     [[nodiscard]] bool canEnqueueRequests() const

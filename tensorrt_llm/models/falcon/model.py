@@ -65,8 +65,7 @@ class FalconDecoderLayer(Module):
             tp_rank=tp_rank,
             bias=config.bias,
             position_embedding_type=config.position_embedding_type,
-            quant_mode=config.quantization.quant_mode,
-        )
+            quant_mode=config.quantization.quant_mode)
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 

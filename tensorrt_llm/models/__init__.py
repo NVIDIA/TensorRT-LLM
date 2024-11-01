@@ -22,7 +22,7 @@ from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
-from .deci.model import DeciLMForCausalLM
+from .deepseek_v1.model import DeepseekForCausalLM
 from .dit.model import DiT
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
@@ -43,6 +43,7 @@ from .medusa.model import MedusaForCausalLm
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
+from .nemotron_nas.model import DeciLMForCausalLM
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
@@ -57,6 +58,7 @@ __all__ = [
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
+    'DeepseekForCausalLM',
     'FalconConfig',
     'FalconForCausalLM',
     'FalconModel',
@@ -95,6 +97,7 @@ __all__ = [
     'PretrainedModel',
     'WhisperEncoder',
     'MambaForCausalLM',
+    'MambaConfig',
     'MPTForCausalLM',
     'MPTModel',
     'SkyworkForCausalLM',
@@ -125,6 +128,7 @@ MODEL_MAP = {
     'Phi3ForCausalLM': Phi3ForCausalLM,
     'Phi3VForCausalLM': Phi3ForCausalLM,
     'Phi3SmallForCausalLM': Phi3ForCausalLM,
+    'PhiMoEForCausalLM': Phi3ForCausalLM,
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
@@ -158,5 +162,6 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
 }

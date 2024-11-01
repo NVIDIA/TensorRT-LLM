@@ -76,6 +76,7 @@ def main(*,
          trt_root: str = None,
          nccl_root: str = None,
          clean: bool = False,
+         clean_wheel: bool = False,
          configure_cmake: bool = False,
          use_ccache: bool = False,
          fast_build: bool = False,
@@ -86,11 +87,23 @@ def main(*,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False):
+
+    if clean:
+        clean_wheel = True
+
     project_dir = get_project_dir()
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
 
-    if not (project_dir / "3rdparty/cutlass/.git").exists():
+    # Get all submodules and check their folder exists. If not,
+    # invoke git submodule update
+    with open(project_dir / ".gitmodules", "r") as submodules_f:
+        submodules = [
+            l.split("=")[1].strip() for l in submodules_f.readlines()
+            if "path = " in l
+        ]
+    if any(not (project_dir / submodule / ".git").exists()
+           for submodule in submodules):
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
@@ -303,14 +316,23 @@ def main(*,
                     print(f"Failed to build pybind11 stubgen: {ex}",
                           file=sys.stderr)
 
-    if dist_dir is None:
-        dist_dir = project_dir / "build"
-    else:
-        dist_dir = Path(dist_dir)
-
-    if not dist_dir.exists():
-        dist_dir.mkdir(parents=True)
     if not skip_building_wheel:
+        if dist_dir is None:
+            dist_dir = project_dir / "build"
+        else:
+            dist_dir = Path(dist_dir)
+
+        if not dist_dir.exists():
+            dist_dir.mkdir(parents=True)
+
+        if clean_wheel:
+            # For incremental build, the python build module adds
+            # the new files but does not remove the deleted files.
+            #
+            # This breaks the Windows CI/CD pipeline when building
+            # and validating python changes in the whl.
+            clear_folder(dist_dir)
+
         build_run(
             f'\"{sys.executable}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )
@@ -327,6 +349,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--cuda_architectures", "-a")
     parser.add_argument("--install", "-i", action="store_true")
     parser.add_argument("--clean", "-c", action="store_true")
+    parser.add_argument("--clean_wheel",
+                        action="store_true",
+                        help="Clear dist_dir folder creating wheel")
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")

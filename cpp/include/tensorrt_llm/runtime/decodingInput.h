@@ -108,6 +108,20 @@ public:
         TensorConstPtr medusaTargetTokensPerStep; //!<  [batchSize], on gpu
     };
 
+    class ExternalDraftTokensInputs
+    {
+    public:
+        TensorPtr draftLogits;
+        TensorPtr draftProbs;
+        TensorPtr targetProbs;
+        TensorPtr numDraftTokens;
+        TensorPtr draftTokenIds;
+        TensorPtr useDraftLogits;
+        SizeType32 step;
+        float constantThreshold;
+        bool useRandomAcceptanceThreshold;
+    };
+
     class ExplicitDraftTokensInputs
     {
     public:
@@ -138,6 +152,8 @@ public:
     std::optional<ExplicitDraftTokensInputs> explicitDraftTokensInputs;
 
     std::optional<LookaheadInputs> lookaheadInputs;
+
+    std::optional<ExternalDraftTokensInputs> externalDraftTokensInputs;
 };
 
 } // namespace tensorrt_llm::runtime

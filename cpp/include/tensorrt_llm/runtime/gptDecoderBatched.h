@@ -62,12 +62,12 @@ public:
     void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
         std::vector<SamplingConfig> const& samplingConfigs) override;
 
-    TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
-    void forwardSync(decoder_batch::Token const& token) override;
+    void forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent) override;
 
-    void forwardSync(
-        decoder_batch::Token const& token, decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    void forwardSync(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent, decoder_batch::Output& output,
+        decoder_batch::Input const& input) override;
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 
@@ -245,7 +245,7 @@ private:
     void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
 
     //! @brief Allocate buffers for speculative decoding.
-    void allocateSpeculativeDecodingBuffers();
+    void allocateSpeculativeDecodingBuffers(nvinfer1::DataType dtype);
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(ModelConfig const& modelConfig);
@@ -271,7 +271,7 @@ private:
     void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
 
     //! @brief Updates finished state on host for all active requests
-    void updateFinished(decoder_batch::Token const& token);
+    void updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent);
 
     //! @brief Sets inputs for explicit draft tokens.
     void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
@@ -289,7 +289,7 @@ private:
     CudaStreamPtr mRuntimeStream;
     CudaStreamPtr mDecoderStream;
     BufferManager mBufferManager;
-    TokenPtr mForwardToken;
+    DecoderFinishedEventPtr mDecoderFinishEvent;
     CudaEvent mForwardEvent;
 
     using GptDecoderPtr = std::unique_ptr<IGptDecoder>;
@@ -300,10 +300,6 @@ private:
     DecodingInputPtr mJointDecodingInput;
     DecodingOutputPtr mJointDecodingOutput;
 
-    std::vector<bool> mAcceptByLogits;
-    TensorPtr mNumDraftTokens;
-    TensorPtr mCurandStates;
-
     std::vector<SizeType32> mNbSteps;
     std::vector<bool> mFinished;
     TensorPtr mFinishedSum;
@@ -313,18 +309,9 @@ private:
 
     TensorPtr mFinishedSteps;     // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
                                   // for each generated token of maxTokensPerStep, on gpu
-    TensorPtr mDraftProbs;        // [batchSize, maxTokensPerEngineStep, beamWidth, vocabPadded], temporary data for
-                                  // speculative decoding accept by logits kernel, on gpu
-    TensorPtr mTargetProbs;       // [batchSize, maxTokensPerEngineStep, beamWidth, vocabPadded], temporary data for
-                                  // speculative decoding accept by logits kernel, on gpu
-    TensorPtr mDraftTokenIds;     // [batchSize, maxTokensPerEngineStep], draft token indices, on gpu
-    TensorPtr mDraftLogits;       // [batchSize, maxTokensPerEngineStep, vocabSizePadded], draft token logits, on gpu
 
     TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned
     TensorPtr mBatchSlotsDecoder; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsAcceptTokens; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsAcceptLogits; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
-    TensorPtr mTargetLogitsPtrs;       // [maxBatchSize], float*, pointers to target logits, pinned
     SizeType32 mMaxSequenceLength{};
     SizeType32 mMaxAttentionWindow{};
     SizeType32 mSinkTokenLength{};

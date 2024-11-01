@@ -15,37 +15,6 @@ The following sections provide an overview of the main classes defined in the Ex
 
 The `Executor` class is responsible for receiving requests from the client, and providing responses for those requests. The executor is constructed by providing a path to a directory containing the TensorRT-LLM engine or buffers containing the engine and the model JSON configuration. The client can create requests and enqueue those requests for execution using the `enqueueRequest` or `enqueueRequests` methods of the `Executor` class. Enqueued requests will be scheduled for execution by the executor, and multiple independent requests can be batched together at every iteration of the main execution loop (a process often referred to as continuous batching or iteration-level batching). Responses for a particular request can be awaited for by calling the `awaitResponses` method, and by providing the request id. Alternatively, responses for any requests can be awaited for by omitting to provide the request id when calling `awaitResponses`. The `Executor` class also allows to cancel requests using the `cancelRequest` method and to obtain per-iteration and per-request statistics using the `getLatestIterationStats`.
 
-#### Logits Post-Processor (optional)
-
-Users can alter the logits produced by the network, by providing a map of named callbacks of the form:
-
-```
-std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
-```
-to an instance of `LogitsPostProcessorConfig`. The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
-
-The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits.
-
-Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
-Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
-
-Multiple requests can share same client id and callback can use different logic based on client id.
-
-We also provide a batched version that allows altering logits of multiple requests in a batch. This allows further optimizations and reduces callback overheads.
-
-```
-std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&, std::vector<std::optional<IdType>> const&)>
-```
-
-A single batched callback can be specified in `LogitsPostProcessorConfig`. Each request can opt to apply this callback by specifying the name of the logits
-post-processor as `Request::kBatchedPostProcessorName`.
-
-Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
-
-In a multi-GPU run, callback is invoked on all tensor parallel ranks (in last pipeline rank) by default.
-For correct execution, user should replicate client-side state accessed by callback on all tensor parallel ranks.
-If replication is expensive or infeasible, use `LogitsPostProcessorConfig::setReplicate(false)` to invoke callback only on first tensor parallel rank.
-
 ### The Request Class
 
 The `Request` class is used to define properties of the request, such as the input token ids and the maximum number of tokens to generate. The `streaming` parameter can be used to indicate if the request should generate a response for each new generated tokens (`streaming = true`) or only after all tokens have been generated (`streaming = false`). Other mandatory parameters of the request include the sampling configuration (defined by the `SamplingConfig` class) which contains parameters controlling the decoding process and the output configuration (defined by the `OutputConfig` class) which controls what information should be included in the `Result` for a particular response.
@@ -82,6 +51,32 @@ The executor can process requests with different beam widths if the following co
 - For requests with two different beam widths, `x` and `y`, requests with beam width `y` are not enqueued until all responses for requests with beam width `x` have been awaited.
 
 The request queue of the executor must be empty to allow it to reconfigure itself for a new beam width. This reconfiguration will happen automatically when requests with a new beam width are enqueued. If requests with different beam widths are enqueued at the same time, the executor will encounter an error and terminate all requests prematurely.
+
+### Controlling output with Logits Post-Processor
+
+Optionally, you can alter the logits produced by the network by providing an instance of `Executor::LogitsPostProcessorConfig`. For instance, this feature can be used to generate JSON formatted output. {cpp:class}`Executor::LogitsPostProcessorConfig <tensorrt_llm::executor::LogitsPostProcessorConfig>` specifies a map of named callbacks in the following form
+
+```cpp
+std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
+```
+
+The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
+
+The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits. Multiple requests can share same client id and callback can use different logic based on client id.
+
+You must use the stream to access the logits tensor. For example, to perform an addition with a bias tensor, the addition operation is enqueued on that stream. Alternatively, you can call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
+
+The executor also includes a {cpp:class}`LogitsPostProcessorBatched <tensorrt_llm::executor::LogitsPostProcessorBatched>` method that enables altering logits of multiple requests in a batch. The batched method allows further optimizations and reduces callback overheads.
+
+```cpp
+std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&, std::vector<std::optional<IdType>> const&)>
+```
+
+A single batched callback can be specified in `LogitsPostProcessorConfig`. Each request can opt to apply this callback by specifying the name of the logits post-processor as `Request::kBatchedPostProcessorName`.
+
+Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
+
+In a multi-GPU run, the callback is invoked on all ranks in the first tensor-parallel group, by default. To ensure correct execution, replicate the client-side state that is accessed by the callback on these ranks. If replication is expensive or infeasible, use `LogitsPostProcessorConfig::setReplicate(false)` to invoke the callback only on rank 0. The executor broadcasts the sampled tokens internally to ensure correct execution.
 
 ## C++ Executor API Example
 

@@ -70,10 +70,10 @@ protected:
         kernelParams.finishedOutput = reinterpret_cast<tensorrt_llm::kernels::FinishedState*>(
             bufferCast<tensorrt_llm::kernels::FinishedState::UnderlyingType>(*this->mFinishedDevice));
         kernelParams.skipDecode = bufferCast<bool>(*this->mSkipDecodeDevice);
-        kernelParams.cumLogProbs = params.returnAllTopK || params.maxTokensPerStep > 1
+        kernelParams.cumLogProbs = params.returnAllSelectedTokens || params.maxTokensPerStep > 1
             ? nullptr
             : bufferCast<float>(*this->mCumLogProbsDevice);
-        kernelParams.outputLogProbs = params.returnAllTopK || params.maxTokensPerStep > 1
+        kernelParams.outputLogProbs = params.returnAllSelectedTokens || params.maxTokensPerStep > 1
             ? nullptr
             : bufferCast<float>(*this->mOutputLogProbsDevice);
         kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
@@ -84,7 +84,7 @@ protected:
         kernelParams.vocabSizePadded = params.vocabSize;
         kernelParams.normalizeLogProbs = params.normalizeLogProbs;
         kernelParams.logitsHasProbs = params.logitsHasProbs;
-        kernelParams.returnAllTopK = params.returnAllTopK;
+        kernelParams.returnAllSelectedTokens = params.returnAllSelectedTokens;
 
         // Perform batched TopK sampling
         tk::invokeBatchTopKSampling(kernelParams, this->mStream->get());
@@ -136,7 +136,7 @@ TYPED_TEST(TopKSamplingKernelTest, CorrectnessTopKMaxTokensPerStep)
         SamplingKernelTestParam().setBatchSize(16).setVocabSize(4000).setTopK(63).setTopP(1.0f).setMaxTokensPerStep(4));
 };
 
-TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllTopK)
+TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllSelectedTokens)
 {
     this->runTest(SamplingKernelTestParam()
                       .setBatchSize(16)
@@ -144,7 +144,18 @@ TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllTopK)
                       .setTopK(10)
                       .setTopP(1.0f)
                       .setMaxTokensPerStep(4)
-                      .setReturnAllTopK());
+                      .setReturnAllSelectedTokens());
+};
+
+TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllSelectedTokensSmallP)
+{
+    this->runTest(SamplingKernelTestParam()
+                      .setBatchSize(16)
+                      .setVocabSize(50)
+                      .setTopK(20)
+                      .setTopP(0.3f)
+                      .setMaxTokensPerStep(4)
+                      .setReturnAllSelectedTokens());
 };
 
 TYPED_TEST(TopKSamplingKernelTest, CorrectnessLogitsPtrs)

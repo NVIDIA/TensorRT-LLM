@@ -92,6 +92,19 @@ def parse_arguments():
         "The huggingface dataset name or the local directory of the dataset for calibration."
     )
     parser.add_argument(
+        "--calib_size",
+        type=int,
+        default=512,
+        help=
+        "Number of samples for calibration. Set to -1 to use the whole dataset.",
+    )
+    parser.add_argument(
+        "--calib_max_seq_length",
+        type=int,
+        default=512,
+        help="Max Sequence length for calibration",
+    )
+    parser.add_argument(
         "--smoothquant",
         "-sq",
         type=float,
@@ -408,6 +421,8 @@ def convert_and_save_hf(args):
             quant_config=quant_config,
             device='cpu' if args.load_model_on_cpu else 'cuda',
             calib_dataset=args.calib_dataset,
+            calib_batches=args.calib_size,
+            calib_max_seq_length=args.calib_max_seq_length,
             **override_fields)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this

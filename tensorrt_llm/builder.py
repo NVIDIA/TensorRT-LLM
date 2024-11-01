@@ -141,7 +141,6 @@ class Builder():
                               use_refit: bool = False,
                               int8: bool = False,
                               strongly_typed: bool = True,
-                              opt_level: Optional[int] = None,
                               force_num_profiles: Optional[int] = None,
                               profiling_verbosity: str = "layer_names_only",
                               use_strip_plan: bool = False,
@@ -190,9 +189,6 @@ class Builder():
 
         if use_strip_plan:
             config.set_flag(trt.BuilderFlag.STRIP_PLAN)
-
-        if opt_level is not None:
-            config.builder_optimization_level = opt_level
 
         # Set TRT Engine profiling verbosity
         if profiling_verbosity == "detailed":
@@ -479,7 +475,6 @@ class BuildConfig:
     gather_context_logits: int = False
     gather_generation_logits: int = False
     strongly_typed: bool = True
-    builder_opt: Optional[int] = None
     force_num_profiles: Optional[int] = None
     profiling_verbosity: str = 'layer_names_only'
     enable_debug_output: bool = False
@@ -567,7 +562,6 @@ class BuildConfig:
         gather_context_logits = config.pop('gather_context_logits', False)
         gather_generation_logits = config.pop('gather_generation_logits', False)
         strongly_typed = config.pop('strongly_typed', True)
-        builder_opt = config.pop('builder_opt', None)
         force_num_profiles = config.pop('force_num_profiles', None)
         weight_sparsity = config.pop('weight_sparsity', False)
         profiling_verbosity = config.pop('profiling_verbosity',
@@ -584,7 +578,7 @@ class BuildConfig:
             config.get('auto_parallel_config', {}))
         max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
         weight_streaming = config.pop('weight_streaming', False)
-
+        use_fused_mlp = config.pop('use_fused_mlp', True)
         use_strip_plan = config.pop('use_strip_plan', False)
 
         if plugin_config is None:
@@ -608,7 +602,6 @@ class BuildConfig:
             gather_context_logits=gather_context_logits,
             gather_generation_logits=gather_generation_logits,
             strongly_typed=strongly_typed,
-            builder_opt=builder_opt,
             force_num_profiles=force_num_profiles,
             profiling_verbosity=profiling_verbosity,
             enable_debug_output=enable_debug_output,
@@ -623,6 +616,7 @@ class BuildConfig:
             max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
             weight_streaming=weight_streaming,
+            use_fused_mlp=use_fused_mlp,
             plugin_config=plugin_config,
             dry_run=dry_run,
             visualize_network=visualize_network)
@@ -689,13 +683,11 @@ class Engine:
         self,
         config: EngineConfig,
         engine: Union[trt.IHostMemory, None],
-        managed_weights: dict[str, np.ndarray] = None,
+        managed_weights: dict[str, np.ndarray] = {},
     ):
         self.config = config
         self.engine = engine
         self.managed_weights = managed_weights
-
-    def regularize_managed_weights(self):
         if self.managed_weights is None:
             self.managed_weights = {}
         for name, value in self.managed_weights.items():
@@ -731,10 +723,24 @@ class Engine:
             if os.path.exists(root_lora_dir) and os.path.isdir(root_lora_dir):
                 shutil.rmtree(root_lora_dir)
         if self.config.pretrained_config.mapping.rank == 0:
+            config_dict = self.config.to_dict()
+            if self.config.pretrained_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+                quant_dict = {
+                    'version': self.config.version,
+                }
+                quant_dict.update(
+                    config_dict['pretrained_config']['quantization'])
+                config_dict['pretrained_config']['quantization'].pop(
+                    'quantized_layers', None)
+                with open(os.path.join(engine_dir, 'quant_cfg.json'),
+                          "w",
+                          encoding="utf-8") as f:
+                    json.dump(quant_dict, f, indent=4, cls=ConfigEncoder)
+
             with open(os.path.join(engine_dir, 'config.json'),
                       "w",
                       encoding="utf-8") as f:
-                json.dump(self.config.to_dict(), f, indent=4, cls=ConfigEncoder)
+                json.dump(config_dict, f, indent=4, cls=ConfigEncoder)
         if self.engine is not None:
             serialize_engine(
                 self.engine,
@@ -807,7 +813,7 @@ def optimize_model_with_config(model: PretrainedModel,
         use_lora=build_config.plugin_config.lora_plugin is not None,
         max_lora_rank=build_config.lora_config.max_lora_rank,
         use_fp8_context_fmha=(
-            model.config.quantization.quant_algo == QuantAlgo.FP8
+            QuantAlgo.FP8 == model.config.quantization.quant_algo
             and build_config.plugin_config.use_fp8_context_fmha),
     )
 
@@ -990,6 +996,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.plugin_config.reduce_fusion and (
             model.config.mapping.tp_size == 1
+            or model.config.mapping.pp_size != 1
             or model.config.architecture != "LlamaForCausalLM"):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
@@ -1053,7 +1060,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "Paged Context FMHA doesn't work with int8 kv cache currently.")
 
     if build_config.plugin_config.manage_weights:
-        if model.config.quant_mode & QuantMode.INT4_WEIGHTS or model.config.quant_mode & QuantMode.INT8_WEIGHTS:
+        if model.config.quant_mode.has_weight_quant():
             raise RuntimeError(
                 "Managed weights is not supported with int4 or int8 weights.")
 
@@ -1068,7 +1075,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
               and not model.config.quant_mode.has_per_group_scaling())
         or model.config.quant_mode.has_int8_kv_cache(),
         strongly_typed=build_config.strongly_typed,
-        opt_level=build_config.builder_opt,
         force_num_profiles=build_config.force_num_profiles,
         profiling_verbosity=build_config.profiling_verbosity,
         quant_mode=model.config.quant_mode,
@@ -1147,6 +1153,10 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             prepare_input_args = {
                 "max_batch_size": build_config.max_batch_size,
             }
+
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
+            prepare_input_args[
+                "spec_decoding_is_generation_length_variable"] = True
 
         inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)

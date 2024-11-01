@@ -67,7 +67,7 @@ The TensorRT-LLM LLaMA example code locates at [examples/llama](./). It takes HF
 Please install required packages first to make sure the example uses matched `tensorrt_llm` version:
 
 ```bash
-pip install -r requirements.txt
+pip install --upgrade -r requirements.txt
 ```
 
 Need to prepare the HF LLaMA checkpoint by following the guides here https://huggingface.co/docs/transformers/main/en/model_doc/llama.
@@ -717,16 +717,19 @@ To run the GPTQ LLaMa example, the following steps are required:
 
 1. Weight quantization:
 
-    Quantized weights for GPTQ are generated using [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa.git) as follow:
+    Quantized weights for GPTQ are generated using [AutoGPTQ](https://github.com/AutoGPTQ/AutoGPTQ) as follow:
 
     ```bash
-    git clone https://github.com/qwopqwop200/GPTQ-for-LLaMa.git
-    cd GPTQ-for-LLaMa
-    pip install -r requirements.txt
+    git clone https://github.com/AutoGPTQ/AutoGPTQ
+    cd AutoGPTQ
+    pip install .
+
+    # Download the quant_autogptq script
+    wget https://gist.githubusercontent.com/TheBloke/b47c50a70dd4fe653f64a12928286682/raw/ebcee019d90a178ee2e6a8107fdd7602c8f1192a/quant_autogptq.py
 
     # Quantize weights into INT4 and save as safetensors
     # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
-    python llama.py ./tmp/llama/7B/ c4 --wbits 4 --true-sequential --groupsize 128 --save_safetensors ./llama-7b-4bit-gs128.safetensors
+    python quant_autogptq.py ./tmp/llama/7B ./llama-7b-4bit-gs128.safetensors wikitext --bits 4 --group_size 128 --desc_act 0 --damp 0.1 --dtype float16 --seqlen 4096 --num_samples 3 --use_fast
     ```
 
     Let us build the TRT-LLM engine with the saved `./llama-7b-4bit-gs128.safetensors`.
@@ -907,6 +910,24 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_codellama \
             --output_dir ./tmp/codellama/trt_engines/fp16/1-gpu/ \
             --gemm_plugin auto
 ```
+The example below uses the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
+
+```bash
+# Quantize HF CodeLlama 7B into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir /tmp/CodeLlama-7b-Instruct-hf \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin auto
+```
+
 Use the following command to build `CodeLlama-34b-Instruct` for 4 GPUs (TP=4):
 ```bash
 python convert_checkpoint.py --model_dir /tmp/CodeLlama-34b-Instruct-hf  \

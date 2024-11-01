@@ -259,7 +259,7 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
         int idx = 0;
         for (int reqId = 0; reqId < numReqs; reqId++)
         {
-            const RequestType reqType = static_cast<RequestType const>(reqTypes[reqId]);
+            RequestType const reqType = static_cast<RequestType const>(reqTypes[reqId]);
             if (reqType == RequestType::kGENERATION)
             {
                 mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 2]));
@@ -284,7 +284,7 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
             fmtstr("LoraParams and input dims don't match, lora tokens %d input tokens %d", idx, numTokens));
     }
 
-    // only used for unifed gemm
+    // only used for unified gemm
     auto bestTactic = mPluginProfiler->getBestConfig(numTokens, mGemmId);
     mLoraImpl->setBestTactic(bestTactic);
     mLoraImpl->run(numTokens, numReqs, input, mExpandLoraRanks.data(), mExpandLoraWeightPtrs.data(), mWeightIndex,

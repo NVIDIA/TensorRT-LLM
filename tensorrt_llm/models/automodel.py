@@ -17,7 +17,14 @@ class AutoConfig:
 
         hf_config = transformers.AutoConfig.from_pretrained(
             hf_model_or_dir, trust_remote_code=True)
-        hf_arch = hf_config.architectures[0]
+
+        if hasattr(hf_config,
+                   'architectures') and hf_config.architectures is not None:
+            hf_arch = hf_config.architectures[0]
+        elif hasattr(hf_config,
+                     'model_type') and hf_config.model_type.find('mamba') != -1:
+            hf_arch = 'MambaForCausalLM'
+
         trtllm_model_cls = MODEL_MAP.get(hf_arch, None)
         if trtllm_model_cls is None:
             raise NotImplementedError(
@@ -47,7 +54,14 @@ class AutoModelForCausalLM:
 
         hf_config = transformers.AutoConfig.from_pretrained(
             hf_model_or_dir, trust_remote_code=trust_remote_code)
-        hf_arch = hf_config.architectures[0]
+
+        if hasattr(hf_config,
+                   'architectures') and hf_config.architectures is not None:
+            hf_arch = hf_config.architectures[0]
+        elif hasattr(hf_config,
+                     'model_type') and hf_config.model_type.find('mamba') != -1:
+            hf_arch = 'MambaForCausalLM'
+
         trtllm_model_cls = MODEL_MAP.get(hf_arch, None)
 
         if trtllm_model_cls is None:

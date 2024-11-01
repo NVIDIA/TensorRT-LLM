@@ -81,37 +81,31 @@ mamba-codestral-7B-v0.1 as an example.
 ```bash
 # mamba-2.8b
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-2.8b/ \
-                             --ckpt_type hf \
                              --dtype bfloat16 \
                              --output_dir ./mamba_model/mamba-2.8b/trt_ckpt/bf16/1-gpu/
 
 # mamba-130m
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-130m/ \
-                             --ckpt_type hf \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba-130m/trt_ckpt/fp16/1-gpu/
 
 # mamba2-2.7b
 python convert_checkpoint.py --model_dir ./mamba_model/mamba2-2.7b/ \
-                             --ckpt_type state_spaces \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba2-2.7b/trt_ckpt/fp16/1-gpu/
 
 # mamba2-130m
 python convert_checkpoint.py --model_dir ./mamba_model/mamba2-130m/ \
-                             --ckpt_type state_spaces \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba2-130m/trt_ckpt/fp16/1-gpu/
 
 # mamba-codestral-7B-v0.1
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
-                             --ckpt_type mistral_inference \
                              --dtype float16 \
                              --output_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp16/1-gpu/
 
 # mamba-codestral-7B-v0.1 with 2-way tensor parallelism.
 python convert_checkpoint.py --model_dir ./mamba_model/mamba-codestral-7B-v0.1/ \
-                             --ckpt_type mistral_inference \
                              --dtype float16 \
                              --world_size 2 \
                              --output_dir ./mamba_model/mamba-codestral-7B-v0.1/trt_ckpt/fp16/2-gpu/

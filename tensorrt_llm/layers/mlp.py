@@ -262,7 +262,7 @@ class FusedGatedMLP(Module):
     def fc_gate_plugin(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
-        #   SiLU(FC(x)) + Gate(x)
+        #   SiLU(FC(x)) * Gate(x)
         #
         # into:
         #
@@ -319,7 +319,7 @@ class FusedGatedMLP(Module):
     def fc_gate(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
         #
-        #   SiLU(FC(x)) + Gate(x)
+        #   SiLU(FC(x)) * Gate(x)
         #
         # into:
         #
@@ -348,7 +348,6 @@ class FusedGatedMLP(Module):
                 lora_layer_params=None,
                 reduce_fusion_params: Optional[AllReduceFusionParams] = None):
         if default_net().plugin_config.gemm_swiglu_plugin:
-            assert self.dtype == 'float16', f"Currently limited support, got {self.dtype}"
             inter = self.fc_gate_plugin(hidden_states, lora_layer_params)
         else:
             inter = self.fc_gate(hidden_states, lora_layer_params)

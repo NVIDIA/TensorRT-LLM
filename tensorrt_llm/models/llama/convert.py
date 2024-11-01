@@ -1085,7 +1085,9 @@ def quantize(hf_model_dir: str,
              config: LLaMAConfig,
              device: str = 'cuda',
              calib_dataset: str = 'cnn_dailymail',
-             trust_remote_code: bool = True):
+             trust_remote_code: bool = True,
+             calib_batches: int = 512,
+             calib_max_seq_length: int = 512):
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
@@ -1121,7 +1123,14 @@ def quantize(hf_model_dir: str,
 
     dataset = load_calib_dataset(calib_dataset)
 
-    act_range = capture_activation_range(hf_model, tokenizer, dataset)
+    if calib_batches == -1:  # use the whole dataset if calib_batches is -1
+        calib_batches = len(dataset)
+
+    act_range = capture_activation_range(hf_model,
+                                         tokenizer,
+                                         dataset,
+                                         num_samples=calib_batches,
+                                         seq_len=calib_max_seq_length)
     qkv_para, smoother = {}, {}
     if use_smooth_quant:
         smooth_llama_model(hf_model, act_range, quant_config.smoothquant_val,
@@ -1548,11 +1557,15 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
             res = tensor_slice[:]
         elif tp_dim >= 0 and tp_dim < len(tensor_shape):
             if is_expert_weights:
-                tp_size = tp_size or mapping.moe_tp_size
-                tp_rank = tp_rank or mapping.moe_tp_rank
+                if tp_size is None:
+                    tp_size = mapping.moe_tp_size
+                if tp_rank is None:
+                    tp_rank = mapping.moe_tp_rank
             else:
-                tp_size = tp_size or mapping.tp_size
-                tp_rank = tp_rank or mapping.tp_rank
+                if tp_size is None:
+                    tp_size = mapping.tp_size
+                if tp_rank is None:
+                    tp_rank = mapping.tp_rank
             dim_size = tensor_shape[tp_dim]
             if dim_size % tp_size != 0:
                 logger.error(

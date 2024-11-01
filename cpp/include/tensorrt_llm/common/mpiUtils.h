@@ -99,7 +99,6 @@ struct MpiTypeConverter<std::byte>
 };
 
 template <>
-
 struct MpiTypeConverter<half>
 
 {
@@ -380,9 +379,14 @@ public:
 
     void allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const;
     void allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const;
+
+    void allgatherv(void const* sendbuf, int sendcount, MpiType sendtype, void* recvbuf,
+        std::vector<int> const& recvcounts, std::vector<int> const& displs, MpiType recvtype) const;
+
     void barrier() const;
 
     void mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
+    bool improbe(int source, int tag, MPI_Message* msg, MPI_Status* status) const;
 
     //! \brief Returns if a message with the specified source and tag is available
     bool iprobe(int source, int tag, MPI_Status* status) const;

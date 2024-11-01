@@ -28,7 +28,7 @@ from ..functional import (ACT2FN, AllReduceFusionParams, AttentionMaskType,
                           allgather, arange, bert_attention, cast, clip, concat,
                           constant, embedding, expand, expand_dims, expand_mask,
                           generate_alibi_biases, generate_alibi_slopes,
-                          gpt_attention, matmul)
+                          gpt_attention, gt, matmul)
 from ..functional import max as fmax
 from ..functional import (minimum, repeat_interleave, shape, slice, softmax,
                           split, unsqueeze, where)
@@ -251,11 +251,13 @@ class KeyValueCacheParams:
                  kv_cache_block_offsets: Tensor = None,
                  host_kv_cache_block_offsets: Tensor = None,
                  host_kv_cache_pool_pointers: Tensor = None,
+                 host_kv_cache_pool_mapping: Tensor = None,
                  cache_indirection: Tensor = None,
                  past_key_value_length: Tensor = None,
                  cross_kv_cache_block_offsets: Tensor = None,
                  host_cross_kv_cache_block_offsets: Tensor = None,
-                 host_cross_kv_cache_pool_pointers: Tensor = None):
+                 host_cross_kv_cache_pool_pointers: Tensor = None,
+                 host_cross_kv_cache_pool_mapping: Tensor = None):
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.host_max_attention_window_sizes = host_max_attention_window_sizes
@@ -263,9 +265,11 @@ class KeyValueCacheParams:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_block_offsets = host_kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
+        self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.cross_kv_cache_block_offsets = cross_kv_cache_block_offsets
         self.host_cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets
         self.host_cross_kv_cache_pool_pointers = host_cross_kv_cache_pool_pointers
+        self.host_cross_kv_cache_pool_mapping = host_cross_kv_cache_pool_mapping
         self.cache_indirection = cache_indirection
         # self.past_key_value_length = past_key_value_length
 
@@ -349,7 +353,8 @@ class Attention(Module):
                  max_attn_value=0.0,
                  block_sparse_params=None,
                  use_implicit_relative_attention=False,
-                 reorder=False):
+                 reorder=False,
+                 layer_idx_in_cache_pool=None):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -357,6 +362,7 @@ class Attention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_kv_heads = num_kv_heads
+        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool if layer_idx_in_cache_pool is not None else local_layer_idx
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
@@ -852,41 +858,32 @@ class Attention(Module):
             attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
 
             if self.position_embedding_type == PositionEmbeddingType.long_rope:
-                short = slice(
-                    attention_params.
-                    embed_positions_short_factors_for_attention_plugin,
-                    concat([0, 0, 0]),
-                    concat([
-                        max(attention_params.sequence_length,
-                            self.original_max_position_embeddings),
-                        self.rotary_embedding_dim // 2, 2
-                    ]))
-                long = slice(
-                    attention_params.
-                    embed_positions_long_factors_for_attention_plugin,
-                    concat([0, 0, 0]),
-                    concat([
-                        max(attention_params.sequence_length,
-                            self.original_max_position_embeddings),
-                        self.rotary_embedding_dim // 2, 2
-                    ]))
-                short = short.view((1, -1))
-                long = long.view((1, -1))
-                embed_positions = concat([short, long], dim=0)
-                select = where(
-                    fmax(attention_params.sequence_length, dim=0) <=
-                    self.original_max_position_embeddings, 0, 1)
-                rotary_cos_sin = slice(embed_positions,
-                                       concat([select, 0]),
-                                       sizes=concat([1, shape(long, 1)]))
-                short_inv_freq = attention_params.short_inv_freq
-                long_inv_freq = attention_params.long_inv_freq
-                concat_inv_freq = concat([short_inv_freq, long_inv_freq], dim=0)
-                rotary_inv_freq = slice(concat_inv_freq,
-                                        concat([select, 0]),
-                                        sizes=concat(
-                                            [1, shape(long_inv_freq, 1)]))
-                rotary_inv_freq = rotary_inv_freq.view((-1, ))
+                max_seq_length = fmax(attention_params.sequence_length, dim=0)
+                floor_seq_length = maximum(
+                    max_seq_length, self.original_max_position_embeddings)
+
+                short = attention_params.embed_positions_short_factors_for_attention_plugin
+                long = attention_params.embed_positions_long_factors_for_attention_plugin
+
+                starts = concat([0, 0, 0])
+                shapes = concat(
+                    [floor_seq_length, self.rotary_embedding_dim // 2, 2])
+
+                short = slice(short, starts, shapes).view((1, -1))
+                long = slice(long, starts, shapes).view((1, -1))
+
+                use_long_factors = gt(max_seq_length,
+                                      self.original_max_position_embeddings)
+
+                cond = Conditional(use_long_factors)
+                true_val = cond.add_input(long)
+                false_val = cond.add_input(short)
+                rotary_cos_sin = cond.add_output(true_val, false_val)
+
+                cond = Conditional(use_long_factors)
+                true_val = cond.add_input(attention_params.long_inv_freq)
+                false_val = cond.add_input(attention_params.short_inv_freq)
+                rotary_inv_freq = cond.add_output(true_val, false_val)
             else:
                 # The rotary inv freq can be pre-computed.
                 rotary_inv_freq = getattr(attention_params, "rotary_inv_freq",
@@ -916,6 +913,7 @@ class Attention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -956,6 +954,9 @@ class Attention(Module):
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers if not self.cross_attention else
                 kv_cache_params.host_cross_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping if not self.cross_attention else
+                kv_cache_params.host_cross_kv_cache_pool_mapping,
                 do_cross_attention=self.cross_attention,
                 cross_qkv=cross_qkv,
                 cross_qkv_length=attention_params.encoder_max_input_length,
@@ -1025,24 +1026,18 @@ class Attention(Module):
             if self.position_embedding_type.is_rope():
                 if self.position_embedding_type == PositionEmbeddingType.long_rope:
                     sequence_length = shape(hidden_states, 1)
+                    floor_seq_length = maximum(
+                        sequence_length, self.original_max_position_embeddings)
+
+                    starts = concat([0, 0, 0])
+                    shapes = concat(
+                        [1, floor_seq_length, self.rotary_embedding_dim])
                     short = slice(
-                        attention_params.embed_positions_short_factors,
-                        concat([0, 0, 0]),
-                        concat([
-                            1,
-                            max(sequence_length,
-                                self.original_max_position_embeddings),
-                            self.rotary_embedding_dim
-                        ]))
-                    long = slice(
-                        attention_params.embed_positions_long_factors,
-                        concat([0, 0, 0]),
-                        concat([
-                            1,
-                            max(sequence_length,
-                                self.original_max_position_embeddings),
-                            self.rotary_embedding_dim
-                        ]))
+                        attention_params.embed_positions_short_factors, starts,
+                        shapes)
+                    long = slice(attention_params.embed_positions_long_factors,
+                                 starts, shapes)
+
                     embed_positions = concat([short, long], dim=0)
                     select = where(
                         sequence_length <=
@@ -1702,6 +1697,8 @@ class CogVLMAttention(Attention):
                 host_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping,
                 do_cross_attention=self.cross_attention,
                 cross_qkv=None,
                 cross_qkv_length=attention_params.encoder_max_input_length,

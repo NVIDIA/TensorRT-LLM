@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 sys.path.append(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples",
                  "apps"))
-from fastapi_server import LLM, KvCacheConfig, LlmServer
+from fastapi_server import LLM, LlmServer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import llama_model_path
@@ -16,14 +16,18 @@ from test_llm import llama_model_path
 @pytest.fixture(scope="module")
 def client():
     llm = LLM(llama_model_path)
-    kv_cache_config = KvCacheConfig()
 
-    app_instance = LlmServer(llm, kv_cache_config)
+    app_instance = LlmServer(llm)
     client = TestClient(app_instance.app)
     yield client
 
     del llm
     del app_instance.llm
+
+
+def test_health(client):
+    response = client.get("/health")
+    assert response.status_code == 200
 
 
 def test_health(client):

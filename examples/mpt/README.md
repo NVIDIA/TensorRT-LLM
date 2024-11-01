@@ -19,10 +19,6 @@ This document explains how to build the [MPT](https://huggingface.co/mosaicml/mp
       - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format)
       - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines)
       - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct)
-    - [Replit Code V-1.5 3B](#replit-code-v-15-3b)
-      - [1. Convert weights from HF Transformers to TRTLLM format](#1-convert-weights-from-hf-transformers-to-trtllm-format-1)
-      - [2. Build TensorRT engine(s)](#2-build-tensorrt-engines-1)
-      - [3. Run TRT engine to check if the build was correct](#3-run-trt-engine-to-check-if-the-build-was-correct-1)
 
 ## Overview
 
@@ -177,56 +173,4 @@ mpirun -n 4 --allow-run-as-root \
     python ../run.py --max_output_len 10 \
                      --engine_dir ./trt_engines/mpt-30b/fp16/4-gpu/ \
                      --tokenizer_dir mosaicml/mpt-30b
-```
-
-### Replit Code V-1.5 3B
-Same commands can be changed to convert [Replit Code V-1.5 3B](https://huggingface.co/replit/replit-code-v1_5-3b) to TRT LLM format. Below is an example to build Replit Code V-1.5 3B fp16 2-way tensor parallelized TRT engine.
-
-#### 1. Convert weights from HF Transformers to TRTLLM format
-
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script allows you to convert weights from HF Transformers format to TRTLLM format.
-
-```bash
-python convert_checkpoint.py --model_dir ./replit-code-v1_5-3b --output_dir ./ckpts/replit-code-v1_5-3b/bf16_tp2/ --tp_size 2 --dtype bfloat16
-```
-
-#### 2. Build TensorRT engine(s)
-
-Examples of build invocations:
-
-```bash
-# Build 2-GPU Replit Code V-1.5 3B bfloat16 engines
-trtllm-build --checkpoint_dir ./ckpts/replit-code-v1_5-3b/bf16_tp2 \
-             --max_batch_size 32 \
-             --max_input_len 1024 \
-             --max_seq_len 1536 \
-             --gpt_attention_plugin bfloat16 \
-             --gemm_plugin bfloat16 \
-             --workers 2 \
-             --output_dir ./trt_engines/replit-code-v1_5-3b/bf16_tp2
-```
-
-#### 3. Run TRT engine to check if the build was correct
-
-```bash
-# Run 2-GPU Replit Code V-1.5 3B TRT engine on a sample input prompt
-mpirun -n 2 --allow-run-as-root \
-    python ../run.py --max_output_len 64 \
-                     --input_text "def fibonacci" \
-                     --engine_dir ./trt_engines/replit-code-v1_5-3b/bf16_tp2 \
-                     --tokenizer_dir ./replit-code-v1_5-3b/
-```
-
-Here is the output of above command.
-```bash
-Input: "def fibonacci"
-Output: "(n):
-    if n == 0:
-        return 0
-    elif n == 1:
-        return 1
-    else:
-        return fibonacci(n-1) + fibonacci(n-2)
-
-print(fibonacci(10))"
 ```

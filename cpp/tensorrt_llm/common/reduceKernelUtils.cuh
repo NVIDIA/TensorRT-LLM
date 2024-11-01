@@ -39,6 +39,12 @@ template <int VPT>
 struct BytesToType;
 
 template <>
+struct BytesToType<1>
+{
+    using type = uint8_t;
+};
+
+template <>
 struct BytesToType<2>
 {
     using type = uint16_t;

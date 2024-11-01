@@ -62,6 +62,7 @@ public:
         TensorMap& inputBuffers, TensorMap& outputBuffers, runtime::WorldConfig const& worldConfig) const;
 
 public:
+    TensorPtr cumSumLength;            // [1] the cumulative sum of generation length, on pinned
     TensorPtr packedMasksDevice;       // [forwardBatchSize, tokensPerStep, numPackedMasks], on gpu
     TensorPtr generationLengthsDevice; // [forwardBatchSize], on gpu
     TensorPtr positionOffsetsDevice;   // [forwardBatchSize, tokensPerStep], on gpu

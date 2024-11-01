@@ -11,6 +11,7 @@ pytest-cov
 pytest-forked
 pytest-xdist
 pytest-timeout
+pytest-split
 rouge_score
 cloudpickle
 typing-extensions==4.8.0
@@ -18,3 +19,4 @@ bandit==1.7.7
 jsonlines==4.0.0
 jieba==0.42.1
 rouge==1.0.1
+pytest-rerunfailures

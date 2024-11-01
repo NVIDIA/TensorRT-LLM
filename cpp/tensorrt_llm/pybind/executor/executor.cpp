@@ -184,6 +184,7 @@ void Executor::initBindings(py::module_& m)
         .def("cancel_request", &Executor::cancelRequest, py::arg("id") = py::none())
         .def("get_latest_iteration_stats", &Executor::getLatestIterationStats)
         .def("get_latest_request_stats", &Executor::getLatestRequestStats)
+        .def("get_latest_debug_tensors", &Executor::getLatestDebugTensors)
         .def("can_enqueue_requests", &Executor::canEnqueueRequests);
 }
 

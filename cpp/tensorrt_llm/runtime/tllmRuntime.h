@@ -73,8 +73,20 @@ public:
 
     void clearContexts();
 
+    /// @brief Set input tensors from tensorMap for all contexts.
+    /// @details The function can be used to set static input tensors for all iterations. If a tensor was set this way,
+    /// it doesn't need to included in calls to setInputTensors anymore.
+    void setStaticInputTensors(TensorMap const& tensorMap);
+
+    /// @brief Set input tensors from tensorMap for context at contextIndex.
+    /// @details The function expects that all input tensors (excluding the ones set by setStaticInputTensors) are
+    /// contained in the tensorMap. If a tensor is missing, has a bad shape or type, it will throw.
     void setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap);
 
+    /// @brief Set output tensors from tensorMap for context at contextIndex.
+    /// @details The function expects that all output tensors are contained in the tensorMap. If a tensor is missing and
+    /// shape inference is enabled, it will allocate the tensor on GPU and insert it into the tensorMap. Otherwise it
+    /// will throw.
     void setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap);
 
     bool executeContext(SizeType32 contextIndex) const;
@@ -123,6 +135,10 @@ public:
     void loadManagedWeights(RawEngine const& rawEngine, int localRank);
 
 private:
+    void cacheTensorNames();
+
+    void setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss);
+
     BufferManager::CudaStreamPtr mStream;
     BufferManager mBufferManager;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
@@ -133,7 +149,10 @@ private:
     std::unique_ptr<nvinfer1::IEngineInspector> mEngineInspector;
     std::unique_ptr<LayerProfiler> mLayerProfiler;
     bool mUseShapeInference;
-    TensorMap mManagedWeightsMap{};
-    std::set<SizeType32> mSetWeights;
+    TensorMap mManagedWeightsMap;
+    // List of input tensor names. Names of static tensors are removed from this list when setStaticInputTensors is
+    // called.
+    std::vector<std::string> mInputTensorNames;
+    std::vector<std::string> mOutputTensorNames;
 };
 } // namespace tensorrt_llm::runtime

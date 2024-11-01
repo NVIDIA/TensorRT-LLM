@@ -16,6 +16,18 @@ This is the starting point to try out TensorRT-LLM. Specifically, this Quick Sta
   git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct
   ```
 
+## LLM API
+The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
+
+Here is a simple example to show how to use the LLM API with TinyLlama.
+
+```{literalinclude} ../../examples/llm-api/quickstart_example.py
+    :language: python
+    :linenos:
+```
+
+To learn more about the LLM API, check out the [](llm-api/index) and [](llm-api-examples/index).
+
 (quick-start-guide-compile)=
 ## Compile the Model into a TensorRT Engine
 
@@ -68,19 +80,6 @@ cd tensorrtllm_backend
 
 2. Refer to [End to end workflow to run llama 7b](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md) in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.
 
-## LLM API
-The LLM API is a Python API to setup & infer with TensorRT-LLM directly in python.It allows for optimizing models by specifying a HuggingFace repo name or a model checkpoint. The LLM API handles checkpoint conversion, engine building, engine loading, and model inference, all from one python object.
-
-Note that these APIs are in incubation, they may change and  supports the [following models](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/index.html#supported-model), which will increase in coming release. We appreciate your patience and understanding as we improve this API.
-
-Here is a simple example to show how to use the LLM API with TinyLlama.
-
-```{literalinclude} ../../examples/llm-api/quickstart_example.py
-    :language: python
-    :linenos:
-```
-
-To learn more about the LLM API, check out the [](llm-api-examples/index) and [](llm-api/index).
 
 ## Next Steps
 

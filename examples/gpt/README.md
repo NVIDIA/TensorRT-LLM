@@ -425,8 +425,7 @@ Then, use `trtllm-build` to build engine(s).
 
 ```bash
 trtllm-build --checkpoint_dir starcoder2/trt_ckpt/int8-sq/ \
-             --output_dir starcoder2/trt_engine/int8-sq/ \
-             --builder_opt 4
+             --output_dir starcoder2/trt_engine/int8-sq/
 ```
 
 

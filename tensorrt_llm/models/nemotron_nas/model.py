@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type, Union
 
 from tensorrt_llm.bindings import KVCacheType
-from tensorrt_llm.functional import (AllReduceFusionParams, AttentionMaskType,
-                                     PositionEmbeddingType, Tensor,
-                                     gather_last_token_logits, recv, send)
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceFusionParams,
+                                     AttentionMaskType, PositionEmbeddingType,
+                                     Tensor, gather_last_token_logits, recv,
+                                     send)
 from tensorrt_llm.layers.attention import (Attention, AttentionParams,
                                            KeyValueCacheParams,
                                            SpecDecodingParams)
@@ -29,16 +30,17 @@ from tensorrt_llm.layers.mlp import GatedMLP
 from tensorrt_llm.layers.normalization import RmsNorm
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import has_safetensors
-from tensorrt_llm.models.deci.config import DeciConfig
-from tensorrt_llm.models.deci.convert import (load_weights_from_hf_model,
-                                              load_weights_from_hf_safetensors)
 from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm.models.nemotron_nas.config import DeciConfig
+from tensorrt_llm.models.nemotron_nas.convert import (
+    load_weights_from_hf_model, load_weights_from_hf_safetensors,
+    update_weights_following_modelopt_optimization)
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.plugin.plugin import init_all_reduce_helper
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ..modeling_utils import QuantConfig, preprocess_weights
+from ..modeling_utils import PretrainedConfig, QuantConfig, preprocess_weights
 
 
 @dataclass
@@ -123,21 +125,106 @@ class DeciLMDecoderLayer(Module):
 
         self.layer_config = self.config.get_layer_config(self.layer_idx)
 
-        layer_type_len = len(config.layer_types)
-        layer_types = config.layer_types * ((layer_idx + 1) // layer_type_len)
-        layer_types = layer_types + config.layer_types[0:(
-            (layer_idx + 1) % layer_type_len)]
-
-        attention_layer_idx = layer_types.count('attention') - 1
-        self._init_attention(attention_layer_idx)
+        self._init_attention()
         self._init_ffn()
 
-    def _init_attention(self, attention_layer_idx) -> None:
+    @property
+    def input_layernorm_was_fused(self) -> bool:
+        """
+        The previous layer ran our input_layernorm for us if:
+        1. The reduce_fusion plugin is enabled and
+        2. We are not the first local model layer and
+        3. The previous layer is an MLP layer
+        """
+        return default_net(
+        ).plugin_config.reduce_fusion and self.local_layer_idx > 0 and self.config.get_layer_config(
+            self.layer_idx -
+            1).is_mlp_layer and self.needs_input_layernorm_fusion
+
+    @property
+    def needs_input_layernorm_fusion(self) -> bool:
+        """
+        This layer needs the previous layer to perform input_layernorm fusion if:
+        1. The reduce_fusion plugin is enabled and
+        2. This is not a NOOP attention layer (otherwise it has no input_layernorm)
+        """
+        return default_net(
+        ).plugin_config.reduce_fusion and not self.layer_config.is_noop_attention_layer
+
+    @property
+    def can_fuse_post_layernorm(self) -> bool:
+        """
+        This layer can fuse attention and post_layernorm if:
+        1. The reduce_fusion plugin is enabled and
+        2. It is an attention layer and
+        3. It is not a NOOP FFN layer (othrewise it has no post_layernorm)
+        """
+        return default_net(
+        ).plugin_config.reduce_fusion and self.layer_config.is_attention_layer and not self.layer_config.is_noop_ffn_layer
+
+    @property
+    def can_fuse_input_layernorm(self) -> bool:
+        """
+        This layer can run the next layer's input_layernorm if:
+        1. The reduce_fusion plugin is enable and
+        2. It is an MLP layer
+        """
+        return default_net(
+        ).plugin_config.reduce_fusion and self.layer_config.is_mlp_layer
+
+    def _init_attention(self) -> None:
         """
         Initialize some attention alternative
         """
         # normal attention
         if self.layer_config.is_attention_layer:
+            # according to recurrentgemma, len(layer_types) can be less than num_hidden_layers
+            # in this case, the list should wrap-around
+            # for example, if layer_types = ["attention", "recurrent", "recurrent"], and we have 5 layers, we get:
+            # layer 0 ==> attention
+            # layer 1 ==> recurrent
+            # layer 2 ==> recurrent
+            # layer 3 ==> attention
+            # layer 4 ==> recurrent
+            # we check which layers are local to our rank
+            layers_range = self.config.mapping.pp_layers(
+                self.config.num_hidden_layers)
+            # then take the size of layer_types in the config
+            layer_type_len = len(self.config.layer_types)
+            # collect the layer types of all the local layers
+            local_layer_types = [
+                self.config.layer_types[layer_id % layer_type_len]
+                for layer_id in layers_range
+            ]
+            # and see how many of them are attention layers to determine our local attention layer idx
+            local_attn_layer_idx = local_layer_types[:self.
+                                                     local_layer_idx].count(
+                                                         "attention")
+
+            # Iterate over all local layer configs, getting num_kv_heads of the attention ones
+            num_kv_heads_per_local_layer = [
+                layer_config.attention.num_key_value_heads for layer_config in
+                [self.config.layer_configs[idx] for idx in layers_range]
+                if layer_config.is_attention_layer
+            ]
+
+            # adjust num heads according to tp size
+            num_kv_heads_per_local_layer = [
+                (nheads + self.config.mapping.tp_size - 1) //
+                self.config.mapping.tp_size
+                for nheads in num_kv_heads_per_local_layer
+            ]
+            nheads_tp = (self.layer_config.attention.num_key_value_heads +
+                         self.config.mapping.tp_size -
+                         1) // self.config.mapping.tp_size
+
+            # local layers with the same number of kv heads share the same cache pool
+            # we count how many such layers there are before us to determine our index inside that pool
+            layer_idx_in_cache_pool = num_kv_heads_per_local_layer[:
+                                                                   local_attn_layer_idx].count(
+                                                                       nheads_tp
+                                                                   )
+
             self.input_layernorm = RmsNorm(
                 normalized_shape=self.config.hidden_size,
                 eps=self.config.norm_epsilon,
@@ -145,7 +232,7 @@ class DeciLMDecoderLayer(Module):
             )
 
             self.attention = Attention(
-                local_layer_idx=attention_layer_idx,
+                local_layer_idx=local_attn_layer_idx,
                 hidden_size=self.config.hidden_size,
                 attention_head_size=self.config.head_size,
                 num_attention_heads=self.config.num_attention_heads,
@@ -161,7 +248,7 @@ class DeciLMDecoderLayer(Module):
                 tp_size=self.config.mapping.tp_size,
                 tp_rank=self.config.mapping.tp_rank,
                 quant_mode=self.config.quant_mode,
-            )
+                layer_idx_in_cache_pool=layer_idx_in_cache_pool)
 
         elif self.layer_config.is_noop_attention_layer:
             self.input_layernorm = NoOpLayerNorm()
@@ -238,7 +325,77 @@ class DeciLMDecoderLayer(Module):
                 f"FFN of type {str(self.layer_config.ffn.impl)} is not implemented"
             )
 
-    def forward(
+    def forward(self,
+                hidden_states: Tensor | Tuple[Tensor, Tensor],
+                attention_mask: Optional[Tensor] = None,
+                use_cache: bool = False,
+                spec_decoding_params=None,
+                kv_cache_params: Optional[KeyValueCacheParams] = None,
+                attention_params: Optional[AttentionParams] = None,
+                lora_layer_params: Optional[LoraParams] = None,
+                next_layer_input_layernorm_args: Optional[Tuple[Tensor,
+                                                                float]] = None):
+        if self.input_layernorm_was_fused:
+            # previous layer already performed our layer norm
+            assert isinstance(hidden_states, tuple)
+            hidden_states, residual = hidden_states
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        if self.can_fuse_post_layernorm:
+            reduce_fusion_params = AllReduceFusionParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=self.post_layernorm.weight.value,
+                eps=self.post_layernorm.eps)
+        else:
+            reduce_fusion_params = None
+
+        attention_output = self._run_attention(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_layer_params=lora_layer_params,
+            reduce_fusion_params=reduce_fusion_params)
+
+        if use_cache:
+            attention_output, present_kv = attention_output
+        else:
+            present_kv = None
+
+        if self.can_fuse_post_layernorm:
+            hidden_states, residual = attention_output
+        else:
+            hidden_states = residual + attention_output
+            residual = hidden_states
+            hidden_states = self.post_layernorm(hidden_states)
+
+        if next_layer_input_layernorm_args is not None:
+            assert self.can_fuse_input_layernorm
+            norm_weight, eps = next_layer_input_layernorm_args
+            reduce_fusion_params = AllReduceFusionParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=eps)
+            hidden_states = self._run_ffn(
+                hidden_states,
+                lora_layer_params=lora_layer_params,
+                reduce_fusion_params=reduce_fusion_params)
+
+        else:
+            hidden_states = self._run_ffn(hidden_states,
+                                          lora_layer_params=lora_layer_params)
+            hidden_states = residual + hidden_states
+
+        return DeciLMLayerOutput(hidden_states=hidden_states,
+                                 present_kv=present_kv)
+
+    def _run_attention(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
@@ -247,34 +404,47 @@ class DeciLMDecoderLayer(Module):
         kv_cache_params: Optional[KeyValueCacheParams] = None,
         attention_params: Optional[AttentionParams] = None,
         lora_layer_params: Optional[LoraParams] = None,
-    ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
-        attention_output = self.attention(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            use_cache=use_cache,
-            spec_decoding_params=spec_decoding_params,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-            lora_layer_params=lora_layer_params,
-        )
-
-        if use_cache:
-            attention_output, present_kv = attention_output
+        reduce_fusion_params: Optional[AllReduceFusionParams] = None
+    ) -> Union[Tensor, Tuple[Tensor, None]]:
+        """
+        Ideally, this functionality would be encapsulated in a LinearAttention class, but during
+        FP8 and lower quantization, our linear classes get overrun by ModelOpt, thus we must
+        control the attention inputs at the DecoderLayer level.
+        """
+        if self.layer_config.is_linear_attention_layer:
+            out = self.attention(hidden_states)
+            return out, None if use_cache else out
         else:
-            present_kv = None
+            if not self.layer_config.is_attention_layer:
+                assert reduce_fusion_params is None, f"Layer with attention of type {self.layer_config.attention.impl} can't do reduce_fusion"
 
-        hidden_states = residual + attention_output
-        residual = hidden_states
-        hidden_states = self.post_layernorm(hidden_states)
-        hidden_states = self.ffn(hidden_states,
-                                 lora_layer_params=lora_layer_params)
-        hidden_states = residual + hidden_states
+            return self.attention(hidden_states=hidden_states,
+                                  attention_mask=attention_mask,
+                                  use_cache=use_cache,
+                                  spec_decoding_params=spec_decoding_params,
+                                  kv_cache_params=kv_cache_params,
+                                  attention_params=attention_params,
+                                  lora_layer_params=lora_layer_params,
+                                  reduce_fusion_params=reduce_fusion_params)
 
-        return DeciLMLayerOutput(hidden_states=hidden_states,
-                                 present_kv=present_kv)
+    def _run_ffn(self,
+                 hidden_states,
+                 lora_layer_params=None,
+                 reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+        """
+        Ideally, this functionality would be encapsulated in a LinearMLP class, but during
+        FP8 and lower quantization, our linear classes get overrun by ModelOpt, thus we must
+        control the MLP inputs at the DecoderLayer level.
+        """
+        if reduce_fusion_params is not None:
+            assert self.layer_config.is_mlp_layer, f"Layer with FFN of type {self.layer_config.ffn.impl} can't do reduce_fusion"
+
+        if self.layer_config.is_linear_ffn_layer:
+            return self.ffn(hidden_states)
+        else:
+            return self.ffn(hidden_states,
+                            lora_layer_params=lora_layer_params,
+                            reduce_fusion_params=reduce_fusion_params)
 
 
 class DeciLMDecoderLayerList(ModuleList):
@@ -311,6 +481,17 @@ class DeciLMDecoderLayerList(ModuleList):
         past_key_values = [x for x in pkv_iter]
 
         for layer_idx, (layer, past) in enumerate(zip(self, past_key_values)):
+            next_layer_input_layernorm_args = None
+            if default_net().plugin_config.reduce_fusion:
+                if layer_idx < self.layer_list[-1]:
+                    # this is not the last layer
+                    next_layer = self[layer_idx + 1]
+                    if layer.can_fuse_input_layernorm and next_layer.needs_input_layernorm_fusion:
+                        # this layer can fuse the next layer's input_layernorm
+                        next_layer_input_layernorm_args = (
+                            next_layer.input_layernorm.weight.value,
+                            next_layer.input_layernorm.eps)
+
             layer_out = layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -329,13 +510,16 @@ class DeciLMDecoderLayerList(ModuleList):
                     host_kv_cache_block_offsets,
                     host_kv_cache_pool_pointers=kv_cache_params.
                     host_kv_cache_pool_pointers,
+                    host_kv_cache_pool_mapping=kv_cache_params.
+                    host_kv_cache_pool_mapping,
                     cache_indirection=kv_cache_params.cache_indirection,
                 ),
                 spec_decoding_params=spec_decoding_params,
                 use_cache=use_cache,
                 lora_layer_params=lora_params.get_layer_config(layer_idx)
                 if lora_params is not None
-                and lora_params.lora_ranks is not None else None)
+                and lora_params.lora_ranks is not None else None,
+                next_layer_input_layernorm_args=next_layer_input_layernorm_args)
 
             hidden_states = layer_out.hidden_states
             if use_cache and layer_out.present_kv is not None:
@@ -511,6 +695,19 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
         model.load(weights)
         return model
 
+    @classmethod
+    def from_checkpoint(cls,
+                        ckpt_dir: str,
+                        rank: Optional[int] = None,
+                        config: Optional["PretrainedConfig"] = None):
+        return super().from_checkpoint(
+            ckpt_dir,
+            rank,
+            config,
+            preprocess_weights_hook=
+            update_weights_following_modelopt_optimization,
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -605,7 +802,6 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
                     attn_layer_idx.append(layer_idx)
                     num_kv_heads_per_layer.append(
                         layer_config.attention.num_key_value_heads)
-            num_layers = len(attn_layer_idx)
 
         attention_inputs = super().prepare_attention_inputs(
             max_batch_size=max_batch_size,
@@ -627,17 +823,5 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
             attn_layer_idx=attn_layer_idx,
             opt_batch_size=opt_batch_size,
             num_kv_heads_per_layer=num_kv_heads_per_layer)
-
-        kv_idx = 0
-        past_key_value = []
-        for i in range(self.config.num_hidden_layers):
-            layer_config = self.config.get_layer_config(i)
-            if layer_config.is_attention_layer:
-                past_key_value.append(
-                    attention_inputs['past_key_value'][kv_idx])
-                kv_idx += 1
-            else:
-                past_key_value.append(None)
-        attention_inputs['past_key_value'] = past_key_value
 
         return attention_inputs

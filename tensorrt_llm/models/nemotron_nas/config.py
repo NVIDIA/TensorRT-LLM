@@ -21,11 +21,11 @@ from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.deci.convert import hf_block_config_to_layer_config
-from tensorrt_llm.models.deci.layer_config import (AttentionConfig,
-                                                   AttentionImplementation,
-                                                   DeciLayerConfig, FFNConfig)
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantConfig
+from tensorrt_llm.models.nemotron_nas.convert import \
+    hf_block_configs_to_layer_configs
+from tensorrt_llm.models.nemotron_nas.layer_config import (
+    AttentionConfig, AttentionImplementation, DeciLayerConfig, FFNConfig)
 
 
 class DeciConfig(PretrainedConfig):
@@ -60,6 +60,7 @@ class DeciConfig(PretrainedConfig):
                                                     Dict[str,
                                                          Dict[str,
                                                               Any]]]]] = None,
+                 block_configs: Optional[object] = None,
                  **kwargs):
         super().__init__(architecture=architecture,
                          dtype=dtype,
@@ -86,7 +87,13 @@ class DeciConfig(PretrainedConfig):
         self.rotary_base = rotary_base
         self.rotary_scaling = rotary_scaling
 
-        if layer_configs is not None:
+        if block_configs is not None:
+            assert layer_configs is None
+            self.layer_configs = hf_block_configs_to_layer_configs(
+                block_configs,
+                num_attention_heads=num_attention_heads,
+                hidden_size=hidden_size)
+        elif layer_configs is not None:
             assert len(
                 layer_configs
             ) == num_hidden_layers, f"num_hidden_layers ({num_hidden_layers}) must match len(layer_configs) ({len(layer_configs)})"
@@ -101,6 +108,14 @@ class DeciConfig(PretrainedConfig):
                 self.get_layer_config(layer_idx).attention.impl).value
             for layer_idx in range(self.num_hidden_layers)
         ]
+
+        # HACK: this is here since the runtime doesn't parse the layer_configs yet
+        self.num_kv_heads_per_layer = []
+        for layer_idx in range(self.num_hidden_layers):
+            layer_config = self.get_layer_config(layer_idx)
+            if layer_config.is_attention_layer:
+                self.num_kv_heads_per_layer.append(
+                    layer_config.attention.num_key_value_heads)
 
     def _ensure_layer_configs(
         self, layer_configs: List[Union[DeciLayerConfig, Dict[str, Any]]]
@@ -154,16 +169,16 @@ class DeciConfig(PretrainedConfig):
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_or_dir, trust_remote_code=trust_remote_code)
 
-        assert hf_config.model_type == "deci", f"Unsupported model type: {hf_config.model_type}"
+        assert hf_config.model_type in (
+            "deci",
+            "nemotron-nas"), f"Unsupported model type: {hf_config.model_type}"
 
         block_configs = getattr(hf_config, "block_configs", None)
         if block_configs is not None:
-            layer_configs = [
-                hf_block_config_to_layer_config(block_config,
-                                                hf_config.num_attention_heads,
-                                                hf_config.hidden_size)
-                for block_config in block_configs
-            ]
+            layer_configs = hf_block_configs_to_layer_configs(
+                block_configs,
+                num_attention_heads=hf_config.num_attention_heads,
+                hidden_size=hf_config.hidden_size)
         else:
             # older deci arch
             num_key_value_heads_per_layer = getattr(

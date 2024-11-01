@@ -15,6 +15,7 @@ __all__ = [
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
+    'CalibConfig',
     'CachedModelLoader',
     'ConfigArbitrateError',
     '_ConfigArbitrator',
@@ -30,9 +31,8 @@ from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
-import tensorrt as trt
 import torch
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -55,7 +55,6 @@ from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (GpuArch, download_hf_model, download_hf_pretrained_config,
-                    file_with_glob_exists, file_with_suffix_exists,
                     get_directory_size_in_gb, print_colored,
                     print_traceback_on_error, set_docstring)
 
@@ -113,6 +112,36 @@ class _ParallelConfig:
     @property
     def is_multi_gpu(self) -> bool:
         return self.world_size > 1
+
+
+@dataclass(slots=True)
+class CalibConfig:
+    """
+    Calibration configuration.
+
+    Args:
+        device (Literal['cuda', 'cpu'], default='cuda'): The device to run calibration.
+        calib_dataset (str, default='cnn_dailymail'): The name or local path of calibration dataset.
+        calib_batches (int, default=512): The number of batches that the calibration runs.
+        calib_batch_size (int, default=1): The batch size that the calibration runs.
+        calib_max_seq_length (int, default=512): The maximum sequence length that the calibration runs.
+        random_seed (int, default=1234): The random seed used for calibration.
+        tokenizer_max_seq_length (int, default=2048): The maximum sequence length to initialize tokenizer for calibration.
+    """
+    device: Literal['cuda', 'cpu'] = 'cuda'
+    calib_dataset: str = 'cnn_dailymail'
+    calib_batches: int = 512
+    calib_batch_size: int = 1
+    calib_max_seq_length: int = 512
+    random_seed: int = 1234
+    tokenizer_max_seq_length: int = 2048
+
+    @classmethod
+    def from_dict(cls, config: dict):
+        return cls(**config)
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class _ModelFormatKind(Enum):
@@ -180,6 +209,10 @@ LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
 
     revision (str, optional): The revision of the model to use.
         Default is None.
+
+    load_format (Literal['auto', 'dummy'], default='auto'): The format of the model weights to load.
+        * 'auto' will try to load the weights from the provided checkpoint.
+        * 'dummy' will initialize the weights with random values, which is mainly for profiling.
 """
 
 # The arguments locate in LLM class's kwargs, and will be concatenated to LLM class's apidocs.
@@ -203,6 +236,8 @@ LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
 
     quant_config (QuantConfig, default=QuantConfig()): The quantization configuration for the model.
         Default is an empty QuantConfig instance.
+
+    calib_config (CalibConfig, default=CalibConfig()): The calibration configuration for the model.
 
     embedding_parallel_mode (str, default="SHARDING_ALONG_VOCAB"): The parallel mode for embeddings.
 
@@ -263,6 +298,8 @@ class LlmArgs:
 
     revision: Optional[str] = None
 
+    load_format: Literal['auto', 'dummy'] = 'auto'
+
     # LoRA arguments
     enable_lora: bool = False
 
@@ -275,7 +312,11 @@ class LlmArgs:
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
     build_config: Optional[BuildConfig] = None
 
+    fast_build: Optional[bool] = False
+
     quant_config: QuantConfig = field(default_factory=QuantConfig)
+
+    calib_config: CalibConfig = field(default_factory=CalibConfig)
 
     # A handful of options from PretrainedConfig
     embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
@@ -330,8 +371,6 @@ class LlmArgs:
                 self.dtype = 'float16'
             if self.dtype == 'bfloat16':
                 raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-
-        self._engine_config: Optional[EngineConfig] = None
 
         self.auto_parallel_config = AutoParallelConfig(
             sharded_io_allowlist=[
@@ -422,6 +461,11 @@ class LlmArgs:
 
         self.build_config = self.build_config or BuildConfig()
 
+        # TODO(xiweny): remove the checker when manage weights support all data types
+        if self.fast_build and (self.quant_config.quant_algo is QuantAlgo.FP8
+                                or self.quant_config.quant_algo is None):
+            self._update_plugin_config("manage_weights", True)
+
         if self.enable_lora:
             self.build_config.plugin_config.lora_plugin = 'auto'
             if self.max_lora_rank is not None:
@@ -433,7 +477,7 @@ class LlmArgs:
     def _perform_config_arbitration(self):
         '''
         Arbitrate the configurations for the model building. The configs between different functional or performance
-        features might be confilcted, and this method will arbitrate the conflicts and raise errors if necessary.
+        features might be conflicted, and this method will arbitrate the conflicts and raise errors if necessary.
         '''
         self._config_arbitrator = _ConfigArbitrator()
         if self.build_config_mutable:
@@ -773,9 +817,7 @@ class _ModelRuntimeContext:
     ''' _ModelRuntimeContext holds the minimum runtime resources for running a model.
     It could be a runtime cache in MPI nodes.
     '''
-    engine_buffer: Optional[trt.IHostMemory] = None
-    # engine_config is only used for saving the engine to disk
-    engine_config: Optional[Union[dict, EngineConfig]] = None
+    engine: Optional[Engine] = None
     mapping: Optional[Mapping] = None
     model_info: Optional[_ModelInfo] = None
 
@@ -783,14 +825,9 @@ class _ModelRuntimeContext:
     engine_path: Optional[str] = None
 
     @property
-    def engine(self) -> trt.IHostMemory:
-        assert self.engine_buffer is not None
-        return self.engine_buffer
-
-    @property
     def model_arch(self) -> str:
         # "LlaMACausalForLM" or "OPTForCausalLM" and so on
-        return self.engine_config.pretrained_config['architecture']
+        return self.engine.config.pretrained_config['architecture']
 
 
 class ModelLoader:
@@ -959,16 +996,10 @@ class ModelLoader:
         )
         pipeline()
 
-        if not hasattr(self, '_engine_config'):
-            raise RuntimeError("config is not loaded.")
-
-        config = self._engine_config
-
         assert engine_dir
 
         runtime_context = _ModelRuntimeContext(
-            engine_buffer=self._engine_buffer,
-            engine_config=config,
+            engine=self._engine,
             mapping=self.mapping,
             model_info=self._model_info,
         )
@@ -1021,28 +1052,37 @@ class ModelLoader:
                     else:
                         shutil.copy2(src, dst)
 
-        engine = Engine(config=model.engine_config, engine=model.engine)
-        engine.save(engine_dir)
+        model.engine.save(engine_dir)
         if rank == 0:
             copy_hf_tokenizer_data_to_engine_dir()
 
     @staticmethod
     def get_model_format(model_dir: str) -> _ModelFormatKind:
         ''' Get the format of the model.  '''
-        # TODO: migrate to detect version field in config.json after TRTLLM-256 finished
-        if Path.exists(
-                Path(model_dir) / 'config.json') and file_with_glob_exists(
-                    model_dir, 'rank*.safetensors'):
-            return _ModelFormatKind.TLLM_CKPT
-        if (Path.exists(Path(model_dir) / 'config.json')
-                and (file_with_suffix_exists(model_dir, '.bin')
-                     or file_with_suffix_exists(model_dir, '.safetensors'))):
-            return _ModelFormatKind.HF
-        if Path.exists(
-                Path(model_dir) / 'config.json') and file_with_suffix_exists(
-                    model_dir, '.engine'):
-            return _ModelFormatKind.TLLM_ENGINE
-        raise ValueError(f"Unknown model format for {model_dir}")
+        if not (Path(model_dir) / 'config.json').exists():
+            raise ValueError(
+                f"Failed to infer model format because no config.json exists in {model_dir}"
+            )
+
+        with open(Path(model_dir) / 'config.json') as f:
+            config = json.load(f)
+
+        try:
+            if 'pretrained_config' in config and 'build_config' in config:
+                model_format = _ModelFormatKind.TLLM_ENGINE
+                EngineConfig.from_json_file(Path(model_dir) / 'config.json')
+            elif 'architecture' in config and 'dtype' in config:
+                model_format = _ModelFormatKind.TLLM_CKPT
+                PretrainedConfig.from_checkpoint(model_dir)
+            else:
+                model_format = _ModelFormatKind.HF
+                AutoConfig.from_hugging_face(model_dir)
+        except Exception as e:
+            raise ValueError(
+                f"Inferred model format {model_format}, but failed to load config.json: {e}"
+            )
+        else:
+            return model_format
 
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
@@ -1065,7 +1105,16 @@ class ModelLoader:
         assert self._model_dir is not None
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code)
-        if self.llm_args.quant_config.requires_calibration:
+        if self.llm_args.load_format == 'dummy':
+            config = model_cls.config_class.from_hugging_face(
+                str(self._model_dir),
+                dtype=self.llm_args.dtype,
+                mapping=self.mapping,
+                quant_config=self.llm_args.quant_config,
+                **self.convert_checkpoint_options,
+            )
+            self.model = model_cls(config)
+        elif self.llm_args.quant_config.requires_calibration:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1075,6 +1124,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
+                    **self.llm_args.calib_config.to_dict(),
                     trust_remote_code=self.llm_args.trust_remote_code,
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
@@ -1108,8 +1158,11 @@ class ModelLoader:
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
         model_cls = MODEL_MAP[architecture]
-        self.model = model_cls.from_checkpoint(self._model_dir,
-                                               config=self.pretrained_config)
+        if self.llm_args.load_format == 'dummy':
+            self.model = model_cls(self.pretrained_config)
+        else:
+            self.model = model_cls.from_checkpoint(
+                self._model_dir, config=self.pretrained_config)
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
@@ -1138,10 +1191,7 @@ class ModelLoader:
             self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
 
-        engine = build(self.model, copied_build_config)
-
-        self._engine_buffer = engine.engine
-        self._engine_config = engine.config
+        self._engine = build(self.model, copied_build_config)
         self.mapping = self.model.config.mapping
 
         # delete the model explicitly to free all the build-time resources
@@ -1162,9 +1212,7 @@ class ModelLoader:
 
     def _load_engine_buffer(self):
         # Load engine buffer from disk
-        engine = Engine.from_dir(self._model_dir)
-        self._engine_buffer = engine.engine
-        self._engine_config = engine.config
+        self._engine = Engine.from_dir(self._model_dir)
 
     @staticmethod
     def load_extra_build_configs_from_engine(
@@ -1322,7 +1370,7 @@ class CachedModelLoader:
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
                 model_loader_kwargs = {
                     'llm_args': self.llm_args,
-                    'workspace': self.workspace,
+                    'workspace': str(self.workspace),
                     'llm_build_stats': self.llm_build_stats,
                 }
 
@@ -1397,7 +1445,7 @@ class CachedModelLoader:
 @dataclass
 class LlmBuildStats:
     ''' LlmBuildStats is the statistics for the LLM model building. '''
-    # Whether the cache is hitted for the engine
+    # Whether the cache is hit for the engine
     cache_hitted: bool = False
     cache_info: Optional[str] = None
 

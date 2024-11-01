@@ -1495,7 +1495,10 @@ class Fp8RowwiseMLP(Module):
         if self.quant_mode.has_fp8_rowwise():
             # Quantize per token outputs tuple:
             # quantized tensor and scaling factors per token
-            inter = quantize_fp8_per_token(inter, self.clamp_val.val)
+            if hasattr(self.clamp_val, "val"):
+                inter = quantize_fp8_per_token(inter, self.clamp_val.val)
+            else:
+                inter = quantize_fp8_per_token(inter)
         output = self.proj(inter)
         return output
 
@@ -1619,32 +1622,31 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
 
 class SmoothQuantAttention(Module):
 
-    def __init__(
-            self,
-            *,
-            local_layer_idx,
-            hidden_size,
-            num_attention_heads,
-            num_kv_heads=None,
-            max_position_embeddings=1024,
-            num_layers=1,
-            apply_query_key_layer_scaling=False,
-            attention_head_size=None,
-            attention_mask_type=AttentionMaskType.padding,
-            bias=True,
-            dense_bias=None,
-            dtype=None,
-            position_embedding_type=PositionEmbeddingType.learned_absolute,
-            rotary_embedding_base=10000.0,
-            rotary_embedding_scaling=None,
-            rotary_embedding_percentage=1.0,
-            tp_group=None,
-            tp_size=1,
-            tp_rank=0,
-            scale_alibi_bias=False,
-            paged_kv_cache=False,
-            quant_mode=QuantMode(0),
-    ):
+    def __init__(self,
+                 *,
+                 local_layer_idx,
+                 hidden_size,
+                 num_attention_heads,
+                 num_kv_heads=None,
+                 max_position_embeddings=1024,
+                 num_layers=1,
+                 apply_query_key_layer_scaling=False,
+                 attention_head_size=None,
+                 attention_mask_type=AttentionMaskType.padding,
+                 bias=True,
+                 dense_bias=None,
+                 dtype=None,
+                 position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 rotary_embedding_base=10000.0,
+                 rotary_embedding_scaling=None,
+                 rotary_embedding_percentage=1.0,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 scale_alibi_bias=False,
+                 paged_kv_cache=False,
+                 quant_mode=QuantMode(0),
+                 layer_idx_in_cache_pool=None):
         super().__init__()
         self.local_layer_idx = local_layer_idx
         self.attention_mask_type = attention_mask_type
@@ -1653,6 +1655,7 @@ class SmoothQuantAttention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
@@ -1817,6 +1820,7 @@ class SmoothQuantAttention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -1839,6 +1843,8 @@ class SmoothQuantAttention(Module):
                 host_kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=kv_cache_params.
                 host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping,
                 host_context_lengths=attention_params.host_context_lengths,
                 use_cache=use_cache,
                 spec_decoding_generation_lengths=spec_decoding_params.

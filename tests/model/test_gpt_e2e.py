@@ -62,7 +62,6 @@ def build_engine(checkpoint_dir: str, engine_dir: str, *args):
         '--max_input_len=40',
         '--max_seq_len=60',
         '--max_beam_width=2',
-        '--builder_opt=0',
     ]
     legacy_args = [
         "--gpt_attention_plugin=disable",

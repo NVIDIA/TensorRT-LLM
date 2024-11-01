@@ -397,7 +397,7 @@ class LLM:
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         del exc_value, traceback
         self._shutdown()
-        return exc_type is not None
+        return False  # propagate exceptions
 
     def __getstate__(self):
         raise RuntimeError("LLM object can not be pickled.")

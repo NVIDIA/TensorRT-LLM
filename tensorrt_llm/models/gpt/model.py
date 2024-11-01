@@ -25,6 +25,8 @@ from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantMode
+from ...quantization.functional import quantize_fp8_per_token
+from ...quantization.layers import Fp8RowwiseMLP
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig, check_share_embedding)
 from .config import GPTConfig
@@ -170,6 +172,10 @@ class GPTDecoderLayer(Module):
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
+
+        # Quantize per-token for fp8
+        if isinstance(self.mlp, Fp8RowwiseMLP):
+            hidden_states = quantize_fp8_per_token(hidden_states)
 
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)

@@ -102,13 +102,15 @@ def test_shutdown(model_files, model_path):
     with pytest.raises(Exception):
         executor.await_responses()
     with pytest.raises(Exception):
-        executor.get_latest_iteration_stats()()
+        executor.get_latest_iteration_stats()
     with pytest.raises(Exception):
-        executor.get_latest_request_stats()()
+        executor.get_latest_request_stats()
     with pytest.raises(Exception):
-        executor.cancel_request(req_id)()
+        executor.get_latest_debug_tensors()
     with pytest.raises(Exception):
-        executor.get_num_responses_ready(req_id)()
+        executor.cancel_request(req_id)
+    with pytest.raises(Exception):
+        executor.get_num_responses_ready(req_id)
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -215,6 +217,7 @@ def test_single_request(streaming: bool, exclude_input_from_output: bool,
 
     executor.get_latest_iteration_stats()
     executor.get_latest_request_stats()
+    executor.get_latest_debug_tensors()
 
 
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
@@ -475,13 +478,12 @@ def test_get_num_responses_ready(streaming: bool,
 @pytest.mark.parametrize("return_context_logits", [False, True])
 @pytest.mark.parametrize("return_generation_logits", [False, True])
 @skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
-def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
-                          beam_width: int, compute_log_probs: bool,
-                          exclude_input_from_output: bool,
-                          return_context_logits: bool,
-                          return_generation_logits: bool, model_files,
-                          model_path, model_path_return_logits, input_data_path,
-                          results_data_path, results_data_path_beam_width_2):
+def test_token_comparison(
+        batching_type: trtllm.BatchingType, streaming: bool, beam_width: int,
+        compute_log_probs: bool, exclude_input_from_output: bool,
+        return_context_logits: bool, return_generation_logits: bool,
+        model_files, model_path, model_path_return_logits, input_data_path,
+        results_data_path_fmhafp32acc, results_data_path_beam_width_2):
     if streaming and beam_width > 1:
         pytest.skip("Test does not support streaming with beam search")
 
@@ -594,7 +596,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
                                executor_config)
 
     # Load test data
-    results_path = results_data_path if beam_width == 1 else results_data_path_beam_width_2
+    results_path = results_data_path_fmhafp32acc if beam_width == 1 else results_data_path_beam_width_2
     given_input, given_input_lengths, max_input_length, test_data = load_test_data(
         input_data_path, results_path)
 
@@ -1020,6 +1022,11 @@ def test_scheduler_config():
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == None
 
+    capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.STATIC_BATCH
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == None
+
     context_chunking_policy = trtllm.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
                                     context_chunking_policy)
@@ -1034,6 +1041,7 @@ def test_kv_cache_config():
     assert config.max_attention_window is None
     assert config.sink_token_length is None
     assert config.free_gpu_memory_fraction is None
+    assert config.cross_kv_cache_fraction is None
     assert config.host_cache_size is None
     assert config.onboard_blocks == True
 
@@ -1042,6 +1050,7 @@ def test_kv_cache_config():
     config.max_attention_window = [2]
     config.sink_token_length = 3
     config.free_gpu_memory_fraction = 0.5
+    config.cross_kv_cache_fraction = 0.5
     config.host_cache_size = 4
     config.onboard_blocks = False
     assert config.enable_block_reuse == True
@@ -1049,6 +1058,7 @@ def test_kv_cache_config():
     assert config.max_attention_window == [2]
     assert config.sink_token_length == 3
     assert config.free_gpu_memory_fraction == 0.5
+    assert config.cross_kv_cache_fraction == 0.5
     assert config.host_cache_size == 4
     assert config.onboard_blocks == False
 
@@ -1058,6 +1068,7 @@ def test_kv_cache_config():
         "max_attention_window": [10],
         "sink_token_length": 2,
         "free_gpu_memory_fraction": 0.5,
+        "cross_kv_cache_fraction": 0.5,
         "host_cache_size": 1024,
         "onboard_blocks": False,
     }
@@ -1208,8 +1219,8 @@ def test_executor_config():
         "extended_runtime_perf_knob_config":
         trtllm.ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
         "debug_config":
-        trtllm.DebugConfig(dump_input_tensors=True,
-                           dump_output_tensors=True,
+        trtllm.DebugConfig(debug_input_tensors=True,
+                           debug_output_tensors=True,
                            debug_tensor_names=["test"]),
         "recv_poll_period_ms":
         50,
@@ -1455,6 +1466,7 @@ def test_request_stats():
         "avgNumDecodedTokensPerIter"] == stats.avg_num_decoded_tokens_per_iter
     assert stats_json["scheduled"] == stats.scheduled
     assert stats_json["paused"] == stats.paused
+    assert stats_json["disServingStats"] is None
 
 
 def test_request_stats_per_iteration():
@@ -1480,12 +1492,14 @@ def test_kv_cache_config_pickle():
     config = trtllm.KvCacheConfig()
     config.enable_block_reuse = True
     config.free_gpu_memory_fraction = 0.3
+    config.cross_kv_cache_fraction = 0.5
     config_copy = pickle.loads(pickle.dumps(config))
     assert config.enable_block_reuse == config_copy.enable_block_reuse
     assert config.max_tokens == config_copy.max_tokens
     assert config.max_attention_window == config_copy.max_attention_window
     assert config.sink_token_length == config_copy.sink_token_length
     assert config.free_gpu_memory_fraction == config_copy.free_gpu_memory_fraction
+    assert config.cross_kv_cache_fraction == config_copy.cross_kv_cache_fraction
     assert config.host_cache_size == config_copy.host_cache_size
     assert config.onboard_blocks == config_copy.onboard_blocks
 
@@ -1516,13 +1530,15 @@ def test_decoding_config_pickle():
 
 
 def test_debug_config_pickle():
-    config = trtllm.DebugConfig(dump_input_tensors=True,
-                                dump_output_tensors=True,
-                                debug_tensor_names=["test"])
+    config = trtllm.DebugConfig(debug_input_tensors=True,
+                                debug_output_tensors=True,
+                                debug_tensor_names=["test"],
+                                debug_tensors_max_iterations=5)
     config_copy = pickle.loads(pickle.dumps(config))
-    assert config.dump_input_tensors == config_copy.dump_input_tensors
-    assert config.dump_output_tensors == config_copy.dump_output_tensors
+    assert config.debug_input_tensors == config_copy.debug_input_tensors
+    assert config.debug_output_tensors == config_copy.debug_output_tensors
     assert config.debug_tensor_names == config_copy.debug_tensor_names
+    assert config.debug_tensors_max_iterations == config_copy.debug_tensors_max_iterations
 
 
 def test_logits_post_processor_config_pickle():
@@ -1573,8 +1589,8 @@ def test_executor_config_pickle():
         "extended_runtime_perf_knob_config":
         trtllm.ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
         "debug_config":
-        trtllm.DebugConfig(dump_input_tensors=True,
-                           dump_output_tensors=True,
+        trtllm.DebugConfig(debug_input_tensors=True,
+                           debug_output_tensors=True,
                            debug_tensor_names=["test"]),
         "recv_poll_period_ms":
         50,
@@ -1602,7 +1618,7 @@ def test_executor_config_pickle():
     assert config.peft_cache_config.num_host_module_layer == config_copy.peft_cache_config.num_host_module_layer
     assert config_copy.decoding_config.decoding_mode.isTopKandTopP
     assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
-    assert config.debug_config.dump_input_tensors == config_copy.debug_config.dump_input_tensors
+    assert config.debug_config.debug_input_tensors == config_copy.debug_config.debug_input_tensors
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
 
 

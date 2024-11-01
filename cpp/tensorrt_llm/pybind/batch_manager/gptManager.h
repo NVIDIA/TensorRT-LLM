@@ -21,6 +21,7 @@
 #include "namedTensor.h"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
+#include "tensorrt_llm/pybind/common/opaqueBindings.h"
 
 #include <ATen/ops/tensor.h>
 #include <functional>

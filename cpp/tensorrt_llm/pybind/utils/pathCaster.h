@@ -22,6 +22,7 @@
 #include "pybind11/detail/descr.h"
 #include "pybind11/pybind11.h"
 #include "pybind11/pytypes.h"
+#include "tensorrt_llm/pybind/common/opaqueBindings.h"
 #include <filesystem>
 
 namespace PYBIND11_NAMESPACE
