@@ -67,14 +67,14 @@ def get_weight(params: Dict[str, torch.Tensor], prefix: str,
                dtype: torch.dtype) -> torch.Tensor:
     if f'{prefix}.weight' not in params:
         return None
-    return params[f'{prefix}.weight'].to(dtype).detach().cpu()
+    return params[f'{prefix}.weight'].to(dtype).detach().cpu().contiguous()
 
 
 def get_bias(params: Dict[str, torch.Tensor], prefix: str,
              dtype: torch.dtype) -> torch.Tensor:
     if f'{prefix}.bias' not in params:
         return None
-    return params[f'{prefix}.bias'].to(dtype).detach().cpu()
+    return params[f'{prefix}.bias'].to(dtype).detach().cpu().contiguous()
 
 
 def get_weight_and_bias(params: Dict[str, torch.Tensor], prefix: str,
@@ -248,6 +248,7 @@ DEFAULT_HF_DATASET_META = {
     'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
     'cnn_dailymail': ('3.0.0', 'train', 'article'),
     'lambada': (None, 'validation', 'text'),
+    '': (None, 'train', 'text'),  # Default value in HF
 }
 
 

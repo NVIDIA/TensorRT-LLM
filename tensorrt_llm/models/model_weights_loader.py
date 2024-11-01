@@ -8,6 +8,7 @@ from typing import Callable, List
 import torch
 from safetensors import safe_open
 from tqdm import tqdm
+from transformers import PreTrainedModel
 
 from .._utils import trt_dtype_to_torch
 from ..layers.moe import MOEWeightWrapper
@@ -17,6 +18,7 @@ from ..quantization.layers import (WeightOnlyGroupwiseQuantColumnLinear,
 
 
 class ModelWeightsFormat(Enum):
+    IN_MEMORY = "in_mem"
     SAFETENSORS = "safetensors"
     BINARY = "bin"
     PYTORCH = "pth"
@@ -69,7 +71,7 @@ class ModelWeightsLoader:
         """Translate TRT-LLM key into HF key or HF key list (e.g. QKV/MoE/GPTQ)
 
         tllm_key will get translated into HF format section by section.
-        If one section is responeded with multiple hf_keys in a list, \
+        If one section is responded with multiple hf_keys in a list, \
         the translated keys will also get multiplied accordingly.
         tllm_key : "transformer.layers.0.attention.  qkv .weight"
                           |        |   |     |        |     |
@@ -135,9 +137,13 @@ class ModelWeightsLoader:
             else:
                 raise NotImplementedError(
                     "Only safetensors/pickle/binary directories are supported.")
+        elif isinstance(self.model_dir, dict) or isinstance(
+                self.model_dir, PreTrainedModel):
+            self.format = ModelWeightsFormat.IN_MEMORY
         else:
             raise NotImplementedError(
-                "args.model_dir is Neither a directory nor a file!")
+                "args.model_dir is not a directory, a file or an in-memory module!"
+            )
 
     def preload(self):
         # Initialize shards and load_func
@@ -145,9 +151,14 @@ class ModelWeightsLoader:
             shard_files = glob.glob(self.model_dir + "/*." + self.format.value)
         elif os.path.isfile(self.model_dir):
             shard_files = [self.model_dir]
+        elif isinstance(self.model_dir, dict):
+            shard_files = [self.model_dir]
+        elif isinstance(self.model_dir, PreTrainedModel):
+            shard_files = [dict(self.model_dir.named_parameters())]
         else:
             raise NotImplementedError(
-                "args.model_dir is Neither a directory nor a file!")
+                "args.model_dir is not a directory, a file or an in-memory module!"
+            )
         shard_files.sort()
         if self.format == ModelWeightsFormat.SAFETENSORS:
             self.shards = [
@@ -158,6 +169,8 @@ class ModelWeightsLoader:
                 torch.load(f, weights_only=True, map_location="cpu", mmap=True)
                 for f in shard_files
             ]
+        elif self.format == ModelWeightsFormat.IN_MEMORY:
+            self.shards = [shard_files[0]]
         else:
             raise NotImplementedError(
                 "Only *.safetensors/*.pth/*.bin files are supported.")
@@ -177,7 +190,7 @@ class ModelWeightsLoader:
             if tensor_shape == []:
                 tensor = self.shards[ptr_idx].get_tensor(key).unsqueeze(0)
                 tensor_shape = tensor.shape
-        elif self.format == ModelWeightsFormat.BINARY or self.format == ModelWeightsFormat.PYTORCH:
+        else:
             tensor = self.shards[ptr_idx][key]
             tensor_shape = tensor.shape
 
@@ -244,6 +257,11 @@ class ModelWeightsLoader:
             elif tllm_key.endswith("weight"):
                 tp_dim = 1 - tp_dim
         tp_size = sub_module.tp_size if hasattr(sub_module, "tp_size") else 1
+        # Disable auto TP when num_kv_heads is invalid for split
+        if getattr(sub_module, "is_qkv",
+                   False) and self.model.config.num_key_value_heads < tp_size:
+            tp_dim = -1
+            tp_size = 1
         if skip_tp:
             tp_dim = -1
             tp_size = 1
@@ -287,23 +305,49 @@ class ModelWeightsLoader:
 
         return weight_dict
 
-    def check_share_embedding(self):
+    def check_share_embedding(self, config):
+        # TODO: Remove after --use_share_embedding is removed
+        if not config.share_embedding_table:
+            return
+
+        from ..logger import logger
         lm_head_weights = self.load_tensor(
             self.translate_to_external_key("lm_head.weight",
                                            self.tllm_to_externel_key_dict))
         vocab_embed_weights = self.load_tensor(
             self.translate_to_external_key("transformer.vocab_embedding.weight",
                                            self.tllm_to_externel_key_dict))
+        share_embedding_table = False
         if lm_head_weights is not None and vocab_embed_weights is not None:
             if lm_head_weights.shape == vocab_embed_weights.shape:
                 if not (lm_head_weights - vocab_embed_weights).any():
-                    return True
-        from ..logger import logger
-        logger.warning(
-            "lm_head.weight and transformer.vocab_embedding.weight are not identical, "
-            "share_embedding_table cannot be enabled; setting share_embedding_table=False."
-        )
-        return False
+                    share_embedding_table = True
+        elif lm_head_weights is None and vocab_embed_weights is not None:
+            self.tllm_to_externel_key_dict[
+                'lm_head'] = self.tllm_to_externel_key_dict[
+                    'transformer'] + '.' + self.tllm_to_externel_key_dict[
+                        'vocab_embedding']
+            share_embedding_table = True
+        elif lm_head_weights is not None and vocab_embed_weights is None:
+            self.tllm_to_externel_key_dict[
+                'vocab_embedding'] = self.tllm_to_externel_key_dict['lm_head']
+            share_embedding_table = True
+
+        # Validation
+        mapping = config.mapping
+        if mapping.tp_size > 1:
+            if (not config.use_parallel_embedding) or (
+                    config.use_parallel_embedding
+                    and config.embedding_sharding_dim == 1):
+                share_embedding_table = False
+        if mapping.pp_size > 1:
+            share_embedding_table = False
+        if mapping.cp_size > 1:
+            share_embedding_table = False
+        config.share_embedding_table = share_embedding_table
+
+        if config.share_embedding_table:
+            logger.info("share_embedding_table enabled.")
 
     def update_key_mapping(self, model):
         self.model = weakref.ref(model)()
@@ -312,10 +356,17 @@ class ModelWeightsLoader:
         if config.mapping.has_pp():
             pp_layers = config.mapping.pp_layers(config.num_hidden_layers)
             self.tllm_to_externel_key_dict.update({
-                str(tllm_locl_layer_idx): str(hf_global_layer_idx)
-                for tllm_locl_layer_idx, hf_global_layer_idx in enumerate(
+                str(tllm_local_layer_idx): str(hf_global_layer_idx)
+                for tllm_local_layer_idx, hf_global_layer_idx in enumerate(
                     pp_layers)
             })
+
+        # Share embedding
+        if self.tllm_to_externel_key_dict[
+                'vocab_embedding'] == self.tllm_to_externel_key_dict['lm_head']:
+            self.model.transformer.vocab_embedding.tllm_to_externel_key_dict = {
+                self.tllm_to_externel_key_dict['transformer']: '',
+            }
 
     def fill(self, weights):
         for tllm_key, param in self.model.named_parameters():

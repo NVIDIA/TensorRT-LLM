@@ -13,8 +13,8 @@ from multiprocessing.connection import Client, Listener
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from queue import Queue
-from typing import (Any, Dict, Generator, List, NamedTuple, Optional, Tuple,
-                    Union)
+from typing import (Any, Dict, Generator, List, Literal, NamedTuple, Optional,
+                    Tuple, Union)
 
 import numpy as np
 import torch
@@ -25,7 +25,8 @@ from .builder import ConfigEncoder, Engine, EngineConfig
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
-from .hlapi.utils import ManagedThread, SamplingParams
+from .hlapi.utils import (ManagedThread, SamplingParams, enable_llm_debug,
+                          print_colored)
 from .lora_manager import LoraManager
 from .runtime import ModelConfig
 from .runtime.model_runner import _engine_config_to_model_config
@@ -37,6 +38,14 @@ def has_event_loop() -> bool:
     except RuntimeError:
         return False
     return True
+
+
+if enable_llm_debug():
+    print_colored("LLM debug mode enabled.", "yellow")
+
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGINT, all_threads=True)
 
 
 @dataclass(slots=True)
@@ -99,6 +108,8 @@ class CompletionOutput:
         token_ids (List[int]): The token ids of the generated output text.
         cumulative_logprob (float): The cumulative log probability of the generated output text.
         logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested.
+        finish_reason (Literal['stop', 'length']): The reason why the sequence is finished.
+        stop_reason (Union[int, str]): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason.
         generation_logits (torch.Tensor): The logits on the generated output token ids.
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
@@ -110,8 +121,9 @@ class CompletionOutput:
     token_ids: List[int] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
     logprobs: List[float] = field(default_factory=list)
+    finish_reason: Optional[Literal['stop', 'length']] = None
+    stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
-
     _last_text: str = field(default="", init=False, repr=False)
     _last_logprobs_len: int = field(default=0, init=False, repr=False)
     _last_token_ids_len: int = field(default=0, init=False, repr=False)
@@ -212,6 +224,10 @@ class CppExecutorError(RuntimeError):
         return f"{self.message}\nStack trace:\n{self.stack_trace}"
 
 
+class RequestError(RuntimeError):
+    ''' The error raised when the request is failed. '''
+
+
 class GenerationResult:
     '''
     The result of a generation request. It can be used to wait for the completion of the request.
@@ -265,13 +281,11 @@ class GenerationResult:
 
     def handle_response(self, response: "GenerationExecutor.Response"):
 
-        if response.error:
-            if isinstance(response.error, Exception):
-                raise response.error
-            else:
-                raise CppExecutorError(response.error)
-
         self._done = response.is_final
+
+        if response.error:
+            assert isinstance(response.error, str)
+            raise RequestError(response.error)
 
         tensors = response.tensors
 
@@ -286,14 +300,23 @@ class GenerationResult:
                 self.outputs[i].generation_logits = tensors.generation_logits[
                     i, :self.outputs[i].length]
 
-        if self.finished and not self._generation_request.sampling_params.include_stop_str_in_output:
-            for beam_output in self.outputs:
-                for stop_ids in self._generation_request.sampling_params._get_stop_words(
-                ):
-                    if beam_output.token_ids[-len(stop_ids):] == stop_ids:
-                        beam_output.token_ids = beam_output.token_ids[:-len(
-                            stop_ids)]
-                        break
+        if self.finished:
+            for i, beam_output in enumerate(self.outputs):
+                if response.finish_reasons[i] == tllm.FinishReason.END_ID:
+                    beam_output.finish_reason = 'stop'
+                elif response.finish_reasons[i] == tllm.FinishReason.STOP_WORDS:
+                    beam_output.finish_reason = 'stop'
+                    sampling_params = self._generation_request.sampling_params
+                    for stop_reason, stop_ids in sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if beam_output.token_ids[-len(stop_ids):] == stop_ids:
+                            beam_output.stop_reason = stop_reason
+                            if not sampling_params.include_stop_str_in_output:
+                                beam_output.token_ids = beam_output.token_ids[:-len(
+                                    stop_ids)]
+                            break
+                elif response.finish_reasons[i] == tllm.FinishReason.LENGTH:
+                    beam_output.finish_reason = 'length'
 
         if tensors.context_logits is not None:
             self.context_logits = tensors.context_logits
@@ -401,6 +424,7 @@ class GenerationExecutor(ABC):
         """ The response from the cpp-executor to the Python main thread. """
         request_id: int
         tensors: Optional["GenerationExecutor.ResponseTensors"]
+        finish_reasons: Optional[List[tllm.FinishReason]]
         is_final: Optional[bool]
         # error is either str from cpp-executor or a Exception from Python threads/processes
         error: Optional[str | Exception]
@@ -422,6 +446,9 @@ class GenerationExecutor(ABC):
         # mapping of pending request_id -> response
         self._pending_responses: Dict[
             int, List[GenerationExecutor.PendingResponse]] = {}
+
+        # A flag to avoid calling shutdown() recursively. This happens when the background threads raise errors.
+        self.doing_shutdown = False
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -492,6 +519,7 @@ class GenerationExecutor(ABC):
         # more than one error.
         if not self._error_queue.empty():
             e = self._error_queue.get()
+            self._error_queue.task_done()
             self.shutdown()
             # We can catch some exceptions here.
             raise e
@@ -627,14 +655,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
             engine = engine[self.rank]
 
         if isinstance(engine, Engine):
-            engine.regularize_managed_weights()
             self.engine = tllm.Executor(engine.engine,
                                         json.dumps(engine.config.to_dict(),
                                                    cls=ConfigEncoder),
                                         tllm.ModelType.DECODER_ONLY,
                                         executor_config=executor_config,
-                                        managed_weights=engine.managed_weights
-                                        or {})
+                                        managed_weights=engine.managed_weights)
         else:
             self.engine = tllm.Executor(engine,
                                         tllm.ModelType.DECODER_ONLY,
@@ -703,28 +729,44 @@ class ExecutorBindingsWorker(GenerationExecutor):
         ) and not self.dispatch_stats_thread.is_alive():
             self.dispatch_stats_thread.start()
 
+    def _engine_response_callback(self, response: tllm.Response):
+        return response
+
     def await_response_task(self) -> bool:
         # Get responses and place in queue.
 
         for response in self.engine.await_responses(timeout=datetime.timedelta(
                 milliseconds=100)):
+            response = self._engine_response_callback(response)
+
             req_id = response.request_id
             if response.has_error():
-                rsp = self.Response(req_id,
-                                    tensors=None,
-                                    is_final=None,
-                                    error=response.error_msg)
+                # This error will be dispatched to the user's generate_async for the corresponding request. It won't
+                # stop the whole service.
+                rsp = self.Response(
+                    req_id,
+                    tensors=None,
+                    # Note: error Response only has one finish reason.
+                    # Since the error will be raised in the main thread, so the finish reason is not actually used.
+                    finish_reasons=[tllm.FinishReason.NOT_FINISHED],
+                    is_final=True,
+                    error=response.error_msg)
+
             else:
                 tensors = self.ResponseTensors(
-                    response.result.output_token_ids,
-                    response.result.context_logits,
-                    response.result.generation_logits,
-                    response.result.log_probs, response.result.cum_log_probs)
+                    output_token_ids=response.result.output_token_ids,
+                    context_logits=response.result.context_logits,
+                    generation_logits=response.result.generation_logits,
+                    log_probs=response.result.log_probs,
+                    cum_log_probs=response.result.cum_log_probs,
+                )
 
-                rsp = self.Response(req_id,
-                                    tensors,
-                                    is_final=response.result.is_final,
-                                    error=None)
+                rsp = self.Response(
+                    req_id,
+                    tensors,
+                    finish_reasons=response.result.finish_reasons,
+                    is_final=response.result.is_final,
+                    error=None)
 
             if self._to_delay_response(rsp):
                 continue
@@ -732,18 +774,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
             self._cleanup_pending_responses(nowait=True)
 
             queue = self.return_queue(req_id)
-            bck_error = self._error_queue.get_nowait(
-            ) if not self._error_queue.empty() else None
-
-            if bck_error is not None:
-                rsp = self.Response(req_id,
-                                    tensors=None,
-                                    is_final=None,
-                                    error=bck_error)
-
             queue.put(rsp)
 
-            if response.result.is_final:
+            if rsp.is_final:
                 self._results.pop(req_id)
 
         return True  # success
@@ -788,27 +821,31 @@ class ExecutorBindingsWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        executor_request = tllm.Request(
-            input_token_ids=request.prompt_token_ids,
-            max_tokens=request.sampling_params.max_tokens,
-            max_new_tokens=request.sampling_params.max_new_tokens,
-            streaming=request.streaming,
-            sampling_config=request.sampling_params._get_sampling_config(),
-            end_id=request.sampling_params.end_id,
-            pad_id=request.sampling_params.pad_id,
-            output_config=request.sampling_params._get_output_config(),
-            bad_words=request.sampling_params._get_bad_words(),
-            stop_words=request.sampling_params._get_stop_words(),
-            embedding_bias=request.sampling_params.embedding_bias,
-            external_draft_tokens_config=request.sampling_params.
-            external_draft_tokens_config,
-            prompt_tuning_config=request.sampling_params.prompt_tuning_config,
-            lora_config=lora_config,
-            logits_post_processor_name=request.sampling_params.
-            logits_post_processor_name,
-        )
-        req_id = self.engine.enqueue_request(executor_request)
-        return req_id
+        try:
+            executor_request = tllm.Request(
+                input_token_ids=request.prompt_token_ids,
+                max_tokens=request.sampling_params.max_tokens,
+                max_new_tokens=request.sampling_params.max_new_tokens,
+                streaming=request.streaming,
+                sampling_config=request.sampling_params._get_sampling_config(),
+                end_id=request.sampling_params.end_id,
+                pad_id=request.sampling_params.pad_id,
+                output_config=request.sampling_params._get_output_config(),
+                bad_words=request.sampling_params._get_bad_words(),
+                stop_words=request.sampling_params._get_stop_words(),
+                embedding_bias=request.sampling_params.embedding_bias,
+                external_draft_tokens_config=request.sampling_params.
+                external_draft_tokens_config,
+                prompt_tuning_config=request.sampling_params.
+                prompt_tuning_config,
+                lora_config=lora_config,
+                logits_post_processor_name=request.sampling_params.
+                logits_post_processor_name,
+            )
+            req_id = self.engine.enqueue_request(executor_request)
+            return req_id
+        except Exception as e:
+            raise RequestError(str(e))
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
@@ -832,17 +869,27 @@ class ExecutorBindingsWorker(GenerationExecutor):
         return result
 
     def shutdown(self):
-        if self.engine is not None:
-            self.await_response_thread.stop()
-            self.dispatch_stats_thread.stop()
+        if enable_llm_debug():
+            print_colored('Proxy.shutdown...\n', "yellow")
+            print(traceback.extract_stack())
 
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        if self.engine is not None:
             if self.engine.can_enqueue_requests():
+
                 if self.await_response_thread.is_alive():
+                    self.await_response_thread.stop()
                     self.await_response_thread.join()
                 if self.dispatch_stats_thread.is_alive():
+                    self.dispatch_stats_thread.stop()
                     self.dispatch_stats_thread.join()
 
-            self.engine.shutdown()
+                self.engine.shutdown()
+
             self.engine = None
 
         # Check if there are any errors from the threads before shutdown.
@@ -900,6 +947,7 @@ class IpcQueue:
         self.host_port, self.authkey = (address[0], address[1]), address[2]
         self.is_server = is_server
         self.conn = None
+        self.listener: Optional[Listener] = None
         if is_server:
             self.listener = Listener(self.host_port,
                                      'AF_INET',
@@ -917,8 +965,11 @@ class IpcQueue:
 
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self._store_tensors_in_shmm(obj.tensors)
-            obj = GenerationExecutor.Response(obj.request_id, tensors,
-                                              obj.is_final, obj.error)
+            obj = GenerationExecutor.Response(request_id=obj.request_id,
+                                              tensors=tensors,
+                                              finish_reasons=obj.finish_reasons,
+                                              is_final=obj.is_final,
+                                              error=obj.error)
 
         self.conn.send(obj)
 
@@ -929,8 +980,11 @@ class IpcQueue:
         obj = self.conn.recv()
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self._load_tensors_from_shmm(obj.tensors)
-            obj = GenerationExecutor.Response(obj.request_id, tensors,
-                                              obj.is_final, obj.error)
+            obj = GenerationExecutor.Response(request_id=obj.request_id,
+                                              tensors=tensors,
+                                              finish_reasons=obj.finish_reasons,
+                                              is_final=obj.is_final,
+                                              error=obj.error)
         return obj
 
     def _store_tensors_in_shmm(
@@ -985,11 +1039,16 @@ class IpcQueue:
     def address(self) -> Tuple[str, int, bytes]:
         return (self.host_port[0], self.host_port[1], self.authkey)
 
-    def __del__(self):
+    def close(self):
         if self.conn is not None:
             self.conn.close()
-        if self.is_server:
+            self.conn = None
+        if self.listener is not None:
             self.listener.close()
+            self.listener = None
+
+    def __del__(self):
+        self.close()
 
 
 class ExecutorBindingsProxy(GenerationExecutor):
@@ -1007,7 +1066,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.request_queue = IpcQueue(is_server=True)
         # Return request id back to dispatcher
-        self.request_id_queue = IpcQueue(is_server=True)
+        self.rid_or_err_queue = IpcQueue(is_server=True)
         self.result_queue = IpcQueue(is_server=True)
         self.mp_stats_queue = IpcQueue(is_server=True)
 
@@ -1024,8 +1083,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.workers_kwargs.update({
             "request_queue_addr":
             self.request_queue.address,
-            "request_id_queue_addr":
-            self.request_id_queue.address,
+            "rid_or_err_queue_addr":
+            self.rid_or_err_queue.address,
             "result_queue_addr":
             self.result_queue.address,
             "stats_queue_addr":
@@ -1044,7 +1103,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
     @staticmethod
     def workers_main(engine: Union[Path, Engine],
                      request_queue_addr: Tuple[str, int, bytes],
-                     request_id_queue_addr: Tuple[str, int, bytes],
+                     rid_or_err_queue_addr: Tuple[str, int, bytes],
                      result_queue_addr: Tuple[str, int, bytes],
                      stats_queue_addr: Tuple[str, int, bytes],
                      executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(
@@ -1054,7 +1113,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         if mpi_rank() == 0:
             request_queue = IpcQueue(request_queue_addr, is_server=False)
-            request_id_queue = IpcQueue(request_id_queue_addr, is_server=False)
+            rid_or_err_queue = IpcQueue(rid_or_err_queue_addr, is_server=False)
             result_queue = IpcQueue(result_queue_addr, is_server=False)
             mp_stats_queue = IpcQueue(stats_queue_addr, is_server=False)
 
@@ -1077,9 +1136,11 @@ class ExecutorBindingsProxy(GenerationExecutor):
                     executor.set_result_queue(result_queue)
                     executor.set_stats_queue(mp_stats_queue)
                     while (req := request_queue.get()) is not None:
-                        result = executor.submit(req)
-                        request_id_queue.put(result.request_id)
-
+                        try:
+                            result = executor.submit(req)
+                            rid_or_err_queue.put(result.request_id)
+                        except RequestError as e:
+                            rid_or_err_queue.put(e)
                     notify_proxy_threads_to_quit()
 
             except ExecutorBindingsWorker.WorkerExit as e:
@@ -1088,8 +1149,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
             except Exception as e:  # other critical errors
                 if mpi_rank() == 0:
                     notify_proxy_threads_to_quit()
-
-                raise CppExecutorError(f"Failed during generation: {e}") from e
+                err = CppExecutorError(f"Failed during generation: {e}")
+                if mpi_rank() == 0:
+                    rid_or_err_queue.put(err)
 
     def dispatch_result_task(self) -> bool:
         # process the remaining pending req_ids before getting the next response, since the queue.get will block, we'd
@@ -1141,9 +1203,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
     def start(self):
 
         def mpi_done_callback(future: concurrent.futures.Future):
-            try:
-                future.result()
-            except:
+            # This is called when the MPI worker is done, so future.exception() will not block.
+            if future.exception() is not None:
                 self._error_queue.put_nowait(future.exception())
 
         self.mpi_futures = self.mpi_session.submit(
@@ -1162,14 +1223,28 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._handle_background_error()
 
     def shutdown(self):
+        if enable_llm_debug():
+            print_colored('Proxy.shutdown...\n', "yellow")
+            print_colored(str(traceback.extract_stack()), "yellow")
         if not self.workers_started:
             return
 
-        self.request_queue.put(None)  # Tell the rank0 worker to quit
+        if self.doing_shutdown:
+            return
+        else:
+            self.doing_shutdown = True
+
+        # step1: notify the workers to quit
+        self.request_queue.put(None)
 
         for f in self.mpi_futures:
-            f.result()
+            try:
+                f.result()
+            except:
+                # The errors are already captured in mpi_done_callback, ignored here
+                pass
 
+        # step2: notify the background threads to quit
         if self.dispatch_result_thread.is_alive():
             self.dispatch_result_thread.stop()
             self.dispatch_result_thread.join()
@@ -1177,8 +1252,16 @@ class ExecutorBindingsProxy(GenerationExecutor):
             self.dispatch_stats_thread.stop()
             self.dispatch_stats_thread.join()
 
+        # step3: finish all remaining work
+
         # It is possible that some requests are still pending in the workers, we need to process them before shutdown
         self._cleanup_pending_responses(nowait=False)
+
+        # close all the sockets
+        self.request_queue.close()
+        self.rid_or_err_queue.close()
+        self.result_queue.close()
+        self.mp_stats_queue.close()
 
         self.workers_started = False
 
@@ -1195,12 +1278,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.request_queue.put(request)
 
-        req_id = self.request_id_queue.get()
-        request.set_id(req_id)
+        rid_or_err = self.rid_or_err_queue.get()
+        if isinstance(rid_or_err, Exception):
+            raise rid_or_err
+        request.set_id(rid_or_err)
 
         result = GenerationResult(
             request, background_error_handler=self._handle_background_error)
-        self._results[req_id] = result
+        self._results[rid_or_err] = result
 
         self._handle_background_error()
 
@@ -1214,4 +1299,4 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
-        return False
+        return False  # propagate the exception

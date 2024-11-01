@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/namedTensor.h"
+#include "tensorrt_llm/pybind/common/opaqueBindings.h"
 
 #include <ATen/ATen.h>
 

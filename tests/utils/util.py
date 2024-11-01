@@ -1,6 +1,7 @@
 import os
 import unittest
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import pytest
 import tensorrt as trt
@@ -199,7 +200,6 @@ def create_session(builder,
                    precision="float32",
                    int8=False,
                    fp8=False,
-                   opt_level=None,
                    memory_pool_limit=None,
                    optimization_profiles=[],
                    quant_mode=QuantMode(0)):
@@ -208,14 +208,13 @@ def create_session(builder,
     Args:
         network: a tensorrt_llm.Network object
         precision: the precision of the network, choose from ["float32", "float16", "bfloat16"]
-        **kwargs: builder flags such as int8, fp8, builder_opt, etc.
+        **kwargs: builder flags such as int8, fp8, etc.
     Returns:
         session: a tensorrt_llm.runtime.Session
     """
     builder_config = builder.create_builder_config(precision=precision,
                                                    int8=int8,
                                                    fp8=fp8,
-                                                   opt_level=opt_level,
                                                    quant_mode=quant_mode)
     # Some tests require to set mem pool limit to avoid OOM
     if memory_pool_limit is not None:
@@ -279,3 +278,8 @@ def similarity_score(a, b):
 def similar(a, b, threshold=0.8):
     "similar compare a and b "
     return similarity_score(a, b) >= threshold
+
+
+def get_project_root(test_file: str) -> Path:
+    return next(p for p in Path(test_file).resolve().parents
+                if (p / 'tests').is_dir() and (p / "tensorrt_llm").is_dir())

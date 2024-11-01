@@ -1,40 +1,10 @@
 import json
-import sys
 from functools import partial
-from pathlib import Path
-from select import select
 from typing import List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses import DatasetMetadata, InferenceRequest
-
-
-def generate_dataset_from_stream(dataset_path: Path,
-                                 model: str,
-                                 num_requests: int = 0):
-    # Check for data on stdin.
-    data_on_stdin: bool = bool(len(select([
-        sys.stdin,
-    ], [], [], 0.0)[0]))
-
-    # Cannot set the data file path and pipe in from stdin. Choose one.
-    if dataset_path is not None and data_on_stdin:
-        raise ValueError(
-            "Cannot provide a dataset on both stdin and by --dataset option. "
-            "Please pick one.")
-    # If we are receiving data from a path or stdin, parse and gather metadata.
-    stream = sys.stdin if data_on_stdin else open(dataset_path, "r")
-    tokenizer = initialize_tokenizer(model)
-    # Parse the dataset from stdin and return it plus its metadata.
-    metadata, requests = \
-        create_dataset_from_stream(
-            tokenizer,
-            stream=stream,
-            num_requests=num_requests
-        )
-
-    return metadata, requests
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -58,20 +28,23 @@ def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
 
 def create_dataset_from_stream(
     tokenizer: PreTrainedTokenizer,
+    stream: TextIO,
     max_input_length: int = 0,
     max_output_length: int = 0,
-    stream: TextIO = sys.stdin,
     num_requests: int = 0,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:
     """Generate metadata and a list of requests to drive benchmarking.
 
     Args:
         tokenizer (PreTrainedTokenizer): HuggingFace tokenizer.
-        max_input_length (int): Maximum input length to cap prompts to.
+        stream (TextIO): Stream of input requests.
+        max_input_length (int, optional): Maximum input length to cap prompts to. Defaults to 0.
+        max_output_length (int, optional): Maximum output length to cap prompts to.. Defaults to 0.
+        num_requests (int, optional): Number of requests to limit to. Defaults to 0.
 
     Returns:
-        DatasetMetadata: Dataclass of dataset statistics.
-        List[InferenceRequest]: A list of inference requests for benchmarking.
+        Tuple[DatasetMetadata, List[InferenceRequest]]: A tuple containing a dataclass of dataset
+        statistics and a list of inference requests for benchmarking.
     """
     # Initialize dataset list, and metadata tracking variables.
     dataset = []

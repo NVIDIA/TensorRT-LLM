@@ -34,7 +34,7 @@ class TopKSamplingLayerTest : public BaseSamplingLayerTest<T>
     void initLayer(TestSamplingParams const& params) override
     {
         auto const decodingDomain
-            = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
+            = tensorrt_llm::layers::DecoderDomain(this->maxBatchSize(), 1, this->mVocabSize, this->mVocabSizePadded);
         this->mSamplingLayer
             = std::make_shared<tensorrt_llm::layers::TopKSamplingLayer<T>>(decodingDomain, this->mBufferManager);
     }

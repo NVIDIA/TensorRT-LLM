@@ -211,6 +211,7 @@ class TestMistral(unittest.TestCase):
         mistral_config.max_position_embeddings = 64
         mistral_config.vocab_size = 128
         mistral_config.num_attention_heads = 2 * num_kv_heads
+        mistral_config.head_dim = head_size
         mistral_config.hidden_size = mistral_config.num_attention_heads * head_size
         mistral_config.intermediate_size = ((
             (mistral_config.hidden_size * 4 * 2 // 3) + head_size - 1) //
@@ -222,7 +223,7 @@ class TestMistral(unittest.TestCase):
         mistral_config.eos_token_id = self.EOS_TOKEN
         seed_idx = random.randint(0, len(PRECHECKED_GOOD_RANDOM_SEEDS) - 1)
         torch.manual_seed(PRECHECKED_GOOD_RANDOM_SEEDS[seed_idx])
-        hf_mistral = MistralForCausalLM(mistral_config).cuda()
+        hf_mistral = MistralForCausalLM(mistral_config).cuda().eval()
         runtime, _ = self._gen_tensorrt_llm_runtime(
             log_level, dtype, world_size, rank, mistral_config, hf_mistral,
             model, use_plugin, batch_size, beam_width, input_len, output_len,

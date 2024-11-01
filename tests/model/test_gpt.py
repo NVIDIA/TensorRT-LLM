@@ -38,11 +38,15 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
-from tensorrt_llm.runtime.kv_cache_manager import (GenerationSequence,
-                                                   KVCacheManager)
+from tensorrt_llm.runtime.kv_cache_manager import GenerationSequence
+from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
+    PoolsKVCacheManager
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+
+from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
+    MemoryPoolsAllocator
 
 
 class TestGPT(unittest.TestCase):
@@ -513,27 +517,50 @@ class TestGPT(unittest.TestCase):
         if enable_paged_kv_cache:
             max_blocks_per_seq = math.ceil(total_length / tokens_per_block)
             num_blocks = batch_size * beam_width * max_blocks_per_seq
-            block_size = gpt_config.n_head * tokens_per_block * head_size
-            kv_cache_manager = KVCacheManager(
-                num_layers=gpt_config.n_layer,
+
+            memory_pools_allocator = MemoryPoolsAllocator(
                 num_blocks=num_blocks,
-                block_size=block_size,
                 tokens_per_block=tokens_per_block,
-                max_blocks_per_seq=max_blocks_per_seq,
+                head_size=head_size)
+            num_kv_heads_per_layer = MemoryPoolsAllocator.prepare_num_kv_heads_per_layer(
+                gpt_config.n_head, gpt_config.n_layer)
+            memory_pools_allocator.allocate(dtype, num_kv_heads_per_layer)
+            pools_kv_cache_manager = PoolsKVCacheManager(
+                memory_pools_allocator.pools_metadata,
+                max_blocks_per_seq,
+                num_blocks,
+                tokens_per_block,
+                head_size,
                 max_attention_window_size=total_length,
-                sink_token_len=0,
-                beam_width=beam_width)
-            host_kv_cache_pool_pointers = torch.tensor(
-                [key_value_cache_buffers[0].data_ptr(), 0], dtype=torch.int64)
+                beam_width=beam_width,
+                sink_token_len=0)
+
+            host_kv_cache_pool_pointers = memory_pools_allocator.get_kv_cache_pool_pointers(
+            )
+            host_kv_cache_pool_mapping = memory_pools_allocator.pool_mapping
+
+            # block_size = gpt_config.n_head * tokens_per_block * head_size
+            # kv_cache_manager = KVCacheManager(
+            #     num_layers=gpt_config.n_layer,
+            #     num_blocks=num_blocks,
+            #     block_size=block_size,
+            #     tokens_per_block=tokens_per_block,
+            #     max_blocks_per_seq=max_blocks_per_seq,
+            #     max_attention_window_size=total_length,
+            #     sink_token_len=0,
+            #     beam_width=beam_width)
+            # host_kv_cache_pool_pointers = torch.tensor(
+            # [key_value_cache_buffers[0].data_ptr(), 0], dtype=torch.int64)
 
             # Add sequences to the manager
             for bi in range(batch_size):
                 generation_sequence = GenerationSequence(seq_idx=bi,
                                                          batch_idx=bi)
-                kv_cache_manager.add_sequence(generation_sequence, seq_len)
+                pools_kv_cache_manager.add_sequence(generation_sequence,
+                                                    seq_len)
 
             # Pre allocate the kv cache for the generated tokens.
-            kv_cache_manager.step([False] * batch_size)
+            pools_kv_cache_manager.step([False] * batch_size)
 
         def run_engine(context,
                        input_ids,
@@ -570,7 +597,7 @@ class TestGPT(unittest.TestCase):
             if enable_paged_kv_cache:
                 assert beam_width == 1
                 # for beam_width > 1 the argument must be '1' in ctx phase and 'beam_width' in gen phase
-                host_kv_cache_block_offsets = kv_cache_manager.get_block_offsets(
+                host_kv_cache_block_offsets = pools_kv_cache_manager.get_block_offsets(
                     beam_width=1)
                 kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
 
@@ -585,6 +612,10 @@ class TestGPT(unittest.TestCase):
                 ctx_buffer[
                     f'host_kv_cache_pool_pointers'] = host_kv_cache_pool_pointers.contiguous(
                     )
+                ctx_buffer[
+                    f'host_kv_cache_pool_mapping'] = memory_pools_allocator.pool_mapping.contiguous(
+                    )
+
                 ctx_buffer[
                     f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
             else:

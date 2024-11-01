@@ -6,8 +6,10 @@ def main():
     # model could accept HF model name or a path to local HF model.
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        # Distributed settings
-        tensor_parallel_size=2,
+        # Enable 2-way tensor parallelism
+        tensor_parallel_size=2
+        # Enable 2-way pipeline parallelism if needed
+        # pipeline_parallel_size=2
     )
 
     # Sample prompts.

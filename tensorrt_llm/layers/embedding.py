@@ -90,15 +90,10 @@ class Embedding(Module):
         param.value = loaded_weight
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        config = kwargs.get("config", None)
         if weights is None:
             return {}
         weights = weights.to(str_dtype_to_torch(self.dtype))
-        if config.share_embedding_table:
-            return {}
-        else:
-            weights = weights.clone()
-            return {tllm_key: weights}
+        return {tllm_key: weights}
 
 
 class PromptTuningEmbedding(Embedding):
@@ -133,7 +128,7 @@ class PromptTuningEmbedding(Embedding):
 
         Parameters:
             tokens : Tensor
-                the ids to embbed, size [batch_size, seq_len]
+                the ids to embed, size [batch_size, seq_len]
 
             prompt_embedding_table : Tensor
                 the additional embedding table for prompt-tuned tokens, size [num_tasks * num_tokens_per_task, hidden_size]

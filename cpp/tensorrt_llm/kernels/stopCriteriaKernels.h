@@ -73,7 +73,7 @@ void invokeLengthCriterion(FinishedState* finished, runtime::SizeType32* finishe
     runtime::SizeType32* numNewTokens, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
     runtime::SizeType32 beamWidth, cudaStream_t stream);
 
-//! \brief Sets finished states based on the endIds and ajusts sequence length to length before the first EOS token.
+//! \brief Sets finished states based on the endIds and adjusts sequence length to length before the first EOS token.
 //! Does not support beamWidth > 1 for now.
 //!
 //! \param outputIds input buffer [maxBatchSize][beamWidth, maxSeqLen].

@@ -12,20 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import tensorrt as trt
+from transformers import AutoModelForCausalLM
 
 from ..._common import default_net
 from ..._utils import str_dtype_to_trt
 from ...functional import (Tensor, arange, cast, concat, expand,
                            gather_last_token_logits, shape, unsqueeze)
 from ...layers import ColumnLinear, Embedding, LayerNorm, Mamba, Mamba2, RmsNorm
+from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ...plugin import current_all_reduce_helper
 from ..generation_mixin import GenerationMixin
-from ..modeling_utils import PretrainedConfig, PretrainedModel
+from ..modeling_utils import PretrainedConfig, PretrainedModel, QuantConfig
+from .config import MambaConfig
+from .convert import convert_from_hf_checkpoint, convert_hf_mamba
 
 
 class MambaLayer(Module):
@@ -168,6 +173,7 @@ class MambaModel(Module):
 
 
 class MambaForCausalLM(PretrainedModel):
+    config_class = MambaConfig
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
@@ -425,3 +431,42 @@ class MambaForCausalLM(PretrainedModel):
             return_dict['slot_mapping'] = slot_mapping
 
         return return_dict
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        import transformers
+
+        assert hf_model_or_dir is not None
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+        config = MambaConfig.from_hugging_face(hf_config_or_dir,
+                                               dtype=dtype,
+                                               mapping=mapping,
+                                               quant_config=quant_config,
+                                               **kwargs)
+
+        if not os.path.exists(hf_model_dir):
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_dir, torch_dtype="auto", trust_remote_code=True)
+
+            assert isinstance(hf_model, transformers.PreTrainedModel)
+            weights = convert_hf_mamba(hf_model, dtype)
+        else:
+            weights = convert_from_hf_checkpoint(config, hf_model_dir)
+
+        model = cls(config)
+        model.load(weights)
+
+        return model

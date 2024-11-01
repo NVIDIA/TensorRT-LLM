@@ -53,6 +53,7 @@ public:
         runtime::TllmRuntime const& runtime);
 
     void setKvPoolPointers(KvCacheManager const* kvCacheManager);
+    void setKvPoolMapping(KvCacheManager const* kvCacheManager);
 
     void reset(BufferManager& manager){};
 
@@ -92,9 +93,10 @@ public:
     TensorPtr maxAttentionWindows;             // with attention plugin, host tensor
     TensorPtr sinkTokenLengths;                // with attention plugin, host tensor
     TensorPtr kvCacheBlockPoolPointers;
-    TensorPtr kvCacheBlockOffsetsHost;         // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr kvCacheBlockOffsetsDevice;       // [batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
-    TensorPtr runtimePerfKnobsHost;            // can hold max 16 perf knobs
+    TensorPtr kvCacheBlockPoolMapping;
+    TensorPtr kvCacheBlockOffsetsHost;   // [numPools, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr kvCacheBlockOffsetsDevice; // [numPools, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
+    TensorPtr runtimePerfKnobsHost;      // can hold max 16 perf knobs
 };
 
 } // namespace tensorrt_llm::runtime

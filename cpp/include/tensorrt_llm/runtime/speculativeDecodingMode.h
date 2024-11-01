@@ -97,8 +97,7 @@ public:
 
     [[nodiscard]] bool constexpr variableDraftLength() const
     {
-        // Add Lookahead, when lookahead supports it.
-        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens);
+        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens | kLookaheadDecoding);
     }
 
     [[nodiscard]] bool constexpr hasDraftLogits() const

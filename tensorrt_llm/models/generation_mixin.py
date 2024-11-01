@@ -14,7 +14,7 @@
 # limitations under the License.
 import math
 from collections import OrderedDict
-from typing import List
+from typing import List, Optional
 
 import tensorrt as trt
 
@@ -166,28 +166,34 @@ class GenerationMixin:
         }
         return num_profiles, ranges
 
-    def prepare_attention_inputs(self,
-                                 *,
-                                 max_batch_size,
-                                 max_beam_width,
-                                 max_input_len,
-                                 max_seq_len,
-                                 num_kv_heads,
-                                 head_size,
-                                 num_layers,
-                                 kv_dtype,
-                                 kv_cache_type: KVCacheType,
-                                 num_profiles=1,
-                                 enable_ctx_gen_opt_profiles=False,
-                                 remove_input_padding=False,
-                                 use_gpt_attention_plugin=False,
-                                 tokens_per_block=64,
-                                 mapping=Mapping(),
-                                 streamingllm=False,
-                                 attn_layer_idx=None,
-                                 opt_batch_size=None,
-                                 num_kv_heads_per_layer=None):
+    def prepare_attention_inputs(
+            self,
+            *,
+            max_batch_size,
+            max_beam_width,
+            max_input_len,
+            max_seq_len,
+            num_kv_heads,
+            head_size,
+            num_layers,
+            kv_dtype,
+            kv_cache_type: KVCacheType,
+            num_profiles=1,
+            enable_ctx_gen_opt_profiles=False,
+            remove_input_padding=False,
+            use_gpt_attention_plugin=False,
+            tokens_per_block=64,
+            mapping=Mapping(),
+            streamingllm=False,
+            attn_layer_idx=None,
+            opt_batch_size=None,
+            num_kv_heads_per_layer: Optional[List[int]] = None):
 
+        if attn_layer_idx is not None and num_kv_heads_per_layer is not None:
+            assert len(attn_layer_idx) == len(num_kv_heads_per_layer), (
+                f"Expected len(attn_layer_idx) ({len(attn_layer_idx)})"
+                f" == len(num_kv_heads_per_layer) ({len(num_kv_heads_per_layer)})"
+            )
         default_range = GenerationMixin.default_range
 
         if opt_batch_size:
@@ -245,23 +251,40 @@ class GenerationMixin:
         max_len_range = [_max_len_range] * num_profiles
 
         num_kv_heads = (num_kv_heads + mapping.tp_size - 1) // mapping.tp_size
+        if num_kv_heads_per_layer is not None:
+            num_kv_heads_per_layer = [
+                (nheads + mapping.tp_size - 1) // mapping.tp_size
+                for nheads in num_kv_heads_per_layer
+            ]
+
         layers_range = mapping.pp_layers(num_layers)
-        num_pp_layers = len(layers_range)
         if attn_layer_idx is None:
             attn_layer_idx = [i for i in range(num_layers)]
+        # layer indices of attention layers local to the current pp rank
+        local_attn_layers = [i for i in layers_range if i in attn_layer_idx]
+        # number of attention layers local to previous pp ranks
+        num_attn_layers_lower_ranks = attn_layer_idx.index(local_attn_layers[0])
         past_key_value = []
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
         host_kv_cache_pool_pointers = None
+        host_kv_cache_pool_mapping = None
         if kv_cache_type == KVCacheType.DISABLED:
             for i in layers_range:
                 past_key_value.append(None)
         else:
             if kv_cache_type != KVCacheType.PAGED:
-                for i in layers_range:
+                for layer_idx in layers_range:
+                    if layer_idx not in local_attn_layers:
+                        # not an attention layer ==> give it None pkv input
+                        past_key_value.append(None)
+                        continue
+
+                    attn_idx = local_attn_layers.index(layer_idx)
                     if num_kv_heads_per_layer is not None:
-                        heads_dim_name = f"num_heads_{attn_layer_idx[i]}"
-                        kv_heads = num_kv_heads_per_layer[i]
+                        heads_dim_name = f"num_heads_{layer_idx}"
+                        kv_heads = num_kv_heads_per_layer[
+                            num_attn_layers_lower_ranks + attn_idx]
                     else:
                         heads_dim_name = "num_heads"
                         kv_heads = num_kv_heads
@@ -274,7 +297,7 @@ class GenerationMixin:
                         ('head_size', [head_size] * num_profiles),
                     ])
 
-                    kv = Tensor(name=f'past_key_value_{attn_layer_idx[i]}',
+                    kv = Tensor(name=f'past_key_value_{layer_idx}',
                                 dtype=kv_dtype,
                                 shape=[-1, 2, kv_heads, -1, head_size],
                                 dim_range=kv_dim_range)
@@ -300,21 +323,28 @@ class GenerationMixin:
                         math.ceil(kv_cache_range[0][2] / tokens_per_block)
                     ]] * num_profiles
 
-                kv_cache_block_offsets = Tensor(name=f'kv_cache_block_offsets',
-                                                dtype=trt.int32,
-                                                shape=[-1, 2, -1],
-                                                dim_range=OrderedDict([
-                                                    ('batch_size_beam_width',
-                                                     bb_range),
-                                                    ('kv', [2] * num_profiles),
-                                                    ('max_blocks_per_seq',
-                                                     max_blocks_per_seq_range),
-                                                ]))
+                num_kv_cache_pools = 1 if num_kv_heads_per_layer is None else len(
+                    set(num_kv_heads_per_layer[num_attn_layers_lower_ranks:
+                                               num_attn_layers_lower_ranks +
+                                               len(local_attn_layers)]))
+                kv_cache_block_offsets = Tensor(
+                    name=f'kv_cache_block_offsets',
+                    dtype=trt.int32,
+                    shape=[num_kv_cache_pools, -1, 2, -1],
+                    dim_range=OrderedDict([
+                        ('num_kv_cache_pools',
+                         [num_kv_cache_pools] * num_profiles),
+                        ('batch_size_beam_width', bb_range),
+                        ('kv', [2] * num_profiles),
+                        ('max_blocks_per_seq', max_blocks_per_seq_range),
+                    ]))
                 host_kv_cache_block_offsets = Tensor(
                     name=f'host_kv_cache_block_offsets',
                     dtype=trt.int32,
-                    shape=[-1, 2, -1],
+                    shape=[num_kv_cache_pools, -1, 2, -1],
                     dim_range=OrderedDict([
+                        ('num_kv_cache_pools',
+                         [num_kv_cache_pools] * num_profiles),
                         ('batch_size_beam_width', bb_range),
                         ('kv', [2] * num_profiles),
                         ('max_blocks_per_seq', max_blocks_per_seq_range),
@@ -322,9 +352,20 @@ class GenerationMixin:
                 host_kv_cache_pool_pointers = Tensor(
                     name=f'host_kv_cache_pool_pointers',
                     dtype=trt.int64,
-                    shape=[2],
+                    shape=[num_kv_cache_pools, 2],
                     dim_range=OrderedDict([
-                        ('num_pools', [2] * num_profiles),
+                        ('num_pools_layers',
+                         [num_kv_cache_pools] * num_profiles),
+                        ('num_pools_kv', [2] * num_profiles),
+                    ]))
+
+                host_kv_cache_pool_mapping = Tensor(
+                    name=f'host_kv_cache_pool_mapping',
+                    dtype=trt.int32,
+                    shape=[len(local_attn_layers)],
+                    dim_range=OrderedDict([
+                        ('pools_mapping',
+                         [len(local_attn_layers)] * num_profiles),
                     ]))
 
                 for i in layers_range:
@@ -403,9 +444,10 @@ class GenerationMixin:
             host_max_attention_window_sizes = Tensor(
                 name=f'host_max_attention_window_sizes',
                 dtype=trt.int32,
-                shape=[num_pp_layers],
-                dim_range=OrderedDict([('num_layers',
-                                        [num_pp_layers] * num_profiles)]))
+                shape=[len(local_attn_layers)],
+                dim_range=OrderedDict([
+                    ('num_layers', [len(local_attn_layers)] * num_profiles)
+                ]))
 
             host_sink_token_length = Tensor(name='host_sink_token_length',
                                             dtype=trt.int32,
@@ -437,6 +479,7 @@ class GenerationMixin:
             'kv_cache_block_offsets': kv_cache_block_offsets,
             'host_kv_cache_block_offsets': host_kv_cache_block_offsets,
             'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers,
+            'host_kv_cache_pool_mapping': host_kv_cache_pool_mapping,
             'context_lengths': context_lengths,
             'host_context_lengths': host_context_lengths,
             'host_request_types': host_request_types,

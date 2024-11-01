@@ -72,6 +72,7 @@ class TestModule(unittest.TestCase):
 
     def test_module(self):
         m = Module3()
+        print(m)
         m.forward()
 
         self.assertEqual(4, len(list(m.named_modules())))
@@ -88,6 +89,7 @@ class TestModule(unittest.TestCase):
 
     def test_module_list(self):
         m = Module4()
+        print(m)
         m.forward()
 
         self.assertEqual(8, len(list(m.named_modules())))

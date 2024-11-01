@@ -31,6 +31,15 @@ constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
 constexpr size_t MAX_RANKS_PER_NODE = 8;
 constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 
+namespace reduce_fusion::details
+{
+static constexpr int kBytesPerAccess = 16;
+static constexpr int kWarpSize = 32;
+static constexpr int kMaxCtaSize = 1024;
+static constexpr int kClusterMaxSize = 8;
+static constexpr int kLamportTokenNumThreshold = 16;
+}; // namespace reduce_fusion::details
+
 // Warning: python definition is in tensorrt_llm/functional.py
 // they must be kept in sync
 enum class AllReduceStrategyType : int8_t
@@ -73,6 +82,7 @@ struct AllReduceFusionParams
     float eps;
     // new residual
     void* intermediate_buffer;
+    void* lamport_peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 3];
 };
 
 struct AllReduceParams
@@ -81,7 +91,8 @@ struct AllReduceParams
     size_t elts_per_rank;
     size_t elts_per_block;
     size_t rank_offset;
-    size_t ranks_per_node, local_rank;
+    size_t ranks_per_node;
+    size_t local_rank;
     uint32_t barrier_flag;
     uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
     uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
@@ -91,7 +102,8 @@ struct AllReduceParams
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank);
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
+        int token_num, AllReduceFusionOp op);
 };
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
@@ -100,5 +112,7 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
 
 void residualRmsNorm(kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream);
+
+void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

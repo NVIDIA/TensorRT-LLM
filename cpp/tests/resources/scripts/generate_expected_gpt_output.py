@@ -151,7 +151,7 @@ def generate_outputs(num_beams):
                     output_logits=True,
                     output_log_probs=True,
                     output_cum_log_probs=True)
-    # GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime
+    # GptExecutorTest.GenerationLogitsEarlyStop and several tests require to use context_fmha_fp32_acc flag in runtime
     model_spec_obj.enable_context_fmha_fp32_acc()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
@@ -165,6 +165,14 @@ def generate_outputs(num_beams):
     model_spec_obj.use_gpt_plugin()
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
+    generate_output(engine=model_spec_obj.get_model_path(),
+                    num_beams=num_beams,
+                    input_name=input_name,
+                    model_spec_obj=model_spec_obj,
+                    output_logits=False,
+                    output_log_probs=True,
+                    output_cum_log_probs=True)
+    model_spec_obj.enable_context_fmha_fp32_acc()
     generate_output(engine=model_spec_obj.get_model_path(),
                     num_beams=num_beams,
                     input_name=input_name,

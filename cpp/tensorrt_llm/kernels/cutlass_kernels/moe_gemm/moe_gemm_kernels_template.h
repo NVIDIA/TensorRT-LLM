@@ -559,8 +559,9 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
     bool is_gated_activation, int gemm_n, int gemm_k) const
 {
+    constexpr bool ENABLE_FUSED_GATED_ACTIVATION = false; // TODO There is a bug that causes non-determinism
     return is_gated_activation && std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8
-        && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0);
+        && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) && ENABLE_FUSED_GATED_ACTIVATION;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>

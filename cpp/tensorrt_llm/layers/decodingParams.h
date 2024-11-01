@@ -210,8 +210,13 @@ struct LookaheadSetupParams : public DecodingSetupParams
     TensorPtr positionOffsets;
     //! see LookaheadDecodingOutputs::attentionPackedMasks
     TensorPtr attentionPackedMasks;
-    //! see LookaheadDecodingOutputs::actualGenerationLengths
-    TensorPtr actualGenerationLengths;
+};
+
+class ExternalDraftTokensSetupParams : public DecodingSetupParams
+{
+public:
+    std::optional<std::vector<runtime::SizeType32>> runtimeTopK; // [1] or [setupBatchSize] on cpu
+    std::optional<std::vector<float>> runtimeTopP;               // [1] or [setupBatchSize] on cpu
 };
 
 class BaseDecodingInputs
@@ -324,6 +329,33 @@ public:
         : DecodingInputs{std::move(endIds), std::move(batchSlots), step, ite, localBatchSize}
     {
     }
+
+    //! optional parameters
+    //! [localBatchSize]
+    curandState_t* curandStates{};
+
+    //! Flag to mark that logits tensor contains probabilities
+    bool probsComputed{};
+};
+
+class ExternalDraftTokensInputs : public DecodingInputs
+{
+public:
+    explicit ExternalDraftTokensInputs(TensorConstPtr endIds, TensorConstPtr batchSlots, runtime::SizeType32 step,
+        runtime::SizeType32 ite, runtime::SizeType32 localBatchSize)
+        : DecodingInputs{std::move(endIds), std::move(batchSlots), step, ite, localBatchSize}
+    {
+    }
+
+    TensorPtr draftLogits;
+    TensorPtr draftProbs;
+    TensorPtr targetProbs;
+    TensorPtr numDraftTokens;
+    TensorPtr draftTokenIds;
+    TensorPtr useDraftLogits;
+    runtime::SizeType32 step;
+    float constantThreshold;
+    bool useRandomAcceptanceThreshold;
 
     //! optional parameters
     //! [localBatchSize]
@@ -479,7 +511,7 @@ public:
 //! {c'} is always accepted and {x', z'} is supposed to be accepted.
 //! The accepted tokens [c', x', z'] is saved in `outputIds` in-place, starting from `sequenceLength`.
 //! The `acceptedLength` is 3, and the accepted draft tokens length is 2.
-//! `sequenceLength` is also increaded by `acceptedLength` in-place.
+//! `sequenceLength` is also increased by `acceptedLength` in-place.
 //! The pathsOffset is {0, 1, 3} for {c', x', z'}.
 //! [] for accepted, <> for draft, {} for input/output.
 //!
@@ -551,8 +583,6 @@ public:
     TensorPtr positionOffsets;
     //! [maxBatchSize, maxDecodingTokens]
     TensorPtr positionIds;
-    //! The actual decoding tokens length, for debug and for future.
-    TensorPtr actualGenerationLengths;
 };
 
 class ExplicitDraftTokensOutputs : public SpeculativeDecodingOutputs

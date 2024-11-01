@@ -201,6 +201,24 @@ class SamplingParams:
                     "please call the setup method.")
             return words + self._stop_word_ids
 
+    def _get_stop_reasons_and_words(
+            self) -> List[Tuple[Union[str, int], List[int]]]:
+        stop_reasons = []
+        if self.stop_token_ids is not None:
+            stop_reasons.extend(self.stop_token_ids)
+        if self.stop is not None:
+            if isinstance(self.stop, str):
+                stop_reasons.append(self.stop)
+            else:
+                stop_reasons.extend(self.stop)
+        stop_words = self._get_stop_words()
+        if len(stop_reasons) != len(stop_words):
+            raise RuntimeError(
+                f"The number of {self.__class__.__name__}.stop_token_ids ({self.stop_token_ids}) "
+                f"and {self.__class__.__name__}.stop ({self.stop}) are inconsistent with the "
+                f"processed stop_words ({stop_words}).")
+        return list(zip(stop_reasons, stop_words))
+
     def _get_sampling_config(self) -> tllme.SamplingConfig:
         expected_fields = [
             "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
@@ -451,10 +469,17 @@ class ManagedThread(threading.Thread):
                 if not self.task(**self.kwargs):
                     break
             except Exception as e:
-                logger.error(f"Error in thread {self.name}: {e}")
+                logger.error(
+                    f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
+                )
                 self.error_queue.put(e)
 
         logger.info(f"Thread {self.name} stopped.")
 
     def stop(self):
         self.stop_event.set()
+
+
+def enable_llm_debug() -> bool:
+    ''' Tell whether to enable the debug mode for LLM class.  '''
+    return os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"

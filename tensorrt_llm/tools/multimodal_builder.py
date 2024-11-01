@@ -18,7 +18,6 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           Pix2StructForConditionalGeneration,
                           VisionEncoderDecoderModel)
 # isort: on
-import json
 import math
 
 import torch.nn.functional as F
@@ -145,7 +144,8 @@ def build_trt_engine(model_type,
 
     config_args = {
         "precision": str(dtype).split('.')[-1],
-        "model_type": model_type
+        "model_type": model_type,
+        "strongly_typed": False
     }
     if num_frames is not None:
         config_args["num_frames"] = num_frames
@@ -325,8 +325,10 @@ def build_llava_engine(args):
                 features = all_hidden_states[self.feature_layer][:, 1:]
                 return self.projector(features)
 
+        hf_config = AutoConfig.from_pretrained(args.model_path)
+        hf_config.vision_config._attn_implementation = "eager"
         model = LlavaForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16)
+            args.model_path, torch_dtype=torch.float16, config=hf_config)
         wrapper = LlavaVisionWrapper(
             model.vision_tower.to(args.device),
             model.multi_modal_projector.to(args.device),
@@ -352,8 +354,10 @@ def build_llava_engine(args):
                 image_features = self.projector(selected_image_feature)
                 return image_features  # (bs, 576, c)
 
+        hf_config = AutoConfig.from_pretrained(args.model_path)
+        hf_config.vision_config._attn_implementation = "eager"
         model = LlavaNextForConditionalGeneration.from_pretrained(
-            args.model_path, torch_dtype=torch.float16)
+            args.model_path, torch_dtype=torch.float16, config=hf_config)
         wrapper = LlavaNextVisionWrapper(
             model.vision_tower.vision_model.to(args.device),
             model.multi_modal_projector.to(args.device),
@@ -644,7 +648,8 @@ def build_video_neva_engine(args):
 
     encoder = AutoModel.from_pretrained(vision_config["from_pretrained"],
                                         torch_dtype=torch.bfloat16,
-                                        trust_remote_code=True)
+                                        trust_remote_code=True,
+                                        attn_implementation="eager")
     vision_encoder = encoder.vision_model
     hf_config = encoder.config
     dtype = hf_config.torch_dtype
@@ -731,13 +736,6 @@ def build_phi_engine(args):
                       images=raw_image,
                       return_tensors="pt")['pixel_values'].to(
                           args.device, torch.float16)
-    try:
-        with open(f"{args.model_path}/preprocessor_config.json", "r") as file:
-            config = file.read()
-            config_dict = json.loads(config)
-            num_crops = config_dict.get("num_crops")
-    except:
-        num_crops = 16
 
     class Phi3VisionWrapper(torch.nn.Module):
 
@@ -792,7 +790,8 @@ def build_phi_engine(args):
     tensors = {"glb_GN": glb_GN, "sub_GN": sub_GN}
     save_file(tensors, args.output_dir + "/image_newlines.safetensors")
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
-    build_trt_engine(
-        args.model_type, [image.shape[1], image.shape[2], image.shape[3]],
-        f'{args.output_dir}/onnx', args.output_dir,
-        args.max_batch_size * (num_crops + 1))  #TODO: Take input from config
+    num_crops = processor.image_processor.num_crops
+    build_trt_engine(args.model_type,
+                     [image.shape[1], image.shape[2], image.shape[3]],
+                     f'{args.output_dir}/onnx', args.output_dir,
+                     args.max_batch_size * (num_crops + 1))

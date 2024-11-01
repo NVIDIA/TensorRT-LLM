@@ -9,6 +9,7 @@ import pytest
 import torch
 from parameterized import parameterized
 
+from tensorrt_llm._utils import release_gc
 from tensorrt_llm.executor import (ExecutorBindingsProxy, GenerationRequest,
                                    GenerationResult)
 from tensorrt_llm.hlapi import LLM, KvCacheConfig, SamplingParams
@@ -110,8 +111,8 @@ def test_llm_return_generation_logits_tp2():
                          ids=["from_ckpt", "from_hf"])
 @skip_single_gpu
 def test_llm_generate_async_tp2(
-        engine_from_checkpoint: tempfile.TemporaryDirectory,
-        use_auto_parallel: bool, from_ckpt: bool):
+        engine_from_checkpoint: tempfile.TemporaryDirectory, from_ckpt: bool,
+        use_auto_parallel: bool):
     if use_auto_parallel and from_ckpt:
         pytest.skip("Skip auto parallel for TP2 checkpoint")
     model_dir = engine_from_checkpoint.name if from_ckpt else get_model_path(
@@ -264,7 +265,7 @@ class DummyExecutorProxy(ExecutorBindingsProxy):
 
         self.request_queue.put(request)
 
-        req_id = self.request_id_queue.get()
+        req_id = self.rid_or_err_queue.get()
         request.set_id(req_id)
 
         result = GenerationResult(
@@ -354,6 +355,8 @@ class DummyExecutorProxy2(ExecutorBindingsProxy):
     def dispatch_result_task(self) -> bool:
         self.counter += 1
 
+        # This will raise error in dispatch_result_thread in the main process, it will be captured by ManagedThread and
+        # redirect to the error_queue
         if self.counter == 2:
             raise DummyError("Test error")
 
@@ -362,6 +365,29 @@ class DummyExecutorProxy2(ExecutorBindingsProxy):
 
 DummyExecutor2 = DummyExecutorMeta("DummyExecutor2", (), {},
                                    proxy_class=DummyExecutorProxy2)
+
+
+# TODO[chunweiy]: This test is not stable, need to investigate
+def test_executor_handle_background_error_in_dispatch_result_thread():
+    llm = LLM(model=llama_model_path,
+              executor_cls=DummyExecutor2,
+              kv_cache_config=global_kv_cache_config)
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    # test in streaming mode
+    async def task():
+        with pytest.raises(DummyError):
+            with llm:
+                async for output in llm.generate_async(
+                        prompts[0], streaming=True,
+                        sampling_params=sampling_params):
+                    print(output)
+
+    asyncio.run(task())
+
+    del llm
+    release_gc()
 
 
 class DummyExecutorProxy3(ExecutorBindingsProxy):
@@ -373,10 +399,13 @@ class DummyExecutorProxy3(ExecutorBindingsProxy):
         model_world_size: int = 1,
         mpi_session=None,
     ) -> None:
-        super().__init__(workers_kwargs,
-                         model_world_size,
-                         mpi_session,
-                         worker_cls=DummyExecutorWorker2)
+        super().__init__(
+            workers_kwargs,
+            model_world_size,
+            mpi_session,
+            # The worker process will raise error, and be captured by mpi4py done handler, and redirect to
+            # the global error queue.
+            worker_cls=DummyExecutorWorker2)
 
 
 DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
@@ -384,45 +413,31 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 
 
 # TODO[chunweiy]: This test is not stable, need to investigate
-def test_executor_handle_background_error():
+# The phenomenon is that the IpcQueues don't match each other.
+def test_executor_handle_background_error_in_worker_process():
 
     llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor2,
+              executor_cls=DummyExecutor3,
               kv_cache_config=global_kv_cache_config)
     # The dummy executor will delay the responses
     sampling_params = SamplingParams(max_tokens=6)
 
     # test in streaming mode
     async def task():
+        nonlocal llm
         with pytest.raises(DummyError):
-            async for output in llm.generate_async(
-                    prompts[0], streaming=True,
-                    sampling_params=sampling_params):
-                print(output)
+            with llm:
+                async for output in llm.generate_async(
+                        prompts[0], streaming=True,
+                        sampling_params=sampling_params):
+                    print(output)
 
     asyncio.run(task())
 
-
-def test_executor_handle_background_error_in_worker():
-    llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor2,
-              kv_cache_config=global_kv_cache_config)
-    # The dummy executor will delay the responses
-    sampling_params = SamplingParams(max_tokens=6)
-
-    # test in streaming mode
-    async def task():
-        with pytest.raises(DummyError):
-            async for output in llm.generate_async(
-                    prompts[0], streaming=True,
-                    sampling_params=sampling_params):
-                print(output)
-
-    asyncio.run(task())
+    del llm
+    release_gc()
 
 
 if __name__ == '__main__':
-    #test_llama_v2_13b_lora_tp2()
-    #test_llm_end2end_tp2({'embedding_parallel_mode': 'NONE'})
-    test_llm_return_context_logits_tp2()
-    test_llm_return_generation_logits_tp2()
+    test_executor_handle_background_error_in_dispatch_result_thread()
+    test_executor_handle_background_error_in_worker_process()

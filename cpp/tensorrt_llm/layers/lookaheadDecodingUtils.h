@@ -121,14 +121,20 @@ private:
 class DebugTensor
 {
 public:
-    DebugTensor(runtime::ITensor const& tensor, char const* name)
+    DebugTensor(runtime::ITensor const& tensor, char const* name,
+        std::shared_ptr<runtime::BufferManager> bufferManager = nullptr,
+        std::shared_ptr<runtime::CudaStream> stream = nullptr)
         : mTensor(tensor)
         , mName(name)
+        , mBufferManager(bufferManager)
+        , mStream(stream)
     {
     }
 
-    DebugTensor(runtime::ITensor::SharedConstPtr tensor, char const* name)
-        : DebugTensor(*tensor, name)
+    DebugTensor(runtime::ITensor::SharedConstPtr tensor, char const* name,
+        std::shared_ptr<runtime::BufferManager> bufferManager = nullptr,
+        std::shared_ptr<runtime::CudaStream> stream = nullptr)
+        : DebugTensor(*tensor, name, bufferManager, stream)
     {
     }
 
@@ -187,9 +193,11 @@ public:
         runtime::BufferManager::ITensorPtr hostPtr{nullptr};
         if (mTensor.getMemoryType() == runtime::MemoryType::kGPU)
         {
-            runtime::BufferManager manager{std::make_shared<runtime::CudaStream>()};
-            hostPtr = manager.copyFrom(mTensor, runtime::MemoryType::kCPU);
-            manager.getStream().synchronize();
+            auto theManager = mBufferManager
+                ? mBufferManager
+                : std::make_shared<runtime::BufferManager>(mStream ? mStream : std::make_shared<runtime::CudaStream>());
+            hostPtr = theManager->copyFrom(mTensor, runtime::MemoryType::kCPU);
+            theManager->getStream().synchronize();
         }
         return hostPtr;
     }
@@ -343,12 +351,80 @@ public:
         TLLM_LOG_DEBUG(shape());
     }
 
+    template <typename T>
+    void randomize(runtime::SizeType32 vtype)
+    {
+        runtime::BufferRange<T> tensorRange(const_cast<runtime::ITensor&>(mTensor));
+        for (auto& item : tensorRange)
+        {
+            item = vtype == 0 ? 0 : vtype == 1 ? 1 : rand();
+        }
+    }
+
+    void randomize(void)
+    {
+        if (mTensor.getMemoryType() == runtime::MemoryType::kGPU)
+        {
+            runtime::ITensor& nonConstTensor = const_cast<runtime::ITensor&>(mTensor);
+            runtime::BufferManager manager{std::make_shared<runtime::CudaStream>()};
+            runtime::ITensor::SharedConstPtr cpuBuffer = manager.cpu(mTensor.getShape(), mTensor.getDataType());
+            DebugTensor(cpuBuffer, "cpuBuffer").randomize();
+            manager.copy(*cpuBuffer, nonConstTensor);
+            manager.getStream().synchronize();
+        }
+        else
+        {
+            switch (mTensor.getDataType())
+            {
+            case nvinfer1::DataType::kBOOL: return randomize<bool>(3);
+            case nvinfer1::DataType::kFLOAT: return randomize<float>(3);
+            case nvinfer1::DataType::kINT8: return randomize<std::int8_t>(3);
+            case nvinfer1::DataType::kINT32: return randomize<std::int32_t>(3);
+            case nvinfer1::DataType::kINT64: return randomize<std::int64_t>(3);
+            case nvinfer1::DataType::kUINT8: return randomize<std::uint8_t>(3);
+            default: return;
+            }
+        }
+    }
+
+    void setZeros(void)
+    {
+        switch (mTensor.getDataType())
+        {
+        case nvinfer1::DataType::kBOOL: return randomize<bool>(0);
+        case nvinfer1::DataType::kFLOAT: return randomize<float>(0);
+        case nvinfer1::DataType::kINT8: return randomize<std::int8_t>(0);
+        case nvinfer1::DataType::kINT32: return randomize<std::int32_t>(0);
+        case nvinfer1::DataType::kINT64: return randomize<std::int64_t>(0);
+        case nvinfer1::DataType::kUINT8: return randomize<std::uint8_t>(0);
+        default: return;
+        }
+    }
+
+    void setOnes(void)
+    {
+        switch (mTensor.getDataType())
+        {
+        case nvinfer1::DataType::kBOOL: return randomize<bool>(1);
+        case nvinfer1::DataType::kFLOAT: return randomize<float>(1);
+        case nvinfer1::DataType::kINT8: return randomize<std::int8_t>(1);
+        case nvinfer1::DataType::kINT32: return randomize<std::int32_t>(1);
+        case nvinfer1::DataType::kINT64: return randomize<std::int64_t>(1);
+        case nvinfer1::DataType::kUINT8: return randomize<std::uint8_t>(1);
+        default: return;
+        }
+    }
+
 private:
     runtime::ITensor const& mTensor;
     std::string mName;
+    std::shared_ptr<runtime::BufferManager> mBufferManager;
+    std::shared_ptr<runtime::CudaStream> mStream;
 };
 
 #define D(x) tensorrt_llm::layers::DebugTensor(x, #x)
+#define Db(x, bufferManager) tensorrt_llm::layers::DebugTensor(x, #x, bufferManager, nullptr)
+#define Ds(x, stream) tensorrt_llm::layers::DebugTensor(x, #x, nullptr, stream)
 #define PRINT_TOKENS(x) D(x).print_tokens()
 #define PRINT_VALUES(x) D(x).print_values()
 #define PRINT_SHAPE(x) D(x).print_shape()

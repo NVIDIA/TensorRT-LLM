@@ -390,7 +390,7 @@ void MedusaDecodingLayer<T>::sampleNewDraftTokens(SpeculativeDecodingOutputs con
     params.maxBatchSize = maxBatchSizeHeadNums;
     params.maxTokensPerStep = 1;
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-    params.returnAllTopK = true;
+    params.returnAllSelectedTokens = true;
 
     invokeBatchTopKSampling(params, getStream());
 

@@ -23,7 +23,7 @@ from .embedding import Embedding, PromptTuningEmbedding
 from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
-from .moe import MOE, MoeConfig
+from .moe import MOE, MoeConfig, SharedMoE
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
@@ -61,6 +61,7 @@ __all__ = [
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',
+    'SharedMoE',
     'Mamba',
     'Mamba2',
     'Recurrent',

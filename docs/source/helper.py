@@ -91,7 +91,7 @@ def generate_llmapi():
     # Destination paths
     doc_dir = root_dir / "docs/source/llm-api"
     doc_dir.mkdir(exist_ok=True)
-    doc_path = doc_dir / "index.rst"
+    doc_path = doc_dir / "reference.rst"
 
     hlapi_all_file = root_dir / "tensorrt_llm/hlapi/__init__.py"
     public_classes_names = extract_all_and_eval(hlapi_all_file)['__all__']

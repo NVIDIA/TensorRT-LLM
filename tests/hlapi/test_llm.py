@@ -4,17 +4,18 @@ import os
 import sys
 import tempfile
 import time
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pytest
 import torch
-from transformers import AutoTokenizer
+import transformers
 
 from tensorrt_llm._utils import release_gc
+from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (ExecutorBindingsWorker, GenerationRequest,
                                    GenerationResult, LoRARequest)
 from tensorrt_llm.hlapi import (LLM, BuildCacheConfig, KvCacheConfig,
-                                SamplingParams)
+                                RequestError, SamplingParams)
 from tensorrt_llm.hlapi.llm_utils import BuildConfig, _ParallelConfig
 from tensorrt_llm.hlapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.hlapi.utils import get_total_gpu_memory
@@ -24,7 +25,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_less_than_40gb_memory
 
-from tensorrt_llm.models.llama.model import LLaMAForCausalLM
+from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
 # There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
@@ -79,20 +80,34 @@ def llm_test_harness(model_dir: str,
 def llm_check_output(llm: LLM,
                      inputs: List[str],
                      references: List[str],
+                     *,
+                     sampling_params: Optional[SamplingParams] = None,
                      similar_threshold: float = 0.8,
-                     *gen_args,
+                     finish_reasons: Optional[List[str]] = None,
+                     stop_reasons: Optional[List[Union[int, str]]] = None,
                      **gen_kwargs):
-    outputs = llm.generate(inputs, *gen_args, **gen_kwargs)
+    outputs = llm.generate(inputs,
+                           sampling_params=sampling_params,
+                           **gen_kwargs)
     assert len(outputs) == len(references)
 
-    for output, target_output in zip(outputs, references):
+    for i, (output, target_output) in enumerate(zip(outputs, references)):
         if isinstance(target_output, list):
             # N output
             assert len(output.outputs) == len(target_output)
-            for out, ref in zip(output.outputs, target_output):
+            for j, (out, ref) in enumerate(zip(output.outputs, target_output)):
                 assert similar(out.text, ref, threshold=similar_threshold)
+                if finish_reasons is not None:
+                    assert out.finish_reason == finish_reasons[i][j]
+                if stop_reasons is not None:
+                    assert out.stop_reason == stop_reasons[i][j]
         else:
-            assert similar(output.outputs[0].text, target_output)
+            out = output.outputs[0]
+            assert similar(out.text, target_output, threshold=similar_threshold)
+            if finish_reasons is not None:
+                assert out.finish_reason == finish_reasons[i]
+            if stop_reasons is not None:
+                assert out.stop_reason == stop_reasons[i]
 
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
@@ -100,6 +115,9 @@ mixtral_model_name = "Mixtral-8x7B-v0.1"
 
 llama_model_path = get_model_path(default_model_name)
 llm_engine_dir = os.environ.get('LLM_ENGINE_DIR', './tmp.engine')
+
+cnn_dailymail_path = str(llm_models_root() / "datasets" / "cnn_dailymail")
+
 prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
@@ -110,7 +128,6 @@ def test_llm_build_config():
     # change some building parameters
     build_config.max_batch_size = 129
     build_config.max_beam_width = 4
-    build_config.builder_opt = 3
     build_config.max_num_tokens = 888
     build_config.strongly_typed = True
     build_config.max_seq_len = 333
@@ -131,7 +148,6 @@ def test_llm_build_config():
         build_config1.plugin_config.nccl_plugin = 'float16'
         assert build_config1.max_batch_size == build_config.max_batch_size
         assert build_config1.max_beam_width == build_config.max_beam_width
-        assert build_config1.builder_opt == build_config.builder_opt
         assert build_config1.max_num_tokens == build_config.max_num_tokens
         assert build_config1.strongly_typed == build_config.strongly_typed
         assert build_config1.max_seq_len == build_config.max_seq_len
@@ -149,16 +165,41 @@ def test_llm_loading_from_hf():
 def test_llm_loading_from_ckpt():
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     assert tokenizer is not None
-    with tempfile.TemporaryDirectory() as ckpt_dir:
-        llama = LLaMAForCausalLM.from_hugging_face(llama_model_path)
-        llama.save_checkpoint(ckpt_dir)
-        del llama
 
-        llm_test_harness(ckpt_dir,
-                         prompts, ["D E F G H I J K"],
-                         tokenizer=tokenizer,
-                         kv_cache_config=global_kvcache_config,
-                         sampling_params=SamplingParams(max_tokens=8))
+    ckpt_dir = tempfile.TemporaryDirectory()
+    llama = AutoModelForCausalLM.from_hugging_face(llama_model_path)
+    llama.save_checkpoint(ckpt_dir.name)
+    del llama
+
+    llm_test_harness(ckpt_dir.name,
+                     prompts, ["D E F G H I J K"],
+                     tokenizer=tokenizer,
+                     kv_cache_config=global_kvcache_config,
+                     sampling_params=SamplingParams(max_tokens=8))
+
+
+@pytest.mark.parametrize('model_format', ['hf', 'ckpt'])
+def test_llm_with_dummy_weights(model_format):
+    # dummy_dir contains config.json and tokenizer files only
+    # the test fails if load_format != 'dummy'
+    dummy_dir = tempfile.TemporaryDirectory()
+    if model_format == 'hf':
+        hf_config = transformers.AutoConfig.from_pretrained(llama_model_path)
+        hf_config.save_pretrained(dummy_dir.name)
+    else:
+        config = AutoConfig.from_hugging_face(llama_model_path, dtype='float16')
+        config.to_json_file(os.path.join(dummy_dir.name, 'config.json'))
+    tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
+    tokenizer.save_pretrained(dummy_dir.name)
+
+    sampling_params = SamplingParams(max_tokens=8)
+    llm_test_harness(dummy_dir.name,
+                     prompts,
+                     ["A placeholder reference for dummy-weight engine."],
+                     sampling_params=sampling_params,
+                     similar_threshold=0.0,
+                     load_format='dummy',
+                     kv_cache_config=global_kvcache_config)
 
 
 class MyTokenizer(TokenizerBase):
@@ -167,8 +208,8 @@ class MyTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                  **kwargs)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            pretrained_model_dir, **kwargs)
         return MyTokenizer(tokenizer)
 
     def __init__(self, tokenizer):
@@ -326,6 +367,9 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_future_async()
     test_non_streaming_usage_wait()
 
+    del llm
+    release_gc()
+
 
 @pytest.fixture(scope="module")
 def llm_for_sampling_params() -> LLM:
@@ -475,27 +519,55 @@ def test_generate_with_stop_words():
 
     llm_check_output(llm,
                      prompts, ["D E F G H I J K L M"],
-                     sampling_params=SamplingParams(stop_token_ids=[stop_id]))
+                     sampling_params=SamplingParams(end_id=stop_id),
+                     finish_reasons=['stop'],
+                     stop_reasons=[None])
+
+    llm_check_output(llm,
+                     prompts, ["D E F G H"],
+                     sampling_params=SamplingParams(max_tokens=5),
+                     finish_reasons=['length'],
+                     stop_reasons=[None])
+
+    llm_check_output(llm,
+                     prompts, ["D E F G H I J K L M"],
+                     sampling_params=SamplingParams(stop_token_ids=[stop_id]),
+                     finish_reasons=['stop'],
+                     stop_reasons=[stop_id])
 
     llm_check_output(llm,
                      prompts, ["D E F G H I J K L M N"],
                      sampling_params=SamplingParams(
                          stop_token_ids=[stop_id],
-                         include_stop_str_in_output=True))
+                         include_stop_str_in_output=True),
+                     finish_reasons=['stop'],
+                     stop_reasons=[stop_id])
 
     llm_check_output(llm,
                      prompts, ["D E F G H"],
-                     sampling_params=SamplingParams(stop="I J"))
+                     sampling_params=SamplingParams(stop="I J"),
+                     finish_reasons=['stop'],
+                     stop_reasons=["I J"])
+
+    llm_check_output(llm,
+                     prompts, ["D E F G H I J K L M"],
+                     sampling_params=SamplingParams(stop="I E", max_tokens=10),
+                     finish_reasons=['length'],
+                     stop_reasons=[None])
 
     llm_check_output(llm,
                      prompts, ["D E F G H I J"],
                      sampling_params=SamplingParams(
-                         stop="I J", include_stop_str_in_output=True))
+                         stop="I J", include_stop_str_in_output=True),
+                     finish_reasons=['stop'],
+                     stop_reasons=["I J"])
 
     llm_check_output(llm,
                      prompts, ["D E F G H"],
                      sampling_params=SamplingParams(stop=["F E", "I J"],
-                                                    stop_token_ids=[stop_id]))
+                                                    stop_token_ids=[stop_id]),
+                     finish_reasons=['stop'],
+                     stop_reasons=["I J"])
 
 
 @force_ampere
@@ -524,8 +596,7 @@ def test_generate_with_bad_words():
 
 @force_ampere
 def test_generate_with_embedding_bias():
-
-    tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     vocab_size_padded = 32000
     embedding_bias = torch.zeros(vocab_size_padded)
@@ -568,6 +639,7 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs):
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
 
+    # For LoRA checkpoints with finetuned embedding and lm_head, lora_dir must be provided at build time.
     build_config = BuildConfig(lora_config=LoraConfig(lora_dir=[hf_lora_dir]))
     llm = LLM(hf_model_dir,
               tokenizer=hf_lora_dir,
@@ -598,8 +670,10 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
     hf_lora_dir1 = get_model_path("llama-models/luotuo-lora-7b-0.1")
     hf_lora_dir2 = get_model_path("llama-models/Japanese-Alpaca-LoRA-7b-v0")
 
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
     build_config = BuildConfig(lora_config=LoraConfig(
-        lora_dir=[hf_lora_dir1, hf_lora_dir2],
         lora_target_modules=['attn_q', 'attn_k', 'attn_v']))
     llm = LLM(hf_model_dir,
               enable_lora=True,
@@ -734,7 +808,7 @@ def test_llm_build_cache():
                          prompts, ["D E F G H I J K"],
                          sampling_params=sampling_params)
 
-        # the cache should be hitted
+        # the cache should be hit
         assert llm.llm_build_stats.cache_hitted, llm.llm_build_stats.cache_info
         del llm
         release_gc()
@@ -914,4 +988,51 @@ def test_llm_return_generation_logits():
     check_llm_return_generation_logits(tp_size=1)
 
 
+class DummyExecutorWorker3(ExecutorBindingsWorker):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.counter = 0
+
+    def _engine_response_callback(self, response: tllm.Response):
+        return tllm.Response(request_id=response.request_id,
+                             error_msg="Test error")
+
+
+DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
+                                   worker_cls=DummyExecutorWorker3)
+
+
+def test_llm_handling_per_requeust_error():
+    llm = LLM(model=llama_model_path,
+              executor_cls=DummyExecutor3,
+              kv_cache_config=global_kvcache_config)
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    # test in streaming mode
+    async def task():
+        with pytest.raises(RequestError):
+            # 10 requests, each request will get error, while the whole LLM instance is still alive
+            for i in range(10):
+                async for output in llm.generate_async(
+                        prompts[0], streaming=True,
+                        sampling_params=sampling_params):
+                    print(output)
+
+    asyncio.run(task())
+
+    def batch_task():
+        with pytest.raises(RequestError):
+            for output in llm.generate(prompts,
+                                       sampling_params=sampling_params):
+                print(output)
+
+    batch_task()
+
+
 # TODO[chunweiy]: Add test for loading inmemory model
+
+if __name__ == '__main__':
+    test_llm_handling_per_requeust_error()

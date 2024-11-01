@@ -13,7 +13,7 @@ except ImportError:
 
 
 def test_ConfigArbitrator_basic():
-    # the performance and functionality have conflict plugins config, keep the functionalies and disable the performance's
+    # the performance and functionality have conflict plugins config, keep the functionalities and disable the performance's
     arb = _ConfigArbitrator()
     arb.claim_perf("chunked_context",
                    config_name="plugin_config",

@@ -32,7 +32,7 @@ public:
     using BufferPtr = IBuffer::SharedPtr;
 
     // MAX_ALL_REDUCE_BLOCKS for block_barrier, 1 for multi_gpu_barrier
-    size_t static constexpr FLAGS_SIZE = (kernels::MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t);
+    size_t static constexpr FLAGS_SIZE = (tensorrt_llm::kernels::MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t);
 
     IpcMemory(
         std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig, bool openIpc = true);

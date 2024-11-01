@@ -630,7 +630,7 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     // ┃ pTemp    ┃ BS * PAD_K * VP * (2 * (PAD_K * 2) + 2) |                          | float     |
     // ┗━━━━━━━━━━┛ --------------------------------------------------------------------------------
 
-    // Stage1: gridDim(BS,BM,nVPart), blockDim(nBlockSize,1,1)
+    // beamStage1Kernel: gridDim(BS,BM,nVPart), blockDim(nBlockSize,1,1)
     // Each ThreadBlock takes `nVocabChunk` contiguous elements in logits to do TopK and reduce_md,
     //   then writes output into pTemp.
     // At end of this kernel, each ThreadBlock holds the indices and values of the top 2*BM elements,
@@ -647,7 +647,7 @@ void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, 
     // ┃    md    ┃ 2               | 2         | float     |
     // ┗━━━━━━━━━━┛ -----------------------------------------
 
-    // Stage2: gridDim(BS,BM,1), blockDim(32/64/128,1,1)
+    // beamStage2Kernel: gridDim(BS,BM,1), blockDim(32/64/128,1,1)
     // Each TheadBlock takes `nVPart` contiguous Tiles in pTemp to do reduce_topk and reduce_md,
     //   writes output topk_id into in pTempId, writes topk_value + cumLogProbs into pTempVal.
 

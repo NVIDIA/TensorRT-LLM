@@ -194,7 +194,7 @@ struct SamplingKernelTestParam
     bool normalizeLogProbs{false};
     bool logitsHasProbs{true};
     int32_t maxTokensPerStep{1};
-    bool returnAllTopK{false};
+    bool returnAllSelectedTokens{false};
     bool useLogitsPtrs{false};
     bool isDeterministicTopP{false};
 
@@ -228,9 +228,9 @@ struct SamplingKernelTestParam
         return *this;
     }
 
-    SamplingKernelTestParam& setReturnAllTopK()
+    SamplingKernelTestParam& setReturnAllSelectedTokens()
     {
-        returnAllTopK = true;
+        returnAllSelectedTokens = true;
         return *this;
     }
 

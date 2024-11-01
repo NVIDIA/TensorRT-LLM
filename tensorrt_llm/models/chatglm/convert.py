@@ -434,9 +434,8 @@ def load_weights_from_hf_model(hf_model: AutoModel,
                                           is_qkv=True,
                                           multi_query_mode=True)
             weights[
-                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.from_numpy(
-                    np.array([qkv_vals_int8['scale_y_quant_orig']],
-                             dtype=np.float32)).contiguous()
+                f'{tllm_prex}.attention.kv_cache_scaling_factor'] = qkv_vals_int8[
+                    'scale_y_quant_orig'].contiguous()
 
         # Attention dense
         attn_dense_weight, attn_dense_bias = get_weight_and_bias(

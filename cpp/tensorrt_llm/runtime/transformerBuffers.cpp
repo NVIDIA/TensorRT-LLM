@@ -15,12 +15,15 @@
  */
 
 #include "tensorrt_llm/runtime/transformerBuffers.h"
+#include "iTensor.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 #include <cstdlib> // std::getenv
+#include <vector>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
@@ -34,6 +37,7 @@ TransformerBuffers::TransformerBuffers()
     presentKeysVals.clear();
     presentKeysValsAlt.clear();
     kvCacheBlockPoolPointers = nullptr;
+    kvCacheBlockPoolMapping = nullptr;
     kvCacheBlockOffsetsHost = nullptr;
     kvCacheBlockOffsetsDevice = nullptr;
 }
@@ -101,15 +105,16 @@ void TransformerBuffers::reshape(
     auto const maxAttentionWindow = generationConfig.maxAttentionWindow;
 
     auto const kvCacheReserve = ITensor::makeShape(
-        {batchSize, 2, modelConfig.getNbKvHeads(), maxAttentionWindow, modelConfig.getSizePerHead()});
+        {batchSize, 2, modelConfig.getNbKvHeads(0), maxAttentionWindow, modelConfig.getSizePerHead()});
     auto const kvCacheShape
-        = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(), maxInputLength, modelConfig.getSizePerHead()});
+        = ITensor::makeShape({batchSize, 2, modelConfig.getNbKvHeads(0), maxInputLength, modelConfig.getSizePerHead()});
+
     if (modelConfig.isPagedKVCache())
     {
         auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
         if (cacheBlockOffsetsShape.nbDims > 0)
         {
-            cacheBlockOffsetsShape.d[0] = batchSize;
+            cacheBlockOffsetsShape.d[1] = batchSize;
             kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
             kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
         }
@@ -123,7 +128,8 @@ void TransformerBuffers::reshape(
         utils::reshapeBufferVector(presentKeysVals, kvCacheReserve);
     }
 
-    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers
+        = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
 
     if (modelConfig.useGptAttentionPlugin())
     {
@@ -147,7 +153,7 @@ void TransformerBuffers::reshapeKvTensors(
 {
     auto const& manager = runtime.getBufferManager();
 
-    auto const cacheBlockOffsetsShape = ITensor::makeShape({maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
+    auto const cacheBlockOffsetsShape = ITensor::makeShape({1, maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
 
     kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
     manager.setZero(*kvCacheBlockOffsetsHost);
@@ -161,6 +167,11 @@ void TransformerBuffers::setKvPoolPointers(KvCacheManager const* kvCacheManager)
     kvCacheBlockPoolPointers = kvCacheManager->getBlockPoolPointers();
 }
 
+void TransformerBuffers::setKvPoolMapping(KvCacheManager const* kvCacheManager)
+{
+    kvCacheBlockPoolMapping = kvCacheManager->getLayerToPoolMapping();
+}
+
 TransformerBuffers TransformerBuffers::sliceTo(
     GenerationConfig const& generationConfig, ModelConfig const& modelConfig, SizeType32 offset, SizeType32 batchSize)
 {
@@ -169,8 +180,15 @@ TransformerBuffers TransformerBuffers::sliceTo(
     auto const generationBatchSize = generationConfig.batchSize;
     if (modelConfig.isPagedKVCache())
     {
+
         auto const& realCacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
-        auto const maxBlocksPerSeq = realCacheBlockOffsetsShape.d[2];
+        auto const numPools = realCacheBlockOffsetsShape.d[0];
+        // (oargov) with multiple pools, slicing the tensor along the batch*beam dimension would require us to support
+        // non-contiguous tensors. with a single pool, we can just ignore the pools dimension when slicing and restore
+        // it later. this is part of the deprecated GPTSession API, so not supporting VGQA here should be ok.
+        TLLM_CHECK_WITH_INFO(numPools == 1,
+            "Deprecated transformerBuffers API does not support multiple cache pools, use the newer API instead");
+        auto const maxBlocksPerSeq = realCacheBlockOffsetsShape.d[3];
 
         // enable slicing by moving generationBatchSize to first dim
         auto const fakeCacheBlockOffsetsShape = ITensor::makeShape({generationBatchSize, 2, maxBlocksPerSeq});
@@ -178,13 +196,14 @@ TransformerBuffers TransformerBuffers::sliceTo(
         TensorPtr kvCacheBlockOffsetsDeviceView{ITensor::view(kvCacheBlockOffsetsDevice, fakeCacheBlockOffsetsShape)};
 
         // slice and reshape to correct shape
-        auto const cacheBlockOffsetsShape = ITensor::makeShape({batchSize, 2, maxBlocksPerSeq});
+        auto const cacheBlockOffsetsShape = ITensor::makeShape({numPools, batchSize, 2, maxBlocksPerSeq});
         buffers.kvCacheBlockOffsetsHost = ITensor::slice(kvCacheBlockOffsetsHostView, offset, batchSize);
         buffers.kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
         buffers.kvCacheBlockOffsetsDevice = ITensor::slice(kvCacheBlockOffsetsDeviceView, offset, batchSize);
         buffers.kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
 
         buffers.kvCacheBlockPoolPointers = kvCacheBlockPoolPointers;
+        buffers.kvCacheBlockPoolMapping = kvCacheBlockPoolMapping;
     }
     else
     {
@@ -529,7 +548,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
     if (modelConfig.useGptAttentionPlugin() && modelConfig.isPagedKVCache())
     {
         auto cacheBlockOffsetsShape = kvCacheBlockOffsetsHost->getShape();
-        cacheBlockOffsetsShape.d[0] = batchSize * beamWidth;
+        cacheBlockOffsetsShape.d[1] = batchSize * beamWidth;
         kvCacheBlockOffsetsHost->reshape(cacheBlockOffsetsShape);
         kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
     }
@@ -720,6 +739,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
             inputBuffers.insert_or_assign("kv_cache_block_offsets", kvCacheBlockOffsetsDevice);
             inputBuffers.insert_or_assign("host_kv_cache_block_offsets", kvCacheBlockOffsetsHost);
             inputBuffers.insert_or_assign("host_kv_cache_pool_pointers", kvCacheBlockPoolPointers);
+            inputBuffers.insert_or_assign("host_kv_cache_pool_mapping", kvCacheBlockPoolMapping);
         }
         else
         {

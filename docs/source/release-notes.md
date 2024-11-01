@@ -5,6 +5,52 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.14.0
+
+### Key Features and Enhancements
+  - Enhanced the `LLM` class in the [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html).
+    - Added support for calibration with offline dataset.
+    - Added support for Mamba2.
+    - Added support for `finish_reason` and `stop_reason`.
+  - Added FP8 support for CodeLlama.
+  - Added `__repr__` methods for class `Module`, thanks to the contribution from @1ytic in #2191.
+  - Added BFloat16 support for fused gated MLP.
+  - Updated ReDrafter beam search logic to match Apple ReDrafter v1.1.
+  - Improved `customAllReduce` performance.
+  - Draft model now can copy logits directly over MPI to the target model's process in `orchestrator` mode. This fast logits copy reduces the delay between draft token generation and the beginning of target model inference.
+  - NVIDIA Volta GPU support is deprecated and will be removed in a future release.
+
+### API Changes
+  - [BREAKING CHANGE] The default `max_batch_size` of the `trtllm-build` command is set to `2048`.
+  - [BREAKING CHANGE] Remove `builder_opt` from the `BuildConfig` class and the `trtllm-build` command.
+  - Add logits post-processor support to the `ModelRunnerCpp` class.
+  - Added `isParticipant` method to the C++ `Executor` API to check if the current process is a participant in the executor instance.
+
+### Model Updates
+  - Added support for NemotronNas, see `examples/nemotron_nas/README.md`.
+  - Added support for Deepseek-v1, see `examples/deepseek_v1/README.md`.
+  - Added support for Phi-3.5 models, see `examples/phi/README.md`.
+
+### Fixed Issues
+  - Fixed a typo in `tensorrt_llm/models/model_weights_loader.py`, thanks to the contribution from @wangkuiyi in #2152.
+  - Fixed duplicated import module in `tensorrt_llm/runtime/generation.py`, thanks to the contribution from @lkm2835 in #2182.
+  - Enabled `share_embedding` for the models that have no `lm_head` in legacy  checkpoint conversion path, thanks to the contribution from @lkm2835 in #2232.
+  - Fixed `kv_cache_type` issue in the Python benchmark, thanks to the contribution from @qingquansong in #2219.
+  - Fixed an issue with SmoothQuant calibration with custom datasets. Thanks to the contribution by @Bhuvanesh09 in #2243.
+  - Fixed an issue surrounding `trtllm-build --fast-build` with fake or random weights. Thanks to @ZJLi2013 for flagging it in #2135.
+  - Fixed missing `use_fused_mlp` when constructing `BuildConfig` from dict, thanks for the fix from @ethnzhng in #2081.
+  - Fixed lookahead batch layout for `numNewTokensCumSum`. (#2263)
+
+### Infrastructure Changes
+  - The dependent ModelOpt version is updated to v0.17.
+
+### Documentation
+  - @Sherlock113 added a [tech blog](https://www.bentoml.com/blog/tuning-tensor-rt-llm-for-optimal-serving-with-bentoml) to the latest news in #2169, thanks for the contribution.
+
+### Known Issues
+  - Replit Code is not supported with the transformers 4.45+
+
+
 ## TensorRT-LLM Release 0.13.0
 
 ### Key Features and Enhancements
@@ -62,10 +108,6 @@ All published functionality in the Release Notes has been fully tested and verif
   - The dependent CUDA version is updated to 12.5.1.
   - The dependent PyTorch version is updated to 2.4.0.
   - The dependent ModelOpt version is updated to v0.15.
-
-### Known Issues
-
-- On Windows, installation of TensorRT-LLM may succeed, but you might hit `OSError: exception: access violation reading 0x0000000000000000` when importing the library in Python. See [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) for workarounds.
 
 
 ## TensorRT-LLM Release 0.12.0
@@ -440,11 +482,11 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
 
-- Chunked context support (see docs/source/gpt_attention.md#chunked-context)
+- Chunked context support (see docs/source/advanced/gpt-attention.md#chunked-context)
 - LoRA support for C++ runtime (see docs/source/lora.md)
 - Medusa decoding support (see examples/medusa/README.md)
   - The support is limited to Python runtime for Ampere or newer GPUs with fp16 and bf16 accuracy, and the `temperature` parameter of sampling configuration should be 0
-- StreamingLLM support for LLaMA (see docs/source/gpt_attention.md#streamingllm)
+- StreamingLLM support for LLaMA (see docs/source/advanced/gpt-attention.md#streamingllm)
 - Support for batch manager to return logits from context and/or generation phases
   - Include support in the Triton backend
 - Support AWQ and GPTQ for QWEN

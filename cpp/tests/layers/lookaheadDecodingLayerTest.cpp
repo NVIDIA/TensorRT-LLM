@@ -230,11 +230,11 @@ protected:
     TensorPtr mNumNewTokensCumSum;
     TensorPtr mPathsOffsets;
     TensorPtr mDraftLengths;
+    TensorPtr mPrevDraftLengths;
     TensorPtr mDraftTokens;
     TensorPtr mPackedMasks;
     TensorPtr mPackedMasksBool;
     TensorPtr mGenerationLengths;
-    TensorPtr mGenerationLengthsMax;
     TensorPtr mPositionOffsets;
     TensorPtr mPositionIds;
     TensorPtr mAttentionPackedMask;
@@ -371,6 +371,7 @@ void LookaheadDecodingLayerTest::allocateBuffers()
         ITensor::makeShape({mMaxTokensPerStep, maxBatchSize, 1}), nvinfer1::DataType::kINT32);
     mNumNewTokens = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mPrevDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mDraftTokens
         = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
     auto packedMaskShape = ITensor::makeShape(
@@ -382,7 +383,6 @@ void LookaheadDecodingLayerTest::allocateBuffers()
     mPathsOffsets = BufferManager::pinnedPool(
         ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
     mGenerationLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mGenerationLengthsMax = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
     mPositionOffsets
         = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
     mPositionIds
@@ -462,10 +462,8 @@ void LookaheadDecodingLayerTest::newRequests(std::vector<SizeType32> requestIds)
         setupParams->prompt.emplace_back(mPrompt[gbi]);
         setupParams->algoConfigs.emplace_back(mTestParam.w, mTestParam.n, mTestParam.g);
         PRINT_TOKENS(setupParams->prompt[bi]);
-        setupParams->generationLengths = mGenerationLengthsMax;
-        setupParams->actualGenerationLengths = mGenerationLengths;
+        setupParams->generationLengths = mGenerationLengths;
         setupParams->positionOffsets = mPositionOffsets;
-        // setupParams->outputs.positionIds = mPositionIds;
         setupParams->attentionPackedMasks = mPackedMasks;
     }
     std::vector<uint64_t> seed(requestIds.begin(), requestIds.end());
@@ -669,14 +667,14 @@ void LookaheadDecodingLayerTest::decodeForward()
     PRINT_VALUES(mSequenceLengths);
     outputParams->sequenceLength = mSequenceLengths;
     outputParams->nextDraftLengths = mDraftLengths;
+    outputParams->prevDraftLengths = mPrevDraftLengths;
     outputParams->nextDraftTokens = mDraftTokens;
     outputParams->packedMasks = mPackedMasks;
     outputParams->numNewTokens = mNumNewTokens;
     outputParams->newTokens = mNewTokens;
     outputParams->numNewTokensCumSum = mNumNewTokensCumSum;
     outputParams->pathsOffsets = mPathsOffsets;
-    outputParams->generationLengths = mGenerationLengthsMax;
-    outputParams->actualGenerationLengths = mGenerationLengths;
+    outputParams->generationLengths = mGenerationLengths;
     outputParams->positionOffsets = mPositionOffsets;
     outputParams->positionIds = mPositionIds;
     outputParams->packedMasks = mPackedMasks;
@@ -722,17 +720,17 @@ void LookaheadDecodingLayerTest::verifyDecode()
     BufferRange<SizeType32> cumSumRange(*mNumNewTokensCumSum);
     BufferRange<SizeType32> pathOffsetsRange(*mPathsOffsets);
     PRINT_VALUES(mNumNewTokensCumSum);
-    for (SizeType32 gbi = 0; gbi < mTestParam.maxBatchSize; gbi++)
+    for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
-        SizeType32 pathOffsetBegin = cumSumRange[gbi];
-        SizeType32 pathOffsetEnd = cumSumRange[gbi + 1];
+        auto gbi = BufferRange<SizeType32>(*mBatchSlots)[bi];
+        SizeType32 pathOffsetBegin = cumSumRange[bi];
+        SizeType32 pathOffsetEnd = cumSumRange[bi + 1];
         TensorPtr golden = ITensor::at(mGoldenSampledTokens, {gbi});
         auto sequenceLength = BufferLocation<SizeType32>(*mSequenceLengths).at(gbi);
         auto numNewTokens = BufferLocation<SizeType32>(*mNumNewTokens).at(gbi);
         TensorPtr newTokens = ITensor::slice(mOutputIds, {gbi, 0, sequenceLength - numNewTokens}, numNewTokens);
         BufferRange<SizeType32> goldenRange(*ITensor::at(mGoldenSampledTokens, {gbi}));
-        BufferRange<TokenIdType> newTokensRange(
-            *ITensor::slice(mOutputIds, {gbi, 0, sequenceLength - numNewTokens}, numNewTokens));
+        BufferRange<TokenIdType> newTokensRange(*newTokens);
 
         SizeType32 ni = 1;
         for (SizeType32 poi = pathOffsetBegin; poi < pathOffsetEnd; poi++)

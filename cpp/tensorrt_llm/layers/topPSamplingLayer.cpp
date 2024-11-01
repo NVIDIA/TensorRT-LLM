@@ -267,7 +267,7 @@ void TopPSamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> con
 
     TopPSamplingKernelParams<T> params{};
     params.probs = probs;
-    params.outputIds = bufferCastOrNull<TokenIdType*>(outputs->outputIdsPtr);
+    params.outputIdsPtrs = bufferCastOrNull<TokenIdType*>(outputs->outputIdsPtr);
     params.workspace = workspace->getRawWorkspaceDevicePtr();
     params.topPs = bufferCastOrNull<float>(mRuntimeTopPDevice);
     params.sequenceLength = sequenceLength;

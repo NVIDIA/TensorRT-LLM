@@ -43,8 +43,6 @@ def main():
     build_config = BuildConfig(max_input_len=256,
                                max_seq_len=276,
                                max_batch_size=1)
-    # just for fast build, not best for production
-    build_config.builder_opt = 0
     build_config.plugin_config.gemm_plugin = 'auto'
 
     if args.clean_build or not args.engine_dir.exists():

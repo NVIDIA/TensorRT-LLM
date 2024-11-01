@@ -75,11 +75,11 @@ public:
 
 using Output = decoder::Output;
 
-// TODO: is this a bad name to mix up with token concept in LLM? Would 'Event' be better? And should move to common.h
-class Token
+// used just as a container for easy returning / passing to function
+class DecoderFinishedEvent
 {
 public:
-    explicit Token(CudaEvent&& event, std::vector<bool> const& active)
+    explicit DecoderFinishedEvent(CudaEvent&& event, std::vector<bool> const& active)
         : event(std::move(event))
         , active(active)
     {
@@ -96,7 +96,7 @@ class IGptDecoderBatched : public virtual IStatefulGptDecoder
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
     using TensorPtr = std::shared_ptr<ITensor>;
-    using TokenPtr = std::unique_ptr<decoder_batch::Token const>;
+    using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
     //! @brief Setup buffers for ExplicitDraftTokens decoding.
     virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
@@ -105,15 +105,15 @@ public:
     virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual TokenPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
+    virtual DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
     //! @brief Call decoder forwardSync and wait for the call to `forwardAsync` associated with a token to complete.
-    virtual void forwardSync(
-        decoder_batch::Token const& token, decoder_batch::Output& output, decoder_batch::Input const& input)
+    virtual void forwardSync(decoder_batch::DecoderFinishedEvent const& token, decoder_batch::Output& output,
+        decoder_batch::Input const& input)
         = 0;
 
     //! @brief Wait for the call to `forwardAsync` associated with a token to complete.
-    virtual void forwardSync(decoder_batch::Token const& token) = 0;
+    virtual void forwardSync(decoder_batch::DecoderFinishedEvent const& token) = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
     virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input)

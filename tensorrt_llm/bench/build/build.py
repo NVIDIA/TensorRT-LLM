@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from select import select
-from sys import stdin
 from typing import Dict, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup, RequiredMutuallyExclusiveOptionGroup
@@ -170,25 +168,18 @@ def build_command(
     # Dataset options
     dataset_path: Path = params.pop("dataset")
     max_seq_len: int = params.pop("max_seq_length")
-    data_on_stdin: bool = bool(len(select([
-        stdin,
-    ], [], [], 0.0)[0]))
-
     # Initialize the HF tokenizer for the specified model.
     tokenizer = initialize_tokenizer(bench_env.model)
 
     # If we are receiving data from a path or stdin, parse and gather metadata.
-    if dataset_path or data_on_stdin:
+    if dataset_path:
         logger.info("Found dataset.")
-        # Cannot set the data file path and pipe in from stdin. Choose one.
-        if dataset_path is not None and data_on_stdin:
-            raise ValueError(
-                "Cannot provide a dataset on both stdin and by --dataset "
-                "option. Please pick one.")
-        stream = stdin if data_on_stdin else open(dataset_path, "r")
-        # Parse the dataset from stdin and return it plus its metadata.
-        metadata, _ = \
-            create_dataset_from_stream(tokenizer, stream=stream)
+        # Dataset Loading and Preparation
+        with open(dataset_path, "r") as dataset:
+            metadata, _ = create_dataset_from_stream(
+                tokenizer,
+                dataset,
+            )
         # The max sequence length option for build is the sum of max osl + isl.
         max_seq_len = metadata.max_sequence_length
         logger.info(metadata.get_summary_for_print())

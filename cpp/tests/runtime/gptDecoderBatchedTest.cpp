@@ -195,7 +195,8 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     SizeType32 constexpr nbRnnLayers{0};
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
-    ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{
+        vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
     auto streamPtr = std::make_shared<CudaStream>();
@@ -315,7 +316,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     SizeType32 constexpr nbRnnLayers{0};
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
-    ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{
+        vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
 
     auto streamPtr = std::make_shared<CudaStream>();
@@ -440,7 +442,8 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     SizeType32 constexpr nbRnnLayers{0};
     SizeType32 constexpr nbHeads{16};
     SizeType32 constexpr hiddenSize{1024};
-    ModelConfig modelConfig{vocabSize, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+    ModelConfig modelConfig{
+        vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
     modelConfig.useGptAttentionPlugin(false);
     modelConfig.setSpeculativeDecodingMode(SpeculativeDecodingMode::DraftTokensExternal());
 
@@ -486,7 +489,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto const maxAttentionWindow = maxSeqLength;
     SizeType32 const sinkTokenLength{0};
 
-    auto const decodingMode = maxBeamWidth == 1 ? tle::DecodingMode::TopKTopP() : tle::DecodingMode::BeamSearch();
+    auto const decodingMode = tle::DecodingMode::ExternalDraftTokens(); // only supports bw=1
 
     // set up decoder
     auto decoder
@@ -515,13 +518,10 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     decoder.forward(outputs, inputs);
 
     advanceSequenceLengths(expectedLengths, acceptedTokensPerStep, samplingConfigs, batchSize, maxBeamWidth);
-    // WAR: we don't write endId back into outputIds when we rejected tokens,
-    // so we adjust the lengths for verifyResults here
-    advanceSequenceLengths(generatedLengths, advancedTokensPerStep, samplingConfigs, batchSize, maxBeamWidth);
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(false));
 
-    verifyResults(manager, decoder, samplingConfigs, inputLengths, generatedLengths, batchSize, maxBeamWidth,
+    verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
         maxSeqLength, tokenId, padId);
 }
 

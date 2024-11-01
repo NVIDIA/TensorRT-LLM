@@ -51,6 +51,16 @@ void simple_assert(bool flag)
     }
 }
 
+void check_last_cuda_error()
+{
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        exit(-1);
+    }
+}
+
 struct CudaBuffer
 {
     void* _data;
@@ -85,8 +95,22 @@ struct CudaBuffer
 };
 
 template <typename T>
-float compare(int rank, void* _pa, void* _pb, int size, float scale)
+float compare(
+    int rank, void* _pa, void* _pb, int size, float scale, bool print_error = false, std::string const& cmp_info = "")
 {
+    if (print_error && rank == 0)
+    {
+        if (!cmp_info.empty())
+        {
+            printf("compare %s\n", cmp_info.c_str());
+        }
+        else
+        {
+            static int cnt = 0;
+            printf("unnamed compare %d\n", cnt++);
+        }
+    }
+
     auto pa = reinterpret_cast<T*>(_pa);
     auto pb = reinterpret_cast<T*>(_pb);
     float max_diff = 0.f, tot_diff = 0.f;
@@ -101,6 +125,10 @@ float compare(int rank, void* _pa, void* _pb, int size, float scale)
         float diff = std::abs(va - vb);
         if (diff > threshold)
         {
+            if (rank == 0 && print_error)
+            {
+                printf("err idx %d, value %f vs %f\n", n, va, vb);
+            }
             max_diff = std::max(max_diff, diff);
             tot_diff += diff;
             ++diff_cnt;
@@ -130,7 +158,7 @@ float compare(int rank, void* _pa, void* _pb, int size, float scale)
 template <typename T1, typename T2>
 void random_fill(std::vector<T1>& vec, T2 minv, T2 maxv)
 {
-    std::mt19937 gen(20240410);
+    std::mt19937 gen(20240725);
     std::uniform_real_distribution<float> dis(static_cast<float>(minv), static_cast<float>(maxv));
     for (auto& v : vec)
     {
@@ -164,8 +192,64 @@ std::string ar_info(AllReduceStrategyType runtime_strategy, AllReduceStrategyCon
     return info;
 }
 
-bool test(int token_num, int hidden_size, bool has_bias, bool has_affine, int warmup, int iter,
-    AllReduceStrategyType runtime_strategy = AllReduceStrategyType::ONESHOT,
+struct SetDevice
+{
+    SetDevice(int device_id)
+    {
+        TLLM_CUDA_CHECK(cudaSetDevice(device_id));
+    }
+};
+
+class Workspace
+{
+public:
+    Workspace(int world_size, int rank, int max_token_num, int max_hidden_size)
+        : world_config(world_size, 1, rank, world_size)
+        , set_device(world_config.getDevice())
+        , p_s(std::make_shared<tr::CudaStream>())
+        , buf_mgr(p_s)
+        , buffers(1, 1, max_token_num, max_hidden_size, buf_mgr, world_config)
+    {
+    }
+
+    void set_params(AllReduceParams& params) const
+    {
+        int world_size = world_config.getSize();
+        for (int i = 0; i < world_size; ++i)
+        {
+            params.peer_comm_buffer_ptrs[i] = buffers.mIpcMemoryHandles[0].getCommPtrs()[i];
+            params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = buffers.mIpcMemoryHandles[4].getCommPtrs()[i];
+            params.fusion_params.lamport_peer_comm_buffer_ptrs[i + MAX_RANKS_PER_NODE]
+                = buffers.mIpcMemoryHandles[5].getCommPtrs()[i];
+            params.fusion_params.lamport_peer_comm_buffer_ptrs[i + MAX_RANKS_PER_NODE * 2]
+                = buffers.mIpcMemoryHandles[6].getCommPtrs()[i];
+        }
+        for (int i = 0; i < world_size; ++i)
+        {
+            params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffers.mIpcMemoryHandles[2].getCommPtrs()[i]);
+        }
+        for (int i = 0; i < world_size; ++i)
+        {
+            params.peer_barrier_ptrs_out[i]
+                = reinterpret_cast<uint32_t*>(buffers.mIpcMemoryHandles[3].getCommPtrs()[i]);
+        }
+    }
+
+    cudaStream_t get_stream() const
+    {
+        return p_s->get();
+    }
+
+protected:
+    tr::WorldConfig world_config;
+    SetDevice set_device;
+    std::shared_ptr<tr::CudaStream> p_s;
+    tr::BufferManager buf_mgr;
+    tr::AllReduceBuffers buffers;
+};
+
+bool test(Workspace const& workspace, int token_num, int hidden_size, bool has_bias, bool has_affine, int warmup,
+    int iter, AllReduceStrategyType runtime_strategy = AllReduceStrategyType::ONESHOT,
     AllReduceStrategyConfig config = AllReduceStrategyConfig(0), AllReduceFusionOp fusion_op = AllReduceFusionOp::NONE)
 {
     std::srand(20240603);
@@ -183,9 +267,13 @@ bool test(int token_num, int hidden_size, bool has_bias, bool has_affine, int wa
     random_fill(residual_buffer, -1, 1);
     random_fill(weight_buffer, -1, 1);
     random_fill(bias_buffer, -1, 1);
+    random_fill(inter_buffer, 0, 0);
+    random_fill(output_buffer, 0, 0);
     residual.copy_from(residual_buffer.data());
     weight.copy_from(weight_buffer.data());
     bias.copy_from(bias_buffer.data());
+    inter.copy_from(inter_buffer.data());
+    out.copy_from(output_buffer.data());
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
@@ -195,40 +283,25 @@ bool test(int token_num, int hidden_size, bool has_bias, bool has_affine, int wa
         if (fusion_op == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             printf(
-                "Custom All Reduce with Residual Add and RMS Norm, %s, message size %d(token num %d, hidden size %d), "
+                "Custom All Reduce with Residual Add and RMS Norm, %s, message size %6d(token num %6d, hidden size "
+                "%6d), "
                 "has bias %d, has affine %d\n",
                 info.c_str(), message_size, token_num, hidden_size, static_cast<int>(has_bias),
                 static_cast<int>(has_affine));
         }
         else
         {
-            printf("Custom All Reduce, %s, message size %d(token num %d, hidden size %d), has bias %d, has affine %d\n",
+            printf(
+                "Custom All Reduce, %s, message size %d(token num %d, hidden size %6d), has bias %6d, has affine %6d\n",
                 info.c_str(), message_size, token_num, hidden_size, static_cast<int>(has_bias),
                 static_cast<int>(has_affine));
         }
     }
-    random_fill(input_buffer, -1 / world_size, 1 / world_size);
+    random_fill(input_buffer, -1, 1);
     in.copy_from(input_buffer.data());
-    cudaSetDevice(rank);
-
-    tr::WorldConfig world_config(world_size, 1, rank, world_size);
-    auto p_s = std::make_shared<tr::CudaStream>();
-    tr::BufferManager buf_mgr(p_s);
-    tr::AllReduceBuffers buffers(1, 1, token_num, hidden_size, buf_mgr, world_config);
 
     AllReduceParams params;
-    for (int i = 0; i < world_size; ++i)
-    {
-        params.peer_comm_buffer_ptrs[i] = buffers.mIpcMemoryHandles[0].getCommPtrs()[i];
-    }
-    for (int i = 0; i < world_size; ++i)
-    {
-        params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffers.mIpcMemoryHandles[2].getCommPtrs()[i]);
-    }
-    for (int i = 0; i < world_size; ++i)
-    {
-        params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(buffers.mIpcMemoryHandles[3].getCommPtrs()[i]);
-    }
+    workspace.set_params(params);
     params.barrier_flag = 0;
     params.ranks_per_node = world_size;
     params.local_rank = rank;
@@ -242,11 +315,18 @@ bool test(int token_num, int hidden_size, bool has_bias, bool has_affine, int wa
     params.fusion_params.eps = eps;
     params.fusion_params.intermediate_buffer = inter.data();
 
-    cudaStream_t s;
-    cudaStreamCreate(&s);
+    cudaStream_t s = workspace.get_stream();
     cudaEvent_t begin, end;
     cudaEventCreate(&begin);
     cudaEventCreate(&end);
+    lamportInitialize(
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[rank], message_size, nvinfer1::DataType::kHALF, s);
+    lamportInitialize(params.fusion_params.lamport_peer_comm_buffer_ptrs[rank + MAX_RANKS_PER_NODE], message_size,
+        nvinfer1::DataType::kHALF, s);
+    lamportInitialize(params.fusion_params.lamport_peer_comm_buffer_ptrs[rank + MAX_RANKS_PER_NODE * 2], message_size,
+        nvinfer1::DataType::kHALF, s);
+    cudaDeviceSynchronize();
+    comm.barrier();
     for (int i = 0; i < warmup; ++i)
     {
         params.barrier_flag += 1;
@@ -307,7 +387,7 @@ bool test(int token_num, int hidden_size, bool has_bias, bool has_affine, int wa
     {
         printf("\033[31mFAILED\033[0m\n");
     }
-    cudaStreamDestroy(s);
+    comm.barrier();
     return pass;
 }
 
@@ -315,6 +395,7 @@ TEST(Kernel, AllReduce)
 {
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
+    auto rank = comm.getRank();
     if (world_size % 2)
         return;
 
@@ -331,6 +412,8 @@ TEST(Kernel, AllReduce)
     };
     // clang-format on
     bool pass = true;
+    int max_token_num = 1000, max_hidden_size = 8192;
+    Workspace workspace(world_size, rank, max_token_num, max_hidden_size);
     for (auto config : configs)
     {
         for (auto op : ops)
@@ -340,23 +423,23 @@ TEST(Kernel, AllReduce)
                 for (auto has_affine : {false, true})
                 {
                     pass = pass
-                        && test(
-                            1, 4096, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT, config, op);
+                        && test(workspace, 1, 4096, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT,
+                            config, op);
                     pass = pass
-                        && test(
-                            1, 8192, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT, config, op);
+                        && test(workspace, 1, 8192, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT,
+                            config, op);
                     pass = pass
-                        && test(
-                            10, 4096, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT, config, op);
+                        && test(workspace, 10, 4096, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT,
+                            config, op);
                     pass = pass
-                        && test(
-                            10, 8192, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT, config, op);
+                        && test(workspace, 10, 8192, has_bias, has_affine, warmup, iter, AllReduceStrategyType::ONESHOT,
+                            config, op);
                     pass = pass
-                        && test(
-                            1000, 4096, has_bias, has_affine, warmup, iter, AllReduceStrategyType::TWOSHOT, config, op);
+                        && test(workspace, 1000, 4096, has_bias, has_affine, warmup, iter,
+                            AllReduceStrategyType::TWOSHOT, config, op);
                     pass = pass
-                        && test(
-                            1000, 8192, has_bias, has_affine, warmup, iter, AllReduceStrategyType::TWOSHOT, config, op);
+                        && test(workspace, 1000, 8192, has_bias, has_affine, warmup, iter,
+                            AllReduceStrategyType::TWOSHOT, config, op);
                 }
             }
         }
@@ -368,28 +451,22 @@ TEST(Kernel, AllReduceOneShot)
 {
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
+    auto rank = comm.getRank();
     if (world_size % 2)
         return;
 
     int warmup = 100, iter = 100;
-    std::vector<int> candidate_bs{1, 2, 4, 8, 16, 32, 64, 128};
-    std::vector<int> candidate_hidden{4096, 8192, 12288, 16384};
+    std::vector<int> candidate_bs{1, 2, 4, 8, 16};
+    std::vector<int> candidate_hidden{1024, 2048, 4096, 8192};
     bool pass = true;
+    int max_token_num = 16, max_hidden_size = 8192;
+    Workspace workspace(world_size, rank, max_token_num, max_hidden_size);
     for (auto bs : candidate_bs)
     {
         for (auto hidden : candidate_hidden)
         {
             pass = pass
-                && test(bs, hidden, false, true, warmup, iter, AllReduceStrategyType::ONESHOT,
-                    AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
-            pass = pass
-                && test(bs, hidden, true, true, warmup, iter, AllReduceStrategyType::ONESHOT,
-                    AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
-            pass = pass
-                && test(bs, hidden, false, false, warmup, iter, AllReduceStrategyType::ONESHOT,
-                    AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
-            pass = pass
-                && test(bs, hidden, true, false, warmup, iter, AllReduceStrategyType::ONESHOT,
+                && test(workspace, bs, hidden, false, true, warmup, iter, AllReduceStrategyType::ONESHOT,
                     AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
         }
     }

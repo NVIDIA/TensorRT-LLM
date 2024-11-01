@@ -85,6 +85,7 @@ struct TestSamplingParams
     std::vector<float> decay;
     std::vector<float> minTopP;
     std::vector<int32_t> topPResetIds;
+    int32_t batchSize = 6;
     bool useBias = false;
 };
 
@@ -96,11 +97,10 @@ protected:
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
 
     int32_t seed = 0;
-    static uint64_t const mMaxSeed = 32;
-    int32_t const mBatchSize = 6;
-    int32_t const mMaxBatchSize = 2 * mBatchSize;
+    int32_t mBatchSize = -1; // setup by runTest
+    static int32_t constexpr mBatchSizeBadPad = 512;
+    static uint64_t constexpr mMaxSeed = 32;
     int32_t const mBeamWidth = 1;
-    int32_t const mBatchBeam = mBatchSize * mBeamWidth;
     int32_t const mVocabSize = 8;
     int32_t const mVocabSizePadded = mVocabSize;
 
@@ -134,6 +134,16 @@ protected:
     std::shared_ptr<tensorrt_llm::runtime::DecodingLayerWorkspace> mDecodingWorkspace;
 
     std::vector<T> mTestLogitsInit;
+
+    int32_t maxBatchSize() const
+    {
+        return 2 * mBatchSize;
+    }
+
+    int32_t batchBeam() const
+    {
+        return mBatchSize * mBeamWidth;
+    }
 
     void setup(uint64_t seed, TestSamplingParams const& params);
 

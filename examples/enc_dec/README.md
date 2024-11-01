@@ -219,6 +219,8 @@ For good usability, Python binding of the C++ runtime is provided. You can use t
 python3 ../run.py --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} --tokenizer_dir tmp/hf_models/${MODEL_NAME} --max_output_len 64 --num_beams=1 --input_text "translate English to German: The house is wonderful."
 ```
 
+You can specify `--kv_cache_free_gpu_memory_fraction` to control the percentage of free GPU memory to be used by KV cache (by default 0.9), and `--cross_kv_cache_fraction` to control the percentage of KV cache to be used by cross attention (by default 0.5, and rest of the KV cache will be used by self attention).
+
 For pure C++ runtime, there is no example given yet. Please check the [`Executor`](../../cpp/include/tensorrt_llm/executor/executor.h) API to implement your own end-to-end workflow. It is highly recommended to leverage more encapsulated solutions such as the above C++ Python binding or [Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend).
 
 #### Run with Triton Backend

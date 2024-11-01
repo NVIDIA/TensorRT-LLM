@@ -59,7 +59,6 @@ def build_engine(ckpt_dir: str,
         "--max_seq_len=384",
         "--gpt_attention_plugin=float16",
         "--gemm_plugin=float16",
-        "--builder_opt=0",
     ]
     if is_ifb:
         build_cmd.extend([
