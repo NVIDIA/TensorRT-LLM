@@ -7,6 +7,7 @@
   <title>Model Definition &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -18,6 +19,8 @@
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../_static/copybutton.js?v=f281be69"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -58,15 +61,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -99,7 +103,14 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="#runtime">Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#examples">Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#llama-3-1-70b">Llama 3.1 70B</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#llama-3-1-405b">Llama 3.1 405B</a></li>
+</ul>
+</li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint.html">TensorRT-LLM Checkpoint</a></li>
 <li class="toctree-l1"><a class="reference internal" href="workflow.html">TensorRT-LLM Build Workflow</a></li>
 <li class="toctree-l1"><a class="reference internal" href="add-model.html">Adding a Model</a></li>
@@ -108,17 +119,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -343,7 +359,7 @@ triggers a CUDA kernel in the <code class="docutils literal notranslate"><span c
 </pre></div>
 </div>
 <p>For more details on how TensorRT-LLM implements the GPT Attention operator, see
-the <a class="reference internal" href="#gpt_attention.md"><span class="xref myst">Multi-head, Multi-query and Group-query Attention</span></a> document.</p>
+the <a class="reference internal" href="../advanced/gpt-attention.html"><span class="std std-doc">Multi-head, Multi-query and Group-query Attention</span></a> document.</p>
 </section>
 </section>
 <section id="runtime">
@@ -352,7 +368,7 @@ the <a class="reference internal" href="#gpt_attention.md"><span class="xref mys
 the runtime components is to load the TensorRT engines and drive their
 execution. Typically, for an auto-regressive model like GPT, the runtime is in
 charge of loading the engine that implements both the processing of the input
-sequence as well as the body of the generation loop. See the <a class="reference internal" href="#gpt_runtime.md"><span class="xref myst">GPT C++
+sequence as well as the body of the generation loop. See the <a class="reference internal" href="../advanced/gpt-runtime.html"><span class="std std-doc">GPT C++
 Runtime</span></a> document for details on the C++ Runtime.</p>
 </section>
 <section id="multi-gpu-and-multi-node-support">
@@ -388,6 +404,126 @@ subsets of layers. Tensor Parallelism usually leads to more balanced executions
 but requires more memory bandwidth between the GPUs. Pipeline Parallelism
 reduces the need for high-bandwidth communication but may incur load-balancing
 issues and may be less efficient in terms of GPU utilization.</p>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading"></a></h2>
+<p>Here are examples of Llama 3.1 70B and Llama 3.1 405B showing how to perform multi-GPU and multi-node inference in TensorRT-LLM. The example of Llama 3.1 70B performs multi-GPU inference on a single node, while the example of Llama 3.1 405B performs multi-node inference.</p>
+<section id="llama-3-1-70b">
+<h3>Llama 3.1 70B<a class="headerlink" href="#llama-3-1-70b" title="Link to this heading"></a></h3>
+<p>The following sample commands build an engine for running the Llama 3.1 70B model with tensor parallelism (TP=4) using 4 GPUs on a single node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">folder_trt_llm</span><span class="o">=</span>../TensorRT-LLM
+<span class="nv">model_dir</span><span class="o">=</span>Llama-3.1-70B
+<span class="nv">ckpt_dir</span><span class="o">=</span>ckpt_llama_3.1_70b
+<span class="nv">engine_dir</span><span class="o">=</span>engine_llama_3.1_70b
+<span class="nv">dtype</span><span class="o">=</span>bfloat16
+<span class="nv">tp_size</span><span class="o">=</span><span class="m">4</span>
+<span class="nv">pp_size</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">kv_cache_type</span><span class="o">=</span>paged
+<span class="nv">max_input_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_output_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_batch_size</span><span class="o">=</span><span class="m">4</span>
+<span class="nv">workers</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="nv">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">pp_size</span><span class="w"> </span><span class="k">))</span>
+
+python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="si">${</span><span class="nv">tp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--pp_size<span class="w"> </span><span class="si">${</span><span class="nv">pp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use_parallel_embedding
+
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gemm_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpt_attention_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_type<span class="w"> </span><span class="si">${</span><span class="nv">kv_cache_type</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="si">${</span><span class="nv">max_input_len</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="k">$((</span><span class="w"> </span><span class="nv">max_input_len</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nv">max_output_len</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>The following sample commands perform inference using 4 GPUs on a single node by running <code class="docutils literal notranslate"><span class="pre">examples/run.py</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">input_text</span><span class="o">=</span><span class="s2">&quot;Born in north-east France, Soyer trained as a&quot;</span>
+
+mpirun<span class="w"> </span>-n<span class="w"> </span><span class="k">$((</span><span class="w"> </span><span class="nv">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nv">pp_size</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/run.py<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--engine_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--tokenizer_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--input_text<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">input_text</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--max_output_len<span class="w"> </span><span class="si">${</span><span class="nv">max_output_len</span><span class="si">}</span>
+</pre></div>
+</div>
+</section>
+<section id="llama-3-1-405b">
+<h3>Llama 3.1 405B<a class="headerlink" href="#llama-3-1-405b" title="Link to this heading"></a></h3>
+<p>The following sample commands build an engine for running the Llama 3.1 405B model with tensor parallelism (TP=16) on 2 nodes that each have 8 GPUs. Although the model runs on multiple nodes, you can build the engine on a single node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">folder_trt_llm</span><span class="o">=</span>../TensorRT-LLM
+<span class="nv">model_dir</span><span class="o">=</span>Llama-3.1-405B
+<span class="nv">ckpt_dir</span><span class="o">=</span>ckpt_llama_3.1_405b
+<span class="nv">engine_dir</span><span class="o">=</span>engine_llama_3.1_405b
+<span class="nv">dtype</span><span class="o">=</span>bfloat16
+<span class="nv">tp_size</span><span class="o">=</span><span class="m">16</span>
+<span class="nv">pp_size</span><span class="o">=</span><span class="m">1</span>
+<span class="nv">kv_cache_type</span><span class="o">=</span>paged
+<span class="nv">max_input_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_output_len</span><span class="o">=</span><span class="m">128</span>
+<span class="nv">max_batch_size</span><span class="o">=</span><span class="m">4</span>
+<span class="nv">workers</span><span class="o">=</span><span class="m">8</span>
+
+python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/llama/convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="si">${</span><span class="nv">tp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--pp_size<span class="w"> </span><span class="si">${</span><span class="nv">pp_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use_parallel_embedding
+
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span><span class="si">${</span><span class="nv">ckpt_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gemm_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpt_attention_plugin<span class="w"> </span><span class="si">${</span><span class="nv">dtype</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_type<span class="w"> </span><span class="si">${</span><span class="nv">kv_cache_type</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_input_len<span class="w"> </span><span class="si">${</span><span class="nv">max_input_len</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="k">$((</span><span class="w"> </span><span class="nv">max_input_len</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nv">max_output_len</span><span class="w"> </span><span class="k">))</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="si">${</span><span class="nv">max_batch_size</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--workers<span class="w"> </span><span class="si">${</span><span class="nv">workers</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>The following sample script, <code class="docutils literal notranslate"><span class="pre">launch_llama_3.1_405b.sh</span></code>, shows how to perform inference with Slurm on 2 nodes that each have 8 GPUs. If you use a different workload management software, the key concern is to run the <code class="docutils literal notranslate"><span class="pre">examples/run.py</span></code> command.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="c1">#SBATCH --account account</span>
+<span class="c1">#SBATCH --partition partition</span>
+<span class="c1">#SBATCH --job-name job-name</span>
+<span class="c1">#SBATCH --time 1:00:00</span>
+<span class="c1">#SBATCH --nodes 2</span>
+
+<span class="nv">folder_trt_llm</span><span class="o">=</span>../TensorRT-LLM
+<span class="nv">engine_dir</span><span class="o">=</span>engine_llama_3.1_405b
+<span class="nv">model_dir</span><span class="o">=</span>Llama-3.1-405B
+<span class="nv">max_output_len</span><span class="o">=</span><span class="m">128</span>
+
+<span class="nv">input_text</span><span class="o">=</span><span class="s2">&quot;Born in north-east France, Soyer trained as a&quot;</span>
+
+srun<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ntasks-per-node<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mpi<span class="w"> </span>pmix<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>python<span class="w"> </span><span class="si">${</span><span class="nv">folder_trt_llm</span><span class="si">}</span>/examples/run.py<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--engine_dir<span class="w"> </span><span class="si">${</span><span class="nv">engine_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--tokenizer_dir<span class="w"> </span><span class="si">${</span><span class="nv">model_dir</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--input_text<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">input_text</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--max_output_len<span class="w"> </span><span class="si">${</span><span class="nv">max_output_len</span><span class="si">}</span>
+</pre></div>
+</div>
+<p>You can perform inference by running the script on the Slurm cluster.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sbatch<span class="w"> </span>launch_llama_3.1_405b.sh
+</pre></div>
+</div>
+</section>
+</section>
 </section>
 
 
@@ -401,7 +537,7 @@ issues and may be less efficient in terms of GPU utilization.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0de69b10>
+<jinja2.runtime.BlockReference object at 0x7fc13e2c7160>
 
 <div class="footer">
     <p>

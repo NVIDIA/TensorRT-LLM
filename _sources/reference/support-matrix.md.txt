@@ -43,7 +43,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
 - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
 - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
-- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
+- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)[^ReplitCode]
 - [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
 - [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
 - [Skywork](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork)
@@ -117,6 +117,7 @@ The following table shows the supported software for TensorRT-LLM.
     - Turing (SM75) - FP32, FP16, INT8[^smooth], INT4
     - Volta (SM70) - FP32, FP16, INT8[^smooth], INT4[^smlt75]
 ```
+[^ReplitCode]：Replit Code is not supported with the transformers 4.45+.
 
 [^smooth]: INT8 SmoothQuant is not supported on SM70 and SM75.
 

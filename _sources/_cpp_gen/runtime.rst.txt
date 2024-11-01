@@ -112,6 +112,12 @@ __________
 .. doxygenfile:: ipcUtils.h
    :project: TensorRT-LLM
 
+lookaheadBuffers.h
+__________________
+
+.. doxygenfile:: lookaheadBuffers.h
+   :project: TensorRT-LLM
+
 lookaheadModule.h
 _________________
 
@@ -200,11 +206,5 @@ worldConfig.h
 _____________
 
 .. doxygenfile:: worldConfig.h
-   :project: TensorRT-LLM
-
-lookaheadBuffers.h
-__________________
-
-.. doxygenfile:: lookaheadBuffers.h
    :project: TensorRT-LLM
 

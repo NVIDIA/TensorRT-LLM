@@ -6,6 +6,7 @@
   <title>tensorrt_llm.runtime.generation &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -17,6 +18,8 @@
         <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
         <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -55,15 +58,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -98,17 +102,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -169,6 +178,7 @@
 
 <span class="kn">import</span> <span class="nn">copy</span>
 <span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">import</span> <span class="nn">os</span>
 <span class="kn">import</span> <span class="nn">platform</span>
 <span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">Counter</span>
 <span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
@@ -200,6 +210,10 @@
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
 <span class="kn">from</span> <span class="nn">.kv_cache_manager</span> <span class="kn">import</span> <span class="n">GenerationSequence</span><span class="p">,</span> <span class="n">KVCacheUpdater</span>
 <span class="kn">from</span> <span class="nn">.session</span> <span class="kn">import</span> <span class="n">_scoped_stream</span>
+
+<span class="c1"># When variable is set, this will disable torch.cuda.set_device(...) calls</span>
+<span class="c1"># Useful in situations where device is already assigned by another library, i.e., megatron.</span>
+<span class="n">DISABLE_TORCH_DEVICE_SET</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;DISABLE_TORCH_DEVICE_SET&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="decode_words_list">
@@ -371,6 +385,8 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">address</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device_memory_size</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">__prepare</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">engine_buffer</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">logger</span><span class="o">.</span><span class="n">level</span> <span class="o">==</span> <span class="s2">&quot;verbose&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">__print_engine_info</span><span class="p">()</span>
 
     <span class="k">def</span> <span class="nf">_serialize_engine</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">IHostMemory</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span>
@@ -404,8 +420,11 @@
     <span class="k">def</span> <span class="nf">__prepare</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">engine_buffer</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
         <span class="n">local_rank</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span> <span class="o">%</span> <span class="n">mapping</span><span class="o">.</span><span class="n">gpus_per_node</span>
-        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">local_rank</span><span class="p">)</span>
-        <span class="n">CUASSERT</span><span class="p">(</span><span class="n">cudart</span><span class="o">.</span><span class="n">cudaSetDevice</span><span class="p">(</span><span class="n">local_rank</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">DISABLE_TORCH_DEVICE_SET</span><span class="p">:</span>
+            <span class="n">CUASSERT</span><span class="p">(</span><span class="n">cudart</span><span class="o">.</span><span class="n">cudaSetDevice</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">local_rank</span><span class="p">)</span>
+            <span class="n">CUASSERT</span><span class="p">(</span><span class="n">cudart</span><span class="o">.</span><span class="n">cudaSetDevice</span><span class="p">(</span><span class="n">local_rank</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Runtime</span><span class="p">(</span><span class="n">logger</span><span class="o">.</span><span class="n">trt_logger</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">engine</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">deserialize_cuda_engine</span><span class="p">(</span><span class="n">engine_buffer</span><span class="p">)</span>
@@ -475,6 +494,84 @@
                     <span class="s2">&quot;Python runtime only support 1 or 2 optimization profiles, &quot;</span>
                     <span class="s2">&quot;set --multiple_profiles=disable when calling trtllm-build &quot;</span>
                     <span class="s2">&quot;to disable the feature.&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">__print_engine_info</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">engine</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span>
+        <span class="n">context</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">create_execution_context</span><span class="p">(</span>
+            <span class="n">trt</span><span class="o">.</span><span class="n">ExecutionContextAllocationStrategy</span><span class="o">.</span><span class="n">USER_MANAGED</span><span class="p">)</span>
+        <span class="n">n_op</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">num_optimization_profiles</span>
+        <span class="n">mwn</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Name</span>
+        <span class="n">mws</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Shape</span>
+        <span class="n">tensor_name_list</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">num_io_tensors</span><span class="p">)</span>
+        <span class="p">]</span>
+
+        <span class="c1"># Get information of engine input / output</span>
+        <span class="n">tid</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># Tensor Information Dictionary</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tensor_name_list</span><span class="p">:</span>
+            <span class="n">item</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+            <span class="n">mwn</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">mwn</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="n">item</span><span class="p">[</span><span class="s2">&quot;mode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;I&#39;</span> <span class="k">if</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_mode</span><span class="p">(</span>
+                <span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">TensorIOMode</span><span class="o">.</span><span class="n">INPUT</span> <span class="k">else</span> <span class="s1">&#39;O&#39;</span>
+            <span class="n">item</span><span class="p">[</span><span class="s2">&quot;location&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;GPU&#39;</span> <span class="k">if</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_location</span><span class="p">(</span>
+                <span class="n">name</span><span class="p">)</span> <span class="k">else</span> <span class="s1">&#39;CPU&#39;</span>
+            <span class="n">item</span><span class="p">[</span><span class="s2">&quot;data_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_dtype</span><span class="p">(</span><span class="n">name</span><span class="p">))[</span><span class="mi">9</span><span class="p">:]</span>
+            <span class="n">item</span><span class="p">[</span><span class="s2">&quot;build_shape&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_shape</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="n">item</span><span class="p">[</span><span class="s2">&quot;profile_list&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_op</span><span class="p">)]</span>
+            <span class="k">if</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;mode&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;I&quot;</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_op</span><span class="p">):</span>
+                    <span class="k">if</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;location&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;GPU&quot;</span><span class="p">:</span>
+                        <span class="n">shape</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_profile_shape</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">shape</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_profile_value</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+                    <span class="n">item</span><span class="p">[</span><span class="s2">&quot;profile_list&quot;</span><span class="p">][</span><span class="n">k</span><span class="p">]</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+                    <span class="n">mws</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">mws</span><span class="p">,</span> <span class="o">*</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">s</span><span class="p">))</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">shape</span><span class="p">])</span>
+            <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">item</span>
+        <span class="c1"># Set input shape to get output shape</span>
+        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_op</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>  <span class="c1"># Min, Opt, Max</span>
+                <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tid</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+                    <span class="k">if</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="s2">&quot;mode&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;I&quot;</span><span class="p">:</span>
+                        <span class="k">if</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="s2">&quot;location&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;GPU&quot;</span><span class="p">:</span>
+                            <span class="n">context</span><span class="o">.</span><span class="n">set_input_shape</span><span class="p">(</span>
+                                <span class="n">name</span><span class="p">,</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="s2">&quot;profile_list&quot;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="n">j</span><span class="p">])</span>
+                        <span class="k">else</span><span class="p">:</span>
+                            <span class="n">context</span><span class="o">.</span><span class="n">set_tensor_address</span><span class="p">(</span>
+                                <span class="n">name</span><span class="p">,</span>
+                                <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="s2">&quot;profile_list&quot;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="n">j</span><span class="p">]</span><span class="o">.</span><span class="n">ctypes</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="s2">&quot;mode&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;O&quot;</span><span class="p">:</span>
+                        <span class="k">assert</span> <span class="n">context</span><span class="o">.</span><span class="n">all_binding_shapes_specified</span> <span class="ow">and</span> <span class="n">context</span><span class="o">.</span><span class="n">all_shape_inputs_specified</span>
+                        <span class="n">shape</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">get_tensor_shape</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+                        <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="s2">&quot;profile_list&quot;</span><span class="p">][</span><span class="n">k</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+
+        <span class="c1"># Print information of engine input / output</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;Information of engine input / output.&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|I/O|Location|DataType|</span><span class="si">{</span><span class="s1">&#39;Shape&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tensor_name_list</span><span class="p">:</span>
+            <span class="n">item</span> <span class="o">=</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;mode&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^3s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;location&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^8s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;data_type&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^8s</span><span class="si">}</span><span class="s2">|&quot;</span>
+            <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;build_shape&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="c1"># Print information of optimization profile</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;Information of optimization profile.&quot;</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_op</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Optimization Profile </span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">:&quot;</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Min&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Opt&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Max&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+            <span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tensor_name_list</span><span class="p">:</span>
+                <span class="n">item</span> <span class="o">=</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+                <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">1</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">2</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_set_shape</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="n">trt</span><span class="o">.</span><span class="n">IExecutionContext</span><span class="p">,</span>
                    <span class="n">shape_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]):</span>
@@ -664,7 +761,7 @@
     <span class="n">lora_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">trtllm_modules_to_hf_modules</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">skip_cross_qkv</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">skip_cross_kv</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">num_medusa_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">max_medusa_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">paged_state</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
@@ -680,7 +777,8 @@
     <span class="c1"># ReDrafter</span>
     <span class="n">redrafter_num_beams</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">redrafter_draft_len_per_beam</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="n">num_kv_heads_per_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">num_kv_heads_per_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">num_kv_heads_per_cross_attn_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -693,12 +791,15 @@
 
     <span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
     <span class="n">num_beams</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">num_return_sequences</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="n">sink_token_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="n">output_sequence_lengths</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">return_dict</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">stop_words_list</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
-    <span class="n">bad_words_list</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="n">stop_words_list</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">list</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+                                    <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="n">bad_words_list</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">list</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
+                                   <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
 
     <span class="n">temperature</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mf">1.0</span><span class="p">)</span>
     <span class="n">top_k</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
@@ -878,9 +979,12 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span> <span class="o">=</span> <span class="n">model_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span> <span class="o">=</span> <span class="n">_Runtime</span><span class="p">(</span><span class="n">engine_buffer</span><span class="p">,</span> <span class="n">mapping</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s1">&#39;cuda:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">runtime_rank</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">mapping</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
-        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">DISABLE_TORCH_DEVICE_SET</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;cuda:</span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s1">&#39;cuda:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">runtime_rank</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">mapping</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="c1"># dynamic_decoder currently use torch&#39;s current stream, so must let TRT enqueue use same stream here</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">stream</span> <span class="o">=</span> <span class="n">stream</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1000,6 +1104,8 @@
                 <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_block_offsets&#39;</span><span class="p">]</span>
                 <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span><span class="p">]</span>
                 <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_mapping&#39;</span><span class="p">]</span>
+                <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">]</span>
+                <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;cross_attention_packed_mask&#39;</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># Refer to gpt_attention() inside functional.py</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span><span class="p">:</span>
@@ -1016,6 +1122,10 @@
                                 <span class="sa">f</span><span class="s1">&#39;cross_present_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
                                 <span class="sa">f</span><span class="s1">&#39;cross_past_key_value_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span>
                             <span class="p">]</span>
+                    <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span>
+                        <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">,</span>
+                    <span class="p">]</span>
+                    <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;cross_attention_packed_mask&#39;</span><span class="p">]</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span>
                         <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">,</span>
@@ -1044,7 +1154,8 @@
 
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span>
                 <span class="s1">&#39;context_lengths&#39;</span><span class="p">,</span> <span class="s1">&#39;host_request_types&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;host_sink_token_length&#39;</span><span class="p">,</span> <span class="s1">&#39;host_runtime_perf_knobs&#39;</span>
+                <span class="s1">&#39;host_sink_token_length&#39;</span><span class="p">,</span> <span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">,</span>
+                <span class="s1">&#39;host_context_progress&#39;</span>
             <span class="p">]</span>
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s1">&#39;host_max_attention_window_sizes&#39;</span><span class="p">]</span>
             <span class="k">if</span> <span class="n">model_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
@@ -1069,9 +1180,9 @@
                 <span class="s1">&#39;encoder_max_input_length&#39;</span><span class="p">,</span>
                 <span class="s1">&#39;cross_kv_cache_gen&#39;</span><span class="p">,</span>
             <span class="p">]</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_qkv</span> <span class="o">=</span> <span class="n">model_config</span><span class="o">.</span><span class="n">skip_cross_qkv</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_qkv</span><span class="p">:</span>
-                <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="s1">&#39;cross_qkv_reuse&#39;</span><span class="p">]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_kv</span> <span class="o">=</span> <span class="n">model_config</span><span class="o">.</span><span class="n">skip_cross_kv</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_kv</span><span class="p">:</span>
+                <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="s1">&#39;cross_kv_reuse&#39;</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">]</span>
@@ -1496,7 +1607,7 @@
 
         <span class="k">assert</span> <span class="n">scfg</span><span class="o">.</span><span class="n">end_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;end_id cannot be none&quot;</span>
         <span class="k">assert</span> <span class="n">scfg</span><span class="o">.</span><span class="n">pad_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">&#39;pad_id cannot be none&#39;</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">end_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">batch_size</span> <span class="o">*</span> <span class="n">scfg</span><span class="o">.</span><span class="n">num_beams</span><span class="p">,</span> <span class="p">),</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">end_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">batch_size</span><span class="p">,</span> <span class="p">),</span>
                                   <span class="n">scfg</span><span class="o">.</span><span class="n">end_id</span><span class="p">,</span>
                                   <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
                                   <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
@@ -1655,7 +1766,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">beam_hyps_num_beams</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">beam_hyps_is_done</span> <span class="o">=</span> <span class="kc">None</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">cross_qkv_reuse</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_reuse</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span> <span class="nf">_tensor_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
         <span class="c1"># return torch dtype given tensor name for convenience</span>
@@ -1910,14 +2021,20 @@
                         <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
                     <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="o">.</span><span class="n">prepare_num_kv_heads_per_layer</span><span class="p">(</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">)</span>
 
                     <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="p">(</span>
                         <span class="n">num_blocks</span><span class="o">=</span><span class="n">cross_num_blocks</span><span class="p">,</span>
                         <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
                         <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_kv_heads_per_cross_attn_layer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">num_kv_heads_per_cross_attn_layer</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="o">.</span><span class="n">prepare_num_kv_heads_per_layer</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">num_kv_heads_per_cross_attn_layer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_kv_heads_per_cross_attn_layer</span>
+
                     <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span>
-                        <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">num_kv_heads_per_layer</span><span class="p">)</span>
+                        <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">num_kv_heads_per_cross_attn_layer</span><span class="p">)</span>
 
             <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">first_layer</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">last_layer</span><span class="p">):</span>
@@ -2100,6 +2217,7 @@
         <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">host_runtime_perf_knobs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">host_context_progress</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RuntimeTensor</span><span class="p">]:</span>
         <span class="n">tensors</span> <span class="o">=</span> <span class="p">{}</span>
 
@@ -2125,6 +2243,7 @@
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">context_lengths</span><span class="p">,</span> <span class="s1">&#39;context_lengths&#39;</span><span class="p">)</span>
                 <span class="k">assert</span> <span class="n">host_runtime_perf_knobs</span> <span class="o">!=</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;gpt_attention_plugin needs to set host_runtime_perf_knobs&quot;</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">host_runtime_perf_knobs</span><span class="p">,</span> <span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">)</span>
+                <span class="n">add_tensor</span><span class="p">(</span><span class="n">host_context_progress</span><span class="p">,</span> <span class="s1">&#39;host_context_progress&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="n">cache_indirection</span><span class="p">,</span> <span class="s1">&#39;cache_indirection&#39;</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">:</span>
@@ -2134,24 +2253,47 @@
             <span class="c1"># in context phase, need to generate cross kv cache, set to True</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">),</span>
                        <span class="s1">&#39;cross_kv_cache_gen&#39;</span><span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_qkv</span><span class="p">:</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_qkv_reuse</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_kv</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_reuse</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="c1"># see Attention&#39;s self.qkv output dim</span>
-                    <span class="n">cross_qkv_out_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span> <span class="o">+</span> <span class="p">(</span>
-                        <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">()</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">)</span>
-                    <span class="n">cross_qkv_shape</span> <span class="o">=</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span>
-                        <span class="n">cross_qkv_out_dim</span><span class="p">,</span> <span class="p">)</span>
-                    <span class="n">cross_qkv_reuse</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">cross_qkv_shape</span><span class="p">,</span>
-                                                  <span class="n">dtype</span><span class="o">=</span><span class="n">encoder_output</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                                                  <span class="n">device</span><span class="o">=</span><span class="n">encoder_output</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_qkv_reuse</span> <span class="o">=</span> <span class="n">cross_qkv_reuse</span>
-                <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_qkv_reuse</span><span class="p">,</span> <span class="s1">&#39;cross_qkv_reuse&#39;</span><span class="p">)</span>
+                    <span class="n">cross_kv_out_dim</span> <span class="o">=</span> <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(</span>
+                    <span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span>
+                    <span class="n">cross_kv_shape</span> <span class="o">=</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span>
+                        <span class="n">cross_kv_out_dim</span><span class="p">,</span> <span class="p">)</span>
+                    <span class="n">cross_kv_reuse</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">cross_kv_shape</span><span class="p">,</span>
+                                                 <span class="n">dtype</span><span class="o">=</span><span class="n">encoder_output</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                                                 <span class="n">device</span><span class="o">=</span><span class="n">encoder_output</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_reuse</span> <span class="o">=</span> <span class="n">cross_kv_reuse</span>
+                <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_reuse</span><span class="p">,</span> <span class="s1">&#39;cross_kv_reuse&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="s1">&#39;encoder_output&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="n">encoder_input_lengths</span><span class="p">,</span> <span class="s1">&#39;encoder_input_lengths&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;encoder_max_input_length&#39;</span><span class="p">],</span>
                        <span class="s1">&#39;encoder_max_input_length&#39;</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_mask</span><span class="p">,</span> <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">cross_attention_mask</span> <span class="o">!=</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># cross-attention packed mask (used by fmha).</span>
+                    <span class="n">cross_attention_packed_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">pack_fmha_mask_by_input</span><span class="p">(</span>
+                        <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
+                        <span class="n">encoder_input_lengths</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_mask</span><span class="p">,</span> <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_packed_mask</span><span class="p">,</span>
+                               <span class="s1">&#39;cross_attention_packed_mask&#39;</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="c1"># create a full 1 cross_attention_mask because it is necessary</span>
+                    <span class="n">batch_size</span> <span class="o">=</span> <span class="n">context_lengths</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                    <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span>
+                        <span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="o">.</span><span class="n">prod</span><span class="p">(),</span>
+                         <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">)[:</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">prod</span><span class="p">()),</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span>
+                        <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_mask</span><span class="p">,</span> <span class="s2">&quot;cross_attention_mask&quot;</span><span class="p">)</span>
+                    <span class="n">cross_attention_packed_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">pack_fmha_mask_by_input</span><span class="p">(</span>
+                        <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
+                        <span class="n">encoder_input_lengths</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_packed_mask</span><span class="p">,</span>
+                               <span class="s2">&quot;cross_attention_packed_mask&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">has_pp</span><span class="p">():</span>
             <span class="n">hidden_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
@@ -2367,29 +2509,31 @@
         <span class="k">return</span> <span class="n">tensors</span>
 
     <span class="k">def</span> <span class="nf">_get_next_step_shape_buffer</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span>
-            <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-            <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-            <span class="n">max_context_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-            <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-            <span class="n">context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">host_context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">last_token_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">cache_indirection</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">hidden_states_input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">tasks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">host_runtime_perf_knobs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_context_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">host_context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">last_token_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">cache_indirection</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">hidden_states_input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">tasks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">host_runtime_perf_knobs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">host_context_progress</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_push</span><span class="p">(</span><span class="s2">&quot;_get_next_step_shape_buffer&quot;</span><span class="p">)</span>
         <span class="n">tensors</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># Dict[str, RuntimeTensor]</span>
 
@@ -2410,6 +2554,7 @@
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">context_lengths_local</span><span class="p">,</span> <span class="s1">&#39;context_lengths&#39;</span><span class="p">)</span>
                 <span class="k">assert</span> <span class="n">host_runtime_perf_knobs</span> <span class="o">!=</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;gpt_attention_plugin needs to set host_runtime_perf_knobs&quot;</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">host_runtime_perf_knobs</span><span class="p">,</span> <span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">)</span>
+                <span class="n">add_tensor</span><span class="p">(</span><span class="n">host_context_progress</span><span class="p">,</span> <span class="s1">&#39;host_context_progress&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="n">cache_indirection</span><span class="p">,</span> <span class="s1">&#39;cache_indirection&#39;</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">:</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">position_ids</span><span class="p">,</span> <span class="s1">&#39;position_ids&#39;</span><span class="p">)</span>
@@ -2454,19 +2599,19 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
                 <span class="c1"># disable (or minimize) cross qkv computation at generation phase</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_qkv</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_kv</span><span class="p">:</span>
                     <span class="c1"># disable</span>
                     <span class="n">encoder_output_shape</span> <span class="o">=</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span>
-                    <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_qkv_reuse</span><span class="p">,</span> <span class="s1">&#39;cross_qkv_reuse&#39;</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_reuse</span><span class="p">,</span> <span class="s1">&#39;cross_kv_reuse&#39;</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="c1"># minimize</span>
                     <span class="c1"># use TensorRT Empty Tensor to skip redundant computation</span>
                     <span class="c1"># 0 for generation phase, &gt;0 for context phase</span>
-                    <span class="n">encoder_output_shape</span> <span class="o">=</span> <span class="p">[</span>
-                        <span class="mi">0</span><span class="p">,</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
-                    <span class="p">]</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">remove_input_padding</span> <span class="k">else</span> <span class="p">[</span>
-                        <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
-                    <span class="p">]</span>
+                    <span class="n">encoder_output_shape</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+                        <span class="n">encoder_output_shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">encoder_output_shape</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]]</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="c1"># OOTB path doesn&#39;t have kv cache for now, so this encoder_output is</span>
                 <span class="c1"># a must-have input. We just use the encoder_output</span>
@@ -2482,6 +2627,33 @@
                        <span class="s1">&#39;encoder_max_input_length&#39;</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
                 <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_mask</span><span class="p">,</span> <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">cross_attention_mask</span> <span class="o">!=</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">_tile_beam_width</span><span class="p">(</span>
+                        <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">)</span>
+                    <span class="c1"># Empty packed mask is passed in the generation phase as it is not used.</span>
+                    <span class="n">cross_attention_packed_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+                        <span class="p">(</span><span class="n">batch_size</span><span class="p">,</span>
+                         <span class="p">(</span><span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">31</span><span class="p">)</span> <span class="o">//</span> <span class="mi">32</span><span class="p">),</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                        <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_mask</span><span class="p">,</span> <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">)</span>
+                    <span class="n">add_tensor</span><span class="p">(</span><span class="n">cross_attention_packed_mask</span><span class="p">,</span>
+                               <span class="s1">&#39;cross_attention_packed_mask&#39;</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="c1"># create a full 1 cross_attention_mask because it is necessary in generation phase</span>
+                    <span class="n">add_tensor</span><span class="p">(</span>
+                        <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">((</span><span class="n">batch_size</span><span class="p">,</span>
+                                    <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span>
+                                        <span class="n">encoder_output</span><span class="o">.</span><span class="n">shape</span><span class="p">)[:</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">prod</span><span class="p">()),</span>
+                                   <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span>
+                                   <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">),</span> <span class="s2">&quot;cross_attention_mask&quot;</span><span class="p">)</span>
+                    <span class="c1"># Empty packed mask is passed in the generation phase as it is not used.</span>
+                    <span class="n">add_tensor</span><span class="p">(</span>
+                        <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="n">batch_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                                    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                    <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">),</span>
+                        <span class="s2">&quot;cross_attention_packed_mask&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
             <span class="n">shape</span> <span class="o">=</span> <span class="n">kv_cache_block_offsets</span><span class="o">.</span><span class="n">shape</span>
@@ -2672,6 +2844,7 @@
                        <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">],</span>
                        <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_redrafter_mode</span><span class="p">:</span>
             <span class="n">set_redrafter_gen_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">add_tensor</span><span class="p">,</span>
                                       <span class="n">add_tensor_with_shape</span><span class="p">)</span>
@@ -2829,6 +3002,37 @@
         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
 
         <span class="k">return</span> <span class="n">ret</span>
+
+    <span class="k">def</span> <span class="nf">_prepare_cross_attention_mask</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
+                                      <span class="n">cross_attention_mask</span><span class="p">):</span>
+        <span class="n">cross_attention_mask_for_context</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">cross_attention_mask_for_gen</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">max_decoder_input_length</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">context_lengths</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">batch_size</span><span class="p">):</span>
+            <span class="n">decoder_input_length</span> <span class="o">=</span> <span class="n">context_lengths</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+            <span class="n">local_mask_for_context</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="p">[</span>
+                <span class="n">batch_idx</span><span class="p">][:</span><span class="n">decoder_input_length</span><span class="p">,</span> <span class="p">:]</span>
+            <span class="n">local_mask_for_gen</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span>
+                <span class="n">decoder_input_length</span><span class="p">:,</span> <span class="p">:]</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
+                <span class="n">local_mask_for_context</span> <span class="o">=</span> <span class="n">local_mask_for_context</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+                <span class="n">local_mask_for_context</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span>
+                    <span class="n">local_mask_for_context</span><span class="p">,</span>
+                    <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                     <span class="p">(</span><span class="n">max_decoder_input_length</span> <span class="o">-</span> <span class="n">decoder_input_length</span><span class="p">)),</span>
+                    <span class="s2">&quot;constant&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+                <span class="n">local_mask_for_gen</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span>
+                    <span class="n">local_mask_for_gen</span><span class="p">,</span>
+                    <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                     <span class="p">(</span><span class="n">max_decoder_input_length</span> <span class="o">-</span> <span class="n">decoder_input_length</span><span class="p">)),</span>
+                    <span class="s2">&quot;constant&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+            <span class="n">cross_attention_mask_for_context</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">local_mask_for_context</span><span class="p">)</span>
+            <span class="c1"># add additional dimension for batch size.</span>
+            <span class="n">cross_attention_mask_for_gen</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">local_mask_for_gen</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">concat</span><span class="p">(</span><span class="n">cross_attention_mask_for_context</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">concat</span><span class="p">(</span>
+            <span class="n">cross_attention_mask_for_gen</span><span class="p">)</span>
 
 <div class="viewcode-block" id="GenerationSession.pp_communicate_new_tokens">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.pp_communicate_new_tokens">[docs]</a>
@@ -3276,25 +3480,28 @@
 
 <div class="viewcode-block" id="GenerationSession.handle_per_step">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.handle_per_step">[docs]</a>
-    <span class="k">def</span> <span class="nf">handle_per_step</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span> <span class="n">cache_indirections</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-            <span class="n">max_context_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">scfg</span><span class="p">:</span> <span class="n">SamplingConfig</span><span class="p">,</span>
-            <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">tasks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">host_context_lengths</span><span class="p">,</span>
-            <span class="n">attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">ite</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-            <span class="n">sequence_limit_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">sequence_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">next_step_tensors</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RuntimeTensor</span><span class="p">],</span> <span class="n">stop_words_data</span><span class="p">,</span>
-            <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span><span class="p">,</span>
-            <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">handle_per_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cache_indirections</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                        <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">scfg</span><span class="p">:</span> <span class="n">SamplingConfig</span><span class="p">,</span>
+                        <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">tasks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">cross_attention_mask_for_context</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">cross_attention_mask_for_gen</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">ite</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                        <span class="n">sequence_limit_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">sequence_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">next_step_tensors</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span>
+                                                <span class="n">RuntimeTensor</span><span class="p">],</span> <span class="n">stop_words_data</span><span class="p">,</span>
+                        <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+                        <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span><span class="p">,</span>
+                        <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
             <span class="nb">print</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;=================================== STEP </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2"> ==================================&quot;</span>
@@ -3338,6 +3545,7 @@
             <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">context_runtime_perf_knobs</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
                 <span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="n">host_context_progress</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
                 <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pools_kv_cache_manager</span><span class="o">.</span><span class="n">get_block_offsets</span><span class="p">(</span>
@@ -3356,7 +3564,7 @@
                 <span class="n">position_ids</span><span class="p">,</span>
                 <span class="n">last_token_ids</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="p">,</span>
-                <span class="n">cross_attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span>
                 <span class="n">this_src_cache_indirection</span><span class="p">,</span>
                 <span class="n">kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
@@ -3368,7 +3576,9 @@
                 <span class="n">prompt_vocab_size</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="p">,</span>
                 <span class="n">encoder_input_lengths</span><span class="p">,</span>
-                <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">context_runtime_perf_knobs</span><span class="p">)</span>
+                <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">context_runtime_perf_knobs</span><span class="p">,</span>
+                <span class="n">host_context_progress</span><span class="o">=</span><span class="n">host_context_progress</span><span class="p">,</span>
+            <span class="p">)</span>
 
             <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">ctx_context</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_set_tensors</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">ctx_tensors</span><span class="p">)</span>
@@ -3506,6 +3716,7 @@
             <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;attention_mask&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">gen_runtime_perf_knobs</span> <span class="o">=</span> <span class="n">model_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;host_runtime_perf_knobs&#39;</span><span class="p">,</span>
                                                       <span class="kc">None</span><span class="p">)</span>
+            <span class="n">host_context_progress</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">0</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
 
             <span class="c1"># Prepare for the next step, and always allocate 1 token slot.</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
@@ -3547,6 +3758,18 @@
                 <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
 
             <span class="n">next_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">context_1</span> <span class="k">if</span> <span class="n">step</span> <span class="o">%</span> <span class="mi">2</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">context_0</span>
+            <span class="n">cross_attention_mask_step</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">cross_attention_mask_for_gen</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># cross_attention_mask_for_gen shape [batch_size, max_output_length, max_encoder_input_length]</span>
+                <span class="n">decode_step</span> <span class="o">=</span> <span class="n">step</span>
+                <span class="k">if</span> <span class="n">decode_step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="n">decode_step</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
+                    <span class="n">cross_attention_mask_step</span> <span class="o">=</span> <span class="n">cross_attention_mask_for_gen</span><span class="p">[:,</span> <span class="p">(</span>
+                        <span class="n">decode_step</span> <span class="o">-</span> <span class="mi">1</span><span class="p">),</span> <span class="p">:]</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">cross_attention_mask_step</span> <span class="o">=</span> <span class="n">cross_attention_mask_for_gen</span><span class="p">[:,</span> <span class="p">(</span>
+                        <span class="n">decode_step</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span><span class="n">decode_step</span><span class="p">,</span> <span class="p">:]</span>
             <span class="n">next_step_tensors</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_next_step_shape_buffer</span><span class="p">(</span>
                 <span class="n">batch_size</span><span class="p">,</span>
                 <span class="n">beam_width</span><span class="p">,</span>
@@ -3557,7 +3780,7 @@
                 <span class="n">position_ids</span><span class="p">,</span>
                 <span class="n">last_token_ids</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="p">,</span>
-                <span class="n">cross_attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_step</span><span class="p">,</span>
                 <span class="n">next_src_cache_indirection</span><span class="p">,</span>
                 <span class="n">kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
@@ -3569,7 +3792,9 @@
                 <span class="n">prompt_vocab_size</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="p">,</span>
                 <span class="n">encoder_input_lengths</span><span class="p">,</span>
-                <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">gen_runtime_perf_knobs</span><span class="p">)</span>
+                <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">gen_runtime_perf_knobs</span><span class="p">,</span>
+                <span class="n">host_context_progress</span><span class="o">=</span><span class="n">host_context_progress</span><span class="p">,</span>
+            <span class="p">)</span>
 
             <span class="c1"># there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object</span>
             <span class="c1"># needs to pro-long the life time of the tensors inside the next_step_tensors array</span>
@@ -3741,7 +3966,7 @@
                        <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                       <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                       <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
@@ -3789,6 +4014,20 @@
                 <span class="n">benchmark_profiler_obj</span><span class="o">.</span><span class="n">add_aux_info</span><span class="p">(</span><span class="s1">&#39;generation_step_count&#39;</span><span class="p">,</span>
                                                     <span class="n">step_count</span><span class="p">)</span>
 
+        <span class="c1"># prepare cross attention mask.</span>
+        <span class="n">cross_attention_mask_for_context</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">cross_attention_mask_for_gen</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">cross_attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cross_attention_mask_for_context</span><span class="p">,</span> <span class="n">cross_attention_mask_for_gen</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cross_attention_mask</span><span class="p">(</span>
+                <span class="n">batch_size</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gpt_attention_plugin</span><span class="p">:</span>
+                <span class="c1"># When we use plugin, the data type of cross_attention_mask is bool.</span>
+                <span class="c1"># When we don&#39;t use plugin, the data type of cross_attention_mask is int32</span>
+                <span class="n">cross_attention_mask_for_context</span> <span class="o">=</span> <span class="n">cross_attention_mask_for_context</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span>
+                <span class="n">cross_attention_mask_for_gen</span> <span class="o">=</span> <span class="n">cross_attention_mask_for_gen</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span>
+
         <span class="n">next_step_tensors</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
 
@@ -3798,7 +4037,8 @@
                 <span class="n">kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
-                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span> <span class="n">cross_attention_mask_for_gen</span><span class="p">,</span>
                 <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">ite</span><span class="p">,</span> <span class="n">sequence_limit_lengths</span><span class="p">,</span>
                 <span class="n">sequence_lengths</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">,</span> <span class="n">stop_words_data</span><span class="p">,</span>
                 <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span> <span class="n">encoder_input_lengths</span><span class="p">,</span>
@@ -3890,7 +4130,7 @@
                       <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                       <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                       <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                      <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                      <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                       <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="n">kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">host_kv_cache_block_offsets</span> <span class="o">=</span> <span class="kc">None</span>
@@ -3910,6 +4150,13 @@
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_context_logits</span>
             <span class="k">return</span> <span class="n">outputs</span>
 
+        <span class="c1"># prepare cross attention mask.</span>
+        <span class="n">cross_attention_mask_for_context</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">cross_attention_mask_for_gen</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">cross_attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cross_attention_mask_for_context</span><span class="p">,</span> <span class="n">cross_attention_mask_for_gen</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cross_attention_mask</span><span class="p">(</span>
+                <span class="n">batch_size</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">)</span>
+
         <span class="n">next_step_tensors</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
 
@@ -3919,7 +4166,8 @@
                 <span class="n">kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
                 <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
-                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span> <span class="n">cross_attention_mask_for_gen</span><span class="p">,</span>
                 <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">ite</span><span class="p">,</span> <span class="n">sequence_limit_lengths</span><span class="p">,</span>
                 <span class="n">sequence_lengths</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">,</span> <span class="n">stop_words_data</span><span class="p">,</span>
                 <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span> <span class="n">encoder_input_lengths</span><span class="p">,</span>
@@ -3992,7 +4240,7 @@
                <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-               <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+               <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="n">scfg</span> <span class="o">=</span> <span class="n">sampling_config</span>
         <span class="n">batch_size</span> <span class="o">=</span> <span class="n">context_lengths</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
@@ -4094,7 +4342,7 @@
                     <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_mapping&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">pool_mapping</span>
 
                 <span class="bp">self</span><span class="o">.</span><span class="n">cross_pools_kv_cache_manager</span> <span class="o">=</span> <span class="n">PoolsKVCacheManager</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">pools_metadata</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">pools_metadata</span><span class="p">,</span>
                     <span class="n">max_cross_blocks_per_seq</span><span class="p">,</span>
                     <span class="n">cross_num_blocks</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
@@ -4456,7 +4704,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0d468040>
+<jinja2.runtime.BlockReference object at 0x7fc13d9f4460>
 
 <div class="footer">
     <p>

@@ -7,6 +7,7 @@
   <title>C++ GPT Runtime &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -18,10 +19,12 @@
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../_static/copybutton.js?v=f281be69"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Graph Rewriting Module" href="graph-rewriting.html" />
+    <link rel="next" title="Executor API" href="executor.html" />
     <link rel="prev" title="Multi-Head, Multi-Query, and Group-Query Attention" href="gpt-attention.html" /> 
 </head>
 
@@ -58,15 +61,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -115,17 +119,22 @@
 <li class="toctree-l2"><a class="reference internal" href="#know-issues-and-future-changes">Know Issues and Future Changes</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -454,9 +463,9 @@ value for a given parameter, the vector can be limited to a single element
 </table>
 <ul class="simple">
 <li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, greedy search is performed.</p></li>
-<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probilities will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopK</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
-<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, tokens will be sorted with probility descendly, then the tokens with highest probilities which the accumulated probility larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopP</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
-<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probilities will be selected, then those selected tokens will be sorted with probility descendly and their probility will be normalized, then the tokens with highest normalized probilities which the accumulated probility larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopKTopP</span> <span class="pre">sampling</span></code> in TRT-LLM)</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">=</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probabilities will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopK</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">=</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, tokens will be sorted with probability descendly, then the tokens with highest probabilities which the accumulated probability larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopP</span> <span class="pre">sampling</span></code> in TRT-LLM).</p></li>
+<li><p>If setting <code class="docutils literal notranslate"><span class="pre">topK</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">topP</span> <span class="pre">&gt;</span> <span class="pre">0.0f</span></code>, <code class="docutils literal notranslate"><span class="pre">topK</span></code> tokens of highest probabilities will be selected, then those selected tokens will be sorted with probability descendly and their probability will be normalized, then the tokens with highest normalized probabilities which the accumulated probability larger than <code class="docutils literal notranslate"><span class="pre">topP</span></code> will become the candidates of sampling (named <code class="docutils literal notranslate"><span class="pre">TopKTopP</span> <span class="pre">sampling</span></code> in TRT-LLM)</p></li>
 <li><p>If different <code class="docutils literal notranslate"><span class="pre">topK</span></code> values are provided for the different sequences in the batch, the performance of the implementation will depend on the largest value. For efficiency reasons, we recommend to batch requests with similar <code class="docutils literal notranslate"><span class="pre">topK</span></code> values together.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">topPDecay</span></code>, <code class="docutils literal notranslate"><span class="pre">topPMin</span></code> and <code class="docutils literal notranslate"><span class="pre">topPResetIds</span></code> are explained in
 <a class="reference external" href="https://arxiv.org/abs/2206.04624"><em>Factuality Enhanced Language Models for Open-Ended Text Generation</em></a>.
@@ -518,7 +527,7 @@ sequence. This limitation is likely to be removed in a future release.</p></li>
 </section>
 <section id="the-session">
 <h2>The Session<a class="headerlink" href="#the-session" title="Link to this heading"></a></h2>
-<p><em>The runtime session is deprecated in favor of the <a class="reference internal" href="../executor.html#executor"><span class="std std-ref">Executor API</span></a>.
+<p><em>The runtime session is deprecated in favor of the <a class="reference internal" href="executor.html#executor"><span class="std std-ref">Executor API</span></a>.
 It will be removed in a future release of TensorRT-LLM.</em></p>
 <p>An example of how to use the <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> to run a GPT-like auto-regressive model can be found in
 <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tests/runtime/gptSessionTest.cpp"><code class="docutils literal notranslate"><span class="pre">cpp/tests/runtime/gptSessionTest.cpp</span></code></a>.</p>
@@ -561,13 +570,13 @@ one.</p></li>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="gpt-attention.html" class="btn btn-neutral float-left" title="Multi-Head, Multi-Query, and Group-Query Attention" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="graph-rewriting.html" class="btn btn-neutral float-right" title="Graph Rewriting Module" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="executor.html" class="btn btn-neutral float-right" title="Executor API" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0dd665f0>
+<jinja2.runtime.BlockReference object at 0x7fc13e1fa830>
 
 <div class="footer">
     <p>

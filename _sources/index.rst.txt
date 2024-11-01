@@ -29,15 +29,6 @@ Welcome to TensorRT-LLM's Documentation!
    installation/windows.md
    installation/build-from-source-windows.md
 
-.. toctree::
-   :maxdepth: 2
-   :caption: LLM API Examples
-   :hidden:
-
-   llm-api-examples/index.md
-   llm-api-examples/customization.md
-   llm-api-examples/llm_api_examples
-
 
 .. toctree::
    :maxdepth: 2
@@ -46,6 +37,16 @@ Welcome to TensorRT-LLM's Documentation!
    :glob:
 
    llm-api/*
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API Examples
+   :hidden:
+
+   llm-api-examples/index.md
+   llm-api-examples/customization.md
+   llm-api-examples/llm_api_examples
 
 
 .. toctree::
@@ -96,11 +97,14 @@ Welcome to TensorRT-LLM's Documentation!
 
    advanced/gpt-attention.md
    advanced/gpt-runtime.md
+   advanced/executor.md
    advanced/graph-rewriting.md
    advanced/batch-manager.md
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md
+   advanced/kv-cache-reuse.md
+   advanced/speculative-decoding.md
 
 .. toctree::
    :maxdepth: 2
@@ -108,7 +112,8 @@ Welcome to TensorRT-LLM's Documentation!
    :name: Performance
 
    performance/perf-overview.md
-   performance/perf-best-practices.md
+   Benchmarking <performance/perf-benchmarking.md>
+   Best Practices <performance/perf-best-practices.md>
    performance/perf-analysis.md
 
 

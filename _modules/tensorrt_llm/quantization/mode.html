@@ -6,6 +6,7 @@
   <title>tensorrt_llm.quantization.mode &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -17,6 +18,8 @@
         <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
         <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -55,15 +58,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -98,17 +102,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,12 +184,13 @@
 
 
 <div class="viewcode-block" id="QuantAlgo">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.quantization.html#tensorrt_llm.hlapi.QuantAlgo">[docs]</a>
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.QuantAlgo">[docs]</a>
 <span class="k">class</span> <span class="nc">QuantAlgo</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">,</span> <span class="n">metaclass</span><span class="o">=</span><span class="n">BaseEnumMeta</span><span class="p">):</span>
     <span class="n">W8A16</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A16</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A16_AWQ</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A8_AWQ</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">W8A16_GPTQ</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A16_GPTQ</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W8A8_SQ_PER_CHANNEL</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W8A8_SQ_PER_TENSOR_PLUGIN</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
@@ -189,7 +199,9 @@
     <span class="n">W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">FP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">FP8_PER_CHANNEL_PER_TOKEN</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
-    <span class="n">INT8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span></div>
+    <span class="n">INT8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">MIXED_PRECISION</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">NO_QUANT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span></div>
 
 
 
@@ -208,7 +220,7 @@
 
 
 <div class="viewcode-block" id="QuantMode">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.quantization.html#tensorrt_llm.hlapi.QuantMode">[docs]</a>
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.QuantMode">[docs]</a>
 <span class="k">class</span> <span class="nc">QuantMode</span><span class="p">(</span><span class="n">IntFlag</span><span class="p">):</span>
     <span class="c1"># [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/common/quantization.h</span>
 
@@ -241,6 +253,9 @@
     <span class="c1"># The mask of all valid flags.</span>
     <span class="n">VALID_FLAGS</span> <span class="o">=</span> <span class="n">COUNT</span> <span class="o">-</span> <span class="mi">1</span>
 
+    <span class="k">def</span> <span class="nf">__deepcopy__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">memo</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
     <span class="c1"># All the bits set? You can restrict the test to the bits indicated by &quot;mask&quot;.</span>
     <span class="k">def</span> <span class="nf">_all</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bits</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">VALID_FLAGS</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">(</span><span class="bp">self</span> <span class="o">&amp;</span> <span class="n">mask</span><span class="p">)</span> <span class="o">==</span> <span class="n">bits</span>
@@ -257,6 +272,9 @@
 
     <span class="k">def</span> <span class="nf">is_weight_only</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_int4_weight_only</span><span class="p">()</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_int8_weight_only</span><span class="p">()</span>
+
+    <span class="k">def</span> <span class="nf">is_int8_weight_only_per_group</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_int8_weight_only</span><span class="p">()</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">PER_GROUP</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">is_int4_weight_only_per_group</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_int4_weight_only</span><span class="p">()</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">PER_GROUP</span><span class="p">)</span>
@@ -296,6 +314,9 @@
 
     <span class="k">def</span> <span class="nf">has_fp8_rowwise</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">FP8_ROWWISE</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">has_weight_quant</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">INT4_WEIGHTS</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_WEIGHTS</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">has_any_quant</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">INT4_WEIGHTS</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_WEIGHTS</span>
@@ -400,7 +421,7 @@
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span> <span class="nf">from_quant_algo</span><span class="p">(</span>
-        <span class="n">quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantAlgo</span><span class="p">],</span>
+        <span class="n">quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantAlgo</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">kv_cache_quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantAlgo</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;QuantMode&quot;</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">quant_algo</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">quant_algo</span> <span class="ow">in</span> <span class="n">QUANT_ALGO_LIST</span>
@@ -417,6 +438,9 @@
                                                    <span class="n">per_group</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_GPTQ</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">use_weight_only</span><span class="p">(</span><span class="n">use_int4_weights</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                                   <span class="n">per_group</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16_GPTQ</span><span class="p">:</span>
+            <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">use_weight_only</span><span class="p">(</span><span class="n">use_int4_weights</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                                    <span class="n">per_group</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">use_smooth_quant</span><span class="p">(</span><span class="n">per_token</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -480,7 +504,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0d489930>
+<jinja2.runtime.BlockReference object at 0x7fc13d8f4430>
 
 <div class="footer">
     <p>

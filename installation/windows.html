@@ -7,6 +7,7 @@
   <title>Installing on Windows &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -18,6 +19,8 @@
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../_static/copybutton.js?v=f281be69"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -58,15 +61,16 @@
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -101,17 +105,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -159,7 +168,7 @@
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.13.0">v0.13.0 tag</a> for the most stable experience.</p>
+We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.14.0">v0.14.0 tag</a> for the most stable experience.</p>
 </div>
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
@@ -206,7 +215,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 </pre></div>
 </div>
 <p>before installing TensorRT-LLM with the following command.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.13.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.14.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
 </pre></div>
 </div>
 <p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
@@ -223,11 +232,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 </ol>
 <p>This may be caused by an outdated Microsoft Visual C++ Redistributable Version. Please install
 <a class="reference external" href="https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version">the latest MSVC</a>
-and retry. Check the system path to make sure the latest version installed in <code class="docutils literal notranslate"><span class="pre">System32</span></code> is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package <code class="docutils literal notranslate"><span class="pre">pyarrow</span></code> might contain an outdated MSCV DLL).</p>
-<ol class="arabic simple" start="2">
-<li><p>OSError: [WinError 126] The specified module could not be found. Error loading “…\Lib\site-packages\torch\lib\fbgemm.dll” or one of its dependencies.</p></li>
-</ol>
-<p>Installing the latest <a class="reference external" href="https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022">Build Tools for Visual Studio 2022</a> will resolve the issue.</p>
+and retry. Check the system path to make sure the latest version installed in <code class="docutils literal notranslate"><span class="pre">System32</span></code> is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package <code class="docutils literal notranslate"><span class="pre">pyarrow</span></code> might contain an outdated MSVC DLL).</p>
 </section>
 
 
@@ -241,7 +246,7 @@ and retry. Check the system path to make sure the latest version installed in <c
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0e079b70>
+<jinja2.runtime.BlockReference object at 0x7fc13e3356c0>
 
 <div class="footer">
     <p>

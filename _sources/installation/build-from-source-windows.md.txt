@@ -185,12 +185,15 @@ Building from source produces the following library files.
     - `th_common.exp`
     - `th_common.lib`
 
-The locations of the DLLs, in addition to some `torch` DLLs, must be added to the Windows `Path` in order to use the TensorRT-LLM C++ runtime. Append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
+The locations of the DLLs, in addition to some `torch` DLLs and `TensorRT` DLLs, must be added to the Windows `Path` in order to use the TensorRT-LLM C++ runtime. Append the locations of these libraries to your `Path`. When complete, your `Path` should include lines similar to these:
 
 ```bash
+%USERPROFILE%\inference\TensorRT\lib
 %USERPROFILE%\inference\TensorRT-LLM\cpp\build\tensorrt_llm
 %USERPROFILE%\AppData\Local\Programs\Python\Python310\Lib\site-packages\tensorrt_llm\libs
 %USERPROFILE%\AppData\Local\Programs\Python\Python310\Lib\site-packages\torch\lib
 ```
 
 Your `Path` additions may differ, particularly if you used the Docker method and copied all the relevant DLLs into a single folder.
+
+Again, close and re-open any existing PowerShell or Git Bash windows so they pick up the new `Path`.

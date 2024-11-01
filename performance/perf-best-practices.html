@@ -7,6 +7,7 @@
   <title>Best Practices for Tuning the Performance of TensorRT-LLM &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -18,11 +19,13 @@
         <script src="../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../_static/doctools.js?v=888ff710"></script>
         <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../_static/copybutton.js?v=f281be69"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Performance Analysis" href="perf-analysis.html" />
-    <link rel="prev" title="Overview" href="perf-overview.html" /> 
+    <link rel="prev" title="TensorRT-LLM Benchmarking" href="perf-benchmarking.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -58,15 +61,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -101,17 +105,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="perf-overview.html">Overview</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Best Practices for Tuning the Performance of TensorRT-LLM</a><ul>
+<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Best Practices</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#how-to-measure-performance">How To Measure Performance?</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#build-options-to-optimize-the-performance-of-tensorrt-llm-models">Build Options to Optimize the Performance of TensorRT-LLM Models</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#max-batch-size-max-seq-len-and-max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a><ul>
@@ -235,8 +244,8 @@ runtime and, for some of them, decrease the engine build time.</p>
 <p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> defines the maximum number of batched input tokens after padding is removed in each batch.​</p>
 <p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> is set to 8192 by default starting from v0.11, you can tune it using the runtime <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> without re-buliding the engine. It is recommended to tune <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code> for better performance.</p>
 <p>The maximum number of tokens equals will not take effects when input padding is
-not removed. When input padding is removed (see <a class="reference internal" href="#remove-input-padding"><span class="xref myst">Remove Input
-Padding</span></a>), the tokens from different sequences are
+not removed. When input padding is removed (see <a class="reference internal" href="#remove-input-padding">Remove Input
+Padding</a>), the tokens from different sequences are
 packed together and the maximum number of the tokens can be set to a different
 (lower) value, which by default to be 8192.</p>
 <p>There are two aspects that must be considered. Firstly, some input sequences
@@ -485,14 +494,14 @@ recommended to start from <code class="docutils literal notranslate"><span class
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="perf-overview.html" class="btn btn-neutral float-left" title="Overview" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="perf-benchmarking.html" class="btn btn-neutral float-left" title="TensorRT-LLM Benchmarking" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="perf-analysis.html" class="btn btn-neutral float-right" title="Performance Analysis" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0e361ab0>
+<jinja2.runtime.BlockReference object at 0x7fc13e594100>
 
 <div class="footer">
     <p>
