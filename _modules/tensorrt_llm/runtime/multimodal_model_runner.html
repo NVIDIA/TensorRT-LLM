@@ -6,6 +6,7 @@
   <title>tensorrt_llm.runtime.multimodal_model_runner &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -17,6 +18,8 @@
         <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
         <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -55,15 +58,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -98,17 +102,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -170,7 +179,8 @@
 
 <span class="kn">from</span> <span class="nn">..</span> <span class="kn">import</span> <span class="n">profiler</span>
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">mpi_rank</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
-                      <span class="n">supports_inflight_batching</span><span class="p">,</span> <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
+                      <span class="n">supports_inflight_batching</span><span class="p">,</span> <span class="n">torch_dtype_to_trt</span><span class="p">,</span>
+                      <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">.enc_dec_model_runner</span> <span class="kn">import</span> <span class="n">EncDecModelRunner</span>
 <span class="kn">from</span> <span class="nn">.model_runner</span> <span class="kn">import</span> <span class="n">ModelRunner</span>
@@ -344,6 +354,19 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">llm_name</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span><span class="o">.</span><span class="n">text_config</span><span class="o">.</span><span class="n">_name_or_path</span>
 
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;mllama&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vision_input_names</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="s2">&quot;pixel_values&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;aspect_ratio_ids&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;aspect_ratio_mask&quot;</span><span class="p">,</span>
+            <span class="p">]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vision_output_names</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="s2">&quot;output&quot;</span><span class="p">,</span>
+            <span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vision_input_names</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;input&quot;</span><span class="p">]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vision_output_names</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">supports_inflight_batching</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">):</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
@@ -361,12 +384,6 @@
             <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">debug_mode</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                     <span class="s2">&quot;Debug mode is not supported in C++ session for now, fallback to Python session.&quot;</span>
-                <span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
-
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s1">&#39;cogvlm&#39;</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="s2">&quot;Only the cogvlm is supported in C++ session for now, fallback to Python session.&quot;</span>
                 <span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">use_py_session</span> <span class="o">=</span> <span class="kc">True</span>
 
@@ -464,7 +481,11 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_llm">[docs]</a>
     <span class="k">def</span> <span class="nf">init_llm</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
+            <span class="n">cross_kv_cache_fraction</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
+                <span class="n">cross_kv_cache_fraction</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cross_kv_cache_fraction</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Running LLM with Python runner&#39;</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">ModelRunner</span><span class="o">.</span><span class="n">from_dir</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">,</span>
                     <span class="n">rank</span><span class="o">=</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">mpi_rank</span><span class="p">(),</span>
@@ -474,12 +495,17 @@
                     <span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">_model_config</span>
             <span class="k">else</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Running LLM with C++ runner&#39;</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">ModelRunnerCpp</span><span class="o">.</span><span class="n">from_dir</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">llm_engine_dir</span><span class="p">,</span>
                     <span class="n">rank</span><span class="o">=</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">mpi_rank</span><span class="p">(),</span>
                     <span class="n">debug_mode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                    <span class="n">enable_chunked_context</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_context</span><span class="p">,</span>
                     <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
-                    <span class="n">enable_context_fmha_fp32_acc</span><span class="p">)</span>
+                    <span class="n">enable_context_fmha_fp32_acc</span><span class="p">,</span>
+                    <span class="n">kv_cache_free_gpu_memory_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
+                    <span class="n">kv_cache_free_gpu_memory_fraction</span><span class="p">,</span>
+                    <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="n">cross_kv_cache_fraction</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">model_config</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">mapping</span>
         <span class="k">else</span><span class="p">:</span>
@@ -539,7 +565,8 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.preprocess">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">[docs]</a>
-    <span class="k">def</span> <span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span>
+                   <span class="n">other_vision_inputs</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">:</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
             <span class="n">image_mask</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s2">&quot;image_embeds_position_mask&quot;</span><span class="p">]</span>
@@ -564,8 +591,8 @@
             <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;Vision&quot;</span><span class="p">)</span>
 
         <span class="n">visual_features</span><span class="p">,</span> <span class="n">visual_atts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_visual_features</span><span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">image</span><span class="p">[</span><span class="s1">&#39;image_patches&#39;</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span>
-            <span class="s1">&#39;fuyu&#39;</span> <span class="k">else</span> <span class="n">image</span><span class="p">)</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">image</span><span class="p">[</span><span class="s1">&#39;image_patches&#39;</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;fuyu&#39;</span> <span class="k">else</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="n">warmup</span><span class="p">:</span>
             <span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">(</span><span class="s2">&quot;Vision&quot;</span><span class="p">)</span>
@@ -657,6 +684,12 @@
             <span class="n">input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ptuning_setup_llava_next</span><span class="p">(</span><span class="n">visual_features</span><span class="p">,</span>
                                                       <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">)</span>
             <span class="n">length</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
+            <span class="n">pre_input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">pre_prompt</span><span class="p">,</span>
+                                           <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
+                                           <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span>
+            <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">post_input_ids</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">pre_input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">pre_prompt</span><span class="p">,</span>
                                            <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
@@ -668,6 +701,9 @@
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;video-neva&#39;</span><span class="p">:</span>
                     <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
                         <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+                <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;internvl&#39;</span><span class="p">:</span>
+                    <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
+                        <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
                         <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
@@ -770,16 +806,23 @@
                  <span class="n">image</span><span class="p">,</span>
                  <span class="n">decoder_input_ids</span><span class="p">,</span>
                  <span class="n">max_new_tokens</span><span class="p">,</span>
-                 <span class="n">warmup</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                 <span class="n">warmup</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">other_vision_inputs</span><span class="o">=</span><span class="p">{},</span>
+                 <span class="n">other_decoder_inputs</span><span class="o">=</span><span class="p">{}):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">warmup</span><span class="p">:</span>
             <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;Generate&quot;</span><span class="p">)</span>
 
         <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">ptuning_args</span><span class="p">,</span> <span class="n">visual_features</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">preprocess</span><span class="p">(</span>
-            <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">)</span>
+            <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">warmup</span><span class="p">:</span> <span class="k">return</span> <span class="kc">None</span>
 
+        <span class="c1"># use prompt tuning to pass multimodal features</span>
+        <span class="c1"># model.generate() expects the following params (see layers/embedding.py):</span>
+        <span class="c1"># args[0]: prompt embedding table, [batch_size, multimodal_len, hidden_size], later flattened to [batch_size * multimodal_len, hidden_size]</span>
+        <span class="c1"># args[1]: prompt task ids, [batch_size]. in multimodal case, arange(batch_size), i.e. in VILA batching mode 2, each image is treated separately in the batch instead of concated together (although the prompt embedding table has to be concated)</span>
+        <span class="c1"># args[2]: prompt task vocab size, [1]. assuming all table has the same length, which in multimodal case equals to multimodal_len</span>
         <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s2">&quot;LLM&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s2">&quot;mllama&quot;</span><span class="p">:</span>
             <span class="n">end_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span>
             <span class="k">if</span> <span class="s1">&#39;opt&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">and</span> <span class="s1">&#39;blip2&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
                 <span class="c1"># For BLIP2-OPT, model outputs a &quot;\n&quot; at the end.</span>
@@ -787,23 +830,24 @@
                 <span class="n">end_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                                                <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
 
-            <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]])</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;cogvlm&#39;</span><span class="p">:</span>
                 <span class="n">input_position_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_position_ids_for_cogvlm</span><span class="p">(</span>
                     <span class="n">input_ids</span><span class="p">)</span>
-                <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
-                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span><span class="p">:</span>
-                    <span class="n">prompt_tasks</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">str</span><span class="p">))</span>
-                    <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
-                        <span class="n">batch_size</span><span class="p">,</span> <span class="n">ptuning_args</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+            <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+            <span class="n">prompt_tasks</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+                <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="nb">str</span><span class="p">))</span>
+            <span class="n">prompt_table</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">]])</span>
+            <span class="n">prompt_table</span> <span class="o">=</span> <span class="n">prompt_table</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+                                             <span class="n">prompt_table</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
 
             <span class="n">output_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
                 <span class="n">input_ids</span><span class="p">,</span>
                 <span class="n">input_position_ids</span><span class="o">=</span><span class="n">input_position_ids</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;cogvlm&#39;</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">sampling_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">prompt_table</span><span class="o">=</span><span class="n">ptuning_args</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
-                <span class="n">prompt_tasks</span><span class="o">=</span><span class="n">prompt_tasks</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_py_session</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">prompt_table</span><span class="o">=</span><span class="n">prompt_table</span><span class="p">,</span>
+                <span class="n">prompt_tasks</span><span class="o">=</span><span class="n">prompt_tasks</span><span class="p">,</span>
                 <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
                 <span class="n">end_id</span><span class="o">=</span><span class="n">end_id</span><span class="p">,</span>
                 <span class="n">pad_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span>
@@ -816,6 +860,83 @@
                 <span class="n">num_beams</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_beams</span><span class="p">,</span>
                 <span class="n">output_sequence_lengths</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">return_dict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;mllama&quot;</span><span class="p">:</span>
+            <span class="n">visual_features</span> <span class="o">=</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="n">encoder_input_features</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">cross_attention_masks</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">encoder_output_lengths</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">):</span>
+                <span class="n">visual_feature</span> <span class="o">=</span> <span class="n">visual_features</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span>
+                <span class="n">num_vision_tokens</span> <span class="o">=</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
+                <span class="n">visual_feature</span> <span class="o">=</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+                    <span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>
+                <span class="n">encoder_max_input_length</span> <span class="o">=</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="n">encoder_input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">(</span>
+                    <span class="p">[</span><span class="n">encoder_max_input_length</span><span class="p">])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">visual_feature</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+                <span class="c1"># prepare cross_attention_mask of context phase</span>
+                <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">other_decoder_inputs</span><span class="p">[</span>
+                    <span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">]</span>
+                <span class="n">batch_size</span><span class="p">,</span> <span class="n">text_total_length</span><span class="p">,</span> <span class="o">*</span><span class="n">_</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">shape</span>
+                <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">repeat_interleave</span><span class="p">(</span>
+                    <span class="n">num_vision_tokens</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+                <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                    <span class="n">batch_size</span><span class="p">,</span> <span class="n">text_total_length</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+                <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+                <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="n">visual_feature</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+                        <span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>
+
+                <span class="c1"># prepare cross_attention_mask for generation phase and concat them</span>
+                <span class="n">tmp_mask</span> <span class="o">=</span> <span class="p">[</span><span class="n">cross_attention_mask</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span>
+                    <span class="n">cross_attention_mask</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:,</span> <span class="p">:]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">max_new_tokens</span><span class="p">)</span>
+                <span class="p">]</span>
+                <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">concat</span><span class="p">(</span><span class="n">tmp_mask</span><span class="p">)</span>
+
+                <span class="n">encoder_input_features</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">visual_feature</span><span class="p">)</span>
+                <span class="n">cross_attention_masks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cross_attention_mask</span><span class="p">)</span>
+                <span class="n">encoder_output_lengths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">encoder_input_lengths</span><span class="p">)</span>
+
+            <span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+                <span class="n">batch_input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">encoder_input_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">encoder_input_features</span><span class="o">=</span><span class="n">encoder_input_features</span><span class="p">,</span>
+                <span class="n">encoder_output_lengths</span><span class="o">=</span><span class="n">encoder_output_lengths</span><span class="p">,</span>
+                <span class="n">cross_attention_masks</span><span class="o">=</span><span class="n">cross_attention_masks</span><span class="p">,</span>
+                <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
+                <span class="c1"># max_attention_window_size=args.max_attention_window_size,</span>
+                <span class="c1"># sink_token_length=args.sink_token_length,</span>
+                <span class="n">end_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">,</span>
+                <span class="n">pad_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span><span class="p">,</span>
+                <span class="n">temperature</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">temperature</span><span class="p">,</span>
+                <span class="n">top_k</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span>
+                <span class="n">top_p</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">top_p</span><span class="p">,</span>
+                <span class="n">num_beams</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_beams</span><span class="p">,</span>
+                <span class="c1"># length_penalty=args.length_penalty,</span>
+                <span class="c1"># early_stopping=args.early_stopping,</span>
+                <span class="n">repetition_penalty</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">repetition_penalty</span><span class="p">,</span>
+                <span class="c1"># presence_penalty=args.presence_penalty,</span>
+                <span class="c1"># frequency_penalty=args.frequency_penalty,</span>
+                <span class="c1"># stop_words_list=stop_words_list,</span>
+                <span class="c1"># bad_words_list=bad_words_list,</span>
+                <span class="c1"># output_cum_log_probs=(args.output_cum_log_probs_npy != None),</span>
+                <span class="c1"># output_log_probs=(args.output_log_probs_npy != None),</span>
+                <span class="c1"># random_seed=args.random_seed,</span>
+                <span class="c1"># lora_uids=args.lora_task_uids,</span>
+                <span class="c1"># prompt_table=args.prompt_table_path,</span>
+                <span class="c1"># prompt_tasks=args.prompt_tasks,</span>
+                <span class="c1"># streaming=args.streaming,</span>
+                <span class="n">output_sequence_lengths</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="c1"># no_repeat_ngram_size=self.args.no_repeat_ngram_size,</span>
+                <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="c1"># medusa_choices=args.medusa_choices,</span>
+                <span class="c1"># return_all_generated_tokens=args.return_all_generated_tokens,</span>
+                <span class="c1"># input_token_extra_ids=input_token_extra_ids,</span>
+                <span class="n">encoder_max_input_length</span><span class="o">=</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">mpi_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">output_ids</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s2">&quot;output_ids&quot;</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;nougat&#39;</span><span class="p">,</span> <span class="s1">&#39;pix2struct&#39;</span><span class="p">]:</span>
                 <span class="c1"># Trim encoder input_ids to match visual features shape</span>
@@ -865,14 +986,21 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_visual_features">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_visual_features">[docs]</a>
-    <span class="k">def</span> <span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">):</span>
         <span class="n">visual_features</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="s1">&#39;input&#39;</span><span class="p">:</span> <span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vision_input_names</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+            <span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">)),</span>
         <span class="p">}</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="n">other_vision_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">visual_features</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">key</span><span class="p">:</span> <span class="n">tensor</span><span class="p">})</span>
+
         <span class="n">tensor_info</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="n">TensorInfo</span><span class="p">(</span><span class="s1">&#39;input&#39;</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">),</span>
-                       <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+            <span class="n">TensorInfo</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_input_names</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                       <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">),</span> <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
         <span class="p">]</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="n">other_vision_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">tensor_info</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="n">TensorInfo</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">torch_dtype_to_trt</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span>
 
         <span class="n">visual_output_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">visual_encoder_session</span><span class="o">.</span><span class="n">infer_shapes</span><span class="p">(</span>
             <span class="n">tensor_info</span><span class="p">)</span>
@@ -889,7 +1017,7 @@
         <span class="k">assert</span> <span class="n">ok</span><span class="p">,</span> <span class="s2">&quot;Runtime execution failed for vision encoder session&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
-        <span class="n">image_embeds</span> <span class="o">=</span> <span class="n">visual_outputs</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">]</span>
+        <span class="n">image_embeds</span> <span class="o">=</span> <span class="n">visual_outputs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_output_names</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
         <span class="n">image_atts</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">image_embeds</span><span class="o">.</span><span class="n">size</span><span class="p">()[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                                 <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
 
@@ -920,7 +1048,7 @@
                 <span class="n">fake_prompt_counter</span> <span class="o">+=</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
                 <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
                 <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">fake_prompt_id</span><span class="p">)</span>
-                <span class="c1"># in case no post prompt</span>
+                <span class="c1"># in case no inter or post prompt</span>
                 <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span>
                     <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">])</span>
 
@@ -931,7 +1059,6 @@
                 <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
                     <span class="n">fake_prompt_counter</span><span class="p">,</span>
                     <span class="n">fake_prompt_counter</span> <span class="o">+</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-                <span class="n">fake_prompt_counter</span> <span class="o">+=</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
                 <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
                 <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">fake_prompt_id</span><span class="p">)</span>
                 <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
@@ -976,10 +1103,15 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">+</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
             <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">1</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="s1">&#39;internvl&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
+            <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="s1">&#39;cogvlm&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
                 <span class="p">[</span><span class="n">pre_input_ids</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">:</span><span class="mi">1</span><span class="p">],</span> <span class="n">fake_prompt_id</span><span class="p">,</span> <span class="n">pre_input_ids</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">:]],</span>
                 <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">post_input_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_input_ids</span><span class="p">,</span> <span class="n">fake_prompt_id</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">]</span>
@@ -987,7 +1119,8 @@
                 <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">fake_prompt_id</span><span class="p">,</span> <span class="n">pre_input_ids</span><span class="p">]</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">()</span>
+            <span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s2">&quot;mllama&quot;</span><span class="p">:</span>
             <span class="n">ptuning_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ptuning_setup</span><span class="p">(</span><span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
                                               <span class="n">input_lengths</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
@@ -1091,75 +1224,77 @@
 <div class="viewcode-block" id="MultimodalModelRunner.load_test_image">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_image">[docs]</a>
     <span class="k">def</span> <span class="nf">load_test_image</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+
+        <span class="k">def</span> <span class="nf">load_images</span><span class="p">(</span><span class="n">image_paths</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_paths</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                <span class="n">image_paths</span> <span class="o">=</span> <span class="p">[</span><span class="n">image_paths</span><span class="p">]</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">image_path</span> <span class="ow">in</span> <span class="n">image_paths</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">image_path</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;http&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">image_path</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span>
+                        <span class="s2">&quot;https&quot;</span><span class="p">):</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;downloading image from url </span><span class="si">{</span><span class="n">image_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">image_path</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+                    <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">BytesIO</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">))</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">&quot;RGB&quot;</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">&quot;RGB&quot;</span><span class="p">)</span>
+                <span class="n">images</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">images</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">images</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">images</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+
         <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png&#39;</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="n">img_url</span>
-                <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
-                    <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">img_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                 <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">raw</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
-                <span class="k">return</span> <span class="p">[</span><span class="n">image</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
+                <span class="n">img_urls</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="s1">&#39;https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png&#39;</span><span class="p">,</span>
+                    <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
+                <span class="p">]</span> <span class="o">*</span> <span class="mi">4</span>
+                <span class="n">img_urls</span> <span class="o">=</span> <span class="n">img_urls</span><span class="p">[:</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">img_urls</span><span class="p">)</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">img_urls</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">))</span>
 
-                <span class="k">def</span> <span class="nf">load_image</span><span class="p">(</span><span class="n">image_path</span><span class="p">):</span>
-                    <span class="k">if</span> <span class="n">image_path</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;http&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">image_path</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span>
-                            <span class="s2">&quot;https&quot;</span><span class="p">):</span>
-                        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;downloading image from url </span><span class="si">{</span><span class="n">image_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-                        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">image_path</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
-                        <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">BytesIO</span><span class="p">(</span>
-                            <span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">))</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">&quot;RGB&quot;</span><span class="p">)</span>
-                    <span class="k">else</span><span class="p">:</span>
-                        <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">&quot;RGB&quot;</span><span class="p">)</span>
-                    <span class="k">return</span> <span class="n">image</span>
-
-                <span class="n">out</span> <span class="o">=</span> <span class="p">[]</span>
-                <span class="n">image_paths</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">image_path</span> <span class="ow">in</span> <span class="n">image_paths</span><span class="p">:</span>
-                    <span class="n">image</span> <span class="o">=</span> <span class="n">load_image</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
-                    <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image</span><span class="p">)</span>
-                <span class="k">return</span> <span class="n">out</span>
         <span class="k">elif</span> <span class="s2">&quot;nougat&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">filepath</span> <span class="o">=</span> <span class="n">hf_hub_download</span><span class="p">(</span>
                 <span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;hf-internal-testing/fixtures_docvqa&quot;</span><span class="p">,</span>
                 <span class="n">filename</span><span class="o">=</span><span class="s2">&quot;nougat_paper.png&quot;</span><span class="p">,</span>
                 <span class="n">repo_type</span><span class="o">=</span><span class="s2">&quot;dataset&quot;</span><span class="p">)</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;fuyu&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">filepath</span> <span class="o">=</span> <span class="n">hf_hub_download</span><span class="p">(</span><span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;adept/fuyu-8b&quot;</span><span class="p">,</span>
                                        <span class="n">filename</span><span class="o">=</span><span class="s2">&quot;skateboard.png&quot;</span><span class="p">,</span>
                                        <span class="n">repo_type</span><span class="o">=</span><span class="s1">&#39;model&#39;</span><span class="p">)</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;kosmos&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png&#39;</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
-                <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">img_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                             <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">raw</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png&#39;</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;pix2struct&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png&#39;</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
-                <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">img_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                             <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">raw</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png&#39;</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;video-neva&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">img_url</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span>
-            <span class="k">if</span> <span class="n">img_url</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
-
-            <span class="k">if</span> <span class="n">img_url</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;http&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">img_url</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;https&quot;</span><span class="p">):</span>
-                <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span>
+        <span class="k">elif</span> <span class="s2">&quot;internvl&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/examples/image1.jpg&#39;</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
                     <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">img_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                                  <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">raw</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">img_url</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">&quot;RGB&quot;</span><span class="p">)</span>
-
-        <span class="k">return</span> <span class="n">image</span></div>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">images</span></div>
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_inputs">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_inputs">[docs]</a>
     <span class="k">def</span> <span class="nf">setup_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">raw_image</span><span class="p">):</span>
         <span class="kn">from</span> <span class="nn">torchvision</span> <span class="kn">import</span> <span class="n">transforms</span>
+        <span class="n">other_vision_inputs</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">if</span> <span class="s1">&#39;blip2&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">Blip2Processor</span>
             <span class="n">processor</span> <span class="o">=</span> <span class="n">Blip2Processor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
@@ -1210,6 +1345,20 @@
             <span class="n">image</span> <span class="o">=</span> <span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
                               <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
                               <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="s1">&#39;internvl&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
+            <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|system|&gt;</span><span class="se">\n</span><span class="s2">你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。&lt;|end|&gt;&lt;|user|&gt;</span><span class="se">\n</span><span class="s2">&lt;image&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
+            <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;Please describe the image shortly.&quot;</span>
+            <span class="n">post_prompt</span> <span class="o">=</span> <span class="n">input_text</span> <span class="o">+</span> <span class="s2">&quot;&lt;|end|&gt;&lt;|assistant|&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
+            <span class="n">prompt</span> <span class="o">=</span> <span class="n">pre_prompt</span> <span class="o">+</span> <span class="n">post_prompt</span>
+
+            <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">CLIPImageProcessor</span>
+
+            <span class="n">image_processor</span> <span class="o">=</span> <span class="n">CLIPImageProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+                <span class="s1">&#39;OpenGVLab/InternViT-300M-448px&#39;</span>
+            <span class="p">)</span>  <span class="c1"># You can change the InternViT model type according to your InternVL type</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="n">image_processor</span><span class="p">(</span><span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
+                                    <span class="n">return_tensors</span><span class="o">=</span><span class="s1">&#39;pt&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">pixel_values</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;pix2struct&quot;</span><span class="p">:</span>
             <span class="n">image_processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
@@ -1316,6 +1465,8 @@
                 <span class="n">vision_tower</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_vision_tower</span><span class="p">()</span>
                 <span class="n">image_processor</span> <span class="o">=</span> <span class="n">vision_tower</span><span class="o">.</span><span class="n">image_processor</span>
                 <span class="kn">from</span> <span class="nn">llava.mm_utils</span> <span class="kn">import</span> <span class="n">process_images</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">raw_image</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                    <span class="n">raw_image</span> <span class="o">=</span> <span class="p">[</span><span class="n">raw_image</span><span class="p">]</span>
                 <span class="n">image</span> <span class="o">=</span> <span class="n">process_images</span><span class="p">(</span><span class="n">raw_image</span><span class="p">,</span> <span class="n">image_processor</span><span class="p">,</span>
                                        <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
                                                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
@@ -1330,16 +1481,40 @@
                     <span class="n">image</span> <span class="o">=</span> <span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">,</span>
                                       <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
                                       <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)[</span><span class="s1">&#39;pixel_values&#39;</span><span class="p">]</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;mllama&#39;</span><span class="p">]:</span>
+            <span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">load_test_image</span><span class="p">()</span>
+            <span class="n">inputs</span> <span class="o">=</span> <span class="n">processor</span><span class="p">(</span><span class="n">images</span><span class="o">=</span><span class="n">image</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span>
+
+            <span class="n">other_vision_inputs</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;aspect_ratio_ids&quot;</span><span class="p">:</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;aspect_ratio_ids&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
+                <span class="s2">&quot;aspect_ratio_mask&quot;</span><span class="p">:</span>
+                <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;aspect_ratio_mask&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(),</span>
+            <span class="p">}</span>
+            <span class="n">cross_attention_mask</span> <span class="o">=</span> <span class="n">processor</span><span class="p">(</span>
+                <span class="n">image</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)[</span><span class="s1">&#39;cross_attention_mask&#39;</span><span class="p">]</span>
+            <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;cross_attention_mask&quot;</span><span class="p">:</span> <span class="n">cross_attention_mask</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">),</span>
+            <span class="p">}</span>
+            <span class="n">pre_prompt</span> <span class="o">=</span> <span class="n">input_text</span>
+            <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;pixel_values&quot;</span><span class="p">]</span>
 
         <span class="c1"># Repeat inputs to match batch size</span>
         <span class="n">pre_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_prompt</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
         <span class="n">post_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="n">post_prompt</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span>
                 <span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;pix2struct&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">,</span> <span class="s1">&#39;vila&#39;</span><span class="p">,</span> <span class="s1">&#39;phi-3-vision&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;llava_next&#39;</span>
+                <span class="s1">&#39;llava_next&#39;</span><span class="p">,</span> <span class="s1">&#39;internvl&#39;</span>
         <span class="p">]:</span>
             <span class="k">if</span> <span class="n">image</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">5</span><span class="p">:</span>
                 <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+                                     <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+            <span class="k">elif</span> <span class="n">image</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">6</span><span class="p">:</span>
+                <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
                                      <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
@@ -1363,21 +1538,22 @@
             <span class="n">decoder_input_ids</span> <span class="o">=</span> <span class="n">decoder_input_ids</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span>
                 <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
 
-        <span class="k">return</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">decoder_input_ids</span></div>
+        <span class="k">return</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">,</span> <span class="n">other_decoder_inputs</span></div>
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.run">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.run">[docs]</a>
     <span class="k">def</span> <span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">):</span>
-        <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">processed_image</span><span class="p">,</span> <span class="n">decoder_input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_inputs</span><span class="p">(</span>
+        <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">processed_image</span><span class="p">,</span> <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">,</span> <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_inputs</span><span class="p">(</span>
             <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">)</span>
-
         <span class="n">output_text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">pre_prompt</span><span class="p">,</span>
                                     <span class="n">post_prompt</span><span class="p">,</span>
                                     <span class="n">processed_image</span><span class="p">,</span>
                                     <span class="n">decoder_input_ids</span><span class="p">,</span>
                                     <span class="n">max_new_tokens</span><span class="p">,</span>
-                                    <span class="n">warmup</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                                    <span class="n">warmup</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                    <span class="n">other_vision_inputs</span><span class="o">=</span><span class="n">other_vision_inputs</span><span class="p">,</span>
+                                    <span class="n">other_decoder_inputs</span><span class="o">=</span><span class="n">other_decoder_inputs</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">output_text</span></div>
 </div>
@@ -1391,7 +1567,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0d53da50>
+<jinja2.runtime.BlockReference object at 0x7fc13d743d60>
 
 <div class="footer">
     <p>

@@ -7,6 +7,7 @@
   <title>Quick Start Guide &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -18,6 +19,8 @@
         <script src="_static/documentation_options.js?v=5929fcd5"></script>
         <script src="_static/doctools.js?v=888ff710"></script>
         <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="_static/copybutton.js?v=f281be69"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
@@ -49,10 +52,10 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Quick Start Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#llm-api">LLM API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#compile-the-model-into-a-tensorrt-engine">Compile the Model into a TensorRT Engine</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#run-the-model">Run the Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#deploy-with-triton-inference-server">Deploy with Triton Inference Server</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#llm-api">LLM API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#next-steps">Next Steps</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#related-information">Related Information</a></li>
 </ul>
@@ -67,15 +70,16 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -110,17 +114,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -178,6 +187,33 @@
 </li>
 </ul>
 </section>
+<section id="llm-api">
+<h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading"></a></h2>
+<p>The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.</p>
+<p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos"> 4</span>    <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos"> 5</span>    <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos"> 6</span>    <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span>    <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span><span class="p">]</span>
+<span class="linenos"> 9</span><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">10</span>
+<span class="linenos">11</span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">12</span>
+<span class="linenos">13</span><span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">14</span>
+<span class="linenos">15</span><span class="c1"># Print the outputs.</span>
+<span class="linenos">16</span><span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+<span class="linenos">17</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+<span class="linenos">18</span>    <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">19</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>To learn more about the LLM API, check out the <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">API Introduction</span></a> and <a class="reference internal" href="llm-api-examples/index.html"><span class="doc std std-doc">LLM Examples Introduction</span></a>.</p>
+</section>
 <section id="compile-the-model-into-a-tensorrt-engine">
 <span id="quick-start-guide-compile"></span><h2>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading"></a></h2>
 <p>Use the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Llama model definition</a> from the <code class="docutils literal notranslate"><span class="pre">examples/llama</span></code> directory of the GitHub repository.
@@ -226,34 +262,6 @@ The model definition is a minimal example that shows some of the optimizations a
 <li><p>Refer to <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md">End to end workflow to run llama 7b</a> in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.</p></li>
 </ol>
 </section>
-<section id="llm-api">
-<h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading"></a></h2>
-<p>The LLM API is a Python API to setup &amp; infer with TensorRT-LLM directly in python.It allows for optimizing models by specifying a HuggingFace repo name or a model checkpoint. The LLM API handles checkpoint conversion, engine building, engine loading, and model inference, all from one python object.</p>
-<p>Note that these APIs are in incubation, they may change and  supports the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/index.html#supported-model">following models</a>, which will increase in coming release. We appreciate your patience and understanding as we improve this API.</p>
-<p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 2</span>
-<span class="linenos"> 3</span><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos"> 4</span>    <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos"> 5</span>    <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-<span class="linenos"> 6</span>    <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos"> 7</span>    <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos"> 8</span><span class="p">]</span>
-<span class="linenos"> 9</span><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">10</span>
-<span class="linenos">11</span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
-<span class="linenos">12</span>
-<span class="linenos">13</span><span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">14</span>
-<span class="linenos">15</span><span class="c1"># Print the outputs.</span>
-<span class="linenos">16</span><span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
-<span class="linenos">17</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
-<span class="linenos">18</span>    <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
-<span class="linenos">19</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-</pre></div>
-</div>
-<p>To learn more about the LLM API, check out the <a class="reference internal" href="llm-api-examples/index.html"><span class="doc std std-doc">LLM Examples Introduction</span></a> and <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">API Reference</span></a>.</p>
-</section>
 <section id="next-steps">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading"></a></h2>
 <p>In this Quick Start Guide, you:</p>
@@ -288,7 +296,7 @@ The model definition is a minimal example that shows some of the optimizations a
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0f4c73a0>
+<jinja2.runtime.BlockReference object at 0x7fc13f340130>
 
 <div class="footer">
     <p>

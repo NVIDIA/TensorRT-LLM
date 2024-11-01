@@ -5,9 +5,11 @@ Examples
    :maxdepth: 2
    :caption: Scripts
 
-   llm_generate
-   llm_generate_async
-   llm_generate_async_streaming
-   llm_generate_distributed
+   llm_inference
+   llm_inference_async
+   llm_inference_async_streaming
+   llm_inference_customize
+   llm_inference_distributed
+   llm_logits_processor
    llm_quantization
    llm_auto_parallel

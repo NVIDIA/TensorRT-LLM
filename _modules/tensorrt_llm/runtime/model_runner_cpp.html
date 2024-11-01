@@ -6,6 +6,7 @@
   <title>tensorrt_llm.runtime.model_runner_cpp &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -17,6 +18,8 @@
         <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../_static/doctools.js?v=888ff710"></script>
         <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -55,15 +58,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -98,17 +102,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -169,14 +178,17 @@
 
 <span class="kn">import</span> <span class="nn">copy</span>
 <span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
 
 <span class="kn">import</span> <span class="nn">torch</span>
 
 <span class="kn">from</span> <span class="nn">..</span> <span class="kn">import</span> <span class="n">profiler</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">mpi_broadcast</span>
 <span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="p">(</span><span class="n">DataType</span><span class="p">,</span> <span class="n">GptJsonConfig</span><span class="p">,</span> <span class="n">KVCacheType</span><span class="p">,</span> <span class="n">ModelConfig</span><span class="p">,</span>
                         <span class="n">WorldConfig</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">trtllm</span>
+<span class="kn">from</span> <span class="nn">..bindings.executor</span> <span class="kn">import</span> <span class="p">(</span><span class="n">ExternalDraftTokensConfig</span><span class="p">,</span> <span class="n">OrchestratorConfig</span><span class="p">,</span>
+                                 <span class="n">ParallelConfig</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">EngineConfig</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
@@ -194,6 +206,8 @@
     <span class="n">DataType</span><span class="o">.</span><span class="n">BF16</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
     <span class="n">DataType</span><span class="o">.</span><span class="n">INT64</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">int64</span>
 <span class="p">}</span>
+
+<span class="n">SamplingConfigType</span> <span class="o">=</span> <span class="n">Union</span><span class="p">[</span><span class="n">SamplingConfig</span><span class="p">,</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">SamplingConfig</span><span class="p">]</span>
 
 
 <div class="viewcode-block" id="ModelRunnerCpp">
@@ -231,30 +245,36 @@
 <div class="viewcode-block" id="ModelRunnerCpp.from_dir">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunnerCpp.from_dir">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">from_dir</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
-                 <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-                 <span class="o">*</span><span class="p">,</span>
-                 <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-                 <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">max_input_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">max_beam_width</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">sink_token_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">kv_cache_free_gpu_memory_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">medusa_choices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">lookahead_config</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                 <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
-                 <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-                 <span class="n">max_tokens_in_paged_kv_cache</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">kv_cache_enable_block_reuse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                 <span class="n">enable_chunked_context</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                 <span class="n">is_enc_dec</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                 <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-                 <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">cuda_graph_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunnerCpp&#39;</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">from_dir</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_input_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_beam_width</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">sink_token_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">kv_cache_free_gpu_memory_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">medusa_choices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">lookahead_config</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
+        <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="n">max_tokens_in_paged_kv_cache</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">kv_cache_enable_block_reuse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">enable_chunked_context</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">is_enc_dec</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cuda_graph_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">logits_processor_map</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LogitsProcessor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">device_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">is_orchestrator_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunnerCpp&#39;</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Create a ModelRunnerCpp instance from an engine directory.</span>
 
@@ -287,6 +307,8 @@
 <span class="sd">                The sink token length, default=0.</span>
 <span class="sd">            kv_cache_free_gpu_memory_fraction (float) :</span>
 <span class="sd">                Free GPU memory fraction that KV cache used.</span>
+<span class="sd">            cross_kv_cache_fraction (float) :</span>
+<span class="sd">                KV Cache fraction reserved for cross attention, should only be used with enc-dec models.</span>
 <span class="sd">            debug_mode (bool):</span>
 <span class="sd">                Whether or not to turn on the debug mode.</span>
 <span class="sd">            medusa_choices (List[List[int]]):</span>
@@ -307,6 +329,13 @@
 <span class="sd">                Enable FMHA runner FP32 accumulation.</span>
 <span class="sd">            cuda_graph_mode (bool):</span>
 <span class="sd">                Whether to use cuda graph for inference.</span>
+<span class="sd">            logits_processor_map (Dict[str, LogitsProcessor])</span>
+<span class="sd">                A map of logits processor functions indexed by names. A name can be provided later to</span>
+<span class="sd">                the generate() function to specify which logits processor to run.</span>
+<span class="sd">            device_ids (List[int]):</span>
+<span class="sd">                Device indices to run the Executor on.</span>
+<span class="sd">            is_orchestrator_mode (bool):</span>
+<span class="sd">                The mode to run the model-runner, Leader mode by default.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            ModelRunnerCpp: An instance of ModelRunnerCpp.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -342,8 +371,8 @@
             <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s1">&#39;load tensorrt_llm engine&#39;</span><span class="p">)</span>
 
             <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">KvCacheConfig</span><span class="p">(</span>
-                <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="n">kv_cache_free_gpu_memory_fraction</span> <span class="o">/</span>
-                <span class="mi">2</span><span class="p">,</span>  <span class="c1"># hardcoded as half self kv &amp; half cross kv for now</span>
+                <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="n">kv_cache_free_gpu_memory_fraction</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="n">cross_kv_cache_fraction</span><span class="p">,</span>
                 <span class="n">max_attention_window</span><span class="o">=</span><span class="n">max_attention_window_size</span><span class="p">,</span>
                 <span class="n">sink_token_length</span><span class="o">=</span><span class="n">sink_token_length</span><span class="p">)</span>
 
@@ -375,6 +404,8 @@
         <span class="n">json_config</span> <span class="o">=</span> <span class="n">GptJsonConfig</span><span class="o">.</span><span class="n">parse_file</span><span class="p">(</span><span class="n">config_path</span><span class="p">)</span>
         <span class="n">model_config</span> <span class="o">=</span> <span class="n">json_config</span><span class="o">.</span><span class="n">model_config</span>
         <span class="n">use_kv_cache</span> <span class="o">=</span> <span class="n">model_config</span><span class="o">.</span><span class="n">kv_cache_type</span> <span class="o">!=</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">DISABLED</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">model_config</span><span class="o">.</span><span class="n">use_cross_attention</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">cross_kv_cache_fraction</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;cross_kv_cache_fraction should only be used with enc-dec models.&quot;</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="n">use_kv_cache</span><span class="p">:</span>
             <span class="k">assert</span> <span class="n">max_output_len</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">max_output_len</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">&#39;Disabled KV cache is intended for context phase only now.&#39;</span>
@@ -382,8 +413,16 @@
         <span class="c1"># Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor</span>
         <span class="c1"># by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and</span>
         <span class="c1"># num_layers properties.</span>
-        <span class="n">tp_size</span> <span class="o">=</span> <span class="n">json_config</span><span class="o">.</span><span class="n">tensor_parallelism</span>
-        <span class="n">pp_size</span> <span class="o">=</span> <span class="n">json_config</span><span class="o">.</span><span class="n">pipeline_parallelism</span>
+
+        <span class="c1"># MPI world size must be 1 in Orchestrator mode</span>
+        <span class="k">if</span> <span class="n">is_orchestrator_mode</span><span class="p">:</span>
+            <span class="n">tp_size</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="n">pp_size</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="c1"># Check the count of devices equal to tp_size of engine</span>
+            <span class="c1"># assert len(device_ids) == json_config.tensor_parallelism</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">tp_size</span> <span class="o">=</span> <span class="n">json_config</span><span class="o">.</span><span class="n">tensor_parallelism</span>
+            <span class="n">pp_size</span> <span class="o">=</span> <span class="n">json_config</span><span class="o">.</span><span class="n">pipeline_parallelism</span>
         <span class="n">gpus_per_node</span> <span class="o">=</span> <span class="n">json_config</span><span class="o">.</span><span class="n">gpus_per_node</span>
         <span class="n">world_config</span> <span class="o">=</span> <span class="n">WorldConfig</span><span class="o">.</span><span class="n">mpi</span><span class="p">(</span><span class="n">tensor_parallelism</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                        <span class="n">pipeline_parallelism</span><span class="o">=</span><span class="n">pp_size</span><span class="p">,</span>
@@ -429,6 +468,9 @@
             <span class="n">lora_manager</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">PeftCacheConfig</span><span class="p">()</span>
 
+        <span class="k">if</span> <span class="n">world_config</span><span class="o">.</span><span class="n">size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">mpi_broadcast</span><span class="p">(</span><span class="n">peft_cache_config</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
         <span class="n">profiler</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="s1">&#39;load tensorrt_llm engine&#39;</span><span class="p">)</span>
 
         <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">KvCacheConfig</span><span class="p">(</span>
@@ -436,7 +478,9 @@
             <span class="n">max_attention_window</span><span class="o">=</span><span class="n">max_attention_window_size</span><span class="p">,</span>
             <span class="n">sink_token_length</span><span class="o">=</span><span class="n">sink_token_length</span><span class="p">,</span>
             <span class="n">max_tokens</span><span class="o">=</span><span class="n">max_tokens_in_paged_kv_cache</span><span class="p">,</span>
-            <span class="n">enable_block_reuse</span><span class="o">=</span><span class="n">kv_cache_enable_block_reuse</span><span class="p">)</span>
+            <span class="n">enable_block_reuse</span><span class="o">=</span><span class="n">kv_cache_enable_block_reuse</span><span class="p">,</span>
+            <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="n">cross_kv_cache_fraction</span><span class="p">,</span>
+        <span class="p">)</span>
 
         <span class="n">decoding_config</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">DecodingConfig</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">medusa_choices</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -490,6 +534,27 @@
             <span class="n">gpu_weights_percent</span><span class="o">=</span><span class="n">gpu_weights_percent</span><span class="p">)</span>
         <span class="n">trtllm_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="n">enable_chunked_context</span>
         <span class="n">trtllm_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="n">extended_runtime_perf_knob_config</span>
+
+        <span class="k">if</span> <span class="n">is_orchestrator_mode</span><span class="p">:</span>
+            <span class="n">communication_mode</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">CommunicationMode</span><span class="o">.</span><span class="n">ORCHESTRATOR</span>
+            <span class="n">path</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">parent</span> <span class="o">/</span> <span class="s1">&#39;bin&#39;</span> <span class="o">/</span> <span class="s1">&#39;executorWorker&#39;</span><span class="p">)</span>
+            <span class="n">orchestrator_config</span> <span class="o">=</span> <span class="n">OrchestratorConfig</span><span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">communication_mode</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">CommunicationMode</span><span class="o">.</span><span class="n">LEADER</span>
+            <span class="n">orchestrator_config</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="n">trtllm_config</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">ParallelConfig</span><span class="p">(</span>
+            <span class="n">trtllm</span><span class="o">.</span><span class="n">CommunicationType</span><span class="o">.</span><span class="n">MPI</span><span class="p">,</span>
+            <span class="n">communication_mode</span><span class="p">,</span>
+            <span class="n">device_ids</span><span class="o">=</span><span class="n">device_ids</span><span class="p">,</span>
+            <span class="n">orchestrator_config</span><span class="o">=</span><span class="n">orchestrator_config</span><span class="p">)</span>
+
+        <span class="c1"># LogitsPostProcessor in Orchestrator mode is not supported yet.</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">is_orchestrator_mode</span><span class="p">:</span>
+            <span class="n">logits_proc_config</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">LogitsPostProcessorConfig</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">logits_processor_map</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">logits_proc_config</span><span class="o">.</span><span class="n">processor_map</span> <span class="o">=</span> <span class="n">logits_processor_map</span>
+            <span class="n">trtllm_config</span><span class="o">.</span><span class="n">logits_post_processor_config</span> <span class="o">=</span> <span class="n">logits_proc_config</span>
 
         <span class="n">executor</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">Executor</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">,</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">ModelType</span><span class="o">.</span><span class="n">DECODER_ONLY</span><span class="p">,</span>
                                    <span class="n">trtllm_config</span><span class="p">)</span>
@@ -589,12 +654,14 @@
             <span class="n">encoder_input_features</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span>
                 <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># TODO: add to doc string</span>
             <span class="n">encoder_output_lengths</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">cross_attention_masks</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># TODO: add to doc string</span>
             <span class="n">sampling_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">lora_uids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">lookahead_config</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
             <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">StoppingCriteria</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">logits_processor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LogitsProcessor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">logits_processor_names</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
             <span class="n">end_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">pad_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -641,8 +708,8 @@
 <span class="sd">                Whether or not to use streaming mode for generation.</span>
 <span class="sd">            stopping_criteria (StoppingCriteria):</span>
 <span class="sd">                Custom stopping criteria.</span>
-<span class="sd">            logits_processor (LogitsProcessor):</span>
-<span class="sd">                Custom logits processors.</span>
+<span class="sd">            logits_processor_names (List[str]):</span>
+<span class="sd">                Custom logits processor names.</span>
 <span class="sd">            return_all_generated_tokens (bool):</span>
 <span class="sd">                Whether the full output is returned at each streaming step</span>
 <span class="sd">            kwargs (Dict[str, Any]:</span>
@@ -660,9 +727,6 @@
         <span class="k">if</span> <span class="n">stopping_criteria</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="s2">&quot;Stopping criteria is not supported in C++ session.&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">logits_processor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-                <span class="s2">&quot;Logits processor is not supported in C++ session.&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span> <span class="ow">and</span> <span class="n">max_new_tokens</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
@@ -685,7 +749,8 @@
                 <span class="s2">&quot;top_p_decay&quot;</span><span class="p">,</span> <span class="s2">&quot;temperature&quot;</span><span class="p">,</span> <span class="s2">&quot;min_tokens&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;beam_search_diversity_rate&quot;</span><span class="p">,</span> <span class="s2">&quot;repetition_penalty&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;presence_penalty&quot;</span><span class="p">,</span> <span class="s2">&quot;frequency_penalty&quot;</span><span class="p">,</span> <span class="s2">&quot;length_penalty&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;early_stopping&quot;</span><span class="p">,</span> <span class="s2">&quot;no_repeat_ngram_size&quot;</span><span class="p">,</span> <span class="s2">&quot;random_seed&quot;</span>
+                <span class="s2">&quot;early_stopping&quot;</span><span class="p">,</span> <span class="s2">&quot;no_repeat_ngram_size&quot;</span><span class="p">,</span> <span class="s2">&quot;random_seed&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;num_return_sequences&quot;</span>
             <span class="p">]</span>
             <span class="n">rename_params</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;num_beams&quot;</span><span class="p">:</span> <span class="s2">&quot;beam_width&quot;</span><span class="p">,</span> <span class="s2">&quot;random_seed&quot;</span><span class="p">:</span> <span class="s2">&quot;seed&quot;</span><span class="p">}</span>
             <span class="n">sampling_params</span> <span class="o">=</span> <span class="p">{</span>
@@ -720,6 +785,8 @@
                                                    <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">))</span>
         <span class="n">bad_words_list</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_words_list</span><span class="p">(</span><span class="n">bad_words_list</span><span class="p">,</span>
                                                   <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">))</span>
+        <span class="n">logits_processor_names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_names_list</span><span class="p">(</span>
+            <span class="n">logits_processor_names</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">))</span>
 
         <span class="n">lora_configs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_lora_configs</span><span class="p">(</span><span class="n">lora_uids</span><span class="p">,</span>
                                                   <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">))</span>
@@ -727,6 +794,29 @@
         <span class="k">if</span> <span class="n">lookahead_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="p">[</span><span class="n">w</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">g</span><span class="p">]</span> <span class="o">=</span> <span class="n">lookahead_config</span>
             <span class="n">request_lookahead_config</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">LookaheadDecodingConfig</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">g</span><span class="p">)</span>
+
+        <span class="c1"># Draft-Target-Model speculative decoding</span>
+        <span class="k">if</span> <span class="s2">&quot;draft_tokens_list&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="ow">and</span> <span class="n">kwargs</span><span class="p">[</span>
+                <span class="s2">&quot;draft_tokens_list&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="s2">&quot;draft_logits_list&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">keys</span><span class="p">(</span>
+                <span class="p">)</span> <span class="ow">and</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;draft_logits_list&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># Use logits to accept</span>
+            <span class="n">external_draft_tokens_configs</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">ExternalDraftTokensConfig</span><span class="p">(</span><span class="n">draft_tokens</span><span class="p">,</span> <span class="n">draft_logits</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">draft_tokens</span><span class="p">,</span> <span class="n">draft_logits</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                    <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;draft_tokens_list&quot;</span><span class="p">],</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;draft_logits_list&quot;</span><span class="p">])</span>
+            <span class="p">]</span>
+            <span class="n">is_draft_target_model</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">elif</span> <span class="s2">&quot;draft_tokens_list&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">keys</span><span class="p">(</span>
+        <span class="p">)</span> <span class="ow">and</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;draft_tokens_list&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># Use tokens to accept</span>
+            <span class="n">external_draft_tokens_configs</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">ExternalDraftTokensConfig</span><span class="p">(</span><span class="n">draft_tokens</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">draft_tokens</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;draft_tokens_list&quot;</span><span class="p">]</span>
+            <span class="p">]</span>
+            <span class="n">is_draft_target_model</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">external_draft_tokens_configs</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">)</span>
+            <span class="n">is_draft_target_model</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="n">requests</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">trtllm</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span>
@@ -739,6 +829,9 @@
                 <span class="k">if</span> <span class="n">encoder_input_features</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
                 <span class="k">if</span> <span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_attention_mask</span><span class="o">=</span><span class="n">cross_attention_masks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span> <span class="k">if</span>
+                <span class="p">(</span><span class="n">cross_attention_masks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                 <span class="ow">and</span> <span class="n">cross_attention_masks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">max_tokens</span><span class="o">=</span><span class="n">max_new_tokens</span><span class="p">,</span>
                 <span class="n">pad_id</span><span class="o">=</span><span class="n">pad_id</span><span class="p">,</span>
                 <span class="n">end_id</span><span class="o">=</span><span class="n">end_id</span><span class="p">,</span>
@@ -750,27 +843,32 @@
                 <span class="n">output_config</span><span class="o">=</span><span class="n">output_config</span><span class="p">,</span>
                 <span class="n">prompt_tuning_config</span><span class="o">=</span><span class="n">prompt_tuning_config</span><span class="p">,</span>
                 <span class="n">lora_config</span><span class="o">=</span><span class="n">lora_config</span><span class="p">,</span>
-                <span class="n">return_all_generated_tokens</span><span class="o">=</span><span class="n">return_all_generated_tokens</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span>
+                <span class="n">return_all_generated_tokens</span><span class="o">=</span><span class="n">return_all_generated_tokens</span><span class="p">,</span>
+                <span class="n">logits_post_processor_name</span><span class="o">=</span><span class="n">logits_post_processor_name</span><span class="p">,</span>
+                <span class="n">external_draft_tokens_config</span><span class="o">=</span><span class="n">external_draft_tokens_config</span><span class="p">,</span>
+            <span class="p">)</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span>
             <span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">stop_words</span><span class="p">,</span> <span class="n">bad_words</span><span class="p">,</span> <span class="n">prompt_tuning_config</span><span class="p">,</span>
-             <span class="n">lora_config</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
+             <span class="n">lora_config</span><span class="p">,</span> <span class="n">logits_post_processor_name</span><span class="p">,</span>
+             <span class="n">external_draft_tokens_config</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
                  <span class="nb">zip</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">stop_words_list</span><span class="p">,</span> <span class="n">bad_words_list</span><span class="p">,</span>
-                     <span class="n">prompt_tuning_configs</span><span class="p">,</span> <span class="n">lora_configs</span><span class="p">))</span>
+                     <span class="n">prompt_tuning_configs</span><span class="p">,</span> <span class="n">lora_configs</span><span class="p">,</span>
+                     <span class="n">logits_processor_names</span><span class="p">,</span> <span class="n">external_draft_tokens_configs</span><span class="p">))</span>
         <span class="p">]</span>
 
         <span class="n">request_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">enqueue_requests</span><span class="p">(</span><span class="n">requests</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">streaming</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_initialize_and_fill_output</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span>
-                                                    <span class="n">return_dict</span><span class="p">,</span>
-                                                    <span class="n">output_sequence_lengths</span><span class="p">,</span>
-                                                    <span class="n">output_log_probs</span><span class="p">,</span>
-                                                    <span class="n">output_cum_log_probs</span><span class="p">,</span>
-                                                    <span class="n">batch_input_ids</span><span class="p">,</span> <span class="n">streaming</span><span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_initialize_and_fill_output</span><span class="p">(</span>
+                <span class="n">request_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span> <span class="n">output_sequence_lengths</span><span class="p">,</span>
+                <span class="n">output_log_probs</span><span class="p">,</span> <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span>
+                <span class="n">streaming</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">,</span> <span class="n">sampling_config</span><span class="p">,</span>
+                <span class="n">is_draft_target_model</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stream</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span>
                                 <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">output_log_probs</span><span class="p">,</span>
                                 <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span>
                                 <span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">streaming</span><span class="p">,</span>
-                                <span class="n">return_all_generated_tokens</span><span class="p">)</span></div>
+                                <span class="n">return_all_generated_tokens</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">,</span>
+                                <span class="n">sampling_config</span><span class="p">,</span> <span class="n">is_draft_target_model</span><span class="p">)</span></div>
 
 
     <span class="k">def</span> <span class="nf">_prepare_words_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">words_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]],</span>
@@ -778,6 +876,11 @@
         <span class="k">if</span> <span class="n">words_list</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span>
         <span class="k">return</span> <span class="n">words_list</span>
+
+    <span class="k">def</span> <span class="nf">_prepare_names_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">names_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">names_list</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">batch_size</span>
+        <span class="k">return</span> <span class="n">names_list</span>
 
     <span class="k">def</span> <span class="nf">_prepare_ptuning_executor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">prompt_table</span><span class="p">,</span>
                                   <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">input_token_extra_ids</span><span class="p">):</span>
@@ -820,13 +923,31 @@
             <span class="k">if</span> <span class="nb">int</span><span class="p">(</span><span class="n">uid</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span> <span class="k">for</span> <span class="n">uid</span> <span class="ow">in</span> <span class="n">lora_uids</span>
         <span class="p">]</span>
 
-    <span class="k">def</span> <span class="nf">_initialize_and_fill_output</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span>
-                                    <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">output_log_probs</span><span class="p">,</span>
-                                    <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span>
-                                    <span class="n">streaming</span><span class="p">):</span>
-        <span class="n">output_ids</span> <span class="o">=</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))]</span>
-        <span class="k">for</span> <span class="n">reqid_pos</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)):</span>
-            <span class="n">output_ids</span><span class="p">[</span><span class="n">reqid_pos</span><span class="p">]</span> <span class="o">=</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">)]</span>
+    <span class="k">def</span> <span class="nf">_get_num_sequences</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sampling_config</span><span class="p">:</span> <span class="n">SamplingConfigType</span><span class="p">):</span>
+        <span class="n">num_beams</span> <span class="o">=</span> <span class="n">sampling_config</span><span class="o">.</span><span class="n">num_beams</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span>
+            <span class="n">sampling_config</span><span class="p">,</span> <span class="n">SamplingConfig</span><span class="p">)</span> <span class="k">else</span> <span class="n">sampling_config</span><span class="o">.</span><span class="n">beam_width</span>
+        <span class="n">num_sequences</span> <span class="o">=</span> <span class="n">sampling_config</span><span class="o">.</span><span class="n">num_return_sequences</span> <span class="ow">or</span> <span class="n">num_beams</span>
+        <span class="k">assert</span> <span class="n">num_beams</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">num_sequences</span> <span class="o">&lt;=</span> <span class="n">num_beams</span>
+        <span class="k">return</span> <span class="n">num_sequences</span>
+
+    <span class="k">def</span> <span class="nf">_initialize_and_fill_output</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">,</span>
+        <span class="n">end_id</span><span class="p">,</span>
+        <span class="n">return_dict</span><span class="p">,</span>
+        <span class="n">output_sequence_lengths</span><span class="p">,</span>
+        <span class="n">output_log_probs</span><span class="p">,</span>
+        <span class="n">output_cum_log_probs</span><span class="p">,</span>
+        <span class="n">batch_input_ids</span><span class="p">,</span>
+        <span class="n">streaming</span><span class="p">,</span>
+        <span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">sampling_config</span><span class="p">:</span> <span class="n">SamplingConfigType</span><span class="p">,</span>
+        <span class="n">is_draft_target_model</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="n">num_sequences</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_sequences</span><span class="p">(</span><span class="n">sampling_config</span><span class="p">)</span>
+        <span class="c1"># (batch_size, num_sequences, sequence_len)</span>
+        <span class="n">output_ids</span> <span class="o">=</span> <span class="p">[[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_sequences</span><span class="p">)]</span>
+                      <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))]</span>
 
         <span class="n">multi_responses</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">await_responses</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)</span>
         <span class="n">responses</span> <span class="o">=</span> <span class="p">[</span>
@@ -836,123 +957,228 @@
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_fill_output</span><span class="p">(</span><span class="n">responses</span><span class="p">,</span> <span class="n">output_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span>
                                  <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">output_log_probs</span><span class="p">,</span>
                                  <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span> <span class="p">[],</span>
-                                 <span class="n">streaming</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+                                 <span class="n">streaming</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="kc">False</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">,</span>
+                                 <span class="n">sampling_config</span><span class="p">,</span> <span class="n">is_draft_target_model</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">_stream</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span> <span class="n">output_sequence_lengths</span><span class="p">,</span>
-                <span class="n">output_log_probs</span><span class="p">,</span> <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span>
-                <span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">streaming</span><span class="p">,</span> <span class="n">return_all_generated_tokens</span><span class="p">):</span>
-        <span class="n">output_ids</span> <span class="o">=</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))]</span>
-        <span class="k">for</span> <span class="n">reqid_pos</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)):</span>
-            <span class="n">output_ids</span><span class="p">[</span><span class="n">reqid_pos</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
-                <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">[</span><span class="n">reqid_pos</span><span class="p">])</span>
-                <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">)</span>
-            <span class="p">]</span>
+    <span class="k">def</span> <span class="nf">_stream</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">,</span>
+        <span class="n">end_id</span><span class="p">,</span>
+        <span class="n">return_dict</span><span class="p">,</span>
+        <span class="n">output_sequence_lengths</span><span class="p">,</span>
+        <span class="n">output_log_probs</span><span class="p">,</span>
+        <span class="n">output_cum_log_probs</span><span class="p">,</span>
+        <span class="n">batch_input_ids</span><span class="p">,</span>
+        <span class="n">batch_input_ids_list</span><span class="p">,</span>
+        <span class="n">streaming</span><span class="p">,</span>
+        <span class="n">return_all_generated_tokens</span><span class="p">,</span>
+        <span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">sampling_config</span><span class="p">:</span> <span class="n">SamplingConfigType</span><span class="p">,</span>
+        <span class="n">is_draft_target_model</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="n">num_sequences</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_sequences</span><span class="p">(</span><span class="n">sampling_config</span><span class="p">)</span>
+        <span class="c1"># (batch_size, num_sequences, sequence_len)</span>
+        <span class="n">output_ids</span> <span class="o">=</span> <span class="p">[[</span>
+            <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">])</span>
+            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_sequences</span><span class="p">)</span>
+        <span class="p">]</span> <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))]</span>
 
-        <span class="n">finished_reqs</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="k">while</span> <span class="n">finished_reqs</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">):</span>
+        <span class="n">finished_request_ids</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">while</span> <span class="n">finished_request_ids</span> <span class="o">!=</span> <span class="nb">set</span><span class="p">(</span><span class="n">request_ids</span><span class="p">):</span>
             <span class="n">responses</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">await_responses</span><span class="p">()</span>
-
             <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">is_final</span><span class="p">:</span>
-                    <span class="n">finished_reqs</span> <span class="o">+=</span> <span class="mi">1</span>
+                    <span class="n">finished_request_ids</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
 
             <span class="k">yield</span> <span class="bp">self</span><span class="o">.</span><span class="n">_fill_output</span><span class="p">(</span><span class="n">responses</span><span class="p">,</span> <span class="n">output_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span>
                                     <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">output_log_probs</span><span class="p">,</span>
                                     <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span>
                                     <span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">streaming</span><span class="p">,</span>
-                                    <span class="n">request_ids</span><span class="p">,</span> <span class="n">return_all_generated_tokens</span><span class="p">)</span>
+                                    <span class="n">request_ids</span><span class="p">,</span> <span class="n">return_all_generated_tokens</span><span class="p">,</span>
+                                    <span class="n">max_new_tokens</span><span class="p">,</span> <span class="n">sampling_config</span><span class="p">,</span>
+                                    <span class="n">is_draft_target_model</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_fill_output</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">responses</span><span class="p">,</span> <span class="n">output_ids</span><span class="p">,</span> <span class="n">end_id</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span>
                      <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">output_log_probs</span><span class="p">,</span>
                      <span class="n">output_cum_log_probs</span><span class="p">,</span> <span class="n">batch_input_ids</span><span class="p">,</span>
                      <span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">streaming</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span>
-                     <span class="n">return_all_generated_tokens</span><span class="p">):</span>
+                     <span class="n">return_all_generated_tokens</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                     <span class="n">sampling_config</span><span class="p">:</span> <span class="n">SamplingConfigType</span><span class="p">,</span>
+                     <span class="n">is_draft_target_model</span><span class="p">:</span> <span class="nb">bool</span><span class="p">):</span>
         <span class="n">cuda_device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+
+        <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids</span><span class="p">)</span>
+        <span class="n">num_sequences</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">output_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+        <span class="n">beam_width</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">sampling_config</span><span class="p">,</span> <span class="s1">&#39;num_beams&#39;</span><span class="p">,</span>
+                             <span class="nb">getattr</span><span class="p">(</span><span class="n">sampling_config</span><span class="p">,</span> <span class="s1">&#39;beam_width&#39;</span><span class="p">))</span>
+        <span class="n">is_beam_search</span> <span class="o">=</span> <span class="n">beam_width</span> <span class="o">&gt;</span> <span class="mi">1</span>
+
+        <span class="k">def</span> <span class="nf">fill_output_ids</span><span class="p">(</span><span class="n">result_token_ids</span><span class="p">,</span> <span class="n">batch_idx</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">):</span>
+            <span class="c1"># Return shape = (batch_size, num_sequences, seq_len)</span>
+            <span class="k">if</span> <span class="n">return_all_generated_tokens</span><span class="p">:</span>
+                <span class="n">output_ids</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="n">seq_idx</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="n">batch_input_ids_list</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]</span> <span class="o">+</span> <span class="n">result_token_ids</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">output_ids</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="n">seq_idx</span><span class="p">]</span> <span class="o">+=</span> <span class="n">result_token_ids</span>
 
         <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">has_error</span><span class="p">():</span>
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error_msg</span><span class="p">)</span>
 
-            <span class="n">reqid_pos</span> <span class="o">=</span> <span class="n">request_ids</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">beam</span><span class="p">,</span> <span class="n">output_tokens</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
-                    <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">):</span>
-                <span class="k">if</span> <span class="n">return_all_generated_tokens</span><span class="p">:</span>
-                    <span class="n">output_ids</span><span class="p">[</span><span class="n">reqid_pos</span><span class="p">][</span>
-                        <span class="n">beam</span><span class="p">]</span> <span class="o">=</span> <span class="n">batch_input_ids_list</span><span class="p">[</span><span class="n">reqid_pos</span><span class="p">]</span> <span class="o">+</span> <span class="n">output_tokens</span>
-                <span class="k">else</span><span class="p">:</span>
-                    <span class="n">output_ids</span><span class="p">[</span><span class="n">reqid_pos</span><span class="p">][</span><span class="n">beam</span><span class="p">]</span> <span class="o">+=</span> <span class="n">output_tokens</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span>
+            <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">request_ids</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">is_beam_search</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">beam</span><span class="p">,</span> <span class="n">output_tokens</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">):</span>
+                    <span class="n">fill_output_ids</span><span class="p">(</span><span class="n">output_tokens</span><span class="p">,</span> <span class="n">batch_idx</span><span class="p">,</span> <span class="n">beam</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">fill_output_ids</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">batch_idx</span><span class="p">,</span>
+                                <span class="n">result</span><span class="o">.</span><span class="n">sequence_index</span><span class="p">)</span>
 
-        <span class="n">sequence_lengths</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">output_ids</span><span class="p">:</span>
-            <span class="n">sequence_lengths</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="nb">len</span><span class="p">(</span><span class="n">a</span><span class="p">)</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">output</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">output_sequence_lengths</span><span class="p">:</span>
+            <span class="n">sequence_lengths</span> <span class="o">=</span> <span class="p">[[</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span> <span class="k">for</span> <span class="n">token_ids</span> <span class="ow">in</span> <span class="n">beams</span><span class="p">]</span>
+                                <span class="k">for</span> <span class="n">beams</span> <span class="ow">in</span> <span class="n">output_ids</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="n">streaming</span><span class="p">:</span>
             <span class="n">output_ids</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="n">output_ids</span><span class="p">)</span>
 
-        <span class="k">for</span> <span class="n">beam</span> <span class="ow">in</span> <span class="n">output_ids</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">output_tokens</span> <span class="ow">in</span> <span class="n">beam</span><span class="p">:</span>
-                <span class="n">output_tokens</span> <span class="o">+=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">-</span>
-                                  <span class="nb">len</span><span class="p">(</span><span class="n">output_tokens</span><span class="p">))</span> <span class="o">*</span> <span class="p">[</span><span class="n">end_id</span><span class="p">]</span>
-
+        <span class="c1"># Pad by end_id tokens (batch, num_sequences, max_seq_len).</span>
+        <span class="k">for</span> <span class="n">beams</span> <span class="ow">in</span> <span class="n">output_ids</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">token_ids</span> <span class="ow">in</span> <span class="n">beams</span><span class="p">:</span>
+                <span class="n">token_ids</span> <span class="o">+=</span> <span class="p">[</span><span class="n">end_id</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">))</span>
         <span class="n">output_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">output_ids</span><span class="p">,</span>
                                   <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
                                   <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">return_dict</span><span class="p">:</span>
             <span class="n">outputs</span> <span class="o">=</span> <span class="p">{</span><span class="s1">&#39;output_ids&#39;</span><span class="p">:</span> <span class="n">output_ids</span><span class="p">}</span>
+
+            <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">batch_input_ids</span><span class="p">],</span>
+                                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                         <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="n">output_sequence_lengths</span><span class="p">:</span>
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;sequence_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">sequence_lengths</span><span class="p">,</span>
                                                            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
                                                            <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">:</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">context_logits</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">responses</span>
-                    <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                <span class="p">]</span>
-                <span class="c1"># Pad context_logits into a rectangle</span>
-                <span class="n">max_input_length</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-                                       <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">])</span>
-                <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">a</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]):</span>
-                    <span class="n">pad_length</span> <span class="o">=</span> <span class="n">max_input_length</span> <span class="o">-</span> <span class="n">a</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-                    <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">][</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span>
-                        <span class="n">a</span><span class="p">,</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">pad_length</span><span class="p">])</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span>
-                    <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">])</span>
+                <span class="n">context_logits</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="n">max_input_len</span> <span class="o">=</span> <span class="n">input_lengths</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+                <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+                    <span class="n">result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span>
+                    <span class="n">logits</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">context_logits</span>
+                    <span class="k">if</span> <span class="n">logits</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="k">continue</span>
+                    <span class="n">input_len</span><span class="p">,</span> <span class="n">vocab_size</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span>
+                    <span class="k">if</span> <span class="n">context_logits</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">context_logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+                            <span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">),</span>
+                            <span class="n">dtype</span><span class="o">=</span><span class="n">logits</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                            <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">sequence_index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                        <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">request_ids</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+                        <span class="n">context_logits</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">input_len</span><span class="p">,</span> <span class="p">:]</span> <span class="o">=</span> <span class="n">logits</span>
+                <span class="k">assert</span> <span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">context_logits</span>
+
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">responses</span>
-                    <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                <span class="p">]</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span>
-                    <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">])</span>
+                <span class="n">gen_logits</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">if</span> <span class="n">is_draft_target_model</span><span class="p">:</span>
+                    <span class="c1"># Put the outputs in a list rather than a tensor since their</span>
+                    <span class="c1"># length may vary among requests in a batch</span>
+                    <span class="n">gen_logits</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">responses</span>
+                        <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="p">]</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="c1"># The shape of generation logits</span>
+                    <span class="c1">#   (num_sequences, seq_len, vocab_size) in non-streaming</span>
+                    <span class="c1">#   (seq_len, num_sequences, vocab_size) in streaming</span>
+                    <span class="n">seq_dim</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">streaming</span> <span class="k">else</span> <span class="mi">1</span>
+                    <span class="n">max_out_len</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
+                        <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="n">seq_dim</span><span class="p">)</span>
+                        <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span>
+                        <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+                    <span class="n">vocab_size</span> <span class="o">=</span> <span class="n">responses</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="n">streaming</span><span class="p">:</span>
+                        <span class="n">gen_shape</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_sequences</span><span class="p">,</span> <span class="n">max_out_len</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">streaming</span> <span class="ow">and</span> <span class="n">return_all_generated_tokens</span><span class="p">:</span>
+                        <span class="n">gen_shape</span> <span class="o">=</span> <span class="p">(</span><span class="n">max_out_len</span><span class="p">,</span> <span class="n">num_sequences</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="c1"># streaming and not return_all_generated_tokens</span>
+                        <span class="n">gen_shape</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_sequences</span><span class="p">,</span> <span class="n">vocab_size</span><span class="p">)</span>
+                    <span class="n">logits_dtype</span> <span class="o">=</span> <span class="n">responses</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span><span class="o">.</span><span class="n">dtype</span>
+                    <span class="n">gen_logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">*</span><span class="n">gen_shape</span><span class="p">),</span>
+                                             <span class="n">dtype</span><span class="o">=</span><span class="n">logits_dtype</span><span class="p">,</span>
+                                             <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
+
+                    <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+                        <span class="n">logits</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">generation_logits</span>
+                        <span class="k">if</span> <span class="n">logits</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="k">continue</span>
+                        <span class="n">seq_len</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="n">seq_dim</span><span class="p">)</span>
+
+                        <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">request_ids</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+                        <span class="n">seq_idx</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">sequence_index</span>
+                        <span class="k">if</span> <span class="n">streaming</span><span class="p">:</span>
+                            <span class="k">if</span> <span class="n">is_beam_search</span><span class="p">:</span>
+                                <span class="c1"># WAR: gen_logits contains all beams, clipping</span>
+                                <span class="c1"># the first n beams as a postprocessing.</span>
+                                <span class="n">gen_logits</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">seq_len</span><span class="p">,</span>
+                                           <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:,</span> <span class="p">:</span><span class="n">num_sequences</span><span class="p">,</span> <span class="p">:]</span>
+                            <span class="k">else</span><span class="p">:</span>
+                                <span class="n">gen_logits</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">seq_len</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">,</span>
+                                           <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">,</span> <span class="p">:]</span>
+                        <span class="k">else</span><span class="p">:</span>
+                            <span class="k">if</span> <span class="n">is_beam_search</span><span class="p">:</span>
+                                <span class="n">gen_logits</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="p">:,</span> <span class="p">:</span><span class="n">seq_len</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">logits</span>
+                            <span class="k">else</span><span class="p">:</span>
+                                <span class="n">gen_logits</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">seq_len</span><span class="p">,</span>
+                                           <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">gen_logits</span>
+
             <span class="k">if</span> <span class="n">output_log_probs</span><span class="p">:</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">log_probs</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">responses</span>
-                    <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                <span class="p">]</span>
-                <span class="c1"># Pad log_probs into a rectangle</span>
-                <span class="n">max_seq_len</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
-                    <span class="nb">len</span><span class="p">(</span><span class="n">a</span><span class="p">)</span> <span class="k">for</span> <span class="n">beam_list</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">]</span>
-                    <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">beam_list</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">a</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">]):</span>
-                    <span class="k">for</span> <span class="n">j</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">a</span><span class="p">):</span>
-                        <span class="n">pad_length</span> <span class="o">=</span> <span class="n">max_seq_len</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">b</span><span class="p">)</span>
-                        <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">][</span><span class="n">i</span><span class="p">][</span><span class="n">j</span><span class="p">]</span> <span class="o">=</span> <span class="n">b</span> <span class="o">+</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">]</span> <span class="o">*</span> <span class="n">pad_length</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">],</span>
-                                                    <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
+                <span class="n">max_log_probs_len</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
+                    <span class="nb">len</span><span class="p">(</span><span class="n">lprobs</span><span class="p">)</span> <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span>
+                    <span class="k">for</span> <span class="n">lprobs</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">log_probs</span><span class="p">)</span>
+                <span class="n">log_probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+                    <span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">num_sequences</span><span class="p">,</span> <span class="n">max_log_probs_len</span><span class="p">),</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+                    <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">request_ids</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">is_beam_search</span><span class="p">:</span>
+                        <span class="k">for</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="n">lprobs</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
+                                <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">log_probs</span><span class="p">):</span>
+                            <span class="n">log_probs</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span>
+                                      <span class="n">beam_idx</span><span class="p">,</span> <span class="p">:</span><span class="nb">len</span><span class="p">(</span><span class="n">lprobs</span><span class="p">)]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+                                          <span class="n">lprobs</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">seq_idx</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">sequence_index</span>
+                        <span class="n">lprobs</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">log_probs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                        <span class="n">log_probs</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span>
+                                  <span class="n">seq_idx</span><span class="p">,</span> <span class="p">:</span><span class="nb">len</span><span class="p">(</span><span class="n">lprobs</span><span class="p">)]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">lprobs</span><span class="p">)</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">log_probs</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span>
+                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;log_probs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">log_probs</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">cuda_device</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="n">output_cum_log_probs</span><span class="p">:</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;cum_log_probs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">cum_log_probs</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">responses</span>
-                    <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">cum_log_probs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                <span class="p">]</span>
-                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;cum_log_probs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
-                    <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;cum_log_probs&#39;</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
-            <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">batch_input_ids</span><span class="p">],</span>
-                                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-                                         <span class="n">device</span><span class="o">=</span><span class="n">cuda_device</span><span class="p">)</span>
+                <span class="n">cum_log_probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">num_sequences</span><span class="p">),</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">cum_log_probs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="k">continue</span>
+                    <span class="n">batch_idx</span> <span class="o">=</span> <span class="n">request_ids</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+                    <span class="n">clprobs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">cum_log_probs</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">is_beam_search</span><span class="p">:</span>
+                        <span class="n">cum_log_probs</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="p">:]</span> <span class="o">=</span> <span class="n">clprobs</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">seq_idx</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">sequence_index</span>
+                        <span class="n">cum_log_probs</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">clprobs</span>
+                <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;cum_log_probs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">cum_log_probs</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">cuda_device</span><span class="p">)</span>
+
             <span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_outputs</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">outputs</span> <span class="o">=</span> <span class="n">output_ids</span>
+
         <span class="k">return</span> <span class="n">outputs</span></div>
 
 </pre></div>
@@ -964,7 +1190,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0d4f32b0>
+<jinja2.runtime.BlockReference object at 0x7fc13d888310>
 
 <div class="footer">
     <p>

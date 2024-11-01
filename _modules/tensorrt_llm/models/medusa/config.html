@@ -6,6 +6,7 @@
   <title>tensorrt_llm.models.medusa.config &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
   
   <!--[if lt IE 9]>
@@ -17,6 +18,8 @@
         <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
         <script src="../../../../_static/doctools.js?v=888ff710"></script>
         <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+        <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+        <script src="../../../../_static/copybutton.js?v=f281be69"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -55,15 +58,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 </ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/reference.html">API Reference</a></li>
+</ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../llm-api-examples/customization.html">Common Customizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../llm-api-examples/llm_api_examples.html">Examples</a></li>
-</ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../../../../llm-api/index.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
 <ul>
@@ -98,17 +102,22 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-best-practices.html">Best Practices for Tuning the Performance of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-best-practices.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -168,11 +177,50 @@
 <span class="c1"># limitations under the License.</span>
 
 <span class="kn">from</span> <span class="nn">..llama.config</span> <span class="kn">import</span> <span class="n">LLaMAConfig</span>
+<span class="kn">from</span> <span class="nn">..qwen.config</span> <span class="kn">import</span> <span class="n">QWenConfig</span>
 
 
+<span class="c1"># MedusaConfig is a thin wrapper that picks parent class for GenericMedusaConfig</span>
+<span class="k">class</span> <span class="nc">QWenMedusaConfig</span><span class="p">(</span><span class="n">QWenConfig</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span> <span class="n">max_draft_len</span><span class="p">,</span>
+                 <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_heads</span> <span class="o">=</span> <span class="n">num_medusa_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_layers</span> <span class="o">=</span> <span class="n">num_medusa_layers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">max_draft_len</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
+        <span class="c1"># Serialize the fields added in MedusaConfig</span>
+        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_heads</span>
+        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;num_medusa_layers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_layers</span>
+        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="k">return</span> <span class="n">output</span>
+
+
+<span class="k">class</span> <span class="nc">LLaMAMedusaConfig</span><span class="p">(</span><span class="n">LLaMAConfig</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span> <span class="n">max_draft_len</span><span class="p">,</span>
+                 <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_heads</span> <span class="o">=</span> <span class="n">num_medusa_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_layers</span> <span class="o">=</span> <span class="n">num_medusa_layers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">max_draft_len</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
+        <span class="c1"># Serialize the fields added in MedusaConfig</span>
+        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_heads</span>
+        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;num_medusa_layers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_layers</span>
+        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="k">return</span> <span class="n">output</span>
+
+
+<span class="c1"># Medusa-specific config is stored and retrieved from GenericMedusaConfig.</span>
 <div class="viewcode-block" id="MedusaConfig">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaConfig">[docs]</a>
-<span class="k">class</span> <span class="nc">MedusaConfig</span><span class="p">(</span><span class="n">LLaMAConfig</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">MedusaConfig</span><span class="p">():</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
@@ -180,21 +228,19 @@
                  <span class="n">num_medusa_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                  <span class="n">max_draft_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">63</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_heads</span> <span class="o">=</span> <span class="n">num_medusa_heads</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_layers</span> <span class="o">=</span> <span class="n">num_medusa_layers</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">max_draft_len</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="n">GenericMedusaConfig</span> <span class="o">=</span> <span class="n">QWenMedusaConfig</span> <span class="k">if</span> <span class="s2">&quot;qwen&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">[</span>
+            <span class="s1">&#39;model_type&#39;</span><span class="p">]</span> <span class="k">else</span> <span class="n">LLaMAMedusaConfig</span>
 
-<div class="viewcode-block" id="MedusaConfig.to_dict">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaConfig.to_dict">[docs]</a>
-    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="n">output</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
-        <span class="c1"># Serialize the fields added in MedusaConfig</span>
-        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_heads</span>
-        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;num_medusa_layers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_medusa_layers</span>
-        <span class="n">output</span><span class="p">[</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
-        <span class="k">return</span> <span class="n">output</span></div>
-</div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">GenericMedusaConfig</span><span class="p">(</span><span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span>
+                                          <span class="n">max_draft_len</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="c1"># Specialization to redirect accesses to self.config</span>
+    <span class="k">def</span> <span class="fm">__getattribute__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s1">&#39;config&#39;</span> <span class="ow">or</span> <span class="s1">&#39;__&#39;</span> <span class="ow">in</span> <span class="n">name</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">object</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">config</span> <span class="o">=</span> <span class="nb">object</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;config&#39;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">config</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="n">name</span><span class="p">)</span></div>
 
 </pre></div>
 
@@ -205,7 +251,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fea0f2a5090>
+<jinja2.runtime.BlockReference object at 0x7fc13fa74400>
 
 <div class="footer">
     <p>
