@@ -3441,13 +3441,17 @@ def conv1d(input: Tensor,
     return output_1d
 
 
-def conv2d(input: Tensor,
-           weight: Tensor,
-           bias: Optional[Tensor] = None,
-           stride: Tuple[int, int] = (1, 1),
-           padding: Tuple[int, int] = (0, 0),
-           dilation: Tuple[int, int] = (1, 1),
-           groups: int = 1) -> Tensor:
+def conv2d(
+    input: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor] = None,
+    stride: Tuple[int, int] = (1, 1),
+    padding: Tuple[int, int] = (0, 0),
+    dilation: Tuple[int, int] = (1, 1),
+    groups: int = 1,
+    pre_padding: Optional[Tuple[int, int]] = None,
+    post_padding: Optional[Tuple[int, int]] = None
+) -> Tensor:
     ##
     ## TODO: Document that function!
     ##
@@ -3475,6 +3479,10 @@ def conv2d(input: Tensor,
     layer.dilation_nd = dilation
     layer.num_groups = groups
     layer.dilation_nd = dilation
+    if pre_padding:
+        layer.pre_padding = pre_padding
+    if post_padding:
+        layer.post_padding = post_padding
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)

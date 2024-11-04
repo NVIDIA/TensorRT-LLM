@@ -12,23 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import tensorrt as trt
 
-from ....functional import allgather, concat, conv2d, slice, stack, unsqueeze
+from ....functional import (allgather, concat, conv2d, slice, stack, unsqueeze)
 from ....layers import Conv2d
 from ....mapping import Mapping
 from ....module import Module
-
-
-def pad(input, pad):
-    assert input.ndim() == 4
-    n, c, h, w = input.shape
-    padded_input = slice(input,
-                         starts=[0, 0, -pad[2], -pad[0]],
-                         sizes=[n, c, pad[2] + h + pad[3], pad[0] + w + pad[1]],
-                         mode=trt.SampleMode.FILL,
-                         fill_value=0.0)
-    return padded_input
 
 
 class DistriConv2dPP(Module):
@@ -54,20 +42,22 @@ class DistriConv2dPP(Module):
         idx = mapping.tp_rank
         h_begin = output_h * idx * stride - padding
         h_end = output_h * (idx + 1) * stride + padding
-        final_padding = [padding, padding, 0, 0]
+        pre_padding = [0, padding]
+        post_padding = [0, padding]
         if h_begin < 0:
             h_begin = 0
-            final_padding[2] = padding
+            pre_padding[0] = padding
         if h_end > h:
             h_end = h
-            final_padding[3] = padding
+            post_padding[0] = padding
         sliced_input = slice(x, [0, 0, h_begin, 0], [b, c, h_end - h_begin, w])
-        padded_input = pad(sliced_input, final_padding)
-        return conv2d(padded_input,
+        return conv2d(sliced_input,
                       self.conv.weight.value,
                       None if self.conv.bias is None else self.conv.bias.value,
                       stride=self.conv.stride,
-                      padding=(0, 0))
+                      padding=(0, 0),
+                      pre_padding=tuple(pre_padding),
+                      post_padding=tuple(post_padding))
 
     def forward(self, x, *args, **kwargs):
         mapping = self.mapping
@@ -78,14 +68,16 @@ class DistriConv2dPP(Module):
             boundary_size = self.conv.padding[0]
 
             def create_padded_x(x, boundaries):
+                preH = 0
+                postH = 0
                 if mapping.tp_rank == 0:
                     b = boundaries.select(0, mapping.tp_rank + 1).select(0, 0)
-                    concat_x = concat([x, b], dim=2)
-                    padded_x = pad(concat_x, [0, 0, boundary_size, 0])
+                    padded_x = concat([x, b], dim=2)
+                    preH = boundary_size
                 elif mapping.tp_rank == mapping.tp_size - 1:
                     b = boundaries.select(0, mapping.tp_rank - 1).select(0, 1)
-                    concat_x = concat([b, x], dim=2)
-                    padded_x = pad(concat_x, [0, 0, 0, boundary_size])
+                    padded_x = concat([b, x], dim=2)
+                    postH = boundary_size
                 else:
                     b0 = boundaries.select(0, mapping.tp_rank - 1).select(0, 1)
                     b1 = boundaries.select(0, mapping.tp_rank + 1).select(0, 0)
@@ -97,7 +89,7 @@ class DistriConv2dPP(Module):
                         ],
                         dim=2,
                     )
-                return padded_x
+                return padded_x, preH, postH
 
             n, c, h, w = x.shape
             b0 = slice(x, [0, 0, 0, 0], [n, c, boundary_size, w])
@@ -107,13 +99,11 @@ class DistriConv2dPP(Module):
 
             boundaries = allgather(unsqueeze(boundary, 0),
                                    group=mapping.tp_group)
-            padded_x = create_padded_x(x, boundaries)
-            output = conv2d(
-                padded_x,
-                self.conv.weight.value,
-                self.conv.bias.value,
-                stride=self.conv.stride,
-                padding=(0, self.conv.padding[1]),
-            )
-
+            padded_x, preH, postH = create_padded_x(x, boundaries)
+            output = conv2d(padded_x,
+                            self.conv.weight.value,
+                            self.conv.bias.value,
+                            stride=self.conv.stride,
+                            pre_padding=(preH, self.conv.padding[1]),
+                            post_padding=(postH, self.conv.padding[1]))
         return output

@@ -14,7 +14,9 @@
 # limitations under the License.
 import math
 
-from ..._utils import fp32_array
+import tensorrt as trt
+
+from ..._utils import fp16_array, fp32_array
 from ...functional import concat, constant, cos, exp, silu, sin
 from ...layers import Linear
 from ...module import Module
@@ -43,7 +45,10 @@ def get_timestep_embedding(timesteps,
         for i in range(half_dim)
     ]
 
-    emb = exp(constant(fp32_array(exponent)))
+    if dtype is trt.float16:
+        emb = exp(constant(fp16_array(exponent)))
+    else:
+        emb = exp(constant(fp32_array(exponent)))
 
     ts_shape = list(timesteps.size())
     ts_shape.append(1)
