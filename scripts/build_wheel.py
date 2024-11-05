@@ -92,7 +92,15 @@ def main(*,
     if not (project_dir / "3rdparty/cutlass/.git").exists():
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
-    requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
+    on_jetson_l4t = "tegra" in platform.release() and \
+                        platform.machine() == "aarch64"
+    if on_windows:
+        requirements_filename = "requirements-dev-windows.txt"
+    elif on_jetson_l4t:
+        requirements_filename = "requirements-dev-jetson.txt"
+    else:
+        requirements_filename = "requirements-dev.txt"
+
     build_run(f"\"{sys.executable}\" -m pip install -r {requirements_filename}")
     # Ensure TRT is installed on windows to prevent surprises.
     reqs = check_output([sys.executable, "-m", "pip", "freeze"])
@@ -125,6 +133,10 @@ def main(*,
         # The Ninja CMake generator is used for our Windows build
         # (Easier than MSBuild to make compatible with our Docker image)
         cmake_generator = "-GNinja"
+
+    if on_jetson_l4t:
+        # Jetson Orin does not support multi-device currently.
+        extra_cmake_vars.extend(["ENABLE_MULTI_DEVICE=0"])
 
     if job_count is None:
         job_count = cpu_count()

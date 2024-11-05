@@ -78,6 +78,10 @@ def parse_arguments(args=None):
         default=False,
         action='store_true',
         help="Run several 10 iterations to profile the inference latencies.")
+    parser.add_argument('--use_mmap',
+                        default=False,
+                        action='store_true',
+                        help="Use mmap to avoid loading weights on CPU.")
     parser = add_common_args(parser)
 
     return parser.parse_args(args=args)
@@ -371,7 +375,8 @@ def main(args):
             kv_cache_free_gpu_memory_fraction=args.
             kv_cache_free_gpu_memory_fraction,
             enable_chunked_context=args.enable_chunked_context,
-            multi_block_mode=args.multi_block_mode)
+            multi_block_mode=args.multi_block_mode,
+            use_mmap=args.use_mmap)
     runner_kwargs.update(
         enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
     runner = runner_cls.from_dir(**runner_kwargs)

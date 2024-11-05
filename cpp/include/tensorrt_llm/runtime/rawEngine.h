@@ -41,6 +41,13 @@ public:
     {
     }
 
+    explicit RawEngine(std::filesystem::path enginePath, bool useMMap) noexcept
+        : mType(FilePath)
+        , mEnginePath(std::move(enginePath))
+        , mUseMMap(useMMap)
+    {
+    }
+
     explicit RawEngine(void const* engineAddr, std::size_t engineSize) noexcept
         : mType(AddressWithSize)
         , mEngineAddr(engineAddr)
@@ -93,9 +100,15 @@ public:
         return mEngineBuffer;
     }
 
+    [[nodiscard]] bool useMMap() const
+    {
+        return mUseMMap;
+    }
+
 private:
     Type mType;
     std::optional<std::filesystem::path> mEnginePath;
+    bool mUseMMap{false};
 
     struct
     {

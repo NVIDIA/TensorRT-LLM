@@ -808,6 +808,12 @@ public:
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
         ModelType modelType, ExecutorConfig const& executorConfig);
 
+    Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig,
+        bool useMMap);
+
+    Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
+        ModelType modelType, ExecutorConfig const& executorConfig, bool useMMap);
+
     Executor(std::vector<uint8_t> const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
         ExecutorConfig const& executorConfig);
 

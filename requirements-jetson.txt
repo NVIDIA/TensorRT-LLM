@@ -1,0 +1,27 @@
+--extra-index-url https://pypi.nvidia.com
+accelerate>=0.25.0
+build
+colored
+cuda-python # Do not override the custom version of cuda-python installed in the NGC PyTorch image.
+diffusers>=0.27.0
+lark
+numpy<2
+onnx>=1.12.0
+polygraphy
+psutil
+pulp
+pandas
+h5py==3.10.0
+StrEnum
+sentencepiece>=0.1.99
+# tensorrt~=10.3.0 # Should be installed in Docker for Jetson
+# Default torch is CPU-only on Jetson, so need to specify a torch version with GPU support
+torch @ https://developer.download.nvidia.cn/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
+nvidia-modelopt~=0.15.0
+transformers>=4.38.2
+pillow==10.2.0
+wheel
+optimum
+evaluate
+janus
+mpmath>=1.3.0

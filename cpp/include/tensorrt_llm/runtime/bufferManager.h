@@ -202,7 +202,17 @@ private:
 
     std::size_t static memoryPoolFree(int device)
     {
-        return memoryPoolReserved(device) - memoryPoolUsed(device);
+        // memUsed might be greater than memReserved on Jetson.
+        auto const memRerserved = memoryPoolReserved(device);
+        auto const memUsed = memoryPoolUsed(device);
+        if (memRerserved >= memUsed)
+        {
+            return memRerserved - memUsed;
+        }
+        else
+        {
+            return 0;
+        }
     }
 
     void static memoryPoolTrimTo(int device, std::size_t size);

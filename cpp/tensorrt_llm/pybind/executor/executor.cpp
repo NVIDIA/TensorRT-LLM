@@ -42,6 +42,18 @@ Executor::Executor(std::filesystem::path const& encoderModelPath, std::filesyste
     mExecutor = std::make_unique<tle::Executor>(encoderModelPath, decoderModelPath, modelType, executorConfig);
 }
 
+Executor::Executor(std::filesystem::path const& modelPath, tle::ModelType modelType,
+    tle::ExecutorConfig const& executorConfig, bool useMMap)
+{
+    mExecutor = std::make_unique<tle::Executor>(modelPath, modelType, executorConfig, useMMap);
+}
+
+Executor::Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
+    tle::ModelType modelType, tle::ExecutorConfig const& executorConfig, bool useMMap)
+{
+    mExecutor = std::make_unique<tle::Executor>(encoderModelPath, decoderModelPath, modelType, executorConfig, useMMap);
+}
+
 Executor::Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
     tle::ExecutorConfig const& executorConfig)
 {
@@ -96,6 +108,12 @@ void Executor::initBindings(py::module_& m)
                  tle::ExecutorConfig const&>(),
             py::arg("encoder_model_path"), py::arg("decoder_model_path"), py::arg("model_type"),
             py::arg("executor_config"))
+        .def(py::init<std::filesystem::path const&, tle::ModelType, tle::ExecutorConfig const&, bool>(),
+            py::arg("model_path"), py::arg("model_type"), py::arg("executor_config"), py::arg("use_mmap"))
+        .def(py::init<std::filesystem::path const&, std::filesystem::path const&, tle::ModelType,
+                 tle::ExecutorConfig const&, bool>(),
+            py::arg("encoder_model_path"), py::arg("decoder_model_path"), py::arg("model_type"),
+            py::arg("executor_config"), py::arg("use_mmap"))
         .def(py::init<py::buffer, std::string const&, tle::ModelType, tle::ExecutorConfig const&>(),
             py::arg("engine_buffer"), py::arg("json_config_str"), py::arg("model_type"), py::arg("executor_config"))
         .def(py::init<std::string const&, std::string const&, std::string const&, std::string const&, tle::ModelType,

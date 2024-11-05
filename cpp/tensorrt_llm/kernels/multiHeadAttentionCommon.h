@@ -68,6 +68,7 @@ constexpr int32_t kSM_72 = 72;
 constexpr int32_t kSM_75 = 75;
 constexpr int32_t kSM_80 = 80;
 constexpr int32_t kSM_86 = 86;
+constexpr int32_t kSM_87 = 87;
 constexpr int32_t kSM_89 = 89;
 constexpr int32_t kSM_90 = 90;
 

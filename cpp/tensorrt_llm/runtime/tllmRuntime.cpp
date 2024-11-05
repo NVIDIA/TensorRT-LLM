@@ -22,6 +22,8 @@
 #include "tllmLogger.h"
 
 #include <limits>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <type_traits>
 
 using namespace tensorrt_llm::runtime;
@@ -114,8 +116,16 @@ TllmRuntime::TllmRuntime(
     {
     case RawEngine::Type::FilePath:
     {
-        auto reader = StreamReader(rawEngine.getPath());
-        mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        if (rawEngine.useMMap())
+        {
+            MMapEngine mmapEngine(rawEngine.getPath());
+            mEngine.reset(mRuntime->deserializeCudaEngine(mmapEngine.getData(), mmapEngine.getSize()));
+        }
+        else
+        {
+            auto reader = StreamReader(rawEngine.getPath());
+            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        }
         break;
     }
     case RawEngine::Type::AddressWithSize:
@@ -362,4 +372,57 @@ void TllmRuntime::loadManagedWeights(std::string const& weightsPath)
         manager.copy(weight->data(), *weightsDevice, MemoryType::kCPU);
         mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
     }
+}
+
+MMapEngine::MMapEngine(std::filesystem::path const& enginePath)
+    : mData(nullptr)
+    , mBytes(0)
+{
+    int fd = open(enginePath.c_str(), O_RDONLY);
+    if (fd <= 0)
+    {
+        TLLM_CHECK_WITH_INFO(false, std::string("Error opening engine file: " + enginePath.string()));
+        return;
+    }
+    struct stat status;
+    if (fstat(fd, &status) != 0)
+    {
+        TLLM_CHECK_WITH_INFO(false, std::string("fstat failed, " + enginePath.string()));
+        close(fd);
+        return;
+    }
+    mBytes = status.st_size;
+    mData = mmap(nullptr, mBytes, PROT_READ, MAP_SHARED, fd, 0);
+    if (mData == MAP_FAILED)
+    {
+        mData = nullptr;
+        TLLM_CHECK_WITH_INFO(false, std::string("mmap failed, " + enginePath.string()));
+        close(fd);
+        return;
+    }
+    close(fd);
+}
+
+MMapEngine::MMapEngine()
+    : mData(nullptr)
+    , mBytes(0)
+{
+}
+
+MMapEngine::~MMapEngine()
+{
+    if (mData != nullptr && mData != MAP_FAILED)
+    {
+        munmap(const_cast<void*>(mData), mBytes);
+    }
+}
+
+void const* MMapEngine::getData() const
+{
+    return mData;
+}
+
+const size_t MMapEngine::getSize() const
+{
+    return mBytes;
 }

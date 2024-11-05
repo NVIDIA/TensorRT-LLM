@@ -136,4 +136,18 @@ private:
     TensorMap mManagedWeightsMap{};
     std::set<SizeType32> mSetWeights;
 };
+
+class MMapEngine
+{
+public:
+    MMapEngine(std::filesystem::path const& enginePath);
+    MMapEngine();
+    ~MMapEngine();
+    void const* getData() const;
+    const size_t getSize() const;
+
+private:
+    void* mData;
+    size_t mBytes;
+};
 } // namespace tensorrt_llm::runtime

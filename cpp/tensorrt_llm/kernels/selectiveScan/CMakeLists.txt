@@ -21,6 +21,7 @@ file(GLOB_RECURSE SRC_CU *.cu)
 filter_cuda_archs("70" SRC_CPP)
 filter_cuda_archs("80" SRC_CPP)
 filter_cuda_archs("86" SRC_CPP)
+filter_cuda_archs("87" SRC_CPP)
 filter_cuda_archs("89" SRC_CPP)
 filter_cuda_archs("90" SRC_CPP)
 

@@ -85,7 +85,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         enable_chunked_context: bool = False,
         is_enc_dec: bool = False,
         multi_block_mode: Optional[bool] = None,
-        enable_context_fmha_fp32_acc: Optional[bool] = None
+        enable_context_fmha_fp32_acc: Optional[bool] = None,
+        use_mmap: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -178,7 +179,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                       kv_cache_config=kv_cache_config,
                                       gpu_weights_percent=gpu_weights_percent,
                                       extended_runtime_perf_knob_config=
-                                      extended_runtime_perf_knob_config))
+                                      extended_runtime_perf_knob_config),
+                use_mmap)
 
             profiler.stop('load tensorrt_llm engine')
 
@@ -253,7 +255,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
 
         executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
-                                   trtllm_config)
+                                   trtllm_config, use_mmap)
 
         profiler.stop('load tensorrt_llm engine')
 

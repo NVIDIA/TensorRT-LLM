@@ -60,7 +60,11 @@ if(NOT WIN32) # Linux
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     set(TARGET_ARCH "x86_64-linux-gnu")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    set(TARGET_ARCH "aarch64-linux-gnu")
+    if(EXISTS "/etc/nv_tegra_release")
+      set(TARGET_ARCH "aarch64-l4t-gnu")
+    else()
+      set(TARGET_ARCH "aarch64-linux-gnu")
+    endif()
     if(NOT ${OS_ID} MATCHES "ubuntu" OR ${OS_VERSION_ID} VERSION_LESS 22.04)
       message(
         FATAL_ERROR

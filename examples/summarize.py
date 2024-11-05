@@ -16,6 +16,7 @@
 import argparse
 import ast
 import os
+import platform
 from pathlib import Path
 
 import evaluate
@@ -498,7 +499,10 @@ def main(args):
             profiler.stop('tensorrt_llm')
 
             empty_batch = (runtime_rank == 0 and len(output_tensorrt_llm) == 0)
-            empty_batch = mpi_broadcast(empty_batch, 0)
+            on_jetson_l4t = "tegra" in platform.release() and \
+                                platform.machine() == "aarch64"
+            empty_batch = mpi_broadcast(empty_batch,
+                                        0) if not on_jetson_l4t else empty_batch
             if empty_batch:
                 # No valid samples in the current batch, skip this iteration
                 data_point_idx += max_batch_size
