@@ -82,6 +82,7 @@ def parse_arguments():
         type=int,
         default=1,
         help='The number of workers for converting checkpoint in parallel')
+
     args = parser.parse_args()
 
     return args
@@ -142,6 +143,9 @@ if __name__ == '__main__':
 
     model_config = AutoConfig.from_pretrained(args.model_dir,
                                               trust_remote_code=True)
+    if hasattr(model_config, "llm_config"):
+        model_config = model_config.llm_config
+
     model_type = model_config.architectures[0]
     supported_models = [
         'PhiForCausalLM', 'Phi3ForCausalLM', 'Phi3VForCausalLM',

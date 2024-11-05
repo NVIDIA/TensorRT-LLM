@@ -811,27 +811,37 @@ def optimize_model_with_config(model: PretrainedModel,
                                build_config: BuildConfig):
     use_auto_parallel = build_config.auto_parallel_config.enabled
     gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
-    if gemm_swiglu_plugin:
+    low_latency_gemm_swiglu_plugin = build_config.plugin_config.low_latency_gemm_swiglu_plugin
+    if gemm_swiglu_plugin or low_latency_gemm_swiglu_plugin:
         if not build_config.use_fused_mlp:
             raise RuntimeError(
                 "GemmSwiGLU plugin requires --use_fused_mlp flag")
-        if gemm_swiglu_plugin not in ["fp8"]:
+        if gemm_swiglu_plugin not in [
+                "fp8"
+        ] and low_latency_gemm_swiglu_plugin not in ["fp8"]:
             raise RuntimeError(
                 f"GemmSwiGLU plugin currently has limited support: fp8 only, "
-                f"got: {gemm_swiglu_plugin}")
+                f"got: {gemm_swiglu_plugin}"
+                f"got: {low_latency_gemm_swiglu_plugin}")
 
     if build_config.plugin_config.lora_plugin is not None:
         model.use_lora(build_config.lora_config)
 
     is_enc_dec = model.config.architecture in ["EncoderModel", "DecoderModel"]
+    # FusedMLP does not support RecurrentGemma FP8 currently.
+    is_recurrent_gemma = model.config.architecture in [
+        "RecurrentGemmaForCausalLM"
+    ]
+    is_fp8 = model.config.quantization.quant_algo == QuantAlgo.FP8
     model = optimize_model(
         model,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
+                       and not (is_recurrent_gemma and is_fp8)
                        and not use_auto_parallel),
         gemm_swiglu_plugin_dtype=gemm_swiglu_plugin,
-        use_fused_rg_lru=model.config.architecture
-        in ["RecurrentGemmaForCausalLM"],
+        low_latency_gemm_swiglu_plugin_dtype=low_latency_gemm_swiglu_plugin,
+        use_fused_rg_lru=is_recurrent_gemma,
         use_unfused_qkv_gemm=use_auto_parallel,
         use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0),
         use_lora=build_config.plugin_config.lora_plugin is not None,
@@ -1020,6 +1030,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.plugin_config.reduce_fusion and (
             model.config.mapping.tp_size == 1
+            or model.config.mapping.pp_size != 1
             or model.config.architecture != "LlamaForCausalLM"):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
@@ -1173,7 +1184,13 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_batch_size": build_config.max_batch_size,
             }
 
-        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING or build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
+            prepare_input_args[
+                "spec_decoding_is_generation_length_variable"] = True
+            assert build_config.max_batch_size <= 512, "Max batch size > 512 is not supported for EAGLE"
+            assert build_config.max_draft_len <= 256, "Max draft len > 256 is not supported for EAGLE"
+
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
 

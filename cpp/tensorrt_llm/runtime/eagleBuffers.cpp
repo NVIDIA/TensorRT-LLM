@@ -157,6 +157,7 @@ void EagleBuffers::reshape(
         modelConfig.getSpeculativeDecodingModulePtr());
 
     auto const maxDecodingTokens = eagleModule->getMaxDecodingTokens();
+    auto const maxDecodingDraftTokens = eagleModule->getMaxDecodingDraftTokens();
 
     // input tensors
     engineInputs.temperatures->reshape(ITensor::makeShape({numSequences}));
@@ -179,14 +180,16 @@ void EagleBuffers::reshape(
     engineInputs.randomDataSample->reshape(ITensor::makeShape({numSequences}));
     engineInputs.randomDataValidation->reshape(ITensor::makeShape({numSequences}));
 
-    engineInputs.eagleNetCtxRequestTypesHost->reshape(ITensor::makeShape({numSequences}));
-    engineInputs.eagleNetCtxContextLengthsHost->reshape(ITensor::makeShape({numSequences}));
-    engineInputs.eagleNetCtxPastKeyValueLengthsHost->reshape(ITensor::makeShape({numSequences}));
-    engineInputs.eagleNetGenRequestTypesHost->reshape(ITensor::makeShape({numSequences}));
-    engineInputs.eagleNetGenContextLengthsHost->reshape(ITensor::makeShape({numSequences}));
-    engineInputs.eagleNetGenPastKeyValueLengthsHost->reshape(ITensor::makeShape({numSequences}));
+    engineInputs.eagleNetCtxRequestTypesHost->reshape(ITensor::makeShape({numSequences, maxDecodingDraftTokens}));
+    engineInputs.eagleNetCtxContextLengthsHost->reshape(ITensor::makeShape({numSequences, maxDecodingDraftTokens}));
+    engineInputs.eagleNetCtxPastKeyValueLengthsHost->reshape(
+        ITensor::makeShape({numSequences, maxDecodingDraftTokens}));
+    engineInputs.eagleNetGenRequestTypesHost->reshape(ITensor::makeShape({numSequences, maxDecodingDraftTokens}));
+    engineInputs.eagleNetGenContextLengthsHost->reshape(ITensor::makeShape({numSequences, maxDecodingDraftTokens}));
+    engineInputs.eagleNetGenPastKeyValueLengthsHost->reshape(
+        ITensor::makeShape({numSequences, maxDecodingDraftTokens}));
 
-    cumSumGenerationLengths->reshape(ITensor::makeShape({numSequences}));
+    cumSumGenerationLengths->reshape(ITensor::makeShape({numSequences + 1}));
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -261,18 +264,28 @@ void EagleBuffers::setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSe
     for (SizeType32 bi = 0; bi < params.batchSize; ++bi)
     {
         auto const batchSlot = params.batchSlots[bi];
-        bufferCast<SizeType32>(*engineInputs.eagleNetCtxRequestTypesHost)[bi]
-            = bufferCast<SizeType32>(*draftBuffers.eagleNetCtxRequestTypesHost)[batchSlot];
-        bufferCast<SizeType32>(*engineInputs.eagleNetCtxContextLengthsHost)[bi]
-            = bufferCast<SizeType32>(*draftBuffers.eagleNetCtxContextLengthsHost)[batchSlot];
-        bufferCast<SizeType32>(*engineInputs.eagleNetCtxPastKeyValueLengthsHost)[bi]
-            = bufferCast<SizeType32>(*draftBuffers.eagleNetCtxPastKeyValueLengthsHost)[batchSlot];
-        bufferCast<SizeType32>(*engineInputs.eagleNetGenRequestTypesHost)[bi]
-            = bufferCast<SizeType32>(*draftBuffers.eagleNetGenRequestTypesHost)[batchSlot];
-        bufferCast<SizeType32>(*engineInputs.eagleNetGenContextLengthsHost)[bi]
-            = bufferCast<SizeType32>(*draftBuffers.eagleNetGenContextLengthsHost)[batchSlot];
-        bufferCast<SizeType32>(*engineInputs.eagleNetGenPastKeyValueLengthsHost)[bi]
-            = bufferCast<SizeType32>(*draftBuffers.eagleNetGenPastKeyValueLengthsHost)[batchSlot];
+        auto const maxDecodingDraftTokens = params.maxDecodingTokens - 1;
+        for (SizeType32 ti = 0; ti < maxDecodingDraftTokens; ++ti)
+        {
+            bufferCast<SizeType32>(*engineInputs.eagleNetCtxRequestTypesHost)[bi * maxDecodingDraftTokens + ti]
+                = bufferCast<SizeType32>(
+                    *draftBuffers.eagleNetCtxRequestTypesHost)[batchSlot * maxDecodingDraftTokens + ti];
+            bufferCast<SizeType32>(*engineInputs.eagleNetCtxContextLengthsHost)[bi * maxDecodingDraftTokens + ti]
+                = bufferCast<SizeType32>(
+                    *draftBuffers.eagleNetCtxContextLengthsHost)[batchSlot * maxDecodingDraftTokens + ti];
+            bufferCast<SizeType32>(*engineInputs.eagleNetCtxPastKeyValueLengthsHost)[bi * maxDecodingDraftTokens + ti]
+                = bufferCast<SizeType32>(
+                    *draftBuffers.eagleNetCtxPastKeyValueLengthsHost)[batchSlot * maxDecodingDraftTokens + ti];
+            bufferCast<SizeType32>(*engineInputs.eagleNetGenRequestTypesHost)[bi * maxDecodingDraftTokens + ti]
+                = bufferCast<SizeType32>(
+                    *draftBuffers.eagleNetGenRequestTypesHost)[batchSlot * maxDecodingDraftTokens + ti];
+            bufferCast<SizeType32>(*engineInputs.eagleNetGenContextLengthsHost)[bi * maxDecodingDraftTokens + ti]
+                = bufferCast<SizeType32>(
+                    *draftBuffers.eagleNetGenContextLengthsHost)[batchSlot * maxDecodingDraftTokens + ti];
+            bufferCast<SizeType32>(*engineInputs.eagleNetGenPastKeyValueLengthsHost)[bi * maxDecodingDraftTokens + ti]
+                = bufferCast<SizeType32>(
+                    *draftBuffers.eagleNetGenPastKeyValueLengthsHost)[batchSlot * maxDecodingDraftTokens + ti];
+        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

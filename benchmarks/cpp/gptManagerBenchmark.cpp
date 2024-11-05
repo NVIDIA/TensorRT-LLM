@@ -147,6 +147,7 @@ struct BenchmarkParams
     std::optional<float> freeGpuMemoryFraction{std::nullopt};
     std::optional<float> crossKvCacheFraction{std::nullopt};
     bool enableTrtOverlap{false};
+    bool enableBatchSizeTuning{false};
     bool enableBlockReuse{false};
     bool enableChunkedContext{false};
     bool streaming{false};
@@ -879,8 +880,9 @@ public:
         , mShutdown(false)
         , mLogIterationData(logIterationData)
     {
+        texec::DynamicBatchConfig dynamicBatchConfig(benchmarkParams.enableBatchSizeTuning);
+        texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy, std::nullopt, dynamicBatchConfig);
 
-        texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy);
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
             benchmarkParams.maxAttentionWindowVec, benchmarkParams.sinkTokenLength,
             benchmarkParams.freeGpuMemoryFraction, benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks,
@@ -1971,6 +1973,8 @@ int main(int argc, char* argv[])
         "max_num_tokens", "The max runtime number of tokens per batch when benchmarking", cxxopts::value<int>());
     options.add_options()("enable_trt_overlap", "Overlap TRT context preparation and execution",
         cxxopts::value<bool>()->default_value("false"));
+    options.add_options()(
+        "enable_batch_size_tuning", "Dynamic tuning of batch size", cxxopts::value<bool>()->default_value("false"));
     options.add_options()("enable_exp_delays", "Enables exponential delay distr to mimic real world request arrival",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("streaming", "Operate in streaming mode", cxxopts::value<bool>()->default_value("false"));
@@ -2152,6 +2156,9 @@ int main(int argc, char* argv[])
     // Argument: Enable TRT overlap
     benchmarkParams.enableTrtOverlap = result["enable_trt_overlap"].as<bool>();
 
+    // Argument: Enable dynamic tuning of batch size
+    benchmarkParams.enableBatchSizeTuning = result["enable_batch_size_tuning"].as<bool>();
+
     // Argument: Enable KV cache reuse
     benchmarkParams.enableBlockReuse = result["enable_kv_cache_reuse"].as<bool>();
 
@@ -2189,6 +2196,11 @@ int main(int argc, char* argv[])
 
     // Argument: Enable batch stats output
     bool logIterationData = result["log_iteration_data"].as<bool>();
+
+    if (logIterationData)
+    {
+        TLLM_LOG_WARNING("Setting log_iteration_data to true adds overheads and may result in lower perf");
+    }
 
     // Argument: Enable chunked context
     benchmarkParams.enableChunkedContext = result["enable_chunked_context"].as<bool>();

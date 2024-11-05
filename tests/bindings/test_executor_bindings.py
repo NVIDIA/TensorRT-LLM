@@ -1032,6 +1032,15 @@ def test_scheduler_config():
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
 
+    dynamic_batch_config = trtllm.DynamicBatchConfig(True, 128)
+    config = trtllm.SchedulerConfig(capacity_scheduler_policy,
+                                    context_chunking_policy,
+                                    dynamic_batch_config)
+    assert config.capacity_scheduler_policy == capacity_scheduler_policy
+    assert config.context_chunking_policy == context_chunking_policy
+    assert config.dynamic_batch_config.enable_batch_size_tuning == True
+    assert config.dynamic_batch_config.dynamic_batch_moving_average_window == 128
+
 
 def test_kv_cache_config():
     config = trtllm.KvCacheConfig()
@@ -1136,6 +1145,20 @@ def test_kv_cache_retention_config():
         ], 50)
 
 
+def test_eagle_config():
+    config = trtllm.EagleConfig([[0, 0], [0, 1]])
+    assert config.eagle_choices == [[0, 0], [0, 1]]
+
+    config = trtllm.EagleConfig([[0, 0], [0, 1, 0]])
+    assert config.eagle_choices == [[0, 0], [0, 1, 0]]
+
+    kwargs = {"eagle_choices": [[0, 0], [0, 1], [0, 2]]}
+
+    config = trtllm.EagleConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
+
+
 def test_decoding_mode():
     mode = trtllm.DecodingMode.Auto()
     assert mode.isAuto()
@@ -1164,12 +1187,14 @@ def test_speculative_decoding_config():
     assert config.decoding_mode is None
     assert config.lookahead_decoding_config is None
     assert config.medusa_choices is None
+    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     config.decoding_mode = trtllm.DecodingMode.TopKTopP()
     assert config.decoding_mode.isTopKandTopP()
     assert config.lookahead_decoding_config == None
     assert config.medusa_choices == None
+    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     la_decoding_config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -1180,6 +1205,7 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config.max_window_size == la_decoding_config.max_window_size
     assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
     assert config.medusa_choices == None
+    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     config.medusa_choices = [[0, 0], [0, 1]]
@@ -1187,6 +1213,16 @@ def test_speculative_decoding_config():
     assert config.decoding_mode.isMedusa()
     assert config.lookahead_decoding_config == None
     assert config.medusa_choices == [[0, 0], [0, 1]]
+    assert config.eagle_config is None
+
+    config = trtllm.DecodingConfig()
+    config.eagle_config = trtllm.EagleConfig([[0, 0], [0, 1]])
+
+    assert config.decoding_mode.isEagle()
+    assert config.lookahead_decoding_config == None
+    assert config.medusa_choices == None
+    assert config.eagle_config is not None
+    assert config.eagle_config.eagle_choices == [[0, 0], [0, 1]]
 
 
 def test_logits_post_processor_config():
@@ -1294,7 +1330,8 @@ def test_parallel_config():
     comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
     #Dummy path to worker executable
     worker_path = _os.path.abspath(__file__)
-    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path))
+    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path),
+                                                    None, True)
     parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
                                             participant_ids,
                                             orchestrator_config)
@@ -1302,6 +1339,7 @@ def test_parallel_config():
     assert parallel_config.orchestrator_config.is_orchestrator == True
     assert parallel_config.orchestrator_config.worker_executable_path == str(
         worker_path)
+    assert parallel_config.orchestrator_config.spawn_processes == True
 
 
 def test_peft_cache_config():

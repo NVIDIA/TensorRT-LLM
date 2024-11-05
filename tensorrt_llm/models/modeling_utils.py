@@ -34,7 +34,8 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
-from ..quantization.layers import (WeightOnlyGroupwiseQuantLinear,
+from ..quantization.layers import (Fp8RowwiseFusedGatedMLP, Fp8RowwiseGatedMLP,
+                                   WeightOnlyGroupwiseQuantLinear,
                                    WeightOnlyGroupwiseQuantRowLinear,
                                    WeightOnlyQuantLinear,
                                    WeightOnlyQuantRowLinear)
@@ -104,6 +105,7 @@ class QuantConfig:
     group_size: Optional[int] = 128
     smoothquant_val: float = 0.5
     clamp_val: Optional[List[float]] = None
+    use_meta_recipe: bool = False
     has_zero_point: Optional[bool] = False
     pre_quant_scale: Optional[bool] = False
     exclude_modules: Optional[List[str]] = None
@@ -516,8 +518,10 @@ class DecoderLayerList(ModuleList):
             if default_net().plugin_config.reduce_fusion:
                 if layer_idx < self.layer_list[-1]:
                     kwargs['next_layer_input_layernorm_args'] = (
-                        self[layer_idx + 1].input_layernorm.weight.value,
-                        self[layer_idx + 1].input_layernorm.eps)
+                        self[layer_idx + 1 -
+                             self.layer_list[0]].input_layernorm.weight.value,
+                        self[layer_idx + 1 -
+                             self.layer_list[0]].input_layernorm.eps)
                 else:
                     kwargs['next_layer_input_layernorm_args'] = None
 
@@ -789,7 +793,9 @@ class PretrainedModel(Module,
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types'],
-                host_runtime_perf_knobs=model_inputs['host_runtime_perf_knobs'])
+                host_runtime_perf_knobs=model_inputs['host_runtime_perf_knobs'],
+                host_context_progress=model_inputs['host_context_progress'],
+            )
         }
 
         if prompt_embedding_table_size > 0:
@@ -965,6 +971,7 @@ class DecoderModelForCausalLM(PretrainedModel):
 def fuse_gate_mlp(
     model: PretrainedModel,
     gemm_swiglu_plugin_dtype: Optional[str] = None,
+    low_latency_gemm_swiglu_plugin_dtype: Optional[str] = None,
 ) -> PretrainedModel:
     from ..quantization.quantize import fp8_quantize
 
@@ -1028,7 +1035,7 @@ def fuse_gate_mlp(
                                     fused_weight_scaling_factor).to(
                                         torch.float8_e4m3fn)
 
-                if gemm_swiglu_plugin_dtype == 'fp8':
+                if gemm_swiglu_plugin_dtype == 'fp8' or low_latency_gemm_swiglu_plugin_dtype == 'fp8':
                     # gemm_swiglu_plugin needs (k, n) weights
                     # but weights should still be k-major for fp8
                     fused_layer.fused_fc.weight = Parameter(
@@ -1064,7 +1071,42 @@ def fuse_gate_mlp(
             fused_layer.proj = mlp.proj
             fused_layer.inner_layernorm = mlp.inner_layernorm
 
-            mlp_name = name.rsplit('.', 1)[-1]
+            _, mlp_name = name.rsplit('.', 1)
+            setattr(layer, mlp_name, fused_layer)
+
+        elif isinstance(mlp, Fp8RowwiseGatedMLP):
+            init_params = get_init_params(mlp)
+
+            hidden_act = init_params["hidden_act"]
+            if hidden_act not in ["silu", "gelu"]:
+                logger.warning(
+                    f"fuse_gate_mlp cannot be done for {name} due to unsupported activation {hidden_act}. Skipping."
+                )
+                continue
+
+            if mlp.clamp_val is not None:
+                init_params["clamp_val"] = mlp.clamp_val.raw_value.tolist()
+            fused_layer = Fp8RowwiseFusedGatedMLP(**init_params)
+            fused_layer.fused_fc.weight.value = np.concatenate(
+                [
+                    mlp.gate.weight.raw_value,
+                    mlp.fc.weight.raw_value,
+                ],
+                axis=0,
+            )
+            fused_layer.fused_fc.per_channel_scale.value = np.concatenate(
+                [
+                    mlp.gate.per_channel_scale.raw_value,
+                    mlp.fc.per_channel_scale.raw_value,
+                ],
+                axis=0,
+            )
+            if mlp.bias:
+                fused_layer.fused_fc.bias.value = np.concatenate(
+                    [mlp.gate.bias.raw_value, mlp.fc.bias.raw_value], axis=0)
+
+            fused_layer.proj = mlp.proj
+            _, mlp_name = name.rsplit('.', 1)
             setattr(layer, mlp_name, fused_layer)
 
     return model
@@ -1301,6 +1343,7 @@ def optimize_model(
     use_ootb_moe: bool = False,
     use_fused_mlp: bool = False,
     gemm_swiglu_plugin_dtype: Optional[str] = None,
+    low_latency_gemm_swiglu_plugin_dtype: Optional[str] = None,
     use_fused_rg_lru: bool = False,
     use_unfused_qkv_gemm: bool = False,
     use_prompt_tuning: bool = False,
@@ -1326,7 +1369,8 @@ def optimize_model(
     if use_ootb_moe:
         model = to_ootb_moe(model)
     if use_fused_mlp:
-        model = fuse_gate_mlp(model, gemm_swiglu_plugin_dtype)
+        model = fuse_gate_mlp(model, gemm_swiglu_plugin_dtype,
+                              low_latency_gemm_swiglu_plugin_dtype)
     if use_fused_rg_lru:
         model = fuse_rg_lru(model)
     if use_unfused_qkv_gemm:

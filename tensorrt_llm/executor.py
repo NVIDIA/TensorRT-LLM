@@ -3,23 +3,27 @@ import atexit
 import concurrent.futures
 import copy
 import datetime
+import faulthandler
 import io
 import json
 import os
+import pickle  # nosec B403
 import secrets
+import signal
 import time
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from multiprocessing.connection import Client, Listener
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import (Any, Callable, Dict, Generator, List, Literal, NamedTuple,
                     Optional, Tuple, Union)
+from weakref import WeakMethod
 
 import numpy as np
 import torch
+import zmq
 
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
@@ -27,39 +31,25 @@ from .builder import ConfigEncoder, Engine, EngineConfig
 from .llmapi.mpi_session import (MpiPoolSession, MpiSession,
                                  external_mpi_comm_available, find_free_port,
                                  need_spawn_mpi_workers)
-from .llmapi.utils import (ManagedThread, SamplingParams, enable_llm_debug,
-                           print_colored)
+from .llmapi.tracer import (VizTracer, enable_llm_tracer, get_tracer,
+                            global_tracer, set_global_tracer)
+from .llmapi.utils import (AsyncQueue, ManagedThread, SamplingParams,
+                           _SyncQueue, enable_llm_debug, print_colored)
 from .lora_manager import LoraManager
 from .prompt_adapter_manager import PromptAdapterManager
-from .runtime import ModelConfig
 from .runtime.model_runner import _engine_config_to_model_config
-
-
-def has_event_loop() -> bool:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return False
-    return True
-
-
-if enable_llm_debug():
-    print_colored("LLM debug mode enabled.", "yellow")
-
-    import faulthandler
-    import signal
-    faulthandler.register(signal.SIGINT, all_threads=True)
 
 
 @dataclass(slots=True)
 class LoRARequest:
+    """ Request for a LoRA adapter. """
     lora_name: str
     lora_int_id: int
     lora_path: str = ""
 
     def __post_init__(self):
         if not os.path.exists(self.lora_path):
-            raise RuntimeError(f"lora_path ({self.lora_path}) does not exist.")
+            raise ValueError(f"lora_path ({self.lora_path}) does not exist.")
 
     @property
     def adapter_id(self):
@@ -139,13 +129,13 @@ class CompletionOutput:
 
     Args:
         index (int): The index of the output in the request.
-        text (str): The generated output text.
-        token_ids (List[int]): The token ids of the generated output text.
-        cumulative_logprob (float): The cumulative log probability of the generated output text.
-        logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested.
-        finish_reason (Literal['stop', 'length']): The reason why the sequence is finished.
-        stop_reason (Union[int, str]): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason.
-        generation_logits (torch.Tensor): The logits on the generated output token ids.
+        text (str): The generated output text. Defaults to "".
+        token_ids (List[int]): The token ids of the generated output text. Defaults to [].
+        cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
+        logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to [].
+        finish_reason (Literal['stop', 'length'], optional): The reason why the sequence is finished. Defaults to None.
+        stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
+        generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
 
     Properties:
         length (int): The number of generated tokens.
@@ -161,6 +151,8 @@ class CompletionOutput:
     finish_reason: Optional[Literal['stop', 'length']] = None
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
+
+    # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
     _last_token_ids_len: int = field(default=0, init=False, repr=False)
     _last_logprobs_len: int = field(default=0, init=False, repr=False)
@@ -185,94 +177,6 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
-class _SyncQueue:
-    '''
-    A simplified Queue that provides a `get` method that is compatible with the asyncio event loop.
-    '''
-
-    def __init__(self,
-                 queue: Queue,
-                 event: asyncio.Event,
-                 loop: Optional[asyncio.AbstractEventLoop] = None):
-        self._q = queue
-        self._event = event
-        self._loop = loop or asyncio.get_event_loop()
-
-    def put(self, item) -> None:
-
-        async def _set_event(event):
-            event.set()
-
-        self._q.put_nowait(item)
-
-        if self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(_set_event(self._event),
-                                             self._loop)
-        else:
-            raise AsyncQueue.EventLoopShutdownError
-
-    def put_nowait(self, item) -> None:
-        ''' Put item without notify the event. '''
-        self._q.put_nowait(item)
-
-    @staticmethod
-    def notify_events(loop: asyncio.AbstractEventLoop,
-                      events: List[asyncio.Event]) -> None:
-        ''' Notify the events in the loop. '''
-
-        async def _set_events(events):
-            for event in events:
-                event.set()
-
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(_set_events(events), loop)
-        else:
-            raise AsyncQueue.EventLoopShutdownError
-
-    @property
-    def loop(self) -> asyncio.AbstractEventLoop:
-        return self._loop
-
-    @property
-    def event(self) -> asyncio.Event:
-        return self._event
-
-    def full(self) -> bool:
-        return self._q.full()
-
-
-class _AsyncQueue:
-    '''
-    A simplified asyncio.Queue that provides a `get` method that is compatible with the standard library Queue.
-    '''
-
-    def __init__(self, queue: Queue):
-        self._event = asyncio.Event()
-        self._q = queue
-
-    async def get(self):
-        await self._event.wait()
-        res = self._q.get()
-        if self._q.empty():
-            self._event.clear()
-        return res
-
-
-class AsyncQueue:
-    '''
-    AsyncQueue is container containing `async_q` for `async get` and `sync_q` for sync `get`.
-    This is used to provide a compatible interface for janus.Queue.
-    '''
-
-    class EventLoopShutdownError(Exception):
-        pass
-
-    def __init__(self):
-        self._q = Queue()
-        self.async_q = _AsyncQueue(self._q)
-        self.sync_q = _SyncQueue(self._q, self.async_q._event)
-
-
 class CppExecutorError(RuntimeError):
 
     def __init__(self, message: Optional[str] = None):
@@ -294,7 +198,7 @@ class GenerationResult:
 
     Args:
         generation_request (GenerationRequest): The generation request object.
-        background_error_handler (Optional[callable]): The error handler to process the errors from the background threads/processes.
+        background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.
     '''
 
     def __init__(self,
@@ -321,7 +225,10 @@ class GenerationResult:
         ]
         self.context_logits: Optional[torch.Tensor] = None
 
-        self._background_error_handler = background_error_handler
+        self._background_error_handler = None
+        if background_error_handler is not None:
+            self._background_error_handler = WeakMethod(
+                background_error_handler)
 
     @property
     def request_id(self) -> int:
@@ -404,8 +311,8 @@ class GenerationResult:
         self._done = response.is_final
 
         if response.error:
-            assert isinstance(response.error, str)
-            raise RequestError(response.error)
+            if handler := self._background_error_handler():
+                handler(response.error)
 
         tensors = response.tensors
 
@@ -420,8 +327,9 @@ class GenerationResult:
             self.context_logits = tensors.context_logits
 
         # Processing background errors here ASAF during generation.
-        if self._background_error_handler:
-            self._background_error_handler()
+        if self._background_error_handler and (
+                handler := self._background_error_handler()):
+            handler()
 
     def result_step(self, timeout: Optional[float] = None):
         response = self.queue.get(timeout=timeout)
@@ -430,6 +338,7 @@ class GenerationResult:
     async def aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
+        global_tracer().log_instant("result_step.get")
         self.handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
@@ -505,6 +414,10 @@ class GenerationResult:
         return hash(self.request_id)
 
 
+class NoStatsAvailable(Exception):
+    pass
+
+
 class GenerationExecutor(ABC):
 
     PENDING_REQ_ID_TIMEOUT = 2  # second
@@ -525,7 +438,11 @@ class GenerationExecutor(ABC):
         finish_reasons: Optional[List[tllm.FinishReason]]
         is_final: Optional[bool]
         sequence_index: Optional[int]
-        # error is either str from cpp-executor or a Exception from Python threads/processes
+        # There are two types of errors:
+        # 1. str for the errors from the cpp-executor.await_responses, this will be dispatched to the user's
+        #    generate_async as a per-request error, and won't stop the whole service.
+        # 2. Exception for the errors from the background threads/processes, this will be processed in the main thread,
+        #    and stop the whole service.
         error: Optional[str | Exception]
 
     @dataclass(slots=True)
@@ -619,14 +536,33 @@ class GenerationExecutor(ABC):
 
         return futures
 
-    def _handle_background_error(self):
+    def _handle_background_error(self, error: Optional[Exception | str] = None):
         """ Process the errors from the threads or processes.
         NOTE: This should be called in the main thread.
         """
+        if error is not None:
+            # For details please refer to the comment of `GenerationResult.error`
+            if isinstance(error, Exception):
+                # Serious error from background thread or process
+                if enable_llm_debug():
+                    print_colored(
+                        f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
+                        "red")
+                self.shutdown()
+                raise error
+            elif isinstance(error, str):
+                if enable_llm_debug():
+                    print_colored(f"Got per-request error: {repr(error)}\n",
+                                  "red")
+                    print_colored(str(traceback.extract_stack()) + "\n", "red")
+                # A per-request error, can be captured and ignored
+                raise RequestError(error)
+
         # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
         # more than one error.
         if not self._error_queue.empty():
             e = self._error_queue.get()
+            self._error_queue.task_done()
             self.shutdown()
             # We can catch some exceptions here.
             raise e
@@ -699,12 +635,49 @@ class GenerationExecutor(ABC):
                 self.stats_queue = self._stats
                 self.stats_aqueue = None
 
-    def get_stats(self):
-        return self.stats_queue.get()
+    def get_stats(self, timeout=None) -> str:
+        ''' Get the stats from the runtime.
 
-    async def aget_stats(self):
-        assert self.stats_aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        return await self.stats_aqueue.get()
+        Exceptions:
+            NoStatsAvailable: If the stats are not available.
+
+        Returns:
+            str: The stats in JSON format.
+
+        Known issue:
+            The `get_stats` cannot mix with `aget_stats` in the same Executor instance.
+        '''
+        assert self.stats_queue, "The stats queue is not created. It is likely that `get_stats` and `aget_stats` methods" \
+        " are mixed."
+        try:
+            res = self.stats_queue.get(timeout=timeout)
+        except Empty:
+            raise NoStatsAvailable
+        return res
+
+    async def aget_stats(self, timeout=None) -> Optional[str]:
+        ''' Get the stats from the runtime.
+
+        Exceptions:
+            NoStatsAvailable: If the stats are not available.
+
+        Returns:
+            str: The stats in JSON format.
+
+        Known issue:
+            The `aget_stats` cannot mix with `get_stats` in the same Executor instance.
+        '''
+        self.create_stats_queue()
+        assert self.stats_aqueue is not None
+
+        if not has_event_loop():
+            raise NoStatsAvailable
+
+        try:
+            res = await self.stats_aqueue.get(timeout=timeout)
+        except asyncio.TimeoutError:
+            raise NoStatsAvailable
+        return res
 
     @staticmethod
     def create(
@@ -796,6 +769,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             self.await_response_task,
             error_queue=self._error_queue,
             name="await_response_thread")
+
         self.dispatch_stats_thread = ManagedThread(
             self.dispatch_stats_task,
             error_queue=self._error_queue,
@@ -887,28 +861,25 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
             if self._to_delay_response(rsp):
                 continue
-
             self._cleanup_pending_responses(nowait=True)
 
             queue = self.return_queue(req_id)
-            if not self._error_queue.empty():
-                bck_error = self._error_queue.get_nowait()
-                rsp = self.Response(req_id,
-                                    tensors=None,
-                                    finish_reasons=None,
-                                    is_final=None,
-                                    sequence_index=None,
-                                    error=str(bck_error))
 
-            # For AsyncQueue.sync_q, we will batch the events to avoid too many notifications, thus put without
-            # notification here.
+            if self._has_background_error():
+                rsp = self._create_error_response(req_id)
+
+            # For AsyncQueue.sync_q, we will batch the events to avoid too many event notifications, thus put without
+            # wait here.
             if isinstance(queue, _SyncQueue):
+                global_tracer().log_instant("worker-rsp.put")
                 queue.put_nowait(rsp)
                 async_events.append(queue.event)
                 event_loop = queue.loop if event_loop is None else event_loop  # all the loops are identical
             else:
-                queue.put(rsp)
+                global_tracer().log_instant("worker-rsp.put")
+                queue.put(rsp)  # This could be IPC
 
+            # Eliminate the finished GenerationRequest instances timely, which may take considerable memory.
             if rsp.is_final:
                 self._results.pop(req_id)
 
@@ -917,10 +888,26 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         return True  # success
 
+    def _has_background_error(self) -> bool:
+        return not self._error_queue.empty()
+
+    def _create_error_response(self, req_id) -> GenerationExecutor.Response:
+        bck_error = self._error_queue.get_nowait()
+        assert isinstance(bck_error, Exception)
+        return GenerationExecutor.Response(req_id,
+                                           tensors=None,
+                                           finish_reasons=None,
+                                           is_final=None,
+                                           sequence_index=None,
+                                           error=bck_error)
+
+    stats_count = 0
+
     def dispatch_stats_task(self) -> bool:
         time.sleep(0.1)
         # Get stats and place in queue.
         for stats in self.engine.get_latest_iteration_stats():
+            self.stats_count += 1
             while hasattr(self.stats_queue, "full") and self.stats_queue.full():
                 self.stats_queue.get()
 
@@ -1025,6 +1012,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
         return result
 
     def shutdown(self):
+        if enable_llm_debug():
+            try:
+                print_colored('Proxy.shutdown...\n', "yellow")
+                print(traceback.extract_stack())
+            except ValueError:
+                pass
+
         if self.doing_shutdown:
             return
         else:
@@ -1084,34 +1078,37 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 wait_set.add(fut)
 
 
-class IpcQueue:
-    ''' A Queue-like container for IPC. '''
+class ZeroMqQueue:
+    ''' A Queue-like container for IPC using ZeroMQ. '''
 
     def __init__(self,
                  address: Optional[Tuple[str, int, str]] = None,
                  *,
                  is_server: bool):
-
         # NOTE: The port could be occupied by other processes if run in parallel.
         address = address or ('localhost', find_free_port(),
                               secrets.token_bytes(512))
 
         self.host_port, self.authkey = (address[0], address[1]), address[2]
         self.is_server = is_server
-        self.conn = None
-        if is_server:
-            self.listener = Listener(self.host_port,
-                                     'AF_INET',
-                                     authkey=self.authkey)
+        self.context = zmq.Context()
+        self.socket = None
+
+    @property
+    def address(self):
+        return (self.host_port[0], self.host_port[1], self.authkey)
 
     def setup(self):
+        self.socket = self.context.socket(
+            zmq.PAIR)  # PAIR for bidir communication
         if self.is_server:
-            self.conn = self.listener.accept()
+            self.socket.bind(f'tcp://{self.host_port[0]}:{self.host_port[1]}')
         else:
-            self.conn = Client(self.host_port, authkey=self.authkey)
+            self.socket.connect(
+                f'tcp://{self.host_port[0]}:{self.host_port[1]}')
 
     def put(self, obj: Any):
-        if self.conn is None:
+        if self.socket is None:
             self.setup()
 
         if isinstance(obj, GenerationExecutor.Response):
@@ -1120,29 +1117,42 @@ class IpcQueue:
                                               tensors=tensors,
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
-                                              sequence_index=obj.sequence_index,
                                               error=obj.error)
 
-        self.conn.send(obj)
+        message = pickle.dumps(obj)  # nosec B301
+        self.socket.send(message)
 
     def get(self) -> Any:
-        if self.conn is None:
+        if self.socket is None:
             self.setup()
 
-        obj = self.conn.recv()
+        message = self.socket.recv()
+        obj = pickle.loads(message)  # nosec B301
+
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self._load_tensors_from_shmm(obj.tensors)
             obj = GenerationExecutor.Response(request_id=obj.request_id,
                                               tensors=tensors,
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
-                                              sequence_index=obj.sequence_index,
                                               error=obj.error)
+
         return obj
+
+    def close(self):
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+        if self.context:
+            self.context.term()
+            self.context = None
 
     def _store_tensors_in_shmm(
         self, tensors: GenerationExecutor.ResponseTensors
     ) -> GenerationExecutor.ResponseTensors:
+        if tensors is None:
+            return tensors
+
         # The tensors are huge and cannot be transferred through socket directly. We need to store them in shared memory,
         # and replace the tensors with the shared memory path.
         def store_tensor(tensor: Optional[torch.Tensor]) -> Optional[str]:
@@ -1169,6 +1179,8 @@ class IpcQueue:
     def _load_tensors_from_shmm(
         self, tensors: GenerationExecutor.ResponseTensors
     ) -> GenerationExecutor.ResponseTensors:
+        if tensors is None:
+            return tensors
 
         def load_tensor(tensor: Optional[str]) -> Optional[torch.Tensor]:
             if tensor is None or isinstance(tensor, torch.Tensor):
@@ -1188,15 +1200,117 @@ class IpcQueue:
             cum_log_probs=tensors.cum_log_probs,
         )
 
+    def __del__(self):
+        self.close()
+
+
+IpcQueue = ZeroMqQueue
+
+
+class FusedIpcQueue:
+    ''' A Queue-like container for IPC with optional message batched. '''
+
+    def __init__(self,
+                 address: Optional[Tuple[str, int, str]] = None,
+                 *,
+                 is_server: bool,
+                 fuse_message=False,
+                 fuse_size=100000,
+                 error_queue=None,
+                 queue_cls=ZeroMqQueue):
+
+        self.queue = queue_cls(address=address, is_server=is_server)
+        self.fuse_message = fuse_message
+        self.error_queue = error_queue
+        self.fuse_size = fuse_size
+        self._message_counter = 0
+        self._obj_counter = 0
+        self._send_thread = None
+        self.sending_queue = Queue() if fuse_message else None
+
+    def setup_sender(self):
+        if not self.fuse_message or self._send_thread is not None:
+            return
+
+        def send_task():
+            while True:
+                qsize = self.sending_queue.qsize()
+                if qsize > 0:
+                    qsize = min(self.fuse_size, qsize)
+                    self._obj_counter += qsize
+                    message = [
+                        self.sending_queue.get_nowait() for _ in range(qsize)
+                    ]
+                    self.queue.put(message)
+                    self._message_counter += 1
+                else:
+                    time.sleep(0.001)
+
+        self._send_thread = ManagedThread(send_task,
+                                          name="fused_send_thread",
+                                          error_queue=self.error_queue)
+        self._send_thread.start()
+
+    def put(self, obj: Any):
+        self.setup_sender()
+        if self.fuse_message:
+            self.sending_queue.put_nowait(self._prepare_message(obj))
+        else:
+            self.queue.put(self._prepare_message(obj))
+
+    def get(self) -> Any:
+        obj = self.queue.get()
+        if isinstance(obj, list):
+            return [self._process_message(o) for o in obj]
+        return self._process_message(obj)
+
+    def _prepare_message(self, obj: Any) -> Any:
+        if isinstance(obj, GenerationExecutor.Response):
+            tensors = self.queue._store_tensors_in_shmm(obj.tensors)
+            return GenerationExecutor.Response(
+                request_id=obj.request_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                sequence_index=obj.sequence_index,
+                error=obj.error)
+        return obj
+
+    def _process_message(self, obj: Any) -> Any:
+        if isinstance(obj, GenerationExecutor.Response):
+            tensors = self.queue._load_tensors_from_shmm(obj.tensors)
+            return GenerationExecutor.Response(
+                request_id=obj.request_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                sequence_index=obj.sequence_index,
+                error=obj.error)
+        return obj
+
     @property
     def address(self) -> Tuple[str, int, bytes]:
-        return (self.host_port[0], self.host_port[1], self.authkey)
+        return self.queue.address
 
     def __del__(self):
-        if self.conn is not None:
-            self.conn.close()
-        if self.is_server:
-            self.listener.close()
+        self.close()
+
+    def print_fuse_stats(self):
+        if self._message_counter > 0:
+            print_colored(
+                f"IPCQueue: {self._message_counter} messages, {self._obj_counter} objects sent, average: {self._obj_counter/self._message_counter}.\n",
+                "green")
+
+    def close(self):
+        self.queue.close()
+
+        if self._send_thread is not None:
+            self._send_thread.stop()
+            self._send_thread.join()
+            self._send_thread = None
+
+        if enable_llm_debug():
+            self.print_fuse_stats()
 
 
 class ExecutorBindingsProxy(GenerationExecutor):
@@ -1215,8 +1329,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.request_queue = IpcQueue(is_server=True)
         # Return request id back to dispatcher
         self.rid_or_err_queue = IpcQueue(is_server=True)
-        self.result_queue = IpcQueue(is_server=True)
-        self.mp_stats_queue = IpcQueue(is_server=True)
+        self.result_queue = FusedIpcQueue(is_server=True, fuse_message=True)
+        self.mp_stats_queue = FusedIpcQueue(is_server=True, fuse_message=True)
 
         self._results: Dict[int, GenerationResult] = {}
 
@@ -1256,20 +1370,37 @@ class ExecutorBindingsProxy(GenerationExecutor):
                      stats_queue_addr: Tuple[str, int, bytes],
                      executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(
                          1),
-                     worker_cls: type = ExecutorBindingsWorker) -> None:
+                     worker_cls: type = ExecutorBindingsWorker,
+                     tracer_init_kwargs=None) -> None:
         result_queue = None
+
+        if tracer_init_kwargs is not None and mpi_rank() == 0:
+            tracer = VizTracer(**tracer_init_kwargs)
+            tracer.register_exit()
+            tracer.start()
+            set_global_tracer(tracer)
 
         if mpi_rank() == 0:
             request_queue = IpcQueue(request_queue_addr, is_server=False)
             rid_or_err_queue = IpcQueue(rid_or_err_queue_addr, is_server=False)
-            result_queue = IpcQueue(result_queue_addr, is_server=False)
-            mp_stats_queue = IpcQueue(stats_queue_addr, is_server=False)
+            result_queue = FusedIpcQueue(result_queue_addr,
+                                         is_server=False,
+                                         fuse_message=True)
+            mp_stats_queue = FusedIpcQueue(stats_queue_addr,
+                                           is_server=False,
+                                           fuse_message=True)
 
         def notify_proxy_threads_to_quit():
             # Signal the dispatcher thread in the proxy to quit
             result_queue.put(None)
             # Signal the stats thread in the proxy to quit
             mp_stats_queue.put(None)
+
+        # Error handling in the Worker/MPI process
+        #   1. During Executor initialization, the errors will be captured by MPIPoolExecutor, and propagate to the
+        #      future.done_callback in the Python main process.
+        #   2. After Executor initialization, the errors will be captured by ManagedThreads, and propagate to the
+        #      error_queue in the Python main process by IPC queue of result_queue in await_response_task.
 
         try:
             executor = worker_cls(engine, executor_config)
@@ -1309,16 +1440,39 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if (res := self.result_queue.get()) is None:
             return False  # shutdown the thread
 
-        req_id = res.request_id
+        async_events = []
+        event_loop = None
 
-        if not self._to_delay_response(res):
-            self._results[req_id].queue.put(res)
+        def process_res(res):
+            req_id = res.request_id
+            nonlocal event_loop
+            nonlocal async_events
 
-            if res.is_final:
-                self._results.pop(req_id)
-        else:
-            self._pending_responses.setdefault(req_id, []).append(
-                self.PendingResponse(res, time.perf_counter()))
+            if not self._to_delay_response(res):
+                queue = self._results[req_id].queue
+                if isinstance(queue, _SyncQueue):
+                    queue.put_nowait(res)
+                    async_events.append(queue.event)
+                    event_loop = queue.loop if event_loop is None else event_loop  # all the loops are identical
+                else:
+                    queue.put(res)
+
+                if res.is_final:
+                    self._results.pop(req_id)
+            else:
+                self._pending_responses.setdefault(req_id, []).append(
+                    self.PendingResponse(res, time.perf_counter()))
+
+        res = res if isinstance(res, list) else [res]
+
+        for i in res:
+            global_tracer().log_instant("IPC.get")
+            if i is None:
+                return False
+            process_res(i)
+
+        if async_events:
+            _SyncQueue.notify_events(event_loop, async_events)
 
         return True  # success
 
@@ -1335,11 +1489,15 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if stats is None:
             return False
 
+        stats = stats if isinstance(stats, list) else [stats]
+
         while self.stats_queue.full():
             self.stats_queue.get()
 
         try:
-            self.stats_queue.put(stats)
+            for s in stats:
+                if s is None: return False
+                self.stats_queue.put(s)
         except AsyncQueue.EventLoopShutdownError:
             # This happens in the last stats loop while the generate workflow is stopped.
             pass
@@ -1355,10 +1513,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
             if future.exception() is not None:
                 self._error_queue.put_nowait(future.exception())
 
+        tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
+        ) else None
         self.mpi_futures = self.mpi_session.submit(
             ExecutorBindingsProxy.workers_main,
             **self.workers_kwargs,
-            worker_cls=self.worker_cls)
+            worker_cls=self.worker_cls,
+            tracer_init_kwargs=tracer_init_kwargs)
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
@@ -1371,6 +1532,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._handle_background_error()
 
     def shutdown(self):
+        if enable_llm_debug():
+            try:
+                print_colored('Proxy.shutdown...\n', "yellow")
+                print_colored(str(traceback.format_exc()) + "\n", "yellow")
+            except ValueError:
+                pass
         if not self.workers_started:
             return
 
@@ -1401,6 +1568,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         # It is possible that some requests are still pending in the workers, we need to process them before shutdown
         self._cleanup_pending_responses(nowait=False)
+
+        # close all the sockets
+        self.request_queue.close()
+        self.rid_or_err_queue.close()
+        self.result_queue.close()
+        self.mp_stats_queue.close()
 
         self.workers_started = False
 
@@ -1439,3 +1612,17 @@ class ExecutorBindingsProxy(GenerationExecutor):
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
         return False  # propagate the exception
+
+
+if enable_llm_debug():
+    print_colored("LLM debug mode enabled.\n", "yellow")
+    # This will dump all the alive threads when the process is interrupted by SIGINT.
+    faulthandler.register(signal.SIGINT, all_threads=True)
+
+
+def has_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True

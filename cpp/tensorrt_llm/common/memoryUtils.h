@@ -40,19 +40,19 @@ template <typename T>
 void deviceFill(T* devptr, size_t size, T value, cudaStream_t stream = 0);
 
 template <typename T>
-void cudaD2Hcpy(T* tgt, T const* src, const size_t size);
+void cudaD2Hcpy(T* tgt, T const* src, size_t const size);
 
 template <typename T>
-void cudaH2Dcpy(T* tgt, T const* src, const size_t size);
+void cudaH2Dcpy(T* tgt, T const* src, size_t const size);
 
 template <typename T>
-void cudaD2Dcpy(T* tgt, T const* src, const size_t size, cudaStream_t stream = NULL);
+void cudaD2Dcpy(T* tgt, T const* src, size_t const size, cudaStream_t stream = NULL);
 
 template <typename T>
-void cudaAutoCpy(T* tgt, T const* src, const size_t size, cudaStream_t stream = NULL);
+void cudaAutoCpy(T* tgt, T const* src, size_t const size, cudaStream_t stream = NULL);
 
 template <typename T>
-void cudaRandomUniform(T* buffer, const size_t size);
+void cudaRandomUniform(T* buffer, size_t const size);
 
 template <typename T>
 int loadWeightFromBin(T* ptr, std::vector<size_t> shape, std::string filename,
@@ -65,21 +65,21 @@ int loadWeightFromBin(T* ptr, std::vector<size_t> shape, std::string filename,
 //                                               std::string         filename,
 //                                               TRTLLMCudaDataType  model_file_type = TRTLLMCudaDataType::FP32);
 
-void invokeCudaD2DcpyHalf2Float(float* dst, half* src, const size_t size, cudaStream_t stream);
-void invokeCudaD2DcpyFloat2Half(half* dst, float* src, const size_t size, cudaStream_t stream);
+void invokeCudaD2DcpyHalf2Float(float* dst, half* src, size_t const size, cudaStream_t stream);
+void invokeCudaD2DcpyFloat2Half(half* dst, float* src, size_t const size, cudaStream_t stream);
 #ifdef ENABLE_FP8
-void invokeCudaD2Dcpyfp82Float(float* dst, __nv_fp8_e4m3* src, const size_t size, cudaStream_t stream);
-void invokeCudaD2Dcpyfp82Half(half* dst, __nv_fp8_e4m3* src, const size_t size, cudaStream_t stream);
-void invokeCudaD2DcpyFloat2fp8(__nv_fp8_e4m3* dst, float* src, const size_t size, cudaStream_t stream);
-void invokeCudaD2DcpyHalf2fp8(__nv_fp8_e4m3* dst, half* src, const size_t size, cudaStream_t stream);
-void invokeCudaD2DcpyBfloat2fp8(__nv_fp8_e4m3* dst, __nv_bfloat16* src, const size_t size, cudaStream_t stream);
+void invokeCudaD2Dcpyfp82Float(float* dst, __nv_fp8_e4m3* src, size_t const size, cudaStream_t stream);
+void invokeCudaD2Dcpyfp82Half(half* dst, __nv_fp8_e4m3* src, size_t const size, cudaStream_t stream);
+void invokeCudaD2DcpyFloat2fp8(__nv_fp8_e4m3* dst, float* src, size_t const size, cudaStream_t stream);
+void invokeCudaD2DcpyHalf2fp8(__nv_fp8_e4m3* dst, half* src, size_t const size, cudaStream_t stream);
+void invokeCudaD2DcpyBfloat2fp8(__nv_fp8_e4m3* dst, __nv_bfloat16* src, size_t const size, cudaStream_t stream);
 #endif // ENABLE_FP8
 #ifdef ENABLE_BF16
-void invokeCudaD2DcpyBfloat2Float(float* dst, __nv_bfloat16* src, const size_t size, cudaStream_t stream);
+void invokeCudaD2DcpyBfloat2Float(float* dst, __nv_bfloat16* src, size_t const size, cudaStream_t stream);
 #endif // ENABLE_BF16
 
 template <typename T_OUT, typename T_IN>
-void invokeCudaCast(T_OUT* dst, T_IN const* const src, const size_t size, cudaStream_t stream);
+void invokeCudaCast(T_OUT* dst, T_IN const* const src, size_t const size, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -217,27 +217,27 @@ __inline__ __host__ __device__ T constexpr flat_index_strided4(TIndex const& ind
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
-void invokeInPlaceTranspose(T* data, T* workspace, const size_t dim0, const size_t dim1);
+void invokeInPlaceTranspose(T* data, T* workspace, size_t const dim0, size_t const dim1);
 
 template <typename T>
 void invokeInPlaceTranspose0213(
-    T* data, T* workspace, const size_t dim0, const size_t dim1, const size_t dim2, const size_t dim3);
+    T* data, T* workspace, size_t const dim0, size_t const dim1, size_t const dim2, size_t const dim3);
 
 template <typename T>
-void invokeInPlaceTranspose102(T* data, T* workspace, const size_t dim0, const size_t dim1, const size_t dim2);
+void invokeInPlaceTranspose102(T* data, T* workspace, size_t const dim0, size_t const dim1, size_t const dim2);
 
 template <typename T>
-void invokeMultiplyScale(T* tensor, float scale, const size_t size, cudaStream_t stream);
+void invokeMultiplyScale(T* tensor, float scale, size_t const size, cudaStream_t stream);
 
 template <typename T>
-void invokeDivideScale(T* tensor, float scale, const size_t size, cudaStream_t stream);
+void invokeDivideScale(T* tensor, float scale, size_t const size, cudaStream_t stream);
 
 template <typename T_IN, typename T_OUT>
-void invokeCudaD2DcpyConvert(T_OUT* tgt, const T_IN* src, const size_t size, cudaStream_t stream = 0);
+void invokeCudaD2DcpyConvert(T_OUT* tgt, const T_IN* src, size_t const size, cudaStream_t stream = 0);
 
 template <typename T_IN, typename T_OUT>
 void invokeCudaD2DScaleCpyConvert(
-    T_OUT* tgt, const T_IN* src, float const* scale, bool invert_scale, const size_t size, cudaStream_t stream = 0);
+    T_OUT* tgt, const T_IN* src, float const* scale, bool invert_scale, size_t const size, cudaStream_t stream = 0);
 
 inline bool checkIfFileExist(std::string const& file_path)
 {
@@ -251,18 +251,42 @@ inline bool checkIfFileExist(std::string const& file_path)
 }
 
 template <typename T>
-void saveToBinary(T const* ptr, const size_t size, std::string filename);
+void saveToBinary(T const* ptr, size_t const size, std::string filename);
 
 template <typename T_IN, typename T_fake_type>
-void invokeFakeCast(T_IN* input_ptr, const size_t size, cudaStream_t stream);
+void invokeFakeCast(T_IN* input_ptr, size_t const size, cudaStream_t stream);
 
 size_t cuda_datatype_size(TRTLLMCudaDataType dt);
 
 template <typename T>
-bool invokeCheckRange(T const* buffer, const size_t size, T min, T max, bool* d_within_range, cudaStream_t stream);
+bool invokeCheckRange(T const* buffer, size_t const size, T min, T max, bool* d_within_range, cudaStream_t stream);
 
-size_t calcAlignedSize(std::vector<size_t> const& sizes, size_t ALIGN_BYTES = 256);
-void calcAlignedPointers(
-    std::vector<void*>& outPtrs, void const* p, std::vector<size_t> const& sizes, size_t ALIGN_BYTES = 256);
+constexpr size_t DEFAULT_ALIGN_BYTES = 256;
+
+size_t calcAlignedSize(std::vector<size_t> const& sizes, size_t ALIGN_BYTES = DEFAULT_ALIGN_BYTES);
+void calcAlignedPointers(std::vector<void*>& outPtrs, void const* p, std::vector<size_t> const& sizes,
+    size_t ALIGN_BYTES = DEFAULT_ALIGN_BYTES);
+
+struct AlignedPointersUnpacker
+{
+    template <typename... T>
+    void operator()(T*&... outPtrs)
+    {
+        assert(sizeof...(T) == alignedPointers.size());
+        auto it = alignedPointers.begin();
+        ((outPtrs = static_cast<T*>(*it++)), ...);
+    }
+
+    std::vector<void*> alignedPointers;
+};
+
+AlignedPointersUnpacker inline calcAlignedPointers(
+    void const* p, std::vector<size_t> const& sizes, size_t ALIGN_BYTES = DEFAULT_ALIGN_BYTES)
+{
+    AlignedPointersUnpacker unpacker{};
+    calcAlignedPointers(unpacker.alignedPointers, p, sizes, ALIGN_BYTES);
+    return unpacker;
+}
+
 } // namespace common
 } // namespace tensorrt_llm

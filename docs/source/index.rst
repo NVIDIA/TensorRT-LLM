@@ -29,15 +29,6 @@ Welcome to TensorRT-LLM's Documentation!
    installation/windows.md
    installation/build-from-source-windows.md
 
-.. toctree::
-   :maxdepth: 2
-   :caption: LLM API Examples
-   :hidden:
-
-   llm-api-examples/index.md
-   llm-api-examples/customization.md
-   llm-api-examples/llm_api_examples
-
 
 .. toctree::
    :maxdepth: 2
@@ -46,6 +37,16 @@ Welcome to TensorRT-LLM's Documentation!
    :glob:
 
    llm-api/*
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: LLM API Examples
+   :hidden:
+
+   llm-api-examples/index.md
+   llm-api-examples/customization.md
+   llm-api-examples/llm_api_examples
 
 
 .. toctree::

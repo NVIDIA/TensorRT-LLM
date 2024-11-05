@@ -641,6 +641,7 @@ class RotaryScalingType(IntEnum):
     dynamic = 2
     longrope = 3
     llama3 = 4
+    yarn = 5
 
     @staticmethod
     def from_string(s):
@@ -2576,7 +2577,8 @@ def embedding(input: Tensor,
               tp_group=None,
               sharding_dim=0,
               tp_rank=None,
-              per_token_scale=None) -> Tensor:
+              per_token_scale=None,
+              padding=None) -> Tensor:
     '''
     Add an operation to perform embedding lookup.
 
@@ -2627,6 +2629,9 @@ def embedding(input: Tensor,
         tp_rank : int
             The tensor parallelism rank. Used to calculate offset in TP on vocab dim.
 
+        padding: Tensor
+            Additional padding added to the end of the embedding table before feeding into gather op.
+
     Returns:
         The tensor produced by the embedding lookup layer.
     '''
@@ -2634,6 +2639,11 @@ def embedding(input: Tensor,
     # Per token scale is only supported by lookup plugin so if per_token_scale is not None, we must use lookup plugin
     # Otherwise, we prefer to use ootb
     use_lookup_plugin = per_token_scale is not None
+
+    if padding is not None:
+        padded_weight = concat([weight, padding], dim=0)
+    else:
+        padded_weight = weight
 
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
@@ -2660,7 +2670,7 @@ def embedding(input: Tensor,
 
                 # Get the temporal results
                 layer = default_trtnet().add_gather(
-                    weight.trt_tensor, placeholder_input.trt_tensor, 0)
+                    padded_weight.trt_tensor, placeholder_input.trt_tensor, 0)
                 tmp_output = _create_tensor(layer.get_output(0), layer)
 
                 # Set zero for invalid results
@@ -2672,7 +2682,7 @@ def embedding(input: Tensor,
                 x = allreduce(x, tp_group)
 
         elif sharding_dim == 1:  # TP on hidden dimension
-            layer = default_trtnet().add_gather(weight.trt_tensor,
+            layer = default_trtnet().add_gather(padded_weight.trt_tensor,
                                                 input.trt_tensor, 0)
             x = _create_tensor(layer.get_output(0), layer)
 
@@ -2688,11 +2698,11 @@ def embedding(input: Tensor,
     else:
         if use_lookup_plugin:
             x = _lookup_plugin(input,
-                               weight,
+                               padded_weight,
                                rank=0,
                                per_token_scale=per_token_scale)
         else:
-            layer = default_trtnet().add_gather(weight.trt_tensor,
+            layer = default_trtnet().add_gather(padded_weight.trt_tensor,
                                                 input.trt_tensor, 0)
             x = _create_tensor(layer.get_output(0), layer)
     return x
@@ -4313,6 +4323,96 @@ class RopeEmbeddingUtils:
                         scaling_long_factors, False, True), short_mscale
 
     @staticmethod
+    def create_fake_weight(dim: int, dtype=np.half):
+        return np.random.rand(dim).astype(dtype)
+
+    @staticmethod
+    def create_sinusoidal_positions_for_deepseek_attention_plugin(
+            num_pos: int,
+            dim: int,
+            base: int = 10000,
+            scaling_factor: float = 1.0,
+            original_max_position_embeddings: int = 4096,
+            beta_fast: int = 32,
+            beta_slow: int = 1,
+            mscale: float = 1.0,
+            mscale_all_dim: float = 1.0,
+            dtype=np.float32):
+
+        # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
+        # Inverse dim formula to find dim based on number of rotations
+        def yarn_find_correction_dim(num_rotations,
+                                     dim,
+                                     base=10000,
+                                     max_position_embeddings=2048):
+            return (dim * math.log(max_position_embeddings /
+                                   (num_rotations * 2 * math.pi))) / (
+                                       2 * math.log(base))
+
+        # Find dim range bounds based on rotations
+        def yarn_find_correction_range(low_rot,
+                                       high_rot,
+                                       dim,
+                                       base=10000,
+                                       max_position_embeddings=2048):
+            low = math.floor(
+                yarn_find_correction_dim(low_rot, dim, base,
+                                         max_position_embeddings))
+            high = math.ceil(
+                yarn_find_correction_dim(high_rot, dim, base,
+                                         max_position_embeddings))
+            if low < 0:
+                low = 0
+            if high > dim - 1:
+                high = dim - 1
+            return low, high  # Clamp values just in case
+
+        def yarn_get_mscale(scale=1, mscale=1):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        def yarn_linear_ramp_mask(min, max, dim):
+            if min == max:
+                max += 0.001  # Prevent singularity
+
+            linear_func = (np.arange(dim, dtype=dtype) - min) / (max - min)
+            ramp_func = np.clip(linear_func, 0, 1)
+            return ramp_func
+
+        freq_extra = 1.0 / (base**(np.arange(0, dim, 2, dtype=dtype) / dim))
+        freq_inter = 1.0 / (scaling_factor *
+                            base**(np.arange(0, dim, 2, dtype=dtype) / dim))
+
+        low, high = yarn_find_correction_range(
+            beta_fast,
+            beta_slow,
+            dim,
+            base,
+            original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
+                                                    dim // 2).astype(dtype)
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        t = np.arange(num_pos, dtype=dtype)
+
+        freqs = np.outer(t, inv_freq)
+
+        _mscale = float(
+            yarn_get_mscale(scaling_factor, mscale) /
+            yarn_get_mscale(scaling_factor, mscale_all_dim))
+
+        emb = np.concatenate((freqs, freqs), axis=-1)
+
+        concat = np.concatenate((np.cos(emb) * _mscale, np.sin(emb) * _mscale),
+                                axis=-1)
+
+        concat = concat.reshape((num_pos, 2, dim))
+        concat = np.transpose(concat, (0, 2, 1))
+
+        return concat.reshape((1, -1)).astype(dtype)
+
+    @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:
         assert tensor.ndim() == 4
 
@@ -4624,8 +4724,8 @@ def gpt_attention(
     host_kv_cache_pool_pointers: Tensor = None,
     host_kv_cache_pool_mapping: Tensor = None,
     do_cross_attention: bool = False,
-    cross_qkv: Optional[Tensor] = None,  # for cross attention
-    cross_qkv_length: Optional[Tensor] = None,  # for cross attention
+    cross_kv: Optional[Tensor] = None,  # for cross attention
+    cross_kv_length: Optional[Tensor] = None,  # for cross attention
     encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
     relative_attention_bias: Optional[Tensor] = None,  # for relative attention
     max_distance: int = 0,  # for relative attention
@@ -4638,7 +4738,17 @@ def gpt_attention(
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
+    host_context_progress: Tensor = None,
     layer_idx_in_cache_pool: Optional[int] = None,
+    is_mla_enabled_flag: bool = False,
+    q_lora_rank: int = 0,
+    kv_lora_rank: int = 0,
+    qk_nope_head_dim: int = 0,
+    qk_rope_head_dim: int = 0,
+    v_head_dim: int = 0,
+    fused_q_proj: Optional[Tensor] = None,
+    q_b_proj: Optional[Tensor] = None,
+    kv_b_proj: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4828,12 +4938,11 @@ def gpt_attention(
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
 
-        cross_qkv: Tensor = None
-            The QKV tensor of encoder output hidden states. Its shape is [batch_size, max_seqlen, 3
-            * hidden_dim] in padded mode and [1, num_tokens, 3 * hidden_dim] in
+        cross_kv: Tensor = None
+            The KV tensor of encoder output hidden states. Its shape is [batch_size, max_seqlen, 2 * kvHeadNum * headSize] in padded mode and [1, num_tokens, 2 * kvHeadNum * headSize] in
             packed mode,
 
-        cross_qkv_length: Tensor = None
+        cross_kv_length: Tensor = None
             The length of the longest encoder output sequence,
 
         encoder_input_lengths: Tensor
@@ -4880,9 +4989,15 @@ def gpt_attention(
             remove_input_padding is True:
                 Shape: [sum(spec_decoding_generation_lengths), divUp(num_draft_tokens + 1, 32)].
 
+        is_mla_enable: bool = False
+            Do we need to enable deepseekv2 mla?
+
 
         host_runtime_perf_knobs: Tensor = None,
             The runtime perf knobs bit mask, controls whether to use certain perf knob in the runtime.
+
+        host_context_progress: Tensor = None,
+            The structure used to track layer-wise progress in context phase.
 
     Returns:
         The tensor produced by that layer.
@@ -4999,6 +5114,24 @@ def gpt_attention(
         "spec_decoding_max_generation_length",
         np.array(spec_decoding_max_generation_length, dtype=np.int32),
         trt.PluginFieldType.INT32)
+    is_mla_enabled = trt.PluginField(
+        "is_mla_enabled", np.array(is_mla_enabled_flag, dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    q_lora_rank = trt.PluginField("q_lora_rank",
+                                  np.array(q_lora_rank, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
+    kv_lora_rank = trt.PluginField("kv_lora_rank",
+                                   np.array(kv_lora_rank, dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
+    qk_nope_head_dim = trt.PluginField(
+        "qk_nope_head_dim", np.array(qk_nope_head_dim, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    qk_rope_head_dim = trt.PluginField(
+        "qk_rope_head_dim", np.array(qk_rope_head_dim, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    v_head_dim = trt.PluginField("v_head_dim",
+                                 np.array(v_head_dim, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
     p_dtype = default_net().plugin_config.gpt_attention_plugin
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -5108,7 +5241,8 @@ def gpt_attention(
         pos_shift_enabled, dense_context_fmha, use_paged_context_fmha_field,
         use_fp8_context_fmha_field, has_full_attention_mask_field, use_cache_pf,
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
-        spec_decoding_max_generation_length
+        spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
+        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5170,7 +5304,7 @@ def gpt_attention(
         plug_inputs += [relative_attention_bias]
 
     if do_cross_attention:
-        plug_inputs += [cross_qkv, cross_qkv_length, encoder_input_lengths]
+        plug_inputs += [cross_kv, cross_kv_length, encoder_input_lengths]
 
     if default_net().plugin_config.remove_input_padding:
         plug_inputs += [host_context_lengths]
@@ -5188,6 +5322,15 @@ def gpt_attention(
         ]
     if host_runtime_perf_knobs is not None:
         plug_inputs += [host_runtime_perf_knobs]
+
+    if host_context_progress is not None:
+        plug_inputs += [host_context_progress]
+
+    if is_mla_enabled_flag:
+        assert fused_q_proj is not None
+        assert q_b_proj is not None
+        assert kv_b_proj is not None
+        plug_inputs += [fused_q_proj, q_b_proj, kv_b_proj]
 
     for idx, i in enumerate(plug_inputs):
         assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
@@ -6368,3 +6511,65 @@ def low_latency_gemm(input: Tensor,
                                                low_latency_gemm_plug)
         _add_plugin_info(layer, plg_creator, "low_latency_gemm", pfc)
         return _create_tensor(layer.get_output(0), layer)
+
+
+def low_latency_gemm_swiglu(input: Tensor,
+                            weight: Tensor,
+                            scale_d0: float = 1.0,
+                            scale_d1: float = 1.0,
+                            scale_output: float = 1.0) -> Tensor:
+    '''
+    Add a matrix multiplication, followed by SwiGLU (`x * SiLU(gate)`) operation.
+
+    The second SwiGLU operation takes the preceding tensor, splits it into two halves
+    along the last dimension, applies SiLU to the second half and multiply the results. The
+    behaviour is undefined if the last dimension is not even.
+
+        Parameters:
+        input : Tensor
+            The first tensor (often called A).
+
+        weight : Tensor
+            The second tensor (often called B).
+
+        scale_d0 : float
+            The scale for dequantizing x, used for fp8
+
+        scale_d1 : float
+            The scale for dequantizing gate, used for fp8
+
+        scale_output : float
+            The scale for quantizing output, used for fp8
+
+                Returns:
+        The tensor produced by the inserted layer.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'LowLatencyGemmSwiglu', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_dtype = default_net().plugin_config.low_latency_gemm_swiglu_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    pf_scale_d0 = trt.PluginField("scale_d0",
+                                  np.array(scale_d0, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_d1 = trt.PluginField("scale_d1",
+                                  np.array(scale_d1, dtype=np.float32),
+                                  trt.PluginFieldType.FLOAT32)
+    pf_scale_output = trt.PluginField("scale_output",
+                                      np.array(scale_output, dtype=np.float32),
+                                      trt.PluginFieldType.FLOAT32)
+
+    pfc = trt.PluginFieldCollection(
+        [pf_type, pf_scale_output, pf_scale_d0, pf_scale_d1])
+    low_latency_gemm_swiglu_plug = plg_creator.create_plugin(
+        "low_latency_gemm_swiglu", pfc)
+
+    plug_inputs = [input.trt_tensor, weight.trt_tensor]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                           low_latency_gemm_swiglu_plug)
+
+    return _create_tensor(layer.get_output(0), layer)

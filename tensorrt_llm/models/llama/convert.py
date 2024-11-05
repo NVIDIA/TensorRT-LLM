@@ -292,9 +292,9 @@ def get_tllm_linear_sq_weight(vals,
 
     if per_token:
         if per_channel:
-            original_weights = torch.Tensor(vals["weight.int8.col"]).cuda()
+            original_weights = torch.Tensor(vals["weight.int8.col"])
         else:
-            original_weights = torch.Tensor(vals["weight.int8"]).cuda()
+            original_weights = torch.Tensor(vals["weight.int8"])
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -310,7 +310,7 @@ def get_tllm_linear_sq_weight(vals,
             cur_weights = cur_weights.reshape(hidden_dim, -1)
         results[prefix + 'weight'] = cur_weights.t().contiguous()
         if smoother_value is None:
-            results[last_prefix] = torch.Tensor([1.0]).to(torch.float32).cuda()
+            results[last_prefix] = torch.Tensor([1.0]).to(torch.float32)
 
         if per_channel:
             cur_per_channel_value = vals["scale_w_quant_orig.col"]
@@ -341,9 +341,9 @@ def get_tllm_linear_sq_weight(vals,
             col_shape).contiguous()
     else:
         if per_channel:
-            original_weights = torch.Tensor(vals["weight.int8.col"]).cuda()
+            original_weights = torch.Tensor(vals["weight.int8.col"])
         else:
-            original_weights = torch.Tensor(vals["weight.int8"]).cuda()
+            original_weights = torch.Tensor(vals["weight.int8"])
         local_dim = original_weights.shape[0]
         head_size = (original_weights.shape[1] - local_dim) // 2
 
@@ -387,12 +387,11 @@ def get_tllm_linear_sq_weight(vals,
 
         results[prefix +
                 'per_channel_scale'] = torch.Tensor(cur_per_channel_value).to(
-                    torch.float32).reshape(col_shape).contiguous().cuda()
-        results[prefix + 'act_scale'] = torch.Tensor([[
-            vals['scale_y_quant_orig']
-        ]]).to(torch.float32).contiguous().cuda()
-        results[last_prefix] = torch.Tensor([vals['scale_x_orig_quant']]).to(
-            torch.float32).contiguous().cuda()
+                    torch.float32).reshape(col_shape).contiguous()
+        results[prefix + 'act_scale'] = torch.Tensor(
+            [[vals['scale_y_quant_orig']]]).to(torch.float32).contiguous()
+        results[last_prefix] = torch.Tensor([vals['scale_x_orig_quant']
+                                             ]).to(torch.float32).contiguous()
 
     if smoother_value is not None:
         cur_smoother_value = torch.chunk(smoother_value,
@@ -1557,11 +1556,15 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
             res = tensor_slice[:]
         elif tp_dim >= 0 and tp_dim < len(tensor_shape):
             if is_expert_weights:
-                tp_size = tp_size or mapping.moe_tp_size
-                tp_rank = tp_rank or mapping.moe_tp_rank
+                if tp_size is None:
+                    tp_size = mapping.moe_tp_size
+                if tp_rank is None:
+                    tp_rank = mapping.moe_tp_rank
             else:
-                tp_size = tp_size or mapping.tp_size
-                tp_rank = tp_rank or mapping.tp_rank
+                if tp_size is None:
+                    tp_size = mapping.tp_size
+                if tp_rank is None:
+                    tp_rank = mapping.tp_rank
             dim_size = tensor_shape[tp_dim]
             if dim_size % tp_size != 0:
                 logger.error(

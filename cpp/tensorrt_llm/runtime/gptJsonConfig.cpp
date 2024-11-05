@@ -20,6 +20,7 @@
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
@@ -213,10 +214,9 @@ ModelConfig createModelConfig(
         // For an encoder-decoder model, this would be overwritten in executorImpl.cpp with correct encoder config
         // The parameters set here will only be used when encoder model is skipped for enc-dec models
         TLLM_LOG_INFO("Setting encoder max input length and hidden size for accepting visual features.");
-        modelConfig.setMaxEncoderLen(json.at("build_config").at("max_encoder_input_len").template get<SizeType32>());
-        modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
         auto const maxEncoderLen = parseJsonFieldOr<SizeType32>(json.at("build_config"), "max_encoder_input_len", 0);
         modelConfig.setMaxEncoderLen(maxEncoderLen);
+        modelConfig.setEncoderHiddenSize(hiddenSize * tensorParallelism);
     }
 
     auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
@@ -504,6 +504,15 @@ GptJsonConfig parseJson(InputType&& input)
                 auto speculativeDecodingModule
                     = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, 1);
                 modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
+            }
+            else if (modelConfig.getSpeculativeDecodingMode().isEagle())
+            {
+                auto const numEagleLayers = parseJsonFieldOr(builderConfig, "num_eagle_layers", 0);
+
+                TLLM_CHECK_WITH_INFO(maxDraftLen > 0, "max_draft_len has to be larger than 0 for eagle decoding");
+                TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
+                auto eagleModule = std::make_shared<EagleModule>(numEagleLayers, maxDraftLen);
+                modelConfig.setSpeculativeDecodingModule(eagleModule);
             }
         }
     }

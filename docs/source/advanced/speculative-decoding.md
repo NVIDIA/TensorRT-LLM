@@ -213,7 +213,71 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
         --verbose
     ```
 
-5. Kill Tritonserver after finishing inference
+5. Enable fast logits D2D transfer when `"use_draft_logits": True`
+    + Obtaining adjusted logits distribution from draft logits is a proposed method in the [Fast Inference from Transformers via Speculative Decoding paper](https://arxiv.org/pdf/2211.17192.pdf). Fast logits feature boosts the performance (TPS) by hiding the latency of logits transfer from draft engine to target engine.
+    + Fast logits feature is newly supported in TensorRT-LLM-0.15.0.
+    + Modify `participant_ids` entry in `tensorrt_llm/config.pbtxt` and `tensorrt_llm_draft/config.pbtxt` to suitable MPI ranks. Usually in this setting, rank 0 is reserved for the orchestrator rank; rank 1 is for draft engine; the rest of the ranks are for target engine. In this example, `particpant_ids` can be set as snippet below. Same logic also applies to TP>1 target engine.
+    ```
+    ### In tensorrt_llm_draft/config.pbtxt
+    parameters: {
+        key: "gpu_device_ids"
+        value: {
+            string_value: "0"
+        }
+    }
+    parameters: {
+        key: "participant_ids"
+        value: {
+            string_value: "1"
+        }
+    }
+    ### In tensorrt_llm/config.pbtxt
+    parameters: {
+        key: "gpu_device_ids"
+        value: {
+            string_value: "1"
+        }
+    }
+    parameters: {
+        key: "participant_ids"
+        value: {
+            string_value: "2"
+        }
+    }
+    ```
+    + Enable `speculative_decoding_fast_logits` in both `tensorrt_llm/config.pbtxt` and `tensorrt_llm_draft/config.pbtxt`.
+    ```
+    parameters: {
+        key: "speculative_decoding_fast_logits"
+        value: {
+            string_value: "1"
+        }
+    }
+    ```
+    + Fast logits feature requires Tritonserver to be launched in orchestrator mode with `--disable-spawn-process`. See [model config](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md) for more information. `--world_size` has to be set as 1 (orchestrator rank 0) + 1 (draft engine ranks) + 1 (target engine ranks).
+    ```bash
+    python3 scripts/launch_triton_server.py \
+        --model_repo=$TRITON_REPO \
+        --tensorrt_llm_model_name "tensorrt_llm,tensorrt_llm_draft" \
+        --multi-model \
+        --disable-spawn-processes \
+        --world_size=3 --log &
+    ```
+    + Send request with `use_draft_logits` to tritonserver BLS API:
+    ```
+    curl -X POST "http://localhost:8000/v2/models/tensorrt_llm_bls/generate" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "text_input": "Continue writing the following story: James Best, best known for his",
+            "max_tokens": 128,
+            "num_draft_tokens": 10,
+            "use_draft_logits": true,
+            "stream": false
+            }'
+    ```
+    + With the fast logits enabled and following optimization tips in [model configuration](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md#some-tips-for-model-configuration), speculative decoding with draft logits achieves 2.x throughput in BS1, 1.x throughput in BS16 comparing to auto-regressive decoding using Llama 3.2 1B draft and Llama 3.1 70B target.
+
+6. Kill Tritonserver after finishing inference
 
     ```bash
     pkill -9 -f trtllmExecutorWorker
@@ -349,49 +413,50 @@ MODEL_DIR=/path/to/vicuna-7b-v1.3
 ENGINE_DIR=tmp/engine
 CKPT_DIR=tmp/engine/ckpt
 
-python3 examples/llama/convert_checkpoint.py \
---model_dir=$MODEL_DIR                       \
---output_dir=$CKPT_DIR                       \
---dtype=float16                              \
---tp_size=1                                  \
---pp_size=1
+python3 examples/llama/convert_checkpoint.py    \
+    --model_dir=$MODEL_DIR                      \
+    --output_dir=$CKPT_DIR                      \
+    --dtype=float16                             \
+    --tp_size=1                                 \
+    --pp_size=1
 ```
 
 ### Build checkpoints for an engine
 ```bash
-trtllm-build                   \
---checkpoint_dir=$CKPT_DIR     \
---output_dir=$ENGINE_DIR       \
---gpt_attention_plugin=float16 \
---gemm_plugin=float16          \
---max_batch_size=32            \
---max_input_len=1024           \
---max_seq_len=2048             \
---max_beam_width=1             \
---log_level=error              \
---max_draft_len=83             \
---speculative_decoding_mode=lookahead_decoding
+trtllm-build                        \
+    --checkpoint_dir=$CKPT_DIR      \
+    --output_dir=$ENGINE_DIR        \
+    --gpt_attention_plugin=float16  \
+    --gemm_plugin=float16           \
+    --max_batch_size=32             \
+    --max_input_len=1024            \
+    --max_seq_len=2048              \
+    --max_beam_width=1              \
+    --log_level=error               \
+    --max_draft_len=83              \
+    --speculative_decoding_mode=lookahead_decoding
 ```
 
 ### Execute an engine
 
 Run `examples/run.py` to generate sequences.
 ```bash
-python examples/run.py              \
---max_output_len=32                 \
---lookahead_config=[7,7,7]          \
---tokenizer_dir=$MODEL_DIR          \
---engine_dir= $ENGINE_DIR           \
---log_levelverbose--input_text 'Once upon' 'To be, or not' 'Be not afraid of greatness'
+python examples/run.py          \
+    --tokenizer_dir=$MODEL_DIR  \
+    --engine_dir=$ENGINE_DIR    \
+    --max_output_len=32         \
+    --lookahead_config=[7,7,7]  \
+    --log_level=verbose         \
+    --input_text 'Once upon' 'To be, or not' 'Be not afraid of greatness'
 ```
 
 Run `examples/summarize.py` to summarize the CNN daily dataset.
 ```bash
-python examples/summarize.py         \
---test_trt_llm                       \
---hf_model_dir$MODEL_DIR             \
---data_type fp16                     \
---engine_dir$ENGINE_DIR              \
---lookahead_config= [7,7,7]          \
---test_hf
+python examples/summarize.py    \
+    --test_hf                   \
+    --test_trt_llm              \
+    --hf_model_dir=$MODEL_DIR   \
+    --engine_dir=$ENGINE_DIR    \
+    --data_type=fp16            \
+    --lookahead_config=[7,7,7]
 ```

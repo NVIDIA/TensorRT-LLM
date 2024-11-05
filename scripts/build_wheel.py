@@ -314,11 +314,12 @@ def main(*,
                 env_ld["LD_LIBRARY_PATH"] = new_library_path
                 try:
                     build_run(
-                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings",
+                        f"\"{sys.executable}\" -m pybind11_stubgen -o . bindings --exit-code",
                         env=env_ld)
                 except CalledProcessError as ex:
                     print(f"Failed to build pybind11 stubgen: {ex}",
                           file=sys.stderr)
+                    exit(1)
 
     if not skip_building_wheel:
         if dist_dir is None:

@@ -1,4 +1,4 @@
-fastapi==0.112
+fastapi>=0.115
 uvicorn
 colorama
 httpx

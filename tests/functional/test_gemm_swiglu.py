@@ -15,23 +15,22 @@
 import os
 import sys
 import unittest
+from itertools import product
 
 import numpy as np
 import pytest
-import tensorrt as trt
 import torch
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch, str_dtype_to_trt
-from tensorrt_llm.functional import gemm_swiglu
+from tensorrt_llm.functional import gemm_swiglu, low_latency_gemm_swiglu
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # Monkey Patching for torch.float8_e4m3fn support
 from polygraphy.datatype import DataType
-from utils.util import getSMVersion
+from utils.util import getSMVersion, unittest_name_func
 
 original_to_dtype = DataType.to_dtype
 
@@ -62,25 +61,31 @@ class TestGemmSwiglu(unittest.TestCase):
         return y_swiglu.to(str_dtype_to_torch(dtype))
 
     def run_gemm_swiglu_sm90(self, m, n, k, scale_d0, scale_d1, scale_output,
-                             dtype):
+                             dtype, is_low_latency):
         assert n % 32 == 0, "dim N must be a integer multiples of 32"
         assert k % 16 == 0, "dim K must be a integer multiples of 16"
 
         torch.random.manual_seed(42)
 
         shape_x = (m, k)
-        x = torch.randint(-2, 2, shape_x).to(str_dtype_to_torch(dtype))
+        x = torch.randint(-2, 2, shape_x,
+                          device="cuda").to(str_dtype_to_torch(dtype))
         shape_w = (k, n)
-        w = torch.randint(-2, 2, shape_w).to(str_dtype_to_torch(dtype))
+        w = torch.randint(-2, 2, shape_w,
+                          device="cuda").to(str_dtype_to_torch(dtype))
 
+        output_dtype = "fp8"
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
         net = builder.create_network()
         # Allow plugin of dtype type
-        net.plugin_config.set_gemm_swiglu_plugin(dtype)
+        if is_low_latency:
+            net.plugin_config.low_latency_gemm_swiglu_plugin = dtype
+        else:
+            net.plugin_config.gemm_swiglu_plugin = dtype
+
         with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
             # Init TensorRT-LLM tensor for x
             x_tensor = Tensor(name='x',
                               shape=x.shape,
@@ -90,37 +95,42 @@ class TestGemmSwiglu(unittest.TestCase):
                               shape=w.shape,
                               dtype=str_dtype_to_trt(dtype))
             # Get output tensor
-            output = gemm_swiglu(x_tensor, w_tensor, None, scale_d0, scale_d1,
-                                 scale_output).trt_tensor
-            output.name = 'output'
-            network.mark_output(output)
-            output.dtype = str_dtype_to_trt(dtype)
+            if not is_low_latency:
+                output = gemm_swiglu(x_tensor, w_tensor, None, scale_d0,
+                                     scale_d1, scale_output)
+            else:
+                output = low_latency_gemm_swiglu(x_tensor, w_tensor, scale_d0,
+                                                 scale_d1, scale_output)
+            net._mark_output(output,
+                             'output',
+                             dtype=str_dtype_to_trt(output_dtype))
 
-        # Build engine
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                fp16=(dtype == "float16"),
-                fp8=(dtype == 'fp8'),
-                memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
+        feed_dict = {'x': x, "w": w.t().reshape(shape_w)}
+        output_trt = torch.empty((m, n // 2),
+                                 device="cuda",
+                                 dtype=str_dtype_to_torch(output_dtype))
+        outputs = {'output': output_trt}
+        stream = torch.cuda.current_stream()
+        builder_config = builder.create_builder_config(precision=output_dtype)
+        engine = builder.build_engine(net, builder_config)
+        session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+        session.run(inputs=feed_dict,
+                    outputs=outputs,
+                    stream=stream.cuda_stream)
+        torch.cuda.synchronize()
 
-        # Infer engine
-        feed_dict = {'x': x, 'w': w.t().reshape(shape_w)}
-        with TrtRunner(build_engine) as runner:
-            outputs = runner.infer(feed_dict=feed_dict, check_inputs=False)
         ref = self.reference_gemm_swiglu_sm90(x, w, scale_d0, scale_d1,
                                               scale_output, dtype)
-        # print(f"ref:\n{ref.float().cpu().numpy()}")
-        # print(f"trt:\n{outputs['output'].float()}")
         np.testing.assert_allclose(ref.float().cpu().numpy(),
-                                   outputs['output'].float(),
+                                   outputs['output'].cpu().float(),
                                    rtol=1e-3)
 
-    @parameterized.expand([('fp8')])
+    @parameterized.expand(list(product([('fp8')], [False, True])),
+                          name_func=unittest_name_func)
     @pytest.mark.skipif(getSMVersion() != 90,
                         reason="GemmSwigluSm90 is only supported in SM90"
                         )  # Skip tests that are not supported in SM90
-    def test_gemm_swiglu_sm90(self, dtype):
+    def test_gemm_swiglu_sm90(self, dtype, is_low_latency):
         bs = 2
         inseq = 13
         hidden_size = 256
@@ -130,7 +140,7 @@ class TestGemmSwiglu(unittest.TestCase):
         scale_output = 0.001
 
         self.run_gemm_swiglu_sm90(bs * inseq, out_size, hidden_size, scale_d0,
-                                  scale_d1, scale_output, dtype)
+                                  scale_d1, scale_output, dtype, is_low_latency)
 
 
 if __name__ == '__main__':

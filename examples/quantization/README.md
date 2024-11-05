@@ -65,8 +65,8 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
     - int8_wo: Actually nothing is applied to weights. Weights are quantized to INT8 channel wise when TRTLLM building the engine.
     - int4_wo: Same as int8_wo but in INT4.
     - full_prec: No quantization.
-- autoq_format: Specific quantization algorithms will be searched in auto quantization. The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq'] and you can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq).
-- auto_quantize_bits: Effective bits constraint for auto quantization. If not set, regular quantization without auto quantization search will be applied. Note: it must be set within correct range otherwise it will be set by lowest value if possible.
+- autoq_format: Specific quantization algorithms will be searched in auto quantization. The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq'] and you can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq). Note: 'int8_sq' can't be used together with 'fp8' now.
+- auto_quantize_bits: Effective bits constraint for auto quantization. If not set, regular quantization without auto quantization search will be applied. Note: it must be set within correct range otherwise it will be set by lowest value if possible. For example, the weights of LLMs have 16 bits defaultly and there will be 40% weight compression if we set `auto_quantize_bits` to 9.6 (9.6 / 16 = 0.6), which means the average bits of the weights are 9.6 but not 16. However, which format to choose is determined by solving an optimization problem, so you should generate the according checkpoint manually if you want to customize your checkpoint formats. The format of mixed precision checkpoint will be described in detail below.
 - output_dir: Path to save the quantized checkpoint.
 - dtype: Specify data type of model when loading from Hugging Face.
 - kv_cache_dtype: Specify kv cache data type.
@@ -123,6 +123,48 @@ FP_O * output_scale = FP8_O
 - KV Cache
     - int8_kv_cache: By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV cache.
     - fp8_kv_cache: By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV cache.
+
+### Format of Mixed Precision Checkpoints
+
+Currently, ModelOpt can help to produce a mixed precision TensorRT-LLM checkpoint. After getting the according checkpoint, we can build engine directly by trtllm-build command. If you have some special needs about the model weights(e.g. int4 for MLP and int8 for the rest), you may need to generate the checkpoint and config files by yourself.
+
+The model weights should keep same as TensorRT-LLM checkpoint formats, but have different quantization method for every linear. What's more, the `quantization` field in `config.json` will be like this:
+```
+    "quantization": {
+        "quant_algo": "MIXED_PRECISION",
+        "kv_cache_quant_algo": "FP8" // The quant_algo of KV cache may change
+    },
+```
+There will be another file about per-layer quantization information named `quant_cfg.json` in the same directory, the format of it is like:
+```
+{
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_quant_algo": "FP8",
+    "quantized_layers": { // one more filed presents per-layer's information
+        "transformer.layers.0.attention.qkv": {
+            "quant_algo": "FP8" // specific algorithm for each linear
+        },
+        "transformer.layers.0.attention.dense": {
+            "quant_algo": "FP8"
+        },
+        "transformer.layers.0.mlp.fc": {
+            "quant_algo": "W4A16_AWQ",
+            "group_size": 128,
+            "has_zero_point": false,
+            "pre_quant_scale": true
+        },
+        "transformer.layers.0.mlp.proj": {
+            "quant_algo": "W8A8_SQ_PER_CHANNEL"
+        },
+        ...
+        "transformer.layers.31.mlp.proj": {
+            "quant_algo": "FP8"
+        }
+    }
+}
+```
+
+TensorRT-LLM will automatically read `quant_cfg.json` after recogniziong the `MIXED_PRECISION` quantization method in `config.json`. All the specific algorithm keeps the same as what in `quantization` filed before. If some layers are not listed, they'll be treated as no quantization.
 
 ## APIs
 

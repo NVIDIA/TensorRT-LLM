@@ -1068,7 +1068,7 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
 {
     // For cross-attention,
     // 1. Load Q from params.qkv_input, and store it to params.q_output.
-    // 2. Load K,V from params.cross_qkv_input, and store it to params.kv_cache_buffer.
+    // 2. Load K,V from params.cross_kv_input, and store it to params.kv_cache_buffer.
 
     // NOTE:
     // head_num == kv_head_num
@@ -1118,8 +1118,7 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     int const hidden_idx = head_idx * params.size_per_head + head_dim_idx;
     int const kv_head_idx = head_idx / params.qheads_per_kv_head;
     int const hidden_idx_kv = kv_head_idx * params.size_per_head + head_dim_idx;
-    int const src_k_offset = params.q_hidden_size;
-    int const src_v_offset = src_k_offset + params.kv_hidden_size;
+    int const src_v_offset = params.kv_hidden_size;
 
     // Cast float scale to dst data type.
     using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
@@ -1169,14 +1168,13 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
             int global_token_idx = token_idx + encoder_seq_offset;
 
             // The memory offset.
-            auto const src_k_idx
-                = static_cast<size_t>(global_token_idx) * params.hidden_size + src_k_offset + hidden_idx_kv;
+            auto const src_k_idx = static_cast<size_t>(global_token_idx) * params.kv_hidden_size * 2 + hidden_idx_kv;
             auto const src_v_idx
-                = static_cast<size_t>(global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
+                = static_cast<size_t>(global_token_idx) * params.kv_hidden_size * 2 + src_v_offset + hidden_idx_kv;
 
             // Only load K,V tokens from encoder qkv input.
-            auto k = *reinterpret_cast<VecT const*>(&params.cross_qkv_input[src_k_idx]);
-            auto v = *reinterpret_cast<VecT const*>(&params.cross_qkv_input[src_v_idx]);
+            auto k = *reinterpret_cast<VecT const*>(&params.cross_kv_input[src_k_idx]);
+            auto v = *reinterpret_cast<VecT const*>(&params.cross_kv_input[src_v_idx]);
 
             // The kv cache pointers.
             auto k_cache_block_ptr

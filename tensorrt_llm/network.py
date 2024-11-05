@@ -19,6 +19,7 @@ import inspect
 import weakref
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (Any, Dict, Iterable, List, Optional, OrderedDict, Set,
                     Tuple, Union)
 
@@ -537,7 +538,7 @@ class Network(object):
             return dot.source
         dot.save(path)
 
-    def to_onnx(self, path=None) -> None:
+    def to_onnx(self, path: Path = None) -> None:
         '''
         Export the network into a "ONNX-like" file for visualization.
 
@@ -814,10 +815,10 @@ class Network(object):
                 export_onnx_file,
                 save_as_external_data=True,
                 all_tensors_to_one_file=True,
-                location=export_onnx_file.split('/')[-1] + ".weight",
+                location=export_onnx_file.name + ".weight",
             )
             logger.debug(
-                f"Export {export_onnx_file.split('/')[-1]}: {len(graph.nodes):5d} Nodes, {len(graph.tensors().keys()):5d} tensors"
+                f"Export {export_onnx_file.name}: {len(graph.nodes):5d} Nodes, {len(graph.tensors().keys()):5d} tensors"
             )
 
         export_network_as_onnx(trt_network, path, True)

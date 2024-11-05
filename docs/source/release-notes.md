@@ -47,6 +47,9 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Documentation
   - @Sherlock113 added a [tech blog](https://www.bentoml.com/blog/tuning-tensor-rt-llm-for-optimal-serving-with-bentoml) to the latest news in #2169, thanks for the contribution.
 
+### Known Issues
+  - Replit Code is not supported with the transformers 4.45+
+
 
 ## TensorRT-LLM Release 0.13.0
 

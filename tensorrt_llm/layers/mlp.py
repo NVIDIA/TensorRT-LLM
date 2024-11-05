@@ -18,7 +18,8 @@ import tensorrt as trt
 
 from .._common import default_net
 from ..functional import (ACT2FN, AllReduceFusionParams, cast, concat,
-                          gemm_swiglu, is_gated_activation)
+                          gemm_swiglu, is_gated_activation,
+                          low_latency_gemm_swiglu)
 from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.functional import quantize
@@ -267,9 +268,13 @@ class FusedGatedMLP(Module):
         # into:
         #
         #   SwiGLU(FusedFC(x))
-        p_dtype = default_net().plugin_config.gemm_swiglu_plugin
+        if default_net(
+        ).plugin_config.low_latency_gemm_swiglu_plugin is not None:
+            p_dtype = default_net().plugin_config.low_latency_gemm_swiglu_plugin
+        else:
+            p_dtype = default_net().plugin_config.gemm_swiglu_plugin
         use_fp8 = p_dtype == 'fp8'
-        assert use_fp8, "gemm_swiglu_plugin only supports fp8 now"
+        assert use_fp8, "gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now"
 
         if lora_layer_params is not None:
             mlp_fc_lora_params = lora_layer_params.get_runtime_params(
@@ -311,8 +316,14 @@ class FusedGatedMLP(Module):
             hidden_states = quantize(hidden_states, activation_scaling_factor,
                                      'fp8')
 
-        inter = gemm_swiglu(hidden_states, self.fused_fc.weight.value, None,
-                            scale_d0, scale_d1, scale_output)
+        if default_net(
+        ).plugin_config.low_latency_gemm_swiglu_plugin is not None:
+            inter = low_latency_gemm_swiglu(hidden_states,
+                                            self.fused_fc.weight.value,
+                                            scale_d0, scale_d1, scale_output)
+        else:
+            inter = gemm_swiglu(hidden_states, self.fused_fc.weight.value, None,
+                                scale_d0, scale_d1, scale_output)
 
         return inter
 
@@ -339,7 +350,7 @@ class FusedGatedMLP(Module):
             inter = ACT2FN['geglu'](inter)
         else:
             raise NotImplementedError(
-                f"Activation {self.hidden_act} not yet implemented for FusedGatedMLP"
+                f"Activation {self.hidden_act} not yet implemented for {self.__class__.__name__}."
             )
         return inter
 
@@ -347,7 +358,8 @@ class FusedGatedMLP(Module):
                 hidden_states,
                 lora_layer_params=None,
                 reduce_fusion_params: Optional[AllReduceFusionParams] = None):
-        if default_net().plugin_config.gemm_swiglu_plugin:
+        if default_net().plugin_config.gemm_swiglu_plugin or default_net(
+        ).plugin_config.low_latency_gemm_swiglu_plugin:
             inter = self.fc_gate_plugin(hidden_states, lora_layer_params)
         else:
             inter = self.fc_gate(hidden_states, lora_layer_params)

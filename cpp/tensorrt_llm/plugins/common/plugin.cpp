@@ -115,6 +115,8 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
             ncclCommDestroy(*comm);
             delete comm;
         });
+    // Need static connection initialization for accurate KV cache size estimation
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     NCCLCHECK(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);

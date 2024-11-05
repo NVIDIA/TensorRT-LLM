@@ -64,7 +64,8 @@ class Phi3Config(PretrainedConfig):
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_dir, trust_remote_code=trust_remote_code)
-
+        if hasattr(hf_config, "llm_config"):
+            hf_config = hf_config.llm_config
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
         if dtype == 'auto':

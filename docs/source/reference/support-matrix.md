@@ -43,7 +43,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
 - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
 - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
-- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
+- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)[^ReplitCode]
 - [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
 - [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
 - [Skywork](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork)
@@ -114,6 +114,7 @@ The following table shows the supported software for TensorRT-LLM.
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]
 ```
+[^ReplitCode]：Replit Code is not supported with the transformers 4.45+.
 
 [^smgte89]: INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 

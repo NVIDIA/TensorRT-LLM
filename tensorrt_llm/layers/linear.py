@@ -358,23 +358,40 @@ class Linear(LinearBase):
         config = kwargs.get("config", None)
         if self.is_qkv:
             if isinstance(weights, list):
+                head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
                 if getattr(config, "remove_duplicated_kv_heads", False):
-                    head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
-                    k, v = weights[1:]
-                    k = k.reshape([
-                        k.shape[0] // head_size // 2, 2, head_size,
-                        self.in_features
-                    ])
-                    v = v.reshape([
-                        v.shape[0] // head_size // 2, 2, head_size,
-                        self.in_features
-                    ])
-                    assert (k[:, 0] == k[:, 1]).all()
-                    assert (v[:, 0] == v[:, 1]).all()
-                    k = k[:, 0].reshape([-1, self.in_features])
-                    v = v[:, 0].reshape([-1, self.in_features])
-                    weights[1] = k
-                    weights[2] = v
+                    if config.remove_duplicated_kv_heads:
+                        k, v = weights[1:]
+                        k = k.reshape([
+                            k.shape[0] // head_size // 2, 2, head_size,
+                            self.in_features
+                        ])
+                        v = v.reshape([
+                            v.shape[0] // head_size // 2, 2, head_size,
+                            self.in_features
+                        ])
+                        assert (k[:, 0] == k[:, 1]).all()
+                        assert (v[:, 0] == v[:, 1]).all()
+                        k = k[:, 0].reshape([-1, self.in_features])
+                        v = v[:, 0].reshape([-1, self.in_features])
+                        weights[1] = k
+                        weights[2] = v
+                # Duplicate kv heads in case of invalid TP size
+                tp_size = config.mapping.tp_size
+                num_kv_heads = config.num_key_value_heads
+                if num_kv_heads < tp_size:
+                    for qkv_idx in range(3):
+                        v = weights[qkv_idx]
+                        if qkv_idx > 0:
+                            assert tp_size % num_kv_heads == 0
+                            reps = tp_size // num_kv_heads
+                            v = v.reshape(num_kv_heads, head_size,
+                                          -1)[:, None, :, :].expand(
+                                              num_kv_heads, reps, head_size,
+                                              v.shape[1])
+                            v = v.reshape(num_kv_heads * reps * head_size, -1)
+                        weights[qkv_idx] = v.chunk(
+                            tp_size, self.tp_dim)[config.mapping.tp_rank]
                 weights = torch.cat(weights)
             if using_head_as_leading_dim:
                 # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 namespace tensorrt_llm::runtime
@@ -25,15 +26,31 @@ namespace tensorrt_llm::runtime
 class EagleModule : public SpeculativeDecodingModule
 {
 public:
-    explicit EagleModule(SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens, SizeType32 maxNumPaths) noexcept
-        : SpeculativeDecodingModule(maxDraftPathLen, maxDecodingDraftTokens, maxNumPaths)
+    explicit EagleModule(SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens) noexcept
+        // Number of paths is maxDecodingTokens = maxDecodingDraftTokens + 1 to account for very flat trees with
+        // depth 1.
+        : SpeculativeDecodingModule(maxDraftPathLen, maxDecodingDraftTokens, maxDecodingDraftTokens + 1)
     {
-        TLLM_CHECK(maxNumPaths * maxDraftPathLen == maxDecodingDraftTokens);
     }
 
     explicit EagleModule() noexcept
-        : EagleModule(0, 0, 0)
+        : EagleModule(0, 0)
     {
     }
+
+    [[nodiscard]] executor::EagleChoices const& getDefaultEagleChoices() const noexcept
+    {
+        return mDefaultEagleChoices;
+    }
+
+private:
+    // We use mc_sim_7b_63 from official Medusa implementation, i.e. one of the best trees with 63 nodes found for 7B
+    // Vicuna model. We use it as default, if no other are trees are specified per request or on the server level.
+    executor::EagleChoices mDefaultEagleChoices = {{0}, {0, 0}, {1}, {0, 1}, {2}, {0, 0, 0}, {1, 0}, {0, 2}, {3},
+        {0, 3}, {4}, {0, 4}, {2, 0}, {0, 5}, {0, 0, 1}, {5}, {0, 6}, {6}, {0, 7}, {0, 1, 0}, {1, 1}, {7}, {0, 8},
+        {0, 0, 2}, {3, 0}, {0, 9}, {8}, {9}, {1, 0, 0}, {0, 2, 0}, {1, 2}, {0, 0, 3}, {4, 0}, {2, 1}, {0, 0, 4},
+        {0, 0, 5}, {0, 0, 0, 0}, {0, 1, 1}, {0, 0, 6}, {0, 3, 0}, {5, 0}, {1, 3}, {0, 0, 7}, {0, 0, 8}, {0, 0, 9},
+        {6, 0}, {0, 4, 0}, {1, 4}, {7, 0}, {0, 1, 2}, {2, 0, 0}, {3, 1}, {2, 2}, {8, 0}, {0, 5, 0}, {1, 5}, {1, 0, 1},
+        {0, 2, 1}, {9, 0}, {0, 6, 0}, {0, 0, 0, 1}, {1, 6}, {0, 7, 0}};
 };
 } // namespace tensorrt_llm::runtime

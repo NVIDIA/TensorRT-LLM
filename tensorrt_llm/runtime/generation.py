@@ -593,7 +593,7 @@ class ModelConfig:
     lora_plugin: bool = False
     lora_target_modules: List[str] = field(default_factory=list)
     trtllm_modules_to_hf_modules: dict = None
-    skip_cross_qkv: bool = False
+    skip_cross_kv: bool = False
     num_medusa_heads: int = 0
     max_medusa_tokens: int = 0
     paged_state: bool = True
@@ -965,7 +965,8 @@ class GenerationSession(object):
 
             expected_tensor_names += [
                 'context_lengths', 'host_request_types',
-                'host_sink_token_length', 'host_runtime_perf_knobs'
+                'host_sink_token_length', 'host_runtime_perf_knobs',
+                'host_context_progress'
             ]
             expected_tensor_names += [f'host_max_attention_window_sizes']
             if model_config.remove_input_padding:
@@ -990,9 +991,9 @@ class GenerationSession(object):
                 'encoder_max_input_length',
                 'cross_kv_cache_gen',
             ]
-            self.skip_cross_qkv = model_config.skip_cross_qkv
-            if self.skip_cross_qkv:
-                expected_tensor_names += ['cross_qkv_reuse']
+            self.skip_cross_kv = model_config.skip_cross_kv
+            if self.skip_cross_kv:
+                expected_tensor_names += ['cross_kv_reuse']
 
         if self.mapping.tp_size > 1:
             expected_tensor_names += ['all_reduce_workspace']
@@ -1570,7 +1571,7 @@ class GenerationSession(object):
             self.beam_hyps_num_beams = None
             self.beam_hyps_is_done = None
 
-        self.cross_qkv_reuse = None
+        self.cross_kv_reuse = None
 
     def _tensor_dtype(self, name):
         # return torch dtype given tensor name for convenience
@@ -2018,6 +2019,7 @@ class GenerationSession(object):
         encoder_output: torch.Tensor = None,
         encoder_input_lengths: torch.Tensor = None,
         host_runtime_perf_knobs: torch.Tensor = None,
+        host_context_progress: torch.Tensor = None,
     ) -> Dict[str, RuntimeTensor]:
         tensors = {}
 
@@ -2043,6 +2045,7 @@ class GenerationSession(object):
                 add_tensor(context_lengths, 'context_lengths')
                 assert host_runtime_perf_knobs != None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
                 add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
+                add_tensor(host_context_progress, 'host_context_progress')
             add_tensor(cache_indirection, 'cache_indirection')
 
             if self.has_position_embedding:
@@ -2052,18 +2055,18 @@ class GenerationSession(object):
             # in context phase, need to generate cross kv cache, set to True
             add_tensor(torch.ones(1, dtype=torch.bool, device=self.device),
                        'cross_kv_cache_gen')
-            if self.skip_cross_qkv:
-                if self.cross_qkv_reuse is None:
+            if self.skip_cross_kv:
+                if self.cross_kv_reuse is None:
                     # see Attention's self.qkv output dim
-                    cross_qkv_out_dim = self.num_heads * self.head_size + (
-                        2 * self.get_num_heads_kv() * self.head_size)
-                    cross_qkv_shape = encoder_output.shape[:-1] + (
-                        cross_qkv_out_dim, )
-                    cross_qkv_reuse = torch.empty(cross_qkv_shape,
-                                                  dtype=encoder_output.dtype,
-                                                  device=encoder_output.device)
-                    self.cross_qkv_reuse = cross_qkv_reuse
-                add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
+                    cross_kv_out_dim = 2 * self.get_num_heads_kv(
+                    ) * self.head_size
+                    cross_kv_shape = encoder_output.shape[:-1] + (
+                        cross_kv_out_dim, )
+                    cross_kv_reuse = torch.empty(cross_kv_shape,
+                                                 dtype=encoder_output.dtype,
+                                                 device=encoder_output.device)
+                    self.cross_kv_reuse = cross_kv_reuse
+                add_tensor(self.cross_kv_reuse, 'cross_kv_reuse')
             add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
             add_tensor(self.buffer['encoder_max_input_length'],
@@ -2331,6 +2334,7 @@ class GenerationSession(object):
         encoder_output: torch.Tensor = None,
         encoder_input_lengths: torch.Tensor = None,
         host_runtime_perf_knobs: torch.Tensor = None,
+        host_context_progress: torch.Tensor = None,
     ):
         torch.cuda.nvtx.range_push("_get_next_step_shape_buffer")
         tensors = {}  # Dict[str, RuntimeTensor]
@@ -2352,6 +2356,7 @@ class GenerationSession(object):
                 add_tensor(context_lengths_local, 'context_lengths')
                 assert host_runtime_perf_knobs != None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
                 add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
+                add_tensor(host_context_progress, 'host_context_progress')
             add_tensor(cache_indirection, 'cache_indirection')
             if self.has_position_embedding:
                 add_tensor(position_ids, 'position_ids')
@@ -2396,10 +2401,10 @@ class GenerationSession(object):
         if self.cross_attention:
             if self.use_gpt_attention_plugin:
                 # disable (or minimize) cross qkv computation at generation phase
-                if self.skip_cross_qkv:
+                if self.skip_cross_kv:
                     # disable
                     encoder_output_shape = encoder_output.shape
-                    add_tensor(self.cross_qkv_reuse, 'cross_qkv_reuse')
+                    add_tensor(self.cross_kv_reuse, 'cross_kv_reuse')
                 else:
                     # minimize
                     # use TensorRT Empty Tensor to skip redundant computation
@@ -3301,6 +3306,7 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
             context_runtime_perf_knobs = model_inputs.get(
                 'host_runtime_perf_knobs', None)
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
 
             if self.paged_kv_cache and self.has_attn_layers:
                 host_kv_cache_block_offsets = self.pools_kv_cache_manager.get_block_offsets(
@@ -3332,6 +3338,7 @@ class GenerationSession(object):
                 encoder_output,
                 encoder_input_lengths,
                 host_runtime_perf_knobs=context_runtime_perf_knobs,
+                host_context_progress=host_context_progress,
             )
 
             context = self.runtime.ctx_context
@@ -3470,6 +3477,7 @@ class GenerationSession(object):
             attention_mask = model_inputs.get('attention_mask', None)
             gen_runtime_perf_knobs = model_inputs.get('host_runtime_perf_knobs',
                                                       None)
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
 
             # Prepare for the next step, and always allocate 1 token slot.
             if self.paged_kv_cache and self.has_attn_layers:
@@ -3546,6 +3554,7 @@ class GenerationSession(object):
                 encoder_output,
                 encoder_input_lengths,
                 host_runtime_perf_knobs=gen_runtime_perf_knobs,
+                host_context_progress=host_context_progress,
             )
 
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object

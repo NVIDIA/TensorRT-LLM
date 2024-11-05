@@ -25,6 +25,7 @@ import math
 import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import save_file
+from transformers import CLIPImageProcessor
 
 
 def add_multimodal_arguments(parser):
@@ -34,7 +35,7 @@ def add_multimodal_arguments(parser):
                         choices=[
                             'blip2', 'llava', 'llava_next', 'vila', 'nougat',
                             'cogvlm', 'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'mllama'
+                            'video-neva', 'phi-3-vision', 'mllama', 'internvl'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -100,6 +101,8 @@ class VisionEngineBuilder:
             build_phi_engine(args)
         elif args.model_type == 'mllama':
             build_mllama_engine(args)
+        elif args.model_type == 'internvl':
+            build_internvl_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -870,3 +873,65 @@ def build_mllama_engine(args):
         model_dtype,
         engine_name=f"{part_name}.engine",
     )
+
+
+def build_internvl_engine(args):
+    raw_image = Image.new('RGB', [10, 10])  # Dummy image
+    if 'InternVL2-26B' in args.model_path:
+        image_processor = AutoProcessor.from_pretrained(
+            'OpenGVLab/InternViT-6B-448px-V1-5')
+    else:
+        image_processor = CLIPImageProcessor.from_pretrained(
+            'OpenGVLab/InternViT-300M-448px')
+    image = image_processor(images=raw_image, return_tensors='pt').pixel_values
+    image = image.to(args.device, torch.float16)
+
+    class InternvlVisionWrapper(torch.nn.Module):
+
+        def __init__(self, model, downsample_ratio=0.5, layer_idx=-1):
+            super().__init__()
+            self.vision_model = model.vision_model
+            self.mlp1 = model.mlp1
+            self.downsample_ratio = downsample_ratio
+            self.layer_idx = layer_idx
+
+        def pixel_shuffle(self, x, scale_factor=0.5):
+            n, w, h, c = x.size()
+            # N, W, H, C --> N, W, H * scale, C // scale
+            x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+            # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+            x = x.permute(0, 2, 1, 3).contiguous()
+            # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+            x = x.view(n, int(h * scale_factor), int(w * scale_factor),
+                       int(c / (scale_factor * scale_factor)))
+
+            x = x.permute(0, 2, 1, 3).contiguous()
+            return x
+
+        def forward(self, image):
+            immde_res = self.vision_model(image, output_hidden_states=True)
+            vit_embeds = immde_res.hidden_states[self.layer_idx]
+            vit_embeds = vit_embeds[:, 1:, :]
+            h = w = int(vit_embeds.shape[1]**0.5)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+            vit_embeds_px = self.pixel_shuffle(
+                vit_embeds, scale_factor=self.downsample_ratio)
+            vit_embeds_px = vit_embeds_px.reshape(vit_embeds_px.shape[0], -1,
+                                                  vit_embeds_px.shape[-1])
+            vit_embeds_mlp = self.mlp1(vit_embeds_px)
+            return vit_embeds_mlp
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_path,
+                                                 torch_dtype=torch.float16,
+                                                 trust_remote_code=True,
+                                                 use_flash_attn=False).to(
+                                                     args.device)
+    max_num_crops = model.config.max_dynamic_patch
+    wrapper = InternvlVisionWrapper(model, model.config.downsample_ratio,
+                                    model.config.select_layer)
+
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_trt_engine(args.model_type,
+                     [image.shape[1], image.shape[2], image.shape[3]],
+                     f'{args.output_dir}/onnx', args.output_dir,
+                     args.max_batch_size * max_num_crops)

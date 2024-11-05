@@ -51,8 +51,10 @@ class TestCommunicationPlugin(unittest.TestCase):
             torch.full([10000000], i + 1, dtype=torch.float32, device="cuda")
             for i in range(self.world_size)
         ]
-        self.mapping = Mapping(self.world_size, self.rank, self.world_size,
-                               self.world_size)
+        self.mapping = Mapping(self.world_size,
+                               self.rank,
+                               self.world_size,
+                               tp_size=self.world_size)
 
     @parameterized.expand(list(
         product(["bfloat16", 'float16', "float32"], [

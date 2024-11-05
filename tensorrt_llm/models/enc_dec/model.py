@@ -309,7 +309,7 @@ class DecoderLayer(Module):
                  max_distance=0,
                  num_buckets=0,
                  fp16_clamping=False,
-                 skip_cross_qkv=False,
+                 skip_cross_kv=False,
                  use_implicit_relative_attention=False):
         super().__init__()
 
@@ -374,7 +374,7 @@ class DecoderLayer(Module):
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
-            skip_cross_qkv=skip_cross_qkv)
+            skip_cross_kv=skip_cross_kv)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                  eps=layernorm_eps,
@@ -413,7 +413,7 @@ class DecoderLayer(Module):
                 attention_params=None,
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_qkv_reuse: Optional[Tensor] = None):
+                cross_kv_reuse: Optional[Tensor] = None):
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -464,7 +464,7 @@ class DecoderLayer(Module):
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
             cross_kv_cache_gen=cross_kv_cache_gen,
-            cross_qkv_reuse=cross_qkv_reuse)
+            cross_kv_reuse=cross_kv_reuse)
 
         if use_cache:
             attention_output, presents_cross = attention_output
@@ -610,7 +610,7 @@ class EncoderModel(PretrainedModel):
         config.set_if_not_exist('encoder_num_kv_heads', None)
         config.set_if_not_exist('encoder_head_size', None)
         config.set_if_not_exist('model_type', 't5')
-        config.set_if_not_exist('skip_cross_qkv', False)
+        config.set_if_not_exist('skip_cross_kv', False)
         config.set_if_not_exist('mlp_type', MLPType.MLP)
         config.set_if_not_exist('has_embedding_scale', False)
         config.set_if_not_exist('residual_scaling', 1.0)
@@ -987,7 +987,7 @@ class DecoderModel(PretrainedModel):
                               == 'float16') and (self.config.model_type
                                                  in ['t5', 'pix2struct'])
 
-        self.skip_cross_qkv = self.config.skip_cross_qkv
+        self.skip_cross_kv = self.config.skip_cross_kv
         self.mlp_type = MLPType.MLP if not hasattr(
             self.config, "mlp_type") else self.config.mlp_type
         self.use_implicit_relative_attention = self.config.use_implicit_relative_attention if hasattr(
@@ -1034,7 +1034,7 @@ class DecoderModel(PretrainedModel):
                 max_distance=self.config.max_distance,
                 num_buckets=self.config.num_buckets,
                 fp16_clamping=self.fp16_clamping,
-                skip_cross_qkv=self.skip_cross_qkv,
+                skip_cross_kv=self.skip_cross_kv,
                 use_implicit_relative_attention=self.
                 use_implicit_relative_attention) for layer_idx in layers_range
         ])
@@ -1090,7 +1090,7 @@ class DecoderModel(PretrainedModel):
         config.set_if_not_exist('encoder_num_kv_heads', None)
         config.set_if_not_exist('encoder_head_size', None)
         config.set_if_not_exist('model_type', 't5')
-        config.set_if_not_exist('skip_cross_qkv', False)
+        config.set_if_not_exist('skip_cross_kv', False)
         config.set_if_not_exist('mlp_type', MLPType.MLP)
         config.set_if_not_exist('has_embedding_scale', False)
         config.set_if_not_exist('residual_scaling', 1.0)
@@ -1113,7 +1113,7 @@ class DecoderModel(PretrainedModel):
                 hidden_states=None,
                 lora_params: LoraParams = None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_qkv_reuse: Optional[Tensor] = None):
+                cross_kv_reuse: Optional[Tensor] = None):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
         else:
@@ -1173,7 +1173,7 @@ class DecoderModel(PretrainedModel):
                 attention_params=attention_params,
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
-                cross_qkv_reuse=cross_qkv_reuse)
+                cross_kv_reuse=cross_kv_reuse)
 
             if use_cache:
                 presents_self, presents_cross = hidden_states[1], hidden_states[
@@ -1303,6 +1303,7 @@ class DecoderModel(PretrainedModel):
         sequence_length = None
         host_past_key_value_lengths = None
         runtime_perf_knobs = None
+        context_progress = None
         attention_mask = None
         cross_attention_mask = None
         cross_attention_packed_mask = None
@@ -1470,6 +1471,12 @@ class DecoderModel(PretrainedModel):
                                         dim_range=OrderedDict([
                                             ('perf_knob_size', [16])
                                         ]))
+            context_progress = Tensor(name='host_context_progress',
+                                      dtype=trt.int64,
+                                      shape=[1],
+                                      dim_range=OrderedDict([
+                                          ('context_progress_size', [1])
+                                      ]))
 
         last_token_ids = None
         if self.mapping.is_last_pp_rank() and not gather_context_logits:
@@ -1825,7 +1832,8 @@ class DecoderModel(PretrainedModel):
                 host_request_types=host_request_types,
                 encoder_input_lengths=encoder_input_lengths,
                 encoder_max_input_length=encoder_max_input_length,
-                host_runtime_perf_knobs=runtime_perf_knobs)
+                host_runtime_perf_knobs=runtime_perf_knobs,
+                host_context_progress=context_progress)
 
         cross_kv_cache_gen = Tensor(name='cross_kv_cache_gen',
                                     dtype=trt.bool,
@@ -1833,30 +1841,30 @@ class DecoderModel(PretrainedModel):
                                     dim_range=OrderedDict([
                                         ('boolean', [1]),
                                     ]))
-        cross_qkv_reuse = None
+        cross_kv_reuse = None
         num_heads = (self.num_heads + self.mapping.tp_size -
                      1) // self.mapping.tp_size
-        cross_qkv_out_dim = num_heads * self.head_size + 2 * num_kv_heads * self.head_size
-        if self.skip_cross_qkv:
+        cross_kv_out_dim = 2 * num_kv_heads * self.head_size
+        if self.skip_cross_kv:
             if remove_input_padding:
-                cross_qkv_reuse = Tensor(
-                    name="cross_qkv_reuse",
+                cross_kv_reuse = Tensor(
+                    name="cross_kv_reuse",
                     dtype=self._dtype,
-                    shape=[-1, cross_qkv_out_dim],
+                    shape=[-1, cross_kv_out_dim],
                     dim_range=OrderedDict([
                         ("encoder_num_tokens", [encoder_num_tokens_range]),
-                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                        ("encoder_kv_size", [cross_kv_out_dim]),
                     ]),
                 )
             else:
-                cross_qkv_reuse = Tensor(
-                    name="cross_qkv_reuse",
+                cross_kv_reuse = Tensor(
+                    name="cross_kv_reuse",
                     dtype=self._dtype,
-                    shape=[-1, -1, cross_qkv_out_dim],
+                    shape=[-1, -1, cross_kv_out_dim],
                     dim_range=OrderedDict([
                         ("batch_size_beam_width_encoder", [bb_range]),
                         ("encoder_input_len", [encoder_input_len_range]),
-                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                        ("encoder_kv_size", [cross_kv_out_dim]),
                     ]),
                 )
 
@@ -1873,7 +1881,7 @@ class DecoderModel(PretrainedModel):
             'hidden_states': hidden_states,
             'lora_params': lora_params,
             'cross_kv_cache_gen': cross_kv_cache_gen,
-            'cross_qkv_reuse': cross_qkv_reuse,
+            'cross_kv_reuse': cross_kv_reuse,
         }
 
         return result

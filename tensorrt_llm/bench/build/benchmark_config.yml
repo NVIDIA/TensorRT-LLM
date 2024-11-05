@@ -131,6 +131,23 @@ mistralai/Mixtral-8x7B-v0.1: &mixtral_8x7b_0_1
     general:
       max_batch_size: 8192
       max_num_tokens: 8192
+mistralai/Mixtral-8x22B-v0.1: &mixtral_8x22b_0_1
+  tp8_pp1:
+    256:
+      max_batch_size: 8192
+      max_num_tokens: 16384
+    2176:
+      max_batch_size: 2048
+      max_num_tokens: 16384
+    4224:
+      max_batch_size: 1024
+      max_num_tokens: 2048
+    5500:
+      max_batch_size: 1024
+      max_num_tokens: 8192
+    general:
+      max_batch_size: 2048
+      max_num_tokens: 8192
 mistralai/Mistral-7B-v0.1:
   tp1_pp1:
     general:
@@ -141,3 +158,4 @@ meta-llama/Llama-3.1-8B-Instruct: *llama_3_1_8b
 meta-llama/Llama-3.1-70B-Instruct: *llama_3_1_70b
 meta-llama/Llama-3.1-405B-Instruct: *llama_3_1_405b
 mistralai/Mixtral-8x7B-Instruct-v0.1: *mixtral_8x7b_0_1
+mistralai/Mixtral-8x22B-Instruct-v0.1: *mixtral_8x22b_0_1

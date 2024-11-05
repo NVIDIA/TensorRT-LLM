@@ -246,6 +246,7 @@ class TestGPT(unittest.TestCase):
         perf_knob_tensor_size = 16
         context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
+        host_context_progress = torch.tensor([0], dtype=torch.int64)
 
         ctx_buffer = {
             'input_ids': ctx_ids,
@@ -257,6 +258,7 @@ class TestGPT(unittest.TestCase):
             'host_request_types': ctx_host_request_types,
             'cache_indirection': cache_indirections[0],
             'host_runtime_perf_knobs': context_runtime_perf_knobs,
+            'host_context_progress': host_context_progress,
         }
         ctx_shape = {k: v.shape for k, v in ctx_buffer.items()}
         for i in range(gpt_config.n_layer):
@@ -342,7 +344,8 @@ class TestGPT(unittest.TestCase):
             'last_token_ids': gen_last_token_ids.shape,
             'attention_mask': gen_attention_mask.shape,
             'cache_indirection': cache_indirections[1].shape,
-            'host_runtime_perf_knobs': gen_runtime_perf_knobs.shape
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs.shape,
+            'host_context_progress': host_context_progress.shape,
         }
         step1_buffer = {
             'input_ids': gen_id,
@@ -353,7 +356,8 @@ class TestGPT(unittest.TestCase):
             'last_token_ids': gen_last_token_ids.contiguous(),
             'attention_mask': gen_attention_mask.contiguous(),
             'cache_indirection': cache_indirections[1].contiguous(),
-            'host_runtime_perf_knobs': gen_runtime_perf_knobs
+            'host_runtime_perf_knobs': gen_runtime_perf_knobs,
+            'host_context_progress': host_context_progress,
         }
         for i in range(gpt_config.n_layer):
             shape = (batch_size, 2, gpt_config.n_head, seq_len,
@@ -580,6 +584,7 @@ class TestGPT(unittest.TestCase):
                        host_max_attention_window_sizes,
                        host_sink_token_length,
                        host_runtime_perf_knobs,
+                       host_context_progress,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -593,7 +598,8 @@ class TestGPT(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
-                'host_runtime_perf_knobs': host_runtime_perf_knobs
+                'host_runtime_perf_knobs': host_runtime_perf_knobs,
+                'host_context_progress': host_context_progress,
             }
 
             assert host_request_types is not None
@@ -702,6 +708,8 @@ class TestGPT(unittest.TestCase):
             if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 ctx_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.ctx_context,
                 input_ids=ctx_ids,
@@ -715,7 +723,8 @@ class TestGPT(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=ctx_runtime_perf_knobs)
+                host_runtime_perf_knobs=ctx_runtime_perf_knobs,
+                host_context_progress=host_context_progress)
 
             if gather_context_logits:
                 np.testing.assert_allclose(ref.cpu().numpy().flatten(),
@@ -782,6 +791,8 @@ class TestGPT(unittest.TestCase):
             if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.context_1,
                 input_ids=gen_ids,
@@ -795,7 +806,8 @@ class TestGPT(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=gen_runtime_perf_knobs)
+                host_runtime_perf_knobs=gen_runtime_perf_knobs,
+                host_context_progress=host_context_progress)
 
             np.testing.assert_allclose(ref.cpu().numpy().flatten(),
                                        res.cpu().numpy().flatten(),
@@ -874,6 +886,8 @@ class TestGPT(unittest.TestCase):
             if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
                 runtime_perf_knobs_tensor[1] = 1  # enable_context_fmha_fp32_acc
 
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.context_1,
                 input_ids=input_ids,
@@ -887,7 +901,8 @@ class TestGPT(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=runtime_perf_knobs_tensor)
+                host_runtime_perf_knobs=runtime_perf_knobs_tensor,
+                host_context_progress=host_context_progress)
 
             np.testing.assert_allclose(ref_out.cpu().numpy(),
                                        res.cpu().numpy(),
@@ -1047,7 +1062,8 @@ class TestGPT(unittest.TestCase):
             assert tensorrt_llm_gpt.transformer.layers[
                 layer_i].attention.position_embedding_type == PositionEmbeddingType.rope_gpt_neox
 
-    def test_gpt_variant_is_overridden(self):
+    @parameterized.expand(["other"], name_func=unittest_name_func)
+    def test_gpt_variant_is_overridden(self, test_partition):
         model_root = llm_models_root()
         if model_root is None:
             pytest.skip("Skipping since real weights are unavailable.")

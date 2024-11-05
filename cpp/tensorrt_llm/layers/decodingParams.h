@@ -187,6 +187,16 @@ public:
     nvinfer1::DataType dtype;   // [1], on cpu
 };
 
+class EagleSetupParams : public DecodingSetupParams
+{
+public:
+    std::optional<std::vector<float>> temperature; // [setupBatchSize] on cpu
+    // Hack to init some data for the context phase in the setup.
+    TensorPtr randomDataSample; // [maxBatchSize], on gpu
+    TensorPtr temperatures;     // [maxBatchSize], on gpu
+    nvinfer1::DataType dtype;   // [1], on cpu
+};
+
 class DynamicDecodeSetupParams : public BaseSetupParams
 {
 public:
@@ -442,6 +452,52 @@ public:
     }
 };
 
+// Explicit draft tokens inputs
+class EagleInputs : public DecodingInputs
+{
+public:
+    explicit EagleInputs(TensorConstPtr endIds, TensorConstPtr batchSlots, runtime::SizeType32 batchSize,
+        TensorConstPtr nextDraftTokens, TensorConstPtr nextDraftLens, TensorConstPtr nextDraftPaths,
+        TensorConstPtr lastDraftTokens, TensorConstPtr lastDraftLens, TensorConstPtr lastDraftPaths,
+        TensorConstPtr acceptedTokens, TensorConstPtr acceptedLens, TensorConstPtr acceptedPathIds,
+        TensorConstPtr seqSlots)
+        : DecodingInputs(std::move(endIds), std::move(batchSlots), 0, 0, batchSize)
+        , nextDraftTokens(nextDraftTokens)
+        , nextDraftLens(nextDraftLens)
+        , nextDraftPaths(nextDraftPaths)
+        , lastDraftTokens(lastDraftTokens)
+        , lastDraftLens(lastDraftLens)
+        , lastDraftPaths(lastDraftPaths)
+        , acceptedTokens(acceptedTokens)
+        , acceptedLens(acceptedLens)
+        , acceptedPathIds(acceptedPathIds)
+        , seqSlots(seqSlots)
+    {
+    }
+
+    //! Draft tokens for the next iteration.
+    TensorConstPtr nextDraftTokens; // [forwardBatchSize, maxDecodingDraftTokens], gpu
+    //! Number of the draft tokens for the next iteration.
+    TensorConstPtr nextDraftLens; // [forwardBatchSize], gpu
+    //! Draft paths for the next iteration.
+    TensorConstPtr nextDraftPaths; // [forwardBatchSize, maxDecodingTokens, maxPathLen], gpu
+    //! Same as `nextDraftTokens`, but for current iteration.
+    TensorConstPtr lastDraftTokens; // [forwardBatchSize, maxNumPaths, maxPathLen], gpu
+    //! Number of the draft tokens input to the previous TRT iteration.
+    TensorConstPtr lastDraftLens; // [forwardBatchSize], gpu
+    //! Same as `nextDraftPaths`, but for current iteration.
+    TensorConstPtr lastDraftPaths; // [forwardBatchSize, maxDecodingTokens, maxPathLen], gpu
+
+    //! Lastly accepted tokens (including golden token).
+    TensorConstPtr acceptedTokens; // [forwardBatchSize, maxPathLen]
+    //! Number of accepted tokens (at least 1).
+    TensorConstPtr acceptedLens; // [forwardBatchSize]
+    //! Ids of the accepted path.
+    TensorConstPtr acceptedPathIds; // [forwardBatchSize]
+
+    TensorConstPtr seqSlots;        // [forwardBatchSize], on gpu
+};
+
 class BaseDecodingOutputs
 {
 public:
@@ -615,6 +671,37 @@ public:
     TensorPtr generationLengthsHost; // [maxBatchSize] on pinned
     //! Maximum number of generated tokens for the next step across whole batch
     TensorPtr maxGenLengthHost; // [1] on pinned
+};
+
+class EagleOutputs : public SpeculativeDecodingOutputs
+{
+public:
+    explicit EagleOutputs(TensorPtr outputIds)
+        : SpeculativeDecodingOutputs{std::move(outputIds)}
+    {
+    }
+
+    //! Draft paths for the next iteration.
+    TensorPtr nextDraftPaths; // [maxBatchSize, maxDecodingTokens, maxPathLen]
+    //! Randomly sampled data (between 0.f and 1.f)
+    TensorPtr randomDataSample; // [maxBatchSize] on gpu
+    //! Randomly sampled data (between 0.f and 1.f)
+    TensorPtr randomDataValidation; // [maxBatchSize] on gpu
+    //! Sampling temperature.
+    TensorPtr temperatures; // [maxBatchSize] on gpu
+
+    //! Request types for ctx stage of the EagleNet0 (filled with 0s).
+    TensorPtr eagleNetCtxRequestTypesHost; //! [maxBatchSize]
+    //! Context lengths of the context EagleNet0.
+    TensorPtr eagleNetCtxContextLengthsHost; //! [maxBatchSize]
+    //! Past kv lengths of the context EagleNet0.
+    TensorPtr eagleNetCtxPastKeyValueLengthsHost; //! [maxBatchSize]
+    //! Request types for ctx stage of the EagleNetX (filled with 1s).
+    TensorPtr eagleNetGenRequestTypesHost; //! [maxBatchSize]
+    //! Context lengths of the generation EagleNetX.
+    TensorPtr eagleNetGenContextLengthsHost; //! [maxBatchSize]
+    //! Past kv lengths of the generation EagleNetX.
+    TensorPtr eagleNetGenPastKeyValueLengthsHost; //! [maxBatchSize]
 };
 
 } // namespace tensorrt_llm::layers

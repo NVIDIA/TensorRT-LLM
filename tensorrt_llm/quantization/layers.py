@@ -380,6 +380,7 @@ class Fp8RowwiseRmsNorm(Module):
             self.bias = Parameter(shape=self.normalized_shape, dtype=dtype)
         else:
             self.register_parameter('bias', None)
+
         if clamp_val:
             if not (isinstance(clamp_val, list) and len(clamp_val) == 2):
                 raise ValueError(f'unsupported clamp_val {clamp_val}')
@@ -388,7 +389,6 @@ class Fp8RowwiseRmsNorm(Module):
                                        is_buffer=True)
         else:
             self.register_parameter('clamp_val', None)
-        self.register_parameter('scale_to_int', None)
 
         self.eps = eps
         self.dtype = dtype
@@ -397,14 +397,15 @@ class Fp8RowwiseRmsNorm(Module):
     def forward(self, x):
         weight = None if self.weight is None else self.weight.value
         bias = None if self.bias is None else self.bias.value
-        scale = None if self.scale_to_int is None else self.scale_to_int.value
+        scale = None
+        clamp_val = None if self.clamp_val is None else self.clamp_val.value
         return fp8_rowwise_rms_norm(
             x,
             self.normalized_shape,
             weight,
             bias,
             scale,
-            self.clamp_val.value,
+            clamp_val,
             self.eps,
             dynamic_act_scaling=self.quant_mode.has_fp8_rowwise())
 
@@ -441,9 +442,7 @@ class Fp8RowwiseLinear(Linear):
                                 dtype=weights_dtype)
 
         if quant_mode.has_fp8_rowwise():
-            scale_shape = (
-                self.out_features, ) if quant_mode.has_fp8_rowwise() else (1, )
-            self.per_channel_scale = Parameter(shape=scale_shape,
+            self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                                dtype="float32")
 
         self.quant_mode = quant_mode
@@ -467,6 +466,8 @@ class Fp8RowwiseLinear(Linear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
+        if "per_channel_scale" in tllm_key:
+            return {}
         return postprocess_fp8_rowwise(tllm_key, weights, **kwargs)
 
 
@@ -502,9 +503,7 @@ class Fp8RowwiseRowLinear(RowLinear):
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=weights_dtype)
         if quant_mode.has_fp8_rowwise():
-            scale_shape = (
-                self.out_features, ) if quant_mode.has_fp8_rowwise() else (1, )
-            self.per_channel_scale = Parameter(shape=scale_shape,
+            self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                                dtype="float32")
 
         self.quant_mode = quant_mode
@@ -539,6 +538,8 @@ class Fp8RowwiseRowLinear(RowLinear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
+        if "per_channel_scale" in tllm_key:
+            return {}
         return postprocess_fp8_rowwise(tllm_key, weights, **kwargs)
 
 
@@ -1488,15 +1489,14 @@ class Fp8RowwiseMLP(Module):
                                         tp_size=tp_size,
                                         quant_mode=quant_mode)
 
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
         self.hidden_act = hidden_act
-        self.quant_mode = quant_mode
+        self.bias = bias
         self.dtype = dtype
-
-        if self.quant_mode.has_act_static_scaling():
-            self.quantization_scaling_factor = Parameter(shape=(1, ),
-                                                         dtype='float32')
-        else:
-            self.register_parameter('quantization_scaling_factor', None)
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.quant_mode = quant_mode
 
         if clamp_val:
             if not (isinstance(clamp_val, list) and len(clamp_val) == 2):
@@ -1508,16 +1508,14 @@ class Fp8RowwiseMLP(Module):
             self.register_parameter('clamp_val', None)
 
     def forward(self, hidden_states, lora_layer_params=None):
-        assert lora_layer_params is None, "lora is not supported on Fp8RowwiseMLP now"
+        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         if self.quant_mode.has_fp8_rowwise():
             # Quantize per token outputs tuple:
             # quantized tensor and scaling factors per token
-            if hasattr(self.clamp_val, "val"):
-                inter = quantize_fp8_per_token(inter, self.clamp_val.val)
-            else:
-                inter = quantize_fp8_per_token(inter)
+            clamp_val = None if self.clamp_val is None else self.clamp_val.value
+            inter = quantize_fp8_per_token(inter, clamp_val)
         output = self.proj(inter)
         return output
 
@@ -1557,14 +1555,8 @@ class Fp8RowwiseGatedMLP(Fp8RowwiseMLP):
                                            gather_output=False,
                                            quant_mode=quant_mode)
 
-        if self.quant_mode.has_act_static_scaling():
-            self.quantization_scaling_factor = Parameter(shape=(1, ),
-                                                         dtype='float32')
-        else:
-            self.register_parameter('quantization_scaling_factor', None)
-
     def forward(self, hidden_states, lora_layer_params=None):
-        assert lora_layer_params is None, "lora is not supported on Fp8RowwiseGatedMLP now"
+        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
@@ -1572,10 +1564,336 @@ class Fp8RowwiseGatedMLP(Fp8RowwiseMLP):
         if self.quant_mode.has_fp8_rowwise():
             # Quantize per token outputs tuple:
             # quantized tensor and scaling factors per token
-            inter_x_gate = quantize_fp8_per_token(inter_x_gate,
-                                                  self.clamp_val.value)
+            clamp_val = None if self.clamp_val is None else self.clamp_val.value
+            inter_x_gate = quantize_fp8_per_token(inter_x_gate, clamp_val)
         output = self.proj(inter_x_gate)
         return output
+
+
+class Fp8RowwiseFusedGatedMLP(Module):
+
+    def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            hidden_act,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+            clamp_val=None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.hidden_act = hidden_act
+        self.bias = bias
+        self.dtype = dtype
+        self.tp_group = tp_group
+        self.tp_size = tp_size
+        self.quant_mode = quant_mode
+
+        self.fused_fc = Fp8RowwiseColumnLinear(hidden_size,
+                                               ffn_hidden_size * 2,
+                                               bias=bias,
+                                               dtype=dtype,
+                                               tp_group=tp_group,
+                                               tp_size=tp_size,
+                                               gather_output=False,
+                                               quant_mode=quant_mode)
+
+        self.proj = Fp8RowwiseRowLinear(ffn_hidden_size,
+                                        hidden_size,
+                                        bias=bias,
+                                        dtype=dtype,
+                                        tp_group=tp_group,
+                                        tp_size=tp_size,
+                                        quant_mode=quant_mode)
+
+        if clamp_val:
+            if not (isinstance(clamp_val, list) and len(clamp_val) == 2):
+                raise ValueError(f'unsupported clamp_val {clamp_val}')
+            self.clamp_val = Parameter(np.array(clamp_val, dtype=np.float32),
+                                       dtype='float32',
+                                       is_buffer=True)
+        else:
+            self.register_parameter('clamp_val', None)
+
+    def forward(self, hidden_states, lora_layer_params=None):
+        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
+        inter = self.fused_fc(hidden_states)
+
+        if self.hidden_act == 'silu':
+            inter = ACT2FN['swiglu'](inter)
+        elif self.hidden_act == 'gelu':
+            inter = ACT2FN['geglu'](inter)
+        else:
+            raise NotImplementedError(
+                f"Activation {self.hidden_act} not yet implemented for {self.__class__.__name__}."
+            )
+
+        if self.quant_mode.has_fp8_rowwise():
+            # Quantize per token outputs tuple:
+            # quantized tensor and scaling factors per token
+            clamp_val = None if self.clamp_val is None else self.clamp_val.value
+            inter = quantize_fp8_per_token(inter, clamp_val)
+        output = self.proj(inter)
+        return output
+
+
+class Fp8RowwiseAttention(Module):
+
+    def __init__(self,
+                 *,
+                 local_layer_idx,
+                 hidden_size,
+                 num_attention_heads,
+                 num_kv_heads=None,
+                 max_position_embeddings=1024,
+                 num_layers=1,
+                 apply_query_key_layer_scaling=False,
+                 attention_head_size=None,
+                 attention_mask_type=AttentionMaskType.padding,
+                 bias=True,
+                 dense_bias=None,
+                 dtype=None,
+                 position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 rotary_embedding_base=10000.0,
+                 rotary_embedding_scaling=None,
+                 rotary_embedding_percentage=1.0,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 scale_alibi_bias=False,
+                 paged_kv_cache=False,
+                 quant_mode=QuantMode(0),
+                 clamp_val=None,
+                 layer_idx_in_cache_pool=None):
+        super().__init__()
+        self.local_layer_idx = local_layer_idx
+        self.attention_mask_type = attention_mask_type
+        self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
+        self.num_attention_heads = num_attention_heads // tp_size
+        self.num_attention_kv_heads = (
+            num_kv_heads + tp_size - 1
+        ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
+        self.hidden_size = hidden_size // tp_size
+        self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.dense_bias = dense_bias
+        if dense_bias is None:
+            self.dense_bias = bias
+
+        self.num_layers = num_layers
+        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        self.norm_factor = math.sqrt(self.attention_head_size)
+        self.q_scaling = 1
+        if self.apply_query_key_layer_scaling:
+            self.norm_factor *= self.num_layers
+            self.q_scaling *= self.num_layers
+        # Whether to scale ALiBi bias. Mathematically, it's equivalent to
+        # normalizing QK after adding bias.
+        #   - False, inv_sqrt_Dh * Q*K^T + alibi_bias
+        #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
+        self.scale_alibi_bias = scale_alibi_bias
+
+        self.position_embedding_type = position_embedding_type
+        self.paged_kv_cache = paged_kv_cache
+
+        self.rotary_embedding_base = rotary_embedding_base
+        self.rotary_embedding_scale_type = RotaryScalingType.none
+        self.rotary_embedding_scale = 1.0
+        self.rotary_embedding_dim = 0
+
+        if rotary_embedding_scaling is not None:
+            rotary_scaling_type = rotary_embedding_scaling.get(
+                "type", rotary_embedding_scaling.get("rope_type"))
+            self.rotary_embedding_scale_type = RotaryScalingType.from_string(
+                rotary_scaling_type)
+            self.rotary_embedding_scale = rotary_embedding_scaling.get(
+                "factor", 1.0)
+
+        if self.position_embedding_type.is_rope():
+            self.rotary_embedding_dim = int(self.attention_head_size *
+                                            rotary_embedding_percentage)
+        elif self.position_embedding_type.is_alibi():
+            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
+            alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
+                                                 self.tp_size,
+                                                 tp_size=self.tp_size,
+                                                 tp_rank=self.tp_rank,
+                                                 alibi_scale=alibi_scale)
+            self.register_parameter(
+                'alibi_slopes',
+                Parameter(alibi_slopes, dtype='float32', is_buffer=True))
+
+        self.quant_mode = quant_mode
+        self.dtype = dtype
+
+        self.register_parameter('kv_cache_scaling_factor', None)
+
+        self.qkv = Fp8RowwiseColumnLinear(
+            hidden_size,
+            tp_size * self.num_attention_heads * self.attention_head_size +
+            (2 * tp_size * self.num_attention_kv_heads *
+             self.attention_head_size),
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            gather_output=False,
+            quant_mode=quant_mode)
+
+        self.dense = Fp8RowwiseRowLinear(tp_size * self.num_attention_heads *
+                                         self.attention_head_size,
+                                         hidden_size,
+                                         bias=self.dense_bias,
+                                         dtype=dtype,
+                                         tp_group=tp_group,
+                                         tp_size=tp_size,
+                                         quant_mode=quant_mode)
+
+        if clamp_val:
+            if not (isinstance(clamp_val, list) and len(clamp_val) == 2):
+                raise ValueError(f'unsupported clamp_val {clamp_val}')
+            self.clamp_val = Parameter(np.array(clamp_val, dtype=np.float32),
+                                       dtype='float32',
+                                       is_buffer=True)
+        else:
+            self.register_parameter('clamp_val', None)
+
+        self.use_lora = False
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask=None,
+        use_cache=False,
+        kv_cache_params=None,
+        attention_params=None,
+        spec_decoding_params=None,
+        encoder_output=None,
+        position_embedding=None,
+        norm_before_bmm1=False,
+        lora_layer_params=None,
+        reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+    ):
+        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
+        qkv = self.qkv(hidden_states)
+
+        alibi_slopes = None
+        if self.position_embedding_type == PositionEmbeddingType.alibi:
+            alibi_slopes = self.alibi_slopes.value
+            dtype = trt.float32
+            if default_net().plugin_config.gpt_attention_plugin or default_net(
+            ).plugin_config.inflight_batching_gpt_attention_plugin:
+                dtype = hidden_states.dtype if self.quant_mode.has_act_static_scaling(
+                ) else hidden_states[0].dtype
+                if dtype == trt.int8:
+                    dtype = trt.float16
+            alibi_slopes = cast(alibi_slopes, dtype)
+
+        if spec_decoding_params is None:
+            spec_decoding_params = SpecDecodingParams()
+
+        assert default_net().plugin_config.gpt_attention_plugin
+
+        assert attention_params.is_valid(
+            default_net().plugin_config.gpt_attention_plugin,
+            default_net().plugin_config.remove_input_padding, use_cache)
+        if use_cache:
+            assert kv_cache_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin)
+        assert self.attention_mask_type == AttentionMaskType.causal, \
+            'Plugin only support masked MHA.'
+        if self.kv_cache_scaling_factor is not None:
+            kv_orig_quant_scale = constant(fp32_array(
+                [1.0])) / self.kv_cache_scaling_factor.value
+            kv_quant_orig_scale = self.kv_cache_scaling_factor.value
+        else:
+            kv_orig_quant_scale = None
+            kv_quant_orig_scale = None
+        if self.position_embedding_type.is_rope():
+            rotary_inv_freq = attention_params.rotary_inv_freq
+            rotary_cos_sin = attention_params.embed_positions_for_gpt_attention
+        else:
+            rotary_inv_freq = None
+            rotary_cos_sin = None
+        context, past_key_value = gpt_attention(
+            qkv=qkv,
+            past_key_value=kv_cache_params.get_first_past_key_value(),
+            sequence_length=attention_params.sequence_length,
+            host_past_key_value_lengths=kv_cache_params.
+            host_past_key_value_lengths,
+            host_max_attention_window_sizes=kv_cache_params.
+            host_max_attention_window_sizes,
+            host_sink_token_length=kv_cache_params.host_sink_token_length,
+            context_lengths=attention_params.context_lengths,
+            cache_indirection=kv_cache_params.cache_indirection,
+            host_request_types=attention_params.host_request_types,
+            layer_idx=self.local_layer_idx,
+            num_heads=self.num_attention_heads,
+            num_kv_heads=self.num_attention_kv_heads,
+            layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
+            hidden_size_per_head=self.attention_head_size,
+            q_scaling=self.q_scaling,
+            rotary_embedding_dim=self.rotary_embedding_dim,
+            rotary_embedding_base=self.rotary_embedding_base,
+            rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+            rotary_embedding_scale=self.rotary_embedding_scale,
+            rotary_embedding_max_positions=self.max_position_embeddings,
+            position_embedding_type=self.position_embedding_type,
+            rotary_inv_freq=rotary_inv_freq,
+            rotary_cos_sin=rotary_cos_sin,
+            kv_orig_quant_scale=kv_orig_quant_scale,
+            kv_quant_orig_scale=kv_quant_orig_scale,
+            kv_cache_quant_mode=self.quant_mode,
+            max_context_length=attention_params.max_context_length,
+            alibi_slopes=alibi_slopes,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
+            host_kv_cache_block_offsets=kv_cache_params.
+            host_kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=kv_cache_params.
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=kv_cache_params.
+            host_kv_cache_pool_mapping,
+            host_context_lengths=attention_params.host_context_lengths,
+            use_cache=use_cache,
+            spec_decoding_generation_lengths=spec_decoding_params.
+            spec_decoding_generation_lengths,
+            spec_decoding_position_offsets=spec_decoding_params.
+            spec_decoding_position_offsets,
+            spec_decoding_packed_mask=spec_decoding_params.
+            spec_decoding_packed_mask,
+            host_runtime_perf_knobs=attention_params.host_runtime_perf_knobs,
+            host_context_progress=attention_params.host_context_progress)
+
+        if self.quant_mode.has_fp8_rowwise():
+            # Quantize per token outputs tuple:
+            # quantized tensor and scaling factors per token
+            clamp_val = None if self.clamp_val is None else self.clamp_val.value
+            context = quantize_fp8_per_token(context, clamp_val)
+
+        context = self.dense(
+            context,
+            reduce_fusion_params=reduce_fusion_params,
+        )
+
+        if use_cache:
+            return (context, past_key_value)
+
+        return context
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        if tllm_key.endswith("kv_cache_scaling_factor") and weights is None:
+            return {tllm_key: torch.ones(1, )}
+        else:
+            return {tllm_key: weights}
 
 
 class SmoothQuantGatedMLP(SmoothQuantMLP):
@@ -1618,7 +1936,7 @@ class SmoothQuantGatedMLP(SmoothQuantMLP):
             self.register_parameter('quantization_scaling_factor', None)
 
     def forward(self, hidden_states, lora_layer_params=None):
-        assert lora_layer_params is None, "lora is not supported on SmoothQuantGatedMLP now"
+        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
         inter = self.fc(hidden_states)
         inter = ACT2FN[self.hidden_act](inter)
         gate = self.gate(hidden_states)
@@ -1780,7 +2098,7 @@ class SmoothQuantAttention(Module):
         lora_layer_params=None,
         reduce_fusion_params: Optional[AllReduceFusionParams] = None,
     ):
-        assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
+        assert lora_layer_params is None, f"lora is not supported on {self.__class__.__name__} now"
         qkv = self.qkv(hidden_states)
 
         alibi_slopes = None
@@ -1869,7 +2187,9 @@ class SmoothQuantAttention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
-                host_runtime_perf_knobs=attention_params.host_runtime_perf_knobs
+                host_runtime_perf_knobs=attention_params.
+                host_runtime_perf_knobs,
+                host_context_progress=attention_params.host_context_progress,
             )
         else:
             assert self.paged_kv_cache == False

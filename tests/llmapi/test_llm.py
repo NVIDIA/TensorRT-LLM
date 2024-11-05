@@ -19,17 +19,16 @@ from tensorrt_llm.executor import (ExecutorBindingsWorker, GenerationRequest,
                                    GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, KvCacheConfig,
-                                 SamplingParams)
+                                 NoStatsAvailable, SamplingParams)
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_less_than_40gb_memory
-
-from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
 # There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
@@ -356,7 +355,7 @@ def _test_llm_generate_async(model_name=default_model_name,
         kv_cache_config=global_kvcache_config,
         tensor_parallel_size=tp_size,
         auto_parallel=use_auto_parallel,
-        world_size=world_size,
+        auto_parallel_world_size=world_size,
     )
 
     sampling_params = SamplingParams(max_tokens=6)
@@ -431,6 +430,9 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_future(streaming=False)
     test_future_async()
     test_non_streaming_usage_wait()
+
+    del llm
+    release_gc()
 
 
 @pytest.fixture(scope="module")
@@ -582,7 +584,8 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
     for output in llm.generate(prompts, sampling_params=sampling_params):
         if gather_context_logits:
             assert output.context_logits is not None
-            assert len(prompts[0].split()) + 1 == output.context_logits.shape[0]
+            assert len(prompts[0].split()) + \
+                1 == output.context_logits.shape[0]
         if gather_generation_logits:
             assert output.outputs[0].generation_logits is not None
             assert sampling_params.max_tokens == output.outputs[
@@ -1108,7 +1111,7 @@ def test_executor_process_background_error():
 
     # test in streaming mode
     async def task():
-        with pytest.raises(RequestError):
+        with pytest.raises(DummyError):
             async for output in llm.generate_async(
                     prompts[0], streaming=True,
                     sampling_params=sampling_params):
@@ -1175,6 +1178,7 @@ def test_llm_return_generation_logits():
 
 
 class DummyExecutorWorker3(ExecutorBindingsWorker):
+    should_raise_error = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1182,8 +1186,12 @@ class DummyExecutorWorker3(ExecutorBindingsWorker):
         self.counter = 0
 
     def _engine_response_callback(self, response: tllm.Response):
-        return tllm.Response(request_id=response.request_id,
-                             error_msg="Test error")
+        if DummyExecutorWorker3.should_raise_error:
+            DummyExecutorWorker3.should_raise_error = False
+            return tllm.Response(request_id=response.request_id,
+                                 error_msg="Test error")
+        else:
+            return response
 
 
 DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
@@ -1197,28 +1205,91 @@ def test_llm_handling_per_requeust_error():
     # The dummy executor will delay the responses
     sampling_params = SamplingParams(max_tokens=6)
 
-    # test in streaming mode
-    async def task():
-        with pytest.raises(RequestError):
-            # 10 requests, each request will get error, while the whole LLM instance is still alive
-            for i in range(10):
-                async for output in llm.generate_async(
-                        prompts[0], streaming=True,
-                        sampling_params=sampling_params):
-                    print(output)
-
-    asyncio.run(task())
-
     def batch_task():
+        DummyExecutorWorker3.should_raise_error = True
         with pytest.raises(RequestError):
             for output in llm.generate(prompts,
                                        sampling_params=sampling_params):
                 print(output)
 
+        for output in llm.generate(prompts, sampling_params=sampling_params):
+            print(output)
+
     batch_task()
 
 
-# TODO[chunweiy]: Add test for loading inmemory model
+def test_llm_handling_per_requeust_error_async():
+    llm = LLM(model=llama_model_path,
+              executor_cls=DummyExecutor3,
+              kv_cache_config=global_kvcache_config)
+    # The dummy executor will delay the responses
+    sampling_params = SamplingParams(max_tokens=6)
+
+    # test in streaming mode
+    async def task():
+        # 10 requests, each request will get error, while the whole LLM instance is still alive
+        with pytest.raises(RequestError):
+            DummyExecutorWorker3.should_raise_error = True
+            async for output in llm.generate_async(
+                    prompts[0], streaming=True,
+                    sampling_params=sampling_params):
+                print(output)
+
+        DummyExecutorWorker3.should_raise_error = False
+        async for output in llm.generate_async(prompts[0],
+                                               streaming=True,
+                                               sampling_params=sampling_params):
+            print(output)
+
+    asyncio.run(task())
+
+
+def test_llm_get_stats(tp_size: int = 1):
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              tensor_parallel_size=tp_size,
+              fast_build=True)
+    sampling_params = SamplingParams(max_tokens=100)
+
+    for output in llm.generate(prompts, sampling_params=sampling_params):
+        print(output)
+
+    while True:
+        try:
+            stats = llm._get_stats(2)
+            print(stats)
+        except NoStatsAvailable:
+            break
+
+
+def test_llm_get_stats_async(tp_size: int = 1):
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              tensor_parallel_size=tp_size,
+              fast_build=True)
+    sampling_params = SamplingParams(max_tokens=6)
+
+    async def task0():
+        async for output in llm.generate_async(prompts[0],
+                                               streaming=True,
+                                               sampling_params=sampling_params):
+            print(output)
+
+    async def task1():
+        while True:
+            try:
+                stats = await llm._get_stats_async(2)
+                print(stats)
+            except NoStatsAvailable:
+                break
+
+    async def main():
+        await asyncio.gather(task0(), task1())
+
+    asyncio.run(main())
+
 
 if __name__ == '__main__':
-    test_executor_process_background_error()
+    #test_llm_get_stats()
+    #test_llm_get_stats_async()
+    test_executor_pending_requests()

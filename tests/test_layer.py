@@ -898,6 +898,9 @@ class TestLayer(unittest.TestCase):
                                                           perf_knob_tensor_size,
                                                           dtype=torch.int64,
                                                           device='cpu')
+            host_context_progress = torch.tensor([0],
+                                                 dtype=torch.int64,
+                                                 device='cpu')
 
         q_weight = torch.empty(size=[hidden_size, hidden_size],
                                dtype=torch_dtype)
@@ -963,6 +966,10 @@ class TestLayer(unittest.TestCase):
                     name='host_runtime_perf_knobs',
                     shape=[16],
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_context_progress_tensor = Tensor(
+                    name='host_context_progress',
+                    shape=[1],
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
 
             mask_type = tensorrt_llm.layers.AttentionMaskType.padding
             if causal_mask:
@@ -999,7 +1006,8 @@ class TestLayer(unittest.TestCase):
                         context_lengths=context_lengths_tensor,
                         host_request_types=host_request_types_tensor,
                         max_context_length=seq_len,
-                        host_runtime_perf_knobs=host_runtime_perf_knobs))
+                        host_runtime_perf_knobs=host_runtime_perf_knobs,
+                        host_context_progress=host_context_progress_tensor))
                 assert isinstance(output, Tensor)
                 output = output
                 present_key_value.mark_output(
@@ -1043,7 +1051,8 @@ class TestLayer(unittest.TestCase):
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection,
-                'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor
+                'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor,
+                'host_context_progress': host_context_progress
             }
             outputs = {
                 'output':

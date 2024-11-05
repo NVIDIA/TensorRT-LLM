@@ -281,7 +281,7 @@ class MultimodalModelRunner:
                 use_fast=False,
                 use_legacy=False)
         else:
-            use_fast = False if self.model_type != "phi-3-vision" else True
+            use_fast = self.model_type in ["phi-3-vision", "internvl"]
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.hf_model_dir, use_fast=use_fast, use_legacy=False)
 
@@ -411,9 +411,12 @@ class MultimodalModelRunner:
         if not warmup:
             profiler.start("Vision")
 
-        visual_features, visual_atts = self.get_visual_features(
-            torch.stack(image['image_patches'], dim=0)
-            if self.model_type == 'fuyu' else image, other_vision_inputs)
+        if image is not None:
+            visual_features, visual_atts = self.get_visual_features(
+                torch.stack(image['image_patches'], dim=0)
+                if self.model_type == 'fuyu' else image, other_vision_inputs)
+        else:
+            visual_features, visual_atts = None, None
 
         if not warmup:
             profiler.stop("Vision")
@@ -522,6 +525,9 @@ class MultimodalModelRunner:
                 if self.model_type == 'video-neva':
                     length = pre_input_ids.shape[1] + post_input_ids.shape[
                         1] + visual_atts.shape[2] * visual_atts.shape[1]
+                elif self.model_type == 'internvl':
+                    length = pre_input_ids.shape[1] + post_input_ids.shape[
+                        1] + visual_atts.shape[0] * visual_atts.shape[1]
                 else:
                     length = pre_input_ids.shape[1] + post_input_ids.shape[
                         1] + visual_atts.shape[1]
@@ -667,6 +673,21 @@ class MultimodalModelRunner:
                 output_sequence_lengths=False,
                 return_dict=False)
         elif self.model_type == "mllama":
+            # When image is passed:
+            # the shape of visual_features is [bs, 1, 4, 1025, hidden_size]
+            # the shape of cross_attention_mask is [bs, decode_input_len, 1, 4]
+            # When image is None, create dummy visual_features and cross_attention_mask
+            if visual_features is None:
+                visual_features = torch.zeros([
+                    self.args.batch_size, 1, 4, 1, self.model_config.hidden_size
+                ],
+                                              dtype=torch.bfloat16,
+                                              device=self.device)
+                dummy_cross_attention_mask = torch.zeros(
+                    [self.args.batch_size, input_ids.shape[1], 1, 4],
+                    dtype=bool,
+                    device=self.device)
+
             visual_features = visual_features.to(torch.bfloat16).chunk(
                 self.args.batch_size, dim=0)
             encoder_input_features = []
@@ -682,13 +703,16 @@ class MultimodalModelRunner:
                     [encoder_max_input_length]).to(visual_feature.device)
 
                 # prepare cross_attention_mask of context phase
-                cross_attention_mask = other_decoder_inputs[
-                    'cross_attention_mask']
-                batch_size, text_total_length, *_ = cross_attention_mask.shape
+                if 'cross_attention_mask' in other_decoder_inputs:
+                    cross_attention_mask = other_decoder_inputs[
+                        'cross_attention_mask'][batch_idx]
+                else:
+                    cross_attention_mask = dummy_cross_attention_mask[batch_idx]
+                text_total_length, *_ = cross_attention_mask.shape
                 cross_attention_mask = cross_attention_mask.repeat_interleave(
-                    num_vision_tokens, dim=3)
+                    num_vision_tokens, dim=2)
                 cross_attention_mask = cross_attention_mask.view(
-                    batch_size, text_total_length, -1)
+                    text_total_length, -1)
                 cross_attention_mask = cross_attention_mask.unsqueeze(1)
                 cross_attention_mask = cross_attention_mask.to(
                     visual_feature.device).to(torch.bool).reshape(
@@ -883,22 +907,27 @@ class MultimodalModelRunner:
             visual_features = visual_features.view(visual_features.shape[0], -1,
                                                    visual_features.shape[-1])
 
-        if self.use_py_session:
-            # Non-IFB Mode(used in python session): All requests in a batch have their prompt_table concatenated in
-            # a shape of (bs*vision_embedding_len, vision_hidden). So only one fake_prompt_id is needed for the
-            # entire batch, with values from 0 to bs * vision_embedding_len-1.
-            fake_prompt_id = torch.arange(
-                self.model_config.vocab_size, self.model_config.vocab_size +
-                visual_features.shape[0] * visual_features.shape[1])
-            fake_prompt_id = fake_prompt_id.reshape(visual_features.shape[0],
-                                                    visual_features.shape[1])
-        else:
-            # IFB Mode(used in c++ session): Each request's prompt_table is independent and requires a fake_prompt_id
-            # for each request, with values ranging from 0 to vision_embedding_len-1.
-            fake_prompt_id = torch.arange(
-                self.model_config.vocab_size,
-                self.model_config.vocab_size + visual_features.shape[1])
-            fake_prompt_id = fake_prompt_id.repeat(visual_features.shape[0], 1)
+        if visual_features is not None:
+            if self.use_py_session:
+                # Non-IFB Mode(used in python session): All requests in a batch have their prompt_table concatenated in
+                # a shape of (bs*vision_embedding_len, vision_hidden). So only one fake_prompt_id is needed for the
+                # entire batch, with values from 0 to bs * vision_embedding_len-1.
+                fake_prompt_id = torch.arange(
+                    self.model_config.vocab_size, self.model_config.vocab_size +
+                    visual_features.shape[0] * visual_features.shape[1])
+                fake_prompt_id = fake_prompt_id.reshape(
+                    visual_features.shape[0], visual_features.shape[1])
+            else:
+                # IFB Mode(used in c++ session): Each request's prompt_table is independent and requires a fake_prompt_id
+                # for each request, with values ranging from 0 to vision_embedding_len-1.
+                fake_prompt_id = torch.arange(
+                    self.model_config.vocab_size,
+                    self.model_config.vocab_size + visual_features.shape[1])
+                fake_prompt_id = fake_prompt_id.repeat(visual_features.shape[0],
+                                                       1)
+
+        if 'internvl' in self.model_type:
+            fake_prompt_id = fake_prompt_id.reshape(1, -1)
 
         if 'cogvlm' in self.model_type:
             input_ids = torch.cat(
@@ -1053,10 +1082,19 @@ class MultimodalModelRunner:
             images = load_images(self.args.image_path)
         elif "video-neva" in self.model_type:
             images = self.args.video_path
-        else:
+        elif "internvl" in self.model_type:
             if self.args.image_path is None:
+                img_url = 'https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/examples/image1.jpg'
+                images = Image.open(
+                    requests.get(img_url, stream=True,
+                                 timeout=5).raw).convert('RGB')
+            else:
+                images = Image.open(self.args.image_path).convert('RGB')
+        else:
+            if self.args.image_path is None and self.model_type != 'mllama':
                 self.args.image_path = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
-            images = load_images(self.args.image_path)
+            images = load_images(self.args.image_path
+                                 ) if self.args.image_path is not None else None
         return images
 
     def setup_inputs(self, input_text, raw_image):
@@ -1113,6 +1151,20 @@ class MultimodalModelRunner:
             image = processor(text=prompt,
                               images=raw_image,
                               return_tensors="pt")
+        elif 'internvl' in self.model_type:
+            pre_prompt = "<|system|>\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|end|><|user|>\n<image>\n"
+            if input_text is None:
+                input_text = "Please describe the image shortly."
+            post_prompt = input_text + "<|end|><|assistant|>\n"
+            prompt = pre_prompt + post_prompt
+
+            from transformers import CLIPImageProcessor
+
+            image_processor = CLIPImageProcessor.from_pretrained(
+                'OpenGVLab/InternViT-300M-448px'
+            )  # You can change the InternViT model type according to your InternVL type
+            image = image_processor(images=raw_image,
+                                    return_tensors='pt').pixel_values
         elif self.model_type == "pix2struct":
             image_processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir)
@@ -1238,42 +1290,55 @@ class MultimodalModelRunner:
         elif self.model_type in ['mllama']:
             processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
             image = self.load_test_image()
-            inputs = processor(images=image, return_tensors="pt")
+            if image is not None:
+                inputs = processor(images=image, return_tensors="pt")
 
-            other_vision_inputs = {
-                "aspect_ratio_ids":
-                inputs["aspect_ratio_ids"].to(self.device).expand(
-                    self.args.batch_size, -1).contiguous(),
-                "aspect_ratio_mask":
-                inputs["aspect_ratio_mask"].to(self.device).expand(
-                    self.args.batch_size, -1, -1).contiguous(),
-            }
-            cross_attention_mask = processor(
-                image, input_text, return_tensors="pt")['cross_attention_mask']
-            other_decoder_inputs = {
-                "cross_attention_mask": cross_attention_mask.to(self.device),
-            }
-            pre_prompt = input_text
-            post_prompt = None
-            image = inputs["pixel_values"]
+                other_vision_inputs = {
+                    "aspect_ratio_ids":
+                    inputs["aspect_ratio_ids"].to(self.device).expand(
+                        self.args.batch_size, -1).contiguous(),
+                    "aspect_ratio_mask":
+                    inputs["aspect_ratio_mask"].to(self.device).expand(
+                        self.args.batch_size, -1, -1).contiguous(),
+                }
+                cross_attention_mask = processor(
+                    image, input_text,
+                    return_tensors="pt")['cross_attention_mask']
+                cross_attention_mask = cross_attention_mask.expand(
+                    self.args.batch_size, -1, -1, -1).contiguous()
+                other_decoder_inputs = {
+                    "cross_attention_mask":
+                    cross_attention_mask.to(self.device),
+                }
+                pre_prompt = input_text
+                post_prompt = None
+                image = inputs["pixel_values"]
+            else:
+                pre_prompt = input_text
+                post_prompt = None
+                logger.warning(
+                    "image_path is None. Will not pass image as input, skipping the vision encoder."
+                )
 
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
-                'llava_next'
+                'llava_next', 'internvl'
         ]:
-            if image.dim() == 5:
-                image = image.expand(self.args.batch_size, -1, -1, -1,
-                                     -1).contiguous()
-            elif image.dim() == 6:
-                image = image.expand(self.args.batch_size, -1, -1, -1, -1,
-                                     -1).contiguous()
-            else:
-                image = image.expand(self.args.batch_size, -1, -1,
-                                     -1).contiguous()
-        image = image.to(self.device)
+            if image is not None:
+                if image.dim() == 5:
+                    image = image.expand(self.args.batch_size, -1, -1, -1,
+                                         -1).contiguous()
+                elif image.dim() == 6:
+                    image = image.expand(self.args.batch_size, -1, -1, -1, -1,
+                                         -1).contiguous()
+                else:
+                    image = image.expand(self.args.batch_size, -1, -1,
+                                         -1).contiguous()
+        if image is not None:
+            image = image.to(self.device)
         # Generate decoder_input_ids for enc-dec models
         # Custom prompts can be added as:
         # decoder_input_ids = model.tokenizer(decoder_prompt).input_ids

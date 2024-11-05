@@ -155,6 +155,14 @@ def parse_arguments():
                         action="store_true",
                         default=False,
                         help="Enable Fp8 per-token per-channel quantization")
+    parser.add_argument(
+        "--use_meta_fp8_rowwise_recipe",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Meta's LLaMA 3.1 recipe for Fp8 per-token per-channel quantization. "
+        "This skips quantization for the first and last Transformer layers and all the Attention layers. "
+        "This option is effective only if use_fp8_rowwise is enabled.")
 
     parser.add_argument(
         '--per_group',
@@ -302,6 +310,8 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
         # this will be overwritten if specified in the hf config.
         quant_config.clamp_val = [-1200.0, 1200.0]
+
+    quant_config.use_meta_recipe = args.use_meta_fp8_rowwise_recipe
 
     if args.int8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.INT8

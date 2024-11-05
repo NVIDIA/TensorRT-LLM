@@ -334,6 +334,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
+
             if config.qwen_type == "qwen":
                 custom_dict = {
                     "transformer": "transformer",
@@ -355,10 +356,13 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
                 }
+            elif config.qwen_type == "qwen2" and config.tie_word_embeddings:
+                custom_dict = {"lm_head": "model.embed_tokens"}
             elif config.architecture == "Qwen2ForSequenceClassification":
                 custom_dict = {
                     "lm_head": "score",
                 }
+
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             if config.share_embedding_table:
                 config.share_embedding_table = loader.check_share_embedding()

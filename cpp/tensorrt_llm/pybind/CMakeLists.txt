@@ -13,6 +13,7 @@ set(SRCS
     batch_manager/namedTensor.cpp
     executor/bindings.cpp
     executor/executor.cpp
+    runtime/bindings.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)

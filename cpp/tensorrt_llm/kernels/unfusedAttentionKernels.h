@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cuda_runtime_api.h>
 
@@ -75,8 +76,8 @@ struct QKVPreprocessingParams
     // source buffer
     // also acts as a dst buffer based on if separate_q_kv_output
     T* qkv_input{nullptr};
-    // The cross attention qkv (= qkv_project(encoder_output)).
-    T* cross_qkv_input{nullptr};
+    // The cross attention kv (= qkv_project(encoder_output), and only slice the kv part).
+    T* cross_kv_input{nullptr};
     // Only used by fp8 quantized output currently.
     void* quantized_qkv_output{nullptr};
     // The separate q output.
@@ -152,7 +153,7 @@ struct QKVPreprocessingParams
 
         ss << "QKVPreprocessingParams ====================" << std::endl;
         ss << "qkv_input: " << qkv_input << std::endl;
-        ss << "cross_qkv_input: " << cross_qkv_input << std::endl;
+        ss << "cross_kv_input: " << cross_kv_input << std::endl;
         ss << "quantized_qkv_output: " << quantized_qkv_output << std::endl;
         ss << "q_output: " << q_output << std::endl;
         ss << "kv_cache_buffer: " << kv_cache_buffer.data << std::endl;

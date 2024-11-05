@@ -83,7 +83,7 @@ def test_single_completion(client: openai.OpenAI, model_name):
 
     # test using token IDs
     completion = client.completions.create(
-        model="llama-v3-8b-instruct-hf",
+        model=model_name,
         prompt=[0, 0, 0, 0, 0],
         max_tokens=5,
         temperature=0.0,

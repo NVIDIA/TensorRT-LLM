@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
+#include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -26,7 +27,6 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -57,6 +57,9 @@ using FreeBlocksQueue = std::list<BlockPtr>;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
+
+template <typename T>
+using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
 struct BlockKey
 {
@@ -391,8 +394,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        std::shared_ptr<LlmRequest> const& llmRequest);
+    void addSequence(
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
@@ -404,7 +407,7 @@ public:
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
     //! \brief Release blocks of the sequence. Store blocks for reuse if llmReqeust is provided.
-    void releaseBlocks(GenerationRequest& sequence, std::shared_ptr<LlmRequest> const& llmRequest = nullptr);
+    void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(GenerationRequest& sequence);
@@ -519,8 +522,7 @@ public:
 
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
     //! \details Only full blocks are considered.
-    BlockKey findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, std::shared_ptr<LlmRequest> const& llmRequest) const;
+    BlockKey findNewContextBlock(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -732,9 +734,9 @@ public:
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        std::shared_ptr<LlmRequest> const& llmRequest = nullptr);
+        OptionalRef<LlmRequest> llmRequest = std::nullopt);
 
-    void removeSequence(LlmRequest::RequestIdType requestId, std::shared_ptr<LlmRequest> const& llmRequest = nullptr);
+    void removeSequence(LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId);
 
@@ -788,17 +790,19 @@ public:
 
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
     //! \details Only full blocks are considered.
-    BlockKey findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, std::shared_ptr<LlmRequest> const& llmRequest) const;
+    BlockKey findNewContextBlock(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
-    void storeContextBlocks(std::shared_ptr<LlmRequest> const& llmRequest);
+    void storeContextBlocks(LlmRequest const& llmRequest);
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
     [[nodiscard]] static SizeType32 getMaxAttentionWindowUpperBound(SizeType32 blocksInPrimaryPool,
         SizeType32 tokensPerBlock, SizeType32 maxBeamWidth, SizeType32 sinkTokenLen, bool useOneMoreBlock);
+
+    //! \brief Get the batch size that can fill the kv cache to the maximum capacity given the sequence length
+    [[nodiscard]] SizeType32 getMaxCapacityBatchSize(SizeType32 seqLen);
 
 private:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
@@ -819,12 +823,18 @@ private:
     // Maximum kv cache length per sequence
     // Enable cyclic kv cache when it exceeds
     SizeType32 mMaxAttentionWindow;
+    // Number of tokens per block
+    SizeType32 mTokensPerBlock;
     // Number of tokens to fill up the sink tokens to a full block size
     SizeType32 mSinkBubbleLength;
+    // Use one more block for each sequence
+    bool mUseOneMoreBlock;
     // Maximum token length (including bubble)
     SizeType32 mMaxTokenNum;
     // Number of tokens in the sink blocks
     SizeType32 mSinkBlockTokenLength;
+    // Number of blocks in primary pool
+    SizeType32 mBlocksInPrimaryPool;
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences

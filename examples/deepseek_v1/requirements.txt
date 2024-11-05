@@ -1,4 +1,3 @@
---extra-index-url https://pypi.nvidia.com
 tensorrt_llm==0.11.0
 datasets~=2.14.6
 evaluate~=0.4.1

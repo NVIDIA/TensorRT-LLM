@@ -313,6 +313,8 @@ if __name__ == '__main__':
         'eagle_net_config': eagle_net_config
     }
 
+    assert args.max_draft_len <= 256, "args.max_draft_len > 256 is not supported"
+
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
             config['quantization']['quant_algo'] = QuantAlgo.W8A16

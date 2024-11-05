@@ -257,6 +257,11 @@ class ModelWeightsLoader:
             elif tllm_key.endswith("weight"):
                 tp_dim = 1 - tp_dim
         tp_size = sub_module.tp_size if hasattr(sub_module, "tp_size") else 1
+        # Disable auto TP when num_kv_heads is invalid for split
+        if getattr(sub_module, "is_qkv",
+                   False) and self.model.config.num_key_value_heads < tp_size:
+            tp_dim = -1
+            tp_size = 1
         if skip_tp:
             tp_dim = -1
             tp_size = 1

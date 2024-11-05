@@ -17,6 +17,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
 - [Video NeVA](#video-neva)
+- [InternVL2](#internvl2)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
 ## BLIP2
@@ -701,6 +702,88 @@ Currently, CogVLM only support bfloat16 precision.
     ```
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
+
+## InternVL2
+
+[InternVL Family](https://github.com/OpenGVLab/InternVL): Closing the Gap to Commercial Multimodal Models with Open-Source Suites —— A Pioneering Open-Source Alternative to GPT-4o. Here we show how to deploy InternVL2‑1B/InternVL2‑2B/InternVL2‑4B/InternVL2‑8B/InternVL2‑26B in TensorRT-LLM.
+
+Firstly, please install transformers with 4.37.2
+```bash
+    pip install transformers==4.37.2
+```
+
+1. Download Huggingface weights
+    - For InternVL2-1B
+        ```bash
+        export MODEL_NAME="InternVL2-1B"
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="qwen"
+        ```
+
+    - For InternVL2-2B/InternVL2‑8B/InternVL2‑26B
+        ```bash
+        export MODEL_NAME="InternVL2-2B" # or InternVL2‑8B, InternVL2‑26B
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="internlm2"
+        ```
+
+    - For InternVL2-4B
+        ```bash
+        export MODEL_NAME="InternVL2-4B"
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="phi"
+        ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints
+    ```bash
+    python ../${LLM_MODEL_NAME}/convert_checkpoint.py \
+            --model_dir tmp/hf_models/${MODEL_NAME} \
+            --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu  \
+            --dtype float16
+    ```
+
+3. Build TRT engines
+    ```bash
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin auto \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4608 \
+        --max_multimodal_len 3328
+    ```
+
+4. Generate TensorRT engines for visual components and combine everything into final pipeline.
+    ```bash
+    python build_visual_engine.py --model_type internvl --model_path tmp/hf_models/${MODEL_NAME}
+    python run.py \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
+        --image_path tmp/hf_models/${MODEL_NAME}/examples/image1.jpg
+    ```
+
+5. (Optional) FP8 and INT8 SmoothQuant quantization is supported for the InternVL2-4B variant (LLM model only).
+
+   ```bash
+   # FP8 quantization
+   python ../quantization/quantize.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
+        --dtype bfloat16 \
+        --qformat fp8 \
+        --kv_cache_dtype fp8
+
+   # INT8 SmoothQuant quantization
+   python ../quantization/quantize.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/int8/1-gpu \
+        --dtype bfloat16 \
+        --qformat int8_sq
+   ```
+
+   Then follow the same `trtllm-build`, `build_visual_engine.py` and `run.py` steps as before.
 
 ## Enabling tensor parallelism for multi-GPU
 

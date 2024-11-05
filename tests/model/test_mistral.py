@@ -312,6 +312,7 @@ class TestMistralAndArctic(unittest.TestCase):
         perf_knob_tensor_size = 16
         context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
+        host_context_progress = torch.tensor([0], dtype=torch.int64)
 
         ctx_buffer = {
             'input_ids': ctx_ids,
@@ -321,6 +322,7 @@ class TestMistralAndArctic(unittest.TestCase):
             'cache_indirection': cache_indirections[0],
             'host_request_types': ctx_host_request_types,
             'host_runtime_perf_knobs': context_runtime_perf_knobs,
+            'host_context_progress': host_context_progress,
         }
         if enable_remove_input_padding:
             ctx_buffer['host_context_lengths'] = ctx_context_lengths.cpu()
@@ -394,6 +396,7 @@ class TestMistralAndArctic(unittest.TestCase):
             'host_request_types': gen_host_request_types,
             'cache_indirection': cache_indirections[1],
             'host_runtime_perf_knobs': gen_runtime_perf_knobs,
+            'host_context_progress': host_context_progress,
         }
         if enable_remove_input_padding:
             step1_buffer['host_context_lengths'] = gen_context_lengths.cpu()

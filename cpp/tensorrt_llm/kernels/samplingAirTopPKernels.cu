@@ -1400,16 +1400,8 @@ void invokeAirTopPSamplingWithDeterministicPara(TopPSamplingKernelParams<T> cons
     IdxT* idxBuf2 = nullptr;
 
     auto const workspaceSizes = getAirTopPWorkspaceSizes<T, isDeterministic>(params.batchSize, vocabSize);
-
-    std::vector<void*> alignedPointers;
-    calcAlignedPointers(alignedPointers, params.workspace, workspaceSizes);
-    counters = static_cast<decltype(counters)>(alignedPointers[0]);
-    histograms = static_cast<decltype(histograms)>(alignedPointers[1]);
-    countHistograms = static_cast<decltype(countHistograms)>(alignedPointers[2]);
-    buf1 = static_cast<decltype(buf1)>(alignedPointers[3]);
-    idxBuf1 = static_cast<decltype(idxBuf1)>(alignedPointers[4]);
-    buf2 = static_cast<decltype(buf2)>(alignedPointers[5]);
-    idxBuf2 = static_cast<decltype(idxBuf2)>(alignedPointers[6]);
+    calcAlignedPointers(params.workspace, workspaceSizes)(
+        counters, histograms, countHistograms, buf1, idxBuf1, buf2, idxBuf2);
 
     airTopPInitialize<T, IdxT, AccT, HisT, BitsPerPass, THREADS_PER_CTA_TOP_P_INIT>
         <<<params.batchSize, THREADS_PER_CTA_TOP_P_INIT, 0, stream>>>(counters, params.batchSize, vocabSize,

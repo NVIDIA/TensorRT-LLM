@@ -156,8 +156,8 @@ void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWid
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::newBatch(
-    GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
+void StatefulGptDecoder::newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
+    SamplingConfig const& samplingConfig, ModelConfig const&)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mBufferManager;

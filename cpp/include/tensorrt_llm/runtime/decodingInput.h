@@ -147,6 +147,38 @@ public:
         TensorPtr tokensPerStep;
     };
 
+    struct EagleInputs
+    {
+        EagleInputs(TensorConstPtr nextDraftTokens, TensorConstPtr nextDraftLens, TensorConstPtr nextDraftPaths,
+            TensorConstPtr lastDraftTokens, TensorConstPtr lastDraftLens, TensorConstPtr lastDraftPaths,
+            TensorConstPtr acceptedTokens, TensorConstPtr acceptedLens, TensorConstPtr acceptedPathIds,
+            TensorConstPtr seqSlots)
+            : nextDraftTokens(nextDraftTokens)
+            , nextDraftLens(nextDraftLens)
+            , nextDraftPaths(nextDraftPaths)
+            , lastDraftTokens(lastDraftTokens)
+            , lastDraftLens(lastDraftLens)
+            , lastDraftPaths(lastDraftPaths)
+            , acceptedTokens(acceptedTokens)
+            , acceptedLens(acceptedLens)
+            , acceptedPathIds(acceptedPathIds)
+            , seqSlots(seqSlots)
+        {
+        }
+
+        TensorConstPtr nextDraftTokens; //!< [batchSize, maxDecodingDraftTokens]
+        TensorConstPtr nextDraftLens;   //!< [batchSize]
+        TensorConstPtr nextDraftPaths;  //!< [batchSize, maxDecodingTokens, maxPathLen]
+        TensorConstPtr lastDraftTokens; //!< [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr lastDraftLens;   //!< [batchSize]
+        TensorConstPtr lastDraftPaths;  //!< [batchSize, maxDecodingTokens, maxPathLen]
+
+        TensorConstPtr acceptedTokens;  //!< [batchSize, maxPathLen]
+        TensorConstPtr acceptedLens;    //!< [batchSize]
+        TensorConstPtr acceptedPathIds; //!< [batchSize]
+        TensorConstPtr seqSlots;        //!< [batchSize]
+    };
+
     std::optional<MedusaInputs> medusaInputs;
 
     std::optional<ExplicitDraftTokensInputs> explicitDraftTokensInputs;
@@ -154,6 +186,8 @@ public:
     std::optional<LookaheadInputs> lookaheadInputs;
 
     std::optional<ExternalDraftTokensInputs> externalDraftTokensInputs;
+
+    std::optional<EagleInputs> eagleInputs;
 };
 
 } // namespace tensorrt_llm::runtime

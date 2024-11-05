@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 from pydantic import (BaseModel, Field, PositiveFloat, computed_field,
-                      model_validator)
+                      field_validator, model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.enums import IFBSchedulingPolicy
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+
+SPECULATIVE_MAP = {
+    SpeculativeDecodingMode.NONE: lambda *args: None,
+    SpeculativeDecodingMode.MEDUSA: trtllm.DecodingMode.Medusa,
+}
 
 
 class RuntimeConfig(BaseModel):
@@ -58,18 +64,32 @@ class PerformanceOptions(BaseModel):
 
 class DecodingConfig(BaseModel):
     medusa_choices: Optional[List[List[int]]] = None
+    decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
+
+    @field_validator("decoding_mode")
+    @classmethod
+    def decoding_mode_validator(
+        cls, value: Union[str, int,
+                          SpeculativeDecodingMode]) -> SpeculativeDecodingMode:
+        return SpeculativeDecodingMode(value)
+
+    @model_validator(mode="after")
+    def validate_speculative_decoding(self) -> DecodingConfig:
+        if self.medusa_choices and self.decoding_mode != SpeculativeDecodingMode.MEDUSA:
+            raise RuntimeError(
+                "Attempting to use set Medusa choices with a non-Medusa engine."
+                " Verify that you are using a Medusa engine.")
+
+        return self
 
     def get_decoding_config(self) -> trtllm.DecodingConfig:
-        config = None
-        if self.medusa_choices is not None:
-            config = trtllm.DecodingConfig(
-                decoding_mode=trtllm.DecodingMode.Medusa(),
-                medusa_choices=self.medusa_choices,
-            )
-        else:
-            config = trtllm.DecodingConfig()
+        """Create a populated TRT-LLM DecodingConfig."""
+        kwargs = {"decoding_mode": SPECULATIVE_MAP[self.decoding_mode]()}
 
-        return config
+        if self.medusa_choices is not None:
+            kwargs["medusa_choices"] = self.medusa_choices
+
+        return trtllm.DecodingConfig(**kwargs)
 
 
 class ExecutorWorldConfig(BaseModel):
@@ -141,9 +161,10 @@ class RequestRecord(BaseModel):
     start_timestamp: int = -1
     first_token_timestamp: int = -1
     end_timestamp: int = -1
+    decode_iteration: int = 0
 
     def register_event(self, is_error: bool, is_final: bool, timestamp: int,
-                       tokens: List[int]) -> None:
+                       decoding_iter: int, tokens: List[int]) -> None:
         if is_final:
             self.end_timestamp = timestamp
         elif self.first_token_timestamp == -1:
@@ -153,6 +174,7 @@ class RequestRecord(BaseModel):
             self.error_tokens += 1
 
         self.tokens += tokens
+        self.decode_iteration = decoding_iter
 
     @computed_field
     def num_output_tokens(self) -> int:
@@ -168,12 +190,14 @@ class RequestRecord(BaseModel):
 
     @computed_field
     def time_to_first_token(self) -> int:
-        return self.first_token_timestamp - self.start_timestamp
+        return (self.first_token_timestamp -
+                self.start_timestamp if self.first_token_timestamp > 0 else 0.0)
 
     @computed_field
     def intertoken_latency(self) -> float:
-        return (self.end_timestamp -
-                self.first_token_timestamp) / self.num_generated_tokens
+        return ((self.end_timestamp - self.first_token_timestamp) /
+                self.num_generated_tokens
+                if self.num_generated_tokens > 0 else 0.0)
 
     @computed_field
     def end_to_end_latency(self) -> int:
@@ -185,7 +209,7 @@ class RequestRecord(BaseModel):
 
     @computed_field
     def output_token_throughput(self) -> float:
-        return self.num_generated_tokens / self.generation_time
+        return (self.num_generated_tokens / self.generation_time)
 
 
 class PercentileStats(BaseModel):
@@ -213,7 +237,6 @@ class PercentileStats(BaseModel):
 class BenchmarkStatistics(BaseModel):
     # Time-related Properties
     total_latency_ns: float
-    total_generation_latency_ns: float
 
     # Token-related Properties
     total_output_tokens: int
@@ -223,12 +246,17 @@ class BenchmarkStatistics(BaseModel):
     num_requests: int
     issue_rate_ns: float
 
+    # Speculative Information
+    acceptance_rate: float
+
     # Percentile-related Statistics
-    request_percentiles: Optional[PercentileStats] = None
+    request_latency_percentiles: Optional[PercentileStats] = None
     token_percentiles: Optional[PercentileStats] = None
     itl_percentiles: Optional[PercentileStats] = None
     ttft_percentiles: Optional[PercentileStats] = None
-    generation_percentiles: Optional[PercentileStats] = None
+    generation_tp_percentiles: Optional[PercentileStats] = None
+    generation_latency_percentiles: Optional[PercentileStats] = None
+    acceptance_percentiles: Optional[PercentileStats] = None
 
     @computed_field
     def generation_tokens(self) -> int:
@@ -240,7 +268,7 @@ class BenchmarkStatistics(BaseModel):
 
     @computed_field
     def generation_token_throughput_ns(self) -> float:
-        return float(self.generation_tokens) / self.total_generation_latency_ns
+        return self.generation_tp_percentiles.average
 
     @computed_field
     def request_throughput_ns(self) -> float:

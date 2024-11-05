@@ -141,7 +141,7 @@ private:
     void setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss);
 
     // Tool functions for `printEngineInfo()`.
-    std::string const shapeToString(nvinfer1::Dims64 const& dim)
+    static std::string shapeToString(nvinfer1::Dims64 const& dim)
     {
         std::string output("(");
         if (dim.nbDims == 0)
@@ -156,29 +156,31 @@ private:
         return output;
     }
 
-    std::string const dataTypeToString(nvinfer1::DataType type)
+    static std::string dataTypeToString(nvinfer1::DataType type)
     {
         switch (type)
         {
-        case nvinfer1::DataType::kINT64: return std::string("INT64");
-        case nvinfer1::DataType::kINT32: return std::string("INT32");
-        case nvinfer1::DataType::kFLOAT: return std::string("FP32");
-        case nvinfer1::DataType::kBF16: return std::string("BF16");
-        case nvinfer1::DataType::kHALF: return std::string("FP16");
-        case nvinfer1::DataType::kBOOL: return std::string("BOOL");
-        case nvinfer1::DataType::kUINT8: return std::string("UINT8");
-        case nvinfer1::DataType::kINT8: return std::string("INT8");
-        case nvinfer1::DataType::kFP8: return std::string("FP8");
-        case nvinfer1::DataType::kINT4: return std::string("INT4");
-        default: return std::string("UNKNOWN");
+        case nvinfer1::DataType::kINT64: return "INT64";
+        case nvinfer1::DataType::kINT32: return "INT32";
+        case nvinfer1::DataType::kFLOAT: return "FP32";
+        case nvinfer1::DataType::kBF16: return "BF16";
+        case nvinfer1::DataType::kHALF: return "FP16";
+        case nvinfer1::DataType::kBOOL: return "BOOL";
+        case nvinfer1::DataType::kUINT8: return "UINT8";
+        case nvinfer1::DataType::kINT8: return "INT8";
+        case nvinfer1::DataType::kFP8: return "FP8";
+        case nvinfer1::DataType::kINT4: return "INT4";
+        default: return "UNKNOWN";
         }
         return "";
     }
 
-    std::string const alignText(
-        std::string const text, int const width, bool const bCenter = true, char const blank = ' ')
+    static std::string alignText(
+        std::string const& text, int const width, bool const bCenter = true, char const blank = ' ')
     {
-        int textLen = text.size(), padLeft = 0, padRight = 0;
+        int textLen = text.size();
+        int padLeft = 0;
+        int padRight = 0;
         padLeft = bCenter ? (width - textLen) / 2 : 0;
         padRight = width - padLeft - textLen;
         return std::string(padLeft, blank) + text + std::string(padRight, blank);

@@ -1,14 +1,13 @@
 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
---extra-index-url https://pypi.nvidia.com
 # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
 # "jax[cuda12_pip]~=0.4.19" specifies "nvidia-cudnn-cu12>=8.9" but actually requires "nvidia-cudnn-cu12~=8.9".
 nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
-tensorrt_llm==0.15.0.dev2024102900
+tensorrt_llm==0.15.0.dev2024110500
 flax~=0.8.0
 # jax[cuda12_pip]~=0.4.19; platform_system != "Windows"
 jax~=0.4.19; platform_system == "Windows"
 safetensors~=0.4.1
-sentencepiece~=0.1.99
+sentencepiece>=0.1.99
 h5py~=3.10.0
 rouge_score
 nltk
