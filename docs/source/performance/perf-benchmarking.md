@@ -402,15 +402,21 @@ To build a Medusa-enabled engine requires checkpoints that contain Medusa heads.
 NVIDIA provides TensorRT-LLM checkpoints on the [NVIDIA](https://huggingface.co/nvidia) page on Hugging Face.
 The checkpoints are pre-quantized and can be directly built after downloading them with the
 [huggingface-cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
-After you download the checkpoints, run the following command and specify the `$tp_size` supported by your Medusa checkpoint:
+After you download the checkpoints, run the following command. Make sure to
+specify the `$tp_size` supported by your Medusa checkpoint and the path to its stored location `$checkpoint_dir`.
+Additionally, `$max_seq_len` should be set to the model's maximum position embedding.
+
+Using Llama-3.1 70B as an example, for a tensor parallel 8 and bfloat16 dtype:
 
 ```shell
+tp_size=8
+max_seq_len=131072
 trtllm-build --checkpoint_dir $checkpoint_dir \
     --speculative_decoding_mode medusa \
     --max_batch_size 1 \
     --gpt_attention_plugin bfloat16 \
-    --max_seq_len $(($isl+$osl)) \
-    --output_dir /tmp/meta-llama/Meta-Llama-3-70B/medusa/engine \
+    --max_seq_len $max_seq_len \
+    --output_dir /tmp/meta-llama/Meta-Llama-3.1-70B/medusa/engine \
     --use_fused_mlp enable \
     --paged_kv_cache enable \
     --use_paged_context_fmha disable \
@@ -422,7 +428,7 @@ trtllm-build --checkpoint_dir $checkpoint_dir \
 ```
 
 After the engine is built, you need to define the Medusa choices.
-The choices are specify with a YAML file like the following example (`medusa.yaml`):
+The choices are specified with a YAML file like the following example (`medusa.yaml`):
 
 ```yaml
 - [0]

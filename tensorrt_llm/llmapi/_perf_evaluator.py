@@ -15,7 +15,9 @@ from tensorrt_llm import logger
 
 from .._utils import release_gc
 from ..profiler import device_memory_info, host_memory_info
+from . import LLM, KvCacheConfig, SamplingParams
 from .llm import LLM, SamplingParams
+from .tracer import global_tracer, log_sparse
 from .utils import is_directory_empty, print_colored
 
 
@@ -125,6 +127,8 @@ class Report:
                       writer=sys.stdout)
 
     def save_json(self, path: Path, **kwargs):
+        # create the directory if not exists
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
             data = self.__dict__.copy()
             data.update(kwargs)
@@ -248,17 +252,37 @@ class LLMPerfEvaluator:
                 sampling_interval=memory_monitor_interval)
             memory_monitor_thread.start()
 
-        # TODO[chunweiy]: Fixit, this barely work, the cpp runtime will trigger RuntimeError, which cannot be caught
+        sampling_extra_params = {}
+        if "return_context_logits" in kwargs:
+            sampling_extra_params["return_context_logits"] = kwargs.pop(
+                "return_context_logits")
+        if "return_generation_logits" in kwargs:
+            sampling_extra_params["return_generation_logits"] = kwargs.pop(
+                "return_generation_logits")
+
+        kvcache_extra_params = {}
+        if "kv_cache_free_gpu_mem_fraction" in kwargs:
+            kvcache_extra_params["free_gpu_memory_fraction"] = kwargs.pop(
+                "kv_cache_free_gpu_mem_fraction")
+
+        print_colored(f"Creating LLM with {model} and {kwargs}\n", "green")
+        print_colored(f"sampling_extra_params: {sampling_extra_params}\n",
+                      "green")
+        print_colored(f"kvcache_extra_params: {kvcache_extra_params}\n",
+                      "green")
+
         try:
+            kv_cache_config = KvCacheConfig(
+                **kvcache_extra_params) if kvcache_extra_params else None
+            if kv_cache_config is not None:
+                kwargs['kv_cache_config'] = kv_cache_config
             llm = LLM(model, skip_tokenizer_init=True, **kwargs)
         except Exception as e:
             logger.error(f"Failed to create LLM with {model} and {kwargs}")
             raise e
 
         if engine_cache_path is not None and not from_cache:
-            print_colored(f"Saving engine to {engine_cache_path}\n",
-                          "green",
-                          writer=sys.stdout)
+            print_colored(f"Saving engine to {engine_cache_path}\n", "green")
             llm.save(engine_cache_path)
 
         samples: List[Sample] = list(cls.load_dataset(samples_path))
@@ -272,7 +296,8 @@ class LLMPerfEvaluator:
                    streaming=streaming,
                    warmup=warmup,
                    concurrency=concurrency,
-                   memory_monitor_thread=memory_monitor_thread)
+                   memory_monitor_thread=memory_monitor_thread,
+                   sampling_extra_params=sampling_extra_params)
 
     def __init__(self,
                  llm: LLM,
@@ -281,19 +306,24 @@ class LLMPerfEvaluator:
                  warmup: int = 2,
                  concurrency: Optional[int] = None,
                  memory_monitor_thread: Optional[
-                     MemoryContinuousMonitorThread] = None):
+                     MemoryContinuousMonitorThread] = None,
+                 sampling_extra_params: Optional[dict] = None):
         self.llm = llm
         self.samples = samples
         self.streaming = streaming
         self.warmup = warmup
         self.concurrency = len(
             self.samples) if concurrency is None else concurrency
+        print_colored(f"sampling_extra_params: {sampling_extra_params}\n",
+                      "green")
         self.memory_monitor_thread = memory_monitor_thread
+        self.sampling_extra_params = sampling_extra_params
 
         self.perf_items: List[PerfItem] = []
         self.start = None
         self.end = None
 
+    #@log_sparse(stack_depth=10)
     def run(self, end_id: int = -1, beam_width: int = 1) -> Report:
         # reset states
         self.perf_items = []
@@ -316,6 +346,9 @@ class LLMPerfEvaluator:
                 sampling_params.max_tokens = sample.output_len
                 sampling_params.end_id = -2
                 sampling_params.pad_id = -2
+                if self.sampling_extra_params is not None:
+                    for key, value in self.sampling_extra_params.items():
+                        setattr(sampling_params, key, value)
 
                 start = time.perf_counter()
                 time_on_first_token = None
@@ -357,12 +390,19 @@ class LLMPerfEvaluator:
         logger.warning("running ...")
 
         async def run_lanes():
+            print(f"** concurrency: {self.concurrency}")
             lanes = [lane(sampling_params) for _ in range(self.concurrency)]
             await asyncio.gather(*lanes)
 
-        self.start = time.perf_counter()
-        asyncio.run(run_lanes())
-        self.end = time.perf_counter()
+        @log_sparse(stack_depth=3)
+        def run_main():
+            global_tracer().log_instant("profile.start")
+            self.start = time.perf_counter()
+            asyncio.run(run_lanes())
+            self.end = time.perf_counter()
+            global_tracer().log_instant("profile.end")
+
+        run_main()
 
         return self._generate_report()
 

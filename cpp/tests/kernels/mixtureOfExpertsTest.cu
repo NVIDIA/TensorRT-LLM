@@ -118,7 +118,7 @@ protected:
         // Whether the current results are as tight as they should be requires further investigation
         // They can be much tighter if we use the same value for all experts (so the scaling factors are trivial)
         // But that is hardly representative
-        bool loose_fp8 = mIsGated || mNormMode == MOEExpertScaleNormalizationMode::RENORMALIZE;
+        bool loose_fp8 = mIsGated || moeRoutingNeedsRenorm(mNormMode);
         float tol = std::is_same_v<DataType, float> ? 0.001
             : std::is_same_v<DataType, half>        ? 0.01
             : std::is_same_v<DataType, SafeFP8>     ? (loose_fp8 ? 0.1 : 0.07)
@@ -968,7 +968,7 @@ protected:
 
     void renormScales(float* probs, int const* experts)
     {
-        if (mNormMode != MOEExpertScaleNormalizationMode::RENORMALIZE)
+        if (!moeRoutingNeedsRenorm(mNormMode))
             return;
         float sum = 0;
         for (int k_idx = 0; k_idx < mK; k_idx++)
@@ -1023,7 +1023,7 @@ protected:
     {
         if (scale_probs.empty())
             scale_probs = getDataFromDevice(mScaleProbs, mTotalTokens * mK);
-        auto softmax_probs = softmax(expected_probs);
+        auto softmax_probs = moeRoutingNeedsSoftmax(mNormMode) ? softmax(expected_probs) : expected_probs;
 
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
@@ -1054,7 +1054,7 @@ protected:
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
 
-        auto softmax_probs = softmax(expected_probs);
+        auto softmax_probs = moeRoutingNeedsSoftmax(mNormMode) ? softmax(expected_probs) : expected_probs;
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             renormScales(&softmax_probs[token_id * mNumExperts], &expected_experts[token_id * mK]);
@@ -1252,6 +1252,22 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSparseMixer)
     this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::SPARSE_MIXER;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteDeviceLimited)
+{
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::DEVICE_LIMITED;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteDeviceLimitedRenorm)
+{
+    this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::DEVICE_LIMITED_RENORM;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)

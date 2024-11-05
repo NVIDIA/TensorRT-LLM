@@ -54,9 +54,10 @@ from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (GpuArch, download_hf_model, download_hf_pretrained_config,
+from .utils import (GpuArch, append_docstring, download_hf_model,
+                    download_hf_pretrained_config, enable_llm_debug,
                     get_directory_size_in_gb, print_colored,
-                    print_traceback_on_error, set_docstring)
+                    print_traceback_on_error)
 
 
 @dataclass
@@ -181,119 +182,112 @@ class _ModelInfo:
         raise NotImplementedError()
 
 
-LLMARGS_STAET_DOCSTRING = "The arguments for constructing a LLM instance.\n\nParameters:\n"
-# The arguments locate in LLM class's explicit arg-list, these will not be included in LLM class's apidocs.
-LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
-    model (str or Path): The model name or a local model directory.
-        Note that if the value could be both a model name or a local model directory,
-        the local model directory will be prioritized.
+# The docstring for LlmArgs and LLM; will be appended to the two classes' apidocs.
+LLMARGS_DOCSTRING = r"""
+        model (str or Path): The model name or a local model directory.
+            Note that if the value could be both a model name or a local model directory,
+            the local model directory will be prioritized.
 
-    parallel_config (_ParallelConfig): The parallel configuration for the model.
-        Default is an empty _ParallelConfig instance.
+        tokenizer (str, Path, TokenizerBase, PreTrainedTokenizerBase, optional):
+            The name or path of a HuggingFace Transformers tokenizer, or the loaded tokenizer.
+            Defaults to None.
 
-    tokenizer (str, Path, TokenizerBase, PreTrainedTokenizerBase, optional):
-        The name or path of a HuggingFace Transformers tokenizer, or the loaded tokenizer.
-        Default is None.
+        tokenizer_mode (Literal['auto', 'slow']): The tokenizer mode.
+            'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer.
+            The fast tokenizer is based on Huggingface's Rust library tokenizers, which achieves a significant speed-up compared to its slow counterpart.
+            Defaults to 'auto'.
 
-    tokenizer_mode (Literal['auto', 'slow'], default='auto'): The tokenizer mode.
-        'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer.
-        The fast tokenizer is based on Huggingface's Rust library tokenizers, which achieves a significant speed-up compared to its slow counterpart.
+        skip_tokenizer_init (bool):
+            If true, skip initialization of tokenizer and detokenizer.
+            LLM.generate and LLM.generate_async will accept prompt token ids as input only.
+            Defaults to False.
 
-    skip_tokenizer_init (bool):
-        If true, skip initialization of tokenizer and detokenizer. LLM.generate and
-        LLM.generate_async will accept prompt token ids as input only.
+        trust_remote_code (bool): Whether to trust remote code when downloading model and tokenizer from Hugging Face. Defaults to False.
 
-    tokenizer_revision (str, optional): The revision of the tokenizer to use.
-        Default is None.
+        tensor_parallel_size(int): The number of processes for tensor parallelism. Defaults to 1.
 
-    dtype (str, default="auto"): The data type for the model weights and activations.
-        Can be "float16", "bfloat16", "float32", or "auto". If "auto", the data type
-        will be automatically inferred from the source model. If the source data type
-        is "float32", it will be converted to "float16".
+        dtype (str): The data type for the model weights and activations.
+            Can be "float16", "bfloat16", "float32", or "auto". If "auto", the data type
+            will be automatically inferred from the source model. If the source data type
+            is "float32", it will be converted to "float16". Defaults to "auto".
 
-    revision (str, optional): The revision of the model to use.
-        Default is None.
+        revision (str, optional): The revision of the model to use. Defaults to None.
 
-    load_format (Literal['auto', 'dummy'], default='auto'): The format of the model weights to load.
-        * 'auto' will try to load the weights from the provided checkpoint.
-        * 'dummy' will initialize the weights with random values, which is mainly for profiling.
-"""
+        tokenizer_revision (str, optional): The revision of the tokenizer to use. Defaults to None.
 
-# The arguments locate in LLM class's kwargs, and will be concatenated to LLM class's apidocs.
-# The parallel_config is replaced by {auto_parallel, pipeline_parallel_size} arguments, the tensor_parallel_size is
-# already in the LLM class's apidocs, so it is not included here.
-LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
-    auto_parallel (bool, default=False): Enable auto parallel mode.
+        pipeline_parallel_size (int): The pipeline parallel size. Defaults to 1.
 
-    pipeline_parallel_size (int, default=1): The pipeline parallel size.
+        load_format (Literal['auto', 'dummy']): The format of the model weights to load.
+            * 'auto' will try to load the weights from the provided checkpoint.
+            * 'dummy' will initialize the weights with random values, which is mainly for profiling.
+            Defaults to 'auto'.
 
-    enable_lora (bool, default=False): Enable LoRA adapters.
+        enable_tqdm (bool): Whether to display a progress bar during model building. Defaults to False.
 
-    max_lora_rank (int, default=None): Maximum LoRA rank. If specified, it overrides `build_config.lora_config.max_lora_rank`.
+        enable_lora (bool): Enable LoRA adapters. Defaults to False.
 
-    max_loras (int, default=4): Maximum number of LoRA adapters to be stored in GPU memory.
+        max_lora_rank (int, optional): Maximum LoRA rank. If specified, it overrides `build_config.lora_config.max_lora_rank`. Defaults to None.
 
-    max_cpu_loras (int, default=4): Maximum number of LoRA adapters to be stored in CPU memory.
+        max_loras (int): Maximum number of LoRA adapters to be stored in GPU memory. Defaults to 4.
 
-    enable_prompt_adapter (bool, default=False): Enable prompt adapters.
+        max_cpu_loras (int): Maximum number of LoRA adapters to be stored in CPU memory. Defaults to 4.
 
-    max_prompt_adapter_token (int, default=0): Maximum number of prompt adapter tokens.
+        enable_prompt_adapter (bool): Enable prompt adapters. Defaults to False.
 
-    build_config (BuildConfig, default=BuildConfig()): The build configuration for the model.
-        Default is an empty BuildConfig instance.
+        max_prompt_adapter_token (int): Maximum number of prompt adapter tokens. Defaults to 0.
 
-    quant_config (QuantConfig, default=QuantConfig()): The quantization configuration for the model.
-        Default is an empty QuantConfig instance.
+        quant_config (QuantConfig, optional): The quantization configuration for the model. Defaults to None.
 
-    calib_config (CalibConfig, default=CalibConfig()): The calibration configuration for the model.
+        calib_config (CalibConfig, optional): The calibration configuration for the model. Defaults to None.
 
-    embedding_parallel_mode (str, default="SHARDING_ALONG_VOCAB"): The parallel mode for embeddings.
+        build_config (BuildConfig, optional)): The build configuration for the model. Defaults to None.
 
-    share_embedding_table (bool, default=False): Whether to share the embedding table.
+        kv_cache_config (KvCacheConfig, optional): The key-value cache configuration for the model. Defaults to None.
 
-    kv_cache_config (KvCacheConfig, optional): The key-value cache configuration for the model.
-        Default is None.
+        decoding_config (DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
 
-    peft_cache_config (PeftCacheConfig, optional): The PEFT cache configuration for the model.
-        Default is None.
+        logits_post_processor_map (Dict[str, Callable], optional): A map of logit post-processing functions. Defaults to None.
 
-    decoding_config (DecodingConfig, optional): The decoding configuration for the model.
-        Default is None.
+        iter_stats_max_iterations (int, optional): The maximum number of iterations for iteration statistics. Defaults to None.
 
-    logits_post_processor_map (Dict[str, Callable], optional): A map of logit post-processing functions.
-        Default is None.
+        request_stats_max_iterations (int, optional): The maximum number of iterations for request statistics. Defaults to None.
 
-    scheduler_config (SchedulerConfig, default=SchedulerConfig()): The scheduler configuration for the model.
-        Default is an empty SchedulerConfig instance.
+        workspace(str, optional): The directory to store intermediate files. Defaults to None.
 
-    normalize_log_probs (bool, default=False): Whether to normalize log probabilities for the model.
+        embedding_parallel_mode (str): The parallel mode for embeddings. Defaults to 'SHARDING_ALONG_VOCAB'.
 
-    iter_stats_max_iterations (int, optional): The maximum number of iterations for iteration statistics.
-        Default is None.
+        share_embedding_table (bool): Whether to share the embedding table. Defaults to False.
 
-    request_stats_max_iterations (int, optional): The maximum number of iterations for request statistics.
-        Default is None.
+        auto_parallel (bool): Enable auto parallel mode. Defaults to False.
 
-    batching_type (BatchingType, optional): The batching type for the model.
-        Default is None.
+        auto_parallel_world_size (int): The MPI world size for auto parallel. Defaults to 1.
 
-    enable_build_cache (bool or BuildCacheConfig, optional): Whether to enable build caching for the model.
-        Default is None.
+        fast_build: (bool): Enable features for faster engine building.
+            This may cause some performance degradation and is currently incompatible with int8/int4 quantization.
+            Defaults to False.
 
-    enable_tqdm (bool, default=False): Whether to display a progress bar during model building.
+        enable_build_cache (bool, BuildCacheConfig, optional): Whether to enable build caching for the model. Defaults to None.
 
-    trust_remote_code (bool, default=False): Whether to trust remote code when downloading model and tokenizer from Hugging Face.
+        peft_cache_config (PeftCacheConfig, optional): The PEFT cache configuration for the model. Defaults to None.
+
+        scheduler_config (SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
+
+        batching_type (BatchingType, optional): The batching type for the model. Defaults to None.
+
+        normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.
+
 """
 
 
-@set_docstring(LLMARGS_STAET_DOCSTRING + LLMARGS_EXPLICIT_ARGS_DOCSTRING +
-               LLMARGS_REMAINING_ARGS_DOCSTRING)
+@append_docstring(LLMARGS_DOCSTRING)
 @dataclass
 class LlmArgs:
+    """The arguments for constructing a LLM instance.
 
+    Parameters:
+    """
+    # Explicit arguments
     model: Union[str, Path]
-
-    parallel_config: _ParallelConfig = field(default_factory=_ParallelConfig)
 
     tokenizer: Optional[Union[str, Path, TokenizerBase,
                               PreTrainedTokenizerBase]] = None
@@ -302,13 +296,26 @@ class LlmArgs:
 
     skip_tokenizer_init: bool = False
 
-    tokenizer_revision: Optional[str] = None
+    trust_remote_code: bool = False
+
+    tensor_parallel_size: int = 1
 
     dtype: str = "auto"
 
     revision: Optional[str] = None
 
+    tokenizer_revision: Optional[str] = None
+
+    # Below are all remaining arguments
+    pipeline_parallel_size: int = 1
+
+    auto_parallel: bool = False
+
+    auto_parallel_world_size: int = 1
+
     load_format: Literal['auto', 'dummy'] = 'auto'
+
+    enable_tqdm: bool = False
 
     # LoRA arguments
     enable_lora: bool = False
@@ -324,47 +331,45 @@ class LlmArgs:
 
     max_prompt_adapter_token: int = 0
 
-    # BuildConfig is introduced to give users a familiar interface to configure the model building.
-    build_config: Optional[BuildConfig] = None
-
-    fast_build: Optional[bool] = False
-
+    # Quantization and calibration configurations
     quant_config: Optional[QuantConfig] = None
 
     calib_config: Optional[CalibConfig] = None
 
-    # A handful of options from PretrainedConfig
-    embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
-
-    share_embedding_table: bool = False
+    # BuildConfig is introduced to give users a familiar interface to configure the model building.
+    build_config: Optional[BuildConfig] = None
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: Optional[KvCacheConfig] = None
-
-    peft_cache_config: Optional[PeftCacheConfig] = None
 
     # TODO[enweiz]: this might affect medusa, and could be removed in the future for API consistency
     decoding_config: Optional[DecodingConfig] = None
 
     logits_post_processor_map: Optional[Dict[str, Callable]] = None
 
-    scheduler_config: SchedulerConfig = field(default_factory=SchedulerConfig)
-
-    normalize_log_probs: bool = False
-
     iter_stats_max_iterations: Optional[int] = None
 
     request_stats_max_iterations: Optional[int] = None
 
-    batching_type: Optional[BatchingType] = None
+    workspace: Optional[str] = None
+
+    # A handful of options from PretrainedConfig
+    embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
+
+    share_embedding_table: bool = False
+
+    fast_build: bool = False
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: Union[BuildCacheConfig, bool] = False
 
-    # Display the model building progress bar
-    enable_tqdm: bool = False
+    peft_cache_config: Optional[PeftCacheConfig] = None
 
-    trust_remote_code: bool = False
+    scheduler_config: Optional[SchedulerConfig] = None
+
+    batching_type: Optional[BatchingType] = None
+
+    normalize_log_probs: bool = False
 
     def __post_init__(self):
         # NOTE: this is only for the compatibility with the old API, and will be removed in the future
@@ -390,6 +395,13 @@ class LlmArgs:
             if self.dtype == 'bfloat16':
                 raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
 
+        self.parallel_config = _ParallelConfig(
+            tp_size=self.tensor_parallel_size,
+            pp_size=self.pipeline_parallel_size,
+            auto_parallel=self.auto_parallel)
+        if self.parallel_config.auto_parallel:
+            self.parallel_config.world_size = self.auto_parallel_world_size
+
         self.auto_parallel_config = AutoParallelConfig(
             sharded_io_allowlist=[
                 "past_key_value_\\d+",
@@ -403,28 +415,21 @@ class LlmArgs:
 
         self.kv_cache_config = self.kv_cache_config or KvCacheConfig()
 
+        self.scheduler_config = self.scheduler_config or SchedulerConfig()
+
         # This is used to hold th options for convert_checkpoint
         self._convert_checkpoint_options = {}
 
     @classmethod
     def from_kwargs(cls, **kwargs) -> "LlmArgs":
         LlmArgs._check_executor_config_options_consistency()
-        parallel_config = _ParallelConfig(
-            tp_size=kwargs.pop('tensor_parallel_size', 1),
-            pp_size=kwargs.pop('pipeline_parallel_size', 1),
-            auto_parallel=kwargs.pop('auto_parallel', False),
-        )
-        # world_size is only used for auto_parallel mode
-        world_size = kwargs.pop('world_size', 1)
-        if parallel_config.auto_parallel:
-            parallel_config.world_size = world_size
-
-        if devices := kwargs.pop('devices', None):
-            parallel_config.devices = devices
-
-        ret = cls(parallel_config=parallel_config, **kwargs)
+        ret = cls(**kwargs)
         ret.setup()
         return ret
+
+    def to_dict(self):
+        return dict(
+            (field.name, getattr(self, field.name)) for field in fields(self))
 
     @staticmethod
     def _check_executor_config_options_consistency():
@@ -1314,6 +1319,7 @@ class CachedModelLoader:
         self.engine_cache_stage: Optional[CachedStage] = None
 
         if self.build_cache_enabled:
+            print_colored("Build cache is enabled.\n", 'yellow')
             if self.llm_args.is_hub_model:
                 # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
                 # cache key.
@@ -1428,13 +1434,28 @@ class CachedModelLoader:
                 # TODO[chunweiy]: Cover the case when the model is from HF model hub.
                 if self.llm_args.is_local_model:
                     # This is not perfect, but will make build-cache much more robust.
-                    has_storage = self.engine_cache_stage.parent.free_storage_in_gb(
-                    ) >= get_directory_size_in_gb(self.llm_args.model_dir)
+                    free_storage = self.engine_cache_stage.parent.free_storage_in_gb(
+                    )
+                    model_size = get_directory_size_in_gb(
+                        self.llm_args.model_dir)
+                    require_size = model_size * 1.3
+                    has_storage = free_storage >= require_size
+
+                    if not has_storage:
+                        print_colored(
+                            f"Build cache is disabled since the cache storage is too small.\n ",
+                            'yellow')
+                        print_colored(
+                            f"Free storage: {free_storage}GB, Required storage: {require_size}GB\n",
+                            'grey')
             except ValueError:
                 has_storage = False
             except Exception as e:
                 logger.error(e)
                 has_storage = False
+
+            if enable_llm_debug():
+                print_colored(f"Has cache storage: {has_storage}\n", 'yellow')
 
             if has_storage:
                 with self.engine_cache_stage.write_guard() as engine_dir:

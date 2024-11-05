@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #include "tllmRuntime.h"
+#include "common.h"
+#include "nlohmann/json.hpp"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
@@ -22,11 +24,17 @@
 #include "tensorrt_llm/executor/tensor.h"
 #include "tllmLogger.h"
 
+#include <NvInferRuntime.h>
 #include <algorithm>
+#include <cstddef>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 using namespace tensorrt_llm::runtime;
 using TensorMap = StringPtrMap<ITensor>;
@@ -105,13 +113,107 @@ void setWeightStreaming(nvinfer1::ICudaEngine& engine, float const gpuWeightsPer
         engine.setWeightStreamingBudgetV2(budget);
     }
 }
+
+class LayerInfo
+{
+public:
+    LayerInfo(std::optional<std::string> name, std::string type)
+        : name(std::move(name))
+        , type(std::move(type)){};
+    std::optional<std::string> name;
+    std::string type;
+};
+
+void assessLikelihoodOfRuntimeAllocation(
+    nvinfer1::ICudaEngine const& engine, nvinfer1::IEngineInspector const& engineInspector)
+
+{
+    TLLM_LOG_INFO("Inspecting the engine to identify potential runtime issues...");
+    auto const profilingVerbosity = engine.getProfilingVerbosity();
+    if (profilingVerbosity != nvinfer1::ProfilingVerbosity::kDETAILED)
+    {
+        TLLM_LOG_INFO(
+            "The profiling verbosity of the engine does not allow this analysis to proceed. Re-build the engine with "
+            "'detailed' profiling verbosity to get more diagnostics.");
+        return;
+    }
+    auto const* const layerTypeKey = "LayerType";
+    auto const* const nameKey = "Name";
+    auto const numLayers = engine.getNbLayers();
+    TLLM_LOG_INFO("Model has %i layers.", numLayers);
+    std::vector<SizeType32> indexes(numLayers);
+    std::iota(indexes.begin(), indexes.end(), 0);
+    std::vector<std::optional<LayerInfo>> layerInfos(numLayers);
+    std::transform(indexes.cbegin(), indexes.cend(), layerInfos.begin(),
+        [&](SizeType32 const idx)
+        {
+            auto const* const layerInfo
+                = engineInspector.getLayerInformation(idx, nvinfer1::LayerInformationFormat::kJSON);
+
+            // Needs to be copied explicitly, see documentation of `getLayerInformation`.
+            auto const layerInfoCopy = std::string(layerInfo);
+            auto const jsonLayerInfo = nlohmann::json::parse(layerInfoCopy);
+            auto const layerJsonType = jsonLayerInfo.type();
+            if (layerJsonType != nlohmann::detail::value_t::object)
+            {
+                return std::optional<LayerInfo>{};
+            }
+            if (!jsonLayerInfo.contains(layerTypeKey))
+            {
+                return std::optional<LayerInfo>{};
+            }
+            auto const& typeJson = jsonLayerInfo.at(layerTypeKey);
+            if (typeJson.type() != nlohmann::detail::value_t::string)
+            {
+                return std::optional<LayerInfo>{};
+            }
+            std::optional<std::string> name{};
+            if (jsonLayerInfo.contains(nameKey))
+            {
+                auto const& nameJson = jsonLayerInfo.at(nameKey);
+                auto const nameJsonType = nameJson.type();
+                if (nameJsonType == nlohmann::detail::value_t::string)
+                {
+                    name = nameJson.get<std::string>();
+                }
+            }
+            return std::make_optional(LayerInfo{name, typeJson.get<std::string>()});
+        });
+    auto const layersWithInfoEnd = std::partition(
+        layerInfos.begin(), layerInfos.end(), [](std::optional<LayerInfo> const& info) { return info.has_value(); });
+    if (layersWithInfoEnd == layerInfos.begin())
+    {
+        TLLM_LOG_INFO("Engine layer infos could not be parsed into useful information.");
+        return;
+    }
+    auto const allocateLayersEnd = std::partition(layerInfos.begin(), layersWithInfoEnd,
+        [](std::optional<LayerInfo> const& info) { return info.value().type == "allocate"; });
+    auto numWarnings = 0;
+    for (auto layerInfo = layerInfos.begin(); layerInfo != allocateLayersEnd; layerInfo++)
+    {
+        auto constexpr maxNumWarnings = 25;
+        if (numWarnings < maxNumWarnings)
+        {
+            auto const layerName = layerInfo->value().name.value_or("");
+            TLLM_LOG_WARNING(
+                "Layer '%s' has type '%s', which could lead to large runtime memory allocations. Performance "
+                "might be degraded and / or you might run out of memory.",
+                layerName.c_str(), layerInfo->value().type.c_str());
+        }
+        numWarnings++;
+    }
+    TLLM_LOG_WARNING(
+        "There were a total of %i layers with type 'allocate'. Some warnings might have been silenced to keep the "
+        "output concise.",
+        numWarnings);
+}
 } // namespace
 
 TllmRuntime::TllmRuntime(
     RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
-    , mRuntime{nvinfer1::createInferRuntime(logger ? *logger : defaultLogger)}
+    , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
     , mUseShapeInference{useShapeInference}
 {
     switch (rawEngine.getType())
@@ -134,7 +236,7 @@ TllmRuntime::TllmRuntime(
 
     TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine.");
     mEngineInspector.reset(mEngine->createEngineInspector());
-
+    assessLikelihoodOfRuntimeAllocation(*mEngine, *mEngineInspector);
     setWeightStreaming(getEngine(), gpuWeightsPercent);
 
     auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
@@ -207,9 +309,10 @@ void TllmRuntime::printEngineInfo()
 
     // Get information of engine input / output
     std::vector<std::string> tensorNameList{};
+    tensorNameList.reserve(nIO);
     for (int i = 0; i < nIO; ++i)
     {
-        tensorNameList.push_back(std::string(mEngine->getIOTensorName(i)));
+        tensorNameList.emplace_back(mEngine->getIOTensorName(i));
     }
     std::vector<std::map<std::string, std::string>> tiv(nIO);          // Tensor Information Vector
     std::vector<std::vector<std::vector<nvinfer1::Dims64>>> topv(nIO); // Tensor Optimization Profile Vector
@@ -346,7 +449,6 @@ void TllmRuntime::printEngineInfo()
         }
         TLLM_LOG_TRACE(std::string(mwn + mws * 3 + 4, '='));
     }
-    return;
 }
 
 void TllmRuntime::clearContexts()

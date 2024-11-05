@@ -82,6 +82,7 @@ PLUGIN_DTYPE_OPTIONS_MAP = {
     "gemm_plugin":
     ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None],
     "low_latency_gemm_plugin": ["fp8", None],
+    "low_latency_gemm_swiglu_plugin": ["fp8", None],
 }
 
 
@@ -136,7 +137,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     There are two option categories:
     * Plugin options (typically with xxx_plugin naming). These options can be assigned with:
-        * "float16"/"bfloat16"/"float32"/"int32", which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin only supports fp8 now)
+        * "float16"/"bfloat16"/"float32"/"int32", which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now)
         * "auto", which means the plugin is enabled with the precision of `dtype` field (the `dtype` field must be same to model dtype, i.e., the one in PretrainedConfig);
         * None, which means the plugin is disabled.
     * Other features. These options can be assigned with boolean:
@@ -174,6 +175,8 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _moe_plugin: Optional[str] = field(default="auto", init=False)
     _mamba_conv1d_plugin: Optional[str] = field(default="auto", init=False)
     _low_latency_gemm_plugin: Optional[str] = field(default=None, init=False)
+    _low_latency_gemm_swiglu_plugin: Optional[str] = field(default=None,
+                                                           init=False)
     # Features
     _context_fmha: bool = field(default=True, init=False)
     _bert_context_fmha_fp32_acc: bool = field(
@@ -307,6 +310,7 @@ cli_plugin_args = [
     "mamba_conv1d_plugin",
     "nccl_plugin",
     "low_latency_gemm_plugin",
+    "low_latency_gemm_swiglu_plugin",
 
     # Features
     "context_fmha",

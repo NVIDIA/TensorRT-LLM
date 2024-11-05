@@ -418,7 +418,7 @@ ITensor::SharedPtr GptSession::initDecoder(ITensor& outputIds, GenerationInput c
     if (mWorldConfig.isLastPipelineParallelRank())
     {
         auto& decoder = *mDecoders.at(microBatchId);
-        decoder.newBatch(inputs, outputs, samplingConfig);
+        decoder.newBatch(inputs, outputs, samplingConfig, mModelConfig);
         return decoder.getNewTokens();
     }
     else if (mWorldConfig.isFirstPipelineParallelRank())

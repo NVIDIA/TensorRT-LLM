@@ -15,8 +15,9 @@
 from .activation import Mish
 from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
                         AttentionParams, BertAttention, BlockSparseAttnParams,
-                        CogVLMAttention, KeyValueCacheParams,
-                        PositionEmbeddingType, SpecDecodingParams)
+                        CogVLMAttention, DeepseekV2Attention,
+                        KeyValueCacheParams, PositionEmbeddingType,
+                        SpecDecodingParams)
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
@@ -40,6 +41,7 @@ __all__ = [
     'Attention',
     'BertAttention',
     'CogVLMAttention',
+    'DeepseekV2Attention',
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',

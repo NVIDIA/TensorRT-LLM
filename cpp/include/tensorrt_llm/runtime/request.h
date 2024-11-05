@@ -60,9 +60,10 @@ public:
     TensorPtr stopWordsList; // [2, stopWordsLength], on gpu
 
     SizeType32 generatedTokensPerEngineStep;
-    TensorPtr medusaPaths;    // [maxDraftTokens + 1, maxAcceptedDraftTokensPerStep + 1], on gpu
-    TensorPtr medusaTreeIds;  // [maxDraftTokens + 1], on gpu
+    TensorPtr medusaPaths;   // [maxDecodingTokens, maxPathLen], on gpu
+    TensorPtr medusaTreeIds; // [maxDecodingTokens], on gpu
     std::optional<executor::LookaheadDecodingConfig> lookaheadRuntimeConfig;
+    std::optional<executor::EagleConfig> eagleConfig;
     nvinfer1::DataType dtype; // request data type, only used by explicit draft tokens.
 };
 

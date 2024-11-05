@@ -18,7 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/tensor.h"
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include <pybind11/pybind11.h>

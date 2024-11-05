@@ -523,7 +523,7 @@ protected:
         this->fillRandomNormal(attention_input, qkv_size);
 
         preprocessingParams.qkv_input = const_cast<fpType*>(attention_input);
-        preprocessingParams.cross_qkv_input = nullptr;
+        preprocessingParams.cross_kv_input = nullptr;
         preprocessingParams.quantized_qkv_output = nullptr; // Assuming this is the correct member for 'O'
         preprocessingParams.q_output = nullptr;
         preprocessingParams.kv_cache_buffer = keyValueCache;

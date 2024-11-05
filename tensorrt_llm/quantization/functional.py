@@ -885,17 +885,21 @@ def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
         return {}
 
     config = kwargs.get("config", None)
-    if weights[1] is not None:
-        assert weights[0].dtype == torch.float8_e4m3fn
-        scale = weights[1].to(torch.float32).reshape(-1)
+    weights, scales = weights[0::2], weights[1::2]
+
+    if scales[0] is not None:
+        assert all(w.dtype == torch.float8_e4m3fn for w in weights)
+        weights = torch.cat(weights, dim=0)
+        scales = torch.cat([s.to(torch.float32).flatten() for s in scales])
         return {
-            tllm_key: weights[0],
-            tllm_key.replace("weight", "per_channel_scale"): scale
+            tllm_key: weights,
+            tllm_key.replace("weight", "per_channel_scale"): scales
         }
     else:
         clamp_val = config.quantization.clamp_val
+        weights = torch.cat(weights, dim=0)
         # activation range bound.
-        x = weights[0].to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+        x = weights.to(torch.float32).clamp(clamp_val[0], clamp_val[1])
         xmax = x.abs().max(-1, keepdim=True).values
         # minimum scaling factor.
         torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))

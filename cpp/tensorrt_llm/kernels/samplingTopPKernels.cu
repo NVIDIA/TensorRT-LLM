@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
 
 using namespace tensorrt_llm::common;
@@ -347,11 +348,24 @@ std::vector<size_t> getTopPWorkspaceSizes(SizeType32 batchSize, SizeType32 vocab
 template std::vector<size_t> getTopPWorkspaceSizes<float>(SizeType32 batchSize, SizeType32 vocabSize);
 template std::vector<size_t> getTopPWorkspaceSizes<half>(SizeType32 batchSize, SizeType32 vocabSize);
 
+[[nodiscard]] std::vector<size_t> getTopPInitWorkspaceSizes(SizeType32 batchSize)
+{
+    auto const tempTopKsBufSize = batchSize * sizeof(SizeType32);
+    auto const tempTopPsBufSize = batchSize * sizeof(float);
+    auto const tempTopPDecayBufSize = batchSize * sizeof(float);
+    auto const tempTopPMinBufSize = batchSize * sizeof(float);
+    auto const tempTopPResetIdsBufSize = batchSize * sizeof(TokenIdType);
+
+    return {tempTopKsBufSize, tempTopPsBufSize, tempTopPDecayBufSize, tempTopPMinBufSize, tempTopPResetIdsBufSize};
+}
+
 template <typename T>
 size_t getTopPWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSizePadded)
 {
     auto const workspaceSizes = getTopPWorkspaceSizes<T>(batchSize, vocabSizePadded);
-    return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
+    auto const initWorkspaceSizes = getTopPInitWorkspaceSizes(batchSize);
+    return std::max(tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256),
+        tensorrt_llm::common::calcAlignedSize(initWorkspaceSizes, 256));
 }
 
 template size_t getTopPWorkspaceSize<float>(SizeType32 batchSize, SizeType32 vocabSizePadded);
@@ -415,9 +429,13 @@ template void invokeBatchTopPSampling(TopPSamplingKernelParams<half> const& para
 
 __global__ void computeToppDecay(float* runtimeTopP, float const* runtimeInitialTopP, TokenIdType const** outputIds,
     float const* topPDecay, float const* topPMin, TokenIdType const* topPResetIds, SizeType32 const* sequenceLengths,
-    SizeType32 const* batchSlots)
+    SizeType32 const* batchSlots, SizeType32 localBatchSize)
 {
     auto const idx = static_cast<SizeType32>(blockDim.x * blockIdx.x + threadIdx.x);
+    if (idx >= localBatchSize)
+    {
+        return;
+    }
     auto const batchSlot = batchSlots[idx];
     auto const currentStep{sequenceLengths[batchSlot]};
     if (outputIds[batchSlot][currentStep] == topPResetIds[batchSlot])
@@ -436,48 +454,39 @@ void invokeComputeToppDecay(float* runtimeTopP, float const* runtimeInitialTopP,
 {
     dim3 block(std::min(localBatchSize, 512));
     dim3 grid((localBatchSize + block.x - 1) / block.x);
-    computeToppDecay<<<grid, block, 0, stream>>>(
-        runtimeTopP, runtimeInitialTopP, outputIds, topPDecay, topPMin, topPResetIds, sequenceLengths, batchSlots);
+    computeToppDecay<<<grid, block, 0, stream>>>(runtimeTopP, runtimeInitialTopP, outputIds, topPDecay, topPMin,
+        topPResetIds, sequenceLengths, batchSlots, localBatchSize);
 }
 
-__global__ void setTopPRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs, SizeType32 topKsSize,
-    float topP, float* topPs, SizeType32 topPsSize, bool* skipDecode, SizeType32 const* batchSlots,
+__global__ void setTopPRuntimeArgs(SizeType32 batchSize, SizeType32 const* batchSlots,
+    ScatterDecodingParamEntry<SizeType32> topK, ScatterDecodingParamEntry<float> topP, bool* skipDecode,
     float* initialTopPBuf)
 {
-    /**
-     * @brief Setup the runtime arguments for topp, broadcasting top_p to top_ps
-              and top_k to top_ks.
-     */
-
     auto index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     for (SizeType32 bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
-        auto const batchSlot = batchSlots[bi];
-        auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
-        auto p = topPsSize > 1 ? topPs[batchSlot] : topP;
-        if (k == 0 && p == 0.0f)
-        {
-            // TensorRT-LLM's topp implementation does not support topp = 0.0f, but it
-            // equivalent to greedy search. So, we set the topk = 1 as an alternative
-            // solution.
-            k = 1;
-        }
-        topKs[batchSlot] = k;
-        topPs[batchSlot] = p;
-        skipDecode[batchSlot] = k > 0;
-
-        initialTopPBuf[batchSlot] = topPs[batchSlot];
+        setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlots, nullptr, skipDecode, initialTopPBuf);
     }
 }
 
-void invokeSetTopPRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* runtimeTopKDevicePtr,
-    SizeType32 runtimeTopKSize, float topP, float* runtimeTopPDevicePtr, SizeType32 runtimeTopPSize,
-    bool* skipDecodeDevicePtr, SizeType32 const* batchSlotsDevicePtr, float* initialTopPDevicePtr, cudaStream_t stream)
+void invokeSetTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodePtr, float* initialTopPPtr, SizeType32 const* batchSlotsPtr,
+    bool onDevice, cudaStream_t stream)
 {
-    dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
-    dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
-    setTopPRuntimeArgs<<<grid, block, 0, stream>>>(batchSize, topK, runtimeTopKDevicePtr, runtimeTopKSize, topP,
-        runtimeTopPDevicePtr, runtimeTopPSize, skipDecodeDevicePtr, batchSlotsDevicePtr, initialTopPDevicePtr);
+    if (onDevice)
+    {
+        dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+        dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+        setTopPRuntimeArgs<<<grid, block, 0, stream>>>(
+            batchSize, batchSlotsPtr, topK, topP, skipDecodePtr, initialTopPPtr);
+    }
+    else
+    {
+        for (int bi = 0; bi < batchSize; ++bi)
+        {
+            setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlotsPtr, nullptr, skipDecodePtr, nullptr);
+        }
+    }
 }
 
 } // namespace tensorrt_llm::kernels

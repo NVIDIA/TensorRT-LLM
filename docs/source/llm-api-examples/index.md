@@ -7,14 +7,16 @@ Here is a simple example to show how to use the LLM with TinyLlama.
 ```
 
 The LLM API can be used for both offline or online usage. See more examples of the LLM API here:
-* [LLM Generate](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_generate.html)
-* [LLM Generate Distributed](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_generate_distributed.html)
-* [LLM Generate Async](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_generate_async.html)
-* [LLM Generate Async Streaming](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_generate_async_streaming.html)
+* [LLM Inference](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference.html)
+* [LLM Inference Distributed](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_distributed.html)
+* [LLM Inference Async](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async.html)
+* [LLM Inference Async Streaming](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async_streaming.html)
 * [LLM Quantization](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_quantization.html)
 * [LLM Auto Parallel](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_auto_parallel.html)
 * [LLM Logits Processor](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_logits_processor.html)
-
+* [Automatic Parallelism](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_auto_parallel.html) (in preview)
+* [Generation Async](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async.html)
+* [Generation Async Streamling](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async_streaming.html)
 For more details on how to fully utilize this API, check out:
 
 * [Common customizations](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/customization.html)
@@ -32,6 +34,7 @@ For more details on how to fully utilize this API, check out:
 * Falcon
 * Baichuan-1/2
 * GPT-J
+* Mamba-1/2
 
 ## Model Preparation
 

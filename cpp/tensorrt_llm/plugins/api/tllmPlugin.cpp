@@ -43,6 +43,7 @@
 #include "tensorrt_llm/plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eagleSampleAndAcceptDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
+#include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/quantizePerTokenPlugin/quantizePerTokenPlugin.h"
 #include "tensorrt_llm/plugins/quantizeTensorPlugin/quantizeTensorPlugin.h"
 #include "tensorrt_llm/plugins/rmsnormQuantizationPlugin/rmsnormQuantizationPlugin.h"
@@ -204,6 +205,7 @@ extern "C"
         static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
         static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
         static tensorrt_llm::plugins::LowLatencyGemmPluginCreator lowLatencyGemmPluginCreator;
+        static tensorrt_llm::plugins::LowLatencyGemmSwigluPluginCreator lowLatencyGemmSwigluPluginCreator;
         static tensorrt_llm::plugins::EagleDecodeDraftTokensPluginCreator eagleDecodeDraftTokensPluginCreator;
         static tensorrt_llm::plugins::EagleSampleAndAcceptDraftTokensPluginCreator
             eagleSampleAndAcceptDraftTokensPluginCreator;
@@ -241,7 +243,7 @@ extern "C"
                   creatorPtr(eagleDecodeDraftTokensPluginCreator),
                   creatorPtr(eagleSampleAndAcceptDraftTokensPluginCreator),
                   creatorPtr(eaglePrepareDrafterInputsPluginCreator),
-              };
+                  creatorPtr(lowLatencyGemmSwigluPluginCreator) };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();
     }

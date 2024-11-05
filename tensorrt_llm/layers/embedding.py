@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
-from ..functional import concat, constant, embedding, unsqueeze, where
+from ..functional import constant, embedding, unsqueeze, where
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -82,16 +82,16 @@ class Embedding(Module):
                                       dtype=trt_dtype_to_np(
                                           self.weight.value.dtype))
             padding = constant(padding_values)
-            padded_weight = concat([self.weight.value, padding], dim=0)
         else:
-            padded_weight = self.weight.value
+            padding = None
 
         return embedding(x,
-                         padded_weight,
+                         self.weight.value,
                          tp_size=self.tp_size,
                          tp_group=self.tp_group,
                          sharding_dim=self.sharding_dim,
-                         tp_rank=self.tp_rank)
+                         tp_rank=self.tp_rank,
+                         padding=padding)
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):

@@ -40,12 +40,13 @@ class TopPSamplingLayerTest : public BaseSamplingLayerTest<T>
     void initLayer(TestSamplingParams const& params) override
     {
         auto const decodingDomain
-            = tensorrt_llm::layers::DecoderDomain(this->mMaxBatchSize, 1, this->mVocabSize, this->mVocabSizePadded);
+            = tensorrt_llm::layers::DecoderDomain(this->maxBatchSize(), 1, this->mVocabSize, this->mVocabSizePadded);
         this->mSamplingLayer = std::make_shared<tensorrt_llm::layers::TopPSamplingLayer<T>>(
             decodingDomain, this->mBufferManager, &mDeviceProp);
     }
 
-    struct cudaDeviceProp mDeviceProp;
+protected:
+    cudaDeviceProp mDeviceProp{};
 };
 
 TYPED_TEST_SUITE(TopPSamplingLayerTest, FloatAndHalfTypes);
@@ -162,6 +163,30 @@ TYPED_TEST(TopPSamplingLayerTest, TopPDecay)
         {2, 3}, {2}, {2}, {2}, {2}, {2, 3},                // step 2
         {0, 1, 2}, {0}, {0}, {0}, {0, 1}, {0, 1}           // step 3
     };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(TopPSamplingLayerTest, LargeBatch)
+{
+    SizeType32 topK = 0;
+    float topP = 0.3f;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {topP};
+
+    // Force to use more than 1 block
+    params.batchSize = this->mDeviceProp.maxThreadsPerBlock + 1;
+    std::vector<std::set<int32_t>> expectedOutputId{{4}, {0}, {2}, {0}};
+    std::vector<std::set<int32_t>> expectedOutputIds;
+    expectedOutputIds.reserve(expectedOutputId.size() * params.batchSize);
+
+    for (auto const& id : expectedOutputId)
+    {
+        for (int32_t i = 0; i < params.batchSize; ++i)
+        {
+            expectedOutputIds.emplace_back(id);
+        }
+    }
     this->runTest(expectedOutputIds, params);
 }
 

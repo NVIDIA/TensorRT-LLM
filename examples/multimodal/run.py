@@ -130,8 +130,12 @@ def print_result(model, input_text, output_text, args):
             elif model.model_type == 'kosmos-2':
                 assert 'snowman' in output_text[0][0].lower()
             elif model.model_type == "mllama":
-                assert "it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a" in output_text[
-                    0][0]
+                if "<|image|><|begin_of_text|>If I had to write a haiku for this one" in input_text:
+                    assert "it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a" in output_text[
+                        0][0]
+                elif "The key to life is" in input_text:
+                    assert "to find your passion and pursue it with all your heart." in output_text[
+                        0][0]
             else:
                 assert output_text[0][0].lower() == 'singapore'
 

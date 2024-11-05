@@ -86,7 +86,7 @@ class CrossAttentionTransformerBlock(Module):
         max_distance=0,
         num_buckets=0,
         fp16_clamping=False,
-        skip_cross_qkv=False,
+        skip_cross_kv=False,
         use_implicit_relative_attention=False,
         rotary_embedding_base=None,
         rotary_embedding_scaling=None,
@@ -121,7 +121,7 @@ class CrossAttentionTransformerBlock(Module):
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.
             learned_absolute,  # we don't use rope for cross attn
-            skip_cross_qkv=skip_cross_qkv,
+            skip_cross_kv=skip_cross_kv,
             qk_layernorm=True,
             layernorm_type=layernorm_type,
             layer_idx_in_cache_pool=layer_idx_in_cache_pool,
@@ -164,7 +164,7 @@ class CrossAttentionTransformerBlock(Module):
                 attention_params=None,
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_qkv_reuse: Optional[Tensor] = None,
+                cross_kv_reuse: Optional[Tensor] = None,
                 full_text_row_masked_out_mask: Tensor = None):
         assert isinstance(hidden_states, Tensor)
 
@@ -195,7 +195,7 @@ class CrossAttentionTransformerBlock(Module):
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
             cross_kv_cache_gen=cross_kv_cache_gen,
-            cross_qkv_reuse=cross_qkv_reuse)
+            cross_kv_reuse=cross_kv_reuse)
 
         if use_cache:
             attention_output, presents_cross = attention_output
@@ -279,7 +279,7 @@ class TransformerBlock(Module):
         max_distance=0,
         num_buckets=0,
         fp16_clamping=False,
-        skip_cross_qkv=False,
+        skip_cross_kv=False,
         use_implicit_relative_attention=False,
         rotary_embedding_base=None,
         rotary_embedding_scaling=None,
@@ -353,7 +353,7 @@ class TransformerBlock(Module):
             attention_params=None,
             lora_layer_params=None,
             cross_kv_cache_gen: Optional[Tensor] = None,
-            cross_qkv_reuse: Optional[Tensor] = None,
+            cross_kv_reuse: Optional[Tensor] = None,
             full_text_row_masked_out_mask: Tensor = None,  # not used
     ):
         assert isinstance(hidden_states, Tensor)
@@ -473,7 +473,7 @@ class MLLaMAModel(PretrainedModel):
 
         self.fp16_clamping = False
 
-        self.skip_cross_qkv = self.config.skip_cross_qkv
+        self.skip_cross_kv = self.config.skip_cross_kv
         self.mlp_type = MLPType.MLP if not hasattr(
             self.config, "mlp_type") else self.config.mlp_type
         self.use_implicit_relative_attention = self.config.use_implicit_relative_attention if hasattr(
@@ -518,7 +518,7 @@ class MLLaMAModel(PretrainedModel):
                 "max_distance": self.config.max_distance,
                 "num_buckets": self.config.num_buckets,
                 "fp16_clamping": self.fp16_clamping,
-                "skip_cross_qkv": self.skip_cross_qkv,
+                "skip_cross_kv": self.skip_cross_kv,
                 "rotary_embedding_base": self.config.rotary_base,
                 "rotary_embedding_scaling": self.config.rotary_scaling,
             }
@@ -584,7 +584,7 @@ class MLLaMAModel(PretrainedModel):
         config.set_if_not_exist('has_mlp_bias', False)
         config.set_if_not_exist('has_model_final_layernorm', True)
         config.set_if_not_exist('model_type', 'MLLaMAModel')
-        config.set_if_not_exist('skip_cross_qkv', False)
+        config.set_if_not_exist('skip_cross_kv', False)
         config.set_if_not_exist('mlp_type', MLPType.GatedMLP)
         config.set_if_not_exist('has_embedding_scale', False)
         config.set_if_not_exist('residual_scaling', 1.0)
@@ -606,7 +606,7 @@ class MLLaMAModel(PretrainedModel):
         hidden_states=None,
         lora_params: LoraParams = None,
         cross_kv_cache_gen: Optional[Tensor] = None,
-        cross_qkv_reuse: Optional[Tensor] = None,
+        cross_kv_reuse: Optional[Tensor] = None,
         prompt_embedding_table: Optional[Tensor] = None,
         prompt_tasks: Optional[Tensor] = None,
         prompt_vocab_size: Optional[Tensor] = None,
@@ -684,7 +684,7 @@ class MLLaMAModel(PretrainedModel):
                 attention_params=attention_params,
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
-                cross_qkv_reuse=cross_qkv_reuse,
+                cross_kv_reuse=cross_kv_reuse,
                 full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             )
 
@@ -901,6 +901,7 @@ class MLLaMAModel(PretrainedModel):
         host_context_lengths = None
         host_request_types = None
         host_runtime_perf_knobs = None
+        host_context_progress = None
         if use_gpt_attention_plugin and remove_input_padding:
             host_context_lengths = Tensor(name='host_context_lengths',
                                           dtype=trt.int32,
@@ -947,6 +948,13 @@ class MLLaMAModel(PretrainedModel):
                                              dim_range=OrderedDict([
                                                  ('perf_knob_size', [16])
                                              ]))
+
+            host_context_progress = Tensor(name='host_context_progress',
+                                           dtype=trt.int64,
+                                           shape=[1],
+                                           dim_range=OrderedDict([
+                                               ('context_progress_size', [1])
+                                           ]))
 
         last_token_ids = None
         if self.mapping.is_last_pp_rank() and not gather_context_logits:
@@ -1282,6 +1290,7 @@ class MLLaMAModel(PretrainedModel):
                 max_context_length=max_decoder_input_len,
                 host_request_types=host_request_types,
                 host_runtime_perf_knobs=host_runtime_perf_knobs,
+                host_context_progress=host_context_progress,
                 encoder_input_lengths=encoder_input_lengths,
                 encoder_max_input_length=encoder_max_input_length,
             )
@@ -1292,30 +1301,30 @@ class MLLaMAModel(PretrainedModel):
                                     dim_range=OrderedDict([
                                         ('boolean', [1]),
                                     ]))
-        cross_qkv_reuse = None
+        cross_kv_reuse = None
         num_heads = (self.num_heads + self.mapping.tp_size -
                      1) // self.mapping.tp_size
-        cross_qkv_out_dim = num_heads * self.head_size + 2 * num_kv_heads * self.head_size
-        if self.skip_cross_qkv:
+        cross_kv_out_dim = 2 * num_kv_heads * self.head_size
+        if self.skip_cross_kv:
             if remove_input_padding:
-                cross_qkv_reuse = Tensor(
-                    name="cross_qkv_reuse",
+                cross_kv_reuse = Tensor(
+                    name="cross_kv_reuse",
                     dtype=self._dtype,
-                    shape=[-1, cross_qkv_out_dim],
+                    shape=[-1, cross_kv_out_dim],
                     dim_range=OrderedDict([
                         ("encoder_num_tokens", [encoder_num_tokens_range]),
-                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                        ("encoder_kv_size", [cross_kv_out_dim]),
                     ]),
                 )
             else:
-                cross_qkv_reuse = Tensor(
-                    name="cross_qkv_reuse",
+                cross_kv_reuse = Tensor(
+                    name="cross_kv_reuse",
                     dtype=self._dtype,
-                    shape=[-1, -1, cross_qkv_out_dim],
+                    shape=[-1, -1, cross_kv_out_dim],
                     dim_range=OrderedDict([
                         ("batch_size_beam_width_encoder", [bb_range]),
                         ("encoder_input_len", [encoder_input_len_range]),
-                        ("encoder_qkv_size", [cross_qkv_out_dim]),
+                        ("encoder_kv_size", [cross_kv_out_dim]),
                     ]),
                 )
 
@@ -1374,7 +1383,7 @@ class MLLaMAModel(PretrainedModel):
             'hidden_states': hidden_states,
             'lora_params': lora_params,
             'cross_kv_cache_gen': cross_kv_cache_gen,
-            'cross_qkv_reuse': cross_qkv_reuse,
+            'cross_kv_reuse': cross_kv_reuse,
             'prompt_embedding_table': prompt_embedding_table,
             'prompt_tasks': tasks,
             'prompt_vocab_size': prompt_vocab_size,

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import io
 import os
@@ -7,7 +8,7 @@ import threading
 import traceback
 import weakref
 from dataclasses import dataclass, field
-from functools import wraps
+from functools import cache, wraps
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, List, Optional, Tuple, Union
@@ -41,26 +42,25 @@ class SamplingParams:
     Sampling parameters for text generation.
 
     Args:
-        end_id (int): The end token id.
-        pad_id (int): The pad token id.
-        max_tokens (int): The maximum number of tokens to generate.
-        max_new_tokens (int): The maximum number of tokens to generate. This argument is being deprecated; please use max_tokens instead.
-        bad (Union[str, List[str]]): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output.
-        bad_token_ids (List[int]): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output.
-        stop (Union[str, List[str]]): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True.
-        stop_token_ids (List[int]): A list of token ids that stop the generation when they are generated.
+        end_id (int, optional): The end token id. Defaults to None.
+        pad_id (int, optional): The pad token id. Defaults to None.
+        max_tokens (int): The maximum number of tokens to generate. Defaults to 32.
+        max_new_tokens (int, optional): The maximum number of tokens to generate. This argument is being deprecated; please use max_tokens instead. Defaults to None.
+        bad (str, List[str], optional): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output. Defaults to None.
+        bad_token_ids (List[int], optional): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Defaults to None.
+        stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
+        stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
-        embedding_bias (torch.Tensor): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size].
-        external_draft_tokens_config (ExternalDraftTokensConfig): The speculative decoding configuration.
-        logits_post_processor_name (str): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig.
+        embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
+        external_draft_tokens_config (ExternalDraftTokensConfig, optional): The speculative decoding configuration. Defaults to None.
+        logits_post_processor_name (str, optional): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig. Defaults to None.
 
+        n (int): Number of sequences to generate. Defaults to 1.
+        best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
+        use_beam_search (bool): Whether to use beam search. Defaults to False.
 
-        n (int): Number of sequences to generate.
-        best_of (int): Number of sequences to consider for best output.
-        use_beam_search (bool): Whether to use beam search.
-
-        beam_width (int): The beam width. Default is 1 which disables beam search. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead.
-        num_return_sequences (int): The number of sequences to return. If set to None, it defaults to the value of `beam_width`. The default is None. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead.
+        beam_width (int): The beam width. Setting 1 disables beam search. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to 1.
+        num_return_sequences (int, optional): The number of sequences to return. If set to None, it defaults to the value of `beam_width`. The default is None. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to None.
 
         top_k (int): Controls number of logits to sample from. Default is 0 (all logits).
         top_p (float): Controls the top-P probability to sample from. Default is 0.f
@@ -86,12 +86,12 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
 
-        ignore_eos (bool, default=False): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated.
-        detokenize (bool, default=True): Whether to detokenize the output.
-        add_special_tokens (bool, default=True): Whether to add special tokens to the prompt.
-        truncate_prompt_tokens (Optional[int], default=None): If set to an integer k, will use only the last k tokens from the prompt (i.e., left truncation).
-        skip_special_tokens (bool, default=True): Whether to skip special tokens in the output.
-        spaces_between_special_tokens (bool, default=True): Whether to add spaces between special tokens in the output.
+        ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
+        detokenize (bool): Whether to detokenize the output. Defaults to True.
+        add_special_tokens (bool): Whether to add special tokens to the prompt. Defaults to True.
+        truncate_prompt_tokens (int, optional): If set to an integer k, will use only the last k tokens from the prompt (i.e., left truncation). Defaults to None.
+        skip_special_tokens (bool): Whether to skip special tokens in the output. Defaults to True.
+        spaces_between_special_tokens (bool): Whether to add spaces between special tokens in the output. Defaults to True.
     """
     # [TO DEVELOPER] This class provides an interface to LLMAPI users.
     # Internally, it manages and dispatches fields to Python bindings of C++ objects, currently including:
@@ -569,7 +569,8 @@ class ManagedThread(threading.Thread):
 
     Args:
         task (Callable[..., bool]): The task to run repeatedly in the thread, should return False if break the loop.
-        error_queue (Queue): The queue to put exceptions into if the task fails
+        error_queue (Queue): The queue to put exceptions into if the task fails.
+        name (str): The name of the thread.
         **kwargs: The arguments to pass to the task
     """
 
@@ -603,6 +604,97 @@ class ManagedThread(threading.Thread):
         self.stop_event.set()
 
 
+@cache
 def enable_llm_debug() -> bool:
     ''' Tell whether to enable the debug mode for LLM class.  '''
     return os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
+
+
+class AsyncQueue:
+    '''
+    AsyncQueue is container containing `async_q` for `async get` and `sync_q` for sync `get`.
+    This is used to provide a compatible interface for janus.Queue.
+    '''
+
+    class EventLoopShutdownError(Exception):
+        pass
+
+    def __init__(self):
+        self._q = Queue()
+        self.async_q = _AsyncQueue(self._q)
+        self.sync_q = _SyncQueue(self._q, self.async_q._event)
+
+
+class _SyncQueue:
+    '''
+    A simplified Queue that provides a `get` method that is compatible with the asyncio event loop.
+    '''
+
+    def __init__(self,
+                 queue: Queue,
+                 event: asyncio.Event,
+                 loop: Optional[asyncio.AbstractEventLoop] = None):
+        self._q = queue
+        self._event = event
+        self._loop = loop or asyncio.get_event_loop()
+
+    def put(self, item) -> None:
+
+        async def _set_event(event):
+            event.set()
+
+        self._q.put_nowait(item)
+
+        if self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(_set_event(self._event),
+                                             self._loop)
+        else:
+            raise AsyncQueue.EventLoopShutdownError
+
+    def put_nowait(self, item) -> None:
+        ''' Put item without notify the event. '''
+        self._q.put_nowait(item)
+
+    @staticmethod
+    def notify_events(loop: asyncio.AbstractEventLoop,
+                      events: List[asyncio.Event]) -> None:
+        ''' Notify the events in the loop. '''
+
+        async def _set_events(events):
+            for event in events:
+                event.set()
+
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_set_events(events), loop)
+        else:
+            raise AsyncQueue.EventLoopShutdownError
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        return self._loop
+
+    @property
+    def event(self) -> asyncio.Event:
+        return self._event
+
+    def full(self) -> bool:
+        return self._q.full()
+
+
+class _AsyncQueue:
+    '''
+    A simplified asyncio.Queue that provides a `get` method that is compatible with the standard library Queue.
+    '''
+
+    def __init__(self, queue: Queue):
+        self._event = asyncio.Event()
+        self._q = queue
+
+    async def get(self, timeout=None):
+        # This may raise asyncio.TimeoutError
+        await asyncio.wait_for(self._event.wait(), timeout=timeout)
+
+        res = self._q.get()
+        if self._q.empty():
+            self._event.clear()
+        return res

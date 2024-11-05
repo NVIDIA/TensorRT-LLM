@@ -16,6 +16,7 @@
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -23,6 +24,7 @@
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+#include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 #include <algorithm>
 #include <cassert>
@@ -437,8 +439,8 @@ void GptDecoderBatched::setupSpeculativeDecoding(ModelConfig const& modelConfig)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::newRequest(
-    SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig)
+void GptDecoderBatched::newRequest(SizeType32 batchSlot, decoder_batch::Request const& request,
+    SamplingConfig const& samplingConfig, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(batchSlot >= 0);
@@ -577,7 +579,7 @@ void GptDecoderBatched::newRequest(
     if (numDecodingEngineTokens > 1)
     {
         TLLM_CHECK(beamWidth == 1);
-        newRequestSpeculativeDecoding(batchSlot, request, samplingConfig);
+        newRequestSpeculativeDecoding(batchSlot, request, samplingConfig, modelConfig);
     }
 
     // remaining
@@ -598,8 +600,8 @@ void GptDecoderBatched::newRequest(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::newRequestSpeculativeDecoding(
-    SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig)
+void GptDecoderBatched::newRequestSpeculativeDecoding(SizeType32 batchIdx, decoder_batch::Request const& request,
+    SamplingConfig const& samplingConfig, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -640,7 +642,7 @@ void GptDecoderBatched::newRequestSpeculativeDecoding(
     }
     else if (mSpeculativeDecodingMode.isEagle())
     {
-        newRequestEagle(batchIdx, request);
+        newRequestEagle(batchIdx, request, modelConfig);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -753,13 +755,51 @@ void GptDecoderBatched::newRequestExplicitDraftTokens(SizeType32 batchIdx, decod
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::newRequestEagle(SizeType32 batchIdx, decoder_batch::Request const& request)
+void GptDecoderBatched::newRequestEagle(
+    SizeType32 batchIdx, decoder_batch::Request const& request, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(mJointDecodingOutput->eagleBuffers);
 
-    // TODO fill me
+    auto& stream = mRuntimeStream;
+    BufferManager manager{stream};
+
+    TensorPtr eagleNetCtxRequestTypesHostSlice
+        = ITensor::slice(mJointDecodingOutput->eagleBuffers->eagleNetCtxRequestTypesHost, batchIdx, 1);
+    TensorPtr eagleNetCtxContextLengthsHostSlice
+        = ITensor::slice(mJointDecodingOutput->eagleBuffers->eagleNetCtxContextLengthsHost, batchIdx, 1);
+    TensorPtr eagleNetCtxPastKeyValueLengthsHostSlice
+        = ITensor::slice(mJointDecodingOutput->eagleBuffers->eagleNetCtxPastKeyValueLengthsHost, batchIdx, 1);
+
+    bufferCast<SizeType32>(*eagleNetCtxRequestTypesHostSlice)[0] = 0;
+    bufferCast<SizeType32>(*eagleNetCtxContextLengthsHostSlice)[0] = request.inputLen;
+    bufferCast<SizeType32>(*eagleNetCtxPastKeyValueLengthsHostSlice)[0] = request.inputLen;
+
+    TensorPtr eagleNetGenRequestTypesHostSlice
+        = ITensor::slice(mJointDecodingOutput->eagleBuffers->eagleNetGenRequestTypesHost, batchIdx, 1);
+    TensorPtr eagleNetGenContextLengthsHostSlice
+        = ITensor::slice(mJointDecodingOutput->eagleBuffers->eagleNetGenContextLengthsHost, batchIdx, 1);
+    TensorPtr eagleNetGenPastKeyValueLengthsHostSlice
+        = ITensor::slice(mJointDecodingOutput->eagleBuffers->eagleNetGenPastKeyValueLengthsHost, batchIdx, 1);
+
+    bufferCast<SizeType32>(*eagleNetGenRequestTypesHostSlice)[0] = 1;
+    bufferCast<SizeType32>(*eagleNetGenContextLengthsHostSlice)[0] = request.inputLen;
+    bufferCast<SizeType32>(*eagleNetGenPastKeyValueLengthsHostSlice)[0] = request.inputLen;
+
+    auto const eagleModule = std::dynamic_pointer_cast<tensorrt_llm::runtime::EagleModule const>(
+        modelConfig.getSpeculativeDecodingModulePtr());
+    std::optional<executor::EagleChoices> eagleChoicesOpt;
+    if (request.eagleConfig)
+    {
+        eagleChoicesOpt = request.eagleConfig->getEagleChoices();
+    }
+
+    std::vector<SizeType32> topKs;
+    TensorPtr draftPathsSlice = ITensor::slice(mJointDecodingOutput->eagleBuffers->draftPaths, batchIdx, 1);
+    utils::initTensorsFromChoices(modelConfig.getSpeculativeDecodingModule(),
+        eagleChoicesOpt.value_or(eagleModule->getDefaultEagleChoices()), topKs, nullptr, nullptr, nullptr,
+        draftPathsSlice, nullptr);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -796,13 +836,22 @@ void GptDecoderBatched::setEagleInputs(decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // TODO fill me
+    TLLM_CHECK(input.eagleInputs.has_value());
+    TLLM_CHECK(input.eagleLastInputs.has_value());
+
+    auto eagleInputs = DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens, input.eagleInputs->nextDraftLens,
+        input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens, input.eagleLastInputs->draftLens,
+        input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens, input.eagleInputs->acceptedLens,
+        input.eagleInputs->acceptedPaths, input.seqSlots);
+
+    mJointDecodingInput->eagleInputs = eagleInputs;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptDecoderBatched::newRequests(std::vector<SizeType32> const& seqSlots,
-    std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs)
+    std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs,
+    ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -810,7 +859,7 @@ void GptDecoderBatched::newRequests(std::vector<SizeType32> const& seqSlots,
     SizeType32 const localBatchSize = seqSlots.size();
     for (SizeType32 bi = 0; bi < localBatchSize; ++bi)
     {
-        newRequest(seqSlots[bi], requests[bi], samplingConfigs[bi]);
+        newRequest(seqSlots[bi], requests[bi], samplingConfigs[bi], modelConfig);
         batchSlotsPtr[bi] = seqSlots[bi];
     }
 
@@ -1097,8 +1146,8 @@ CudaEvent GptDecoderBatched::postProcessRequest(
     return event;
 }
 
-void GptDecoderBatched::newBatch(
-    GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
+void GptDecoderBatched::newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
+    SamplingConfig const& samplingConfig, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // split batch into single requests
@@ -1174,7 +1223,7 @@ void GptDecoderBatched::newBatch(
         auto requestSamplingConfig = extractSamplingConfig(samplingConfig, batchIdx);
         requestSamplingConfig.cumLogProbs = {{outputs.cumLogProbs != nullptr}};
         requestSamplingConfig.outputLogProbs = {{outputs.logProbs != nullptr}};
-        newRequest(batchIdx, request, requestSamplingConfig);
+        newRequest(batchIdx, request, requestSamplingConfig, modelConfig);
         samplingConfigs.push_back(requestSamplingConfig);
     }
 

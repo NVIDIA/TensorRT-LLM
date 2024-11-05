@@ -174,6 +174,16 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         externalDraftTokensParams->runtimeTopP = mSamplingConfig.topP;
         setupParams->decodingParams = std::move(externalDraftTokensParams);
     }
+    else if (mDecodingMode.isEagle())
+    {
+        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Eagle");
+        auto eagleParams = std::make_shared<tl::EagleSetupParams>();
+        eagleParams->temperature = mSamplingConfig.temperature;
+        eagleParams->randomDataSample = output->eagleBuffers->randomDataSample;
+        eagleParams->temperatures = output->eagleBuffers->temperatures;
+
+        setupParams->decodingParams = eagleParams;
+    }
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
     mDecodingLayerWorkspace->setDeviceBatchSlots(batchSlots);
@@ -355,9 +365,21 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams = std::make_shared<tl::ExternalDraftTokensInputs>(
             input.endIds, input.batchSlots, input.step, ite, input.batchSize);
     }
+    else if (decodingMode.isEagle())
+    {
+        auto& eagleInputs = input.eagleInputs;
 
-    // No logits for explicit draft tokens
-    if (!decodingMode.isExplicitDraftTokens())
+        TLLM_CHECK_WITH_INFO(eagleInputs.has_value(), "EagleInputs are not set");
+
+        forwardParams = std::make_shared<tl::EagleInputs>(input.endIds, input.batchSlots, input.batchSize,
+            eagleInputs->nextDraftTokens, eagleInputs->nextDraftLens, eagleInputs->nextDraftPaths,
+            eagleInputs->lastDraftTokens, eagleInputs->lastDraftLens, eagleInputs->lastDraftPaths,
+            eagleInputs->acceptedTokens, eagleInputs->acceptedLens, eagleInputs->acceptedPathIds,
+            eagleInputs->seqSlots);
+    }
+
+    // No logits for explicit draft tokens and eagle
+    if (!decodingMode.isExplicitDraftTokens() && !decodingMode.isEagle())
     {
         if (input.logitsVec)
         {
@@ -517,7 +539,7 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         outputParams->generationLengthsHost = explicitDraftTokensBuffers->generationLengthsHost;
         outputParams->maxGenLengthHost = explicitDraftTokensBuffers->maxGenLengthHost;
     }
-    if (decodingMode.isLookahead())
+    else if (decodingMode.isLookahead())
     {
         TLLM_CHECK(output.lookaheadOutputs);
         auto outputParams = std::dynamic_pointer_cast<tl::LookaheadDecodingOutputs>(baseOutputs);
@@ -525,6 +547,14 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         outputParams->positionIds = output.lookaheadOutputs->positionIds;
         outputParams->positionOffsets = output.lookaheadOutputs->positionOffsets;
         outputParams->generationLengths = output.lookaheadOutputs->generationLengths;
+    }
+    else if (decodingMode.isEagle())
+    {
+        auto outputParams = std::dynamic_pointer_cast<tl::EagleOutputs>(baseOutputs);
+        auto const& eagleBuffers = output.eagleBuffers;
+        TLLM_CHECK_WITH_INFO(eagleBuffers.has_value(), "eagleBuffers is not set");
+
+        TLLM_THROW("Not implemented");
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -550,6 +580,10 @@ std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(DecodingOutput& output, 
     else if (decodingMode.isExplicitDraftTokens())
     {
         outputParams = std::make_shared<tl::ExplicitDraftTokensOutputs>(output.ids);
+    }
+    else if (decodingMode.isEagle())
+    {
+        outputParams = std::make_shared<tl::EagleOutputs>(output.ids);
     }
     else
     {
@@ -597,7 +631,8 @@ std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(DecodingOutput& output, 
     }
 
     // Speculative decoding outputs
-    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens())
+    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens()
+        || decodingMode.isEagle())
     {
         prepareSpeculativeDecodingOutputs(output, outputParams, decodingMode);
     }

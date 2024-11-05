@@ -38,7 +38,14 @@ bool canAccessPeer(WorldConfig const& worldConfig)
     for (SizeType32 rank : worldConfig.getTensorParallelGroup())
     {
         SizeType32 destDevice = worldConfig.getDeviceOf(rank);
-        if (worldConfig.getNodeRankOf(rank) != worldConfig.getNodeRank() || destDevice == srcDevice)
+        if (worldConfig.getNodeRankOf(rank) != worldConfig.getNodeRank())
+        {
+            TLLM_LOG_INFO("Detect inter-node TP between rank %d and rank %d, fail to access peer GPU memory",
+                worldConfig.getRank(), rank);
+            TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+            return false;
+        }
+        if (destDevice == srcDevice)
         {
             continue;
         }
@@ -177,7 +184,9 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
 #if ENABLE_MULTI_DEVICE
     auto rank = worldConfig.getRank();
     auto tp_rank = worldConfig.getTensorParallelRank();
-    if (rank == tp_rank)
+    // When p2p is not supported all the mIpcMemoryHandles are
+    // null
+    if (rank == tp_rank && isP2pSupported)
     {
         tensorrt_llm::kernels::lamportInitialize(
             mIpcMemoryHandles[4].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);

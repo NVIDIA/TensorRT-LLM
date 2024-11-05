@@ -13,6 +13,7 @@ import filelock
 
 import tensorrt_llm
 from tensorrt_llm import BuildConfig
+from tensorrt_llm.llmapi.utils import enable_llm_debug, print_colored
 from tensorrt_llm.logger import logger
 
 
@@ -282,6 +283,8 @@ class CachedStage:
         self.parent.prune_caches(has_incoming_record=True)
 
         target_dir = self.get_cache_path()
+        if enable_llm_debug():
+            print_colored(f"Writing cache to {target_dir}\n", "yellow")
 
         # To avoid the cache modification conflict, a dummy directory is used to write the cache, and then rename it to
         # the target directory

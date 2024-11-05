@@ -87,8 +87,11 @@ class TestPPReduceScatter(unittest.TestCase):
         if self.world_size == 1 or pp_size > self.world_size:
             pytest.skip("Skip single GPU and pp_size > world_size case")
         tp_size = self.world_size // pp_size
-        mapping = Mapping(self.world_size, self.rank, self.world_size, 1,
-                          tp_size, pp_size)
+        mapping = Mapping(self.world_size,
+                          self.rank,
+                          self.world_size,
+                          tp_size=tp_size,
+                          pp_size=pp_size)
 
         size = token_num * hidden_size  # tensor size
         torch_dtype = tllm._utils.str_dtype_to_torch(dtype)

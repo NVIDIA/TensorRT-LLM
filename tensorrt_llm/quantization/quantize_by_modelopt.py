@@ -140,7 +140,7 @@ class _CustomDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = {
-            key: torch.tensor(val[idx])
+            key: val[idx].clone().detach().requires_grad_(False)
             for key, val in self.encodings.items()
         }
         return item
@@ -194,11 +194,20 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         raise NotImplementedError(f"Unknown dtype {dtype}")
 
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
-    hf_config = AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
+    if "mpt" in ckpt_path:
+        # MPT-7B cannot get initialized from AutoConfig
+        from transformers import MptConfig
+        hf_config = MptConfig.from_pretrained(ckpt_path)
+    else:
+        hf_config = AutoConfig.from_pretrained(ckpt_path,
+                                               trust_remote_code=True)
     model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
         model_cls = LlavaForConditionalGeneration
+    elif hf_config.model_type == "mpt":
+        from transformers import MptForCausalLM
+        model_cls = MptForCausalLM
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     elif hf_config.model_type == "glm":
@@ -213,7 +222,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
             device_map="auto" if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
-        if hf_config.model_type == "llava":
+        if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
     model.eval()
 

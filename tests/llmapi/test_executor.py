@@ -2,6 +2,7 @@ import asyncio
 import json
 import os as _os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,8 @@ import torch
 
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (GenerationExecutor, GenerationRequest,
-                                   SamplingParams)
+from tensorrt_llm.executor import (FusedIpcQueue, GenerationExecutor,
+                                   GenerationRequest, SamplingParams)
 from tensorrt_llm.llmapi import LLM, BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 
@@ -210,3 +211,35 @@ def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     stats = executor.get_stats()
     assert json.loads(stats)["iter"] == 1
     executor.shutdown()
+
+
+def test_FusedIpcQueue():
+    producer_queue = FusedIpcQueue(is_server=True)
+    consumer_queue = FusedIpcQueue(is_server=False,
+                                   address=producer_queue.address)
+
+    def producer(queue: FusedIpcQueue, n: int):
+        for i in range(n):
+            queue.put(i)
+        queue.put(None)
+
+    def consumer(queue: FusedIpcQueue):
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            print(f"consumer got {item}")
+
+    producer_thread = threading.Thread(target=producer,
+                                       args=(producer_queue, 10))
+    consumer_thread = threading.Thread(target=consumer, args=(consumer_queue, ))
+
+    producer_thread.start()
+    consumer_thread.start()
+
+    producer_thread.join()
+    consumer_thread.join()
+
+
+if __name__ == '__main__':
+    test_FusedIpcQueue()

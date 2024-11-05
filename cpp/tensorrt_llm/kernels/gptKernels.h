@@ -57,6 +57,8 @@ enum class PositionEmbeddingType : int8_t
     // Workflow: (bmm1_output + alibi) * scale_bmm1.
     kALIBI_WITH_SCALE = 5,
     kRELATIVE = 6,
+    kCHATGLM = 7,
+    kYARN = 8,
 };
 
 enum class RotaryScalingType : int8_t

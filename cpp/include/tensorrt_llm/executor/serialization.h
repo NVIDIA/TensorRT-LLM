@@ -154,6 +154,11 @@ public:
     static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
     static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
 
+    // EagleConfig
+    static EagleConfig deserializeEagleConfig(std::istream& is);
+    static void serialize(EagleConfig const& eagleConfig, std::ostream& os);
+    static size_t serializedSize(EagleConfig const& eagleConfig);
+
     // KvCacheRetentionConfig
     static KvCacheRetentionConfig deserializeKvCacheRetentionConfig(std::istream& is);
     static void serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os);

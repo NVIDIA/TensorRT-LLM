@@ -467,18 +467,37 @@ def convert_hf_qwen(hf_model,
     tik = time.time()
     tensor_parallel = mapping.tp_size
     model_params = dict(hf_model.named_parameters())
+
     dtype = getattr(torch, dtype)
-    num_attention_heads = hf_model.config.num_attention_heads
-    hidden_size = hf_model.config.hidden_size
+    hf_config = hf_model.config
+    if hasattr(hf_config, 'llm_config'):
+        hf_config = hf_config.llm_config
+
+    #This is for InternVL2 - 1B
+    keys_to_rename = [
+        key for key in model_params.keys() if 'language_model.' in key
+    ]
+    keys_to_delete = [
+        key for key in model_params.keys() if 'vision_model.' in key
+    ]
+    for key in keys_to_rename:
+        keys_rename = key.replace('language_model.', '')
+        model_params[keys_rename] = model_params[key]
+        del model_params[key]
+    for key in keys_to_delete:
+        del model_params[key]
+
+    num_attention_heads = hf_config.num_attention_heads
+    hidden_size = hf_config.hidden_size
     head_size = hidden_size // num_attention_heads
     if qwen_type == 'qwen':
-        intermediate_size = hf_model.config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
+        intermediate_size = hf_config.intermediate_size // 2  # Qwen version 1 has actual intermediate_size one half of what's in hf_config
     else:
-        intermediate_size = hf_model.config.intermediate_size
-    num_key_value_heads = hf_model.config.num_key_value_heads if hasattr(
-        hf_model.config, "num_key_value_heads") else num_attention_heads
+        intermediate_size = hf_config.intermediate_size
+    num_key_value_heads = hf_config.num_key_value_heads if hasattr(
+        hf_config, "num_key_value_heads") else num_attention_heads
     mha_mode = (num_key_value_heads == num_attention_heads)
-    layers_range = mapping.pp_layers(hf_model.config.num_hidden_layers)
+    layers_range = mapping.pp_layers(hf_config.num_hidden_layers)
 
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)
@@ -841,7 +860,7 @@ def convert_hf_qwen(hf_model,
     v = get_weight(model_params, key_list[7], dtype)
 
     if mapping.is_last_pp_rank():
-        if hf_model.config.tie_word_embeddings:
+        if hf_config.tie_word_embeddings:
             # lm_head.weight has the same weights as embedding
             lm_head_weights = v.clone()
         else:

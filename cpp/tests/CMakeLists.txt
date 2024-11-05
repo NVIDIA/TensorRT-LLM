@@ -90,6 +90,7 @@ add_gtest(quantizationTest common/quantizationTest.cpp)
 add_gtest(stringUtilsTest common/stringUtilsTest.cpp)
 add_gtest(tllmExceptionTest common/tllmExceptionTest.cpp)
 add_gtest(cudaUtilsTest common/cudaUtilsTest.cpp)
+add_gtest(optionalRefTest common/optionalRefTest.cpp)
 add_gtest(stlUtilsTest common/stlUtilsTest.cpp)
 add_gtest(cudaProfilerUtilsTest common/cudaProfilerUtilsTest.cpp)
 add_gtest(timestampUtilsTest common/timestampUtilsTest.cpp)
@@ -141,6 +142,7 @@ add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 add_gtest(dynamicDecodeLayerTest layers/dynamicDecodeLayerTest.cpp)
 add_gtest(layerUtilsTest layers/layerUtilsTest.cpp)
 add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
+add_gtest(explicitDraftTokensLayerTest layers/explicitDraftTokensLayerTest.cpp)
 set(LOOKAHEAD_POOLMANAGER_TEST_SRC layers/randomLlm.cpp
                                    layers/lookaheadPoolManagerTest.cpp)
 add_gtest(lookaheadPoolManagerTest "${LOOKAHEAD_POOLMANAGER_TEST_SRC}")
@@ -150,10 +152,10 @@ add_gtest(lookaheadAlgorithmTest "${LOOKAHEAD_ALGORITHM_TEST_SRC}")
 set(LOOKAHEAD_RANDOMLLM_TEST_SRC layers/randomLlm.cpp
                                  layers/lookaheadRandomLlmTest.cpp)
 add_gtest(lookaheadRandomLlmTest "${LOOKAHEAD_RANDOMLLM_TEST_SRC}")
-add_gtest(explicitDraftTokensLayerTest layers/explicitDraftTokensLayerTest.cpp)
 set(LOOKAHEAD_DECODING_TEST_SRC layers/randomLlm.cpp
                                 layers/lookaheadDecodingLayerTest.cpp)
 add_gtest(lookaheadDecodingLayerTest "${LOOKAHEAD_DECODING_TEST_SRC}")
+add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest

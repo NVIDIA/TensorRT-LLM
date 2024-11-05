@@ -52,7 +52,7 @@ def read_config(config_path: Path):
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     cross_attention = pretrained_config["architecture"] == "DecoderModel"
-    skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
+    skip_cross_kv = pretrained_config.get('skip_cross_kv', False)
     has_position_embedding = pretrained_config["has_position_embedding"]
     has_token_type_embedding = hasattr(pretrained_config, "type_vocab_size")
     dtype = pretrained_config["dtype"]
@@ -92,7 +92,7 @@ def read_config(config_path: Path):
         lora_target_modules=lora_config.get('lora_target_modules'),
         trtllm_modules_to_hf_modules=lora_config.get(
             'trtllm_modules_to_hf_modules'),
-        skip_cross_qkv=skip_cross_qkv,
+        skip_cross_kv=skip_cross_kv,
     )
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype

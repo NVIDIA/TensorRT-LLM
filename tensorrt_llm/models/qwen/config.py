@@ -84,6 +84,8 @@ class QWenConfig(PretrainedConfig):
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_dir, trust_remote_code=trust_remote_code)
+        if hasattr(hf_config, 'llm_config'):
+            hf_config = hf_config.llm_config
 
         qwen_type = hf_config.model_type
         valid_types = ('qwen', 'qwen2', 'qwen2_moe')
@@ -129,6 +131,7 @@ class QWenConfig(PretrainedConfig):
                 dtype = torch_dtype_to_str(dtype)
             if dtype == 'float32':
                 dtype = 'float16'
+        tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -156,4 +159,5 @@ class QWenConfig(PretrainedConfig):
             mapping=mapping,
             quantization=quant_config,
             num_labels=num_labels,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs)

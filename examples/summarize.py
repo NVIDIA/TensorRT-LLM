@@ -576,6 +576,10 @@ def main(args):
             auto_model_cls = AutoModel
         else:
             auto_model_cls = AutoModelForCausalLM
+        # TODO: args.hf_device_map_auto is not being correctly set
+        # remove in future version
+        if model_name == 'DeepseekV2ForCausalLM':
+            args.hf_device_map_auto = True
         model = auto_model_cls.from_pretrained(
             args.hf_model_dir,
             trust_remote_code=True,

@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/tensor.h"
-#include "tensorrt_llm/pybind/utils/pathCaster.h"
 
 #include <pybind11/chrono.h>
 #include <pybind11/numpy.h>

@@ -20,6 +20,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.llmapi.openai_protocol import (
     ChatCompletionLogProbs, ChatCompletionLogProbsContent,
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
@@ -251,6 +252,7 @@ class OpenaiServer:
                     choices=[], model=self.model, usage=final_usage)
                 final_usage_data = final_usage_chunk.model_dump_json()
                 yield f"data: {final_usage_data}\n\n"
+            yield f"data: [DONE]\n\n"
 
         async def create_chat_response(promise: RequestOutput) -> JSONResponse:
             await promise.aresult()
@@ -466,6 +468,7 @@ class OpenaiServer:
 @click.option("--tp_size", type=int, default=1)
 @click.option("--pp_size", type=int, default=1)
 @click.option("--kv_cache_free_gpu_memory_fraction", type=float, default=0.8)
+@click.option("--trust_remote_code", is_flag=True, default=False)
 def entrypoint(model_dir: str,
                tokenizer: Optional[str] = None,
                host: Optional[str] = None,
@@ -474,7 +477,8 @@ def entrypoint(model_dir: str,
                max_seq_len: int = 512,
                tp_size: int = 1,
                pp_size: int = 1,
-               kv_cache_free_gpu_memory_fraction: float = 0.8):
+               kv_cache_free_gpu_memory_fraction: float = 0.8,
+               trust_remote_code: bool = False):
     host = host or "0.0.0.0"
     port = port or 8000
     logging.info(f"Starting server at {host}:{port}")
@@ -483,12 +487,17 @@ def entrypoint(model_dir: str,
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
 
-    llm = LLM(model_dir,
-              tokenizer,
-              tensor_parallel_size=tp_size,
-              pipeline_parallel_size=pp_size,
-              build_config=build_config,
-              kv_cache_config=kv_cache_config)
+    llm_args = LlmArgs.from_kwargs(
+        model=model_dir,
+        tokenizer=tokenizer,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        trust_remote_code=trust_remote_code,
+        build_config=build_config,
+        kv_cache_config=kv_cache_config,
+    )
+
+    llm = LLM(**llm_args.to_dict())
 
     hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_dir)
 

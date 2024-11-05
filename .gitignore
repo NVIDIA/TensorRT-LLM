@@ -29,15 +29,15 @@ dump*/
 config.json
 /*.svg
 cpp/cmake-build-*
-cpp/.ccache/
+cpp/.ccache
 tensorrt_llm/bin
 tensorrt_llm/libs
 tensorrt_llm/bindings.*.so
 tensorrt_llm/bindings.pyi
-tensorrt_llm/bindings/*.pyi
+tensorrt_llm/bindings/**/*.pyi
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
-docs/source/llm-api
+docs/source/llm-api/*.rst
 docs/source/llm-api-examples/llm_*.rst
 *.swp
 

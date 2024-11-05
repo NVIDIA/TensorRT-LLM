@@ -72,6 +72,10 @@ public:
     // explicit draft tokens data.
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
     std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
+
+    // eagle data
+    std::optional<EagleBuffers::EngineOutputs> eagleInputs;
+    std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
 using Output = decoder::Output;
@@ -166,7 +170,8 @@ public:
 
     //! @brief Initialize batched decoder at seqSlots with a new `requests`.
     virtual void newRequests(std::vector<SizeType32> const& seqSlots,
-        std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs)
+        std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs,
+        ModelConfig const& modelConfig)
         = 0;
 
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu

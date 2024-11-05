@@ -169,6 +169,14 @@ template <typename T>
     return {tempLogProbsBufSize, topKTmpIdsBufSize, topKTmpValBufSize};
 }
 
+[[nodiscard]] inline std::vector<size_t> getTopKInitWorkspaceSizes(runtime::SizeType32 batchSize)
+{
+    auto const tempTopKsBufSize = batchSize * sizeof(runtime::SizeType32);
+    auto const tempTopPsBufSize = batchSize * sizeof(float);
+
+    return {tempTopKsBufSize, tempTopPsBufSize};
+}
+
 //! \brief Returns workspace size in bytes needed for sampling TopK computation
 //! \param batchSize batch size
 //! \param maxTokensPerStep maximum number of tokens per computed per step
@@ -179,12 +187,96 @@ template <typename T>
     runtime::SizeType32 maxTopK, runtime::SizeType32 vocabSizePadded)
 {
     auto const workspaceSizes = getTopKWorkspaceSizes<T>(batchSize, maxTokensPerStep, maxTopK, vocabSizePadded);
-    return tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256);
+    auto const initWorkspaceSizes = getTopKInitWorkspaceSizes(batchSize);
+    return std::max(tensorrt_llm::common::calcAlignedSize(workspaceSizes, 256),
+        tensorrt_llm::common::calcAlignedSize(initWorkspaceSizes, 256));
 }
 
-void invokeSetupTopKRuntimeArgs(runtime::SizeType32 batchSize, runtime::SizeType32 topK,
-    runtime::SizeType32* runtimeTopKDevicePtr, runtime::SizeType32 runtimeTopKSize, float topP,
-    float* runtimeTopPDevicePtr, runtime::SizeType32 runtimeTopPSize, bool* skipDecodeDevicePtr,
-    runtime::SizeType32 const* batchSlotsDevicePtr, cudaStream_t stream);
+void invokeSetupTopKRuntimeArgs(runtime::SizeType32 batchSize, ScatterDecodingParamEntry<runtime::SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodePtr, runtime::SizeType32 const* batchSlotsPtr, bool onDevice,
+    cudaStream_t stream = nullptr);
+
+void invokeSetupTopKTopPRuntimeArgs(runtime::SizeType32 batchSize, ScatterDecodingParamEntry<runtime::SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodeTopKPtr, bool* skipDecodeTopPPtr,
+    runtime::SizeType32 const* batchSlotsPtr, bool onDevice, cudaStream_t stream = nullptr);
+
+inline bool clampTopP(float& topP)
+{
+    if (topP < 0.f || topP > 1.0f)
+    {
+        TLLM_LOG_WARNING("TopP (%f) is out of range ([0.0, 1.0f]). Clip to closest number.", topP);
+        topP = std::clamp(topP, 0.f, 1.f);
+        return true;
+    }
+
+    return false;
+}
+
+inline bool clampTopK(runtime::SizeType32& topK)
+{
+    if (topK < 0 || topK > TOP_K_MAX)
+    {
+        TLLM_LOG_WARNING(
+            "TopK (%d) is larger than max supported number (%d). Clip to max supported number.", topK, TOP_K_MAX);
+        topK = std::clamp(topK, 0, TOP_K_MAX);
+        return true;
+    }
+
+    return false;
+}
+
+inline bool regularizeTopKTopP(runtime::SizeType32& topK, float& topP)
+{
+    bool modified = false;
+    if (topK == 0 && topP == 0.0f)
+    {
+        // TensorRT-LLM's topp implementation does not support topp = 0.0f, but it
+        // equivalent to greedy search. So, we set the topk = 1 as an alternative
+        // solution.
+        topK = 1;
+        modified = true;
+    }
+    if (topK > 0 && topP == 0.0f)
+    {
+        // This case corresponds to the old topk sampling, which is equivalent to
+        // the old topk_topp sampling with topp=1.0f. TopKSamplingLayer and
+        // TopKTopPSamplingLayer are now merged by TopKSamplingLayer. Thus, we
+        // replace the case topk>0 and topp=0.0f by topk>0 and topp=1.0f for the
+        // compatibility.
+        topP = 1.0f;
+        modified = true;
+    }
+
+    return modified;
+}
+
+__device__ __host__ inline void setupTopKTopPRuntimeArgOne(runtime::SizeType32 batchIndex,
+    ScatterDecodingParamEntry<runtime::SizeType32> topK, ScatterDecodingParamEntry<float> topP,
+    runtime::SizeType32 const* batchSlots, bool* skipDecodeTopK, bool* skipDecodeTopP, float* initialTopPBuf)
+{
+    auto const batchSlot = batchSlots[batchIndex];
+    auto const k = topK.mVector == nullptr ? topK.mScalar : topK.mVector[batchIndex];
+    auto const p = topP.mVector == nullptr ? topP.mScalar : topP.mVector[batchIndex];
+    if (topK.mTarget != nullptr)
+    {
+        topK.mTarget[batchSlot] = k;
+    }
+    if (topP.mTarget != nullptr)
+    {
+        topP.mTarget[batchSlot] = p;
+    }
+    if (skipDecodeTopK != nullptr)
+    {
+        skipDecodeTopK[batchSlot] = k == 0;
+    }
+    if (skipDecodeTopP != nullptr)
+    {
+        skipDecodeTopP[batchSlot] = k != 0;
+    }
+    if (initialTopPBuf != nullptr)
+    {
+        initialTopPBuf[batchSlot] = p;
+    }
+}
 
 } // namespace tensorrt_llm::kernels

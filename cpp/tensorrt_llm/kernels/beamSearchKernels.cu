@@ -50,6 +50,10 @@ void invokeTopkSoftMax(T const* logits, T const* bias, void* workspace, BeamHypo
         CASE_K(32)
     case 64:       // 32 < beam_width <= 64
         CASE_K(64)
+    case 128:      // 64 < beam_width <= 128
+        CASE_K(128)
+    case 256:      // 128 < beam_width <= 256
+        CASE_K(256)
 #endif             // FAST_BUILD
     default:
         throw std::runtime_error(

@@ -228,6 +228,7 @@ class TestGPTJ(unittest.TestCase):
             host_sink_token_length,
             sequence_length,
             host_runtime_perf_knobs,
+            host_context_progress,
             host_context_lengths=None,
         ):
 
@@ -242,6 +243,7 @@ class TestGPTJ(unittest.TestCase):
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
                 'host_runtime_perf_knobs': host_runtime_perf_knobs,
+                'host_context_progress': host_context_progress,
             }
             ctx_buffer[
                 f'host_max_attention_window_sizes'] = host_max_attention_window_sizes
@@ -336,6 +338,8 @@ class TestGPTJ(unittest.TestCase):
                 context_runtime_perf_knobs[
                     1] = 1  # enable_context_fmha_fp32_acc
 
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.ctx_context,
                 input_ids=ctx_ids,
@@ -349,7 +353,8 @@ class TestGPTJ(unittest.TestCase):
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=context_runtime_perf_knobs)
+                host_runtime_perf_knobs=context_runtime_perf_knobs,
+                host_context_progress=host_context_progress)
 
             np.testing.assert_allclose(ref.cpu().numpy(),
                                        res.cpu().numpy(),
@@ -431,6 +436,8 @@ class TestGPTJ(unittest.TestCase):
             if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
                 gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
+
             res = run_engine(
                 context=runtime.context_1,
                 input_ids=step1_id,
@@ -445,7 +452,8 @@ class TestGPTJ(unittest.TestCase):
                 sequence_length=sequence_length_buffer,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=gen_runtime_perf_knobs)
+                host_runtime_perf_knobs=gen_runtime_perf_knobs,
+                host_context_progress=host_context_progress)
 
             np.testing.assert_allclose(ref.cpu().numpy(),
                                        res.cpu().numpy(),

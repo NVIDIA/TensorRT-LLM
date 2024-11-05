@@ -18,7 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/namedTensor.h"
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 
 #include <ATen/ATen.h>
 
@@ -41,7 +41,6 @@ public:
         : Base(std::move(_name)){};
 
     explicit NamedTensor(tensorrt_llm::batch_manager::NamedTensor const& cppNamedTensor);
-    static void initBindings(pybind11::module_& m);
 };
 
 } // namespace tensorrt_llm::pybind::batch_manager

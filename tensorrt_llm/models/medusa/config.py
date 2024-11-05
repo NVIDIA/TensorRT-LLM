@@ -18,6 +18,42 @@ from ..qwen.config import QWenConfig
 
 
 # MedusaConfig is a thin wrapper that picks parent class for GenericMedusaConfig
+class QWenMedusaConfig(QWenConfig):
+
+    def __init__(self, num_medusa_heads, num_medusa_layers, max_draft_len,
+                 **kwargs):
+        self.num_medusa_heads = num_medusa_heads
+        self.num_medusa_layers = num_medusa_layers
+        self.max_draft_len = max_draft_len
+        super().__init__(**kwargs)
+
+    def to_dict(self):
+        output = super().to_dict()
+        # Serialize the fields added in MedusaConfig
+        output['num_medusa_heads'] = self.num_medusa_heads
+        output['num_medusa_layers'] = self.num_medusa_layers
+        output['max_draft_len'] = self.max_draft_len
+        return output
+
+
+class LLaMAMedusaConfig(LLaMAConfig):
+
+    def __init__(self, num_medusa_heads, num_medusa_layers, max_draft_len,
+                 **kwargs):
+        self.num_medusa_heads = num_medusa_heads
+        self.num_medusa_layers = num_medusa_layers
+        self.max_draft_len = max_draft_len
+        super().__init__(**kwargs)
+
+    def to_dict(self):
+        output = super().to_dict()
+        # Serialize the fields added in MedusaConfig
+        output['num_medusa_heads'] = self.num_medusa_heads
+        output['num_medusa_layers'] = self.num_medusa_layers
+        output['max_draft_len'] = self.max_draft_len
+        return output
+
+
 # Medusa-specific config is stored and retrieved from GenericMedusaConfig.
 class MedusaConfig():
 
@@ -27,25 +63,8 @@ class MedusaConfig():
                  num_medusa_layers: int = 1,
                  max_draft_len: int = 63,
                  **kwargs):
-        BaseConfig = QWenConfig if "qwen" in kwargs[
-            'model_type'] else LLaMAConfig
-
-        class GenericMedusaConfig(BaseConfig):
-
-            def __init__(self, num_medusa_heads, num_medusa_layers,
-                         max_draft_len, **kwargs):
-                self.num_medusa_heads = num_medusa_heads
-                self.num_medusa_layers = num_medusa_layers
-                self.max_draft_len = max_draft_len
-                super().__init__(**kwargs)
-
-            def to_dict(self):
-                output = super().to_dict()
-                # Serialize the fields added in MedusaConfig
-                output['num_medusa_heads'] = self.num_medusa_heads
-                output['num_medusa_layers'] = self.num_medusa_layers
-                output['max_draft_len'] = self.max_draft_len
-                return output
+        GenericMedusaConfig = QWenMedusaConfig if "qwen" in kwargs[
+            'model_type'] else LLaMAMedusaConfig
 
         self.config = GenericMedusaConfig(num_medusa_heads, num_medusa_layers,
                                           max_draft_len, **kwargs)

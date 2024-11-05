@@ -17,6 +17,7 @@
  */
 #pragma once
 #include "decoderXQAConstants.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -25,6 +26,7 @@
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "xqaParams.h"
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 namespace tensorrt_llm
@@ -283,7 +285,7 @@ std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWr
             return std::nullopt;
         }
         [[fallthrough]];
-    default: cuErrCheck(("Failed to retrieve global variable from cubin.", error), driver);
+    default: TLLM_THROW("Failed to retrieve global variable from cubin: error code %i.", static_cast<int32_t>(error));
     }
     return std::optional<T>{std::move(ret)};
 }

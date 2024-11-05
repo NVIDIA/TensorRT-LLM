@@ -497,6 +497,7 @@ class TestNemotronNas(unittest.TestCase):
                        host_max_attention_window_sizes,
                        host_sink_token_length,
                        host_runtime_perf_knobs,
+                       host_context_progress,
                        sequence_length=None,
                        host_context_lengths=None):
 
@@ -510,7 +511,8 @@ class TestNemotronNas(unittest.TestCase):
                 'host_past_key_value_lengths': host_past_key_value_lengths,
                 'sequence_length': sequence_length,
                 'host_sink_token_length': host_sink_token_length,
-                'host_runtime_perf_knobs': host_runtime_perf_knobs
+                'host_runtime_perf_knobs': host_runtime_perf_knobs,
+                'host_context_progress': host_context_progress,
             }
 
             assert host_request_types is not None
@@ -600,6 +602,7 @@ class TestNemotronNas(unittest.TestCase):
             perf_knob_tensor_size = 16
             ctx_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
+            host_context_progress = torch.tensor([0], dtype=torch.int64)
 
             step0 = run_engine(
                 context=runtime_handle.runtime.ctx_context,
@@ -614,7 +617,8 @@ class TestNemotronNas(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=ctx_runtime_perf_knobs)
+                host_runtime_perf_knobs=ctx_runtime_perf_knobs,
+                host_context_progress=host_context_progress)
 
             step = 1
             gen_ids = step1_ids.clone()
@@ -666,7 +670,8 @@ class TestNemotronNas(unittest.TestCase):
                 sequence_length=sequence_length,
                 host_context_lengths=host_context_lengths,
                 host_request_types=host_request_types,
-                host_runtime_perf_knobs=gen_runtime_perf_knobs)
+                host_runtime_perf_knobs=gen_runtime_perf_knobs,
+                host_context_progress=host_context_progress)
 
             return step0, step1
 

@@ -299,6 +299,20 @@ private:
     SizeType32 mVerificationSetSize;
 };
 
+struct EagleConfig
+{
+    explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt);
+
+    bool operator==(EagleConfig const& other) const;
+    [[nodiscard]] std::optional<EagleChoices> getEagleChoices() const;
+
+private:
+    friend class Serialization;
+
+    /// @brief choices forming tree for EAGLE-1.
+    std::optional<EagleChoices> mEagleChoices;
+};
+
 class ContextPhaseParams
 {
 public:
@@ -433,9 +447,10 @@ public:
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]
-    /// @param externalDraftTokensConfig The speculative decoding configuration
+    /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
+    /// @param lookaheadConfig The lookahead speculative decoding configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
     /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
     /// name provided to the ExecutorConfig.
@@ -450,6 +465,7 @@ public:
     /// @param type Indicate the request type for disaggregated serving mode.
     /// @param contextPhaseParams Generated token ID  from context only executor.
     /// @param numReturnSequences The number of returning sequences.
+    /// @param eagleConfig The EAGLE speculative decoding configuration
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -469,7 +485,8 @@ public:
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
-        std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1);
+        std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
+        std::optional<EagleConfig> eagleConfig = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -508,6 +525,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
     [[nodiscard]] SizeType32 getNumReturnSequences() const;
+    [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -534,6 +552,7 @@ public:
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setCrossAttentionMask(Tensor crossAttentionMask);
     void setNumReturnSequences(SizeType32 numReturnSequences);
+    void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
 
 private:
     friend class Serialization;
@@ -636,19 +655,62 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
+/// @brief Configuration class for dynamic tuning of batch size and max num tokens. During runtime the statistics of
+/// input and output lengths are recoreded. Based on these statistics, the batch size and max num tokens are tuned
+/// dynamically to better serve the requests.
+class DynamicBatchConfig
+{
+public:
+    /// @brief The default window size for moving average of input and output length which is used to calculate dynamic
+    /// batch size and max num tokens
+    static SizeType32 const kDefaultDynamicBatchMovingAverageWindow = 128;
+
+    explicit DynamicBatchConfig(bool enableBatchSizeTuning = false,
+        SizeType32 dynamicBatchMovingAverageWindow = kDefaultDynamicBatchMovingAverageWindow,
+        std::vector<std::pair<SizeType32, SizeType32>> batchSizeTable = kDefaultBatchSizeTable);
+
+    [[nodiscard]] SizeType32 getDynamicBatchMovingAverageWindow() const;
+
+    [[nodiscard]] bool getEnableBatchSizeTuning() const;
+
+    [[nodiscard]] std::vector<std::pair<SizeType32, SizeType32>> getBatchSizeTable() const;
+
+    /// @brief The default value of batch size table
+    static std::vector<std::pair<SizeType32, SizeType32>> const kDefaultBatchSizeTable;
+
+private:
+    friend class Serialization;
+
+    /// @brief Controls if the batch size should be tuned dynamically
+    bool mEnableBatchSizeTuning;
+
+    /// @brief The window size for moving average of input and output length which is used to calculate dynamic batch
+    /// size and max num tokens
+    SizeType32 mDynamicBatchMovingAverageWindow;
+
+    /// @brief A vector of (batchSizeLimit, batchSize). When max capacity batch size is less than
+    // batchSizeLimit_{i} but greater or equal to batchSizeLimit_{i-1}, the batch size will be batchSize_{i}.
+    // For max capcity batch size beyond the last batchSizeLimit, the batch size may be rounded down to multiple of 512
+    // based on the actual implementation.
+    std::vector<std::pair<SizeType32, SizeType32>> mBatchSizeTable;
+};
+
 /// @brief Configuration class for the scheduler
 class SchedulerConfig
 {
 public:
     explicit SchedulerConfig(
         CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
-        std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt);
+        std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt,
+        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt);
 
     bool operator==(SchedulerConfig const& other) const;
 
     [[nodiscard]] CapacitySchedulerPolicy getCapacitySchedulerPolicy() const;
 
     [[nodiscard]] std::optional<ContextChunkingPolicy> getContextChunkingPolicy() const;
+
+    [[nodiscard]] std::optional<DynamicBatchConfig> getDynamicBatchConfig() const;
 
 private:
     friend class Serialization;
@@ -658,6 +720,9 @@ private:
 
     /// @brief The context chunking policy. See ContextChunkingPolicy.
     std::optional<ContextChunkingPolicy> mContextChunkingPolicy;
+
+    /// @brief The config for tuning batch size dynamically. See DynamicBatchSizeConfig.
+    std::optional<DynamicBatchConfig> mDynamicBatchConfig;
 };
 
 /// @brief Configuration class for the KV cache
@@ -941,7 +1006,8 @@ class DecodingConfig
 public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
-        std::optional<MedusaChoices> medusaChoices = std::nullopt);
+        std::optional<MedusaChoices> medusaChoices = std::nullopt,
+        std::optional<EagleConfig> eagleConfig = std::nullopt);
 
     bool operator==(DecodingConfig const& other) const;
 
@@ -960,6 +1026,11 @@ public:
     void setMedusaChoices(MedusaChoices const&);
     [[nodiscard]] std::optional<MedusaChoices> getMedusaChoices() const;
 
+    // EAGLE methods.
+    /// @brief Sets eagle mode and config.
+    void setEagleConfig(EagleConfig const&);
+    [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
+
 private:
     friend class Serialization;
 
@@ -969,6 +1040,8 @@ private:
     std::optional<LookaheadDecodingConfig> mLookaheadDecodingConfig;
     // Medusa params.
     std::optional<MedusaChoices> mMedusaChoices;
+    // Eagle config.
+    std::optional<EagleConfig> mEagleConfig;
 };
 
 class LogitsPostProcessorConfig

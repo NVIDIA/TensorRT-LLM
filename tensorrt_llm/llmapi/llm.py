@@ -3,7 +3,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, List, Literal, Optional, Sequence, Union
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -14,9 +14,8 @@ from ..builder import EngineConfig
 from ..executor import (GenerationExecutor, GenerationResult, LoRARequest,
                         PromptAdapterRequest)
 from ..logger import logger
-from .llm_utils import (LLMARGS_REMAINING_ARGS_DOCSTRING, CachedModelLoader,
-                        LlmArgs, LlmBuildStats, ModelLoader,
-                        _ModelRuntimeContext)
+from .llm_utils import (LLMARGS_DOCSTRING, CachedModelLoader, LlmArgs,
+                        LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase
@@ -30,10 +29,10 @@ class RequestOutput(GenerationResult):
 
     Fields:
         request_id (int): The unique ID of the request.
-        prompt (str): The prompt string of the request.
+        prompt (str, optional): The prompt string of the request.
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
-        context_logits (torch.Tensor): The logits on the prompt token ids.
+        context_logits (torch.Tensor, optional): The logits on the prompt token ids.
         finished (bool): Whether the whole request is finished.
     """
 
@@ -83,48 +82,25 @@ class RequestOutput(GenerationResult):
 
 PromptInputs = Union[str, List[int]]
 
-LLM_END_DOCSTRING = '\n'.join(
-    [' ' * 4 + _ for _ in LLMARGS_REMAINING_ARGS_DOCSTRING.split('\n')])
 
-
-@append_docstring(LLM_END_DOCSTRING)
+@append_docstring(LLMARGS_DOCSTRING)
 class LLM:
-    '''LLM class is the main class for running a LLM model.
+    """LLM class is the main class for running a LLM model.
 
     Args:
-        model(str): The model name or a local path to the model directory. It could be a HuggingFace(HF) model name,
-            a local path to the HF model, or a local path to the TRT-LLM engine or checkpoint.
-
-        tokenizer(Optional[Union[str, Path, TokenizerBase, PreTrainedTokenizerBase]]): The tokenizer name or a local
-            path to the tokenizer directory.
-
-        skip_tokenizer_init: If true, skip initialization of tokenizer and detokenizer. generate and generate_async
-            will accept prompt token ids as input only.
-
-        tensor_parallel_size(int): The number of processes for tensor parallelism.
-
-        dtype(str): The data type for the model weights and activations.
-
-        trust_remote_code(bool): Download the model and tokenizer from trust remote code (e.g, Hugging Face)
-
-        revision(Optional[str]): The revision of the model.
-
-        tokenzier_revision(Optional[str]): The revision of the tokenizer.
-
-        workspace(Optional[str]): The directory to store intermediate files.
-    '''
+    """
 
     def __init__(self,
                  model: str,
                  tokenizer: Optional[Union[str, Path, TokenizerBase,
                                            PreTrainedTokenizerBase]] = None,
+                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
                  skip_tokenizer_init: bool = False,
+                 trust_remote_code: bool = False,
                  tensor_parallel_size: int = 1,
                  dtype: str = "auto",
-                 trust_remote_code: bool = False,
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
-                 workspace: Optional[str] = None,
                  **kwargs: Any):
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
@@ -134,10 +110,11 @@ class LLM:
             self.args = LlmArgs.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
+                tokenizer_mode=tokenizer_mode,
                 skip_tokenizer_init=skip_tokenizer_init,
+                trust_remote_code=trust_remote_code,
                 tensor_parallel_size=tensor_parallel_size,
                 dtype=dtype,
-                trust_remote_code=trust_remote_code,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
@@ -169,7 +146,7 @@ class LLM:
             self._executor: Optional[GenerationExecutor] = None
 
             self._workspace = tempfile.TemporaryDirectory(
-                suffix="-llm-workspace", dir=workspace)
+                suffix="-llm-workspace", dir=self.args.workspace)
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
@@ -202,13 +179,15 @@ class LLM:
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            inputs (Union[PromptInputs, Sequence[PromptInputs]]): The prompt text or token ids.
-                Note, it must be single prompt or batched prompts.
-            sampling_params (Optional[Union[SamplingParams, List[SamplingParams]]]): The sampling params for the
-                generation, a default one will be used if not provided.
-            use_tqdm (bool): Whether to use tqdm to display the progress bar.
-            lora_request (Optional[Union[LoRARequest, Sequence[LoRARequest]]]): LoRA request to use for generation, if any.
-            prompt_adapter_request (Optional[Union[PromptAdapterRequest, Sequence[PromptAdapterRequest]]]): Prompt Adapter request to use for generation, if any.
+            inputs (PromptInputs or Sequence[PromptInputs]): The prompt text or token ids.
+                it can be single prompt or batched prompts.
+            sampling_params (SamplingParams, List[SamplingParams], optional): The sampling params for the
+                generation, a default one will be used if not provided. Defaults to None.
+            use_tqdm (bool): Whether to use tqdm to display the progress bar. Defaults to True.
+            lora_request (LoRARequest, Sequence[LoRARequest], optional): LoRA request to use for generation,
+                if any. Defaults to None.
+            prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):
+                Prompt Adapter request to use for generation, if any. Defaults to None.
 
         Returns:
             Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.
@@ -265,12 +244,15 @@ class LLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (PromptInputs): The prompt text or token ids; must be single prompt.
-            sampling_params (Optional[SamplingParams]): The sampling params for the generation, a default one will be
-                used if not provided.
-            lora_request (Optional[LoRARequest]): LoRA request to use for generation, if any.
-            prompt_adapter_request (Optional[PromptAdapterRequest]): Prompt Adapter request to use for generation, if any.
-            streaming (bool): Whether to use the streaming mode for the generation.
+            inputs (PromptInputs): The prompt text or token ids; it must be single prompt.
+            sampling_params (SamplingParams, optional): The sampling params for the generation,
+                a default one will be used if not provided. Defaults to None.
+            lora_request (LoRARequest, optional): LoRA request to use for generation, if any.
+                Defaults to None.
+            prompt_adapter_request (PromptAdapterRequest, optional): Prompt Adapter request to
+                use for generation, if any. Defaults to None.
+            streaming (bool): Whether to use the streaming mode for the generation. Defaults to
+                False.
 
         Returns:
             RequestOutput: The output data of the completion request to the LLM.
@@ -298,6 +280,34 @@ class LLM:
             streaming=streaming,
         )
         return RequestOutput(result, prompt, self.tokenizer)
+
+    def _get_stats(self, timeout=None) -> str:
+        ''' Get the stats from the runtime.
+
+        Exceptions:
+            NoStatsAvailable: If the stats are not available.
+
+        Returns:
+            str: The stats in JSON format.
+
+        Known issue:
+            The `_get_stats` cannot mix with `_get_stats_async` in the same LLM instance.
+        '''
+        return self._executor.get_stats(timeout=timeout)
+
+    async def _get_stats_async(self, timeout=None) -> str:
+        ''' Get the stats from the runtime.
+
+        Exceptions:
+            NoStatsAvailable: If the stats are not available.
+
+        Returns:
+            str: The stats in JSON format.
+
+        Known issue:
+            The `_get_stats_async` cannot mix with `_get_stats` in the same LLM instance.
+        '''
+        return await self._executor.aget_stats(timeout=timeout)
 
     def _prepare_prompt_token_ids(self, prompt: str,
                                   sampling_params: SamplingParams) -> List[int]:
@@ -454,7 +464,7 @@ class LLM:
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         del exc_value, traceback
         self._shutdown()
-        return exc_type is not None
+        return False  # propagate exceptions
 
     def __getstate__(self):
         raise RuntimeError("LLM object can not be pickled.")

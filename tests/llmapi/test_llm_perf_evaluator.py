@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess  # nosec B404
 import sys
 import tempfile
 import time
@@ -65,6 +66,22 @@ def test_perf_evaluator():
         report = evaluator.run()
         report.display()
         report.save_json(workspace / "report.json")
+
+
+def _test_e2e_script():
+    ''' Test the ./_perf_evaluator/run.sh script. '''
+    script_path = Path(__file__).parent / '_perf_evaluator/run.sh'
+    commands = [
+        '/bin/bash',
+        script_path,
+        "-m",
+        llama_model_path,
+        "-i",
+        "16",
+        "-o",
+        "16",
+    ]
+    subprocess.run(commands, cwd=script_path.parent, check=True)
 
 
 if __name__ == '__main__':

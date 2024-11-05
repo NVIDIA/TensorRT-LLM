@@ -59,6 +59,9 @@ enum class CutlassTileConfig
     // Warp configs for M=256
     CtaShape256x128x64_WarpShape64x64x64,
 
+    // TensorCore config CTA_N = 64, CTA_K = 128
+    CtaShape128x64x128_WarpShape64x32x128,
+
     // TensorCore config CTA_N = 256, CTA_K = 64
     CtaShape16x256x64_WarpShape16x64x64,
 

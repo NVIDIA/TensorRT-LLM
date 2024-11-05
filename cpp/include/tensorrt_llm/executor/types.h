@@ -62,6 +62,7 @@ using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&
     std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
     std::vector<std::optional<IdType>> const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
+using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;
 
@@ -312,6 +313,12 @@ struct IterationStats
     SizeType32 numCompletedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
+    /// @brief Static max batch size passed to the executor
+    SizeType32 maxBatchSizeStatic;
+    /// @brief Batch size produced by dynamic tuner based on input stats
+    SizeType32 maxBatchSizeTunerRecommended;
+    /// @brife The min of maxBatchSizeStatic and maxBatchSizeRuntimeUpperbound
+    SizeType32 maxBatchSizeRuntime;
     /// @brief GPU memory usage in bytes
     size_t gpuMemUsage;
     /// @brief CPU memory usage in bytes

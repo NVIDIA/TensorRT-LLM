@@ -160,13 +160,14 @@ def throughput_command(
     executor_requests = get_executor_requests(
         requests,
         streaming,
+        eos_id=-1,
+        pad_id=-1,
     )
     del requests
 
     logger.info("Setting up benchmarker and infrastructure.")
     new_request_queue = mp.Queue()
     response_queue = mp.Queue()
-    logger.set_level("error")
     benchmark = ThroughputBenchmark(
         dataset=executor_requests,
         request_rate=request_rate,
@@ -183,10 +184,8 @@ def throughput_command(
         benchmark.stop_benchmark()
         benchmark.report_statistics()
     except KeyboardInterrupt:
-        logger.set_level("error")
         benchmark.stop_benchmark()
     finally:
-        logger.set_level("error")
         benchmark.shutdown()
 
 
@@ -262,8 +261,8 @@ class ExecutorManager:
             if len(responses) > 0:
                 self.responses.put([
                     ResponseTuple(now, r.request_id, r.result.is_final,
-                                  r.has_error(), r.result.output_token_ids[0])
-                    for r in responses
+                                  r.has_error(), r.result.output_token_ids[0],
+                                  r.result.decoding_iter) for r in responses
                 ])
 
         while not self._shutdown.is_set():
@@ -397,13 +396,14 @@ class ThroughputBenchmark:
             while not self.response_queue.empty():
                 responses: Tuple[
                     int,
-                    List[trtllm.Response]] = self.response_queue.get_nowait()
+                    List[ResponseTuple]] = self.response_queue.get_nowait()
                 for response in responses:
                     self.statistics.register_response(
                         response.request_id,
                         response.timestamp,
                         response.final,
                         response.error,
+                        response.decoding_iteration,
                         response.tokens,
                     )
 
@@ -476,7 +476,7 @@ class ThroughputBenchmark:
                 "===========================================================\n"
                 "= STREAMING STATISTICS \n"
                 "===========================================================\n"
-                f"Average request latency (ms):\t\t{stats.request_percentiles.average * 1.0e-6:.4f}\n"
+                f"Average request latency (ms):\t\t{stats.request_latency_percentiles.average * 1.0e-6:.4f}\n"
                 f"Average time-to-first-token (ms):\t{stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
                 f"Average inter-token latency (ms):\t{stats.itl_percentiles.average * 1.0e-6:.4f}\n"
             )

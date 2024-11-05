@@ -1292,11 +1292,16 @@ python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_model/
                             --workers 8 \
 
 # Run FP8 model by FP8
+# The source HF model is in FP8 format, so --use_fp8_rowwise is enabled automatically
+# Optionally enable --use_meta_fp8_rowwise_recipe to strictly follow the original Meta's LLaMA 3.1 recipe:
+# (1) Skip quantization for the first and last Transformer layers
+# (2) Skip quantization for the Attention layers
 python examples/llama/convert_checkpoint.py --model_dir llama_3.1_405B_HF_FP8_model/ \
                             --output_dir llama_3.1_405B_HF_FP8_model/trt_ckpts/tp8-pp1/ \
                             --dtype bfloat16 \
                             --tp_size 8 \
                             --pp_size 1 \
+                            --use_meta_fp8_rowwise_recipe \
                             --load_by_shard \
                             --workers 8
 ```

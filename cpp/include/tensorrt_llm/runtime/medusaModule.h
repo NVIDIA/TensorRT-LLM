@@ -45,36 +45,10 @@ public:
         return mDefaultMedusaChoices;
     }
 
-    void initMedusaTensorsFromChoices(MedusaChoices const& choices, std::vector<SizeType32>& topKs,
-        TensorPtr& generationInputLengths, TensorPtr& positionOffsets, TensorPtr& treeIds, TensorPtr& paths,
-        TensorPtr& packedMask, SizeType32& totalPaths) const noexcept;
-
 private:
-    using Prefix = uint64_t;
-    static SizeType32 constexpr PREFIX_CHUNK_SIZE_BITS = 4;
-    static SizeType32 constexpr PREFIX_MAX_VALUE = 16;
-
-    struct MedusaTreeNode
-    {
-        SizeType32 nodeId;
-        SizeType32 depth;
-        SizeType32 parentLinearIdx;
-        SizeType32 linearIdx;
-        std::vector<SizeType32> childLinearIndices;
-    };
-
-    SizeType32 computePathsAndMask(
-        std::vector<MedusaTreeNode> const& tree, TensorPtr& packedMask, TensorPtr& paths) const;
-
-    void copyPackedMask(TensorPtr& mask, SizeType32 srcIdx, SizeType32 dstIdx) const;
-    void setOnePackedMask(TensorPtr& mask, SizeType32 row, SizeType32 col) const;
-    Prefix computePrefix(std::vector<SizeType32> const& vec, SizeType32 len) const;
-
-    void dumpChoices(MedusaChoices const& choices, std::vector<SizeType32> const& indices) const;
-
-private:
-    // FIXME(nkorobov): this should come from outside to setup or per request
-    // mc_sim_7b_63
+    /// We use mc_sim_7b_63 from official Medusa implementation, i.e. one of the best trees with 63 nodes found for 7B
+    /// Vicuna model.
+    // We use it as default, if no other are trees are specified on the server level.
     MedusaChoices mDefaultMedusaChoices = {{0}, {0, 0}, {1}, {0, 1}, {2}, {0, 0, 0}, {1, 0}, {0, 2}, {3}, {0, 3}, {4},
         {0, 4}, {2, 0}, {0, 5}, {0, 0, 1}, {5}, {0, 6}, {6}, {0, 7}, {0, 1, 0}, {1, 1}, {7}, {0, 8}, {0, 0, 2}, {3, 0},
         {0, 9}, {8}, {9}, {1, 0, 0}, {0, 2, 0}, {1, 2}, {0, 0, 3}, {4, 0}, {2, 1}, {0, 0, 4}, {0, 0, 5}, {0, 0, 0, 0},

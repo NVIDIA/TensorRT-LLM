@@ -48,9 +48,6 @@ public:
     //! @returns workspace needed for this layer in bytes
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
-protected:
-    runtime::SizeType32 mRuntimeMaxTopK{0};
-
 private:
     using Base::mDecoderDomain;
 
@@ -71,9 +68,8 @@ private:
     TensorPtr mOutputIdsAfterSampling;
     TensorPtr mTargetOutputIds;
     TensorPtr mRuntimeTopKDevice;
-    TensorPtr mRuntimeTopPForTopKDevice;
+    TensorPtr mRuntimeTopKHost;
     TensorPtr mRuntimeTopPDevice;
-    TensorPtr mInitialTopPDevice;
     TensorPtr mMaskBuffer;
 
     TensorPtr mTargetLogits;

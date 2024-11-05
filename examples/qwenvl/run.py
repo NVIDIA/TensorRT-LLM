@@ -312,15 +312,16 @@ class QWenInfer(object):
         max_input_length = torch.max(input_lengths).item()
         max_new_tokens = min(max_new_tokens,
                              self.global_max_input_len - max_input_length)
-        self.decoder.setup(
-            batch_size=input_lengths.size(0),
-            max_context_length=max_input_length,
-            max_new_tokens=max_new_tokens,
-            beam_width=num_beams,
-        )
+
         profiler.start("QWen")
         run_time = 10
         for _ in range(run_time):
+            self.decoder.setup(
+                batch_size=input_lengths.size(0),
+                max_context_length=max_input_length,
+                max_new_tokens=max_new_tokens,
+                beam_width=num_beams,
+            )
             output_ids = self.decoder.decode(
                 input_ids,
                 input_lengths,

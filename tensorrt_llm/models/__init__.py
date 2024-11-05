@@ -24,6 +24,7 @@ from .commandr.model import CohereForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .deepseek_v1.model import DeepseekForCausalLM
+from .deepseek_v2.model import DeepseekV2ForCausalLM
 from .dit.model import DiT
 from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
@@ -63,6 +64,7 @@ __all__ = [
     'DiT',
     'DeepseekForCausalLM',
     'FalconConfig',
+    'DeepseekV2ForCausalLM',
     'FalconForCausalLM',
     'FalconModel',
     'GPTConfig',
@@ -171,6 +173,7 @@ MODEL_MAP = {
     'DiT': DiT,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
+    'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
     'MllamaForConditionalGeneration': MLLaMAModel,

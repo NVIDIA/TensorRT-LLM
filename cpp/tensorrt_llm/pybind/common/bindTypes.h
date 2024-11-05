@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 #include <pybind11/pybind11.h>
 
 namespace PybindUtils
@@ -59,7 +59,7 @@ void bindSet(py::module& m, std::string const& name)
         .def(py::init())
         .def("clear", &T::clear)
         .def("size", &T::size)
-        // .def("insert", py::overload_cast<const typename T::value_type&>(&T::insert))
+        .def("insert", [](T& s, typename T::value_type const& value) { s.insert(value); })
         .def("erase", py::overload_cast<typename T::value_type const&>(&T::erase))
         .def("__contains__", [](T const& s, typename T::value_type x) { return s.find(x) != s.end(); })
         .def(

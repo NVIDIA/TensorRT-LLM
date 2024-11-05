@@ -1191,7 +1191,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int qkv_id;
         int head_id;
         int size_id = index % size_per_head;
-        if (kv_head_num < head_num)
+        if (kv_head_num < head_num || head_num == 0)
         {
             // [token, h + 2*kv_head_num, d]
             //  ^^^^^  ^^^^^^^^
@@ -1320,6 +1320,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
     extern __shared__ __align__(sizeof(float2)) char smem_[]; // align on largest vector type
+    bool isCrossKV = q_buf == nullptr;                        // does not have query in qkv buffer (namely, only kv)
 
     constexpr int vec_size = Vec_t<T>::size;
     using Vec_t = typename Vec_t<T>::Type;
@@ -1342,16 +1343,15 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     bool const is_head_size_masked = tidx * vec_size >= size_per_head;
     bool const is_masked = is_head_size_masked || is_seq_masked;
 
-    int const hidden_size = head_num * size_per_head;
     int const hidden_idx = head_idx * size_per_head + tidx * vec_size;
-    int const qheads_per_kv_head = head_num / kv_head_num;
+    int const qheads_per_kv_head = isCrossKV ? 1 : head_num / kv_head_num;
     int const kv_head_idx = head_idx / qheads_per_kv_head;
     int const hidden_idx_kv = kv_head_idx * size_per_head + tidx * vec_size;
-    int const n = (head_num + 2 * kv_head_num) * size_per_head;
+    int const n = (isCrossKV ? 0 : head_num + 2 * kv_head_num) * size_per_head;
 
     int const dst_kv_seq_idx = seq_idx;
-    int const src_k_offset = hidden_size;
-    int const src_v_offset = hidden_size + kv_head_num * size_per_head;
+    int const src_k_offset = isCrossKV ? 0 : head_num * size_per_head;
+    int const src_v_offset = src_k_offset + kv_head_num * size_per_head;
 
     // NOTE: q has seq len excluding prefix prompt
     // head_num == kv_head_num:
@@ -1512,7 +1512,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         int const m = token_num;
         int const n = head_num * size_per_head;
         dim3 block(384);
-        dim3 grid((int) (ceil(1.0 * m * n / 384)));
+        dim3 grid(std::max((int) (ceil(1.0 * m * n / 384)), 1));
 
         if (qkv_bias != nullptr)
         {
@@ -1528,7 +1528,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
         // To implement rotary embeddings, each thread processes two QKV elems:
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
-        dim3 grid(token_num, head_num);
+        dim3 grid(token_num, std::max(head_num, 1));
         size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
                     || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
                 ? 2 * rotary_embedding_dim * sizeof(T)

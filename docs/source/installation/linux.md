@@ -21,7 +21,7 @@
     # Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
     # If you want to install the stable version (corresponding to the release branch), please
     # remove the `--pre` option.
-    pip3 install tensorrt_llm -U --pre --extra-index-url https://pypi.nvidia.com
+    pip3 install tensorrt_llm --upgrade --pre
 
     # Check installation
     python3 -c "import tensorrt_llm"

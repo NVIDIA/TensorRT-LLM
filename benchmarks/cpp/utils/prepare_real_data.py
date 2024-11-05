@@ -231,8 +231,6 @@ def dataset(root_args, **kwargs):
             }, root_args.output)
     else:
         print_dataset(
-            task_ids,
             input_ids,
             output_lens,
-            tokenizer=None,
         )

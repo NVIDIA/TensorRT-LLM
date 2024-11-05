@@ -20,7 +20,7 @@
 #include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/batch_manager/namedTensor.h"
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 
 #include <ATen/ATen.h>
 #include <pybind11/pybind11.h>

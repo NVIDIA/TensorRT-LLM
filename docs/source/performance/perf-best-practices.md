@@ -183,6 +183,8 @@ argument with `trtllm-build`. When the workload is very small, or the accuracy
 after enabling it does not satisfy your requirement, it is not recommended to
 enable that feature.
 
+If your bachsize is small, you can also use `--use_fused_mlp=enable --low_latency_gemm_swiglu_plugin fp8` argument with `trtllm-build` to accelerate the running time.
+
 ### GEMM Plugin
 
 The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and

@@ -143,7 +143,7 @@ def get_decoder_config(model_metadata: dict, dtype: str, logits_dtype: str,
         'encoder_hidden_size': model_metadata['n_text_state'],
         'encoder_num_heads': model_metadata['n_text_head'],
         'encoder_head_size': None,
-        'skip_cross_qkv': False,
+        'skip_cross_kv': False,
         'quantization': {
             'quant_algo': quant_algo
         },

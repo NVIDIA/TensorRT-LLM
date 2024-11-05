@@ -65,7 +65,7 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues,
+void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const& peftValues,
     SizeType32 batchIdx, SizeType32 beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -78,12 +78,12 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
     auto weightsPointersPtr = bufferCast<int64_t>(*weightsPtrs);
     auto adapterSizesPtr = bufferCast<int32_t>(*adapterSizes);
 
-    TLLM_CHECK(!peftValues->empty());
+    TLLM_CHECK(!peftValues.empty());
 
-    auto const numRows = static_cast<SizeType32>(peftValues->size());
+    auto const numRows = static_cast<SizeType32>(peftValues.size());
     for (SizeType32 row = 0; row < numRows; ++row)
     {
-        auto const& peftValue = peftValues->at(row);
+        auto const& peftValue = peftValues.at(row);
         auto const moduleId = peftValue.moduleId;
         auto const adapterSize = peftValue.adapterSize;
         auto const modOff = mModuleOffset.at(moduleId);

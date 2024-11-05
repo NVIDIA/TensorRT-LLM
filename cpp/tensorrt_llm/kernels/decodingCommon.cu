@@ -175,7 +175,7 @@ template void invokeAddBiasSoftMax(half* logits, half** logitsPtrs, half* probs,
     bool batchSlotsLogits, cudaStream_t stream);
 
 template <typename T>
-__global__ void scatterDecodingParamsKernel(T const* src, T* dst, int const* batchSlots, int batchSize)
+__global__ void scatterDecodingParamsKernel(T const* src, T scalar, T* dst, int const* batchSlots, int batchSize)
 {
     auto const batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (batchIdx >= batchSize)
@@ -183,23 +183,24 @@ __global__ void scatterDecodingParamsKernel(T const* src, T* dst, int const* bat
         return;
     }
     auto const batchSlot = batchSlots[batchIdx];
-    dst[batchSlot] = src[batchIdx];
+    dst[batchSlot] = (src == nullptr ? scalar : src[batchIdx]);
 }
 
 template <typename T>
-void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream)
+void invokeScatterDecodingParams(
+    T const* src, T scalar, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream)
 {
     constexpr int THREADS_PER_CTA = 256;
     dim3 grid(divUp(batchSize, THREADS_PER_CTA));
-    scatterDecodingParamsKernel<<<grid, THREADS_PER_CTA, 0, stream>>>(src, dst, batchSlots, batchSize);
+    scatterDecodingParamsKernel<<<grid, THREADS_PER_CTA, 0, stream>>>(src, scalar, dst, batchSlots, batchSize);
 }
 
 template void invokeScatterDecodingParams(
-    float const* src, float* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+    float const* src, float scalar, float* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 template void invokeScatterDecodingParams(
-    uint32_t const* src, uint32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+    uint32_t const* src, uint32_t scalar, uint32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 template void invokeScatterDecodingParams(
-    int32_t const* src, int32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+    int32_t const* src, int32_t scalar, int32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

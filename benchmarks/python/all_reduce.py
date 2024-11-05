@@ -41,7 +41,7 @@ def allreduce_benchmark(dtype: str,
     torch.cuda.set_device(local_rank)
     cudart.cudaSetDevice(local_rank)
 
-    mapping = Mapping(world_size, rank, gpus_per_node, world_size)
+    mapping = Mapping(world_size, rank, gpus_per_node, tp_size=world_size)
 
     if world_size == 1:
         raise RuntimeError("Benchmark must run with mpi_world_size > 1")

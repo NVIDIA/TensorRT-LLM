@@ -23,13 +23,14 @@ class RemoteOpenAIServer:
         model: str,
         cli_args: List[str],
     ) -> None:
-        self.host = '0.0.0.0'
+        self.host = "0.0.0.0"
         self.port = 8000
 
-        self.proc = subprocess.Popen(["python3", SERVER_PATH] + [model] +
-                                     cli_args,
-                                     stdout=sys.stdout,
-                                     stderr=sys.stderr)
+        self.proc = subprocess.Popen(
+            ["python3", SERVER_PATH] + [model] + cli_args,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)
 
@@ -38,6 +39,11 @@ class RemoteOpenAIServer:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.proc.terminate()
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            self.proc.kill()
+            self.proc.wait(timeout=30)
 
     def _wait_for_server(self, *, url: str, timeout: float):
         # run health check

@@ -132,6 +132,8 @@ int RecvPlugin::initialize() noexcept
     }
     ncclUniqueId id;
     COMM_SESSION.recvValue(id, mSrcRank, 0);
+    // Need static connection initialization for accurate KV cache size estimation
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }

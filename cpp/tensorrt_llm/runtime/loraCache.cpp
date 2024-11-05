@@ -387,7 +387,7 @@ void LoraCache::markAllDone()
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::shared_ptr<std::vector<LoraCache::TaskLayerModuleConfig>> LoraCache::get(TaskIdType taskId)
+std::vector<LoraCache::TaskLayerModuleConfig> const& LoraCache::get(TaskIdType taskId)
 {
     std::lock_guard<std::mutex> lock(mCacheMutex);
     if (kVALUE_STATUS_LOADED != getStatus(taskId))
@@ -396,7 +396,7 @@ std::shared_ptr<std::vector<LoraCache::TaskLayerModuleConfig>> LoraCache::get(Ta
     }
 
     bumpTaskInProgress(taskId);
-    return mCacheMap.at(taskId)->configs;
+    return *mCacheMap.at(taskId)->configs;
 }
 
 void LoraCache::bump(TaskIdType taskId)

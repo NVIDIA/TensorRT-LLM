@@ -107,6 +107,8 @@ struct MHARunnerFixedParams
     int numKvHeads;
     // The head size.
     int headSize;
+    // The head size of V.
+    int headSizeV = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The tanh scale after bmm1 (used in Grok models).
@@ -134,6 +136,7 @@ struct MHARunnerFixedParams
         }
         // Head size.
         output += ", head_size = " + std::to_string(headSize);
+        output += ", head_size_V = " + std::to_string(headSizeV);
         // Attention mask type.
         output += ", attention_mask_type = ";
         switch (attentionMaskType)
@@ -325,6 +328,11 @@ struct Fused_multihead_attention_params_v2
 
     // is input/output padded
     bool is_s_padded = false;
+
+    // The dimension of V.
+    int dv = 0;
+    // The stride of V. If unset, v_stride_in_bytes = kv_stride_in_bytes * dv / d
+    int64_t v_stride_in_bytes = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

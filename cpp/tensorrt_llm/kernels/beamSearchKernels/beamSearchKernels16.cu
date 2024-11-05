@@ -20,7 +20,7 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-#ifndef FAST_BUILD // skip beam_width between [?, 16] for fast build
+#ifndef FAST_BUILD // skip beam_width larger than 8
 INSTANTIATE_BEAMSEARCH_K(float, 16);
 INSTANTIATE_BEAMSEARCH_K(half, 16);
 #endif // FAST_BUILD

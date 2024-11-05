@@ -110,7 +110,7 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1)
+        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -157,6 +157,7 @@ public:
         , mLlmRequestType(llmRequestType)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
+        , mEagleConfig(eagleConfig)
         , mSequenceIndex(0)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
@@ -211,6 +212,7 @@ public:
         , mContextPhaseParams(req.getContextPhaseParams())
         , mInputTokenExtraIds(std::nullopt)
         , mNumReturnSequences(1)
+        , mEagleConfig(req.getEagleConfig())
         , mSequenceIndex(0)
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -300,11 +302,6 @@ public:
                     executor::detail::toITensor(loraConfig.value().getConfig().value()));
                 mLoraConfig.value()->unsqueeze(0);
             }
-        }
-
-        auto lookaheadConfig = req.getLookaheadConfig();
-        if (lookaheadConfig)
-        {
         }
 
         auto externalDraftTokensConfig = req.getExternalDraftTokensConfig();
@@ -437,6 +434,16 @@ public:
     void setContextPhaseParams(executor::ContextPhaseParams contextPhaseParams)
     {
         mContextPhaseParams = std::move(contextPhaseParams);
+    }
+
+    [[nodiscard]] bool isLayerWiseKvCacheEnabled() const
+    {
+        return isContextOnlyRequest() && mLayerWiseKvCacheEnabled;
+    }
+
+    void setLayerWiseKvCacheEnabled(bool enabled)
+    {
+        mLayerWiseKvCacheEnabled = enabled;
     }
 
     /// @brief Get the state params of the context
@@ -843,6 +850,16 @@ public:
     void clearLookaheadConfig()
     {
         mLookaheadConfig = std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<executor::EagleConfig> getEagleConfig() const
+    {
+        return mEagleConfig;
+    }
+
+    void setEagleConfig(executor::EagleConfig config)
+    {
+        mEagleConfig = config;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const
@@ -1626,6 +1643,7 @@ protected:
     std::optional<TensorPtr> mCrossAttentionMask; // Input cross attention mask
     LlmRequestType mLlmRequestType;
     std::optional<executor::ContextPhaseParams> mContextPhaseParams;
+    bool mLayerWiseKvCacheEnabled = false;
 
     std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds;
     BeamUniqueTokens mUniqueTokens;
@@ -1633,6 +1651,7 @@ protected:
     std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens;
 
     SizeType32 mNumReturnSequences;
+    std::optional<executor::EagleConfig> mEagleConfig;
     SizeType32 mSequenceIndex;
     std::vector<RequestPtr> mChildRequests;
     RequestIdType mParentRequestId;
@@ -1804,7 +1823,7 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1)
+        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
@@ -1812,7 +1831,51 @@ public:
             returnGenerationLogits, std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput,
             std::move(logitsPostProcessor), applyLogitsPostProcessorBatched, std::move(encoderInputTokens),
             returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), std::move(encoderOutputLength),
-            std::move(crossAttentionMask), llmRequestType, std::move(inputTokenExtraIds), numReturnSequences)
+            std::move(crossAttentionMask), llmRequestType, std::move(inputTokenExtraIds), numReturnSequences,
+            std::move(eagleConfig))
+    {
+    }
+
+    LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+        std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
+        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
+        bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
+        bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
+        bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
+        executor::PriorityType priority = executor::Request::kDefaultPriority,
+        std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
+        LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1)
+        : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
+            samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
+            std::move(stopWordsList),
+            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
+                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
+            std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
+            returnGenerationLogits,
+            draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
+                                    : std::make_shared<VecTokens>(),
+            draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,
+            encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
+                               : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
+            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength, crossAttentionMask,
+            llmRequestType,
+            inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
+                               : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
+            numReturnSequences)
     {
     }
 

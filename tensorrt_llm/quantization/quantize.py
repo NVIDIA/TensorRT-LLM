@@ -7,11 +7,12 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import LayerQuantConfig, QuantConfig
 from ..parameter import Parameter
-from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseGatedMLP, Fp8RowwiseMLP,
-                     Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
-                     Int8SmoothQuantRowLinear, SmoothQuantAttention,
-                     SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
-                     SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
+from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
+                     Fp8RowwiseGatedMLP, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
+                     Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
+                     SmoothQuantAttention, SmoothQuantGatedMLP,
+                     SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
+                     WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
                      WeightOnlyQuantRowLinear)
@@ -85,7 +86,7 @@ def weight_only_quantize(model, quant_config: QuantConfig, model_config=None):
 
     try:
         model_cfg = model.config
-    except Exception:
+    except AttributeError:
         model_cfg = model_config
 
     quant_map = {
@@ -117,7 +118,7 @@ def weight_only_groupwise_quantize(model,
 
     try:
         model_cfg = model.config
-    except Exception:
+    except AttributeError:
         model_cfg = model_config
 
     quant_map = {
@@ -222,19 +223,20 @@ def fp8_quantize(model, quant_config: QuantConfig):
     return model
 
 
-def fp8_rowwise_quantize(model, quant_config: QuantConfig, model_config=None):
+def fp8_rowwise_quantize(model, quant_config: QuantConfig):
     assert quant_config.quant_mode.has_fp8_rowwise()
 
-    try:
-        model_cfg = model.config
-    except Exception:
-        model_cfg = model_config
-
-    quant_map = {
+    quant_cls_map = {
         RmsNorm: Fp8RowwiseRmsNorm,
         GatedMLP: Fp8RowwiseGatedMLP,
         MLP: Fp8RowwiseMLP,
+        Attention: Fp8RowwiseAttention,
     }
+
+    if quant_config.exclude_modules is None:
+        exclude_modules = ['*ln_f', '*ln_embed']
+    else:
+        exclude_modules = quant_config.exclude_modules
 
     def extract_layer_idx(name):
         ss = name.split('.')
@@ -243,35 +245,49 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig, model_config=None):
                 return int(s)
         return None
 
-    for name, layer, parent in model.named_modules_with_parent():
-        layer_name = name.rsplit('.', 1)[-1]
-        layer_idx = extract_layer_idx(name)
-        if layer_name in ['ln_f', 'ln_embed'] or "input_layernorm" in name:
-            continue
+    # Meta's LLaMA 3.1 recipe:
+    # (1) Skip quantization for the first and last Transformer layers
+    # (2) Skip quantization for the Attention layers
+    if quant_config.use_meta_recipe:
+        exclude_modules.extend(['*input_layernorm', '*attention'])
 
-        # Meta's Fp8 recipe
-        mapping = model_cfg.mapping
-        layers_range = mapping.pp_layers(model_cfg.num_hidden_layers)
-        is_first_layer = mapping.is_first_pp_rank() and layer_idx == 0
-        is_last_layer = mapping.is_last_pp_rank(
-        ) and layer_idx == len(layers_range) - 1
-        if is_first_layer or is_last_layer:
-            continue
+    for name, layer, parent in model.named_modules_with_parent():
+        module_name = name.rsplit('.', 1)[-1]
+
+        if quant_config.use_meta_recipe:
+            local_layer_idx = extract_layer_idx(name)
+            mapping = model.config.mapping
+            layers_range = mapping.pp_layers(model.config.num_hidden_layers)
+            if mapping.is_first_pp_rank() and local_layer_idx == 0:
+                continue
+            if mapping.is_last_pp_rank(
+            ) and local_layer_idx == len(layers_range) - 1:
+                continue
 
         quant_cls = None
-        for cls in quant_map:
+        for cls in quant_cls_map:
             if isinstance(layer, cls):
-                quant_cls = quant_map[cls]
+                quant_cls = quant_cls_map[cls]
                 break
-
         if quant_cls is None:
+            continue
+
+        is_excluded = False
+        for exclude_module in exclude_modules:
+            if fnmatch.fnmatchcase(name, exclude_module):
+                is_excluded = True
+                break
+        if is_excluded:
             continue
 
         init_params = get_init_params(layer, quant_cls)
         init_params["quant_mode"] = quant_config.quant_mode
+        if isinstance(layer, Attention):
+            init_params[
+                "num_attention_heads"] = layer.num_attention_heads * layer.tp_size
         quant_layer = quant_cls(**init_params, clamp_val=quant_config.clamp_val)
         if parent is not None:
-            setattr(parent, layer_name, quant_layer)
+            setattr(parent, module_name, quant_layer)
         else:
             model = quant_layer
 
@@ -282,7 +298,8 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig, model_config=None):
 # Now consider the kv cache is enabled for all layers
 def kv_cache_quantize(model):
     for name, module in model.named_modules():
-        if isinstance(module, (Attention, SmoothQuantAttention)):
+        if isinstance(module,
+                      (Attention, SmoothQuantAttention, Fp8RowwiseAttention)):
             module.kv_cache_scaling_factor = Parameter(shape=(1, ),
                                                        dtype='float32')
     return model
@@ -307,7 +324,7 @@ def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
         if layer_quant_mode.has_fp8_qdq():
             module = fp8_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_fp8_rowwise():
-            module = fp8_rowwise_quantize(module, layer_quant_cfg, model.config)
+            module = fp8_rowwise_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_act_and_weight_quant():
             module = smooth_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_weight_only():
