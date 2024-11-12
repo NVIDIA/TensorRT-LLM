@@ -317,13 +317,14 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                 rand_data_validation_t,
                 TreeParams(paths=paths_t),
                 greedy_sampling=greedy_sampling)
-            accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, next_draft_lens, hidden_size_batch_level_starts = output
+            accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, next_draft_lens, next_draft_paths, hidden_size_batch_level_starts = output
 
             accepted_tokens.mark_output('accepted_tokens')
             num_accepted_tokens.mark_output('num_accepted_tokens')
             accepted_paths.mark_output('accepted_paths')
             next_draft_tokens.mark_output('next_draft_tokens')
             next_draft_lens.mark_output('next_draft_lens')
+            next_draft_paths.mark_output('next_draft_paths')
             hidden_size_batch_level_starts.mark_output(
                 'hidden_size_batch_level_starts')
 
@@ -352,6 +353,11 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                 atol=0)
         torch.testing.assert_close(ref_accepted_paths,
                                    outputs["accepted_paths"],
+                                   rtol=0,
+                                   atol=0)
+
+        torch.testing.assert_close(paths,
+                                   outputs["next_draft_paths"],
                                    rtol=0,
                                    atol=0)
 

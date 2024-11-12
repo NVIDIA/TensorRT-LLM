@@ -4,6 +4,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from random import choices, shuffle
 from time import monotonic_ns, sleep
 from typing import List
 
@@ -66,6 +67,12 @@ from tensorrt_llm.logger import logger
     help="Number of requests to cap benchmark run at. Minimum between value and"
     "length of dataset.",
 )
+@optgroup.option(
+    "--warmup",
+    type=int,
+    default=0,
+    help="Number of requests warm up benchmark.",
+)
 @optgroup.group("Speculative Decode Options",
                 help="Runtime settings for executing a TensorRT-LLM engine.")
 @optgroup.option(
@@ -125,6 +132,7 @@ def latency_command(
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
+    warmup_steps = params.get("warmup")
 
     # Initialize the HF tokenizer for the specified model.
     ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
@@ -161,6 +169,7 @@ def latency_command(
 
     try:
         logger.info("Ready to start benchmark.")
+        benchmark.setup_warmup(warmup_steps)
         benchmark.start_benchmark()
         benchmark.report_statistics()
     except KeyboardInterrupt:
@@ -186,6 +195,7 @@ class LatencyBenchmark:
         """
         # Dataset and input properties.
         self.requests = dataset
+        self.warm_up_dataset = None
         self.runtime_config = deepcopy(runtime_cfg)
         self.streaming = True
 
@@ -208,6 +218,12 @@ class LatencyBenchmark:
         os.environ["FORCE_MULTI_BLOCK_MODE"] = "1"
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
+    def setup_warmup(self, steps) -> None:
+        """Warm up the benchmarker."""
+        if steps > 0:
+            self.warm_up_dataset = choices(self.requests, k=steps)
+            shuffle(self.warm_up_dataset)
+
     def start_benchmark(self) -> None:
         """Start the benchmark."""
         logger.info("Initializing backend...")
@@ -221,6 +237,18 @@ class LatencyBenchmark:
         while not self.executor.can_enqueue_requests():
             logger.info("Waiting for executor to stand up...")
             sleep(1)
+
+        if self.warm_up_dataset and len(self.warm_up_dataset) > 0:
+            logger.info(f"WARMING UP...")
+            for i, request in enumerate(self.warm_up_dataset, start=1):
+                logger.info(f"Running warm up step {i}...")
+                req_id = self.executor.enqueue_request(request)
+                final = False
+                while not final:
+                    responses = self.executor.await_responses(req_id)
+                    final = any([resp.result.is_final for resp in responses])
+
+            logger.info("WARMUP COMPLETE.")
 
         logger.info("Low latency benchmark started.")
         self.start_time = monotonic_ns()

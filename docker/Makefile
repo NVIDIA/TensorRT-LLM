@@ -155,7 +155,7 @@ centos7_%: BASE_TAG = 12.4.0-devel-centos7
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.6.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.6.2-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

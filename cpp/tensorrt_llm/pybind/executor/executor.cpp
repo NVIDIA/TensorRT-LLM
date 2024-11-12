@@ -184,7 +184,8 @@ void Executor::initBindings(py::module_& m)
         .def("get_latest_iteration_stats", &Executor::getLatestIterationStats)
         .def("get_latest_request_stats", &Executor::getLatestRequestStats)
         .def("get_latest_debug_tensors", &Executor::getLatestDebugTensors)
-        .def("can_enqueue_requests", &Executor::canEnqueueRequests);
+        .def("can_enqueue_requests", &Executor::canEnqueueRequests)
+        .def("get_kv_cache_event_manager", &Executor::getKVCacheEventManager);
 }
 
 } // namespace tensorrt_llm::pybind::executor

@@ -40,7 +40,7 @@ from .functional import (
     quantize_fp8_per_token, quantize_per_token, quantize_tensor,
     validate_group_size, smooth_quant_gemm, smooth_quant_layer_norm,
     smooth_quant_rms_norm, weight_only_groupwise_quant_matmul,
-    weight_only_quant_matmul)
+    weight_only_quant_matmul, qserve_gemm_per_group, qserve_gemm_per_channel)
 # isort: on
 from .mode import QuantMode
 
@@ -349,6 +349,159 @@ class SmoothQuantRmsNorm(Module):
             clamp_val,
             self.eps,
             dynamic_act_scaling=self.quant_mode.has_per_token_dynamic_scaling())
+
+
+class QServeW4A8Linear(Linear):
+
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 gather_output=True,
+                 quant_mode=QuantMode(0)):
+        assert dtype == "float16"  # Currently the kernel only supports float16 output
+
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size,
+                         gather_output=gather_output)
+
+        self.quant_mode = quant_mode
+        assert self.quant_mode.is_qserve_w4a8()
+
+        # Only support g128 now.
+        if self.quant_mode.has_per_group_scaling():
+            self.group_size = 128
+        else:
+            self.group_size = -1
+
+        self.weight = Parameter(shape=(self.out_features,
+                                       self.in_features // 2),
+                                dtype="int8")
+
+        self.s1_scales = Parameter(shape=(self.out_features, ), dtype="float16")
+
+        if self.group_size == -1:
+            self.s1_szeros = Parameter(shape=(self.out_features, ),
+                                       dtype="float16")
+        else:
+            self.s2_scales = Parameter(
+                shape=(self.in_features // self.group_size, self.out_features),
+                dtype="int8")
+            self.s2_zeros = Parameter(
+                shape=(self.in_features // self.group_size, self.out_features),
+                dtype="int8")
+
+    def forward(self, x):
+        if self.group_size == -1:
+            x, per_token_scale, per_token_sum = x
+            x = qserve_gemm_per_channel(x, per_token_scale, per_token_sum,
+                                        self.weight.value, self.s1_scales.value,
+                                        self.s1_szeros.value)
+
+        else:
+            x, per_token_scale = x
+            x = qserve_gemm_per_group(x, per_token_scale, self.weight.value,
+                                      self.s1_scales.value,
+                                      self.s2_scales.value, self.s2_zeros.value,
+                                      self.group_size)
+
+        if self.bias is not None:
+            x = x + self.bias.value
+
+        if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
+        return x
+
+
+QServeW4A8ColumnLinear = QServeW4A8Linear
+
+
+class QServeW4A8RowLinear(RowLinear):
+
+    def __init__(
+            self,
+            in_features,
+            out_features,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+    ):
+        assert dtype == "float16"  # Currently the kernel only supports float16 output
+
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size)
+
+        self.quant_mode = quant_mode
+        assert self.quant_mode.is_qserve_w4a8()
+        # Only supports 128g now.
+        if self.quant_mode.has_per_group_scaling():
+            self.group_size = 128
+        else:
+            self.group_size = -1
+
+        self.weight = Parameter(shape=(self.out_features,
+                                       self.in_features // 2),
+                                dtype="int8")
+
+        self.s1_scales = Parameter(shape=(self.out_features, ), dtype="float16")
+
+        if self.group_size == -1:
+            self.s1_szeros = Parameter(shape=(self.out_features, ),
+                                       dtype="float16")
+        else:
+            self.s2_scales = Parameter(
+                shape=(self.in_features // self.group_size, self.out_features),
+                dtype="int8")
+            self.s2_zeros = Parameter(
+                shape=(self.in_features // self.group_size, self.out_features),
+                dtype="int8")
+
+    def forward(self, x, reduce_fusion_params=None):
+        if self.group_size == -1:
+            x, per_token_scale, per_token_sum = x
+            x = qserve_gemm_per_channel(x, per_token_scale, per_token_sum,
+                                        self.weight.value, self.s1_scales.value,
+                                        self.s1_szeros.value)
+        else:
+            x, per_token_scale = x
+            x = qserve_gemm_per_group(x, per_token_scale, self.weight.value,
+                                      self.s1_scales.value,
+                                      self.s2_scales.value, self.s2_zeros.value,
+                                      self.group_size)
+
+        if self.tp_size > 1 and self.tp_group is not None:
+            need_bias = self.bias is not None
+            fuse_bias_into_all_reduce = need_bias and (
+                reduce_fusion_params
+                is not None) and (reduce_fusion_params.fusion_op
+                                  == AllReduceFusionOp.RESIDUAL_RMS_NORM)
+            if fuse_bias_into_all_reduce:
+                reduce_fusion_params.bias = self.bias.value
+            x = allreduce(x,
+                          self.tp_group,
+                          reduce_fusion_params=reduce_fusion_params)
+            if need_bias and not fuse_bias_into_all_reduce:
+                x = x + self.bias.value
+            return x
+
+        if self.bias is not None:
+            x = x + self.bias.value
+
+        return x
 
 
 class Fp8RowwiseRmsNorm(Module):
@@ -2300,6 +2453,521 @@ class SmoothQuantAttention(Module):
             context,
             reduce_fusion_params=reduce_fusion_params,
         )
+
+        if use_cache:
+            return (context, past_key_value)
+
+        return context
+
+
+# TODO: Duplicates SmoothQuantRmsNorm
+class QServeRmsNorm(Module):
+
+    def __init__(self,
+                 normalized_shape,
+                 eps=1e-06,
+                 elementwise_affine=False,
+                 dtype=None,
+                 quant_mode=QuantMode(0),
+                 bias=False,
+                 clamp_val=None):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape, )
+        assert quant_mode.is_qserve_w4a8()
+        self.normalized_shape = tuple(normalized_shape)
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = Parameter(shape=self.normalized_shape, dtype=dtype)
+        else:
+            self.register_parameter('weight', None)
+
+        if bias:
+            self.bias = Parameter(shape=self.normalized_shape, dtype=dtype)
+        else:
+            self.register_parameter('bias', None)
+        if clamp_val:
+            if not (isinstance(clamp_val, list) and len(clamp_val) == 2):
+                raise ValueError(f'unsupported clamp_val {clamp_val}')
+            self.clamp_val = Parameter(np.array(clamp_val, dtype=np.float32),
+                                       dtype='float32',
+                                       is_buffer=True)
+        else:
+            self.register_parameter('clamp_val', None)
+
+        self.eps = eps
+        self.dtype = dtype
+        self.quant_mode = quant_mode
+
+        if self.quant_mode.has_act_and_weight_quant():
+            self.scale_to_int = Parameter(shape=(1, ), dtype=dtype)
+        else:
+            self.register_parameter('scale_to_int', None)
+
+    def forward(self, x):
+        weight = None if self.weight is None else self.weight.value
+        bias = None if self.bias is None else self.bias.value
+        scale = None if self.scale_to_int is None else self.scale_to_int.value
+        clamp_val = None if self.clamp_val is None else self.clamp_val.value
+        return smooth_quant_rms_norm(
+            x,
+            self.normalized_shape,
+            weight,
+            bias,
+            scale,
+            clamp_val,
+            self.eps,
+            dynamic_act_scaling=True,
+            scale_dtype='float16',
+            sum_per_token=not self.quant_mode.has_per_group_scaling(),
+            sum_dtype='float16')
+
+
+# TODO: Mostly duplicates SmoothQuantMLP.
+# TODO: MLP could represent GatedMLP if hidden_act=='swiglu'.
+class QServeMLP(Module):
+
+    def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            hidden_act,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+    ):
+        super().__init__()
+        if hidden_act not in ACT2FN:
+            raise ValueError(
+                'unsupported activation function: {}'.format(hidden_act))
+        fc_output_size = 2 * ffn_hidden_size if hidden_act == 'swiglu' else ffn_hidden_size
+        self.fc = QServeW4A8ColumnLinear(hidden_size,
+                                         fc_output_size,
+                                         bias=bias,
+                                         dtype=dtype,
+                                         tp_group=tp_group,
+                                         tp_size=tp_size,
+                                         gather_output=False,
+                                         quant_mode=quant_mode)
+
+        self.proj = QServeW4A8RowLinear(ffn_hidden_size,
+                                        hidden_size,
+                                        bias=bias,
+                                        dtype=dtype,
+                                        tp_group=tp_group,
+                                        tp_size=tp_size,
+                                        quant_mode=quant_mode)
+
+        self.hidden_act = hidden_act
+        self.quant_mode = quant_mode
+        self.dtype = dtype
+
+    def forward(self, hidden_states):
+        inter = self.fc(hidden_states)
+        inter = ACT2FN[self.hidden_act](inter)
+        inter = quantize_per_token(
+            inter,
+            scale_dtype='float16',
+            sum_per_token=not self.quant_mode.has_per_group_scaling(),
+            sum_dtype='float16')
+        output = self.proj(inter)
+        return output
+
+
+# TODO: Mostly duplicates SmoothQuantGatedMLP.
+class QServeGatedMLP(QServeMLP):
+
+    def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            hidden_act,
+            bias=True,
+            dtype=None,
+            tp_group=None,
+            tp_size=1,
+            quant_mode=QuantMode(0),
+    ):
+        super().__init__(hidden_size,
+                         ffn_hidden_size,
+                         hidden_act,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size,
+                         quant_mode=quant_mode)
+        if hidden_act not in ACT2FN:
+            raise ValueError(
+                'unsupported activation function: {}'.format(hidden_act))
+        self.gate = QServeW4A8Linear(hidden_size,
+                                     ffn_hidden_size,
+                                     bias=bias,
+                                     dtype=dtype,
+                                     tp_group=tp_group,
+                                     tp_size=tp_size,
+                                     gather_output=False,
+                                     quant_mode=quant_mode)
+
+    def forward(self, hidden_states, lora_layer_params=None):
+        assert lora_layer_params is None, "lora_layer_params not supported"
+        inter = self.fc(hidden_states)
+        inter = ACT2FN[self.hidden_act](inter)
+        gate = self.gate(hidden_states)
+
+        inter_x_gate = inter * gate
+        inter_x_gate = quantize_per_token(
+            inter_x_gate,
+            scale_dtype='float16',
+            sum_per_token=not self.quant_mode.has_per_group_scaling(),
+            sum_dtype='float16')
+
+        output = self.proj(inter_x_gate)
+        return output
+
+
+# TODO: Duplicates SmoothQuantAttention.
+class QServeAttention(Module):
+
+    def __init__(self,
+                 *,
+                 local_layer_idx,
+                 hidden_size,
+                 num_attention_heads,
+                 num_kv_heads=None,
+                 max_position_embeddings=1024,
+                 num_layers=1,
+                 apply_query_key_layer_scaling=False,
+                 attention_head_size=None,
+                 attention_mask_type=AttentionMaskType.padding,
+                 bias=True,
+                 dense_bias=None,
+                 dtype=None,
+                 position_embedding_type=PositionEmbeddingType.learned_absolute,
+                 rotary_embedding_base=10000.0,
+                 rotary_embedding_scaling=None,
+                 rotary_embedding_percentage=1.0,
+                 tp_group=None,
+                 tp_size=1,
+                 tp_rank=0,
+                 scale_alibi_bias=False,
+                 paged_kv_cache=False,
+                 quant_mode=QuantMode(0),
+                 layer_idx_in_cache_pool=None):
+        super().__init__()
+        self.local_layer_idx = local_layer_idx
+        self.attention_mask_type = attention_mask_type
+        self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
+        self.num_attention_heads = num_attention_heads // tp_size
+        self.num_attention_kv_heads = (
+            num_kv_heads + tp_size - 1
+        ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
+        self.hidden_size = hidden_size // tp_size
+        self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.dense_bias = dense_bias
+        if dense_bias is None:
+            self.dense_bias = bias
+
+        self.num_layers = num_layers
+        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        self.norm_factor = math.sqrt(self.attention_head_size)
+        self.q_scaling = 1
+        if self.apply_query_key_layer_scaling:
+            self.norm_factor *= self.num_layers
+            self.q_scaling *= self.num_layers
+        # Whether to scale ALiBi bias. Mathematically, it's equivalent to
+        # normalizing QK after adding bias.
+        #   - False, inv_sqrt_Dh * Q*K^T + alibi_bias
+        #   - True,  inv_sqrt_Dh * Q*K^T + inv_sqrt_Dh * alibi_bias
+        self.scale_alibi_bias = scale_alibi_bias
+
+        self.position_embedding_type = position_embedding_type
+        self.paged_kv_cache = paged_kv_cache
+
+        self.rotary_embedding_base = rotary_embedding_base
+        self.rotary_embedding_scale_type = RotaryScalingType.none
+        self.rotary_embedding_scale = 1.0
+        self.rotary_embedding_dim = 0
+
+        if rotary_embedding_scaling is not None:
+            rotary_scaling_type = rotary_embedding_scaling.get(
+                "type", rotary_embedding_scaling.get("rope_type"))
+            self.rotary_embedding_scale_type = RotaryScalingType.from_string(
+                rotary_scaling_type)
+            self.rotary_embedding_scale = rotary_embedding_scaling.get(
+                "factor", 1.0)
+
+        if self.position_embedding_type.is_rope():
+            self.rotary_embedding_dim = int(self.attention_head_size *
+                                            rotary_embedding_percentage)
+        elif self.position_embedding_type.is_alibi():
+            alibi_scale = 1. / self.norm_factor if self.scale_alibi_bias else 1.
+            alibi_slopes = generate_alibi_slopes(self.num_attention_heads *
+                                                 self.tp_size,
+                                                 tp_size=self.tp_size,
+                                                 tp_rank=self.tp_rank,
+                                                 alibi_scale=alibi_scale)
+            self.register_parameter(
+                'alibi_slopes',
+                Parameter(alibi_slopes, dtype='float32', is_buffer=True))
+
+        self.quant_mode = quant_mode
+        self.dtype = dtype
+
+        # QServe does not use act static scaling
+        # if self.quant_mode.has_act_static_scaling():
+        #     self.quantization_scaling_factor = Parameter(shape=(1, ),
+        #                                                  dtype='float32')
+        # else:
+        #     self.register_parameter('quantization_scaling_factor', None)
+
+        qkv_quant_mode = quant_mode
+        if self.quant_mode.has_act_and_weight_quant():
+            # We need to hijack quant_mode for QKV because QKV always uses per channel scaling
+            qkv_quant_mode = QuantMode.from_description(
+                True, True, quant_mode.has_per_token_dynamic_scaling(), True)
+
+        self.register_parameter('kv_cache_scaling_factor', None)
+
+        self.qkv = QServeW4A8ColumnLinear(
+            hidden_size,
+            tp_size * self.num_attention_heads * self.attention_head_size +
+            (2 * tp_size * self.num_attention_kv_heads *
+             self.attention_head_size),
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            gather_output=False,
+            quant_mode=qkv_quant_mode)
+
+        self.dense = QServeW4A8RowLinear(tp_size * self.num_attention_heads *
+                                         self.attention_head_size,
+                                         hidden_size,
+                                         bias=self.dense_bias,
+                                         dtype=dtype,
+                                         tp_group=tp_group,
+                                         tp_size=tp_size,
+                                         quant_mode=quant_mode)
+
+        self.use_lora = False
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask=None,
+        use_cache=False,
+        kv_cache_params=None,
+        attention_params=None,
+        spec_decoding_params=None,
+        encoder_output=None,
+        position_embedding=None,
+        norm_before_bmm1=False,
+        lora_layer_params=None,
+        reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+    ):
+        assert lora_layer_params is None, "lora is not supported on SmoothQuantAttention now"
+        if default_net().plugin_config.qserve_gemm_plugin:
+            qkv = self.qkv(hidden_states)
+        else:
+            raise ValueError("qserve_gemm_plugin is not set")
+
+        alibi_slopes = None
+        if self.position_embedding_type == PositionEmbeddingType.alibi:
+            alibi_slopes = self.alibi_slopes.value
+            dtype = trt.float32
+            if default_net().plugin_config.gpt_attention_plugin or default_net(
+            ).plugin_config.inflight_batching_gpt_attention_plugin:
+                dtype = hidden_states.dtype if self.quant_mode.has_act_static_scaling(
+                ) else hidden_states[0].dtype
+                if dtype == trt.int8:
+                    dtype = trt.float16
+            alibi_slopes = cast(alibi_slopes, dtype)
+
+        if spec_decoding_params is None:
+            spec_decoding_params = SpecDecodingParams()
+
+        if default_net().plugin_config.gpt_attention_plugin:
+
+            assert attention_params.is_valid(
+                default_net().plugin_config.gpt_attention_plugin,
+                default_net().plugin_config.remove_input_padding, use_cache)
+            if use_cache:
+                assert kv_cache_params.is_valid(
+                    default_net().plugin_config.gpt_attention_plugin)
+            assert self.attention_mask_type == AttentionMaskType.causal, \
+                'Plugin only support masked MHA.'
+            if self.kv_cache_scaling_factor is not None:
+                kv_orig_quant_scale = constant(fp32_array(
+                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_quant_orig_scale = self.kv_cache_scaling_factor.value
+            else:
+                kv_orig_quant_scale = None
+                kv_quant_orig_scale = None
+            if self.position_embedding_type.is_rope():
+                rotary_inv_freq = attention_params.rotary_inv_freq
+                rotary_cos_sin = attention_params.embed_positions_for_gpt_attention
+            else:
+                rotary_inv_freq = None
+                rotary_cos_sin = None
+            context, past_key_value = gpt_attention(
+                qkv=qkv,
+                past_key_value=kv_cache_params.get_first_past_key_value(),
+                sequence_length=attention_params.sequence_length,
+                host_past_key_value_lengths=kv_cache_params.
+                host_past_key_value_lengths,
+                host_max_attention_window_sizes=kv_cache_params.
+                host_max_attention_window_sizes,
+                host_sink_token_length=kv_cache_params.host_sink_token_length,
+                context_lengths=attention_params.context_lengths,
+                cache_indirection=kv_cache_params.cache_indirection,
+                host_request_types=attention_params.host_request_types,
+                layer_idx=self.local_layer_idx,
+                num_heads=self.num_attention_heads,
+                num_kv_heads=self.num_attention_kv_heads,
+                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
+                hidden_size_per_head=self.attention_head_size,
+                q_scaling=self.q_scaling,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                rotary_embedding_base=self.rotary_embedding_base,
+                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
+                rotary_embedding_scale=self.rotary_embedding_scale,
+                rotary_embedding_max_positions=self.max_position_embeddings,
+                position_embedding_type=self.position_embedding_type,
+                rotary_inv_freq=rotary_inv_freq,
+                rotary_cos_sin=rotary_cos_sin,
+                kv_orig_quant_scale=kv_orig_quant_scale,
+                kv_quant_orig_scale=kv_quant_orig_scale,
+                kv_cache_quant_mode=self.quant_mode,
+                max_context_length=attention_params.max_context_length,
+                alibi_slopes=alibi_slopes,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets,
+                host_kv_cache_block_offsets=kv_cache_params.
+                host_kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=kv_cache_params.
+                host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=kv_cache_params.
+                host_kv_cache_pool_mapping,
+                host_context_lengths=attention_params.host_context_lengths,
+                use_cache=use_cache,
+                spec_decoding_generation_lengths=spec_decoding_params.
+                spec_decoding_generation_lengths,
+                spec_decoding_position_offsets=spec_decoding_params.
+                spec_decoding_position_offsets,
+                spec_decoding_packed_mask=spec_decoding_params.
+                spec_decoding_packed_mask,
+                host_runtime_perf_knobs=attention_params.
+                host_runtime_perf_knobs,
+                host_context_progress=attention_params.host_context_progress)
+        else:
+            assert self.paged_kv_cache == False
+
+            def transpose_for_scores(x):
+                new_x_shape = concat([
+                    shape(x, 0),
+                    shape(x, 1), self.num_attention_heads,
+                    self.attention_head_size
+                ])
+                return x.view(new_x_shape).permute([0, 2, 1, 3])
+
+            query, key, value = split(qkv, self.hidden_size, dim=2)
+            query = transpose_for_scores(query)
+            key = transpose_for_scores(key)
+            value = transpose_for_scores(value)
+
+            past_key_value = kv_cache_params.get_first_past_key_value()
+            if past_key_value is not None:
+
+                def dequantize_tensor(x, scale):
+                    # Cast from int8 to dtype
+                    casted_x = cast(x, self.dtype)
+                    return casted_x * scale
+
+                if self.quant_mode.has_int8_kv_cache():
+                    past_key_value = dequantize_tensor(
+                        past_key_value, self.kv_dequantization_scale.value)
+
+                # past_key_value [bs, 2, num_heads, max_seq_len, head_dim]
+                past_key, past_value = split(past_key_value, 1, dim=1)
+
+                key_shape = concat([
+                    shape(past_key, 0),
+                    shape(past_key, 2),
+                    shape(past_key, 3),
+                    shape(past_key, 4)
+                ])
+                past_key = past_key.view(key_shape, zero_is_placeholder=False)
+                past_value = past_value.view(key_shape,
+                                             zero_is_placeholder=False)
+                key = concat([past_key, key], dim=2)
+                value = concat([past_value, value], dim=2)
+
+            def merge_caches():
+                key_inflated_shape = concat([
+                    shape(key, 0), 1,
+                    shape(key, 1),
+                    shape(key, 2),
+                    shape(key, 3)
+                ])
+                inflated_key = key.view(key_inflated_shape,
+                                        zero_is_placeholder=False)
+                inflated_value = value.view(key_inflated_shape,
+                                            zero_is_placeholder=False)
+                past_key_value = concat([inflated_key, inflated_value], dim=1)
+                return past_key_value
+
+            if self.attention_mask_type == AttentionMaskType.causal:
+                query_length = shape(query, 2)
+                key_length = shape(key, 2)
+                starts = concat([0, 0, key_length - query_length, 0])
+                sizes = concat([1, 1, query_length, key_length])
+                buffer = constant(
+                    np.expand_dims(
+                        np.tril(
+                            np.ones(
+                                (self.max_position_embeddings,
+                                 self.max_position_embeddings))).astype(bool),
+                        (0, 1)))
+                causal_mask = slice(buffer, starts, sizes)
+
+            key = key.permute([0, 1, 3, 2])
+            with precision("float32"):
+                attention_scores = matmul(query, key)
+
+                if self.attention_mask_type == AttentionMaskType.causal:
+                    attention_scores = where(causal_mask, attention_scores,
+                                             -10000.0)
+
+                attention_scores = attention_scores / self.norm_factor
+                attention_probs = softmax(attention_scores, dim=-1)
+
+            context = matmul(attention_probs, value,
+                             use_fp32_acc=False).permute([0, 2, 1, 3])
+            context = context.view(
+                concat([shape(context, 0),
+                        shape(context, 1), self.hidden_size]))
+
+            past_key_value = merge_caches()
+
+            if use_cache and self.quant_mode.has_int8_kv_cache():
+                past_key_value = quantize_tensor(
+                    past_key_value, self.kv_quantization_scale.value)
+
+        # Quantize per token outputs tuple:
+        # quantized tensor and scaling factors per token
+        context = quantize_per_token(
+            context,
+            scale_dtype='float16',
+            sum_per_token=not self.quant_mode.has_per_group_scaling(),
+            sum_dtype='float16')
+
+        context = self.dense(context, reduce_fusion_params=reduce_fusion_params)
 
         if use_cache:
             return (context, past_key_value)

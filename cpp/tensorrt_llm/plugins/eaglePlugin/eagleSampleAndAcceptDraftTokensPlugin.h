@@ -92,6 +92,8 @@ private:
         NEXT_DRAFT_TOKEN_IDS,
         //! [batch_size]
         NEXT_DRAFT_LENS,
+        //! [batch_size,  max_decoding_tokens, max_path_len]
+        NEXT_DRAFT_PATHS,
         //! [max_draft_path_len * batch_size]
         HIDDEN_SIZE_BATCH_LEVEL_STARTS,
     };

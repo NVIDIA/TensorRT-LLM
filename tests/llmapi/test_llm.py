@@ -5,7 +5,6 @@ import random
 import shutil
 import sys
 import tempfile
-import time
 from typing import List, Optional, Union
 
 import datasets
@@ -15,8 +14,7 @@ import transformers
 
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (ExecutorBindingsWorker, GenerationRequest,
-                                   GenerationResult, LoRARequest,
+from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, KvCacheConfig,
                                  NoStatsAvailable, SamplingParams)
@@ -24,6 +22,7 @@ from tensorrt_llm.llmapi.llm_utils import BuildConfig, _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -868,6 +867,29 @@ def test_llama_7b_multi_lora():
     llama_7b_multi_lora_test_harness(max_loras=1, max_cpu_loras=8)
 
 
+@skip_less_than_40gb_memory
+def test_mixtral_8x7b_moe_tp_and_moe_ep(**llm_kwargs):
+    mixtral_8x7b_dir = get_model_path("Mixtral-8x7B-v0.1")
+    llm = LLM(mixtral_8x7b_dir,
+              tensor_parallel_size=2,
+              moe_expert_parallel_size=2,
+              moe_tensor_parallel_size=1,
+              **llm_kwargs)
+    tmpdir = tempfile.TemporaryDirectory()
+
+    llm.save(tmpdir.name)
+
+    with open(os.path.join(tmpdir.name, "config.json"), "r") as f:
+        # read the build_config and check if the parameters are correctly saved
+        engine_config = json.load(f)
+
+        pretrained_config = PretrainedConfig.from_dict(
+            engine_config["pretrained_config"])
+
+        assert pretrained_config.mapping.moe_tp_size == 1
+        assert pretrained_config.mapping.moe_ep_size == 2
+
+
 def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-7b-hf")
     hf_prompt_adapter_dir = get_model_path("llama-models-v2/llama_tweet_ptune")
@@ -1023,64 +1045,6 @@ class DummyExecutorMeta(type):
         return new_cls
 
 
-class DummyExecutorWorker(ExecutorBindingsWorker):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        # This is copied from the ExecutorBindingsWorker.submit method with minor modification
-
-        self.start()
-
-        req_id = self._enqueue_request(request)
-        request.set_id(req_id)
-
-        result = GenerationResult(request)
-
-        # Force the responses to be delayed
-        time.sleep(1)
-
-        print(f"number of pending responses: {len(self._pending_responses)}")
-        assert self._pending_responses
-
-        self._results[req_id] = result
-
-        assert self._cleanup_pending_responses()
-
-        return result
-
-
-DummyExecutor = DummyExecutorMeta("DummyExecutor", (), {},
-                                  worker_cls=DummyExecutorWorker)
-
-
-def test_executor_pending_requests():
-    llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor,
-              kv_cache_config=global_kvcache_config)
-    # The dummy executor will delay the responses
-    sampling_params = SamplingParams(max_tokens=6)
-
-    def test_nonstreaming():
-        for output in llm.generate(prompts, sampling_params=sampling_params):
-            print(output)
-
-    def test_streaming():
-
-        async def task():
-            async for output in llm.generate_async(
-                    prompts[0], streaming=True,
-                    sampling_params=sampling_params):
-                print(output)
-
-        asyncio.run(task())
-
-    test_nonstreaming()
-
-    test_streaming()
-
-
 class DummyExecutorWorker2(ExecutorBindingsWorker):
 
     def __init__(self, *args, **kwargs):
@@ -1184,12 +1148,20 @@ class DummyExecutorWorker3(ExecutorBindingsWorker):
         super().__init__(*args, **kwargs)
 
         self.counter = 0
+        self.failed_requests = set()
 
     def _engine_response_callback(self, response: tllm.Response):
+        if response.client_id in self.failed_requests:
+            return None
+        # Making the first response failed, and the subsequent responses successful
         if DummyExecutorWorker3.should_raise_error:
             DummyExecutorWorker3.should_raise_error = False
-            return tllm.Response(request_id=response.request_id,
-                                 error_msg="Test error")
+            print(f"Raise error for {response.client_id}")
+            self.failed_requests.add(response.client_id)
+            return tllm.Response(
+                request_id=0,  # dummy value
+                client_id=response.client_id,
+                error_msg="Test error")
         else:
             return response
 
@@ -1292,4 +1264,7 @@ def test_llm_get_stats_async(tp_size: int = 1):
 if __name__ == '__main__':
     #test_llm_get_stats()
     #test_llm_get_stats_async()
-    test_executor_pending_requests()
+    #test_executor_pending_requests()
+    test_llm_handling_per_requeust_error()
+    test_llm_handling_per_requeust_error_async()
+    #test_llm_loading_from_hf()

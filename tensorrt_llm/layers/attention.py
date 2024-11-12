@@ -677,21 +677,24 @@ class Attention(Module):
         # Fill nothing.
         return attention_params
 
-    def forward(self,
-                hidden_states: Tensor,
-                attention_mask=None,
-                attention_packed_mask=None,
-                use_cache=False,
-                spec_decoding_params=None,
-                kv_cache_params=None,
-                attention_params=None,
-                encoder_output: Optional[Tensor] = None,
-                position_embedding=None,
-                norm_before_bmm1=False,
-                lora_layer_params=None,
-                cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_kv_reuse: Optional[Tensor] = None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask=None,
+        attention_packed_mask=None,
+        use_cache=False,
+        spec_decoding_params=None,
+        kv_cache_params=None,
+        attention_params=None,
+        encoder_output: Optional[Tensor] = None,
+        position_embedding=None,
+        norm_before_bmm1=False,
+        lora_layer_params=None,
+        cross_kv_cache_gen: Optional[Tensor] = None,
+        cross_kv_reuse: Optional[Tensor] = None,
+        reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+        skip_attn=None,
+    ):
 
         assert isinstance(hidden_states, Tensor)
 
@@ -1081,6 +1084,7 @@ class Attention(Module):
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,
+                skip_attn=skip_attn,
             )
 
         else:
@@ -1418,11 +1422,23 @@ class Attention(Module):
             dense_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_dense")
 
+        if skip_attn is not None:
+            # This case is used when we can skip this attention layer directly.
+            # The output would be undefined and not used if skip_attn is not None
+            # and set skip_attn as True during runtime
+
+            dense_conditional = Conditional(skip_attn)
+            skip_case = dense_conditional.add_input(context)
+            context = dense_conditional.add_input(context)
+
         if self.inner_layernorm is not None:
             context = self.inner_layernorm(context)
         context = self.dense(context,
                              lora_runtime_params=dense_lora_params,
                              reduce_fusion_params=reduce_fusion_params)
+
+        if skip_attn is not None:
+            context = dense_conditional.add_output(skip_case, context)
 
         if use_cache:
             return (context, past_key_value)
@@ -2075,8 +2091,8 @@ class DeepseekV2Attention(Attention):
                 host_kv_cache_pool_mapping=kv_cache_params.
                 host_kv_cache_pool_mapping,
                 do_cross_attention=self.cross_attention,
-                cross_qkv=None,
-                cross_qkv_length=attention_params.encoder_max_input_length,
+                cross_kv=None,
+                cross_kv_length=attention_params.encoder_max_input_length,
                 encoder_input_lengths=attention_params.encoder_input_lengths,
                 relative_attention_bias=self.rel_attn_table.value
                 if self.relative_attention else None,
@@ -2096,6 +2112,7 @@ class DeepseekV2Attention(Attention):
                 qk_tanh_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
+                host_context_progress=attention_params.host_context_progress,
                 is_mla_enabled_flag=True,
                 q_lora_rank=self.q_lora_rank,
                 kv_lora_rank=self.kv_lora_rank,

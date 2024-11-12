@@ -35,6 +35,7 @@ class Record(NamedTuple):
     streaming: str
     llmapi_throughput: float
     cpp_throughput: float
+    ratio: str
 
 
 @click.command()
@@ -46,7 +47,7 @@ def main(directory, output_file):
         writer = csv.writer(csvfile)
 
         # Write header row
-        writer.writerow(['isl', 'osl', 'streaming', 'llmapi', 'cpp'])
+        writer.writerow(['isl', 'osl', 'streaming', 'llmapi', 'cpp', 'ratio'])
 
         records = []
 
@@ -56,8 +57,15 @@ def main(directory, output_file):
                 isl, osl, llmapi_throughput, cpp_throughput, streaming = process_file(
                     os.path.join(directory, filename))
                 records.append(
-                    Record(isl, osl, streaming, llmapi_throughput,
-                           cpp_throughput))
+                    Record(
+                        isl,
+                        osl,
+                        streaming,
+                        llmapi_throughput,
+                        cpp_throughput,
+                        ratio=
+                        f"{float(llmapi_throughput) / float(cpp_throughput) * 100.:.2f}%"
+                    ))
 
         # sort by isl, osl and streaming
         records = sorted(records, key=lambda x: (x.isl, x.osl, x.streaming))

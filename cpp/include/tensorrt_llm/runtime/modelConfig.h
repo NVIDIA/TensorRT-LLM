@@ -137,6 +137,7 @@ public:
         , mLogitsDtype(nvinfer1::DataType::kFLOAT)
         , mUseShapeInference(true)
         , mManageWeightsType(ManageWeightsType::kDisabled)
+        , mSkipCrossAttnBlocks(false)
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -760,6 +761,16 @@ public:
         return sumLocalHeads;
     }
 
+    [[nodiscard]] bool constexpr skipCrossAttnBlocks() const noexcept
+    {
+        return mSkipCrossAttnBlocks;
+    }
+
+    void constexpr setSkipCrossAttnBlocks(bool skipCrossAttnBlocks) noexcept
+    {
+        mSkipCrossAttnBlocks = skipCrossAttnBlocks;
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbLayers;
@@ -821,6 +832,7 @@ private:
     std::string mModelName;
     std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
     std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
+    bool mSkipCrossAttnBlocks;
 };
 
 } // namespace tensorrt_llm::runtime

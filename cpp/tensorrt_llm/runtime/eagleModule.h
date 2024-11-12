@@ -26,15 +26,17 @@ namespace tensorrt_llm::runtime
 class EagleModule : public SpeculativeDecodingModule
 {
 public:
-    explicit EagleModule(SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens) noexcept
-        // Number of paths is maxDecodingTokens = maxDecodingDraftTokens + 1 to account for very flat trees with
-        // depth 1.
+    // Number of paths is maxDecodingTokens = maxDecodingDraftTokens + 1 to account for very flat trees with
+    // depth 1.
+    explicit EagleModule(
+        SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens, SizeType32 numTransformersLayer) noexcept
         : SpeculativeDecodingModule(maxDraftPathLen, maxDecodingDraftTokens, maxDecodingDraftTokens + 1)
+        , mNumTransformersLayer(numTransformersLayer)
     {
     }
 
     explicit EagleModule() noexcept
-        : EagleModule(0, 0)
+        : EagleModule(0, 0, 0)
     {
     }
 
@@ -43,7 +45,14 @@ public:
         return mDefaultEagleChoices;
     }
 
+    [[nodiscard]] SizeType32 getNumTransformerLayers() const noexcept
+    {
+        return mNumTransformersLayer;
+    }
+
 private:
+    SizeType32 mNumTransformersLayer;
+
     // We use mc_sim_7b_63 from official Medusa implementation, i.e. one of the best trees with 63 nodes found for 7B
     // Vicuna model. We use it as default, if no other are trees are specified per request or on the server level.
     executor::EagleChoices mDefaultEagleChoices = {{0}, {0, 0}, {1}, {0, 1}, {2}, {0, 0, 0}, {1, 0}, {0, 2}, {3},

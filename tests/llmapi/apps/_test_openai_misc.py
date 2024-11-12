@@ -14,7 +14,7 @@ from tensorrt_llm.version import __version__ as VERSION
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "llama-models-v3/llama-v3-8b-instruct-hf"
+    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
 @pytest.fixture(scope="module")

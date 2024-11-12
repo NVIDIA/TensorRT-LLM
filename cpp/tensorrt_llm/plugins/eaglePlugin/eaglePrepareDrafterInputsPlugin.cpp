@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::EaglePrepareDrafterInputsPluginCreator;
@@ -40,104 +41,203 @@ EaglePrepareDrafterInputsPlugin::EaglePrepareDrafterInputsPlugin(int32_t layerId
 {
 }
 
-// Parameterized constructor
-EaglePrepareDrafterInputsPlugin::EaglePrepareDrafterInputsPlugin(void const* data, size_t length)
+void EaglePrepareDrafterInputsPlugin::initFieldsToSerialize()
 {
-    char const *d = reinterpret_cast<char const*>(data), *a = d;
-    read(d, mLayerIdx);
-    TLLM_CHECK_WITH_INFO(d == a + length,
-        "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
-        "engine and run engine.",
-        static_cast<int>(length), static_cast<int>(d - a));
+    mDataToSerialize.clear();
+    mDataToSerialize.emplace_back(PluginField("layer_idx", &mLayerIdx, PluginFieldType::kINT32, 1));
+    mFCToSerialize.nbFields = mDataToSerialize.size();
+    mFCToSerialize.fields = mDataToSerialize.data();
 }
 
-// IPluginV2DynamicExt Methods
-nvinfer1::IPluginV2DynamicExt* EaglePrepareDrafterInputsPlugin::clone() const noexcept
+nvinfer1::IPluginCapability* EaglePrepareDrafterInputsPlugin::getCapabilityInterface(
+    nvinfer1::PluginCapabilityType type) noexcept
 {
-    auto* plugin = new EaglePrepareDrafterInputsPlugin(*this);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    return plugin;
+    try
+    {
+        if (type == nvinfer1::PluginCapabilityType::kBUILD)
+        {
+            return static_cast<nvinfer1::IPluginV3OneBuild*>(this);
+        }
+        if (type == nvinfer1::PluginCapabilityType::kRUNTIME)
+        {
+            return static_cast<nvinfer1::IPluginV3OneRuntime*>(this);
+        }
+        TLLM_CHECK(type == nvinfer1::PluginCapabilityType::kCORE);
+        return static_cast<nvinfer1::IPluginV3OneCore*>(this);
+    }
+    catch (std::exception const& e)
+    {
+        caughtError(e);
+    }
+    return nullptr;
 }
 
-nvinfer1::DimsExprs EaglePrepareDrafterInputsPlugin::getOutputDimensions(
-    int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+// IPluginV3 methods
+nvinfer1::IPluginV3* EaglePrepareDrafterInputsPlugin::clone() noexcept
 {
-    TLLM_CHECK(outputIndex < 12);
+    auto clone = std::make_unique<EaglePrepareDrafterInputsPlugin>(*this);
+    clone->initFieldsToSerialize();
+    return clone.release();
+}
+
+// IPluginV3OneCore methods
+char const* EaglePrepareDrafterInputsPlugin::getPluginName() const noexcept
+{
+    return EAGLE_PREPARE_DRAFTER_INPUTS_PLUGIN_NAME;
+}
+
+char const* EaglePrepareDrafterInputsPlugin::getPluginVersion() const noexcept
+{
+    return EAGLE_PREPARE_DRAFTER_INPUTS_PLUGIN_VERSION;
+}
+
+char const* EaglePrepareDrafterInputsPlugin::getPluginNamespace() const noexcept
+{
+    return tensorrt_llm::plugins::api::kDefaultNamespace;
+}
+
+// IPluginV3OneBuild methods
+int32_t EaglePrepareDrafterInputsPlugin::getNbOutputs() const noexcept
+{
+    return 12;
+}
+
+int32_t EaglePrepareDrafterInputsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+{
+    return 0;
+}
+
+bool EaglePrepareDrafterInputsPlugin::supportsFormatCombination(
+    int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+{
+    return (inOut[pos].desc.type == nvinfer1::DataType::kINT32) && (inOut[pos].desc.format == TensorFormat::kLINEAR);
+}
+
+int32_t EaglePrepareDrafterInputsPlugin::getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs,
+    nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
+{
+    outputTypes[0] = nvinfer1::DataType::kINT32;
+    outputTypes[1] = nvinfer1::DataType::kINT32;
+    outputTypes[2] = nvinfer1::DataType::kINT32;
+    outputTypes[3] = nvinfer1::DataType::kINT32;
+    outputTypes[4] = nvinfer1::DataType::kINT32;
+    outputTypes[5] = nvinfer1::DataType::kINT32;
+    outputTypes[6] = nvinfer1::DataType::kINT32;
+    outputTypes[7] = nvinfer1::DataType::kINT32;
+    outputTypes[8] = nvinfer1::DataType::kINT32;
+    outputTypes[9] = nvinfer1::DataType::kINT32;
+    outputTypes[10] = nvinfer1::DataType::kINT32;
+    outputTypes[11] = nvinfer1::DataType::kINT32;
+    return 0;
+}
+
+int32_t EaglePrepareDrafterInputsPlugin::getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+    nvinfer1::DimsExprs const* shapeInputs, int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
+    nvinfer1::IExprBuilder& exprBuilder) noexcept
+{
+    TLLM_CHECK(nbOutputs == 12);
     TLLM_CHECK(nbInputs == 12);
+    TLLM_CHECK(nbShapeInputs == 0);
     auto const numTokens = inputs[getIdx(InputIdxEntry::INPUT_IDS)].d[0];
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[0];
     auto const maxDecodingLenExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[1];
     auto const maxPathLenExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[2];
 
     nvinfer1::DimsExprs ret;
-    if (outputIndex == getIdx(OutputIdxEntry::SEQUENCE_LENGTHS)
-        || outputIndex == getIdx(OutputIdxEntry::CONTEXT_LENGTHS)
-        || outputIndex == getIdx(OutputIdxEntry::SPEC_DECODING_GENERATION_LENGTHS))
+    for (SizeType32 outputIndex = 0; outputIndex < nbOutputs; ++outputIndex)
     {
-        ret = inputs[getIdx(InputIdxEntry::SEQUENCE_LENGTHS)];
+        if (outputIndex == getIdx(OutputIdxEntry::SEQUENCE_LENGTHS)
+            || outputIndex == getIdx(OutputIdxEntry::CONTEXT_LENGTHS)
+            || outputIndex == getIdx(OutputIdxEntry::SPEC_DECODING_GENERATION_LENGTHS))
+        {
+            outputs[outputIndex] = inputs[getIdx(InputIdxEntry::SEQUENCE_LENGTHS)];
+        }
+        else if (outputIndex == getIdx(OutputIdxEntry::SPEC_DECODING_PACKED_MASK))
+        {
+            outputs[outputIndex].nbDims = 3;
+            outputs[outputIndex].d[0] = batchSizeExpr;
+            outputs[outputIndex].d[1] = maxDecodingLenExpr;
+            outputs[outputIndex].d[2]
+                = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *maxDecodingLenExpr, *exprBuilder.constant(32));
+        }
+        else if (outputIndex == getIdx(OutputIdxEntry::SPEC_DECODING_POSITION_OFFSETS))
+        {
+            outputs[outputIndex].nbDims = 2;
+            outputs[outputIndex].d[0] = batchSizeExpr;
+            outputs[outputIndex].d[1] = maxDecodingLenExpr;
+        }
+        else if (outputIndex == getIdx(OutputIdxEntry::OUTPUT_IDS)
+            || outputIndex == getIdx(OutputIdxEntry::HIDDEN_STATES_INDICES)
+            || (mLayerIdx == 0 && outputIndex == getIdx(OutputIdxEntry::POSITION_IDS)))
+        {
+            auto optValue = exprBuilder.operation(DimensionOperation::kPROD, *maxDecodingLenExpr, *batchSizeExpr);
+            auto upperBound = exprBuilder.operation(DimensionOperation::kSUM, *optValue, *numTokens);
+
+            SizeType32 outSizeIndex = getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS);
+            auto outSizeTensor = exprBuilder.declareSizeTensor(outSizeIndex, *optValue, *upperBound);
+
+            outputs[outputIndex].nbDims = 1;
+            outputs[outputIndex].d[0] = outSizeTensor;
+        }
+        else if (mLayerIdx > 0 && outputIndex == getIdx(OutputIdxEntry::POSITION_IDS))
+        {
+            outputs[outputIndex].nbDims = 1;
+            outputs[outputIndex].d[0] = batchSizeExpr;
+        }
+        else if (outputIndex == getIdx(OutputIdxEntry::LAST_TOKEN_INDICES))
+        {
+            auto upperBound = exprBuilder.operation(DimensionOperation::kPROD, *maxDecodingLenExpr, *batchSizeExpr);
+            auto optValue = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *upperBound, *exprBuilder.constant(2));
+
+            SizeType32 outSizeIndex = getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES);
+            auto outSizeTensor = exprBuilder.declareSizeTensor(outSizeIndex, *optValue, *upperBound);
+
+            outputs[outputIndex].nbDims = 1;
+            outputs[outputIndex].d[0] = outSizeTensor;
+        }
+        else if (outputIndex == getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS)
+            || outputIndex == getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES))
+        {
+            // size tensors must be declared as 0-D
+            outputs[outputIndex].nbDims = 0;
+        }
+        else if (outputIndex == getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS))
+        {
+            // batchSize * (maxPathLen - 1) + 1
+            outputs[outputIndex].nbDims = 1;
+            outputs[outputIndex].d[0] = exprBuilder.operation(DimensionOperation::kSUM, *exprBuilder.constant(1),
+                *exprBuilder.operation(DimensionOperation::kPROD, *batchSizeExpr,
+                    *exprBuilder.operation(DimensionOperation::kSUB, *maxPathLenExpr, *exprBuilder.constant(1))));
+        }
     }
-    else if (outputIndex == getIdx(OutputIdxEntry::SPEC_DECODING_PACKED_MASK))
-    {
-        // FIXME
-        ret.nbDims = 3;
-        ret.d[0] = batchSizeExpr;
-        ret.d[1] = maxDecodingLenExpr;
-        ret.d[2] = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *maxDecodingLenExpr, *exprBuilder.constant(32));
-    }
-    else if (outputIndex == getIdx(OutputIdxEntry::SPEC_DECODING_POSITION_OFFSETS))
-    {
-        ret.nbDims = 2;
-        ret.d[0] = batchSizeExpr;
-        ret.d[1] = maxDecodingLenExpr;
-    }
-    else if (outputIndex == getIdx(OutputIdxEntry::OUTPUT_IDS) || outputIndex == getIdx(OutputIdxEntry::POSITION_IDS)
-        || outputIndex == getIdx(OutputIdxEntry::HIDDEN_STATES_INDICES))
-    {
-        ret.nbDims = 1;
-        ret.d[0] = exprBuilder.operation(DimensionOperation::kSUM,
-            *exprBuilder.operation(DimensionOperation::kPROD, *maxDecodingLenExpr, *batchSizeExpr), *numTokens);
-    }
-    else if (outputIndex == getIdx(OutputIdxEntry::LAST_TOKEN_INDICES))
-    {
-        ret.nbDims = 1;
-        ret.d[0] = exprBuilder.operation(DimensionOperation::kPROD, *maxDecodingLenExpr, *batchSizeExpr);
-    }
-    else if (outputIndex == getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS)
-        || outputIndex == getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES))
-    {
-        ret.nbDims = 1;
-        ret.d[0] = exprBuilder.constant(1);
-    }
-    else if (outputIndex == getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS))
-    {
-        // batchSize * (maxPathLen - 1) + 1
-        ret.nbDims = 1;
-        ret.d[0] = exprBuilder.operation(DimensionOperation::kSUM, *exprBuilder.constant(1),
-            *exprBuilder.operation(DimensionOperation::kPROD, *batchSizeExpr,
-                *exprBuilder.operation(DimensionOperation::kSUB, *maxPathLenExpr, *exprBuilder.constant(1))));
-    }
-    return ret;
+    return 0;
 }
 
-bool EaglePrepareDrafterInputsPlugin::supportsFormatCombination(
-    int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
+int32_t EaglePrepareDrafterInputsPlugin::onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs,
+    nvinfer1::PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    return (inOut[pos].type == nvinfer1::DataType::kINT32) && (inOut[pos].format == TensorFormat::kLINEAR);
+    return 0;
 }
 
-void EaglePrepareDrafterInputsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
-    nvinfer1::DynamicPluginTensorDesc const* out, int nbOutputs) noexcept
+nvinfer1::IPluginV3* EaglePrepareDrafterInputsPlugin::attachToContext(
+    nvinfer1::IPluginResourceContext* context) noexcept
 {
+    return clone();
 }
 
-size_t EaglePrepareDrafterInputsPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
-    nvinfer1::PluginTensorDesc const* outputs, int nbOutputs) const noexcept
+PluginFieldCollection const* EaglePrepareDrafterInputsPlugin::getFieldsToSerialize() noexcept
+{
+    return &mFCToSerialize;
+}
+
+size_t EaglePrepareDrafterInputsPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* outputs, int nbOutputs) const noexcept
 {
     size_t workspaceSize{0};
 
-    auto const batchSize = inputs[getIdx(InputIdxEntry::SEQUENCE_LENGTHS)].dims.d[0];
-    auto const maxDecodingTokens = inputs[getIdx(InputIdxEntry::NEXT_DRAFT_PATHS)].dims.d[1];
+    auto const batchSize = inputs[getIdx(InputIdxEntry::NEXT_DRAFT_PATHS)].max.d[0];
+    auto const maxDecodingTokens = inputs[getIdx(InputIdxEntry::NEXT_DRAFT_PATHS)].max.d[1];
 
     if (mLayerIdx > 0)
     {
@@ -188,13 +288,12 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
     auto prevPaths = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)]);
     auto bestPathIds = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::ACCEPTED_PATHS)]);
 
-    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace);
-    size_t offset{0};
-
     invokePrepareCtxEagleNetInputs(eagleNetSequenceLengths, eagleNetContextLengths, outputIds, positionIds,
         hiddenStatesIndices, lastTokenIndices, numOutputTokens, numLastTokenIndices, hiddenSizeBatchLevelStarts,
         inputIds, baseNetSequenceLengths, baseNetContextLengths, acceptedTokens, acceptedLens, prevDraftLens, prevPaths,
         bestPathIds, batchSize, maxPathLen, maxDecodingTokens, stream);
+
+    auto const numTokens = inputDesc[getIdx(InputIdxEntry::INPUT_IDS)].dims.d[0];
 
     sync_check_cuda_error();
 
@@ -257,6 +356,10 @@ void EaglePrepareDrafterInputsPlugin::prepareGenEagleNetData(nvinfer1::PluginTen
         tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(SizeType32)));
     SizeType32* maxGenerationLength
         = reinterpret_cast<SizeType32*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, 1 * sizeof(SizeType32)));
+
+    cudaMemsetAsync(selectedMasks, 0, batchSize * maxDecodingTokens * maxDecodingTokens * sizeof(int8_t), stream);
+    // Prefill mask setting all to leaves.
+    cudaMemsetAsync(isLeafMask, 1, batchSize * maxDecodingTokens * sizeof(int8_t), stream);
 
     PrepareGenEagleNetInputsParams params;
     params.nextSequenceLengths = eagleNetSequenceLengths;
@@ -350,55 +453,6 @@ int EaglePrepareDrafterInputsPlugin::enqueue(nvinfer1::PluginTensorDesc const* i
     return 0;
 }
 
-// IPluginV2Ext Methods
-nvinfer1::DataType EaglePrepareDrafterInputsPlugin::getOutputDataType(
-    int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
-{
-    return inputTypes[getIdx(InputIdxEntry::SEQUENCE_LENGTHS)];
-}
-
-// IPluginV2 Methods
-
-char const* EaglePrepareDrafterInputsPlugin::getPluginType() const noexcept
-{
-    return EAGLE_PREPARE_DRAFTER_INPUTS_PLUGIN_NAME;
-}
-
-char const* EaglePrepareDrafterInputsPlugin::getPluginVersion() const noexcept
-{
-    return EAGLE_PREPARE_DRAFTER_INPUTS_PLUGIN_VERSION;
-}
-
-int EaglePrepareDrafterInputsPlugin::getNbOutputs() const noexcept
-{
-    return 12;
-}
-
-int EaglePrepareDrafterInputsPlugin::initialize() noexcept
-{
-    return 0;
-}
-
-void EaglePrepareDrafterInputsPlugin::terminate() noexcept {}
-
-size_t EaglePrepareDrafterInputsPlugin::getSerializationSize() const noexcept
-{
-    return sizeof(mLayerIdx);
-}
-
-void EaglePrepareDrafterInputsPlugin::serialize(void* buffer) const noexcept
-{
-    char *d = static_cast<char*>(buffer), *a = d;
-    write(d, mLayerIdx);
-    assert(d == a + getSerializationSize());
-}
-
-void EaglePrepareDrafterInputsPlugin::destroy() noexcept
-{
-    // This gets called when the network containing plugin is destroyed
-    delete this;
-}
-
 ///////////////
 
 EaglePrepareDrafterInputsPluginCreator::EaglePrepareDrafterInputsPluginCreator()
@@ -425,27 +479,23 @@ PluginFieldCollection const* EaglePrepareDrafterInputsPluginCreator::getFieldNam
     return &mFC;
 }
 
-IPluginV2* EaglePrepareDrafterInputsPluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc) noexcept
+nvinfer1::IPluginV3* EaglePrepareDrafterInputsPluginCreator::createPlugin(
+    char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
-    PluginField const* fields = fc->fields;
-    int32_t layerIdx;
-    // Read configurations from each fields
-    for (int i = 0; i < fc->nbFields; ++i)
-    {
-        char const* attrName = fields[i].name;
-        if (!strcmp(attrName, "layer_idx"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            layerIdx = *static_cast<int32_t const*>(fields[i].data);
-        }
-    }
-
     try
     {
-        auto* obj = new EaglePrepareDrafterInputsPlugin(layerIdx);
-        obj->setPluginNamespace(mNamespace.c_str());
-        return obj;
+        int32_t layerIdx{0};
+        // Read configurations from each fields
+        for (int i = 0; i < fc->nbFields; ++i)
+        {
+            char const* attrName = fc->fields[i].name;
+            if (!strcmp(attrName, "layer_idx"))
+            {
+                TLLM_CHECK(fc->fields[i].type == PluginFieldType::kINT32);
+                layerIdx = *static_cast<int32_t const*>(fc->fields[i].data);
+            }
+        }
+        return new EaglePrepareDrafterInputsPlugin(layerIdx);
     }
     catch (std::exception const& e)
     {
@@ -454,20 +504,7 @@ IPluginV2* EaglePrepareDrafterInputsPluginCreator::createPlugin(
     return nullptr;
 }
 
-IPluginV2* EaglePrepareDrafterInputsPluginCreator::deserializePlugin(
-    char const* name, void const* serialData, size_t serialLength) noexcept
+char const* EaglePrepareDrafterInputsPluginCreator::getPluginNamespace() const noexcept
 {
-    // This object will be deleted when the network is destroyed, which will
-    // call EaglePrepareDrafterInputsPlugin::destroy()
-    try
-    {
-        auto* obj = new EaglePrepareDrafterInputsPlugin(serialData, serialLength);
-        obj->setPluginNamespace(mNamespace.c_str());
-        return obj;
-    }
-    catch (std::exception const& e)
-    {
-        caughtError(e);
-    }
-    return nullptr;
+    return tensorrt_llm::plugins::api::kDefaultNamespace;
 }

@@ -17,11 +17,9 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -59,6 +57,8 @@ class LLaMAConfig(PretrainedConfig):
         self.remove_duplicated_kv_heads = remove_duplicated_kv_heads
         self.fc_after_embed = False
         self.use_input_layernorm_in_first_layer = True
+        self.use_last_layernorm = True
+        self.layer_idx_offset = 0
 
         super().__init__(**kwargs)
 
@@ -75,6 +75,8 @@ class LLaMAConfig(PretrainedConfig):
         output['fc_after_embed'] = self.fc_after_embed
         output[
             'use_input_layernorm_in_first_layer'] = self.use_input_layernorm_in_first_layer
+        output['use_last_layernorm'] = self.use_last_layernorm
+        output['layer_idx_offset'] = self.layer_idx_offset
         output['moe'] = self.moe.to_dict()
         return output
 
@@ -159,14 +161,7 @@ class LLaMAConfig(PretrainedConfig):
                                normalization_mode=moe_normalization_mode)
         moe_config.validate()
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -223,8 +218,7 @@ class LLaMAConfig(PretrainedConfig):
                 (int(n_embd_ * ffn_dim_multiplier) + multiple_of - 1) //
                 multiple_of)
 
-        if dtype == 'auto':
-            dtype = 'bfloat16'
+        dtype = infer_dtype(dtype, 'bfloat16')
 
         if meta_config.get('use_scaled_rope'):
             rotary_scaling = {"type": "llama3"}

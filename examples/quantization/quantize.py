@@ -49,7 +49,15 @@ if __name__ == "__main__":
         "Pipeline parallel size for calibration; effective for NeMo checkpoint only."
     )
 
-    parser.add_argument("--dtype", help="Model data type.", default="float16")
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations of the non-quantized part, e.g., embedding and lm_head. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument(
         "--qformat",
         help="Quantization format.",

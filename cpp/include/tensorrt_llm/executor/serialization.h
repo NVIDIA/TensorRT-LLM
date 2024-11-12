@@ -164,12 +164,11 @@ public:
     static void serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os);
     static size_t serializedSize(KvCacheRetentionConfig const& kvCacheRetentionConfig);
 
-    // TokenRangeRetentionPriority
-    static KvCacheRetentionConfig::TokenRangeRetentionPriority deserializeTokenRangeRetentionPriority(std::istream& is);
+    // TokenRangeRetentionConfig
+    static KvCacheRetentionConfig::TokenRangeRetentionConfig deserializeTokenRangeRetentionConfig(std::istream& is);
     static void serialize(
-        KvCacheRetentionConfig::TokenRangeRetentionPriority const& tokenRangeRetentionPriority, std::ostream& os);
-    static size_t serializedSize(
-        KvCacheRetentionConfig::TokenRangeRetentionPriority const& tokenRangeRetentionPriority);
+        KvCacheRetentionConfig::TokenRangeRetentionConfig const& tokenRangeRetentionConfig, std::ostream& os);
+    static size_t serializedSize(KvCacheRetentionConfig::TokenRangeRetentionConfig const& tokenRangeRetentionConfig);
 
     // DecodingConfig
     static DecodingConfig deserializeDecodingConfig(std::istream& is);

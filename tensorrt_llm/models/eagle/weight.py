@@ -565,7 +565,7 @@ def convert_hf_llama(hf_model,
                                                     dim=0)
 
         ln_f_w = get_weight(model_params, 'model.norm', dtype)
-    weights['transformer.ln_f.weight'] = ln_f_w
+        weights['transformer.ln_f.weight'] = ln_f_w
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
@@ -591,14 +591,18 @@ def load_eagle_hf(eagle_model_dir,
     torch_dtype = str_dtype_to_torch(dtype)
 
     for di in range(num_eagle_layers):
-        renamed_weights[
-            f"eagle_nets.{di}.drafter.fc.weight"] = eagle_state_dict[
-                "fc.weight"].clone().to(torch_dtype)
-        renamed_weights[f"eagle_nets.{di}.drafter.fc.bias"] = eagle_state_dict[
-            "fc.bias"].clone().to(torch_dtype)
+        fc_embed_weight = eagle_state_dict["fc.weight"]
+        renamed_weights[f"eagle_nets.{di}.drafter.fc.weight"] = split(
+            fc_embed_weight.clone().to(torch_dtype), mapping.tp_size,
+            mapping.tp_rank)
+        fc_ebmed_bias = eagle_state_dict["fc.bias"].clone().to(torch_dtype)
+        renamed_weights[f"eagle_nets.{di}.drafter.fc.bias"] = split(
+            fc_ebmed_bias.clone().to(torch_dtype), mapping.tp_size,
+            mapping.tp_rank)
         # Use main model to duplicate lm_head
-        renamed_weights[f"eagle_nets.{di}.lm_head.weight"] = base_model_params[
-            "lm_head.weight"].clone().to(torch_dtype)
+        renamed_weights[f"eagle_nets.{di}.lm_head.weight"] = split(
+            base_model_params["lm_head.weight"].clone().to(torch_dtype),
+            mapping.tp_size, mapping.tp_rank)
 
     for di in range(num_eagle_layers):
         for name, param in weights.items():

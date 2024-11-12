@@ -100,11 +100,12 @@ void TopKSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Ten
     if (paramsSize > 1)
     {
         auto initWorkspaceSizes = getTopKInitWorkspaceSizes(batchSize);
-        calcAlignedPointers(workspace->getRawWorkspaceDevicePtr(), initWorkspaceSizes)(topKsPtr, topPsPtr);
-        DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, runtimeTopK,
-            ITensor::wrap(topKsPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[0])}}));
-        DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, runtimeTopP,
-            ITensor::wrap(topPsPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[1])}}));
+        auto workspacePtr = workspace->getRawWorkspaceDevicePtr();
+        calcAlignedPointers(workspacePtr, initWorkspaceSizes)(topKsPtr, topPsPtr);
+        DecodingLayerWorkspace::copyToWorkspace(
+            *mBufferManager, runtimeTopK, IBuffer::wrap(topKsPtr, initWorkspaceSizes[0] / sizeof(*topKsPtr)));
+        DecodingLayerWorkspace::copyToWorkspace(
+            *mBufferManager, runtimeTopP, IBuffer::wrap(topPsPtr, initWorkspaceSizes[1] / sizeof(*topPsPtr)));
     }
     auto const* batchSlotsDevicePtr = workspace->getDeviceBatchSlotsPtr();
     auto* skipDecodeDevicePtr = bufferCastOrNull<bool>(mSkipDecodeDevice);

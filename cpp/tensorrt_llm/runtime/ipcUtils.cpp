@@ -188,16 +188,21 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     // null
     if (rank == tp_rank && isP2pSupported)
     {
-        tensorrt_llm::kernels::lamportInitialize(
-            mIpcMemoryHandles[4].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
-        tensorrt_llm::kernels::lamportInitialize(
-            mIpcMemoryHandles[5].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
-        tensorrt_llm::kernels::lamportInitialize(
-            mIpcMemoryHandles[6].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
-        cudaDeviceSynchronize();
+        lamportInitializeAll(mIpcMemoryHandles[4].getCommPtrs()[rank], mIpcMemoryHandles[5].getCommPtrs()[rank],
+            mIpcMemoryHandles[6].getCommPtrs()[rank], lamportBufferSize);
     }
 #endif
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size)
+{
+#if ENABLE_MULTI_DEVICE
+    tensorrt_llm::kernels::lamportInitialize(buffer_0, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_1, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_2, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    cudaDeviceSynchronize();
+#endif
 }
 
 } // namespace tensorrt_llm::runtime

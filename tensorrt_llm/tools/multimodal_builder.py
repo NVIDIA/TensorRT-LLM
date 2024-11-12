@@ -10,17 +10,17 @@ import yaml
 # isort: off
 import torch
 import tensorrt as trt
-from tensorrt_llm._utils import torch_dtype_to_str
+from tensorrt_llm._utils import torch_dtype_to_str, to_json_file
 from tensorrt_llm.builder import Builder
+from tensorrt_llm.logger import logger
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForVision2Seq, AutoProcessor,
                           Blip2ForConditionalGeneration, Blip2Processor,
                           FuyuForCausalLM, FuyuProcessor,
                           LlavaForConditionalGeneration, NougatProcessor,
                           Pix2StructForConditionalGeneration,
-                          VisionEncoderDecoderModel)
+                          VisionEncoderDecoderModel, CLIPVisionModel)
 # isort: on
-import math
 
 import torch.nn.functional as F
 from PIL import Image
@@ -33,8 +33,9 @@ def add_multimodal_arguments(parser):
                         type=str,
                         default=None,
                         choices=[
-                            'blip2', 'llava', 'llava_next', 'vila', 'nougat',
-                            'cogvlm', 'fuyu', 'pix2struct', 'neva', 'kosmos-2',
+                            'blip2', 'llava', 'llava_next', 'llava_onevision',
+                            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
+                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
                             'video-neva', 'phi-3-vision', 'mllama', 'internvl'
                         ],
                         help="Model type")
@@ -381,6 +382,60 @@ def build_llava_engine(args):
             model.vision_tower.vision_model.to(args.device),
             model.multi_modal_projector.to(args.device),
         )
+    elif args.model_type == "llava_onevision_lmms":
+        from llava.mm_utils import process_images
+        from llava.model.builder import load_pretrained_model
+        _, model, processor, _ = load_pretrained_model(args.model_path,
+                                                       None,
+                                                       args.model_type,
+                                                       torch_dtype="float16")
+        raw_image = Image.new('RGB', [512, 512])
+        image = process_images([raw_image], processor,
+                               model.config).squeeze(0).to(
+                                   args.device, torch.float16)
+
+        class LlavaQwenVisionWrapper(torch.nn.Module):
+
+            def __init__(self, vision_tower, projector):
+                super().__init__()
+                self.vision_tower = vision_tower
+                self.projector = projector
+
+            def forward(self, pixel_values):
+                image_features = self.vision_tower(pixel_values)
+                image_features = self.projector(image_features)
+                return image_features  # (sigma(bs, patches_i), 729, c)
+
+        wrapper = LlavaQwenVisionWrapper(model.get_model().get_vision_tower(),
+                                         model.get_model().mm_projector)
+    elif args.model_type == "llava_onevision":
+        from transformers import LlavaOnevisionForConditionalGeneration
+        raw_image = Image.new('RGB', [512, 512])
+        image = processor(text="dummy", images=raw_image,
+                          return_tensors="pt")['pixel_values'].to(
+                              args.device, torch.float16)[0]
+
+        class LlavaOnevisionVisionWrapper(torch.nn.Module):
+
+            def __init__(self, vision_tower, projector, config):
+                super().__init__()
+                self.vision_tower = vision_tower
+                self.projector = projector
+                self.config = config
+
+            def forward(self, pixel_values):
+                image_features = self.vision_tower(pixel_values,
+                                                   output_hidden_states=True)
+                selected_image_feature = image_features.hidden_states[
+                    self.config.vision_feature_layer]
+                image_features = self.projector(selected_image_feature)
+                return image_features  # (sigma(bs, patches_i), 729, c)
+
+        model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+            args.model_path, torch_dtype=torch.float16)
+        wrapper = LlavaOnevisionVisionWrapper(
+            model.vision_tower.vision_model.to(args.device),
+            model.multi_modal_projector.to(args.device), model.config)
 
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
@@ -391,6 +446,16 @@ def build_llava_engine(args):
         args.max_batch_size)
     if args.model_type == "llava_next":
         image_newline = model.image_newline.data
+        tensor_img_newline = {"image_newline": image_newline}
+        save_file(tensor_img_newline,
+                  os.path.join(args.output_dir, "image_newlines.safetensors"))
+    if args.model_type == "llava_onevision":
+        image_newline = model.image_newline.data
+        tensor_img_newline = {"image_newline": image_newline}
+        save_file(tensor_img_newline,
+                  os.path.join(args.output_dir, "image_newlines.safetensors"))
+    if args.model_type == "llava_onevision_lmms":
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
@@ -748,6 +813,20 @@ def build_kosmos_engine(args):
 
 
 def build_phi_engine(args):
+    logger.warning(
+        "Skipping TRT engine build for Phi-3 vision encoder.  MultimodalModelRunner will use PyTorch vision encoder. Flash/SDPA attention in CLIP encoder is not compatible with torch.onnx.export and eager attention is unstable in PyTorch."
+    )
+
+    # Dump config.json needed by model runner
+    config_args = {
+        "builder_config": {
+            "precision": torch_dtype_to_str(torch.float16),
+            "model_type": "phi-3-vision",
+        }
+    }
+    to_json_file(config_args, args.output_dir + "/config.json")
+    return
+
     processor = AutoProcessor.from_pretrained(args.model_path,
                                               trust_remote_code=True)
     raw_image = Image.new('RGB', [10, 10])  # dummy image
@@ -755,59 +834,32 @@ def build_phi_engine(args):
                       images=raw_image,
                       return_tensors="pt")['pixel_values'].to(
                           args.device, torch.float16)
+    image = image.flatten(0, 1)
 
     class Phi3VisionWrapper(torch.nn.Module):
 
-        def __init__(self, img_processor, img_projection, layer_idx,
-                     image_dim_out):
+        def __init__(self, vision_model):
             super().__init__()
-            self.img_processor = img_processor
-            self.img_projection = img_projection
-            self.layer_idx = layer_idx
-            self.image_dim_out = image_dim_out
+            self.vision_model = vision_model
 
-        def get_img_features(
-                self, img_embeds: torch.FloatTensor) -> torch.FloatTensor:
-            LAYER_IDX = self.layer_idx
-
-            img_processor_output = self.img_processor(img_embeds,
-                                                      output_hidden_states=True)
-            img_feature = img_processor_output.hidden_states[LAYER_IDX]
-
-            patch_feature = img_feature[:, 1:]
-            return patch_feature
-
-        def forward(self, image):
-            img_features = self.get_img_features(image)
-            base_feat_height = int(math.sqrt(img_features.shape[1]))
-            C = self.image_dim_out
-            H = base_feat_height
-            img_features = img_features.reshape(-1, H, H, C).reshape(
-                -1, H // 2, 2, H // 2, 2,
-                C).contiguous().permute(0, 1, 3, 2, 4,
-                                        5).reshape(-1, H // 2, H // 2,
-                                                   4 * C).contiguous()
-            return self.apply_img_projection(img_features)
-
-        def apply_img_projection(self, input):
-            return self.img_projection(input)
+        def forward(self, pixel_values):
+            return self.vision_model.get_img_features(pixel_values).reshape(
+                1, pixel_values.shape[0], -1, self.vision_model.image_dim_out)
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path,
                                                  torch_dtype=torch.float16,
-                                                 trust_remote_code=True).to(
-                                                     args.device)
+                                                 trust_remote_code=True)
+    vision_model = model.model.vision_embed_tokens
 
-    wrapper = Phi3VisionWrapper(model.model.vision_embed_tokens.img_processor,
-                                model.model.vision_embed_tokens.img_projection,
-                                model.model.vision_embed_tokens.layer_idx,
-                                model.model.vision_embed_tokens.image_dim_out)
-    image = image.flatten(0, 1)
-    glb_GN = wrapper.apply_img_projection(
-        model.model.vision_embed_tokens.glb_GN)
-    sub_GN = wrapper.apply_img_projection(
-        model.model.vision_embed_tokens.sub_GN)
-    tensors = {"glb_GN": glb_GN, "sub_GN": sub_GN}
-    save_file(tensors, args.output_dir + "/image_newlines.safetensors")
+    # Replace img_processor that uses flash attention with eager attention
+    clip_config = vision_model.img_processor.config
+    clip_config._attn_implementation = 'eager'
+    del vision_model.img_processor
+    vision_model.img_processor = CLIPVisionModel(clip_config).to(torch.float16)
+
+    vision_model = vision_model.to(args.device)
+    wrapper = Phi3VisionWrapper(vision_model)
+
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     num_crops = processor.image_processor.num_crops
     build_trt_engine(args.model_type,

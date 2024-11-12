@@ -1,6 +1,8 @@
 import fnmatch
 from typing import Union
 
+import torch
+
 from .._utils import get_init_params
 from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
                       LayerNorm, RmsNorm, RowLinear)
@@ -10,6 +12,7 @@ from ..parameter import Parameter
 from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
                      Fp8RowwiseGatedMLP, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
                      Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
+                     QServeAttention, QServeGatedMLP, QServeMLP, QServeRmsNorm,
                      SmoothQuantAttention, SmoothQuantGatedMLP,
                      SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
                      WeightOnlyGroupwiseQuantColumnLinear,
@@ -295,6 +298,225 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
     return model
 
 
+# TODO: These functions should be moved to ModelOpt.
+def qserve_quantize_weight_per_group(linear_weight: torch.HalfTensor,
+                                     s1_scales: torch.FloatTensor,
+                                     s2_scales: torch.FloatTensor,
+                                     s2_zeros: torch.FloatTensor,
+                                     group_size: int) -> torch.CharTensor:
+    out_features = linear_weight.shape[0]
+    in_features = linear_weight.shape[1]
+
+    # Step 1: Quantize the weights to int8
+    linear_weight = linear_weight.div_(
+        s1_scales.reshape(out_features, 1).to(linear_weight.device))
+    linear_weight = linear_weight.round_()
+    # assert linear_weight.min() >= -119 and linear_weight.max() <= 119, "Stage 1: Quantized weight out of range" # 119 is the "magic" number
+    assert (linear_weight.min() >= -128 and linear_weight.max() <= 127
+            ), "Stage 1: Quantized weight out of range"
+
+    # Step 2: Quantize the weights to int4
+    linear_weight = linear_weight.reshape(out_features,
+                                          in_features // group_size, group_size)
+    s2_zero = s2_zeros.reshape(out_features, in_features // group_size, 1)
+    s2_scales = s2_scales.reshape(out_features, in_features // group_size, 1)
+    linear_weight = linear_weight.div_(
+        s2_scales.to(torch.float16).to(linear_weight.device)).add_(
+            s2_zero.to(torch.float16).to(linear_weight.device)).reshape(
+                out_features, in_features)
+    assert (linear_weight.min() >= 0 and
+            linear_weight.max() <= 15), "Stage 2: Quantized weight out of range"
+
+    qweight = linear_weight.to(torch.int8)
+    return qweight
+
+
+def qserve_quantize_weight_per_channel(
+        linear_weight: torch.HalfTensor, s1_scales: torch.FloatTensor,
+        s1_zeros: torch.FloatTensor) -> torch.CharTensor:
+    out_features = linear_weight.shape[0]
+    linear_weight.shape[1]
+
+    # Step 1: Quantize the weights to int4
+    linear_weight = linear_weight.div_(
+        s1_scales.reshape(out_features, 1).to(linear_weight.device))
+    qweight = linear_weight.round_().to(torch.int8)
+    qweight = qweight.add_(
+        s1_zeros.reshape(out_features,
+                         1).to(linear_weight.device).to(torch.int8))
+
+    assert (qweight.min() >= 0
+            and qweight.max() <= 15), "Quantized weight out of range"
+
+    return qweight
+
+
+# Pack the quantized weights, scales and zeros and apply the reordering required by QServe kernels.
+# Return: processed [qweight, s1_scales, s2_scales, s2_zeros]
+def qserve_pack_reorder_per_group(qweight: torch.CharTensor,
+                                  s1_scales: torch.FloatTensor,
+                                  s2_scales: torch.FloatTensor,
+                                  s2_zeros: torch.FloatTensor, group_size):
+    out_features = qweight.shape[0]
+    in_features = qweight.shape[1]
+
+    outputs = []
+
+    s1_scales = s1_scales.reshape(out_features).to(torch.float16)
+    s2_zeros = s2_zeros.reshape(out_features,
+                                in_features // group_size).to(torch.int8)
+    s2_scales = s2_scales.reshape(out_features,
+                                  in_features // group_size).to(torch.int8)
+
+    # Step 3: Pack the quantized weights to real quantized weights
+    # ---- Repack the weight ---- #
+    assert qweight.dtype == torch.int8
+    # pack to M // 32, K // 32, (8, 4), ([2], 2, 2, 4)
+    W_unpack_reorder = (qweight.reshape(
+        out_features // 32,
+        2,
+        2,
+        8,
+        in_features // 32,
+        2,
+        4,
+        4,
+    ).permute(0, 4, 3, 6, 1, 5, 2, 7).contiguous())
+    W_unpack_reorder = (W_unpack_reorder.permute(0, 1, 2, 3, 5, 6, 7,
+                                                 4).contiguous().to(torch.int8))
+    # B_fp16_reorder = B_fp16_reorder[:, :, :, :, :, :, [3, 2, 1, 0]].contiguous()
+    # [16, 0, 17, 1, ...]
+    W_unpack_repacked = (W_unpack_reorder[..., 1] << 4) + W_unpack_reorder[...,
+                                                                           0]
+    W_unpack_repacked = W_unpack_repacked.reshape(out_features // 32,
+                                                  in_features // 32, 32, 16)
+    W_unpack_repacked = W_unpack_repacked.reshape(out_features,
+                                                  in_features // 2)
+
+    outputs.append(W_unpack_repacked)
+
+    # for the last dimension, organize as 0, 8, 16, 24, 1, 9, 17, 25, ... following the requirement of tensor core gemm
+    # ---- Pack the scales ---- #
+    outputs.append(s1_scales.reshape(out_features))
+
+    s2_scales = (s2_scales.reshape(out_features, in_features //
+                                   group_size).transpose(0, 1).contiguous())
+    s2_scales = s2_scales.reshape(in_features // group_size, out_features // 32,
+                                  32)
+    s2_scales = (s2_scales.reshape(in_features // group_size,
+                                   out_features // 32, 4,
+                                   8).transpose(-2, -1).contiguous())
+    s2_scales = s2_scales.reshape(in_features // group_size,
+                                  out_features).contiguous()
+    outputs.append(s2_scales)
+
+    # ---- Pack the zeros ---- #
+    s2_zeros = (s2_zeros.reshape(out_features, in_features //
+                                 group_size).transpose(0, 1).contiguous())
+    s2_zeros = s2_zeros.reshape(in_features // group_size, out_features // 32,
+                                32)
+    s2_zeros = (s2_zeros.reshape(in_features // group_size, out_features // 32,
+                                 4, 8).transpose(-2, -1).contiguous())
+    s2_zeros = (s2_zeros.reshape(in_features // group_size,
+                                 out_features).contiguous())
+
+    # (q - s2_zeros) * s2_scales = q * s2_scales - s2_zeros * s2_scales,
+    # We convert the s2_zeros -> -s2_zeros * s2_scales
+    s2_zeros = (-s2_zeros).int() * s2_scales
+    s2_zeros = s2_zeros.to(torch.int8)
+
+    outputs.append(s2_zeros)
+
+    return outputs
+
+
+def qserve_pack_reorder_per_channel(qweight: torch.CharTensor,
+                                    s1_scales: torch.FloatTensor,
+                                    s1_zeros: torch.FloatTensor):
+    out_features = qweight.shape[0]
+    in_features = qweight.shape[1]
+
+    outputs = []
+
+    # ---- Repack the weight ---- #
+    assert qweight.dtype == torch.int8
+    # pack to M // 32, K // 32, (8, 4), ([2], 2, 2, 4)
+    W_unpack_reorder = (qweight.reshape(
+        out_features // 32,
+        2,
+        2,
+        8,
+        in_features // 32,
+        2,
+        4,
+        4,
+    ).permute(0, 4, 3, 6, 1, 5, 2, 7).contiguous())
+    W_unpack_reorder = (W_unpack_reorder.permute(0, 1, 2, 3, 5, 6, 7,
+                                                 4).contiguous())
+    # B_fp16_reorder = B_fp16_reorder[:, :, :, :, :, :, [3, 2, 1, 0]].contiguous()
+    # [16, 0, 17, 1, ...]
+    W_unpack_repacked = (W_unpack_reorder[..., 1] << 4) + W_unpack_reorder[...,
+                                                                           0]
+    W_unpack_repacked = W_unpack_repacked.reshape(out_features // 32,
+                                                  in_features // 32, 32, 16)
+    W_unpack_repacked = W_unpack_repacked.reshape(out_features, in_features //
+                                                  2).contiguous()
+
+    outputs.append(W_unpack_repacked)
+
+    # ---- Pack the scales and zeros ---- #
+    s1_scales = s1_scales.reshape(out_features).contiguous()
+    outputs.append(s1_scales.half())
+
+    s1_szeros = s1_zeros.reshape(
+        out_features).contiguous().float() * s1_scales.float()
+    outputs.append(s1_szeros.half())
+
+    return outputs
+
+
+# TODO: Duplicates smooth_quantize and quantize_layers
+def qserve_quantize(model, quant_config: QuantConfig):
+    quant_mode = quant_config.quant_mode
+    assert quant_config.quant_mode.is_qserve_w4a8()
+
+    quant_map = {
+        RmsNorm: QServeRmsNorm,
+        LayerNorm: QServeRmsNorm,
+        GatedMLP: QServeGatedMLP,
+        MLP: QServeMLP,
+        Attention: QServeAttention,
+    }
+
+    for name, layer, parent in model.named_modules_with_parent():
+        layer_name = name.rsplit('.', 1)[-1]
+        if layer_name in ['ln_f', 'ln_embed']:
+            continue
+
+        quant_cls = None
+        for cls in quant_map:
+            if isinstance(layer, cls):
+                quant_cls = quant_map[cls]
+                break
+
+        if quant_cls is None:
+            continue
+
+        init_params = get_init_params(layer, quant_cls)
+        init_params["quant_mode"] = quant_mode
+        if isinstance(layer, Attention):
+            init_params[
+                "num_attention_heads"] = layer.num_attention_heads * layer.tp_size
+        quant_layer = quant_cls(**init_params)
+        if parent is not None:
+            setattr(parent, layer_name, quant_layer)
+        else:
+            model = quant_layer
+
+    setattr(model, 'quant_mode', quant_mode)
+    return model
+
+
 # Now consider the kv cache is enabled for all layers
 def kv_cache_quantize(model):
     for name, module in model.named_modules():
@@ -325,6 +547,8 @@ def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
             module = fp8_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_fp8_rowwise():
             module = fp8_rowwise_quantize(module, layer_quant_cfg)
+        elif layer_quant_mode.is_qserve_w4a8():
+            model = qserve_quantize(model, quant_config)
         elif layer_quant_mode.has_act_and_weight_quant():
             module = smooth_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_weight_only():

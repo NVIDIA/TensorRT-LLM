@@ -60,7 +60,7 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
     bool has_full_attention_mask, bool use_cache, bool is_spec_decoding_enabled,
     bool spec_decoding_is_generation_length_variable, int spec_decoding_max_generation_length, bool is_mla_enabled,
-    int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim)
+    int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn)
     : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, layer_idx_in_cache_pool,
         head_size, unidirectional, q_scaling, qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
         rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
@@ -70,7 +70,7 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
         cross_attention, max_distance, pos_shift_enabled, dense_context_fmha, use_paged_context_fmha,
         use_fp8_context_fmha, has_full_attention_mask, use_cache, is_spec_decoding_enabled,
         spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
-        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim)
+        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn)
 {
     initEntryIdx();
 }
@@ -119,6 +119,7 @@ std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return "SPEC_DECODING_POSITION_OFFSETS";
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return "HOST_RUNTIME_PERF_KNOBS";
     case IdxEntry::HOST_CONTEXT_PROGRESS: return "HOST_CONTEXT_PROGRESS";
+    case IdxEntry::SKIP_ATTN: return "SKIP_ATTN";
     case IdxEntry::ENUM_SIZE: return "ENUM_SIZE";
     }
     TLLM_LOG_TRACE(common::fmtstr("Missing string description for IdxEntry enum %lu.\n", static_cast<size_t>(entry)));
@@ -166,6 +167,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::MLA_FUSED_Q_PROJ_TENSOR: return mIsMLAEnabled;
     case IdxEntry::MLA_Q_B_PROJ_TENSOR: return mIsMLAEnabled;
     case IdxEntry::MLA_KV_B_PROJ_TENSOR: return mIsMLAEnabled;
+    case IdxEntry::SKIP_ATTN: return mSkipAttn;
     default: return false;
     }
 }
@@ -358,6 +360,11 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         // Output tensor now supports fp8 data type.
         posCaseLine = __LINE__;
         result = (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
+    }
+    else if (mSkipAttn && pos == getIdx(IdxEntry::SKIP_ATTN))
+    {
+        posCaseLine = __LINE__;
+        result = inOut[pos].type == nvinfer1::DataType::kBOOL && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else
     {
@@ -1076,6 +1083,15 @@ int GPTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     {
         return 0;
     }
+    if (mSkipAttn)
+    {
+        bool const* SKIP_ATTN = reinterpret_cast<bool const*>(inputs[getIdx(IdxEntry::SKIP_ATTN)]);
+        if (SKIP_ATTN[0])
+        {
+            return 0;
+        }
+    }
+
     if (mType == nvinfer1::DataType::kHALF)
     {
 #ifdef ENABLE_FP8
@@ -1229,7 +1245,8 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("kv_lora_rank").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("qk_nope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("qk_rope_head_dim").value()),
-            static_cast<int32_t>(p.getScalar<int32_t>("v_head_dim").value()));
+            static_cast<int32_t>(p.getScalar<int32_t>("v_head_dim").value()),
+            static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

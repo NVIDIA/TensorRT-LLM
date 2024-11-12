@@ -29,10 +29,11 @@ static char const* RMSNORM_QUANTIZATION_PLUGIN_NAME{"RmsnormQuantization"};
 PluginFieldCollection RmsnormQuantizationPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> RmsnormQuantizationPluginCreator::mPluginAttributes;
 
-RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, bool clampValEnabled,
-    QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType)
+RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, bool sumPerToken,
+    bool clampValEnabled, QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType)
     : mEps(eps)
     , mDynActScaling(dynamicActivationScaling)
+    , mSumPerToken(sumPerToken)
     , mClampValEnabled{clampValEnabled}
     , mQuantMode{quantMode}
     , mType(type)
@@ -50,6 +51,7 @@ RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(void const* data, size_t le
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mEps);
     read(d, mDynActScaling);
+    read(d, mSumPerToken);
     read(d, mClampValEnabled);
     read(d, mQuantMode);
     read(d, mType);
@@ -64,8 +66,8 @@ RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(void const* data, size_t le
 // IPluginV2DynamicExt Methods
 nvinfer1::IPluginV2DynamicExt* RmsnormQuantizationPlugin::clone() const noexcept
 {
-    auto* plugin
-        = new RmsnormQuantizationPlugin(mEps, mDynActScaling, mClampValEnabled, mQuantMode, mType, mOutputType);
+    auto* plugin = new RmsnormQuantizationPlugin(
+        mEps, mDynActScaling, mSumPerToken, mClampValEnabled, mQuantMode, mType, mOutputType);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -79,10 +81,22 @@ nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
         return inputs[outputIndex];
     }
 
-    // Dynamic scaling output if enabled
+    // Dynamic scaling or per-token sum if enabled.
     try
     {
-        TLLM_CHECK(outputIndex == 1);
+        if (outputIndex == 1)
+        {
+            TLLM_CHECK(mDynActScaling);
+        }
+        else if (outputIndex == 2)
+        {
+            TLLM_CHECK(mSumPerToken);
+        }
+        else
+        {
+            TLLM_CHECK(false);
+        }
+
         DimsExprs ret;
         ret.nbDims = inputs[0].nbDims;
         for (int di = 0; di < ret.nbDims - 1; ++di)
@@ -102,7 +116,8 @@ nvinfer1::DimsExprs RmsnormQuantizationPlugin::getOutputDimensions(
 bool RmsnormQuantizationPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    int const totalPoses = 6 + static_cast<int>(mClampValEnabled) + static_cast<int>(mDynActScaling);
+    int const totalPoses
+        = 6 + static_cast<int>(mClampValEnabled) + static_cast<int>(mDynActScaling) + static_cast<int>(mSumPerToken);
     TLLM_CHECK(0 <= pos && pos < totalPoses);
     TLLM_CHECK(nbInputs == 4 + static_cast<int>(mClampValEnabled));
     if (pos < nbInputs)
@@ -133,6 +148,11 @@ bool RmsnormQuantizationPlugin::supportsFormatCombination(
         // Dynamic scaling if enabled
         return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
+    else if (pos == 6 + int(mClampValEnabled))
+    {
+        // Per-token activation sum if enabled
+        return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+    }
 
     // Never should be here
     TLLM_CHECK_WITH_INFO(false, "The input/output is not supported.");
@@ -153,7 +173,7 @@ size_t RmsnormQuantizationPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc co
 template <typename T, typename QuantT>
 void RmsnormQuantizationPlugin::dispatchDataType(void* out, void const* input, void const* gamma, void const* beta,
     float const eps, int const tokens, int const hidden_dim, cudaStream_t stream, void const* clampValPtr,
-    void const* scale, void* dynamic_scale, void* normed_output_quant) noexcept
+    void const* scale, void* dynamic_scale, void* sum_per_token, void* normed_output_quant) noexcept
 {
     // inputs
     //     activation     [dim0(*), dim1]
@@ -165,7 +185,8 @@ void RmsnormQuantizationPlugin::dispatchDataType(void* out, void const* input, v
     invokeGeneralRmsNorm(reinterpret_cast<T*>(out), reinterpret_cast<T const*>(input),
         reinterpret_cast<T const*>(gamma), reinterpret_cast<T const*>(beta), eps, tokens, hidden_dim, mQuantMode,
         stream, reinterpret_cast<float const*>(clampValPtr), reinterpret_cast<float const*>(scale),
-        reinterpret_cast<float*>(dynamic_scale), reinterpret_cast<QuantT*>(normed_output_quant));
+        reinterpret_cast<float*>(dynamic_scale), reinterpret_cast<float*>(sum_per_token),
+        reinterpret_cast<QuantT*>(normed_output_quant));
 }
 
 int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
@@ -179,8 +200,9 @@ int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     //     scale_to_int [1]
     //     clamp_value [2], contains min val, and max val (optional)
     // outputs
-    //     output [M(*), N]
-    //     dynamic_scaling [M(*), 1] (optional output)
+    //     output           [M(*), N]   Normalized activations, potentially with quantization applied.
+    //     dynamic_scaling  [M(*), 1]   (Optional) Per-token scales if quantization is enabled.
+    //     token_sums       [M(*), 1]   (Optional) Per-token sums of all the channels (before quantization).
 
     int64_t m64 = 1;
     for (int i = 0; i < inputDesc[0].dims.nbDims - 1; ++i)
@@ -197,42 +219,43 @@ int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     void const* clampValPtr = mClampValEnabled ? inputs[4] : nullptr;
     void* output = outputs[0];
     void* dynamic_scale = mDynActScaling ? outputs[1] : nullptr;
+    void* sum_per_token = mSumPerToken ? outputs[2] : nullptr;
 
     if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kINT8)
     {
         dispatchDataType<float, int8_t>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
 #ifdef ENABLE_FP8
     else if (inputDesc[0].type == DataType::kFLOAT && mOutputType == DataType::kFP8)
     {
         dispatchDataType<float, __nv_fp8_e4m3>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
 #endif // ENABLE_FP8
     else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kINT8)
     {
         dispatchDataType<half, int8_t>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
 #ifdef ENABLE_FP8
     else if (inputDesc[0].type == DataType::kHALF && mOutputType == DataType::kFP8)
     {
         dispatchDataType<half, __nv_fp8_e4m3>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
 #endif // ENABLE_FP8
 #ifdef ENABLE_BF16
     else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kINT8)
     {
         dispatchDataType<__nv_bfloat16, int8_t>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
 #ifdef ENABLE_FP8
     else if (inputDesc[0].type == DataType::kBF16 && mOutputType == DataType::kFP8)
     {
         dispatchDataType<__nv_bfloat16, __nv_fp8_e4m3>(
-            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, output);
+            nullptr, input, weight, bias, mEps, m, n, stream, clampValPtr, scale, dynamic_scale, sum_per_token, output);
     }
 #endif // ENABLE_FP8
 #endif // ENABLE_BF16
@@ -244,14 +267,25 @@ int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
 nvinfer1::DataType RmsnormQuantizationPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    assert((mDynActScaling && index < 2) || (!mDynActScaling && index == 0));
+    assert(index <= 2);
+
     if (index == 0)
     {
         // Output 0 quantized output of layer norm
         return mOutputType;
     }
-    // Output 1 dynamic act scaling
-    return nvinfer1::DataType::kFLOAT;
+    if (index == 1)
+    {
+        assert(mDynActScaling);
+        // Output 1 dynamic act scaling
+        return nvinfer1::DataType::kFLOAT;
+    }
+    // index == 2
+    {
+        assert(mDynActScaling && mSumPerToken);
+        // Output 2 per token sum
+        return nvinfer1::DataType::kFLOAT;
+    }
 }
 
 // IPluginV2 Methods
@@ -268,7 +302,7 @@ char const* RmsnormQuantizationPlugin::getPluginVersion() const noexcept
 
 int RmsnormQuantizationPlugin::getNbOutputs() const noexcept
 {
-    return 1 + static_cast<int>(mDynActScaling);
+    return 1 + static_cast<int>(mDynActScaling) + static_cast<int>(mSumPerToken);
 }
 
 int RmsnormQuantizationPlugin::initialize() noexcept
@@ -280,8 +314,8 @@ void RmsnormQuantizationPlugin::terminate() noexcept {}
 
 size_t RmsnormQuantizationPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mOutputType) + sizeof(mClampValEnabled) + sizeof(mEps) + sizeof(mDynActScaling) + sizeof(mType)
-        + sizeof(mQuantMode);
+    return sizeof(mOutputType) + sizeof(mClampValEnabled) + sizeof(mEps) + sizeof(mDynActScaling) + sizeof(mSumPerToken)
+        + sizeof(mType) + sizeof(mQuantMode);
 }
 
 void RmsnormQuantizationPlugin::serialize(void* buffer) const noexcept
@@ -289,6 +323,7 @@ void RmsnormQuantizationPlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mEps);
     write(d, mDynActScaling);
+    write(d, mSumPerToken);
     write(d, mClampValEnabled);
     write(d, mQuantMode);
     write(d, mType);
@@ -310,6 +345,7 @@ RmsnormQuantizationPluginCreator::RmsnormQuantizationPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1e-5f));
     mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("sum_per_token", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("clamp_enabled", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("quant_mode", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
@@ -342,6 +378,7 @@ IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(char const* name, Plug
     float eps;
     nvinfer1::DataType type;
     bool dynamicActivationScaling;
+    bool sumPerToken;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -376,11 +413,16 @@ IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(char const* name, Plug
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             dynamicActivationScaling = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
         }
+        else if (!strcmp(attrName, "sum_per_token"))
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
+            sumPerToken = static_cast<bool>(*(static_cast<bool const*>(fields[i].data)));
+        }
     }
     try
     {
         auto* obj = new RmsnormQuantizationPlugin(
-            eps, dynamicActivationScaling, clampValEnabled, quantMode, type, outputType);
+            eps, dynamicActivationScaling, sumPerToken, clampValEnabled, quantMode, type, outputType);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

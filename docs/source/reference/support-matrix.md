@@ -32,6 +32,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba)
 - [mBART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
+- [Minitron] (https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
 - [Mistral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mistral NeMo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mixtral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral)
@@ -63,6 +64,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [LLaVa-Next](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+- [LLaVa-OneVision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
@@ -105,9 +107,9 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [24.09](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [24.10](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.5](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.6](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4

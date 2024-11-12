@@ -133,7 +133,7 @@ class ReDrafterForCausalLM(LLaMAForCausalLM):
             lm_logits, presents, hidden_states = super().forward(
                 *args, **base_kwargs)
         else:
-            lm_logits, hidden_states = super().forward(*args, **base_kwargs)
+            lm_logits, hidden_states, _ = super().forward(*args, **base_kwargs)
 
         # lm_logits could be in fp32
         lm_logits_cast = cast(lm_logits, self.dtype)  # no-op if same type

@@ -65,6 +65,8 @@ class _ParallelConfig:
     ''' The model distribution configs for LLM.  '''
     tp_size: int = 1
     pp_size: int = 1
+    moe_tp_size: int = 1
+    moe_ep_size: int = 1
     auto_parallel: bool = False
 
     _world_size: int = field(default=1, init=False)
@@ -262,6 +264,10 @@ LLMARGS_DOCSTRING = r"""
 
         auto_parallel_world_size (int): The MPI world size for auto parallel. Defaults to 1.
 
+        moe_tensor_parallel_size (int, optional): The tensor parallel size for MoE models's expert weights.
+
+        moe_expert_parallel_size (int, optional): The expert parallel size for MoE models's expert weights.
+
         fast_build: (bool): Enable features for faster engine building.
             This may cause some performance degradation and is currently incompatible with int8/int4 quantization.
             Defaults to False.
@@ -308,6 +314,10 @@ class LlmArgs:
 
     # Below are all remaining arguments
     pipeline_parallel_size: int = 1
+
+    moe_tensor_parallel_size: Optional[int] = None
+
+    moe_expert_parallel_size: Optional[int] = None
 
     auto_parallel: bool = False
 
@@ -371,6 +381,8 @@ class LlmArgs:
 
     normalize_log_probs: bool = False
 
+    use_runtime_defaults: bool = True
+
     def __post_init__(self):
         # NOTE: this is only for the compatibility with the old API, and will be removed in the future
         # chunked context is disabled by default, and it is recommended to keep it enabled.
@@ -395,9 +407,17 @@ class LlmArgs:
             if self.dtype == 'bfloat16':
                 raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
 
+        if self.moe_tensor_parallel_size is None:
+            self.moe_tensor_parallel_size = -1
+
+        if self.moe_expert_parallel_size is None:
+            self.moe_expert_parallel_size = -1
+
         self.parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
+            moe_tp_size=self.moe_tensor_parallel_size,
+            moe_ep_size=self.moe_expert_parallel_size,
             auto_parallel=self.auto_parallel)
         if self.parallel_config.auto_parallel:
             self.parallel_config.world_size = self.auto_parallel_world_size
@@ -475,6 +495,10 @@ class LlmArgs:
                         "The build_config is ignored for model format of TLLM_ENGINE."
                     )
                 self._load_config_from_engine(Path(self.model_dir))
+                runtime_defaults = self._pretrained_config.runtime_defaults
+                if self.use_runtime_defaults and runtime_defaults:
+                    self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
+                        runtime_defaults)
 
             # Load parallel_config from the checkpoint.
             elif self.model_format is _ModelFormatKind.TLLM_CKPT:
@@ -587,16 +611,18 @@ class LlmArgs:
             raise ValueError(
                 f"pp_size {self.parallel_config.pp_size} is not consistent with the engine's pp_size {mapping.pp_size}"
             )
-        self.parallel_config = _ParallelConfig(
-            tp_size=mapping.tp_size,
-            pp_size=mapping.pp_size,
-        )
+        self.parallel_config = _ParallelConfig(tp_size=mapping.tp_size,
+                                               pp_size=mapping.pp_size,
+                                               moe_tp_size=mapping.moe_tp_size,
+                                               moe_ep_size=mapping.moe_ep_size)
 
     def _load_config_from_ckpt(self, ckpt_dir: Path):
         pretrained_config = PretrainedConfig.from_json_file(ckpt_dir /
                                                             "config.json")
         tp_size = pretrained_config.mapping.tp_size
         pp_size = pretrained_config.mapping.pp_size
+        moe_tp_size = pretrained_config.mapping.moe_tp_size
+        moe_ep_size = pretrained_config.mapping.moe_ep_size
         world_size = pretrained_config.mapping.world_size
 
         # load parallel_config
@@ -614,10 +640,10 @@ class LlmArgs:
                 f"auto parallel with world_size {self.parallel_config.world_size} does not support checkpoint with "
                 "world_size {world_size} > 1")
         if not self.parallel_config.auto_parallel:
-            self.parallel_config = _ParallelConfig(
-                tp_size=tp_size,
-                pp_size=pp_size,
-            )
+            self.parallel_config = _ParallelConfig(tp_size=tp_size,
+                                                   pp_size=pp_size,
+                                                   moe_tp_size=moe_tp_size,
+                                                   moe_ep_size=moe_ep_size)
 
     def _setup_embedding_parallel_mode(self):
         if self.embedding_parallel_mode == 'NONE':
@@ -885,6 +911,8 @@ class ModelLoader:
             self.mapping = Mapping(
                 tp_size=llm_args.parallel_config.tp_size,
                 pp_size=llm_args.parallel_config.pp_size,
+                moe_tp_size=llm_args.parallel_config.moe_tp_size,
+                moe_ep_size=llm_args.parallel_config.moe_ep_size,
                 rank=self.rank,
                 world_size=llm_args.parallel_config.world_size,
             )

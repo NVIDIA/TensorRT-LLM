@@ -93,6 +93,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         kv_cache_free_gpu_memory_fraction: Optional[float] = None,
         cross_kv_cache_fraction: Optional[float] = None,
         medusa_choices: list[list[int]] | None = None,
+        eagle_choices: list[list[int]] | None = None,
         lookahead_config: list[int] | None = None,
         debug_mode: bool = False,
         lora_ckpt_source: str = "hf",
@@ -107,6 +108,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         logits_processor_map: Optional[Dict[str, LogitsProcessor]] = None,
         device_ids: List[int] | None = None,
         is_orchestrator_mode: bool = False,
+        use_runtime_defaults: bool = True,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -146,6 +148,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Whether or not to turn on the debug mode.
             medusa_choices (List[List[int]]):
                 Medusa choices to use when in Medusa decoding.
+            eagle_choices (List[List[int]]):
+                Eagle choices to use when in Eagle-1 decoding.
             lora_ckpt_source (str):
                 Source of checkpoint. Should be one of ['hf', 'nemo'].
             max_tokens_in_paged_kv_cache (int):
@@ -313,6 +317,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             max_tokens=max_tokens_in_paged_kv_cache,
             enable_block_reuse=kv_cache_enable_block_reuse,
             cross_kv_cache_fraction=cross_kv_cache_fraction,
+            runtime_defaults=json_config.runtime_defaults
+            if use_runtime_defaults else None,
         )
 
         decoding_config = trtllm.DecodingConfig()
@@ -320,6 +326,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config.medusa_choices = medusa_choices
             if multi_block_mode is not None:
                 multi_block_mode = False  # Medusa doesn't support multi-block mode.
+
+        if eagle_choices is not None:
+            decoding_config.eagle_config = trtllm.EagleConfig(eagle_choices)
+            if multi_block_mode is not None:
+                logger.warning(
+                    f'Multi block mode is not supported for EAGLE. Disabling it.'
+                )
+                multi_block_mode = False  # Eagle doesn't support multi-block mode.
 
         if lookahead_config is not None:
             [w, n, g] = lookahead_config
@@ -624,6 +638,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if lookahead_config is not None:
             [w, n, g] = lookahead_config
             request_lookahead_config = trtllm.LookaheadDecodingConfig(w, n, g)
+        skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
 
         # Draft-Target-Model speculative decoding
         if "draft_tokens_list" in kwargs.keys() and kwargs[
@@ -676,6 +691,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 return_all_generated_tokens=return_all_generated_tokens,
                 logits_post_processor_name=logits_post_processor_name,
                 external_draft_tokens_config=external_draft_tokens_config,
+                skip_cross_attn_blocks=skip_cross_attn_blocks,
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
              lora_config, logits_post_processor_name,

@@ -140,10 +140,13 @@ class ExecutorSettingsConfig(BaseModel):
     max_batch_size: int
     max_num_tokens: int
     kv_cache_percent: PositiveFloat = Field(default=.90, le=1.0)
+    kv_cache_reuse: bool = False
 
     def get_kvcache_config(self) -> trtllm.KvCacheConfig:
         return trtllm.KvCacheConfig(
-            free_gpu_memory_fraction=self.kv_cache_percent, )
+            free_gpu_memory_fraction=self.kv_cache_percent,
+            enable_block_reuse=False,
+        )
 
     def get_scheduler_config(self) -> trtllm.SchedulerConfig:
         return trtllm.SchedulerConfig(

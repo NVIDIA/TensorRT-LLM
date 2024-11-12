@@ -1120,6 +1120,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    use_qserve = model.config.quant_mode.is_qserve_w4a8()
     use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
@@ -1131,6 +1132,9 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
     if use_smooth_quant and model.config.quantization.use_plugin_sq and build_config.plugin_config.smooth_quant_plugins:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
+    if use_qserve:
+        network.plugin_config.set_qserve_plugins(model.config.dtype)
+
     if use_fp8_rowwise:
         network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
@@ -1193,6 +1197,11 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
+
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:
+            logger.warning(
+                "Paged Context FMHA is required for EAGLE. Turning it on")
+            build_config.plugin_config.use_paged_context_fmha = True
 
         inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)

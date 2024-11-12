@@ -2,7 +2,7 @@
 accelerate>=0.25.0
 build
 colored
-cuda-python==12.5.0
+cuda-python==12.6.0
 diffusers>=0.27.0
 numpy<2
 onnx>=1.12.0
@@ -16,7 +16,7 @@ h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.2.0
-tensorrt~=10.4.0
+tensorrt~=10.5.0
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch==2.4.1+cu124
@@ -27,4 +27,7 @@ wheel
 optimum
 evaluate
 janus
-mpmath==1.3.0
+mpmath>=1.3.0
+click
+click_option_group
+pyzmq

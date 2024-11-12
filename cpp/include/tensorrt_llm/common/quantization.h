@@ -97,6 +97,11 @@ public:
         return QuantMode(BaseType(1u) << 3 | BaseType(1u) << 4 | BaseType(1u) << 9);
     }
 
+    static constexpr QuantMode w4a8QServe() noexcept
+    {
+        return QuantMode(BaseType(1u) << 10);
+    }
+
     constexpr BaseType value() const noexcept
     {
         return mValue;
@@ -169,7 +174,8 @@ public:
 
     static constexpr QuantMode fromDescription(bool quantizeWeights = false, bool quantizeActivations = false,
         bool perToken = false, bool perChannel = false, bool perGroup = false, bool useInt4Weights = false,
-        bool useInt8KvCache = false, bool useFp8KvCache = false, bool useFp8Qdq = false, bool useFp8RowWise = false)
+        bool useInt8KvCache = false, bool useFp8KvCache = false, bool useFp8Qdq = false, bool useFp8RowWise = false,
+        bool useW4a8QServe = false)
     {
         QuantMode quantMode{};
         if (quantizeWeights)
@@ -218,6 +224,11 @@ public:
             quantMode += fp8RowWise();
         }
 
+        if (useW4a8QServe)
+        {
+            quantMode += w4a8QServe();
+        }
+
         return quantMode;
     }
 
@@ -226,12 +237,17 @@ public:
         return fromDescription(true, true, perToken, perChannel);
     }
 
+    static constexpr QuantMode useQServe(bool perGroup)
+    {
+        return fromDescription(true, true, false, false, perGroup, true, false, false, false, false, true);
+    }
+
     static constexpr QuantMode useWeightOnly(bool useInt4Weights = false, bool perGroup = false)
     {
         return fromDescription(true, false, false, false, perGroup, useInt4Weights);
     }
 
-    static const QuantMode fromQuantAlgo(
+    static QuantMode const fromQuantAlgo(
         std::optional<std::string> quantAlgo = std::nullopt, std::optional<std::string> kvCacheQuantAlgo = std::nullopt)
     {
         QuantMode quantMode{};
@@ -250,6 +266,14 @@ public:
         else if (quantAlgo == "W4A8_AWQ")
         {
             quantMode = useWeightOnly(true, true);
+        }
+        else if (quantAlgo == "W4A8_QSERVE_PER_GROUP")
+        {
+            quantMode = useQServe(false);
+        }
+        else if (quantAlgo == "W4A8_QSERVE_PER_CHANNEL")
+        {
+            quantMode = useQServe(true);
         }
         else if (quantAlgo == "W4A16_GPTQ")
         {

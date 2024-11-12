@@ -52,8 +52,6 @@ def build_engine(
     max_seq_len: int = 384,
 ):
 
-    if os.path.exists(engine_dir):
-        assert False
     build_cmd = [
         "trtllm-build",
         '--log_level=error',

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/request.h"
@@ -271,6 +272,15 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("position_ids", &tr::ExplicitDraftTokensBuffers::Inputs::positionIds)
         .def_readwrite("max_gen_length_host", &tr::ExplicitDraftTokensBuffers::Inputs::maxGenLengthHost)
         .def_readwrite("generation_lengths_host", &tr::ExplicitDraftTokensBuffers::Inputs::generationLengthsHost);
+
+    m.def(
+        "lamport_initialize_all",
+        [](intptr_t buffer_0, intptr_t buffer_1, intptr_t buffer_2, size_t size)
+        {
+            tr::lamportInitializeAll(reinterpret_cast<void*>(buffer_0), reinterpret_cast<void*>(buffer_1),
+                reinterpret_cast<void*>(buffer_2), size);
+        },
+        "Lamport initialize all buffers");
 }
 
 } // namespace tensorrt_llm::pybind::runtime

@@ -211,9 +211,6 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
 
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    auto const [blocksInPrimaryPool, blocksInSecondaryPool] = bmkv::KVCacheManager::calculateMaxNumBlocks(
-        kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
-
     // If maxBeamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
     // tokens, when enabling cyclic kv cache.
     auto const useOneMoreBlock = maxBeamWidth > 1 && maxSequenceLength > maxAttentionWindow;
@@ -239,6 +236,9 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1 || !enableDiffMaxAttenWin,
         "Can't support layer-wise max_attention_window with beam search. Please use a unified max_attention_window for "
         "all layers.");
+
+    auto const [blocksInPrimaryPool, blocksInSecondaryPool] = bmkv::KVCacheManager::calculateMaxNumBlocks(
+        kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(
         std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd), sizePerHead, tokensPerBlock,
         blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength,

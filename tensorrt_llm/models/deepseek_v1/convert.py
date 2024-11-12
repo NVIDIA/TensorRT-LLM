@@ -22,17 +22,17 @@ from tensorrt_llm.layers import MoeConfig
 
 from ..._utils import pad_vocab_size, release_gc
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 
 
 ## Convert config parameters to dict
 def create_trt_config_from_hf(model_dir,
-                              dtype,
+                              dtype: str,
                               mapping: Mapping,
                               override_fields: dict = {}):
-    config = {}
     assert isinstance(model_dir, str)
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    dtype = dtype
+    dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
     n_layer = hf_config.num_hidden_layers
     n_head = hf_config.num_attention_heads
     n_embd = hf_config.hidden_size

@@ -1,5 +1,1 @@
-fastapi>=0.115
-uvicorn
 colorama
-httpx
-pytest-asyncio

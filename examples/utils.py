@@ -356,11 +356,26 @@ def add_common_args(parser):
         "   E.g.: [4, [0], [1], False] for [draft_len, draft_model_device_list, target_model_device_list, use_logits]."
     )
     parser.add_argument(
+        '--prompt_lookup_config',
+        type=str,
+        default=None,
+        help=
+        "Configuration of Prompt-Lookup decoding, see `examples/prompt_lookup/README.md` for more information."
+        "   E.g.: [10,2,[0]] for [prompt_lookup_num_tokens, max_matching_ngram_size, device_list].",
+    )
+    parser.add_argument(
         '--medusa_choices',
         type=str,
         default=None,
         help="Configuration of Medusa decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 medusa tokens."
+    )
+    parser.add_argument(
+        '--eagle_choices',
+        type=str,
+        default=None,
+        help="Configuration of Eagle-1 decoding."
+        "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 draft tokens."
     )
     parser.add_argument(
         '--lookahead_config',

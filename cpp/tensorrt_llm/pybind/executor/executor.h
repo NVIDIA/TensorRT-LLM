@@ -115,6 +115,11 @@ public:
         return mExecutor->canEnqueueRequests();
     }
 
+    [[nodiscard]] std::optional<std::shared_ptr<tle::KVCacheEventManager>> getKVCacheEventManager() const
+    {
+        return mExecutor->getKVCacheEventManager();
+    }
+
     static void initBindings(pybind11::module_& m);
 
 private:

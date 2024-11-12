@@ -15,12 +15,9 @@
 
 from typing import Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
-from ...logger import logger
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -68,19 +65,7 @@ class Phi3Config(PretrainedConfig):
             hf_config = hf_config.llm_config
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         small_variant = hf_config.architectures[0] == "Phi3SmallForCausalLM"
         if small_variant:

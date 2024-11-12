@@ -128,6 +128,7 @@ setup(
             'trtllm-prune=tensorrt_llm.commands.prune:main',
             'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
+            'trtllm-serve=tensorrt_llm.commands.serve:main',
         ],
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],

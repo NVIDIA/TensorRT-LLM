@@ -50,67 +50,28 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using ContextChunkingPolicy = tensorrt_llm::executor::ContextChunkingPolicy;
 
-    MicroBatchScheduler() = default;
-
-    explicit MicroBatchScheduler(SizeType32 maxBatchSize, std::optional<SizeType32> maxNumTokens = std::nullopt,
+    explicit MicroBatchScheduler(std::optional<SizeType32> maxNumTokens = std::nullopt,
         std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
         std::optional<SizeType32> maxContextLength = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
-    static MicroBatchScheduler make(SizeType32 maxBatchSize, std::optional<SizeType32> maxNumTokens = std::nullopt,
-        std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
-        std::optional<SizeType32> maxContextLength = std::nullopt,
-        LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE)
-    {
-        return MicroBatchScheduler{
-            maxBatchSize, maxNumTokens, ctxChunkConfig, maxContextLength, noScheduleUntilState, noScheduleAfterState};
-    }
-
     std::tuple<RequestVector, RequestVector> operator()(
-        RequestVector const& activeRequests, ReqIdsSet const& inflightReqIds);
+        RequestVector& activeRequests, ReqIdsSet const& inflightReqIds, SizeType32 maxBatchSizeRuntime) const;
 
-    static void setCtxRequestsChunkSize(RequestVector const& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
+    static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
         std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
         std::optional<SizeType32> const& maxContextLength);
-
-    void setRuntimeMaxBatchSize(SizeType32 runtimeMaxBatchSize);
-
-    SizeType32 getMaxBatchSizeStatic() const
-    {
-        return mMaxBatchSize;
-    }
-
-    SizeType32 getMaxBatchSizeTunerRecommended() const
-    {
-        return mMaxBatchSizeTunerRecommended;
-    }
-
-    SizeType32 getMaxBatchSizeRuntime() const
-    {
-        return mMaxBatchSizeRuntime;
-    }
 
 private:
     template <ContextChunkingPolicy tPolicy>
-    static void setCtxRequestsChunkSize(RequestVector const& contextsToBeChunked,
-        std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
-        std::optional<SizeType32> const& maxContextLength);
+    static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
+        SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextLength);
 
     /// After the chunk sizes have been determined, this function will discard
     /// any draft tokens that don't fit.
-    static void fitDraftTokens(RequestVector const& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
+    static void fitDraftTokens(RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
         SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextLength);
-
-    /// The maximum number of requests returned by scheduleRequests
-    SizeType32 mMaxBatchSize;
-
-    /// The max batch size recommended by the dynamic tuner
-    SizeType32 mMaxBatchSizeTunerRecommended;
-
-    /// The min of mMaxBatchSize and mMaxBatchSizeTunerRecommended
-    SizeType32 mMaxBatchSizeRuntime;
 
     /// The maximum number of tokens to include in a batch
     std::optional<SizeType32> mMaxNumTokens;

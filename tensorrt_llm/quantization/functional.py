@@ -23,7 +23,7 @@ from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt, trt_dtype_to_np
 from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
                           constant, flatten, layer_norm, matmul,
-                          repeat_interleave, rms_norm, round, view)
+                          repeat_interleave, rms_norm, round, sum, view)
 from ..layers.linear import ColumnLinear
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .mode import QuantMode
@@ -91,6 +91,82 @@ def smooth_quant_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
         if not default_net().strongly_typed:
             layer.get_input(0).set_dynamic_range(-127, 127)
             layer.get_input(1).set_dynamic_range(-127, 127)
+        return _create_tensor(layer.get_output(0), layer)
+
+
+def qserve_gemm_per_group(input: Tensor,
+                          act_scales: Tensor,
+                          weights: Tensor,
+                          s1_scales: Tensor,
+                          s2_scales: Tensor,
+                          s2_zeros: Tensor,
+                          group_size: int = 128) -> Tensor:
+    if not default_net().plugin_config.qserve_gemm_plugin:
+        raise TypeError("QServe Quant GEMM is only supported with plugin")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'QServeGemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+
+        p_dtype = default_net().plugin_config.qserve_gemm_plugin
+        pf_type = trt.PluginField(
+            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+            trt.PluginFieldType.INT32)
+        pf_group_size = trt.PluginField("group_size",
+                                        np.array([group_size], np.int32),
+                                        trt.PluginFieldType.INT32)
+
+        pfc = trt.PluginFieldCollection([pf_type, pf_group_size])
+        gemm_plug = plg_creator.create_plugin("qserve_gemm", pfc)
+        plug_inputs = [
+            input.trt_tensor, weights.trt_tensor, s2_zeros.trt_tensor,
+            s2_scales.trt_tensor, s1_scales.trt_tensor, act_scales.trt_tensor
+        ]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
+        _add_plugin_info(layer, plg_creator, "qserve_gemm", pfc)
+        if not default_net().strongly_typed:
+            # Useless. But must be kept otherwise leads to the following TRT API Usage error:
+            # input/output with DataType Int8 in network without Q/DQ layers must have dynamic range set when no calibrator is used
+            layer.get_input(0).set_dynamic_range(-128, 127)
+            layer.get_input(1).set_dynamic_range(-128, 127)
+            layer.get_input(2).set_dynamic_range(-128, 127)
+            layer.get_input(3).set_dynamic_range(-128, 127)
+        return _create_tensor(layer.get_output(0), layer)
+
+
+def qserve_gemm_per_channel(input: Tensor, act_scales: Tensor, act_sums: Tensor,
+                            weights: Tensor, s1_scales: Tensor,
+                            s1_szeros: Tensor) -> Tensor:
+    if not default_net().plugin_config.qserve_gemm_plugin:
+        raise TypeError("QServe Quant GEMM is only supported with plugin")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'QServeGemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+
+        p_dtype = default_net().plugin_config.qserve_gemm_plugin
+        pf_type = trt.PluginField(
+            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+            trt.PluginFieldType.INT32)
+        pf_group_size = trt.PluginField("group_size", np.array([-1], np.int32),
+                                        trt.PluginFieldType.INT32)
+
+        pfc = trt.PluginFieldCollection([pf_type, pf_group_size])
+        gemm_plug = plg_creator.create_plugin("qserve_gemm", pfc)
+
+        plug_inputs = [
+            input.trt_tensor, weights.trt_tensor, s1_scales.trt_tensor,
+            s1_szeros.trt_tensor, act_sums.trt_tensor, act_scales.trt_tensor
+        ]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, gemm_plug)
+        _add_plugin_info(layer, plg_creator, "qserve_gemm", pfc)
+
+        if not default_net().strongly_typed:
+            # Useless. But must be kept otherwise leads to the following TRT API Usage error:
+            # input/output with DataType Int8 in network without Q/DQ layers must have dynamic range set when no calibrator is used
+            layer.get_input(0).set_dynamic_range(-128, 127)
+            layer.get_input(1).set_dynamic_range(-128, 127)
+
         return _create_tensor(layer.get_output(0), layer)
 
 
@@ -262,6 +338,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
         return _create_tensor(layer.get_output(0), layer)
 
 
+# TODO: Should be renamed to layer_norm_quantize.
 def smooth_quant_layer_norm(input: Tensor,
                             normalized_shape: Union[int, Tuple[int]],
                             weight: Optional[Tensor] = None,
@@ -331,14 +408,24 @@ def smooth_quant_layer_norm(input: Tensor,
                               layer), _create_tensor(layer.get_output(1), layer)
 
 
-def smooth_quant_rms_norm(input: Tensor,
-                          normalized_shape: Union[int, Tuple[int]],
-                          weight: Optional[Tensor] = None,
-                          bias: Optional[Tensor] = None,
-                          scale: Optional[Tensor] = None,
-                          clamp_val: Optional[Tensor] = None,
-                          eps: float = 1e-05,
-                          dynamic_act_scaling: bool = False) -> Tensor:
+# TODO: Should be renamed to rms_norm_quantize. This is also used by QServe.
+def smooth_quant_rms_norm(
+    input: Tensor,
+    normalized_shape: Union[int, Tuple[int]],
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    scale: Optional[Tensor] = None,
+    clamp_val: Optional[Tensor] = None,
+    eps: float = 1e-05,
+    dynamic_act_scaling: bool = False,
+    scale_dtype='float32',
+    sum_per_token: bool = False,
+    sum_dtype='float32'
+) -> Tensor | tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+    if sum_per_token and not dynamic_act_scaling:
+        raise ValueError(
+            "sum_per_token is only allowed if dynamic_act_scaling is enabled!")
+
     if not default_net().plugin_config.rmsnorm_quantization_plugin:
         result = rms_norm(input, normalized_shape, 1, weight, eps)
         if bias is not None:
@@ -346,7 +433,8 @@ def smooth_quant_rms_norm(input: Tensor,
         if not dynamic_act_scaling:
             return quantize_tensor(result, scale)
         else:
-            return quantize_per_token(result)
+            return quantize_per_token(result, clamp_val, scale_dtype,
+                                      sum_per_token, sum_dtype)
     else:
         plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'RmsnormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -370,13 +458,17 @@ def smooth_quant_rms_norm(input: Tensor,
             "dyn_act_scaling", np.array([int(dynamic_act_scaling)], np.int32),
             trt.PluginFieldType.INT32)
 
+        sum_per_token_pf = trt.PluginField(
+            "sum_per_token", np.array([int(sum_per_token)], np.int32),
+            trt.PluginFieldType.INT32)
+
         p_dtype = default_net().plugin_config.rmsnorm_quantization_plugin
         pf_type = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
         pfc = trt.PluginFieldCollection([
-            eps, dyn_act_scaling, clamp_enabled, quant_mode, pf_type,
-            output_type
+            eps, dyn_act_scaling, sum_per_token_pf, clamp_enabled, quant_mode,
+            pf_type, output_type
         ])
         rmsnorm_plug = plg_creator.create_plugin("rmsnorm_quantized", pfc)
         normalized_shape = [normalized_shape] if isinstance(
@@ -388,8 +480,13 @@ def smooth_quant_rms_norm(input: Tensor,
             bias = constant(
                 np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
 
+        # TODO: Why not fuse scale (which seems to be a per-tensor scaling factor of the original values) into weight?
+        if scale is None:
+            scale = constant(np.ones(1, dtype=str_dtype_to_np(p_dtype)))
+
         # RMS Norm Plugin only supports float32 scale
         scale = cast(scale, "float32")
+
         plug_inputs = [
             input.trt_tensor, weight.trt_tensor, bias.trt_tensor,
             scale.trt_tensor
@@ -403,8 +500,22 @@ def smooth_quant_rms_norm(input: Tensor,
         if not dynamic_act_scaling:
             return _create_tensor(layer.get_output(0), layer)
 
-        return _create_tensor(layer.get_output(0),
-                              layer), _create_tensor(layer.get_output(1), layer)
+        output_quantized = _create_tensor(layer.get_output(0), layer)
+        output_scales = _create_tensor(layer.get_output(1), layer)
+
+        # TODO: The plugin should be able to directly output float16 scales
+        if str_dtype_to_trt(scale_dtype) != output_scales.dtype:
+            output_scales = cast(output_scales, scale_dtype)
+
+        if not sum_per_token:
+            return output_quantized, output_scales
+
+        output_sums = _create_tensor(layer.get_output(2), layer)
+        # TODO: The plugin should be able to directly output float16 sums
+        if str_dtype_to_trt(sum_dtype) != output_sums.dtype:
+            output_sums = cast(output_sums, sum_dtype)
+
+        return output_quantized, output_scales, output_sums
 
 
 def fp8_rowwise_rms_norm(input: Tensor,
@@ -439,15 +550,20 @@ def fp8_rowwise_rms_norm(input: Tensor,
         dyn_act_scaling = trt.PluginField(
             "dyn_act_scaling", np.array([int(dynamic_act_scaling)], np.int32),
             trt.PluginFieldType.INT32)
+        sum_per_token_pf = trt.PluginField("sum_per_token",
+                                           np.array([int(False)], np.int32),
+                                           trt.PluginFieldType.INT32)
 
         p_dtype = default_net().plugin_config.rmsnorm_quantization_plugin
         pf_type = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
+
         pfc = trt.PluginFieldCollection([
-            eps, dyn_act_scaling, clamp_enabled, quant_mode, pf_type,
-            output_type
+            eps, dyn_act_scaling, sum_per_token_pf, clamp_enabled, quant_mode,
+            pf_type, output_type
         ])
+
         rmsnorm_plug = plg_creator.create_plugin("rmsnorm_quantized", pfc)
         normalized_shape = [normalized_shape] if isinstance(
             normalized_shape, int) else normalized_shape
@@ -514,49 +630,75 @@ def dequantize(input: Tensor,
     return output
 
 
-def quantize_per_token(x: Tensor,
-                       clamp_val: Optional[Tensor] = None) -> Tuple[Tensor]:
+def quantize_per_token(
+    x: Tensor,
+    clamp_val: Optional[Tensor] = None,
+    scale_dtype='float32',
+    sum_per_token: bool = False,
+    sum_dtype='float32',
+) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     if not default_net().plugin_config.quantize_per_token_plugin:
         x = cast(x, 'float32')
         xmax = x.abs().max(-1, keepdim=True)
-        scale = xmax / 127.0
+        scales = xmax / 127.0
         out = x * 127.0 / xmax
         out = round(out)
         out = clip(out, -128, 127)
-        quantized_out = cast(out, 'int8')
-        return quantized_out, scale
-    else:
-        plg_creator = trt.get_plugin_registry().get_plugin_creator(
-            'QuantizePerToken', '1', TRT_LLM_PLUGIN_NAMESPACE)
-        assert plg_creator is not None
+        quantized = cast(out, 'int8')
+        if not sum_per_token:
+            return quantized, scales
+        sums = sum(x, -1, keepdim=True)
+        if sum_dtype is not None and str_dtype_to_trt(sum_dtype) != sums.dtype:
+            sums = cast(sums, sum_dtype)
+        return quantized, scales, sums
 
-        output_type = trt.PluginField("type_id",
-                                      np.array([int(trt.int8)], np.int32),
-                                      trt.PluginFieldType.INT32)
-        quant_mode = trt.PluginField(
-            "quant_mode",
-            np.array([int(QuantMode.use_smooth_quant(per_token=True))],
-                     np.int32), trt.PluginFieldType.INT32)
-        clamp_enabled = trt.PluginField(
-            "clamp_enabled", np.array([clamp_val is not None], np.int8),
-            trt.PluginFieldType.INT8)
-        pfc = trt.PluginFieldCollection(
-            [output_type, quant_mode, clamp_enabled])
-        quantize_plug = plg_creator.create_plugin("quantize_per_token_plugin",
-                                                  pfc)
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'QuantizePerToken', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
 
-        plug_inputs = [x.trt_tensor]
-        if clamp_val:
-            plug_inputs += [clamp_val.trt_tensor]
-        layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
-        if not default_net().strongly_typed:
-            layer.get_output(0).set_dynamic_range(-127, 127)
-        _add_plugin_info(layer, plg_creator, "quantize_per_token_plugin", pfc)
+    output_type = trt.PluginField("type_id", np.array([int(trt.int8)],
+                                                      np.int32),
+                                  trt.PluginFieldType.INT32)
+    quant_mode = trt.PluginField(
+        "quant_mode",
+        np.array([int(QuantMode.use_smooth_quant(per_token=True))], np.int32),
+        trt.PluginFieldType.INT32)
+    clamp_enabled = trt.PluginField("clamp_enabled",
+                                    np.array([clamp_val is not None], np.int8),
+                                    trt.PluginFieldType.INT8)
 
-        quantized = _create_tensor(layer.get_output(0), layer)
-        scales = _create_tensor(layer.get_output(1), layer)
+    sum_per_token_pf = trt.PluginField("sum_per_token",
+                                       np.array([int(sum_per_token)], np.int32),
+                                       trt.PluginFieldType.INT32)
 
+    pfc = trt.PluginFieldCollection(
+        [output_type, quant_mode, clamp_enabled, sum_per_token_pf])
+    quantize_plug = plg_creator.create_plugin("quantize_per_token_plugin", pfc)
+
+    plug_inputs = [x.trt_tensor]
+    if clamp_val:
+        plug_inputs += [clamp_val.trt_tensor]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
+    if not default_net().strongly_typed:
+        layer.get_output(0).set_dynamic_range(-127, 127)
+    _add_plugin_info(layer, plg_creator, "quantize_per_token_plugin", pfc)
+
+    quantized = _create_tensor(layer.get_output(0), layer)
+    scales = _create_tensor(layer.get_output(1), layer)
+
+    # TODO: The plugin should be able to directly output float16 scales to avoid a cast
+    if scale_dtype is not None and str_dtype_to_trt(
+            scale_dtype) != scales.dtype:
+        scales = cast(scales, scale_dtype)
+    if not sum_per_token:
         return quantized, scales
+
+    sums = _create_tensor(layer.get_output(2), layer)
+    # TODO: The plugin should be able to directly output float16 sums to avoid a cast
+    if sum_dtype is not None and str_dtype_to_trt(sum_dtype) != sums.dtype:
+        sums = cast(sums, sum_dtype)
+
+    return quantized, scales, sums
 
 
 def quantize_fp8_per_token(x: Tensor,
@@ -585,8 +727,11 @@ def quantize_fp8_per_token(x: Tensor,
         clamp_enabled = trt.PluginField(
             "clamp_enabled", np.array([clamp_val is not None], np.int8),
             trt.PluginFieldType.INT8)
+        sum_per_token_pf = trt.PluginField("sum_per_token",
+                                           np.array([int(False)], np.int32),
+                                           trt.PluginFieldType.INT32)
         pfc = trt.PluginFieldCollection(
-            [output_type, quant_mode, clamp_enabled])
+            [output_type, quant_mode, clamp_enabled, sum_per_token_pf])
         quantize_plug = plg_creator.create_plugin("quantize_per_token_plugin",
                                                   pfc)
 

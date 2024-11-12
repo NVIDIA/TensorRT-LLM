@@ -9,7 +9,6 @@ This document shows how to build and run [deepseek-v2](https://arxiv.org/pdf/240
     - [Support Matrix](#support-matrix)
     - [Usage](#usage)
         - [Build TensorRT engine(s)](#build-tensorrt-engines)
-    - [Benchmarks](#benchmarks)
 
 ## Prerequisite
 
@@ -87,7 +86,7 @@ trtllm-build --checkpoint_dir ./trtllm_checkpoint_deepseek_v2_8gpu_bf16 \
             --use_paged_context_fmha enable
 ```
 
-***Caution: `--max_batch_size` and `--max_seq_len` are the main factors to determine how many GPU memory will be used during runtime, so later when try to run e.g., `summarize.py` or `mmlu.py` or `gptManagerBenchmark.cpp`may need adjust `--max_batch_size` and `--max_seq_len` accordingly to avoid OOM.(meaning rebuild TensorRT engine with smaller `--max_batch_size` and `--max_seq_len` if needed based on GPU memory size), there is beautiful technical log [perf-best-practices.md](../../../tekit/docs/source/performance/perf-best-practices.md) explained the mechanism.***
+***Caution: `--max_batch_size` and `--max_seq_len` are the main factors to determine how many GPU memory will be used during runtime, so later when try to run e.g., `summarize.py` or `mmlu.py` or `gptManagerBenchmark.cpp`may need adjust `--max_batch_size` and `--max_seq_len` accordingly to avoid OOM.(meaning rebuild TensorRT engine with smaller `--max_batch_size` and `--max_seq_len` if needed based on GPU memory size), there is beautiful technical log perf-best-practices.md (https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md) explained the mechanism.***
 
 Test the engine with [run.py](../run.py) script:
 

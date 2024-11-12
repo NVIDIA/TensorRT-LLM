@@ -10,6 +10,7 @@ from typing import Iterable, List, Optional
 
 import numpy as np
 import torch
+import tqdm
 
 from tensorrt_llm import logger
 
@@ -323,7 +324,6 @@ class LLMPerfEvaluator:
         self.start = None
         self.end = None
 
-    #@log_sparse(stack_depth=10)
     def run(self, end_id: int = -1, beam_width: int = 1) -> Report:
         # reset states
         self.perf_items = []
@@ -336,7 +336,8 @@ class LLMPerfEvaluator:
         )
 
         async def lane(sampling_params: SamplingParams,
-                       is_warmup: bool = False):
+                       is_warmup: bool = False,
+                       tqdm_bar: tqdm.tqdm = None):
             nonlocal sample_offset
             num_samples = self.warmup if is_warmup else len(self.samples)
 
@@ -374,31 +375,41 @@ class LLMPerfEvaluator:
                 if not is_warmup:
                     self.perf_items.append(perf_item)
 
+                if tqdm_bar:
+                    tqdm_bar.update(1)
+
         if self.warmup > 0:
             logger.warning("warming up ...")
 
-            async def run_lanes():
+            async def run_lanes(tqdm_bar=None):
                 lanes = [
-                    lane(sampling_params, is_warmup=True)
+                    lane(sampling_params, is_warmup=True, tqdm_bar=tqdm_bar)
                     for _ in range(min(self.concurrency, self.warmup))
                 ]
                 await asyncio.gather(*lanes)
 
-            asyncio.run(run_lanes())
+            with tqdm.tqdm(total=self.warmup) as pbar:
+                asyncio.run(run_lanes(tqdm_bar=pbar))
+
+            # restore the sample offset
             sample_offset = 0
 
         logger.warning("running ...")
 
-        async def run_lanes():
-            print(f"** concurrency: {self.concurrency}")
-            lanes = [lane(sampling_params) for _ in range(self.concurrency)]
+        async def run_lanes(tqdm_bar=None):
+            print_colored(f"concurrency: {self.concurrency}\n", "green")
+            lanes = [
+                lane(sampling_params, tqdm_bar=tqdm_bar)
+                for _ in range(self.concurrency)
+            ]
             await asyncio.gather(*lanes)
 
         @log_sparse(stack_depth=3)
         def run_main():
             global_tracer().log_instant("profile.start")
             self.start = time.perf_counter()
-            asyncio.run(run_lanes())
+            with tqdm.tqdm(total=len(self.samples)) as pbar:
+                asyncio.run(run_lanes(pbar))
             self.end = time.perf_counter()
             global_tracer().log_instant("profile.end")
 

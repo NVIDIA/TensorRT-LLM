@@ -144,6 +144,79 @@ def gt_matmul_smooth_quant(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
     return ref
 
 
+# Note: The qweight here should be torch Tensors before being processed by `qserve_convert_linear`
+# i.e., without reordering and packing. There should be no packing and reordering for scales and zeros as well.
+# The zeros here are scaled zeros
+def gt_qserve_gemm_per_group(qact: torch.IntTensor,
+                             act_scales: torch.HalfTensor,
+                             qweight: torch.IntTensor,
+                             s1_scales: torch.HalfTensor,
+                             s2_scales: torch.IntTensor,
+                             s2_zeros: torch.IntTensor,
+                             group_size=128) -> torch.HalfTensor:
+    out_features = qweight.shape[0]
+    in_features = qweight.shape[1]
+
+    # Step 1: Dequantize weight from int4 to int8
+    s2_zeros = s2_zeros.reshape(out_features, in_features // group_size,
+                                1).to(qweight.device)
+    s2_scales = s2_scales.reshape(out_features, in_features // group_size,
+                                  1).to(qweight.device)
+
+    assert qweight.dtype == torch.int8
+    # The kernel relies on two's complement arithmetic of int8.
+    # If qweight is converted to int32 the result will not match the kernel.
+    dequantized_weight = qweight.reshape(
+        out_features, in_features // group_size,
+        group_size).sub(s2_zeros).mul(s2_scales)
+    dequantized_weight = dequantized_weight.reshape(out_features, in_features)
+
+    # Step 2: Perform matrix multiplication in int32
+    result = torch.matmul(qact.to(torch.int32),
+                          dequantized_weight.T.to(torch.int32))
+
+    # Step 3: Dequantize the result to float
+    # Convert int GEMM result, ascales and wscales all to float, which is aligned with the QServe GEMM kernel.
+    result = result.float()
+    s1_scales = s1_scales.reshape(1, out_features).to(result.device).float()
+    act_scales = act_scales.reshape(act_scales.shape[0],
+                                    1).to(result.device).float()
+    # To match the result exactly to QServe, the multiplication order must be preserved due to float rounding errors.
+    result = result.mul(s1_scales.mul(act_scales))
+    return result.half()
+
+
+def gt_qserve_gemm_per_channel(qact: torch.IntTensor,
+                               act_scales: torch.HalfTensor,
+                               act_sums: torch.HalfTensor,
+                               qweight: torch.CharTensor,
+                               s1_scales: torch.HalfTensor,
+                               s1_zeros: torch.HalfTensor) -> torch.HalfTensor:
+    out_features = qweight.shape[0]
+    qweight.shape[1]
+    num_activations = qact.shape[0]
+
+    # Step 1: Perform matrix multiplication in int32
+    result = torch.matmul(qact.to(torch.int32), qweight.T.to(torch.int32))
+
+    # Step 2: Dequantize the result to float
+    # Convert int GEMM result, ascales and wscales all to float, which is aligned with the QServe GEMM kernel.
+    result = result.float()
+    s1_scales = s1_scales.reshape(1, out_features).to(result.device).float()
+    act_scales = act_scales.reshape(act_scales.shape[0],
+                                    1).to(result.device).float()
+    # To match the result exactly to QServe, the multiplication order must be preserved due to float rounding errors.
+    result = result.mul(s1_scales.mul(act_scales))
+    # Step 3: Add the outer product between act_sums and s1_szeros
+    # Note: no unary minus before zeros like in per-channel version.
+    act_sums = act_sums.reshape(num_activations, 1).to(result.device).float()
+    s1_szeros = s1_zeros.reshape(1, out_features).to(
+        result.device).float() * s1_scales
+    result = result - act_sums * s1_szeros
+
+    return result.half()
+
+
 def gt_matmul_fp8_rowwise(mat1, mat2, scale_a_, scale_b_, dtype, bias=None):
     # Convert to float32 for PyTorch GT Matmul with accumulation in float32.
     device = mat1.device

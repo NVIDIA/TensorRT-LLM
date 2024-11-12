@@ -306,9 +306,11 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         }
 
         int token_num = size / inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+        int hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
 
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, mOp);
+            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, hidden_size,
+            mOp);
 
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
@@ -320,7 +322,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
             params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
             params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
-            params.fusion_params.hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
+            params.fusion_params.hidden_size = hidden_size;
             params.fusion_params.eps = mEps;
             params.fusion_params.intermediate_buffer = outputs[1];
             for (int i = 0; i < tpSize; ++i)

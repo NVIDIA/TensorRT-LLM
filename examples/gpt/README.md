@@ -27,6 +27,7 @@ This document explains how to build the [GPT](https://huggingface.co/gpt2) model
   - [Embedding Parallelism](#embedding-parallelism)
     - [1. Embedding parallelism](#1-embedding-parallelism)
     - [2. The sharding dimension for embedding parallelism](#2-the-sharding-dimension-for-embedding-parallelism)
+  - [GPT Variant - Granite(20B and 34B)](#gpt-variant---granite)
   - [GPT Variant - SantaCoder](#gpt-variant---santacoder)
   - [GPT Variant - StarCoder (v1 and v2)](#gpt-variant---starcoder-v1-and-v2)
     - [Run StarCoder2 with LoRA](#run-starcoder2-with-lora)
@@ -535,6 +536,33 @@ trtllm-build --checkpoint_dir gpt2/trt_ckpt/fp16/2-gpu \
         --output_dir gpt2/trt_engines/fp16/2-gpu
 ```
 
+## GPT Variant - Granite
+
+For Granite, the steps are similar to StarCoder.
+
+```bash
+# Download hf granite model
+git clone https://huggingface.co/ibm-granite/granite-34b-code-instruct granite
+
+# Convert to TensorRT-LLM checkpoint
+python3 convert_checkpoint.py --model_dir granite \
+        --dtype float16 \
+        --gpt_variant starcoder \
+        --tp_size 4 \
+        --output_dir granite/trt_ckpt/fp16/4-gpu
+
+# Build TensorRT-LLM engines
+trtllm-build --checkpoint_dir granite/trt_ckpt/fp16/4-gpu \
+        --gemm_plugin auto \
+        --output_dir granite/trt_engines/fp16/4-gpu
+
+# Run inference
+mpirun -np 4 \
+    python3 ../run.py --engine_dir granite/trt_engines/fp16/4-gpu \
+        --tokenizer_dir granite \
+        --input_text "def print_hello_world():" \
+        --max_output_len 20
+```
 
 ## GPT Variant - SantaCoder
 

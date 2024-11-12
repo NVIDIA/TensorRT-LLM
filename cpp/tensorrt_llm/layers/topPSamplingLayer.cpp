@@ -171,16 +171,16 @@ void TopPSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Ten
         std::vector<void*> alignedPointers;
         calcAlignedPointers(workspace->getRawWorkspaceDevicePtr(), initWorkspaceSizes)(
             topKsPtr, topPsPtr, topPDecayPtr, topPMinPtr, topPResetIdsPtr);
-        DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, runtimeTopK,
-            ITensor::wrap(topKsPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[0])}}));
-        DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, runtimeTopP,
-            ITensor::wrap(topPsPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[1])}}));
-        DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, decayVec,
-            ITensor::wrap(topPDecayPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[2])}}));
-        DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, topPMinVec,
-            ITensor::wrap(topPMinPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[3])}}));
+        DecodingLayerWorkspace::copyToWorkspace(
+            *mBufferManager, runtimeTopK, IBuffer::wrap(topKsPtr, initWorkspaceSizes[0] / sizeof(*topKsPtr)));
+        DecodingLayerWorkspace::copyToWorkspace(
+            *mBufferManager, runtimeTopP, IBuffer::wrap(topPsPtr, initWorkspaceSizes[1] / sizeof(*topPsPtr)));
+        DecodingLayerWorkspace::copyToWorkspace(
+            *mBufferManager, decayVec, IBuffer::wrap(topPDecayPtr, initWorkspaceSizes[2] / sizeof(*topPDecayPtr)));
+        DecodingLayerWorkspace::copyToWorkspace(
+            *mBufferManager, topPMinVec, IBuffer::wrap(topPMinPtr, initWorkspaceSizes[3] / sizeof(*topPMinPtr)));
         DecodingLayerWorkspace::copyToWorkspace(*mBufferManager, topPResetIdsVec,
-            ITensor::wrap(topPResetIdsPtr, {1, {static_cast<ITensor::DimType64>(initWorkspaceSizes[4])}}));
+            IBuffer::wrap(topPResetIdsPtr, initWorkspaceSizes[4] / sizeof(*topPResetIdsPtr)));
     }
 
     auto const* batchSlotsDevicePtr = workspace->getDeviceBatchSlotsPtr();

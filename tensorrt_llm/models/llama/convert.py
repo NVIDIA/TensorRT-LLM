@@ -33,6 +33,10 @@ from transformers.pytorch_utils import Conv1D
 from ..._utils import pad_vocab_size, release_gc, str_dtype_to_torch
 from ...logger import logger
 from ...quantization import QuantAlgo
+from ...quantization.quantize import (qserve_pack_reorder_per_channel,
+                                      qserve_pack_reorder_per_group,
+                                      qserve_quantize_weight_per_channel,
+                                      qserve_quantize_weight_per_group)
 from ..convert_utils import (dup_kv_weight, generate_int8,
                              get_tllm_linear_weight, iterate_shard_files,
                              load_calib_dataset, load_state_dict,
@@ -1914,6 +1918,221 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Weights loaded. Total time: {t}')
 
+    return weights
+
+
+def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
+    logger.info(
+        'Loading weights from lmquant torch checkpoint for QServe W4A8 inference...'
+    )
+    weights = {}
+    tik = time.time()
+
+    per_group = config.quant_mode.has_per_group_scaling()
+    group_size = 128 if per_group else -1
+
+    num_hidden_layers = config.num_hidden_layers
+    vocab_size = config.vocab_size
+    dtype = config.dtype
+    mapping = config.mapping
+    torch_dtype = str_dtype_to_torch(dtype)
+    assert torch_dtype == torch.float16, "Currently QServe only supports float16"
+
+    # weight
+    fake_quant_weights = torch.load(lmquant_ckpt_path + '/model.pt',
+                                    map_location='cpu')
+    # scale.0, scale.1, zero
+    quant_params = torch.load(lmquant_ckpt_path + '/scale.pt',
+                              map_location='cpu')
+
+    def load(key):
+        if 'zero' in key:
+            v = quant_params[key]
+            # https://github.com/mit-han-lab/qserve/blob/64ee627dfd747510809998d3592439f05a71ba31/scripts/ckpt_converter/checkpoint_converter.py#L99
+            if v.min() < 0:
+                v = v + 8
+            return v
+        if 'scale' in key:
+            return quant_params[key]
+        return fake_quant_weights[key]
+
+    if per_group:
+        lmquant_suffix = [
+            'weight', 'weight.scale.0', 'weight.scale.1', 'weight.zero'
+        ]
+        qserve_suffix = ['weight', 's1_scales', 's2_scales', 's2_zeros']
+    else:
+        lmquant_suffix = ['weight', 'weight.scale.0', 'weight.zero']
+        qserve_suffix = ['weight', 's1_scales', 's1_szeros']
+
+    def tp_split_tensor(v: torch.Tensor, dim):
+        if v.shape[dim] % mapping.tp_size != 0:
+            logger.error(
+                f"Current weight shape is invalid for mapping.tp_size={mapping.tp_size}"
+            )
+            assert False, "Invalid TP size"
+        return v.split(v.shape[dim] // mapping.tp_size,
+                       dim=dim)[mapping.tp_rank].contiguous()
+
+    def tp_split_weight_and_params(v: List[torch.Tensor], column_linear: bool):
+        if per_group:
+            weight, s1_scales, s2_scales, s2_zeros = v
+            # weight (out_features, in_features)
+            # weight.scale.0 (out_features, 1, 1, 1)
+            # weight.scale.1 (out_features, 1, in_features/group_size, 1)
+            # weight.zero (out_features, 1, in_features/group_size, 1)
+            if column_linear:
+                weight = tp_split_tensor(weight, 0)
+                s1_scales = tp_split_tensor(s1_scales, 0)
+                s2_scales = tp_split_tensor(s2_scales, 0)
+                s2_zeros = tp_split_tensor(s2_zeros, 0)
+            else:
+                weight = tp_split_tensor(weight, 1)
+                s1_scales = s1_scales
+                s2_scales = tp_split_tensor(s2_scales, 2)
+                s2_zeros = tp_split_tensor(s2_zeros, 2)
+            return [weight, s1_scales, s2_scales, s2_zeros]
+        else:
+            weight, s1_scales, s1_zeros = v
+            # weight (out_features, in_features)
+            # weight.scale.0 (out_features, 1, 1, 1)
+            # weight.zero (out_features, 1, 1, 1)
+            if column_linear:
+                weight = tp_split_tensor(weight, 0)
+                s1_scales = tp_split_tensor(s1_scales, 0)
+                s1_zeros = tp_split_tensor(s1_zeros, 0)
+            else:
+                weight = tp_split_tensor(weight, 1)
+                s1_scales = s1_scales
+                s1_zeros = s1_zeros
+            return [weight, s1_scales, s1_zeros]
+
+    def process_weight_and_params(v: List[torch.Tensor], tllm_prex: str):
+        if per_group:
+            weight, s1_scales, s2_scales, s2_zeros = v
+            qweight = qserve_quantize_weight_per_group(weight, s1_scales,
+                                                       s2_scales, s2_zeros,
+                                                       group_size)
+            qweight, s1_scales, s2_scales, s2_zeros = qserve_pack_reorder_per_group(
+                qweight, s1_scales, s2_scales, s2_zeros, group_size)
+
+            return {
+                # Note: Linear modules in TRTLLM do not use the name 'qweight'
+                f'{tllm_prex}.{qserve_suffix[0]}': qweight,
+                f'{tllm_prex}.{qserve_suffix[1]}': s1_scales,
+                f'{tllm_prex}.{qserve_suffix[2]}': s2_scales,
+                f'{tllm_prex}.{qserve_suffix[3]}': s2_zeros,
+            }
+        else:
+            weight, s1_scales, s1_zeros = v
+            qweight = qserve_quantize_weight_per_channel(
+                weight, s1_scales, s1_zeros)
+            qweight, s1_scales, s1_szeros = qserve_pack_reorder_per_channel(
+                qweight, s1_scales, s1_zeros)
+
+            return {
+                # Note: Linear modules in TRTLLM use the name 'weight' instead of 'qweight'
+                f'{tllm_prex}.{qserve_suffix[0]}': qweight,
+                f'{tllm_prex}.{qserve_suffix[1]}': s1_scales,
+                f'{tllm_prex}.{qserve_suffix[2]}': s1_szeros,
+            }
+
+    # Load weights
+    # 1. vocab_embedding
+    v = load('model.embed_tokens.weight')
+    if mapping.is_first_pp_rank():
+        weights['transformer.vocab_embedding.weight'] = v.to(torch_dtype)
+
+    # 2. lm_head
+    v = load('lm_head.weight')
+    if mapping.is_last_pp_rank():
+        if vocab_size % mapping.tp_size != 0:
+            # padding
+            vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            v = torch.nn.functional.pad(v, (0, 0, 0, pad_width))
+        weights['lm_head.weight'] = tp_split_tensor(v, 0).to(torch_dtype)
+
+    # 3. ln_f
+    v = load('model.norm.weight')
+    if mapping.is_last_pp_rank():
+        weights['transformer.ln_f.weight'] = v.to(torch_dtype)
+
+    # 4. Weights inside each layer
+    layers_range = mapping.pp_layers(num_hidden_layers)
+    for layer_idx in layers_range:
+        prefix = f'model.layers.{layer_idx}'
+        logger.info(f'Processing weights in layer: {layer_idx}')
+        tllm_prex = f'transformer.layers.{layer_idx - layers_range[0]}'
+
+        # 4.1 attention.qkv
+        qkv_list = []
+        for comp in ["q", "k", "v"]:
+            v = [
+                load(f'{prefix}.self_attn.{comp}_proj.{suffix}')
+                for suffix in lmquant_suffix
+            ]
+            v = tp_split_weight_and_params(v, column_linear=True)
+            qkv_list.append(v)
+        # Concat qkv
+        q, k, v = qkv_list
+        qkv = [
+            torch.concat((q[i], k[i], v[i]), dim=0)
+            for i in range(len(lmquant_suffix))
+        ]
+        weights.update(
+            process_weight_and_params(qkv, f'{tllm_prex}.attention.qkv'))
+
+        # 4.2 attention.dense
+        v = [
+            load(f'{prefix}.self_attn.o_proj.{suffix}')
+            for suffix in lmquant_suffix
+        ]
+        v = tp_split_weight_and_params(v, column_linear=False)
+        weights.update(
+            process_weight_and_params(v, f'{tllm_prex}.attention.dense'))
+
+        # TODO: The naming here is tricky.
+        # The implementation of GatedMLP is act(fc(x)) * gate(x).
+        # However, the common convention is act(gate_proj(x)) * up_proj(x).
+
+        # 4.3 mlp.gate
+        v = [
+            load(f'{prefix}.mlp.up_proj.{suffix}') for suffix in lmquant_suffix
+        ]
+        v = tp_split_weight_and_params(v, column_linear=True)
+        weights.update(process_weight_and_params(v, f'{tllm_prex}.mlp.gate'))
+
+        # 4.4 mlp.fc
+        v = [
+            load(f'{prefix}.mlp.gate_proj.{suffix}')
+            for suffix in lmquant_suffix
+        ]
+        v = tp_split_weight_and_params(v, column_linear=True)
+        weights.update(process_weight_and_params(v, f'{tllm_prex}.mlp.fc'))
+
+        # 4.5 mlp.proj
+        v = [
+            load(f'{prefix}.mlp.down_proj.{suffix}')
+            for suffix in lmquant_suffix
+        ]
+        v = tp_split_weight_and_params(v, column_linear=False)
+        weights.update(process_weight_and_params(v, f'{tllm_prex}.mlp.proj'))
+
+        # 4.6 input_layernorm
+        v = load(f'{prefix}.input_layernorm.weight')
+        weights[f'{tllm_prex}.input_layernorm.weight'] = v.to(torch_dtype)
+
+        # 4.7 post_layernorm
+        v = load(f'{prefix}.post_attention_layernorm.weight')
+        weights[f'{tllm_prex}.post_layernorm.weight'] = v.to(torch_dtype)
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Weights loaded. Total time: {t}')
+
+    # TODO: All the RMSNorm weight, including ln_f, input_layernorm, post_layernorm, are actually all 1s
+    # Could implement a simplified module without weight
     return weights
 
 

@@ -13,6 +13,7 @@ from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -44,10 +45,15 @@ def parse_arguments():
         help=
         'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
     )
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument('--vocab_size', type=int, default=32000)
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_layer', type=int, default=32)
@@ -112,6 +118,10 @@ def parse_arguments():
         help="Set the α parameter (see https://arxiv.org/pdf/2211.10438.pdf)"
         " to Smoothquant the model, and output int8 weights."
         " A good first try is 0.5. Must be in [0, 1]")
+    parser.add_argument('--use_qserve',
+                        default=False,
+                        action="store_true",
+                        help='Use QServe W4A8 quantization.')
     parser.add_argument(
         '--per_channel',
         action="store_true",
@@ -171,7 +181,9 @@ def parse_arguments():
         help=
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
-        'The flag is built for GPTQ/AWQ quantization.')
+        'The flag is built for GPTQ/AWQ quantization.'
+        'If --use_qserve is enabled, this option also decides whether we use per-group or per-channel version of QServe'
+    )
 
     parser.add_argument('--load_by_shard',
                         action='store_true',
@@ -311,6 +323,9 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         # this will be overwritten if specified in the hf config.
         quant_config.clamp_val = [-1200.0, 1200.0]
 
+    elif args.use_qserve:
+        quant_config.quant_algo = QuantAlgo.W4A8_QSERVE_PER_GROUP if args.per_group else QuantAlgo.W4A8_QSERVE_PER_CHANNEL
+
     quant_config.use_meta_recipe = args.use_meta_fp8_rowwise_recipe
 
     if args.int8_kv_cache:
@@ -371,7 +386,7 @@ def from_cli_args(args):
     n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head
     config = {
         'architecture': "LlamaForCausalLM",
-        'dtype': args.dtype,
+        'dtype': infer_dtype(args.dtype),
         'logits_dtype': 'float32',
         'num_hidden_layers': args.n_layer,
         'num_attention_heads': args.n_head,
@@ -525,9 +540,10 @@ def main():
     else:  # all other paths from hf model
         assert args.model_dir is not None
         assert (
-            args.quant_ckpt_path is not None
-            and args.weight_only_precision in {'int4_gptq', 'int8_gptq'}
-        ) or args.quant_ckpt_path is None, "only gptq weights only needs this option"
+            args.quant_ckpt_path is not None and
+            (args.weight_only_precision in {'int4_gptq', 'int8_gptq'}
+             or args.use_qserve)
+        ) or args.quant_ckpt_path is None, "only gptq weights or qserve need this option"
         convert_and_save_hf(args)
 
     tok = time.time()

@@ -87,7 +87,7 @@ public:
 
     [[nodiscard]] bool constexpr updatesPositionIds() const
     {
-        return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens | kEagle);
+        return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens);
     }
 
     [[nodiscard]] bool constexpr requiresAttentionMask() const

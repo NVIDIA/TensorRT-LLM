@@ -1,4 +1,4 @@
-tensorrt_llm==0.15.0.dev2024110500
+tensorrt_llm==0.15.0.dev2024111200
 git+https://github.com/google-deepmind/recurrentgemma.git
 flax>=0.8.2
 jax~=0.4.23

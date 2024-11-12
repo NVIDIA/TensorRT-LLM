@@ -121,7 +121,7 @@ struct PrepareGenEagleNetInputsParams
     //! output buffer [numOutputTokens]
     //! Selected tokens ids.
     runtime::TokenIdType* outputIds{nullptr};
-    //! output buffer [numOutputTokens]
+    //! output buffer [batchSize]
     //! Position ids of the selected tokens.
     runtime::SizeType32* positionIds{nullptr};
     //! output buffer [batchSize]
@@ -270,8 +270,6 @@ struct PackEagleParams
     float const* inputRandomDataValidation{nullptr};
     //! [maxBatchSize, maxDecodingDraftTokens]
     runtime::TokenIdType const* inputNextDraftTokens{nullptr};
-    //! [maxBatchSize]
-    runtime::SizeType32 const* inputNextDraftLens{nullptr};
     //! [maxBatchSize, maxDecodingTokens, maxPathLen]
     runtime::SizeType32 const* inputNextDraftPaths{nullptr};
     //! [maxBatchSize]
@@ -315,7 +313,6 @@ struct PackEagleParams
         TLLM_CHECK(inputRandomDataSample);
         TLLM_CHECK(inputRandomDataValidation);
         TLLM_CHECK(inputNextDraftTokens);
-        TLLM_CHECK(inputNextDraftLens);
         TLLM_CHECK(inputNextDraftPaths);
         TLLM_CHECK(inputSpecDecodingGenerationLengths);
         TLLM_CHECK(inputSpecDecodingPositionOffsets);
@@ -327,9 +324,9 @@ struct PackEagleParams
         TLLM_CHECK(outputNextDraftTokens);
         TLLM_CHECK(outputNextDraftLens);
         TLLM_CHECK(outputNextDraftPaths);
-        TLLM_CHECK(outputSpecDecodingGenerationLengths);
-        TLLM_CHECK(outputSpecDecodingPositionOffsets);
-        TLLM_CHECK(outputSpecDecodingPackedMasks);
+        TLLM_CHECK((numGenerationRequests > 0 && outputSpecDecodingGenerationLengths) || numGenerationRequests == 0);
+        TLLM_CHECK((numGenerationRequests > 0 && outputSpecDecodingPositionOffsets) || numGenerationRequests == 0);
+        TLLM_CHECK((numGenerationRequests > 0 && outputSpecDecodingPackedMasks) || numGenerationRequests == 0);
 
         TLLM_CHECK(maxGenerationLength);
         TLLM_CHECK(cumSumGenerationLengths);
@@ -377,6 +374,8 @@ struct UnpackEagleDataParams
     //! [maxBatchSize]
     runtime::SizeType32* outputSequenceLengths{nullptr};
     //! [maxBatchSize, maxDecodingDraftTokens]
+    runtime::TokenIdType* outputUnpackedNextDraftTokens{nullptr};
+    //! [maxBatchSize, maxDecodingDraftTokens]
     runtime::TokenIdType* outputNextDraftTokens{nullptr};
     //! [maxBatchSize]
     runtime::SizeType32* outputNextDraftLengths{nullptr};
@@ -384,6 +383,8 @@ struct UnpackEagleDataParams
     runtime::SizeType32* outputNextDraftPaths{nullptr};
     //! [maxBatchSize]
     runtime::SizeType32* outputPrevDraftLengths{nullptr};
+    //! [maxBatchSize]
+    runtime::SizeType32* outputNextGenerationLength{nullptr};
     //! [maxBatchSize, maxDecodingTokens]
     runtime::SizeType32* outputPositionIds{nullptr};
 
@@ -428,10 +429,12 @@ struct UnpackEagleDataParams
         TLLM_CHECK(outputIds);
         TLLM_CHECK(outputNumNewTokens);
         TLLM_CHECK(outputSequenceLengths);
+        TLLM_CHECK(outputUnpackedNextDraftTokens);
         TLLM_CHECK(outputNextDraftTokens);
         TLLM_CHECK(outputNextDraftLengths);
         TLLM_CHECK(outputNextDraftPaths);
         TLLM_CHECK(outputPrevDraftLengths);
+        TLLM_CHECK(outputNextGenerationLength);
         TLLM_CHECK(outputPositionIds);
 
         TLLM_CHECK(outputRandDataSample);

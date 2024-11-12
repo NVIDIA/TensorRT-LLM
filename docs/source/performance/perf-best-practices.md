@@ -113,7 +113,7 @@ argument in `trtllm-build` is used to control it.
 
 When input padding is removed, the different tokens are packed together. It
 reduces both the amount of computations and memory consumption. For more details, see
-this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#padded-and-packed-tensors).
+this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#padded-and-packed-tensors).
 
 ### Paged KV Cache
 

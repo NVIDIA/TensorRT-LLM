@@ -17,32 +17,29 @@
 #ifndef CUDA_DRIVER_WRAPPER_H
 #define CUDA_DRIVER_WRAPPER_H
 
+#include "tensorrt_llm/common/assert.h"
 #include <cstdio>
 #include <cuda.h>
 #include <memory>
 #include <mutex>
 
-#define cuErrCheck(stat, wrap)                                                                                         \
-    {                                                                                                                  \
-        cuErrCheck_((stat), wrap.get(), __FILE__, __LINE__);                                                           \
-    }
-
-namespace tensorrt_llm
-{
-namespace common
+namespace tensorrt_llm::common
 {
 
 class CUDADriverWrapper
 {
-    // Use getInstance() instead.
-    CUDADriverWrapper();
-
 public:
     static std::shared_ptr<CUDADriverWrapper> getInstance();
 
     ~CUDADriverWrapper();
+    CUDADriverWrapper(CUDADriverWrapper const&) = delete;
+    CUDADriverWrapper operator=(CUDADriverWrapper const&) = delete;
+    CUDADriverWrapper(CUDADriverWrapper&&) = delete;
+    CUDADriverWrapper operator=(CUDADriverWrapper&&) = delete;
 
     CUresult cuGetErrorName(CUresult error, char const** pStr) const;
+
+    CUresult cuGetErrorMessage(CUresult error, char const** pStr) const;
 
     CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) const;
 
@@ -84,7 +81,10 @@ public:
 
 private:
     void* handle;
+    CUDADriverWrapper();
+
     CUresult (*_cuGetErrorName)(CUresult, char const**);
+    CUresult (*_cuGetErrorMessage)(CUresult, char const**);
     CUresult (*_cuFuncSetAttribute)(CUfunction, CUfunction_attribute, int);
     CUresult (*_cuLinkComplete)(CUlinkState, void**, size_t*);
     CUresult (*_cuModuleUnload)(CUmodule);
@@ -108,17 +108,31 @@ private:
     CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
 };
 
-inline void cuErrCheck_(CUresult stat, CUDADriverWrapper const* wrap, char const* file, int line)
+template <typename T>
+void checkDriver(
+    T result, CUDADriverWrapper const& wrap, char const* const func, char const* const file, int const line)
 {
-    if (stat != CUDA_SUCCESS)
+    if (result)
     {
-        char const* msg = nullptr;
-        wrap->cuGetErrorName(stat, &msg);
-        fprintf(stderr, "CUDA Error: %s %s %d\n", msg, file, line);
+        char const* errorName = nullptr;
+        char const* errorMsg = nullptr;
+        wrap.cuGetErrorName(result, &errorName);
+        wrap.cuGetErrorMessage(result, &errorMsg);
+        throw TllmException(
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %s: %s", func, errorName, errorMsg));
     }
 }
 
-} // namespace common
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::common
+
+/*
+ * Macros compliant with TensorRT coding conventions
+ */
+#define TLLM_CU_CHECK(stat)                                                                                            \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        tensorrt_llm::common::checkDriver(                                                                             \
+            (stat), *tensorrt_llm::common::CUDADriverWrapper::getInstance(), #stat, __FILE__, __LINE__);               \
+    } while (0)
 
 #endif // CUDA_DRIVER_WRAPPER_H

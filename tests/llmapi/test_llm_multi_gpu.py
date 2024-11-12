@@ -3,15 +3,13 @@ import os
 import subprocess  # nosec B404
 import sys
 import tempfile
-import time
 
 import pytest
 import torch
 from parameterized import parameterized
 
 from tensorrt_llm._utils import release_gc
-from tensorrt_llm.executor import (ExecutorBindingsProxy, GenerationRequest,
-                                   GenerationResult, RequestError)
+from tensorrt_llm.executor import ExecutorBindingsProxy, RequestError
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
@@ -30,7 +28,7 @@ try:
         llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
         llama_v2_13b_lora_test_harness, llm_check_output, llm_test_harness,
         mixtral_model_name, prompts, test_llm_get_stats,
-        test_llm_get_stats_async)
+        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep)
 except ImportError:
     from test_llm import (
         DummyError, DummyExecutorWorker3, _test_llm_generate_async,
@@ -39,7 +37,7 @@ except ImportError:
         llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
         llama_v2_13b_lora_test_harness, llm_check_output, llm_test_harness,
         mixtral_model_name, prompts, test_llm_get_stats,
-        test_llm_get_stats_async)
+        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep)
 # isort: on
 
 
@@ -158,6 +156,12 @@ def test_llm_generate_mixtral_for_tp2():
         print(output)
 
 
+@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_host_memory(480000)
+def test_llm_mixtral_8x7b_moe_ep_and_moe_tp():
+    test_mixtral_8x7b_moe_tp_and_moe_ep()
+
+
 def test_llm_pp2():
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -263,70 +267,6 @@ def test_executor_results_cleanup():
     assert num_remaining_results == 0
 
 
-class DummyExecutorProxy(ExecutorBindingsProxy):
-
-    def __init__(
-        self,
-        workers_kwargs,
-        model_world_size: int = 1,
-        mpi_session=None,
-    ) -> None:
-        super().__init__(workers_kwargs, model_world_size, mpi_session)
-
-    # This is copied from the ExecutorBindsProxy.submit method with minor modification
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        if not self.workers_started:
-            self.start()
-
-        self.request_queue.put(request)
-
-        req_id = self.rid_or_err_queue.get()
-        request.set_id(req_id)
-
-        result = GenerationResult(
-            request, background_error_handler=self._handle_background_error)
-
-        # Force the responses to be delayed, need a long time to ensure at least one response is generated, especially
-        # for the non-streaming mode when some internal lasy-setup considered
-        time.sleep(10)
-
-        print(f"number of pending responses: {len(self._pending_responses)}")
-        assert self._pending_responses
-
-        self._results[req_id] = result
-
-        assert self._cleanup_pending_responses()
-
-        return result
-
-
-def test_executor_pending_requests():
-    llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor,
-              tensor_parallel_size=2,
-              kv_cache_config=global_kv_cache_config)
-    # The dummy executor will delay the responses
-    sampling_params = SamplingParams(max_tokens=6)
-
-    def test_nonstreaming():
-        for output in llm.generate(prompts, sampling_params=sampling_params):
-            print(output)
-
-    def test_streaming():
-
-        async def task():
-            async for output in llm.generate_async(
-                    prompts[0], streaming=True,
-                    sampling_params=sampling_params):
-                print(output)
-
-        asyncio.run(task())
-
-    test_nonstreaming()
-
-    test_streaming()
-
-
 class DummyExecutorMeta(type):
 
     def __new__(cls, name, bases, dic, proxy_class):
@@ -349,10 +289,6 @@ class DummyExecutorMeta(type):
 
         new_cls.create = create
         return new_cls
-
-
-DummyExecutor = DummyExecutorMeta("DummyExecutor", (), {},
-                                  proxy_class=DummyExecutorProxy)
 
 
 class DummyExecutorProxy2(ExecutorBindingsProxy):
@@ -467,6 +403,4 @@ if __name__ == '__main__':
 
     test_llm_get_stats()
     test_llm_get_stats_async()
-    test_llm_generate_tp2()
-    test_llm_generate_tp2()
     test_llm_generate_tp2()
