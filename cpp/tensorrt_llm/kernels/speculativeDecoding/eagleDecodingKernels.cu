@@ -153,8 +153,7 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
     if (isValid)
     {
         // Sequence length of the base model (without draft len for gen requests and all prompt tokens for ctx request)
-        auto const oldSequenceLength
-            = baseNetSequenceLengths[bid] - (numInputTokens - static_cast<SizeType32>(!isContextRequest));
+        auto const oldSequenceLength = baseNetSequenceLengths[bid] - numInputTokens;
         for (SizeType32 ti = 0; ti < numDecodingTokens; ++ti)
         {
             TokenIdType token;
@@ -249,14 +248,6 @@ __global__ void buildLeafMask(
 {
     auto const bid = static_cast<SizeType32>(blockIdx.x);
     auto const level = static_cast<SizeType32>(blockIdx.y);
-    // Prefill mask setting all to leaves.
-    for (auto tid = static_cast<SizeType32>(threadIdx.x); tid < maxDecodingTokens;
-         tid += static_cast<SizeType32>(blockDim.x))
-    {
-        isLeafMask[bid * maxDecodingTokens + tid] = 1;
-    }
-
-    __syncthreads();
 
     // For all paths
     for (auto pathIdx = static_cast<SizeType32>(threadIdx.x); pathIdx < maxDecodingTokens;
@@ -268,8 +259,8 @@ __global__ void buildLeafMask(
         auto const tokenCurLevelOffset = flat_index3(bid, pathIdx, level, maxDecodingTokens, maxPathLen);
         // Get token idx in the flattened draft tokens for the of the current level
         auto const curNodeTokenIdx = paths[tokenCurLevelOffset];
-        // If token idx is not -1 (not terminated path)
-        // And the next level token is not -1 -- path is not terminating and token at current level has child.
+        // If token idx is not -1 (not terminated path) And the next
+        // level token is not -1 -- path is not terminating and token at current level has child.
         if (curNodeTokenIdx != -1 && paths[tokenNextLevelOffset] != -1)
         {
             // Mark mask to 0.
@@ -303,11 +294,6 @@ __global__ void getNonLeafEndingSubtree(SizeType32* selectedDraftIndices, SizeTy
         // Init selected paths for CAS.
         selectedPathsSmem[ii] = -1;
     }
-    // Fill mask.
-    for (auto ii = static_cast<SizeType32>(threadIdx.x); ii < maxDecodingTokens;
-         ii += static_cast<SizeType32>(blockDim.x))
-    {
-    }
 
     __syncthreads();
 
@@ -320,7 +306,7 @@ __global__ void getNonLeafEndingSubtree(SizeType32* selectedDraftIndices, SizeTy
         auto const tokenIdxLevel = paths[tokenCurLevelOffset];
         // Check if this path is not terminated yet.
         // And check if this node is not leaf.
-        if (tokenIdxLevel >= 0 && !isLeafMask[tokenIdxLevel])
+        if (tokenIdxLevel >= 0 && !isLeafMask[bid * maxDecodingTokens + tokenIdxLevel])
         {
             // Set this path as selected for this token.
             atomicCAS(&selectedPathsSmem[tokenIdxLevel], -1, pi);
@@ -372,7 +358,7 @@ __global__ void getNonLeafEndingSubtree(SizeType32* selectedDraftIndices, SizeTy
                 }
 
                 // If node is not leaf
-                if (!isLeafMask[ti])
+                if (!isLeafMask[bid * maxDecodingTokens + ti])
                 {
                     // Save its in-level index for output hidden state indices calculation.
                     nonLeavesInLevelOffsets[bid * maxDecodingTokens + ti] = nonLeavesInLevelCounter;
@@ -506,15 +492,13 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
     if (bid == 0)
     {
         // Save max draft length for the mask packing kernel.
-        maxGenerationLength[0] = maxDecodingTokens;
+        maxGenerationLength[0] = maxGenLength;
     }
 
     if (isValid)
     {
         // Fill spec decoding gen length.
-        // We do -1 here as attn expects golden token + draft tokens.
-        // We do not provide golden token, but just reduce the number of draft tokens.
-        specDecodingGenLengths[bid] = nextDraftLen - 1;
+        specDecodingGenLengths[bid] = nextDraftLen;
         // Simply copy context len.
         nextContextLengths[bid] = prevContextLengths[bid];
         auto const sequenceLen = eagleNet0SequenceLengths[bid];
@@ -523,6 +507,9 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
 
         // Fill cumulative sum for the mask packing kernel.
         cumSumGenerationLengths[bid] = genLengthCumSum;
+
+        // Pos id is Ctx EagleNet seqLen (prompt + all accepted).
+        positionIds[bid] = sequenceLen;
 
         SizeType32 lastTokenIdx{0};
         for (SizeType32 ti = 0; ti < nextDraftLen; ++ti)
@@ -535,8 +522,6 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
             // Get draft pos offset.
             auto const posOffset = selectedDraftPosIds[bid * maxDecodingDraftTokens + ti];
             specDecodingPositionOffsets[bid * maxDecodingTokens + ti] = posOffset;
-            // Pos id is Ctx EagleNet seqLen (prompt + all accepted) + pos offset
-            positionIds[outputIndexBase + ti] = sequenceLen + posOffset;
 
             // hiddenStatesIndex is constructed having hidden states layout in mind.
             // Hidden states are placed in memory as [maxPathLen - 1, batchSize, numOutputTokens] (this tensor is
@@ -589,6 +574,11 @@ inline __device__ __host__ T divUp(T m, T n)
     return (m + n - 1) / n;
 }
 
+__device__ SizeType32 positivePowerOfTwo(SizeType32 n)
+{
+    return 1 << n;
+}
+
 //! @brief Takes mask of size [maxGenerationLength] filled with 1s and 0s defined in the shared memory
 //! and packs it to bitmask of size [numPackedMasks] written to outputPtr.
 //! numPackedMasks = ceil(maxGenerationLength / 32);
@@ -609,20 +599,33 @@ __device__ __forceinline__ void maskToPackedMask(
             auto const shMaskIndexEnd = maxGenerationLength - maskId * 32;
             auto const validNumBits = shMaskIndexEnd - shMaskIndexStart;
 
-            SizeType32 packedMask = 0;
-            for (SizeType32 ii = 0; ii < validNumBits; ++ii)
+            auto const firstBit1 = (shMask[shMaskIndexStart] == '1') ? true : false;
+            SizeType32 mask31bits = 0;
+            if (validNumBits != 1)
             {
-                auto const index = (validNumBits - 1) - (ii - shMaskIndexStart - 1) - 1;
-                packedMask += (shMask[shMaskIndexStart + ii] == '1') ? 1 << index : 0;
+                for (auto i = shMaskIndexStart + 1; i < shMaskIndexEnd; i++)
+                {
+                    auto const index = (validNumBits - 1) - (i - shMaskIndexStart);
+                    mask31bits += (shMask[i] == '1') ? positivePowerOfTwo(index) : 0;
+                }
             }
-            outputPtr[maskId] = packedMask;
+            SizeType32 mask32bits;
+            if (validNumBits == 32)
+            {
+                mask32bits = firstBit1 ? mask31bits - positivePowerOfTwo(validNumBits - 1) : mask31bits;
+            }
+            else
+            {
+                mask32bits = firstBit1 ? mask31bits + positivePowerOfTwo(validNumBits - 1) : mask31bits;
+            }
+            outputPtr[maskId] = mask32bits;
         }
     }
 }
 
 __global__ void getPackedMask(SizeType32 const* __restrict__ cumGenerationLengths,
-    SizeType32 const* __restrict__ maxGenerationLengths, bool const* __restrict__ mask, SizeType32 maxDraftTokens,
-    SizeType32* __restrict__ packedMask)
+    SizeType32 const* __restrict__ maxGenerationLengths, bool const* __restrict__ mask,
+    SizeType32 maxDecodingDraftTokens, SizeType32* __restrict__ packedMask)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.y);
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.x);
@@ -635,7 +638,8 @@ __global__ void getPackedMask(SizeType32 const* __restrict__ cumGenerationLength
     }
 
     auto const maxGenerationLength = maxGenerationLengths[0];
-    auto const numPackedMasks = divUp(maxDraftTokens + 1, 32);
+    auto const maxDecodingTokens = maxDecodingDraftTokens + 1;
+    auto const numPackedMasks = divUp(maxDecodingTokens, 32);
 
     auto const outputStartId = ((batchIdx == 0) ? 0 : cumGenerationLengths[batchIdx - 1]);
     auto* outputPtr = packedMask + (outputStartId + tokenIdx) * numPackedMasks;
@@ -650,8 +654,7 @@ __global__ void getPackedMask(SizeType32 const* __restrict__ cumGenerationLength
     }
     else
     {
-        bool const* maskPtr
-            = mask + batchIdx * maxGenerationLength * maxGenerationLength + tokenIdx * maxGenerationLength;
+        bool const* maskPtr = mask + batchIdx * maxDecodingTokens * maxDecodingTokens + tokenIdx * maxDecodingTokens;
         extern __shared__ char shMask[];
         for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < maxGenerationLength;
              ti += static_cast<SizeType32>(blockDim.x))
@@ -1071,7 +1074,7 @@ __global__ void packEagleGenerationLengths(PackEagleParams params)
 
     if (threadIdx.x == 0 && isGenerationRequest)
     {
-        params.outputSpecDecodingGenerationLengths[genIdx] = params.inputNextDraftLens[batchSlot];
+        params.outputSpecDecodingGenerationLengths[genIdx] = params.inputSpecDecodingGenerationLengths[batchSlot];
     }
 }
 } // namespace
@@ -1101,7 +1104,8 @@ __global__ void packEagleTensors(PackEagleParams params)
         params.outputRandomDataValidation[batchIdx] = params.inputRandomDataValidation[batchSlot];
 
         // 0 for ctx request and actual draft len for gen requests.
-        params.outputNextDraftLens[batchIdx] = isGenerationRequest ? params.inputNextDraftLens[batchSlot] : 0;
+        params.outputNextDraftLens[batchIdx]
+            = isGenerationRequest ? params.inputSpecDecodingGenerationLengths[batchSlot] - 1 : 0;
     }
 
     // Copy draft paths
@@ -1186,6 +1190,8 @@ __global__ void unpackEagleData(UnpackEagleDataParams params)
         // Copy next draft tokens to the slots.
         params.outputNextDraftTokens[batchSlot * maxDecodingDraftTokens + ti]
             = params.inputNextDraftTokens[bid * maxDecodingDraftTokens + ti];
+        params.outputUnpackedNextDraftTokens[batchSlot * maxDecodingDraftTokens + ti]
+            = params.inputNextDraftTokens[bid * maxDecodingDraftTokens + ti];
     }
 
     for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < params.maxDecodingTokens * params.maxPathLength;
@@ -1204,6 +1210,8 @@ __global__ void unpackEagleData(UnpackEagleDataParams params)
         params.outputNumNewTokens[batchSlot] = acceptedLength;
         // One thread copies next draft len to slot
         params.outputNextDraftLengths[batchSlot] = params.inputNextDraftLens[bid];
+        // Set next gen len to slot.
+        params.outputNextGenerationLength[batchSlot] = params.inputNextDraftLens[bid] + 1;
         // Set prev draft lengths needed for kv cache rewind in variable draft len.
         params.outputPrevDraftLengths[batchSlot] = params.inputLastDraftLens[bid];
         // Set random data for draft sampling kernels.

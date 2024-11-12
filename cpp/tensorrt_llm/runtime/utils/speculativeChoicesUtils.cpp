@@ -21,6 +21,9 @@
 namespace tensorrt_llm::runtime::utils
 {
 
+static SizeType32 constexpr PREFIX_CHUNK_SIZE_BITS = 4;
+static SizeType32 constexpr PREFIX_MAX_VALUE = 16;
+
 using TensorPtr = ITensor::SharedPtr;
 using Choices = std::vector<std::vector<SizeType32>>;
 
@@ -158,7 +161,34 @@ uint64_t computePrefix(std::vector<SizeType32> const& vec, SizeType32 len)
     return prefix;
 }
 
-void initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecodingModule, Choices const& choices,
+void dumpChoices(Choices const& choices, std::vector<SizeType32> const& indices)
+{
+    std::stringstream ss;
+    ss << "Choices = [";
+    for (size_t ci = 0; ci < indices.size(); ++ci)
+    {
+        auto const idx = indices[ci];
+        auto const& choice = choices[idx];
+        ss << "[";
+        for (size_t vi = 0; vi < choice.size(); ++vi)
+        {
+            ss << choice[vi];
+            if (vi < choice.size() - 1)
+            {
+                ss << ", ";
+            }
+        }
+        ss << "]";
+        if (ci < indices.size() - 1)
+        {
+            ss << ", ";
+        }
+    }
+    ss << "]" << std::endl;
+    TLLM_LOG_DEBUG(ss.str().c_str());
+}
+
+SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecodingModule, Choices const& choices,
     std::vector<SizeType32>& topKs, TensorPtr generationInputLengths, TensorPtr positionOffsets, TensorPtr treeIds,
     TensorPtr paths, TensorPtr packedMask)
 {
@@ -204,6 +234,8 @@ void initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecoding
     {
         std::fill(treeIdsPtr, treeIdsPtr + treeIds->getSize(), -1);
     }
+
+    dumpChoices(choices, sortedIndices);
 
     // +1 for root
     std::vector<TreeNode> tree(choices.size() + 1);
@@ -310,33 +342,8 @@ void initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecoding
     }
 
     computePathsAndMask(speculativeDecodingModule, tree, packedMask, paths);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
 
-void dumpChoices(Choices const& choices, std::vector<SizeType32> const& indices)
-{
-    std::stringstream ss;
-    ss << "Choices = [";
-    for (size_t ci = 0; ci < indices.size(); ++ci)
-    {
-        auto const idx = indices[ci];
-        auto const& choice = choices[idx];
-        ss << "[";
-        for (size_t vi = 0; vi < choice.size(); ++vi)
-        {
-            ss << choice[vi];
-            if (vi < choice.size() - 1)
-            {
-                ss << ", ";
-            }
-        }
-        ss << "]";
-        if (ci < indices.size() - 1)
-        {
-            ss << ", ";
-        }
-    }
-    ss << "]" << std::endl;
-    TLLM_LOG_DEBUG(ss.str().c_str());
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return depth;
 }
 } // namespace tensorrt_llm::runtime::utils

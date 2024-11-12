@@ -118,7 +118,7 @@ class MedusaForCausalLm(PretrainedModel):
 
                 if kwargs['use_cache']:
                     if default_net().plugin_config.paged_kv_cache:
-                        lm_logits, hidden_states = hidden_states
+                        lm_logits, hidden_states, _ = hidden_states
                     else:
                         lm_logits, presents, hidden_states = hidden_states
 

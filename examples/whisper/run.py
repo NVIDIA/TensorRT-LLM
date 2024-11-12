@@ -96,7 +96,7 @@ def parse_arguments():
         help=
         """1. max: pad to the 30s, using the option if the model is trained with max padding e.g. openai official models,
            2. longest: pad to the longest sequence in the batch,
-           3. zero: no padding, only works with cpp session,
+           3. nopad: no padding, only works with cpp session,
         """,
     )
     return parser.parse_args()
@@ -167,7 +167,13 @@ class WhisperEncoding:
                            mel_input_lengths,
                            encoder_downsampling_factor=2):
         if isinstance(mel, list):
-            mel = torch.cat(mel, dim=0).type(str_dtype_to_torch("float16"))
+            longest_mel = max([f.shape[-1] for f in mel])
+            mel = [
+                torch.nn.functional.pad(f, (0, longest_mel - f.shape[-1]),
+                                        mode='constant') for f in mel
+            ]
+            mel = torch.cat(mel, dim=0).type(
+                str_dtype_to_torch("float16")).contiguous()
         bsz, seq_len = mel.shape[0], mel.shape[2]
         position_ids = torch.arange(
             math.ceil(seq_len / encoder_downsampling_factor),
@@ -177,8 +183,8 @@ class WhisperEncoding:
             # mel B,D,T -> B,T,D -> BxT, D
             mel = mel.transpose(1, 2)
             mel = remove_tensor_padding(mel, mel_input_lengths)
-            position_ids = remove_tensor_padding(position_ids,
-                                                 mel_input_lengths)
+            position_ids = remove_tensor_padding(
+                position_ids, mel_input_lengths // encoder_downsampling_factor)
         inputs = OrderedDict()
         inputs['input_features'] = mel
         inputs['input_lengths'] = mel_input_lengths
@@ -276,7 +282,6 @@ class WhisperDecoding:
             batch_size, decoder_max_input_length + max_new_tokens,
             encoder_max_input_length
         ]).int().cuda()
-
         # generation config
         sampling_config = SamplingConfig(end_id=eot_id,
                                          pad_id=eot_id,
@@ -326,7 +331,8 @@ class WhisperTRTLLM(object):
                  debug_mode=False,
                  assets_dir=None,
                  batch_size=64,
-                 use_py_session=False):
+                 use_py_session=False,
+                 num_beams=1):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -365,9 +371,10 @@ class WhisperTRTLLM(object):
                                  max_batch_size=batch_size,
                                  max_input_len=3000,
                                  max_output_len=96,
-                                 max_beam_width=1,
+                                 max_beam_width=num_beams,
                                  debug_mode=debug_mode,
-                                 kv_cache_free_gpu_memory_fraction=0.9)
+                                 kv_cache_free_gpu_memory_fraction=0.9,
+                                 cross_kv_cache_fraction=0.5)
             self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
         self.use_py_session = use_py_session
 
@@ -508,7 +515,7 @@ def decode_dataset(
 
         if padding_strategy == "longest":
             longest_duration = max(durations)
-        elif padding_strategy == "zero":
+        elif padding_strategy == "nopad":
             longest_duration = 0
         else:
             longest_duration = int(16000 * 30)
@@ -551,10 +558,8 @@ def decode_dataset(
 if __name__ == '__main__':
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
-    if args.padding_strategy == "zero":
-        assert not args.use_py_session, "zero padding strategy only works with cpp session"
     model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir,
-                          args.batch_size, args.use_py_session)
+                          args.batch_size, args.use_py_session, args.num_beams)
     normalizer = EnglishTextNormalizer()
     dataset = load_dataset(args.dataset,
                            args.dataset_name,

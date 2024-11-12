@@ -163,8 +163,10 @@ __launch_bounds__(TPB) __global__ void moeTopK(float const* inputs_after_softmax
 
             for (int prior_k = startk; prior_k < k_idx; ++prior_k)
             {
-                int const prior_winning_expert = indices[k * block_row + prior_k];
-
+                int prior_winning_expert = indices[k * block_row + prior_k];
+                // Adjust the selected index to correct for the expert parallel transformation
+                prior_winning_expert = prior_winning_expert >= num_experts ? prior_winning_expert - num_experts
+                                                                           : prior_winning_expert + start_expert;
                 if (prior_winning_expert == expert)
                 {
                     inp_kvp = thread_kvp;

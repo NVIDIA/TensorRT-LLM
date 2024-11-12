@@ -1,5 +1,7 @@
 import json
+import os
 import pickle
+import sys
 import tempfile
 from pathlib import Path
 
@@ -7,6 +9,10 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.mapping import Mapping
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 
 def test_quant_mode():
@@ -229,6 +235,8 @@ def test_gpt_json_config():
 
     check_properties(gpt_json_config, json_config, model_config)
 
+    assert gpt_json_config.runtime_defaults is None
+
     json_dict = {
         "builder_config": {
             "name": json_config["name"],
@@ -270,6 +278,31 @@ def test_gpt_json_config():
         world_config) == json_config["name"] + "_float32_tp1_rank3.engine"
     assert gpt_json_config.engine_filename(
         world_config, "llama") == "llama_float32_tp1_rank3.engine"
+
+    def parse_runtime_defaults(defaults_dict: dict | None = None):
+        config = _tb.GptJsonConfig.parse(
+            json.dumps({
+                "version": "some.version",
+                "build_config": {
+                    "plugin_config": json_dict["plugin_config"],
+                    "lora_config": {},
+                },
+                "pretrained_config": {
+                    **json_dict["builder_config"],
+                    "architecture": "LlamaForCausalLM",
+                    "mapping": Mapping().to_dict(),
+                    "dtype": "bfloat16",
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "quantization": {},
+                    "runtime_defaults": defaults_dict,
+                },
+            }))
+        return config.runtime_defaults
+
+    strict_keys = False  # GptJsonConfig is written in cpp, and there is currently no nice way to throw on extra keys
+    assert_runtime_defaults_are_parsed_correctly(parse_runtime_defaults,
+                                                 strict_keys=strict_keys)
 
 
 def test_llm_request():

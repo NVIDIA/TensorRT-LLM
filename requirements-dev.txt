@@ -7,6 +7,7 @@ parameterized
 pre-commit
 pybind11
 pybind11-stubgen
+pytest-asyncio
 pytest-cov
 pytest-forked
 pytest-xdist

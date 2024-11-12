@@ -4,7 +4,7 @@ set -ex
 
 # This script is used for reinstalling CUDA on CentOS 7 with the run file.
 # CUDA version is usually aligned with the latest NGC CUDA image tag.
-CUDA_VER="12.6.1_560.35.03"
+CUDA_VER="12.6.2_560.35.03"
 CUDA_VER_SHORT="${CUDA_VER%_*}"
 
 NVCC_VERSION_OUTPUT=$(nvcc --version)

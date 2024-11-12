@@ -133,10 +133,17 @@ class TestQuantizationFunctional(unittest.TestCase):
 
         torch.testing.assert_close(ref.int_repr(), outputs['output'])
 
-    @parameterized.expand([('float32', True), ('float16', True),
-                           ('float32', False), ('bfloat16', True)],
+    @parameterized.expand([
+        ('float32', False, False),
+        ('float32', True, True),
+        ('float32', True, False),
+        ('float16', True, True),
+        ('float16', True, False),
+        ('bfloat16', True, True),
+        ('bfloat16', True, False),
+    ],
                           name_func=unittest_name_func)
-    def test_quantize_per_token(self, dtype, use_plugin):
+    def test_quantize_per_token(self, dtype, use_plugin, sum_per_token):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -155,7 +162,12 @@ class TestQuantizationFunctional(unittest.TestCase):
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
 
-            output, scale = quantize_per_token(x)
+            if sum_per_token:
+                output, scale, sums = quantize_per_token(x, sum_per_token=True)
+                sums.mark_output('sums', trt.float32)
+            else:
+                output, scale = quantize_per_token(x)
+
             output.mark_output('output', trt.int8)
             scale.mark_output('scale', dtype)
 
@@ -166,6 +178,9 @@ class TestQuantizationFunctional(unittest.TestCase):
         outputs = run_session(session, inputs)
 
         ref, ref_scale = _utils.gt_quantize_per_token(x_data)
+        if sum_per_token:
+            ref_sum = x_data.float().sum(dim=-1, keepdim=True)
+
         scale_shape = list(x_data.shape)
         scale_shape[-1] = 1
         ref_scale = ref_scale.reshape(scale_shape)
@@ -176,6 +191,8 @@ class TestQuantizationFunctional(unittest.TestCase):
                                    outputs['scale'].float(),
                                    atol=1e-2,
                                    rtol=0)
+        if sum_per_token:
+            torch.testing.assert_close(ref_sum, outputs['sums'])
 
     def test_dequantize(self):
         dtype = 'int8'

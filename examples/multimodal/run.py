@@ -50,10 +50,19 @@ def parse_arguments():
     parser.add_argument('--check_accuracy',
                         action='store_true',
                         help='Check correctness of text output')
-    parser.add_argument('--video_path',
-                        type=str,
-                        default=None,
-                        help='Path to your local video file')
+    parser.add_argument(
+        '--video_path',
+        type=str,
+        default=None,
+        help=
+        'Path to your local video file, using \'llava-onevision-accuracy\' to check the Llava-OneVision model accuracy'
+    )
+    parser.add_argument(
+        '--video_num_frames',
+        type=int,
+        help=
+        "The number of frames sampled from the video in the Llava-OneVision model.",
+        default=None)
     parser.add_argument("--image_path",
                         type=str,
                         default=None,
@@ -136,6 +145,12 @@ def print_result(model, input_text, output_text, args):
                 elif "The key to life is" in input_text:
                     assert "to find your passion and pursue it with all your heart." in output_text[
                         0][0]
+            elif model.model_type == 'llava_onevision':
+                if args.video_path is None:
+                    assert 'singapore' in output_text[0][0].lower()
+                else:
+                    assert 'the video is funny because the child\'s actions are' in output_text[
+                        0][0].lower()
             else:
                 assert output_text[0][0].lower() == 'singapore'
 

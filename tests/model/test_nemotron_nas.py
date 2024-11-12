@@ -16,11 +16,13 @@ import itertools
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -50,12 +52,12 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime.generation import _Runtime
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.llm_data import llm_models_root
+
+from utils.llm_data import llm_datasets_root, llm_models_root
 from utils.util import get_project_root, unittest_name_func
 
 sys.path.append(
     os.path.join(os.path.dirname(__file__), '../..', 'examples/nemotron_nas'))
-from calibration_utils import create_trtllm_magpie_calibration_dataset
 
 from tensorrt_llm.runtime.kv_cache_manager import GenerationSequence
 from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
@@ -99,6 +101,33 @@ class TestParams:
 class RuntimeHandle:
     """Deleting `Runtime().runtime` will **definitively** deallocate the weights."""
     runtime: _Runtime
+
+
+QUANTIZED_DIR_PREFIX = "/tmp/nemotron/quantized"
+
+
+@cache
+def quantized(model_dir: str) -> str:
+    root = get_project_root(__file__)
+    quantize_path = str(root / "examples/quantization/quantize.py")
+
+    quantize_dir = f"{QUANTIZED_DIR_PREFIX}/{Path(model_dir).stem}"
+
+    quantize = [
+        sys.executable,
+        quantize_path,
+        f"--model_dir={model_dir}",
+        f"--output_dir={quantize_dir}",
+        "--dtype=bfloat16",
+        "--kv_cache_dtype=fp8",
+        "--qformat=fp8",
+        f"--calib_dataset={llm_datasets_root()}/cnn_dailymail",
+        "--calib_size=1",  # It's a test, so calibration won't really be useful. So keep it short.
+    ]
+    print(f"Running quantize: {quantize}")
+    subprocess.run(quantize, check=True)
+
+    return quantize_dir
 
 
 class TestNemotronNas(unittest.TestCase):
@@ -244,32 +273,15 @@ class TestNemotronNas(unittest.TestCase):
         runtime = RuntimeHandle(_Runtime(engine_buffer, mapping))
         return runtime, model.config
 
-    def _from_fp8_quantized_engine(
-            self,
-            *,
-            model_dir: str,
-            quantize_dir: str,
-            dataset: Optional[str] = "cnn_dailymail",
-            params: TestParams) -> Tuple[RuntimeHandle, PretrainedConfig]:
-        root = get_project_root(__file__)
-        quantize_path = str(root / "examples/quantization/quantize.py")
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if Path(QUANTIZED_DIR_PREFIX).is_dir():
+            shutil.rmtree(QUANTIZED_DIR_PREFIX)
 
-        with tempfile.TemporaryDirectory(
-                prefix="transformed_magpie") as dataset_dir:
-            create_trtllm_magpie_calibration_dataset(dataset_dir)
-            quantize = [
-                sys.executable,
-                quantize_path,
-                f"--model_dir={model_dir}",
-                f"--output_dir={quantize_dir}",
-                f"--calib_dataset={dataset_dir}",
-                "--dtype=bfloat16",
-                "--kv_cache_dtype=fp8",
-                "--qformat=fp8",
-                "--calib_size=512",
-            ]
-            print(f"Running quantize: {quantize}")
-            subprocess.run(quantize, check=True)
+    def _from_fp8_quantized_engine(
+            self, *, model_dir: str,
+            params: TestParams) -> Tuple[RuntimeHandle, PretrainedConfig]:
+        quantize_dir = quantized(model_dir)
 
         engine_path = f"{quantize_dir}/engine"
         build = [
@@ -397,6 +409,7 @@ class TestNemotronNas(unittest.TestCase):
         config: PretrainedConfig,
         params: TestParams,
         obtain_hf_model: Callable[[], transformers.AutoModelForCausalLM],
+        atol: int = 1e-1,
     ):
         batch_size = params.batch_size
         beam_width = params.beam_width
@@ -696,21 +709,15 @@ class TestNemotronNas(unittest.TestCase):
         ref_step0, ref_step1 = hf()
         np.testing.assert_allclose(ref_step0.cpu().numpy().flatten(),
                                    res_step0.cpu().numpy().flatten(),
-                                   atol=1e-1)
+                                   atol=atol)
         np.testing.assert_allclose(ref_step1.cpu().numpy().flatten(),
                                    res_step1.cpu().numpy().flatten(),
-                                   atol=1e-1)
+                                   atol=atol)
 
     @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
-    @pytest.mark.skipif(
-        os.environ.get("TEST_NEMOTRON_NAS_FP8_ALLCLOSE") is None,
-        reason="fp8 accuracy is low.")
     def test_allclose_to_hf_fp8(self, hf_model_dir: str, params: TestParams):
-        with tempfile.TemporaryDirectory("quantize_dir") as quantize_dir:
-            runtime, config = self._from_fp8_quantized_engine(
-                model_dir=hf_model_dir,
-                quantize_dir=quantize_dir,
-                params=params)
+        runtime, config = self._from_fp8_quantized_engine(
+            model_dir=hf_model_dir, params=params)
         self.allclose(
             runtime,
             config=config,
@@ -722,22 +729,22 @@ class TestNemotronNas(unittest.TestCase):
                 torch_dtype=tensorrt_llm._utils.str_dtype_to_torch(params.dtype
                                                                    ),
             ).cuda(),
+            atol=
+            0.9,  # We've observed that on a real checkpoint with the current code, fp8 MMLU is on par with BF16, and this is the observed threshold, though it may seem high.
         )
 
     @pytest.mark.skipif(
-        os.environ.get("NEMOTRON_NAS_CKPT") is None
-        or os.environ.get("NEMOTRON_NAS_OUTPUT_DIR") is None,
-        reason="You must define NEMOTRON_NAS_CKPT, NEMOTRON_NAS_OUTPUT_DIR",
+        os.environ.get("NEMOTRON_NAS_CKPT") is None,
+        reason="You must define NEMOTRON_NAS_CKPT",
     )
     def test_allclose_to_hf_fp8_accelerate(self):
         hf_model_dir = os.environ["NEMOTRON_NAS_CKPT"]
-        output_dir = os.environ["NEMOTRON_NAS_OUTPUT_DIR"]
         params = TestParams(enable_paged_kv_cache=True,
                             enable_remove_input_padding=True,
                             dtype="float16",
                             seq_len=2048)
         runtime, config = self._from_fp8_quantized_engine(
-            model_dir=hf_model_dir, quantize_dir=str(output_dir), params=params)
+            model_dir=hf_model_dir, params=params)
         self.allclose(
             runtime,
             config=config,

@@ -116,9 +116,10 @@ class GenerationRequest:
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
-        self.id = -1
+        self.id: Optional[int] = None
 
     def set_id(self, id):
+        assert self.id is None, f"Request ID is already set: {self.id}"
         self.id = id
         return self
 
@@ -420,8 +421,6 @@ class NoStatsAvailable(Exception):
 
 class GenerationExecutor(ABC):
 
-    PENDING_REQ_ID_TIMEOUT = 2  # second
-
     class ResponseTensors(NamedTuple):
         output_token_ids: List[List[int]]
         # context_logits is a tensor or a string denoting the path to the shared memory.
@@ -433,7 +432,7 @@ class GenerationExecutor(ABC):
 
     class Response(NamedTuple):
         """ The response from the cpp-executor to the Python main thread. """
-        request_id: int
+        client_id: int
         tensors: Optional["GenerationExecutor.ResponseTensors"]
         finish_reasons: Optional[List[tllm.FinishReason]]
         is_final: Optional[bool]
@@ -445,11 +444,6 @@ class GenerationExecutor(ABC):
         #    and stop the whole service.
         error: Optional[str | Exception]
 
-    @dataclass(slots=True)
-    class PendingResponse:
-        response: "GenerationExecutor.Response"
-        start_time: float  # this is used to track the latency before the response is dispatched.
-
     def __init__(self):
         self._stats = None
         self.stats_queue = None
@@ -459,12 +453,10 @@ class GenerationExecutor(ABC):
         # This is used to capture the exceptions from the threads.
         self._error_queue = Queue()
 
-        # mapping of pending request_id -> response
-        self._pending_responses: Dict[
-            int, List[GenerationExecutor.PendingResponse]] = {}
-
         # A flag to avoid calling shutdown() recursively. This happens when the background threads raise errors.
         self.doing_shutdown = False
+
+        self._last_client_id: int = 1
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -536,6 +528,11 @@ class GenerationExecutor(ABC):
 
         return futures
 
+    def _get_next_client_id(self):
+        # (self._last_client_id + 1) % UINT64_MAX
+        self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
+        return self._last_client_id
+
     def _handle_background_error(self, error: Optional[Exception | str] = None):
         """ Process the errors from the threads or processes.
         NOTE: This should be called in the main thread.
@@ -567,58 +564,6 @@ class GenerationExecutor(ABC):
             # We can catch some exceptions here.
             raise e
 
-    def _to_delay_response(self,
-                           response: "GenerationExecutor.Response") -> bool:
-        ''' the engine.enqueue_request may not be finished in another thread, so we need to postpone it. '''
-        req_id = response.request_id
-        if req_id not in self._results:
-            self._pending_responses.setdefault(req_id, []).append(
-                self.PendingResponse(response, time.perf_counter()))
-            if time.perf_counter() - self._pending_responses[req_id][
-                    0].start_time > self.PENDING_REQ_ID_TIMEOUT:
-                raise TimeoutError(
-                    f"Request ID {req_id} not found in the results queue.")
-            return True
-
-        return False
-
-    def _cleanup_pending_responses(self, nowait=False) -> bool:
-        ''' Process the pending responses that are not found in the results. '''
-
-        def cleanup():
-            done_req_ids = set()
-            for req_id, responses in self._pending_responses.items():
-                if req_id not in self._results:
-                    if time.perf_counter(
-                    ) - responses[0].start_time > self.PENDING_REQ_ID_TIMEOUT:
-                        raise TimeoutError(
-                            f"Request ID {req_id} not found in the results queue."
-                        )
-                else:
-                    is_done = False
-                    for response in responses:
-                        is_done = is_done or response.response.is_final
-                        self._results[req_id].queue.put(
-                            response.response)  # dispatch
-                    if is_done:
-                        done_req_ids.add(req_id)
-
-            for req_id in done_req_ids:
-                self._pending_responses.pop(req_id, None)
-
-            return not bool(self._pending_responses)
-
-        if nowait:
-            cleanup()
-        else:
-            # It is possible that some requests are still pending in the workers, we need to process them before shutdown
-            for _ in range(int(self.PENDING_REQ_ID_TIMEOUT / 0.1) + 1):
-                if cleanup(): break
-                time.sleep(0.1)
-                # It will raise TimeoutError if the pending responses are not processed in time.
-
-        return not bool(self._pending_responses)
-
     @abstractmethod
     def shutdown(self):
         pass
@@ -648,7 +593,7 @@ class GenerationExecutor(ABC):
             The `get_stats` cannot mix with `aget_stats` in the same Executor instance.
         '''
         assert self.stats_queue, "The stats queue is not created. It is likely that `get_stats` and `aget_stats` methods" \
-        " are mixed."
+            " are mixed."
         try:
             res = self.stats_queue.get(timeout=timeout)
         except Empty:
@@ -732,6 +677,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self.engine = None
         self.result_queue = None
         self.rank = mpi_rank()
+        # mapping: client_id -> GenerationResult
         self._results: Dict[int, GenerationResult] = {}
 
         if isinstance(engine, list):
@@ -797,14 +743,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self.stats_queue = self._stats
         self.stats_aqueue = None
 
-    def return_queue(self, req_id: int):
+    def return_queue(self, client_id: int):
         """ If a centralized result queue is registered (used for communication with the proxy)
             send the message there.
             Otherwise, push the result directly in the GenerationResult queue.
         """
         if self.result_queue is not None:
             return self.result_queue
-        return self._results[req_id].queue
+        return self._results[client_id].queue
 
     def start_awaiter_thread(self):
         if self.engine.can_enqueue_requests(
@@ -827,13 +773,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
         for response in self.engine.await_responses(timeout=datetime.timedelta(
                 milliseconds=100)):
             response = self._engine_response_callback(response)
+            if response is None:
+                continue
 
-            req_id = response.request_id
+            client_id = response.client_id
+            assert client_id is not None
             if response.has_error():
                 # This error will be dispatched to the user's generate_async for the corresponding request. It won't
                 # stop the whole service.
                 rsp = self.Response(
-                    req_id,
+                    client_id,
                     tensors=None,
                     # Note: error Response only has one finish reason.
                     # Since the error will be raised in the main thread, so the finish reason is not actually used.
@@ -852,21 +801,17 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 )
 
                 rsp = self.Response(
-                    req_id,
+                    client_id,
                     tensors,
                     finish_reasons=response.result.finish_reasons,
                     is_final=response.result.is_final,
                     sequence_index=response.result.sequence_index,
                     error=None)
 
-            if self._to_delay_response(rsp):
-                continue
-            self._cleanup_pending_responses(nowait=True)
-
-            queue = self.return_queue(req_id)
+            queue = self.return_queue(client_id)
 
             if self._has_background_error():
-                rsp = self._create_error_response(req_id)
+                rsp = self._create_error_response(client_id)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many event notifications, thus put without
             # wait here.
@@ -874,14 +819,15 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 global_tracer().log_instant("worker-rsp.put")
                 queue.put_nowait(rsp)
                 async_events.append(queue.event)
-                event_loop = queue.loop if event_loop is None else event_loop  # all the loops are identical
+                # all the loops are identical
+                event_loop = queue.loop if event_loop is None else event_loop
             else:
                 global_tracer().log_instant("worker-rsp.put")
                 queue.put(rsp)  # This could be IPC
 
             # Eliminate the finished GenerationRequest instances timely, which may take considerable memory.
             if rsp.is_final:
-                self._results.pop(req_id)
+                self._results.pop(client_id)
 
         if async_events:
             _SyncQueue.notify_events(event_loop, async_events)
@@ -891,10 +837,10 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
 
-    def _create_error_response(self, req_id) -> GenerationExecutor.Response:
+    def _create_error_response(self, client_id) -> GenerationExecutor.Response:
         bck_error = self._error_queue.get_nowait()
         assert isinstance(bck_error, Exception)
-        return GenerationExecutor.Response(req_id,
+        return GenerationExecutor.Response(client_id,
                                            tensors=None,
                                            finish_reasons=None,
                                            is_final=None,
@@ -941,6 +887,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             uids=[str(prompt_adapter_request.adapter_id)])
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
+        assert request.id is not None
         if self._lora_manager is not None and request.lora_request is not None:
             self._load_lora_adapter(request.lora_request)
             uid = str(request.lora_request.adapter_id)
@@ -964,8 +911,10 @@ class ExecutorBindingsWorker(GenerationExecutor):
         else:
             prompt_tuning_config = None
 
+        assert request.id is not None
         try:
             executor_request = tllm.Request(
+                client_id=request.id,
                 input_token_ids=prompt_token_ids,
                 max_tokens=request.sampling_params.max_tokens,
                 max_new_tokens=request.sampling_params.max_new_tokens,
@@ -999,13 +948,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 "Only rank 0 can submit requests.\n"
                 "To fix this, ensure that the llm.generate(...) method is "
                 "guarded with the `if __name__ == '__main__':` block.")
-        req_id = self._enqueue_request(request)
 
-        request.set_id(req_id)
+        client_id = request.id if request.id is not None else self._get_next_client_id(
+        )
+        if request.id is None:
+            request.set_id(client_id)
+        self._enqueue_request(request)
 
         result = GenerationResult(
             request, background_error_handler=self._handle_background_error)
-        self._results[req_id] = result
+        self._results[client_id] = result
 
         self._handle_background_error()
 
@@ -1092,6 +1044,7 @@ class ZeroMqQueue:
         self.host_port, self.authkey = (address[0], address[1]), address[2]
         self.is_server = is_server
         self.context = zmq.Context()
+        self.poller = None
         self.socket = None
 
     @property
@@ -1106,6 +1059,22 @@ class ZeroMqQueue:
         else:
             self.socket.connect(
                 f'tcp://{self.host_port[0]}:{self.host_port[1]}')
+        self.poller = zmq.Poller()
+        self.poller.register(self.socket, zmq.POLLIN)
+
+    def poll(self, timeout: int) -> bool:
+        """
+        Parameters:
+            timeout (int): Timeout in seconds
+        """
+        if self.socket is None:
+            self.setup()
+
+        events = dict(self.poller.poll(timeout=timeout * 1000))
+        if self.socket in events and events[self.socket] == zmq.POLLIN:
+            return True
+        else:
+            return False
 
     def put(self, obj: Any):
         if self.socket is None:
@@ -1113,7 +1082,7 @@ class ZeroMqQueue:
 
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self._store_tensors_in_shmm(obj.tensors)
-            obj = GenerationExecutor.Response(request_id=obj.request_id,
+            obj = GenerationExecutor.Response(client_id=obj.client_id,
                                               tensors=tensors,
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
@@ -1131,7 +1100,7 @@ class ZeroMqQueue:
 
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self._load_tensors_from_shmm(obj.tensors)
-            obj = GenerationExecutor.Response(request_id=obj.request_id,
+            obj = GenerationExecutor.Response(client_id=obj.client_id,
                                               tensors=tensors,
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
@@ -1268,7 +1237,7 @@ class FusedIpcQueue:
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self.queue._store_tensors_in_shmm(obj.tensors)
             return GenerationExecutor.Response(
-                request_id=obj.request_id,
+                client_id=obj.client_id,
                 tensors=tensors,
                 finish_reasons=obj.finish_reasons,
                 is_final=obj.is_final,
@@ -1280,7 +1249,7 @@ class FusedIpcQueue:
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self.queue._load_tensors_from_shmm(obj.tensors)
             return GenerationExecutor.Response(
-                request_id=obj.request_id,
+                client_id=obj.client_id,
                 tensors=tensors,
                 finish_reasons=obj.finish_reasons,
                 is_final=obj.is_final,
@@ -1314,6 +1283,7 @@ class FusedIpcQueue:
 
 
 class ExecutorBindingsProxy(GenerationExecutor):
+    READY_SIGNAL = b"READY"
 
     def __init__(self,
                  workers_kwargs,
@@ -1328,7 +1298,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.request_queue = IpcQueue(is_server=True)
         # Return request id back to dispatcher
-        self.rid_or_err_queue = IpcQueue(is_server=True)
+        self.request_error_queue = IpcQueue(is_server=True)
         self.result_queue = FusedIpcQueue(is_server=True, fuse_message=True)
         self.mp_stats_queue = FusedIpcQueue(is_server=True, fuse_message=True)
 
@@ -1345,27 +1315,23 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.workers_kwargs.update({
             "request_queue_addr":
             self.request_queue.address,
-            "rid_or_err_queue_addr":
-            self.rid_or_err_queue.address,
+            "request_error_queue_addr":
+            self.request_error_queue.address,
             "result_queue_addr":
             self.result_queue.address,
             "stats_queue_addr":
             self.mp_stats_queue.address,
         })
 
-        self.dispatch_result_thread = ManagedThread(
-            self.dispatch_result_task,
-            error_queue=self._error_queue,
-            name="proxy_dispatch_result_thread")
-        self.dispatch_stats_thread = ManagedThread(
-            self.dispatch_stats_task,
-            error_queue=self._error_queue,
-            name="proxy_dispatch_stats_thread")
+        self.dispatch_result_thread: Optional[ManagedThread] = None
+        self.dispatch_stats_thread: Optional[ManagedThread] = None
+
+        self._start_executor_workers()
 
     @staticmethod
     def workers_main(engine: Union[Path, Engine],
                      request_queue_addr: Tuple[str, int, bytes],
-                     rid_or_err_queue_addr: Tuple[str, int, bytes],
+                     request_error_queue_addr: Tuple[str, int, bytes],
                      result_queue_addr: Tuple[str, int, bytes],
                      stats_queue_addr: Tuple[str, int, bytes],
                      executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(
@@ -1382,7 +1348,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         if mpi_rank() == 0:
             request_queue = IpcQueue(request_queue_addr, is_server=False)
-            rid_or_err_queue = IpcQueue(rid_or_err_queue_addr, is_server=False)
+            request_error_queue = IpcQueue(request_error_queue_addr,
+                                           is_server=False)
             result_queue = FusedIpcQueue(result_queue_addr,
                                          is_server=False,
                                          fuse_message=True)
@@ -1414,29 +1381,28 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 if mpi_rank() == 0:
                     executor.set_result_queue(result_queue)
                     executor.set_stats_queue(mp_stats_queue)
+                    request_error_queue.put(ExecutorBindingsProxy.READY_SIGNAL)
                     while (req := request_queue.get()) is not None:
                         try:
                             result = executor.submit(req)
-                            rid_or_err_queue.put(result.request_id)
+                            request_error_queue.put(None)  # None means success
                         except RequestError as e:
-                            rid_or_err_queue.put(e)
+                            request_error_queue.put(e)
+
                     notify_proxy_threads_to_quit()
 
             except ExecutorBindingsWorker.WorkerExit as e:
-                raise e  # This will capture by the with-statement and exit normally.
+                # This will capture by the with-statement and exit normally.
+                raise e
 
             except Exception as e:  # other critical errors
                 if mpi_rank() == 0:
                     notify_proxy_threads_to_quit()
                 err = CppExecutorError(f"Failed during generation: {e}")
                 if mpi_rank() == 0:
-                    rid_or_err_queue.put(err)
+                    request_error_queue.put(err)
 
     def dispatch_result_task(self) -> bool:
-        # process the remaining pending req_ids before getting the next response, since the queue.get will block, we'd
-        # better to process the pending req_ids before queue.get.
-        self._cleanup_pending_responses(nowait=True)
-
         if (res := self.result_queue.get()) is None:
             return False  # shutdown the thread
 
@@ -1444,24 +1410,21 @@ class ExecutorBindingsProxy(GenerationExecutor):
         event_loop = None
 
         def process_res(res):
-            req_id = res.request_id
+            client_id = res.client_id
             nonlocal event_loop
             nonlocal async_events
 
-            if not self._to_delay_response(res):
-                queue = self._results[req_id].queue
-                if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(res)
-                    async_events.append(queue.event)
-                    event_loop = queue.loop if event_loop is None else event_loop  # all the loops are identical
-                else:
-                    queue.put(res)
-
-                if res.is_final:
-                    self._results.pop(req_id)
+            queue = self._results[client_id].queue
+            if isinstance(queue, _SyncQueue):
+                queue.put_nowait(res)
+                async_events.append(queue.event)
+                # all the loops are identical
+                event_loop = queue.loop if event_loop is None else event_loop
             else:
-                self._pending_responses.setdefault(req_id, []).append(
-                    self.PendingResponse(res, time.perf_counter()))
+                queue.put(res)
+
+            if res.is_final:
+                self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
 
@@ -1496,7 +1459,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         try:
             for s in stats:
-                if s is None: return False
+                if s is None:
+                    return False
                 self.stats_queue.put(s)
         except AsyncQueue.EventLoopShutdownError:
             # This happens in the last stats loop while the generate workflow is stopped.
@@ -1506,7 +1470,25 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         return True  # success
 
-    def start(self):
+    def _start_dispatch_threads(self):
+        if self.dispatch_result_thread is None:
+
+            self.dispatch_result_thread = ManagedThread(
+                self.dispatch_result_task,
+                error_queue=self._error_queue,
+                name="proxy_dispatch_result_thread")
+            self.dispatch_stats_thread = ManagedThread(
+                self.dispatch_stats_task,
+                error_queue=self._error_queue,
+                name="proxy_dispatch_stats_thread")
+
+            self.dispatch_result_thread.start()
+            self.create_stats_queue()
+            self.dispatch_stats_thread.start()
+
+        self._handle_background_error()
+
+    def _start_executor_workers(self):
 
         def mpi_done_callback(future: concurrent.futures.Future):
             # This is called when the MPI worker is done, so future.exception() will not block.
@@ -1525,11 +1507,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.workers_started = True
 
-        self.dispatch_result_thread.start()
-        self.create_stats_queue()
-        self.dispatch_stats_thread.start()
-
-        self._handle_background_error()
+        while not self.request_error_queue.poll(1):
+            self._handle_background_error()
+        ready_signal = self.request_error_queue.get()
+        assert ready_signal == ExecutorBindingsProxy.READY_SIGNAL
 
     def shutdown(self):
         if enable_llm_debug():
@@ -1547,7 +1528,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             self.doing_shutdown = True
 
         # step1: notify the workers to quit
-        self.request_queue.put(None)
+        if all(not f.done() for f in self.mpi_futures):
+            self.request_queue.put(None)
 
         for f in self.mpi_futures:
             try:
@@ -1557,21 +1539,20 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 pass
 
         # step2: notify the background threads to quit
-        if self.dispatch_result_thread.is_alive():
+        if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
+        ):
             self.dispatch_result_thread.stop()
             self.dispatch_result_thread.join()
-        if self.dispatch_stats_thread.is_alive():
+        if self.dispatch_stats_thread is not None and self.dispatch_stats_thread.is_alive(
+        ):
             self.dispatch_stats_thread.stop()
             self.dispatch_stats_thread.join()
 
         # step3: finish all remaining work
 
-        # It is possible that some requests are still pending in the workers, we need to process them before shutdown
-        self._cleanup_pending_responses(nowait=False)
-
         # close all the sockets
         self.request_queue.close()
-        self.rid_or_err_queue.close()
+        self.request_error_queue.close()
         self.result_queue.close()
         self.mp_stats_queue.close()
 
@@ -1585,19 +1566,19 @@ class ExecutorBindingsProxy(GenerationExecutor):
             Low-level API to the executor. Return a "future" GenerationResult which can be waited.
             Forwards the request to the workers through the request queue.
         """
-        if not self.workers_started:
-            self.start()
+        self._start_dispatch_threads()
 
-        self.request_queue.put(request)
-
-        rid_or_err = self.rid_or_err_queue.get()
-        if isinstance(rid_or_err, Exception):
-            raise rid_or_err
-        request.set_id(rid_or_err)
+        request.set_id(self._get_next_client_id())
 
         result = GenerationResult(
             request, background_error_handler=self._handle_background_error)
-        self._results[rid_or_err] = result
+        self._results[request.id] = result
+
+        self.request_queue.put(request)
+
+        error = self.request_error_queue.get()
+        if isinstance(error, Exception):
+            raise error
 
         self._handle_background_error()
 

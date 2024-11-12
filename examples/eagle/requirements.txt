@@ -1,4 +1,4 @@
-tensorrt_llm==0.15.0.dev2024110500
+tensorrt_llm==0.15.0.dev2024111200
 datasets~=2.14.5
 rouge_score~=0.1.2
 SentencePiece~=0.1.99

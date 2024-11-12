@@ -564,6 +564,10 @@ void EagleDecodingLayerTest<T>::allocateBuffers()
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingDraftTokens()}),
         nvinfer1::DataType::kINT32);
 
+    mOutputUnpackedNextDraftTokens = BufferManager::pinnedPool(
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingDraftTokens()}),
+        nvinfer1::DataType::kINT32);
+
     mAcceptedLengths = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
@@ -575,6 +579,12 @@ void EagleDecodingLayerTest<T>::allocateBuffers()
         ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mNextDraftLengths = BufferManager::pinnedPool(
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
+
+    mNextGenerationLengths
+        = mBufferManager->gpu(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
+
+    mNextGenerationLengthsHost = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mAcceptedLengthCumSum = BufferManager::pinnedPool(
@@ -673,10 +683,13 @@ void EagleDecodingLayerTest<T>::setup()
     trk::invokeFill(*mOutputIds, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mSeqLengths, SizeType32{0}, *mStream);
     trk::invokeFill(*mOutputNextDraftTokens, TokenIdType{-1}, *mStream);
+    trk::invokeFill(*mOutputUnpackedNextDraftTokens, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mAcceptedLengths, SizeType32{0}, *mStream);
     trk::invokeFill(*mNextPosIds, SizeType32{0}, *mStream);
     trk::invokeFill(*mPrevDraftLengths, SizeType32{0}, *mStream);
     trk::invokeFill(*mNextDraftLengths, SizeType32{0}, *mStream);
+    trk::invokeFill(*mNextGenerationLengths, SizeType32{0}, *mStream);
+    trk::invokeFill(*mNextGenerationLengthsHost, SizeType32{0}, *mStream);
     trk::invokeFill(*mAcceptedLengthCumSum, SizeType32{-1}, *mStream);
     trk::invokeFill(*mPathsOffsets, SizeType32{0}, *mStream);
     trk::invokeFill(*mPackedMasks, SizeType32{0}, *mStream);
@@ -799,15 +812,21 @@ std::shared_ptr<EagleOutputs> EagleDecodingLayerTest<T>::createOutputTensors()
 
     outputParams->sequenceLength = mSeqLengths;
 
+    outputParams->unpackedNextDraftTokens = mOutputUnpackedNextDraftTokens;
+
     outputParams->nextDraftTokens = mOutputNextDraftTokens;
 
     outputParams->numNewTokens = mAcceptedLengths;
 
-    outputParams->nextDraftPosIds = mNextPosIds; // TODO
+    outputParams->nextDraftPosIds = mNextPosIds;
 
     outputParams->prevDraftLengths = mPrevDraftLengths;
 
     outputParams->nextDraftLengths = mNextDraftLengths;
+
+    outputParams->generationLengths = mNextGenerationLengths;
+
+    outputParams->generationLengthsHost = mNextGenerationLengthsHost;
 
     outputParams->numNewTokensCumSum = mAcceptedLengthCumSum;
 
@@ -915,6 +934,7 @@ void EagleDecodingLayerTest<T>::checkLayerResult()
     // Check new draft tokens
     {
         auto const outputNextDraftTokens = BufferRange<TokenIdType>(*mOutputNextDraftTokens);
+        auto const outputUnpackedNextDraftTokens = BufferRange<TokenIdType>(*mOutputUnpackedNextDraftTokens);
         auto const nextDraftLens = mNetwork.getNextDraftLens();
         auto const prevDraftLens = mNetwork.getLastDraftLens();
         auto const nextDraftTokens = mNetwork.getNextDraftTokens();
@@ -928,8 +948,12 @@ void EagleDecodingLayerTest<T>::checkLayerResult()
             {
                 auto const idx = flat_index2(batchSlot, ti, mSamplingParams.getMaxDecodingDraftTokens());
                 EXPECT_EQ(outputNextDraftTokens[idx], nextDraftTokens[bi][ti]) << " bi: " << bi << " ti: " << ti;
+                EXPECT_EQ(outputUnpackedNextDraftTokens[idx], nextDraftTokens[bi][ti])
+                    << " bi: " << bi << " ti: " << ti;
             }
             // Check length of the draft tokens.
+            EXPECT_EQ(BufferRange<SizeType32>(*mNextGenerationLengthsHost)[batchSlot], nextDraftLen + 1)
+                << " bi: " << bi;
             EXPECT_EQ(BufferRange<SizeType32>(*mNextDraftLengths)[batchSlot], nextDraftLen) << " bi: " << bi;
             EXPECT_EQ(BufferRange<SizeType32>(*mPrevDraftLengths)[batchSlot], prevDraftLen) << " bi: " << bi;
 

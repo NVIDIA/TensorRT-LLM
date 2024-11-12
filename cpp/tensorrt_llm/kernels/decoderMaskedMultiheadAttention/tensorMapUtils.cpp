@@ -19,9 +19,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 namespace
@@ -75,10 +73,9 @@ CUtensorMap makeTensorMapForPagedKVCache(std::shared_ptr<CUDADriverWrapper> cons
         }
     }();
 
-    cuErrCheck(driver->cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims,
-                   globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                   CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-        driver);
+    TLLM_CU_CHECK(driver->cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims,
+        globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return tensorMap;
 }
 
@@ -107,10 +104,9 @@ CUtensorMap makeTensorMapForContiguousKVCache(std::shared_ptr<CUDADriverWrapper>
         }
     }();
 
-    cuErrCheck(driver->cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims,
-                   globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                   CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-        driver);
+    TLLM_CU_CHECK(driver->cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims,
+        globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return tensorMap;
 }
 
@@ -139,5 +135,4 @@ template CUtensorMap makeTensorMapForKVCache(
 template CUtensorMap makeTensorMapForKVCache(
     std::shared_ptr<CUDADriverWrapper> const&, XQAParams const&, KVLinearBuffer const&);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels

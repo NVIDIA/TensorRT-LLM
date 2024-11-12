@@ -13,6 +13,7 @@ from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import MLLaMAModel
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -44,10 +45,15 @@ def parse_arguments():
         help=
         'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
     )
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument('--vocab_size', type=int, default=32000)
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_layer', type=int, default=32)
@@ -325,7 +331,7 @@ def from_cli_args(args):
     n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head
     config = {
         'architecture': "MLLaMAModel",
-        'dtype': args.dtype,
+        'dtype': infer_dtype(args.dtype),
         'logits_dtype': 'float32',
         'num_hidden_layers': args.n_layer,
         'num_attention_heads': args.n_head,

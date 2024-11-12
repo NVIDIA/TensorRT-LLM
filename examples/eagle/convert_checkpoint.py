@@ -434,15 +434,20 @@ if __name__ == '__main__':
                     qkv_para=convert_args['llama_qkv_para'],
                     smoother=convert_args['llama_smoother'])
 
-                eagle_weights = load_eagle_hf(
-                    eagle_model_dir=args.eagle_model_dir,
-                    eagle_model=convert_args['hf_eagle_model'],
-                    base_model=convert_args['hf_base_model'],
-                    num_eagle_layers=args.num_eagle_layers,
-                    mapping=mapping,
-                    rank=rank,
-                    dtype=args.dtype)
-                weights.update(eagle_weights)
+                if mapping.is_last_pp_rank():
+                    eagle_mapping = Mapping(world_size=world_size,
+                                            rank=rank,
+                                            tp_size=world_size,
+                                            pp_size=1)
+                    eagle_weights = load_eagle_hf(
+                        eagle_model_dir=args.eagle_model_dir,
+                        eagle_model=convert_args['hf_eagle_model'],
+                        base_model=convert_args['hf_base_model'],
+                        num_eagle_layers=args.num_eagle_layers,
+                        mapping=eagle_mapping,
+                        rank=rank,
+                        dtype=args.dtype)
+                    weights.update(eagle_weights)
 
         safetensors.torch.save_file(
             weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))

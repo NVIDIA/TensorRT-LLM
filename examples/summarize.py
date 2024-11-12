@@ -38,6 +38,8 @@ from tensorrt_llm.tools.ppl import ppl
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
+from prompt_lookup.run_dtm_pld import run_dtm_pld
+
 
 def main(args):
     runtime_rank = tensorrt_llm.mpi_rank()
@@ -235,7 +237,8 @@ def main(args):
                      eval_task='summarize',
                      eval_ppl=False,
                      add_special_tokens=True,
-                     min_input_length=0):
+                     min_input_length=0,
+                     runner=None):
         batch_size = len(datapoint[dataset_input_key])
         batch_input_ids = _prepare_inputs(datapoint[dataset_input_key],
                                           eval_task=eval_task,
@@ -246,33 +249,48 @@ def main(args):
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
-        with torch.no_grad():
-            outputs = runner.generate(
-                batch_input_ids,
-                max_new_tokens=output_len,
-                max_attention_window_size=max_attention_window_size,
-                sink_token_length=sink_token_length,
-                end_id=end_id,
-                pad_id=pad_id,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                stop_words_list=stop_words_list,
-                bad_words_list=bad_words_list,
-                num_beams=num_beams,
-                num_return_sequences=num_return_sequences,
-                length_penalty=length_penalty,
-                early_stopping=early_stopping,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
-                lora_uids=args.lora_task_uids,
-                lookahead_config=args.lookahead_config,
-                output_sequence_lengths=True,
-                return_dict=True,
-                random_seed=random_seed,
-                medusa_choices=args.medusa_choices)
-            torch.cuda.synchronize()
+        if args.prompt_lookup_config is not None:
+            # Speculative decoding of Prompt-Lookup-Decoding (PLD)
+            outputs = run_dtm_pld(batch_input_ids,
+                                  args,
+                                  runtime_rank,
+                                  end_id,
+                                  pad_id,
+                                  stop_words_list,
+                                  bad_words_list,
+                                  tokenizer.vocab_size,
+                                  target_runner=runner)
+            if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
+                outputs, runner = list(outputs)[0]
+        else:  # Normal run
+            with torch.no_grad():
+                outputs = runner.generate(
+                    batch_input_ids,
+                    max_new_tokens=output_len,
+                    max_attention_window_size=max_attention_window_size,
+                    sink_token_length=sink_token_length,
+                    end_id=end_id,
+                    pad_id=pad_id,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    stop_words_list=stop_words_list,
+                    bad_words_list=bad_words_list,
+                    num_beams=num_beams,
+                    num_return_sequences=num_return_sequences,
+                    length_penalty=length_penalty,
+                    early_stopping=early_stopping,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    lora_uids=args.lora_task_uids,
+                    lookahead_config=args.lookahead_config,
+                    output_sequence_lengths=True,
+                    return_dict=True,
+                    random_seed=random_seed,
+                    medusa_choices=args.medusa_choices,
+                    eagle_choices=args.eagle_choices)
+                torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
         if runtime_rank == 0:
@@ -448,6 +466,10 @@ def main(args):
             raise ValueError(
                 "Returning all the generated tokens at each step is not supported in summarize.py"
             )
+
+        logger.info(
+            f"Using {'Python' if args.use_py_session else 'C++'} session")
+
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
         runner_kwargs = dict(engine_dir=args.engine_dir,
                              rank=runtime_rank,
@@ -458,14 +480,30 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
+        if args.eagle_choices is not None:
+            args.eagle_choices = ast.literal_eval(args.eagle_choices)
+            assert args.num_beams == 1, "Eagle should use num_beams == 1"
+            runner_kwargs.update(eagle_choices=args.eagle_choices)
         if args.lookahead_config is not None:
             args.lookahead_config = ast.literal_eval(args.lookahead_config)
             assert len(
                 args.lookahead_config
             ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
             runner_kwargs.update(lookahead_config=args.lookahead_config)
+        if args.prompt_lookup_config is not None:
+            assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
+            assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
+            assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
+            prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
+                args.prompt_lookup_config)
+            args.max_output_len = output_len  # Specialization for PLD
+            runner_kwargs.update(is_orchestrator_mode=True,
+                                 device_ids=target_device_list)
+
         if not args.use_py_session:
             runner_kwargs.update(
+                lora_dir=args.lora_dir,
+                lora_ckpt_source=args.lora_ckpt_source,
                 max_batch_size=max_batch_size,
                 max_input_len=test_token_num,
                 max_output_len=output_len,
@@ -481,6 +519,10 @@ def main(args):
                 cuda_graph_mode=args.cuda_graph_mode)
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+        if args.prompt_lookup_config is not None:
+            # Specialization for PLD since many call of `generate()` is needed
+            runner_kwargs.update(max_input_len=test_token_num +
+                                 prompt_lookup_num_tokens + output_len)
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
@@ -490,7 +532,8 @@ def main(args):
                                   eval_task=args.eval_task,
                                   eval_ppl=args.eval_ppl,
                                   add_special_tokens=args.add_special_tokens,
-                                  min_input_length=args.min_input_length)
+                                  min_input_length=args.min_input_length,
+                                  runner=runner)
         if runtime_rank == 0 and args.eval_task != "eval_context_ppl":
             logger.info(
                 "---------------------------------------------------------")
@@ -518,7 +561,8 @@ def main(args):
                 eval_task=args.eval_task,
                 eval_ppl=args.eval_ppl,
                 add_special_tokens=args.add_special_tokens,
-                min_input_length=args.min_input_length)
+                min_input_length=args.min_input_length,
+                runner=runner)
             profiler.stop('tensorrt_llm')
 
             empty_batch = runtime_rank == 0 and len(output_tensorrt_llm) == 0

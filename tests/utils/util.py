@@ -232,7 +232,11 @@ def create_session(builder,
     return session
 
 
-def run_session(session: Session, inputs, outputs={}, override_shapes={}):
+def run_session(session: Session,
+                inputs,
+                outputs={},
+                override_shapes={},
+                output_override_shapes={}):
     """
     The current session object needs to pass in both inputs and outputs bindings.
     For test convenience, create a function that infers output shapes automatically,
@@ -243,6 +247,8 @@ def run_session(session: Session, inputs, outputs={}, override_shapes={}):
            This function will prioritize to use the tensor in this dictionary.
         2. `override_shapes` can be used to force some input tensors' shape to be different than the passed tensor.
            Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
+        2. `output_override_shapes` can be used to force some output tensors' shape to be different than the passed tensor.
+           Required for dynamic shape tensors since their shape will contain -1.
     """
 
     # Prepare output tensors.
@@ -252,6 +258,10 @@ def run_session(session: Session, inputs, outputs={}, override_shapes={}):
             if name not in override_shapes else override_shapes[name])
         for name, tensor in inputs.items()
     ])
+
+    for tensor in output_info:
+        if tensor.name in output_override_shapes:
+            tensor.shape = output_override_shapes[tensor.name]
 
     outputs = {
         t.name:

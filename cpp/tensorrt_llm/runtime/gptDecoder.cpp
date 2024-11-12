@@ -329,6 +329,30 @@ void prepareLookaheadInputs(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void prepareEagleInput(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto inputParams = std::dynamic_pointer_cast<tl::EagleInputs>(baseInputs);
+
+    auto& eagleInputs = inputs.eagleInputs;
+
+    TLLM_CHECK_WITH_INFO(eagleInputs.has_value(), "EagleInputs are not set");
+
+    inputParams->nextDraftTokens = eagleInputs->nextDraftTokens;
+    inputParams->nextDraftLens = eagleInputs->nextDraftLens;
+    inputParams->nextDraftPaths = eagleInputs->nextDraftPaths;
+    inputParams->lastDraftTokens = eagleInputs->lastDraftTokens;
+    inputParams->lastDraftLens = eagleInputs->lastDraftLens;
+    inputParams->lastDraftPaths = eagleInputs->lastDraftPaths;
+    inputParams->acceptedTokens = eagleInputs->acceptedTokens;
+    inputParams->acceptedLens = eagleInputs->acceptedLens;
+    inputParams->acceptedPathIds = eagleInputs->acceptedPathIds;
+    inputParams->seqSlots = eagleInputs->seqSlots;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 template <typename T>
 std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
@@ -445,6 +469,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         prepareExternalDraftTokensInputs(input, maxBatchSize, forwardParams);
     }
 
+    if (decodingMode.isEagle())
+    {
+        prepareEagleInput(input, forwardParams);
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 
     return forwardParams;
@@ -554,7 +583,22 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         auto const& eagleBuffers = output.eagleBuffers;
         TLLM_CHECK_WITH_INFO(eagleBuffers.has_value(), "eagleBuffers is not set");
 
-        TLLM_THROW("Not implemented");
+        outputParams->temperatures = eagleBuffers->temperatures;
+        outputParams->unpackedNextDraftTokens = eagleBuffers->draftTokens;
+        outputParams->nextDraftPaths = eagleBuffers->draftPaths;
+        outputParams->generationLengths = eagleBuffers->specDecodingGenerationLengths;
+        outputParams->generationLengthsHost = eagleBuffers->specDecodingGenerationLengthsHost;
+        outputParams->nextDraftPosIds = eagleBuffers->specDecodingPositionOffsets;
+        outputParams->packedMasks = eagleBuffers->specDecodingPackedMasks;
+        outputParams->randomDataSample = eagleBuffers->randomDataSample;
+        outputParams->randomDataValidation = eagleBuffers->randomDataValidation;
+
+        outputParams->eagleNetCtxRequestTypesHost = eagleBuffers->eagleNetCtxRequestTypesHost;
+        outputParams->eagleNetCtxContextLengthsHost = eagleBuffers->eagleNetCtxContextLengthsHost;
+        outputParams->eagleNetCtxPastKeyValueLengthsHost = eagleBuffers->eagleNetCtxPastKeyValueLengthsHost;
+        outputParams->eagleNetGenRequestTypesHost = eagleBuffers->eagleNetGenRequestTypesHost;
+        outputParams->eagleNetGenContextLengthsHost = eagleBuffers->eagleNetGenContextLengthsHost;
+        outputParams->eagleNetGenPastKeyValueLengthsHost = eagleBuffers->eagleNetGenPastKeyValueLengthsHost;
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

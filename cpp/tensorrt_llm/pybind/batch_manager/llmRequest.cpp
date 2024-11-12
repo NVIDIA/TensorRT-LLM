@@ -78,6 +78,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto draftLogits = from_torch(mDraftLogits);
     auto encoderInputFeatures = from_torch(mEncoderInputFeatures);
     auto crossAttentionMask = from_torch(mCrossAttentionMask);
+    auto skipCrossAttnBlocks = from_torch(mSkipCrossAttnBlocks);
 
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
@@ -86,5 +87,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mReturnGenerationLogits, mDraftTokens, draftLogits, mExcludeInputFromOutput,
         callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched, mEncoderTokens, mReturnEncoderOutput,
         mClientId, mPriority, encoderInputFeatures, mEncoderOutputLength, crossAttentionMask,
-        tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, mInputTokenExtraIds, mNumReturnSequences);
+        tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, mInputTokenExtraIds, mNumReturnSequences,
+        std::nullopt, skipCrossAttnBlocks);
 }

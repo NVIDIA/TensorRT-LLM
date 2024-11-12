@@ -10,6 +10,7 @@ import tensorrt_llm
 from tensorrt_llm.llmapi import QuantConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import GPTJConfig, GPTJForCausalLM
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -24,10 +25,15 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument('--vocab_size', type=int, default=50400)
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_layer', type=int, default=28)
@@ -130,7 +136,7 @@ def main():
 
     if args.model_dir is None:
         config = GPTJConfig(architecture='GPTJForCausalLM',
-                            dtype=args.dtype,
+                            dtype=infer_dtype(args.dtype),
                             num_hidden_layers=args.n_layer,
                             num_attention_heads=args.n_head,
                             hidden_size=args.n_embd,

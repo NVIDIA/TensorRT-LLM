@@ -2,42 +2,34 @@
 
 # Installing on Linux
 
-1. Retrieve and launch the docker container (optional).
-
-    You can pre-install the environment using the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit) to avoid manual environment configuration.
+1. Install TensorRT-LLM on Ubuntu 22.04.
 
     ```bash
-    # Obtain and start the basic docker image environment (optional).
-    docker run --rm --ipc=host --runtime=nvidia --gpus all --entrypoint /bin/bash -it nvidia/cuda:12.5.1-devel-ubuntu22.04
-    ```
-    Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
+    sudo apt-get -y install libopenmpi-dev && pip3 install tensorrt_llm
 
-2. Install TensorRT-LLM.
-
-    ```bash
-    # Install dependencies, TensorRT-LLM requires Python 3.10
-    apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev git git-lfs
-
-    # Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.
-    # If you want to install the stable version (corresponding to the release branch), please
-    # remove the `--pre` option.
-    pip3 install tensorrt_llm --upgrade --pre
-
-    # Check installation
     python3 -c "import tensorrt_llm"
     ```
 
-    Please note that TensorRT-LLM depends on TensorRT. In earlier versions that include TensorRT 8,
-    overwriting an upgraded to a new version may require explicitly running `pip uninstall tensorrt`
-    to uninstall the old version.
+2. Sanity check the installation.
 
-3. Install the requirements for running the example.
+    ```python3
+    from tensorrt_llm import LLM, SamplingParams
 
-    ```bash
-    git clone https://github.com/NVIDIA/TensorRT-LLM.git
-    cd TensorRT-LLM
-    pip install -r examples/bloom/requirements.txt
-    git lfs install
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    # Print the outputs.
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
     ```
-
-Beyond the local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this [Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM](https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/) blog.

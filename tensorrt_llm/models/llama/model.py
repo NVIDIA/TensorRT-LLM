@@ -34,7 +34,7 @@ from .config import LLaMAConfig
 from .convert import (load_hf_llama, load_weights_from_gptq,
                       load_weights_from_hf_by_shard, load_weights_from_hf_model,
                       load_weights_from_hf_safetensors,
-                      load_weights_from_meta_ckpt)
+                      load_weights_from_lmquant, load_weights_from_meta_ckpt)
 
 
 class LLaMADecoderLayer(Module):
@@ -42,6 +42,7 @@ class LLaMADecoderLayer(Module):
     def __init__(self, config: LLaMAConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        layer_idx += config.layer_idx_offset
         self.config = config
         self.mapping = config.mapping
 
@@ -207,6 +208,7 @@ class LLaMADecoderLayer(Module):
                     hidden_states = self.mlp(
                         hidden_states, lora_layer_params=lora_layer_params)
                     hidden_states = residual + hidden_states
+
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -233,12 +235,14 @@ class LLaMAModel(Module):
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
                                    tp_size=config.mapping.tp_size,
-                                   gather_output=False)
+                                   gather_output=True)
 
         if self.mapping.is_last_pp_rank():
-            self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
-                                eps=config.norm_epsilon,
-                                dtype=config.dtype)
+            self.ln_f = None
+            if config.use_last_layernorm:
+                self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                                    eps=config.norm_epsilon,
+                                    dtype=config.dtype)
 
     def forward(self,
                 input_ids,
@@ -289,7 +293,8 @@ class LLaMAModel(Module):
             hidden_states, presents = hidden_states
 
         if self.mapping.is_last_pp_rank():
-            hidden_states = self.ln_f(hidden_states)
+            if self.ln_f:
+                hidden_states = self.ln_f(hidden_states)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
@@ -340,9 +345,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             if "vila" in hf_model_or_dir or "llava" in hf_model_or_dir:
                 hf_model_or_dir = load_hf_llama(hf_model_or_dir,
                                                 load_model_on_cpu)
-            elif not (load_by_shard or
-                      (has_safetensors(hf_model_or_dir)
-                       and not quant_config.quant_mode.has_any_quant())):
+            elif not load_by_shard and not has_safetensors(
+                    hf_model_or_dir
+            ) and not quant_config.quant_mode.has_any_quant():
                 hf_model_or_dir = load_hf_llama(hf_model_or_dir,
                                                 load_model_on_cpu)
 
@@ -405,7 +410,14 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                     hf_model_dir) and not config.quant_mode.has_any_quant():
                 weights = load_weights_from_hf_safetensors(hf_model_dir, config)
             elif quant_ckpt_path is not None:
-                weights = load_weights_from_gptq(quant_ckpt_path, config)
+                if quant_config.quant_mode.is_int4_weight_only():
+                    weights = load_weights_from_gptq(quant_ckpt_path, config)
+                elif quant_config.quant_mode.is_qserve_w4a8():
+                    weights = load_weights_from_lmquant(quant_ckpt_path, config)
+                else:
+                    raise ValueError(
+                        "quant_ckpt_path should be specified only for GPTQ or QServe"
+                    )
             else:
                 hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
                 weights = load_weights_from_hf_model(hf_model, config)

@@ -4,8 +4,9 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-09.html#rel-24-09
-TORCH_VERSION="2.4.1"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-10.html#rel-24-10
+# PyTorch v2.5.1 has a fix for https://github.com/pytorch/pytorch/issues/138324.
+TORCH_VERSION="2.5.1"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {

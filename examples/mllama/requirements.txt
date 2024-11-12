@@ -1,4 +1,1 @@
 transformers>=4.45.2
-# TensorRT 10.5 has a known issue.
-# Downgrade tensorrt package version to 10.4.0
-tensorrt~=10.4.0

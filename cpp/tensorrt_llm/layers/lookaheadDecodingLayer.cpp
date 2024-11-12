@@ -163,7 +163,13 @@ void LookaheadDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth
                 "runtime w(%d) n(%d) g(%d) exceeds maxTokensPerStep(%d)", w, n, g,
                 mDecoderDomain.getMaxDecodingTokens());
             PRINT_VALUES(mCpuAlgo->mPrompts[bi]);
-            mCpuAlgo->mAlgos[gbi].setup(mCpuAlgo->mPrompts[bi], w, n, g);
+            auto seed = DefaultDecodingParams::getSeed();
+            if (setupParams->randomSeed)
+            {
+                auto& seeds = setupParams->randomSeed.value();
+                seed = seeds.size() == 1 ? seeds[0] : seeds[bi];
+            }
+            mCpuAlgo->mAlgos[gbi].setup(mCpuAlgo->mPrompts[bi], w, n, g, seed);
         }
 
         for (runtime::SizeType32 bi = 0; bi < batchSize; bi++)

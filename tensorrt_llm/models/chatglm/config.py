@@ -14,10 +14,8 @@
 # limitations under the License.
 from typing import Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 GLM_VERSIONS = ['glm4', 'chatglm3', 'chatglm2', 'chatglm', 'glm']
@@ -152,14 +150,7 @@ class ChatGLMConfig(PretrainedConfig):
         elif chatglm_version == 'chatglm3' or chatglm_version == 'glm4':
             rotary_base *= hf_config.rope_ratio
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(
             architecture=hf_config.architectures[0],

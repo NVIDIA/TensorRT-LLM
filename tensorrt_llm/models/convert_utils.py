@@ -6,7 +6,32 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from datasets import load_dataset
 
+from .._utils import torch_dtype_to_str
+from ..logger import logger
 from ..quantization import QuantAlgo
+
+
+def infer_dtype(dtype: str,
+                source_dtype: Optional[Union[str, torch.dtype]] = None) -> str:
+    if dtype == 'auto':
+        if source_dtype is None:
+            dtype = 'float16'
+        elif isinstance(source_dtype, str):
+            dtype = source_dtype
+        elif isinstance(source_dtype, torch.dtype):
+            dtype = torch_dtype_to_str(source_dtype)
+        if dtype == 'float32':
+            dtype = 'float16'
+        logger.info(f"Specified dtype 'auto'; inferred dtype {dtype!r}.")
+        return dtype
+    elif dtype in ('float16', 'fp16'):
+        return 'float16'
+    elif dtype in ('bfloat16', 'bf16'):
+        return 'bfloat16'
+    elif dtype in ('float32', 'fp32'):
+        return 'float32'
+    else:
+        raise ValueError(f"Unexpected dtype value {dtype}.")
 
 
 def split(v, tp_size, idx, dim=0):

@@ -56,7 +56,7 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int32_t spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0);
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -414,6 +414,7 @@ protected:
     // This is implementation details which we want to save when serializing, but not expose as
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
+    bool mSkipAttn = false;
 
     struct Deleter
     {
@@ -469,6 +470,7 @@ protected:
         ss << "mDeviceId: " << mDeviceId << std::endl;
         ss << "mUseKVCache: " << std::boolalpha << mUseKVCache << std::endl;
         ss << "mForceMultiBlockWarned: " << mForceMultiBlockWarned << std::endl;
+        ss << "mSkipAttn: " << std::boolalpha << mSkipAttn << std::endl;
 
         return ss.str();
     }

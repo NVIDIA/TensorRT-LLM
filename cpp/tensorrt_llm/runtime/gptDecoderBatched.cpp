@@ -797,9 +797,14 @@ void GptDecoderBatched::newRequestEagle(
 
     std::vector<SizeType32> topKs;
     TensorPtr draftPathsSlice = ITensor::slice(mJointDecodingOutput->eagleBuffers->draftPaths, batchIdx, 1);
-    utils::initTensorsFromChoices(modelConfig.getSpeculativeDecodingModule(),
+    TensorPtr draftPathsHost = manager.pinnedPool(draftPathsSlice->getShape(), nvinfer1::DataType::kINT32);
+    auto const depth = utils::initTensorsFromChoices(modelConfig.getSpeculativeDecodingModule(),
         eagleChoicesOpt.value_or(eagleModule->getDefaultEagleChoices()), topKs, nullptr, nullptr, nullptr,
-        draftPathsSlice, nullptr);
+        draftPathsHost, nullptr);
+    TLLM_CHECK_WITH_INFO(depth == modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(),
+        "EAGLE-1 requires Eagle-tree depth being equal to the the number of build-time EAGLE layers.");
+
+    manager.copy(*draftPathsHost, *draftPathsSlice);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

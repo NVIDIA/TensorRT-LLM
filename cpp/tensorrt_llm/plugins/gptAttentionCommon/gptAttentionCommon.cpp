@@ -413,7 +413,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
     bool has_full_attention_mask, bool use_cache, bool is_spec_decoding_enabled,
     bool spec_decoding_is_generation_length_variable, int32_t spec_decoding_max_generation_length, bool is_mla_enabled,
-    int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim)
+    int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn)
     : mLayerIdx(layer_idx)
     , mNumHeads(num_heads)
     , mVisionStart(vision_start)
@@ -464,6 +464,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mIsMLAEnabled(is_mla_enabled)
     , mMLAParams({q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim})
     , mDriver(CUDADriverWrapper::getInstance())
+    , mSkipAttn(skip_attn)
 {
     // Pre-check whether FMHA is supported in order to save memory allocation.
     if (mEnableContextFMHA)
@@ -596,6 +597,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mIsMLAEnabled);
     read(d, mMLAParams);
     read(d, mNbMultiBlockSemaphores);
+    read(d, mSkipAttn);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
@@ -2112,7 +2114,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mHasFullAttentionMask) + sizeof(mUseKVCache)
         + sizeof(mUnfuseQkvGemm) + sizeof(mIsSpecDecodingEnabled) + sizeof(mSpecDecodingIsGenerationLengthVariable)
         + sizeof(mSpecDecodingMaxGenerationLength) + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled)
-        + sizeof(mMLAParams) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
+        + sizeof(mMLAParams) + sizeof(mSkipAttn) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
         + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
 }
 
@@ -2168,6 +2170,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mIsMLAEnabled);
     write(d, mMLAParams);
     write(d, mNbMultiBlockSemaphores);
+    write(d, mSkipAttn);
 
     // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
     uint32_t decoderXQARunnerResourceSerializedSize = DecoderXQARunner::getResourceGlobal()->getSerializationSize();
@@ -2270,7 +2273,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("qk_nope_head_dim", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("qk_rope_head_dim", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("v_head_dim", nullptr, PluginFieldType::kINT32, 0));
-
+    mPluginAttributes.emplace_back(PluginField("skip_attn", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

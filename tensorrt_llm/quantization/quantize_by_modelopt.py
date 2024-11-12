@@ -32,7 +32,7 @@ from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from .._utils import release_gc
+from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
 from ..mapping import Mapping
 from .mode import QuantAlgo
@@ -119,8 +119,11 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "Gemma2": "gemma2",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
+    "NemotronForCausalLM": "nemotron",
+    "GPTBigCodeForCausalLM": "gpt_bigcode",
     "ArcticForCausalLM": "llama",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
@@ -182,25 +185,37 @@ def _get_vila_model(model_dir):
     return model.llm
 
 
-def get_model(ckpt_path, dtype="fp16", device="cuda"):
-    logger.info(f"Initializing model from {ckpt_path}")
-    if dtype == "bf16" or dtype == "bfloat16":
-        dtype = torch.bfloat16
-    elif dtype == "fp16" or dtype == "float16":
-        dtype = torch.float16
-    elif dtype == "fp32" or dtype == "float32":
-        dtype = torch.float32
-    else:
-        raise NotImplementedError(f"Unknown dtype {dtype}")
-
-    # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+def get_hf_config(ckpt_path):
     if "mpt" in ckpt_path:
         # MPT-7B cannot get initialized from AutoConfig
         from transformers import MptConfig
-        hf_config = MptConfig.from_pretrained(ckpt_path)
+        return MptConfig.from_pretrained(ckpt_path)
     else:
-        hf_config = AutoConfig.from_pretrained(ckpt_path,
-                                               trust_remote_code=True)
+        return AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
+
+
+def _get_llava_qwen_model(model_dir, dtype, device):
+    if "hf" in model_dir:
+        from transformers import LlavaOnevisionForConditionalGeneration
+        model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype=dtype, device_map=device)
+        model = model.language_model
+    else:
+        from llava.model.builder import load_pretrained_model
+        _, model, _, _ = load_pretrained_model(model_dir,
+                                               None,
+                                               'llava_qwen',
+                                               torch_dtype=dtype,
+                                               device_map=device)
+    return model
+
+
+def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
+    logger.info(f"Initializing model from {ckpt_path}")
+    # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+    hf_config = get_hf_config(ckpt_path)
+    torch_dtype = str_dtype_to_torch(dtype)
+
     model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
@@ -210,11 +225,13 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         model_cls = MptForCausalLM
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
+    elif "llava-onevision-qwen2" in ckpt_path:
+        model = _get_llava_qwen_model(ckpt_path, dtype, device)
     elif hf_config.model_type == "glm":
         from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
                                                       device_map="cuda",
-                                                      torch_dtype=dtype,
+                                                      torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
     else:
         model = model_cls.from_pretrained(
@@ -227,7 +244,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
-    if dtype != model_dtype:
+    if torch_dtype != model_dtype:
         logger.info(
             f"[TensorRT-LLM][WARNING] The manually set model data type is {dtype}, "
             f"but the data type of the HuggingFace model is {model_dtype}.")
@@ -514,6 +531,8 @@ def quantize_and_export(*,
 
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
 
+    from tensorrt_llm.models.convert_utils import infer_dtype
+
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
 
@@ -524,6 +543,9 @@ def quantize_and_export(*,
     if not auto_quantize_bits:
         assert (len(qformat.split(",")) == 1
                 ), "Quantization supports only one quantization format."
+
+    hf_config = get_hf_config(model_dir)
+    dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
     model = get_model(model_dir, dtype, device=device)
     model_type = get_model_type(model)
@@ -574,18 +596,11 @@ def quantize_and_export(*,
                         "alpha_step": 1
                     }
 
-            # Always turn on FP8 kv cache to save memory footprint.
-            # For int8_sq, we do not quantize kv cache to preserve accuracy.
-            # We turn off FP8 kv cache for unified_hf checkpoint
-            enable_quant_kv_cache = "int8_sq" not in qformat
-            print(
-                f'{"Enable" if enable_quant_kv_cache else "Disable"} KV cache quantization'
-            )
-            quant_cfg["quant_cfg"]["*output_quantizer"] = {
-                "num_bits": 8 if qformat == "int8_sq" else (4, 3),
-                "axis": None,
-                "enable": enable_quant_kv_cache,
-            }
+            if kv_cache_dtype is not None:
+                if kv_cache_dtype == "fp8":
+                    for value in KV_CACHE_CFG.values():
+                        value.update({"num_bits": (4, 3)})  # type: ignore
+                quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
 
             # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
             if model_type == "gemma" and "int8_sq" in qformat:
@@ -686,6 +701,12 @@ def quantize_and_export(*,
                 tensorrt_llm_config = json.load(f)
             qwen_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
+            try:
+                from transformers import LlavaOnevisionConfig
+                if isinstance(qwen_config, LlavaOnevisionConfig):
+                    qwen_config = qwen_config.text_config
+            except:
+                pass
             tensorrt_llm_config["qwen_type"] = qwen_config.model_type
             if qwen_config.model_type == "qwen2":
                 tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
@@ -832,13 +853,22 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
     random.seed(seed)
     np.random.seed(seed)
 
-    # dtype is used for non-quantized layers
-    supported_dtype = ["float16", "bfloat16"]
-    assert (dtype in supported_dtype
-            ), f"{dtype} not supported. Supported dtypes are {supported_dtype}"
-    torch_dtype = getattr(torch, dtype)
-
     model_cfg = load_config(nemo_ckpt_path)
+
+    # dtype is used for non-quantized layers
+    supported_dtype = ["auto", "float16", "bfloat16"]
+    assert dtype in supported_dtype, f"{dtype} not supported. Supported dtypes are {supported_dtype}"
+
+    if dtype == 'auto':
+        dtype = model_cfg.get('precision', None)
+        if dtype is None:
+            dtype = 'float16'
+        elif 'bf16' in dtype or 'bfloat16' in dtype:
+            dtype = 'bfloat16'
+        else:
+            dtype = 'float16'
+        logger.info(f"Specified dtype 'auto'; inferred dtype {dtype!r}.")
+    torch_dtype = getattr(torch, dtype)
 
     with open_dict(model_cfg):
         model_cfg.activations_checkpoint_method = None

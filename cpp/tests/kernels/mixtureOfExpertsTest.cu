@@ -1487,6 +1487,36 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelelismTest(
         this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
         this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;                         \
         this->ParallelismType##Test(2, 4096, 8);                                                                       \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
+    {                                                                                                                  \
+        this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwoRenorm)                                             \
+    {                                                                                                                  \
+        this->mNormMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;                         \
+        this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwoSwiglu)                                             \
+    {                                                                                                                  \
+        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+        this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
+    }                                                                                                                  \
+                                                                                                                       \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##ManyExperts)                                                     \
+    {                                                                                                                  \
+        this->ParallelismType##Test(1, this->MINIMUM_ALIGNMENT, 512);                                                  \
+        this->ParallelismType##Test(2, this->MINIMUM_ALIGNMENT, 512);                                                  \
+        this->ParallelismType##Test(3, this->MINIMUM_ALIGNMENT, 512);                                                  \
     }
 
 PARALLEL_TEST_SUITE(ExpertParallel)

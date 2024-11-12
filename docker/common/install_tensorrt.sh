@@ -2,20 +2,21 @@
 
 set -ex
 
-TRT_VER="10.5.0.18"
+TRT_VER="10.6.0.26"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-09.html#rel-24-09
-CUDA_VER="12.6" # 12.6.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-10.html#rel-24-10
+CUDA_VER="12.6" # 12.6.2
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
 CUDA_DRIVER_VERSION="560.35.03-1"
-CUDNN_VER="9.4.0.58-1"
+CUDNN_VER="9.5.0.50-1"
 NCCL_VER="2.22.3-1+cuda12.6"
+# Use cuBLAS 12.6.1.4 instead of 12.6.3.3 to avoid accuracy issues
 CUBLAS_VER="12.6.1.4-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
-# https://docs.nvidia.com/cuda/archive/12.6.1/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.6.68-1"
-CUDA_RUNTIME="12.6.68-1"
+# https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
+NVRTC_VER="12.6.77-1"
+CUDA_RUNTIME="12.6.77-1"
 
 for i in "$@"; do
     case $i in
@@ -99,7 +100,7 @@ install_tensorrt() {
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
         if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
         if [ "$ARCH" = "aarch64" ];then OS1="Ubuntu24_04" && OS2="Ubuntu-24.04" && OS="ubuntu-24.04"; else OS1="Linux" && OS2="Linux" && OS="linux";fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.5.0/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
+        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.6.0/tars/TensorRT-${TRT_VER}.${OS2}.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/

@@ -15,9 +15,7 @@
 
 from typing import Optional
 
-import torch
-
-from ..._utils import pad_vocab_size, torch_dtype_to_str
+from ..._utils import pad_vocab_size
 from ...functional import Tensor, non_gated_version, recv, send
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                        GatedMLP, MoeConfig, PositionEmbeddingType, RmsNorm,
@@ -225,26 +223,12 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
         pretrained_config = PretrainedConfig.from_dict(config)
         pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
 
-        if dtype == 'auto':
-            dtype = getattr(config, 'torch_dtype', None)
-        if dtype is None:
-            dtype = 'float16'
-        if isinstance(dtype, torch.dtype):
-            dtype = torch_dtype_to_str(dtype)
-        if dtype == 'float32':  # should remove "float32"
-            dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
-
         deepseek = cls.from_config(pretrained_config)
         weights = convert_deepseek(
             hf_model,
             config,
-            mapping,
-            dtype=dtype,
+            mapping=pretrained_config.mapping,
+            dtype=pretrained_config.dtype,
             use_parallel_embedding=config.get('use_parallel_embedding', False),
             sharding_dim=config.get('embedding_sharding_dim', 0),
             share_embedding_table=config.get('share_embedding_table', False))

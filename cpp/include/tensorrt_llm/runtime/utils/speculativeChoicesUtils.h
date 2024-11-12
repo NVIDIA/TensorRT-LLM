@@ -23,10 +23,6 @@
 
 namespace tensorrt_llm::runtime::utils
 {
-
-static SizeType32 constexpr PREFIX_CHUNK_SIZE_BITS = 4;
-static SizeType32 constexpr PREFIX_MAX_VALUE = 16;
-
 struct TreeNode
 {
     SizeType32 nodeId;
@@ -36,11 +32,9 @@ struct TreeNode
     std::vector<SizeType32> childLinearIndices;
 };
 
-void initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecodingModule,
+SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecodingModule,
     std::vector<std::vector<SizeType32>> const& choices, std::vector<SizeType32>& topKs,
     ITensor::SharedPtr generationInputLengths, ITensor::SharedPtr positionOffsets, ITensor::SharedPtr treeIds,
     ITensor::SharedPtr paths, ITensor::SharedPtr packedMask);
-
-void dumpChoices(std::vector<std::vector<SizeType32>> const& choices, std::vector<SizeType32> const& indices);
 
 } // namespace tensorrt_llm::runtime::utils

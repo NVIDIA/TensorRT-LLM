@@ -51,10 +51,15 @@ def parse_arguments():
         help=
         'N-way expert parallelism size for MoE, default is 1, which will do tp-only for MoE'
     )
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",

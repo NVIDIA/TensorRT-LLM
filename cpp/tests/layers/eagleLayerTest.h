@@ -234,10 +234,13 @@ private:
     TensorPtr mOutputIds;
     TensorPtr mSeqLengths;
     TensorPtr mOutputNextDraftTokens;
+    TensorPtr mOutputUnpackedNextDraftTokens;
     TensorPtr mAcceptedLengths;
     TensorPtr mNextPosIds;
     TensorPtr mPrevDraftLengths;
     TensorPtr mNextDraftLengths;
+    TensorPtr mNextGenerationLengths;
+    TensorPtr mNextGenerationLengthsHost;
     TensorPtr mAcceptedLengthCumSum;
     TensorPtr mPathsOffsets;
     TensorPtr mPackedMasks;

@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import tensorrt as trt
 
 from .._ipc_utils import IpcMemory, can_access_peer
+from ..bindings.internal.runtime import lamport_initialize_all
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -156,6 +157,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _gemm_swiglu_plugin: Optional[str] = field(default=None, init=False)
     _fp8_rowwise_gemm_plugin: Optional[str] = field(default=None, init=False)
     _smooth_quant_gemm_plugin: Optional[str] = field(default=None, init=False)
+    _qserve_gemm_plugin: Optional[str] = field(default=None, init=False)
     _identity_plugin: Optional[str] = field(default=None, init=False)
     _layernorm_quantization_plugin: Optional[str] = field(default=None,
                                                           init=False)
@@ -274,6 +276,12 @@ class PluginConfig(metaclass=PluginConfigMeta):
         self.quantize_tensor_plugin = True
         return self
 
+    def set_qserve_plugins(self, dtype: str = "auto"):
+        self.qserve_gemm_plugin = dtype
+        self.rmsnorm_quantization_plugin = dtype
+        self.quantize_per_token_plugin = True
+        return self
+
     def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
         self.fp8_rowwise_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
@@ -378,6 +386,7 @@ class CustomAllReduceHelper:
               Then, each instance of allreduce will reference that tensor automatically.
     """
     POINTERS_PER_RANK = 7
+    POINTERS_OF_COUNTER = 2
 
     def __init__(self) -> None:
         self.workspace: Optional[Tensor] = None
@@ -386,7 +395,7 @@ class CustomAllReduceHelper:
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
         from ..functional import Tensor
-        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 2
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + self.POINTERS_OF_COUNTER
 
         dim_range = None
         if num_profiles is not None:
@@ -427,6 +436,15 @@ class CustomAllReduceHelper:
                                       is_p2p_supported)
         lamport_buffers_2 = IpcMemory(mapping, size * mapping.tp_size,
                                       is_p2p_supported)
+        rank = mapping.rank
+        tp_rank = mapping.tp_rank
+        if rank == tp_rank and is_p2p_supported:
+            lamport_initialize_all(
+                lamport_buffers_0.local_ptr,
+                lamport_buffers_1.local_ptr,
+                lamport_buffers_2.local_ptr,
+                size * mapping.tp_size,
+            )
         buffers = [
             ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
             ipc_barriers_out, lamport_buffers_0, lamport_buffers_1,

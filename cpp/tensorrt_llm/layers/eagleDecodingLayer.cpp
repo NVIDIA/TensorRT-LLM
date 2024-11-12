@@ -155,8 +155,12 @@ void EagleDecodingLayer<T>::unpackData(EagleOutputs const& outputs, EagleInputs 
     params.outputIds = bufferCast<TokenIdType>(*outputs.outputIds);
     params.outputNumNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
     params.outputSequenceLengths = bufferCast<SizeType32>(*outputs.sequenceLength.value());
+    // FIXME outputUnpackedNextDraftTokens is the same as outputNextDraftTokens.
+    // outputUnpackedNextDraftTokens is used in eagleBuffers and outputNextDraftTokens is used in the runtime
+    params.outputUnpackedNextDraftTokens = bufferCast<TokenIdType>(*outputs.unpackedNextDraftTokens);
     params.outputNextDraftTokens = bufferCast<TokenIdType>(*outputs.nextDraftTokens);
     params.outputNextDraftLengths = bufferCast<SizeType32>(*outputs.nextDraftLengths);
+    params.outputNextGenerationLength = bufferCast<SizeType32>(*outputs.generationLengths);
     params.outputNextDraftPaths = bufferCast<SizeType32>(*outputs.nextDraftPaths);
     params.outputPrevDraftLengths = bufferCast<SizeType32>(*outputs.prevDraftLengths);
     params.outputPositionIds = bufferCast<SizeType32>(*outputs.nextDraftPosIds);
@@ -188,6 +192,8 @@ void EagleDecodingLayer<T>::unpackData(EagleOutputs const& outputs, EagleInputs 
     mBufferManager->copy(*mEagleNetGenRequestTypes, *outputs.eagleNetGenRequestTypesHost);
     mBufferManager->copy(*mEagleNetGenContextLengths, *outputs.eagleNetGenContextLengthsHost);
     mBufferManager->copy(*mEagleNetGenPastKeyValueLengths, *outputs.eagleNetGenPastKeyValueLengthsHost);
+
+    mBufferManager->copy(*outputs.generationLengths, *outputs.generationLengthsHost);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

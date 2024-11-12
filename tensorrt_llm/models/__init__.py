@@ -128,6 +128,7 @@ MODEL_MAP = {
     'Kosmos2ForConditionalGeneration': GPTForCausalLM,
     'JAISLMHeadModel': GPTForCausalLM,
     'GPTForCausalLM': GPTForCausalLM,
+    'NemotronForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
     'RWForCausalLM': FalconForCausalLM,

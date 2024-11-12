@@ -58,6 +58,8 @@ public:
         TensorPtr draftPaths;
         //! [maxBatchSize] or [numGenSequences]
         TensorPtr specDecodingGenerationLengths;
+        //! [maxBatchSize] or [numGenSequences]
+        TensorPtr specDecodingGenerationLengthsHost;
         //! [maxBatchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         //! or [numGenSequences, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         TensorPtr specDecodingPackedMasks;

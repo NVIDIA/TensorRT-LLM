@@ -60,7 +60,7 @@ static std::vector<std::unique_ptr<BaseLayer>> createLayers(executor::DecodingMo
     std::vector<std::unique_ptr<BaseLayer>> layers;
     auto layerTypes = createDecodingLayerTypes(mode);
     // Only when draft tokens and predicted and decoded by the engine, we can skip penalty layer.
-    if (!mode.isExplicitDraftTokens())
+    if (!mode.isExplicitDraftTokens() && !mode.isEagle())
     {
         TLLM_CHECK_WITH_INFO(layerTypes.size() && layerTypes[0] == DecodingLayers_t::PENALTY_LAYER,
             "Penalty layer is required to be the first layer for any decoder configuration");

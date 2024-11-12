@@ -1,6 +1,10 @@
 # Executor API examples
 
-This directory contains three examples that demonstrate how to use the `Executor` API. The first example defined in `executorExampleBasic.cpp` shows how you can generate output tokens for a single prompt in only a few lines of code. The second example defined in `executorExampleAdvanced.cpp` supports more options such as providing an arbitrary number of input requests with arbitrary tokens per request and running in streaming mode. The third example defined in `executorExampleLogitsProcessor.cpp` shows how to use `LogitsPostProcessor` to control output tokens.
+This directory contains four examples that demonstrate how to use the `Executor` API:
+1. The example defined in `executorExampleBasic.cpp` shows how you can generate output tokens for a single prompt in only a few lines of code.
+2. The example defined in `executorExampleAdvanced.cpp` supports more options such as providing an arbitrary number of input requests with arbitrary tokens per request and running in streaming mode.
+3. The example defined in `executorExampleLogitsProcessor.cpp` shows how to use `LogitsPostProcessor` to control output tokens.
+4. The example defined in `executorExampleFastLogits` shows how to use `ExternalDraftTokensConfig` for speculative decoding and optionally use the fast logits feature.
 
 ## Building the examples
 
@@ -87,3 +91,16 @@ Alternatively, it's also possible to run multi-GPU model by using the so-called 
 ./executorExampleAdvanced --engine_dir <path_to_engine_dir>  --input_tokens_csv_file ../inputTokens.csv --use_orchestrator_mode --worker_executable_path <path_to_executor_worker>
 ```
 where `<path_to_executor_worker>` is the absolute path to the stand-alone executor worker executable, located at`cpp/build/tensorrt_llm/executor_worker/executorWorker` by default.
+
+
+### executorExampleFastLogits
+
+To run the `executorExampleFastLogits`, you need two GPUs (one for the draft model and one for the target model). You can run it as follows:
+
+```
+mpirun -n 3  --allow-run-as-root ./executorExampleFastLogits --engine_dir <path_to_target_engine> --draft_engine_dir <path_to_draft_engine> --num_draft_tokens=3
+```
+
+The examples uses 3 MPI ranks (one for the orchestrator, one for the draft model and one for the target model).
+
+Use `--fast_logits=false` to disable the fast logits feature.

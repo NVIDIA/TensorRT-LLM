@@ -22,9 +22,11 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
+#include "tensorrt_llm/runtime/jsonSerialization.h"
 #include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/runtimeDefaults.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -134,7 +136,23 @@ ModelConfig createModelConfig(
     auto const* const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
 
     auto const arch = engineVersionNone ? std::string("none") : config.at(archField).template get<std::string>();
-    auto const numLayers = config.at(numLayersField).template get<SizeType32>();
+    auto numLayers = config.at(numLayersField).template get<SizeType32>();
+
+    if (!engineVersionNone)
+    {
+        auto const speculativeDecodingModeOpt = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(
+            json.at("build_config"), "speculative_decoding_mode");
+
+        if (speculativeDecodingModeOpt.has_value()
+            && SpeculativeDecodingMode(speculativeDecodingModeOpt.value()).isEagle())
+        {
+            auto const& eagleConfig = json.at("pretrained_config").at("eagle_net_config");
+            auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
+
+            numLayers += numEagleNetLayers;
+        }
+    }
+
     auto const numHeads = config.at(numHeadsField).template get<SizeType32>() / tensorParallelism;
     auto const layerStringTypes
         = parseJsonFieldOr<std::vector<std::string>>(config, "layer_types", std::vector<std::string>());
@@ -221,9 +239,12 @@ ModelConfig createModelConfig(
 
     auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
     auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
+    auto const skipCrossAttnBlocks
+        = useCrossAttention && parseJsonFieldOr<bool>(config, "skip_cross_attn_blocks", false);
     modelConfig.setUseCrossAttention(useCrossAttention);
     modelConfig.setUsePositionEmbedding(usePositionEmbedding);
     modelConfig.setUseTokenTypeEmbedding(useTokenTypeEmbedding);
+    modelConfig.setSkipCrossAttnBlocks(skipCrossAttnBlocks);
 
     if (mlpHiddenSize.has_value())
     {
@@ -412,6 +433,10 @@ GptJsonConfig parseJson(InputType&& input)
 
     parseLora(modelConfig, json, pluginConfig, engineVersionNone, tensorParallelism);
 
+    auto runtimeDefaults = engineVersionNone
+        ? std::nullopt
+        : parseJsonFieldOptional<RuntimeDefaults>(json.at("pretrained_config"), "runtime_defaults");
+
     if (engineVersionNone)
     {
         auto const quantMode
@@ -507,11 +532,15 @@ GptJsonConfig parseJson(InputType&& input)
             }
             else if (modelConfig.getSpeculativeDecodingMode().isEagle())
             {
-                auto const numEagleLayers = parseJsonFieldOr(builderConfig, "num_eagle_layers", 0);
+                auto const& pretrainedConfig = json.at("pretrained_config");
+
+                auto const numEagleLayers = parseJsonFieldOr(pretrainedConfig, "num_eagle_layers", 0);
+                auto const& eagleConfig = pretrainedConfig.at("eagle_net_config");
+                auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
 
                 TLLM_CHECK_WITH_INFO(maxDraftLen > 0, "max_draft_len has to be larger than 0 for eagle decoding");
                 TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
-                auto eagleModule = std::make_shared<EagleModule>(numEagleLayers, maxDraftLen);
+                auto eagleModule = std::make_shared<EagleModule>(numEagleLayers, maxDraftLen, numEagleNetLayers);
                 modelConfig.setSpeculativeDecodingModule(eagleModule);
             }
         }
@@ -578,8 +607,8 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
-    return GptJsonConfig{
-        name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode, modelConfig};
+    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode,
+        modelConfig, runtimeDefaults};
 }
 
 } // namespace

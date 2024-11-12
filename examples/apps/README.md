@@ -1,8 +1,8 @@
 # Apps examples with GenerationExecutor / LLM API
 ## OpenAI API
-[openai_server.py](./openai_server.py) is an OpenAI compatible server which supports `v1/version`, `v1/completions` and `v1/chat/completions`. [openai_client.py](./openai_client.py) is a simple example using OpenAI client to query your model. To start the server, you can run
+[openai_server.py](../../tensorrt_llm/serve/openai_server.py) is an OpenAI compatible server which supports `v1/version`, `v1/completions` and `v1/chat/completions`. [openai_client.py](./openai_client.py) is a simple example using OpenAI client to query your model. To start the server, you can run
 ```
-python3 ./openai_server.py <model_path>
+trtllm-serve <model>
 ```
 Then you can use the following APIs by running our example client or by `curl`.
 ### v1/completions

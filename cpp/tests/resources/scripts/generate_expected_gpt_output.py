@@ -88,8 +88,6 @@ def generate_output(engine: str,
     if model_spec_obj.get_enable_context_fmha_fp32_acc():
         args_list.extend(["--enable_context_fmha_fp32_acc"])
 
-    assert not os.path.exists(results_file) and not os.path.exists(results_csv)
-
     if output_cum_log_probs:
         args_list.extend([
             '--output_cum_log_probs_npy',

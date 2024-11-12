@@ -17,6 +17,9 @@ RETURN_GENERATION_LOGITS=0
 KVCACHE_MEM_FRACTION=0.95
 MAX_BATCH_SIZE=2048
 MAX_NUM_TOKENS=8192
+FP8_QUANT=0
+EXAMPLE_DIR="llama"
+OUTPUT_FILE=$WORKSPACE/"output.txt"
 
 function usage() {
   echo "Usage: $0 -m <hf_model_dir> -t <tp_size> -i <isl> -o <osl>"
@@ -26,13 +29,26 @@ function usage() {
   echo "  -o: Output sequence length, comma separated"
   echo "  -b: Max batch size"
   echo "  -n: Max number of tokens"
+  echo "  -r: Example directory"
   echo "  -c: Return context logits"
   echo "  -g: Return generation logits"
+  echo "  -q: FP8 quantization"
   echo "  -h: Display this help message"
+  echo ""
+  echo "Example: ./run.sh -m /gptj -i "128" -o "128" -t 2 -b 2048 -n 2048 -r gptj"
+  echo "Example: ./run.sh -m /llama -i "128" -o "128" -t 1 -b 2048 -n 2048 -r llama"
   exit 1
 }
 
-PARSED_OPTIONS=$(getopt -n "$0" -o m:t:i:o:b:n:h:cg -l "model:,tp-size:,isl:,osl:,max-batch-size:,max-num-tokens:,help:,context-logit,generation-logit" -- "$@")
+# ANSI color codes
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+BLUE='\033[34m'
+NC='\033[0m' # No Color
+
+
+PARSED_OPTIONS=$(getopt -n "$0" -o m:t:i:o:b:n:r:q:h:cg -l "model:,tp-size:,isl:,osl:,max-batch-size:,max-num-tokens:,example:,fp8:,help:,context-logit,generation-logit" -- "$@")
 
 if [ $? -ne 0 ]; then
   usage
@@ -65,6 +81,14 @@ function parse_args() {
         ;;
       -n|--max-num-tokens)
         MAX_NUM_TOKENS=$2
+        shift 2
+        ;;
+      -r|--example)
+        EXAMPLE_DIR=$2
+        shift 2
+        ;;
+      -q|--fp8)
+        FP8_QUANT=$2
         shift 2
         ;;
       -h|--help)
@@ -141,13 +165,38 @@ function build_engine_using_cli() {
 
   local CKPT_DIR=/tmp/ckpt-${MODEL}-tp${TP_SIZE}
 
-  if [ ! -e $CKPT_DIR ]; then
-      python examples/llama/convert_checkpoint.py \
-          --model_dir $HF_MODEL_DIR \
-          --output_dir $CKPT_DIR \
-          --tp_size $TP_SIZE \
-          --workers $TP_SIZE
+  if [ $FP8_QUANT -eq 1 ]; then
+      CKPT_DIR=/tmp/ckpt-${MODEL}-tp${TP_SIZE}-fp8
+      ENGINE_DIR=/tmp/engine-${MODEL}-tp${TP_SIZE}-fp8
+
+      if [ ! -e $CKPT_DIR ]; then
+
+        echo -e "${GREEN}Quantizing the model to FP8${NC}"
+        set -x
+        python $TRTLLM_ROOT/examples/quantization/quantize.py --model_dir $HF_MODEL_DIR \
+                                    --dtype float16 \
+                                    --qformat fp8 \
+                                    --kv_cache_dtype fp8 \
+                                    --output_dir $CKPT_DIR \
+                                    --calib_size 512 \
+                                    --tp_size $TP_SIZE
+        set +x
+      fi
+
+  else
+
+    if [ ! -e $CKPT_DIR ]; then
+        set -x
+        python examples/$EXAMPLE_DIR/convert_checkpoint.py \
+            --model_dir $HF_MODEL_DIR \
+            --output_dir $CKPT_DIR \
+            --tp_size $TP_SIZE \
+            --workers $TP_SIZE
+        set +x
+    fi
+
   fi
+
 
   if [ ! -e $ENGINE_DIR ]; then
       gather_context_logits=""
@@ -208,7 +257,7 @@ function run_perf() {
   local data_path=$DATA_DIR/data.$samples.$isl.$osl.json
   local cpp_benchmark=$TRTLLM_ROOT/cpp/build/benchmarks/gptManagerBenchmark
   local log_path=$LOGS_DIR/$samples.$isl.$osl.log
-  local report_path=$WORKSPACE/reports/$samples.$isl.$osl
+  local report_path=reports/$samples.$isl.$osl
   local evaluator_py=$WORKSPACE/llmapi_evaluator.py
 
   cd $TRTLLM_ROOT/tests/llmapi
@@ -221,6 +270,7 @@ function run_perf() {
   rm -f $log_path
   mkdir -p $report_path
 
+  set -x
   python $evaluator_py benchmark \
   --model-path $ENGINE_DIR \
   --tp-size $TP_SIZE \
@@ -231,14 +281,16 @@ function run_perf() {
   --return-context-logits $RETURN_CONTEXT_LOGITS \
   --return-generation-logits $RETURN_GENERATION_LOGITS \
    ${streaming_suffix} \
-   --kv-cache-free-gpu-mem-fraction $KVCACHE_MEM_FRACTION \
-   --cpp-executable $cpp_benchmark \
+  --kv-cache-free-gpu-mem-fraction $KVCACHE_MEM_FRACTION \
+  --cpp-executable $cpp_benchmark \
   2>&1 | tee -a $log_path
+  set +x
 
   if [ ${PIPESTATUS[0]} -ne 0 ]; then
     echo "Python command failed. Exiting..."
     exit 1
   fi
+
 }
 
 function extractlog() {
@@ -249,13 +301,6 @@ function extractlog() {
 
   cat $log_path | ./extract_log.py > $report_path
 }
-
-# ANSI color codes
-GREEN='\033[32m'
-YELLOW='\033[33m'
-RED='\033[31m'
-BLUE='\033[34m'
-NC='\033[0m' # No Color
 
 function run() {
   local isl=$1
@@ -296,6 +341,7 @@ split_into_array() {
 }
 
 # main
+
 cd $WORKSPACE
 chmod +x *.py
 
@@ -317,3 +363,15 @@ done
 
 # You can paste the generated CSV string to excel to visualize the results
 parse_final_report
+
+# Append the result to the result
+echo "Appending result to $OUTPUT_FILE"
+LOCK_FILE=$WORKSPACE/_lockfile
+(
+  flock -x 200
+
+  echo "Date: $(date)" >> $OUTPUT_FILE
+  echo $MODEL >> $OUTPUT_FILE
+  cat $LOGS_DIR/output.csv >> $OUTPUT_FILE
+  echo >> $OUTPUT_FILE
+) 200>"$LOCK_FILE"

@@ -19,6 +19,7 @@ from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType
+from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor,
                           gather_last_token_logits, tanh)
 from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
@@ -65,6 +66,8 @@ if TYPE_CHECKING:
     ConfigGroups = Union[Gemma2ConfigGroup]
     """Groupings of config where, if one of said properties exists, we assume all of the properties exist (even if they are `None`)"""
     CG = TypeVar("CG", bound=ConfigGroups)
+
+    RuntimeDefaultsIn = Optional[Union[RuntimeDefaults, dict]]
 
 
 class SpeculativeDecodingMode(IntFlag):
@@ -305,6 +308,7 @@ class PretrainedConfig:
                  share_embedding_table: bool = False,
                  head_size: Optional[int] = None,
                  qk_layernorm: bool = False,
+                 runtime_defaults: "RuntimeDefaultsIn" = None,
                  **kwargs):
         self.architecture = architecture
         self.dtype = dtype
@@ -316,6 +320,8 @@ class PretrainedConfig:
 
         self.logits_dtype = logits_dtype
         self.norm_epsilon = norm_epsilon
+
+        self.runtime_defaults = self.create_runtime_defaults(runtime_defaults)
 
         if isinstance(position_embedding_type, str):
             position_embedding_type = PositionEmbeddingType.from_string(
@@ -379,6 +385,13 @@ class PretrainedConfig:
                 )
             except AttributeError as err:
                 raise err
+
+    @staticmethod
+    def create_runtime_defaults(
+            defaults: "RuntimeDefaultsIn" = None) -> Optional[RuntimeDefaults]:
+        if isinstance(defaults, dict):
+            return RuntimeDefaults(**defaults)
+        return defaults
 
     @property
     def kv_dtype(self):
@@ -694,7 +707,8 @@ class PretrainedModel(Module,
             gather_context_logits: bool = False,
             gather_generation_logits: bool = False,
             lora_target_modules: List[str] = None,
-            opt_batch_size: int = 0):
+            opt_batch_size: int = 0,
+            num_hidden_layers: int = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -730,7 +744,8 @@ class PretrainedModel(Module,
             hidden_size=self.config.hidden_size,
             num_kv_heads=self.config.num_key_value_heads,
             head_size=self.config.head_size,
-            num_layers=self.config.num_hidden_layers,
+            num_layers=num_hidden_layers
+            if num_hidden_layers is not None else self.config.num_hidden_layers,
             kv_dtype=str_dtype_to_trt(self.config.kv_dtype),
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
@@ -933,6 +948,7 @@ class DecoderModelForCausalLM(PretrainedModel):
             hidden_states, presents = hidden_states
 
         if self.config.mapping.is_last_pp_rank():
+            all_hidden_states = hidden_states
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
                 default_net().plugin_config.remove_input_padding)
@@ -964,7 +980,7 @@ class DecoderModelForCausalLM(PretrainedModel):
             return (hidden_states, presents)
         else:
             if self.config.mapping.is_last_pp_rank():
-                return lm_logits, hidden_states
+                return lm_logits, hidden_states, all_hidden_states
             return hidden_states
 
 

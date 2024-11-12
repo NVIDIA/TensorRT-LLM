@@ -17,12 +17,10 @@ import os
 from enum import Enum
 from typing import List, Optional, Union
 
-import torch
 import transformers
 
-from ..._utils import torch_dtype_to_str
-from ...logger import logger
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -86,20 +84,7 @@ class MambaConfig(PretrainedConfig):
                 hf_config = transformers.AutoConfig.from_pretrained(
                     hf_config_dir, trust_remote_code=True)
 
-            if dtype == 'auto':
-                dtype = getattr(hf_config, 'torch_dtype', None)
-                if dtype is None:
-                    dtype = 'float16'
-                if isinstance(dtype, torch.dtype):
-                    dtype = torch_dtype_to_str(dtype)
-                if dtype == 'float32':
-                    dtype = 'float16'
-            if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                    0).major < 8:
-                logger.warning(
-                    "Pre SM 80 GPUs do not support bfloat16, fallback to float16"
-                )
-                dtype = 'float16'
+            dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
             vocab_size = hf_config.vocab_size
             pad_vocab_size_multiple = getattr(hf_config,
@@ -137,20 +122,8 @@ class MambaConfig(PretrainedConfig):
 
                 hf_config = transformers.AutoConfig.from_pretrained(
                     hf_config_dir, trust_remote_code=True)
-            if dtype == 'auto':
-                dtype = getattr(hf_config, 'torch_dtype', None)
-                if dtype is None:
-                    dtype = 'float16'
-                if isinstance(dtype, torch.dtype):
-                    dtype = torch_dtype_to_str(dtype)
-                if dtype == 'float32':
-                    dtype = 'float16'
-            if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                    0).major < 8:
-                logger.warning(
-                    "Pre SM 80 GPUs do not support bfloat16, fallback to float16"
-                )
-                dtype = 'float16'
+
+            dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
             vocab_size = hf_config.vocab_size
             pad_vocab_size_multiple = getattr(hf_config,

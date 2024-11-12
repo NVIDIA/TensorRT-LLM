@@ -16,10 +16,9 @@ import json
 from pathlib import Path
 from typing import List, Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
+from ...functional import LayerNormPositionType, LayerNormType, MLPType
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -33,8 +32,26 @@ class MLLaMAConfig(PretrainedConfig):
                  rotary_scaling: Optional[dict] = None,
                  residual_mlp: bool = False,
                  disable_weight_only_quant_plugin: bool = False,
+                 cross_attention: bool = True,
                  cross_attention_layers: List[int] = None,
                  vision_output_dim: int = 0,
+                 has_position_embedding=False,
+                 type_vocab_size=None,
+                 rescale_before_lm_head=False,
+                 layernorm_type=LayerNormType.RmsNorm,
+                 layernorm_position=LayerNormPositionType.pre_layernorm,
+                 has_attention_qkvo_bias=False,
+                 has_mlp_bias=False,
+                 has_model_final_layernorm=True,
+                 model_type='MLLaMAModel',
+                 skip_cross_kv=False,
+                 mlp_type=MLPType.GatedMLP,
+                 has_embedding_scale=False,
+                 residual_scaling=1.0,
+                 has_lm_head_bias=False,
+                 num_buckets=None,
+                 max_distance=0,
+                 relative_attention=False,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -43,36 +60,58 @@ class MLLaMAConfig(PretrainedConfig):
         self.residual_mlp = residual_mlp
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
 
-        self.cross_attention = True
+        assert cross_attention
+        self.cross_attention = cross_attention
         self.cross_attention_layers = cross_attention_layers
         assert vision_output_dim != 0
         self.vision_output_dim = vision_output_dim
 
-        super().__init__(**kwargs)
-        self.embed_vocab_size = self.vocab_size + 8  #FIXME The vocab_size of embedding contains the special tokens for image
+        self.has_position_embedding = has_position_embedding
+        self.type_vocab_size = type_vocab_size
+        self.rescale_before_lm_head = rescale_before_lm_head
+        self.layernorm_type = layernorm_type
+        self.layernorm_position = layernorm_position
+        self.has_attention_qkvo_bias = has_attention_qkvo_bias
+        self.has_mlp_bias = has_mlp_bias
+        self.has_model_final_layernorm = has_model_final_layernorm
+        self.model_type = model_type
+        self.skip_cross_kv = skip_cross_kv
+        self.mlp_type = mlp_type
+        self.has_embedding_scale = has_embedding_scale
+        self.residual_scaling = residual_scaling
+        self.has_lm_head_bias = has_lm_head_bias
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention = relative_attention
+        self.skip_cross_attn_blocks = True
 
+        kwargs.pop('embed_vocab_size', None)
+        kwargs.pop('num_kv_heads_per_layer', None)
+        kwargs.pop('num_kv_heads_per_cross_attn_layer', None)
+        super().__init__(**kwargs)
+
+    @property
+    def embed_vocab_size(self):
+        return self.vocab_size + 8  #FIXME The vocab_size of embedding contains the special tokens for image
+
+    @property
+    def num_kv_heads_per_layer(self):
         num_kv_heads_per_layer = [
             self.num_key_value_heads for _ in range(self.num_hidden_layers)
         ]
+        for layer_idx in self.cross_attention_layers:
+            num_kv_heads_per_layer[layer_idx] = 0
+        return num_kv_heads_per_layer
+
+    @property
+    def num_kv_heads_per_cross_attn_layer(self):
         num_kv_heads_per_cross_attn_layer = [
             0 for _ in range(self.num_hidden_layers)
         ]
         for layer_idx in self.cross_attention_layers:
-            num_kv_heads_per_layer[layer_idx] = 0
             num_kv_heads_per_cross_attn_layer[
                 layer_idx] = self.num_key_value_heads
-
-        # adjust num heads according to tp size
-        num_kv_heads_per_layer = [
-            (nheads + self.mapping.tp_size - 1) // self.mapping.tp_size
-            for nheads in num_kv_heads_per_layer
-        ]
-        num_kv_heads_per_cross_attn_layer = [
-            (nheads + self.mapping.tp_size - 1) // self.mapping.tp_size
-            for nheads in num_kv_heads_per_cross_attn_layer
-        ]
-        self.num_kv_heads_per_layer = num_kv_heads_per_layer
-        self.num_kv_heads_per_cross_attn_layer = num_kv_heads_per_cross_attn_layer
+        return num_kv_heads_per_cross_attn_layer
 
     def to_dict(self):
         output = super().to_dict()
@@ -86,11 +125,12 @@ class MLLaMAConfig(PretrainedConfig):
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
         output['cross_attention'] = self.cross_attention
         output['cross_attention_layers'] = self.cross_attention_layers
-        output['embed_vocab_size'] = self.embed_vocab_size
         output['vision_output_dim'] = self.vision_output_dim
+        output['embed_vocab_size'] = self.embed_vocab_size
         output['num_kv_heads_per_layer'] = self.num_kv_heads_per_layer
         output[
             'num_kv_heads_per_cross_attn_layer'] = self.num_kv_heads_per_cross_attn_layer
+        output['skip_cross_attn_blocks'] = self.skip_cross_attn_blocks
         return output
 
     @classmethod
@@ -131,14 +171,7 @@ class MLLaMAConfig(PretrainedConfig):
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)
 
-        if dtype == 'auto':
-            dtype = getattr(hf_text_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -195,8 +228,7 @@ class MLLaMAConfig(PretrainedConfig):
                 (int(n_embd_ * ffn_dim_multiplier) + multiple_of - 1) //
                 multiple_of)
 
-        if dtype == 'auto':
-            dtype = 'bfloat16'
+        dtype = infer_dtype(dtype, 'bfloat16')
 
         if meta_config.get('use_scaled_rope'):
             rotary_scaling = {"type": "llama3"}

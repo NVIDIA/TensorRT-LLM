@@ -882,7 +882,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
 }
 
 template <typename T>
-bool is_lamport_supported(int token_num)
+bool is_lamport_supported(int token_num, int hidden_size)
 {
     static char* disableLamportReduceNormFusionChar = std::getenv("DISABLE_LAMPORT_REDUCE_NORM_FUSION");
     bool disableLamportReduceNormFusion = (disableLamportReduceNormFusionChar != nullptr);
@@ -901,17 +901,21 @@ bool is_lamport_supported(int token_num)
     {
         return false;
     }
+    if (hidden_size < details::kLamportHiddenSizeThreshold)
+    {
+        return false;
+    }
     return true;
 }
 
-bool is_lamport_supported(nvinfer1::DataType dataType, int token_num)
+bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: return is_lamport_supported<float>(token_num);
-    case nvinfer1::DataType::kHALF: return is_lamport_supported<half>(token_num);
+    case nvinfer1::DataType::kFLOAT: return is_lamport_supported<float>(token_num, hidden_size);
+    case nvinfer1::DataType::kHALF: return is_lamport_supported<half>(token_num, hidden_size);
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: return is_lamport_supported<__nv_bfloat16>(token_num);
+    case nvinfer1::DataType::kBF16: return is_lamport_supported<__nv_bfloat16>(token_num, hidden_size);
 #endif
     default: return false;
     }
@@ -921,7 +925,7 @@ template <typename T, int RanksPerNode, bool Bias, bool Affine>
 void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream)
 {
     int token_num = params.elts_total / params.fusion_params.hidden_size;
-    if (is_lamport_supported<T>(token_num))
+    if (is_lamport_supported<T>(token_num, params.fusion_params.hidden_size))
     {
         lamport_style_one_shot_all_reduce_norm_kernel_launcher<T, RanksPerNode, Bias, Affine>(params, stream);
     }
@@ -1568,12 +1572,13 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     }
 }
 
-AllReduceParams AllReduceParams::deserialize(
-    int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType, int token_num, AllReduceFusionOp op)
+AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
+    int token_num, int hidden_size, AllReduceFusionOp op)
 {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
     int flag_offset;
-    if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM && reduce_fusion::is_lamport_supported(dataType, token_num))
+    if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM
+        && reduce_fusion::is_lamport_supported(dataType, token_num, hidden_size))
     {
         flag_offset = 0;
     }

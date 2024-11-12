@@ -192,7 +192,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights") = false,
             py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
             py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
-            py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false)
+            py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false,
+            py::arg("use_w4a8_qserve") = false)
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -332,9 +333,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("__eq__", &tr::SamplingConfig::operator==);
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, tr::ModelConfig>(),
+        .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, tr::ModelConfig,
+                 std::optional<tr::RuntimeDefaults>>(),
             py::arg("name"), py::arg("version"), py::arg("precision"), py::arg("tensor_parallelism"),
-            py::arg("pipeline_parallelism"), py::arg("gpus_per_node"), py::arg("model_config"))
+            py::arg("pipeline_parallelism"), py::arg("gpus_per_node"), py::arg("model_config"),
+            py::arg("runtime_defaults") = py::none())
         .def_static("parse", py::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), py::arg("json"))
         .def_static(
             "parse_file", py::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), py::arg("path"))
@@ -346,6 +349,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
         .def_property_readonly("gpus_per_node", &tr::GptJsonConfig::getGpusPerNode)
         .def_property_readonly("world_size", &tr::GptJsonConfig::getWorldSize)
+        .def_property_readonly("runtime_defaults", &tr::GptJsonConfig::getRuntimeDefaults)
         .def("engine_filename",
             py::overload_cast<tr::WorldConfig const&, std::string const&>(
                 &tr::GptJsonConfig::engineFilename, py::const_),
@@ -392,6 +396,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorNames.attr("PROMPT_EMBEDDING_TABLE") = py::str(tb::inference_request::kPromptEmbeddingTableName);
     tensorNames.attr("PROMPT_VOCAB_SIZE") = py::str(tb::inference_request::kPromptVocabSizeName);
     tensorNames.attr("NO_REPEAT_NGRAM_SIZE") = py::str(tb::inference_request::kNoRepeatNgramSizeTensorName);
+    tensorNames.attr("SKIP_CROSS_ATTN_BLOCKS") = py::str(tb::inference_request::kSkipCrossAttnBlocksTensorName);
 
     // Output tensor names
     tensorNames.attr("OUTPUT_IDS") = py::str(tb::inference_request::kOutputIdsTensorName);

@@ -143,6 +143,8 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     lora_plugin = plugin_config.get('lora_plugin')
+    skip_cross_attn_blocks = bool(
+        pretrained_config.get('skip_cross_attn_blocks', False))
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,
@@ -173,6 +175,7 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
         trtllm_modules_to_hf_modules=lora_trtllm_modules_to_hf_modules,
         num_medusa_heads=num_medusa_heads,
         max_medusa_tokens=max_medusa_token_len,
+        skip_cross_attn_blocks=skip_cross_attn_blocks,
         # ReDrafter
         redrafter_num_beams=redrafter_num_beams,
         redrafter_draft_len_per_beam=redrafter_draft_len_per_beam,
@@ -282,6 +285,8 @@ def _engine_config_to_model_config(engine_config: EngineConfig,
         cross_attention=getattr(pretrained_config, 'cross_attention', False),
         has_position_embedding=getattr(pretrained_config,
                                        'has_position_embedding', True),
+        skip_cross_attn_blocks=getattr(pretrained_config,
+                                       'skip_cross_attn_blocks', False),
         **kwargs)
 
 
@@ -903,8 +908,10 @@ class ModelRunner(ModelRunnerMixin):
 
         batch_input_ids = batch_input_ids.cuda()
         input_lengths = input_lengths.cuda()
-        ptuning_kwargs = self._prepare_ptuning(prompt_table, prompt_tasks,
-                                               batch_size)
+        other_kwargs = self._prepare_ptuning(prompt_table, prompt_tasks,
+                                             batch_size)
+        other_kwargs['skip_cross_attn_blocks'] = kwargs.get(
+            'skip_cross_attn_blocks', None)
         outputs = self.session.decode(
             batch_input_ids,
             input_lengths,
@@ -920,7 +927,7 @@ class ModelRunner(ModelRunnerMixin):
             encoder_output=encoder_input_features,
             encoder_input_lengths=encoder_output_lengths,
             cross_attention_mask=cross_attention_masks,
-            **ptuning_kwargs)
+            **other_kwargs)
         if sampling_config.return_dict:
             if streaming:
                 outputs = (self._prepare_outputs(curr_outputs, input_lengths)

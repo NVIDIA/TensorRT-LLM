@@ -55,7 +55,6 @@ enum class LlmRequestState : int32_t
                                               /// Waiting context-only request transmitting the kv cache
     kDISAGG_CONTEXT_COMPLETE = 8,             ///< Context-only request finished kv cache transmission.
     kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< For disaggregated serving only: transmitting the kv cache
-    kWAITING_TO_SEND_LOGITS = 10,             ///< Generation phase completed, logits not sent yet
 };
 
 enum LlmRequestType
@@ -110,7 +109,8 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt)
+        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -159,6 +159,7 @@ public:
         , mNumReturnSequences(numReturnSequences)
         , mEagleConfig(eagleConfig)
         , mSequenceIndex(0)
+        , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -335,6 +336,16 @@ public:
         else
         {
             mCrossAttentionMask = std::nullopt;
+        }
+
+        auto const& skipCrossAttnBlocks = req.getSkipCrossAttnBlocks();
+        if (skipCrossAttnBlocks.has_value())
+        {
+            mSkipCrossAttnBlocks = executor::detail::toITensor(skipCrossAttnBlocks.value());
+        }
+        else
+        {
+            mSkipCrossAttnBlocks = std::nullopt;
         }
 
         switch (req.getRequestType())
@@ -1071,6 +1082,11 @@ public:
         return mCrossAttentionMask.value_or(nullptr);
     }
 
+    [[nodiscard]] TensorPtr const getSkipCrossAttnBlocks() const
+    {
+        return mSkipCrossAttnBlocks.value_or(nullptr);
+    }
+
     [[nodiscard]] bool constexpr isStreaming() const noexcept
     {
         return mIsStreaming;
@@ -1235,11 +1251,6 @@ public:
         return mState == LlmRequestState::kDISAGG_CONTEXT_COMPLETE;
     }
 
-    [[nodiscard]] bool isCompleteWaitingToSendLogits() const noexcept
-    {
-        return mState == LlmRequestState::kWAITING_TO_SEND_LOGITS;
-    }
-
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
     /// is still different from the unchunked state, which indicates the initial status.
     [[nodiscard]] bool isFullContextRequest() const noexcept
@@ -1342,7 +1353,7 @@ public:
 
     [[nodiscard]] bool isFinished() const noexcept
     {
-        return isGenerationCompleteState() || isDisaggContextTransmissionState() || isCompleteWaitingToSendLogits();
+        return isGenerationCompleteState() || isDisaggContextTransmissionState();
     }
 
     /// @brief  Create a Response from the current state of the request
@@ -1665,6 +1676,8 @@ protected:
     SizeType32 mReusedBlocksPerRequest{0};
     SizeType32 mMissedBlocksPerRequest{0};
 
+    std::optional<TensorPtr> mSkipCrossAttnBlocks;
+
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
@@ -1823,7 +1836,8 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt)
+        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
@@ -1832,7 +1846,7 @@ public:
             std::move(logitsPostProcessor), applyLogitsPostProcessorBatched, std::move(encoderInputTokens),
             returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), std::move(encoderOutputLength),
             std::move(crossAttentionMask), llmRequestType, std::move(inputTokenExtraIds), numReturnSequences,
-            std::move(eagleConfig))
+            std::move(eagleConfig), std::move(skipCrossAttnBlocks))
     {
     }
 
@@ -1857,7 +1871,9 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1)
+        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1,
+        std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -1875,7 +1891,7 @@ public:
             llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            numReturnSequences)
+            numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks)
     {
     }
 

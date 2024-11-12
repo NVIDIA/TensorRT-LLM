@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/runtimeDefaults.h"
 
 #include <chrono>
 #include <cstdint>
@@ -29,12 +31,18 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace tensorrt_llm::mpi
 {
 class MpiComm;
-}
+} // namespace tensorrt_llm::mpi
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class KVCacheManager;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
 
 namespace tensorrt_llm::executor
 {
@@ -355,7 +363,7 @@ private:
 class SpeculativeDecodingConfig
 {
 public:
-    explicit SpeculativeDecodingConfig(bool fastLogits);
+    explicit SpeculativeDecodingConfig(bool fastLogits = false);
 
     bool operator==(SpeculativeDecodingConfig const& other) const;
 
@@ -364,6 +372,20 @@ public:
 };
 
 using RetentionPriority = SizeType32;
+
+struct RetentionPriorityAndDuration
+{
+
+    RetentionPriorityAndDuration(std::optional<RetentionPriority> const& retentionPriority,
+        std::optional<std::chrono::milliseconds> const& durationMs)
+        : retentionPriority{retentionPriority}
+        , durationMs{durationMs}
+    {
+    }
+
+    std::optional<RetentionPriority> retentionPriority;
+    std::optional<std::chrono::milliseconds> durationMs;
+};
 
 /// @brief Configuration for the request's retention in the KV Cache
 class KvCacheRetentionConfig
@@ -376,14 +398,16 @@ public:
 
     /// @brief A single entry to set block priorities over a token range. Earlier ranges always take priority over later
     /// ones. For example, with a block size of 16, a range of [0, 17] would be applied to the first two blocks.
-    struct TokenRangeRetentionPriority
+    struct TokenRangeRetentionConfig
     {
     public:
-        explicit TokenRangeRetentionPriority(SizeType32 tokenStart, std::optional<SizeType32> tokenEnd = std::nullopt,
-            RetentionPriority priority = KvCacheRetentionConfig::kDefaultRetentionPriority)
+        explicit TokenRangeRetentionConfig(SizeType32 tokenStart, std::optional<SizeType32> tokenEnd = std::nullopt,
+            RetentionPriority priority = KvCacheRetentionConfig::kDefaultRetentionPriority,
+            std::optional<std::chrono::milliseconds> durationMs = std::nullopt)
             : tokenStart{tokenStart}
             , tokenEnd{tokenEnd}
             , priority{priority}
+            , durationMs{durationMs}
         {
             TLLM_CHECK_WITH_INFO(priority >= KvCacheRetentionConfig::kMinRetentionPriority
                     && priority <= KvCacheRetentionConfig::kMaxRetentionPriority,
@@ -398,10 +422,15 @@ public:
         std::optional<SizeType32> tokenEnd;
         /// @brief The priority of this token range. Higher priorities are less likely to be evicted or offloaded.
         RetentionPriority priority;
+        /// @brief The duration in ms that the block should remain at the given priority level. Set to std::nullopt to
+        /// have no expiration time, and keep the block at the given priority level until it gets reclaimed. After the
+        /// duration has passed, the block will be moved back to the `kDefaultRetentionPriority` level.
+        std::optional<std::chrono::milliseconds> durationMs;
 
-        bool operator==(TokenRangeRetentionPriority const& other) const
+        bool operator==(TokenRangeRetentionConfig const& other) const
         {
-            return tokenStart == other.tokenStart && tokenEnd == other.tokenEnd && priority == other.priority;
+            return tokenStart == other.tokenStart && tokenEnd == other.tokenEnd && priority == other.priority
+                && durationMs == other.durationMs;
         }
     };
 
@@ -410,22 +439,28 @@ public:
     {
     }
 
-    KvCacheRetentionConfig(std::vector<TokenRangeRetentionPriority> const& tokenRangeRetentionPriorities,
-        RetentionPriority decodeRetentionPriority);
+    explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
+        RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
+        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt);
 
-    [[nodiscard]] std::vector<TokenRangeRetentionPriority> getTokenRangeRetentionPriorities() const;
+    [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
+    [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
 
-    /// @brief Convert the token range data into an entry per kv cache block for a given seqLen
-    std::vector<std::optional<RetentionPriority>> getPerBlockEvictionPolicy(SizeType32 blockSize, SizeType32 seqLen);
+    /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
+    /// priorities and durations for each block.
+    [[nodiscard]] std::vector<RetentionPriorityAndDuration> getPerBlockRetentionPriorityDuration(
+        SizeType32 blockSize, SizeType32 seqLen) const;
 
 private:
     /// @brief The token ranges and priority levels to update. Ranges must be non-overlapping. For example [(0, 64),
     /// (100, 128), (70, 80)] is valid, whereas
     /// [(0, 64), (60, 128)] is not.
-    std::vector<TokenRangeRetentionPriority> mTokenRangeRetentionPriorities;
+    std::vector<TokenRangeRetentionConfig> mTokenRangeRetentionConfigs;
     /// @brief The priority level to assign to blocks allocated in the decode phase
     RetentionPriority mDecodeRetentionPriority;
+    /// @brief The duration in ms that decode blocks should remain at their assigned priority level.
+    std::optional<std::chrono::milliseconds> mDecodeDurationMs;
 };
 
 /// @brief A class that holds information about the request
@@ -466,6 +501,7 @@ public:
     /// @param contextPhaseParams Generated token ID  from context only executor.
     /// @param numReturnSequences The number of returning sequences.
     /// @param eagleConfig The EAGLE speculative decoding configuration
+    /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -486,7 +522,8 @@ public:
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
-        std::optional<EagleConfig> eagleConfig = std::nullopt);
+        std::optional<EagleConfig> eagleConfig = std::nullopt,
+        std::optional<Tensor> skipCrossAttnBlocks = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -526,6 +563,7 @@ public:
     [[nodiscard]] RequestType getRequestType() const;
     [[nodiscard]] SizeType32 getNumReturnSequences() const;
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
+    [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -553,6 +591,7 @@ public:
     void setCrossAttentionMask(Tensor crossAttentionMask);
     void setNumReturnSequences(SizeType32 numReturnSequences);
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
+    void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
 
 private:
     friend class Serialization;
@@ -568,6 +607,9 @@ struct SpeculativeDecodingFastLogitsInfo
 
     /// @brief MPI world rank of the draft model leader
     int32_t draftParticipantId;
+
+    /// @brief Returns the struct serialized into a tensor that can be used as generation logits input
+    [[nodiscard]] Tensor toTensor() const;
 };
 
 /// @brief Struct that holds the generation result
@@ -735,7 +777,8 @@ public:
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
-        std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt);
+        std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
     [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
@@ -746,6 +789,7 @@ public:
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
     [[nodiscard]] bool getOnboardBlocks() const;
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
+    [[nodiscard]] size_t getEventBufferMaxSize() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setMaxTokens(SizeType32 maxTokens);
@@ -756,6 +800,8 @@ public:
     void setHostCacheSize(size_t hostCacheSize);
     void setOnboardBlocks(bool onboardBlocks);
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
+    void setEventBufferMaxSize(size_t eventBufferMaxSize);
+    void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults runtimeDefaults);
 
 private:
     friend class Serialization;
@@ -797,6 +843,9 @@ private:
 
     /// @brief Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory.
     std::optional<RetentionPriority> mSecondaryOffloadMinPriority;
+
+    /// @brief Max size of the KV cache event buffer
+    size_t mEventBufferMaxSize;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1197,6 +1246,113 @@ private:
     std::optional<SpeculativeDecodingConfig> mSpeculativeDecodingConfig;
 };
 
+struct KVCacheCreatedData
+{
+    /// @brief The amount of blocks at each cache level
+    std::vector<SizeType32> numBlocksPerCacheLevel;
+};
+
+/// @brief An entry for a single block stored into the tree
+struct KVCacheStoredBlockData
+{
+
+    KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens const& tokens,
+        tensorrt_llm::runtime::LoraTaskIdType loraId, SizeType32 cacheLevel, SizeType32 priority)
+        : blockHash{blockHash}
+        , tokens{tokens}
+        , loraId{loraId}
+        , cacheLevel{cacheLevel}
+        , priority{priority}
+    {
+    }
+
+    /// @brief The hash of the block
+    IdType blockHash;
+    /// @brief The unique tokens of the block
+    tensorrt_llm::runtime::VecUniqueTokens tokens;
+    /// @brief The Lora task id of the block
+    tensorrt_llm::runtime::LoraTaskIdType loraId;
+    /// @brief The cache level of the block
+    SizeType32 cacheLevel;
+    /// @brief The priority of the block
+    SizeType32 priority;
+};
+
+struct KVCacheStoredData
+{
+    /// @brief The parent of this sequence of stored blocks
+    std::optional<IdType> parentHash;
+    /// @brief A sequence of blocks. The parent of block `i` is block `i-1`
+    std::vector<KVCacheStoredBlockData> blocks;
+};
+
+struct KVCacheRemovedData
+{
+    /// @brief The hashes of blocks being removed
+    std::vector<IdType> blockHashes;
+};
+
+template <typename T>
+struct KVCacheEventDiff
+{
+    T oldValue;
+    T newValue;
+};
+
+struct KVCacheUpdatedData
+{
+
+    explicit KVCacheUpdatedData(IdType blockHash)
+        : blockHash{blockHash} {};
+
+    KVCacheUpdatedData& cacheLevelUpdated(SizeType32 oldValue, SizeType32 newValue)
+    {
+        cacheLevel = KVCacheEventDiff<SizeType32>{oldValue, newValue};
+        return *this;
+    }
+
+    KVCacheUpdatedData& priorityUpdated(SizeType32 oldValue, SizeType32 newValue)
+    {
+        priority = KVCacheEventDiff<SizeType32>{oldValue, newValue};
+        return *this;
+    }
+
+    /// @brief The hash of the updated block
+    IdType blockHash;
+    /// @brief The updated value of the cacheLevel field
+    std::optional<KVCacheEventDiff<SizeType32>> cacheLevel = std::nullopt;
+    /// @brief The updated value of the priority field
+    std::optional<KVCacheEventDiff<SizeType32>> priority = std::nullopt;
+};
+
+using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVCacheRemovedData, KVCacheUpdatedData>;
+
+struct KVCacheEvent
+{
+
+    KVCacheEvent(IdType eventId, KVCacheEventData data);
+
+    /// @brief The unique id of this event
+    IdType eventId;
+    /// @brief The data corresponding to this event
+    KVCacheEventData data;
+};
+
+/// @brief Exposes a limited set of KV cache manager functionalities
+class KVCacheEventManager
+{
+public:
+    KVCacheEventManager(std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManager> kvCacheManager);
+
+    /// @brief Get the latest KV Cache events.
+    /// @param timeout The maximum time to wait for new events. If nullopt, will only return when new events are
+    /// available, or when the executor instance has shutdown.
+    std::deque<KVCacheEvent> getLatestEvents(std::optional<std::chrono::milliseconds> timeout = std::nullopt);
+
+private:
+    std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManager> kvCacheManager;
+};
+
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
 class Executor
 {
@@ -1299,6 +1455,8 @@ public:
 
     /// @brief  Indicates if the current process participates in this executor instance
     [[nodiscard]] bool isParticipant() const;
+
+    std::optional<std::shared_ptr<KVCacheEventManager>> getKVCacheEventManager() const;
 
 private:
     class Impl;

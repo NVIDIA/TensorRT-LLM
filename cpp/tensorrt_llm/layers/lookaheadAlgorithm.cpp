@@ -61,7 +61,7 @@ LookaheadAlgorithm::LookaheadAlgorithm(
     mEncodeMapMax = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), nvinfer1::DataType::kINT32);
 }
 
-void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeType32 n, SizeType32 g)
+void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeType32 n, SizeType32 g, uint64_t seed)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(w <= mMaxW, "lookahead requires setup w (%d) <= max_w (%d)", w, mMaxW);
@@ -85,6 +85,9 @@ void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeT
     BufferRange<TokenIdType> prefillRange(*mPrefills);
     BufferRange<TokenIdType> pastRange(*mPastTokens);
     BufferRange<TokenIdType> goldRange(*mGoldenTokens);
+
+    srand(seed);
+
     auto randToken = [&promptRange](auto& item) { item = promptRange[rand() % promptRange.size()]; };
     std::for_each(prefillRange.begin(), prefillRange.end(), randToken);
     std::for_each(pastRange.begin(), pastRange.end(), [](auto& a) { a = -1; });

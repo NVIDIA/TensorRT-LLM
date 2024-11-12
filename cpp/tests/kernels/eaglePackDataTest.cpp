@@ -147,9 +147,6 @@ public:
             ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingDraftTokens()}),
             nvinfer1::DataType::kINT32);
 
-        mInputNextDraftLens = BufferManager::pinnedPool(
-            ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
-
         mInputNextDraftPaths
             = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getMaxBatchSize(),
                                             mSamplingParams.getMaxDecodingTokens(), mSamplingParams.getMaxPathLen()}),
@@ -237,7 +234,7 @@ public:
         std::mt19937 gen(42);
         std::uniform_real_distribution<float> distr(0.0, 1.0);
         std::uniform_int_distribution<SizeType32> intDistr(0, 1000);
-        std::uniform_int_distribution<SizeType32> lenDistr(0, 32);
+        std::uniform_int_distribution<SizeType32> lenDistr(0, mSamplingParams.getMaxDecodingTokens() - 1);
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
         {
             bufferCast<float>(*mInputTemperatures)[batchSlotsPtr[bi]] = distr(gen);
@@ -273,9 +270,7 @@ public:
                     batchSlotsPtr[bi], ti, mSamplingParams.getMaxDecodingTokens())]
                     = intDistr(gen);
             }
-            bufferCast<SizeType32>(*mInputNextDraftLens)[batchSlotsPtr[bi]] = lenDistr(gen);
-            bufferCast<SizeType32>(*mInputSpecDecodingGenerationLengths)[batchSlotsPtr[bi]]
-                = bufferCast<SizeType32>(*mInputNextDraftLens)[batchSlotsPtr[bi]];
+            bufferCast<SizeType32>(*mInputSpecDecodingGenerationLengths)[batchSlotsPtr[bi]] = lenDistr(gen) + 1;
         }
     }
 
@@ -297,7 +292,6 @@ public:
         params.inputRandomDataValidation = bufferCast<float>(*mInputRandomDataValidation);
 
         params.inputNextDraftTokens = bufferCast<TokenIdType>(*mInputNextDraftTokens);
-        params.inputNextDraftLens = bufferCast<SizeType32>(*mInputNextDraftLens);
         params.inputNextDraftPaths = bufferCast<SizeType32>(*mInputNextDraftPaths);
 
         params.inputSpecDecodingGenerationLengths = bufferCast<SizeType32>(*mInputSpecDecodingGenerationLengths);
@@ -374,7 +368,9 @@ public:
                 }
             }
             EXPECT_EQ(BufferRange<SizeType32>(*mOutputNextDraftLens)[bi],
-                bi < numCtxRequests ? 0 : BufferRange<SizeType32>(*mInputNextDraftLens)[batchSlotsPtr[bi]]);
+                bi < numCtxRequests
+                    ? 0
+                    : BufferRange<SizeType32>(*mInputSpecDecodingGenerationLengths)[batchSlotsPtr[bi]] - 1);
         }
 
         auto const maxGenerationLength = bufferCast<SizeType32>(*mMaxGenerationLength)[0];
@@ -440,7 +436,6 @@ private:
     TensorPtr mInputRandomDataSample;
     TensorPtr mInputRandomDataValidation;
     TensorPtr mInputNextDraftTokens;
-    TensorPtr mInputNextDraftLens;
     TensorPtr mInputNextDraftPaths;
     TensorPtr mInputSpecDecodingGenerationLengths;
     TensorPtr mInputSpecDecodingPositionOffsets;

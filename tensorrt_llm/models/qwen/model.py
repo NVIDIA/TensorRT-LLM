@@ -362,7 +362,11 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 custom_dict = {
                     "lm_head": "score",
                 }
-
+            elif config.qwen_type == "qwen2_llava_onevision":
+                custom_dict = {
+                    "transformer": "language_model.model",
+                    "lm_head": "language_model.lm_head",
+                }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             if config.share_embedding_table:
                 config.share_embedding_table = loader.check_share_embedding()

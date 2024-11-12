@@ -123,7 +123,7 @@ OpenAI's official Whisper models accept WAV files of up to 30 seconds in length.
 
 1. **max (default)**: Pads to 30 seconds.
 2. **longest**: Pads according to the longest duration in the current batch.
-3. **zero**: No padding is applied. You will need to fine-tune the Whisper model to maintain accuracy. See [examples](https://github.com/k2-fsa/icefall/blob/master/egs/aishell/ASR/whisper/whisper_encoder_forward_monkey_patch.py#L15).
+3. **nopad**: No padding is applied. You will need to fine-tune the Whisper model to maintain accuracy. See [examples](https://github.com/k2-fsa/icefall/blob/master/egs/aishell/ASR/whisper/whisper_encoder_forward_monkey_patch.py#L15).
 
 `--text_prefix`
 You can modify the input prompt for the Whisper decoder. For example, use `<|startoftranscript|><|en|><|zh|><|transcribe|><|notimestamps|>` to perform code-switching ASR between Chinese and English.

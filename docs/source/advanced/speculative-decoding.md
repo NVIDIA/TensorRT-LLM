@@ -32,7 +32,7 @@ may prove simpler than generating a summary for an article.
 Furthermore, when integrating Medusa with a standard PyTorch model implementation which may not be as finely
 tuned as TensorRT-LLM, the potential time savings are more pronounced.
 
-## Draft-Target-Model Approach
+## Draft-Target-Model
 
 The Draft-Target-Model involves the use of two distinct models trained independently but sharing the same vocabulary: a smaller Draft model and a larger Target model. For example, GPT 125M / 6.7B models can serve as the Draft / Target model.
 
@@ -283,6 +283,10 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
     pkill -9 -f trtllmExecutorWorker
     pkill -9 -f tritonserver
     ```
+
+## Prompt-Lookup-Decoding
+
+See document in [examples/prompt_lookup/README.md](../../../examples/prompt_lookup/README.md) and the code can be found in [examples/run.py](../../../examples/run.py).
 
 ## Medusa
 

@@ -70,9 +70,10 @@ nvinfer1::DimsExprs EagleSampleAndAcceptDraftTokensPlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     TLLM_CHECK(nbInputs == 6);
-    TLLM_CHECK(outputIndex < 6);
+    TLLM_CHECK(outputIndex < 7);
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[0];
     auto const maxDecodingDraftTokensExpr = inputs[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)].d[1];
+    auto const maxDecodingTokensExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[1];
     auto const maxPathLenExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[2];
 
     nvinfer1::DimsExprs ret;
@@ -102,6 +103,13 @@ nvinfer1::DimsExprs EagleSampleAndAcceptDraftTokensPlugin::getOutputDimensions(
     {
         ret.nbDims = 1;
         ret.d[0] = batchSizeExpr;
+    }
+    else if (outputIndex == getIdx(OutputIdxEntry::NEXT_DRAFT_PATHS))
+    {
+        ret.nbDims = 3;
+        ret.d[0] = batchSizeExpr;
+        ret.d[1] = maxDecodingTokensExpr;
+        ret.d[2] = maxPathLenExpr;
     }
     else if (outputIndex == getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS))
     {
@@ -289,6 +297,10 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
 
     acceptDraftTokensByIdsWithPaths(params);
 
+    // Copy input paths to the output
+    cudaMemcpyAsync(outputs[getIdx(OutputIdxEntry::NEXT_DRAFT_PATHS)], inputs[getIdx(InputIdxEntry::PATHS)],
+        batchSize * maxDecodingTokens * maxPathLen * sizeof(SizeType32), cudaMemcpyDeviceToDevice, stream);
+
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -356,7 +368,7 @@ int EagleSampleAndAcceptDraftTokensPlugin::enqueue(nvinfer1::PluginTensorDesc co
 nvinfer1::DataType EagleSampleAndAcceptDraftTokensPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    TLLM_CHECK(index < 6);
+    TLLM_CHECK(index < 7);
     // input 1 is draft tokens now of int32 type. All outputs are int32_t as well.
     return inputTypes[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)];
 }
@@ -375,7 +387,7 @@ char const* EagleSampleAndAcceptDraftTokensPlugin::getPluginVersion() const noex
 
 int EagleSampleAndAcceptDraftTokensPlugin::getNbOutputs() const noexcept
 {
-    return 6;
+    return 7;
 }
 
 int EagleSampleAndAcceptDraftTokensPlugin::initialize() noexcept

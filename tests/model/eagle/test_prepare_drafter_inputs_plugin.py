@@ -94,7 +94,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
                                                               device="cuda")
 
         # Refs
-        ref_sequence_lengths = torch.tensor([5],
+        ref_sequence_lengths = torch.tensor([4],
                                             dtype=torch.int32,
                                             device="cuda")
         ref_context_lengths = torch.tensor([3],
@@ -103,7 +103,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_output_ids = torch.tensor([0, 1, 5],
                                       dtype=torch.int32,
                                       device="cuda")
-        ref_position_ids = torch.tensor([2, 3, 4],
+        ref_position_ids = torch.tensor([1, 2, 3],
                                         dtype=torch.int32,
                                         device="cuda")
         ref_hidden_states_indices = torch.tensor([0, 2, 4],
@@ -251,7 +251,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             device="cuda")
 
         # Refs
-        ref_sequence_lengths = torch.tensor([6, 8],
+        ref_sequence_lengths = torch.tensor([5, 7],
                                             dtype=torch.int32,
                                             device="cuda")
         ref_context_lengths = torch.tensor([2, 3],
@@ -260,7 +260,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_output_ids = torch.tensor([0, 5, 10, 11, 20],
                                       dtype=torch.int32,
                                       device="cuda")
-        ref_position_ids = torch.tensor([4, 5, 5, 6, 7],
+        ref_position_ids = torch.tensor([3, 4, 4, 5, 6],
                                         dtype=torch.int32,
                                         device="cuda")
         ref_hidden_states_indices = torch.tensor([0, 1, 3, 5, 6],
@@ -336,7 +336,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             device="cuda")
 
         # Refs
-        ref_sequence_lengths = torch.tensor([3, 8],
+        ref_sequence_lengths = torch.tensor([3, 7],
                                             dtype=torch.int32,
                                             device="cuda")
         ref_context_lengths = torch.tensor([3, 3],
@@ -345,7 +345,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_output_ids = torch.tensor([1, 2, 3, 10, 11, 20],
                                       dtype=torch.int32,
                                       device="cuda")
-        ref_position_ids = torch.tensor([0, 1, 2, 5, 6, 7],
+        ref_position_ids = torch.tensor([0, 1, 2, 4, 5, 6],
                                         dtype=torch.int32,
                                         device="cuda")
         ref_hidden_states_indices = torch.tensor([0, 1, 2, 3, 5, 6],
@@ -428,9 +428,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_output_ids = torch.tensor([11, 12],
                                       dtype=torch.int32,
                                       device="cuda")
-        ref_position_ids = torch.tensor([6, 6],
-                                        dtype=torch.int32,
-                                        device="cuda")
+        ref_position_ids = torch.tensor([6], dtype=torch.int32, device="cuda")
         ref_hidden_states_indices = torch.tensor([0, 0],
                                                  dtype=torch.int32,
                                                  device="cuda")
@@ -448,7 +446,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
                                                               dtype=torch.int32,
                                                               device="cuda")
 
-        ref_spec_decoding_generation_lengths = torch.tensor([1],
+        ref_spec_decoding_generation_lengths = torch.tensor([2],
                                                             dtype=torch.int32,
                                                             device="cuda")
         ref_spec_decoding_position_offsets = torch.tensor(
@@ -488,9 +486,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_output_ids = torch.tensor([11, 12, 13, 15],
                                       dtype=torch.int32,
                                       device="cuda")
-        ref_position_ids = torch.tensor([6, 6, 7, 7],
-                                        dtype=torch.int32,
-                                        device="cuda")
+        ref_position_ids = torch.tensor([6], dtype=torch.int32, device="cuda")
         ref_hidden_states_indices = torch.tensor([0, 0, 1, 2],
                                                  dtype=torch.int32,
                                                  device="cuda")
@@ -508,7 +504,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
                                                               dtype=torch.int32,
                                                               device="cuda")
 
-        ref_spec_decoding_generation_lengths = torch.tensor([3],
+        ref_spec_decoding_generation_lengths = torch.tensor([4],
                                                             dtype=torch.int32,
                                                             device="cuda")
         ref_spec_decoding_position_offsets = torch.tensor(
@@ -592,7 +588,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_output_ids = torch.tensor([11, 12, 13, 15, 21, 25],
                                       dtype=torch.int32,
                                       device="cuda")
-        ref_position_ids = torch.tensor([6, 6, 7, 7, 8, 9],
+        ref_position_ids = torch.tensor([6, 8],
                                         dtype=torch.int32,
                                         device="cuda")
         ref_hidden_states_indices = torch.tensor([0, 0, 2, 3, 1, 4],
@@ -610,7 +606,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         ref_out_hidden_size_batch_level_starts = torch.tensor(
             [0, 1, 2, 4, 5, 7, 8], dtype=torch.int32, device="cuda")
 
-        ref_spec_decoding_generation_lengths = torch.tensor([3, 1],
+        ref_spec_decoding_generation_lengths = torch.tensor([4, 2],
                                                             dtype=torch.int32,
                                                             device="cuda")
         ref_spec_decoding_position_offsets = torch.tensor(
@@ -760,8 +756,8 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             output[6].mark_output('output_position_ids')
             output[7].mark_output('hidden_states_indices')
             output[8].mark_output('last_token_indices')
-            output[9].mark_output('num_output_tokens')
-            output[10].mark_output('num_last_token_indices')
+            # output[9].mark_output('num_output_tokens')
+            # output[10].mark_output('num_last_token_indices')
             output[11].mark_output('out_hidden_size_batch_level_starts')
 
         # trt run
@@ -780,7 +776,19 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             "prev_draft_paths": prev_draft_paths,
             "hidden_size_batch_level_starts": hidden_size_batch_level_starts
         }
-        outputs = run_session(session, inputs)
+
+        output_override_shapes = {
+            "output_ids": (ref_num_output_tokens[0], ),
+            "hidden_states_indices": (ref_num_output_tokens[0], ),
+            "last_token_indices": (ref_num_last_token_indices[0], )
+        }
+        if layer_idx == 0:
+            output_override_shapes["output_position_ids"] = (
+                ref_num_output_tokens[0], )
+
+        outputs = run_session(session,
+                              inputs,
+                              output_override_shapes=output_override_shapes)
 
         if print_tensors:
             print("output_sequence_lengths", outputs['output_sequence_lengths'])
@@ -791,14 +799,10 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
                   outputs['hidden_states_indices'][:ref_num_output_tokens[0]],
                   ref_hidden_states_indices)
             print("last_token_indices", outputs['last_token_indices'])
-            print("num_last_token_indices", outputs['num_last_token_indices'])
+            # print("num_last_token_indices", outputs['num_last_token_indices'])
             print("out_hidden_size_batch_level_starts",
                   outputs['out_hidden_size_batch_level_starts'])
 
-        torch.testing.assert_close(ref_num_output_tokens,
-                                   outputs['num_output_tokens'],
-                                   rtol=0,
-                                   atol=0)
         torch.testing.assert_close(ref_sequence_lengths,
                                    outputs['output_sequence_lengths'],
                                    rtol=0,
@@ -812,9 +816,11 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             outputs['output_ids'][:ref_num_output_tokens[0]],
             rtol=0,
             atol=0)
+        num_position_ids = ref_num_output_tokens[
+            0] if layer_idx == 0 else batch_size
         torch.testing.assert_close(
             ref_position_ids,
-            outputs['output_position_ids'][:ref_num_output_tokens[0]],
+            outputs['output_position_ids'][:num_position_ids],
             rtol=0,
             atol=0)
         torch.testing.assert_close(
@@ -822,11 +828,6 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             outputs['hidden_states_indices'][:ref_num_output_tokens[0]],
             rtol=0,
             atol=0)
-
-        torch.testing.assert_close(ref_num_last_token_indices,
-                                   outputs['num_last_token_indices'],
-                                   rtol=0,
-                                   atol=0)
 
         torch.testing.assert_close(
             ref_last_token_indices,

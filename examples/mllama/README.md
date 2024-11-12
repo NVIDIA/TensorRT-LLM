@@ -7,8 +7,6 @@
 
 ```bash
 pip install -U transformers
-pip uninstall tensorrt -y
-pip install tensorrt~=10.4.0 # TensorRT 10.5 has a known issue to build the encoder engine.
 ```
 
 * build vision encoder model via onnx

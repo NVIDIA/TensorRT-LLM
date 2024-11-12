@@ -27,7 +27,7 @@ def parse_arguments():
         default=None,
         choices=[
             None, 'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon',
-            'kosmos-2'
+            'kosmos-2', 'nemotron'
         ],
         help=
         "By default the script will try to infer the gpt_variant from model_dir. "
@@ -40,10 +40,15 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument("--load_model_on_cpu", action="store_true")
     parser.add_argument(
         '--use_parallel_embedding',

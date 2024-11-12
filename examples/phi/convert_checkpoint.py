@@ -38,10 +38,15 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument(
         '--use_weight_only',
         default=False,
@@ -156,7 +161,7 @@ if __name__ == '__main__':
         assert False, "Invalid model type"
 
     is_phi3 = 'Phi3' in model_type or 'MoE' in model_type
-    phi_model = Phi3ForCausalLM if is_phi3 else PhiForCausalLM
+    phi_model_cls = Phi3ForCausalLM if is_phi3 else PhiForCausalLM
 
     quant_config = args_to_quant_config(args)
 
@@ -168,7 +173,7 @@ if __name__ == '__main__':
                           moe_tp_size=args.moe_tp_size,
                           moe_ep_size=args.moe_ep_size)
 
-        phi = phi_model.from_hugging_face(
+        phi = phi_model_cls.from_hugging_face(
             args.model_dir,
             args.dtype,
             mapping=mapping,

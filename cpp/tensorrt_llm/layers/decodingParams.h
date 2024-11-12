@@ -681,27 +681,33 @@ public:
     {
     }
 
+    //! Unpacked draft tokens
+    TensorPtr unpackedNextDraftTokens; // [maxBatchSize, maxDecodingDraftTokens] on gpu
     //! Draft paths for the next iteration.
-    TensorPtr nextDraftPaths; // [maxBatchSize, maxDecodingTokens, maxPathLen]
+    TensorPtr nextDraftPaths; // [maxBatchSize, maxDecodingTokens, maxPathLen] on gpu
     //! Randomly sampled data (between 0.f and 1.f)
     TensorPtr randomDataSample; // [maxBatchSize] on gpu
     //! Randomly sampled data (between 0.f and 1.f)
     TensorPtr randomDataValidation; // [maxBatchSize] on gpu
     //! Sampling temperature.
     TensorPtr temperatures; // [maxBatchSize] on gpu
+    //! Next generation lengths.
+    TensorPtr generationLengths; // [maxBatchSize] on gpu
+    //! Next generation lengths.
+    TensorPtr generationLengthsHost; // [maxBatchSize] on pinned
 
     //! Request types for ctx stage of the EagleNet0 (filled with 0s).
-    TensorPtr eagleNetCtxRequestTypesHost; //! [maxBatchSize]
+    TensorPtr eagleNetCtxRequestTypesHost; //! [maxBatchSize] on pinned
     //! Context lengths of the context EagleNet0.
-    TensorPtr eagleNetCtxContextLengthsHost; //! [maxBatchSize]
+    TensorPtr eagleNetCtxContextLengthsHost; //! [maxBatchSize] on pinned
     //! Past kv lengths of the context EagleNet0.
-    TensorPtr eagleNetCtxPastKeyValueLengthsHost; //! [maxBatchSize]
+    TensorPtr eagleNetCtxPastKeyValueLengthsHost; //! [maxBatchSize] on pinned
     //! Request types for ctx stage of the EagleNetX (filled with 1s).
-    TensorPtr eagleNetGenRequestTypesHost; //! [maxBatchSize]
+    TensorPtr eagleNetGenRequestTypesHost; //! [maxBatchSize] on pinned
     //! Context lengths of the generation EagleNetX.
-    TensorPtr eagleNetGenContextLengthsHost; //! [maxBatchSize]
+    TensorPtr eagleNetGenContextLengthsHost; //! [maxBatchSize] on pinned
     //! Past kv lengths of the generation EagleNetX.
-    TensorPtr eagleNetGenPastKeyValueLengthsHost; //! [maxBatchSize]
+    TensorPtr eagleNetGenPastKeyValueLengthsHost; //! [maxBatchSize] on pinned
 };
 
 } // namespace tensorrt_llm::layers

@@ -4749,6 +4749,7 @@ def gpt_attention(
     fused_q_proj: Optional[Tensor] = None,
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
+    skip_attn=None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4999,9 +5000,13 @@ def gpt_attention(
         host_context_progress: Tensor = None,
             The structure used to track layer-wise progress in context phase.
 
+        skip_attn: Tensor = None,
+            A bool tensor on CPU. If it is true, don't run attention plugin, returning directly.
+
     Returns:
         The tensor produced by that layer.
     '''
+
     assert host_request_types is not None
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -5223,7 +5228,9 @@ def gpt_attention(
     use_cache_pf = trt.PluginField("use_cache",
                                    np.array([use_cache], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
-
+    skip_attn_pf = trt.PluginField(
+        "skip_attn", np.array([skip_attn is not None], dtype=np.int8),
+        trt.PluginFieldType.INT8)
     pfc = trt.PluginFieldCollection([
         layer_idx, nheads, vision_start, vision_length, num_kv_heads,
         layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
@@ -5242,7 +5249,8 @@ def gpt_attention(
         use_fp8_context_fmha_field, has_full_attention_mask_field, use_cache_pf,
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
-        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim
+        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
+        skip_attn_pf
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5332,6 +5340,9 @@ def gpt_attention(
         assert kv_b_proj is not None
         plug_inputs += [fused_q_proj, q_b_proj, kv_b_proj]
 
+    if skip_attn is not None:
+        plug_inputs += [skip_attn]
+
     for idx, i in enumerate(plug_inputs):
         assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
 
@@ -5361,6 +5372,7 @@ def gpt_attention(
             layer.get_input(0).set_dynamic_range(-127, 127)
             layer.get_input(1).set_dynamic_range(-127, 127)
             layer.get_output(0).set_dynamic_range(-127, 127)
+
     assert output is not None
     return output, present_key_value
 
@@ -6395,7 +6407,8 @@ def rg_lru(input: Tensor,
 def topk(input: Tensor,
          k: Union[Tensor, int],
          dim: int,
-         largest: bool = True) -> Tuple[Tensor, Tensor]:
+         largest: bool = True,
+         prefer_plugin: bool = True) -> Tuple[Tensor, Tensor]:
     '''
     Add an topk operation.
 
@@ -6425,25 +6438,69 @@ def topk(input: Tensor,
         largest: bool
             Controls whether to return largest or smallest elements
 
+        prefer_plugin : bool
+            Whether to use the topkLastDim plugin if dim is last dim and k is static.
+
 
     Returns:
         The tensors (values, indices) produced by this topk operation.
     '''
-    dim = dim_resolve_negative(dim, input.ndim())
-    axes = dim_to_trt_axes(dim)
-    layer = default_trtnet().add_topk(
-        input.trt_tensor,
-        trt.TopKOperation.MAX if largest else trt.TopKOperation.MIN,
-        k=k if not isinstance(k, Tensor) else 1,
-        axes=axes)
-    if isinstance(k, Tensor):
-        if k.ndim() == 1:
-            k = squeeze(k, 0)
-        layer.set_input(1, k.trt_tensor)
-    values = layer.get_output(0)
-    indices = layer.get_output(1)
+    dim = dim_resolve_negative(dim, input.ndim())[0]
+    if prefer_plugin and dim == input.ndim() - 1 and not isinstance(k, Tensor):
+        last_dim = input.size(-1)
+        if last_dim == -1:  # dynamic?
+            last_dim = shape(input, -1)
+        # since we might need to flatten the input to 2d tensor,
+        # we need to prepare the output shape
+        out_shape = []
+        for i in range(input.ndim() - 1):
+            out_shape.append(shape(input, i))
+        out_shape = concat(out_shape + [k])
+        if input.ndim() == 1:
+            input_2d = unsqueeze(input,
+                                 0)  # special handling of rank-1 dynamic tensor
+        elif input.ndim() != 2:
+            input_2d = input.view(concat([-1, last_dim]),
+                                  zero_is_placeholder=False)
+        else:
+            input_2d = input
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            "TopkLastDim", "1", TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+        is_largest = trt.PluginField(
+            "is_largest", np.array(1 if largest else 0, dtype=np.int32),
+            trt.PluginFieldType.INT32)
+        k = trt.PluginField("k", np.array(k, dtype=np.int32),
+                            trt.PluginFieldType.INT32)
+        pf_type = trt.PluginField("type_id",
+                                  np.array([int(input_2d.dtype)], np.int32),
+                                  trt.PluginFieldType.INT32)
+        pfc = trt.PluginFieldCollection([pf_type, k, is_largest])
+        topk_last_dim_plug = plg_creator.create_plugin("topk_last_dim", pfc)
+        plug_inputs = [input_2d]
+        plug_inputs = [i.trt_tensor for i in plug_inputs]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, topk_last_dim_plug)
+        _add_plugin_info(layer, plg_creator, "topk_last_dim", pfc)
+        values = _create_tensor(layer.get_output(0), layer)
+        indices = _create_tensor(layer.get_output(1), layer)
+        values = values.view(out_shape, zero_is_placeholder=False)
+        indices = indices.view(out_shape, zero_is_placeholder=False)
+    else:
+        # non-plugin path
+        axes = dim_to_trt_axes(dim)
+        layer = default_trtnet().add_topk(
+            input.trt_tensor,
+            trt.TopKOperation.MAX if largest else trt.TopKOperation.MIN,
+            k=k if not isinstance(k, Tensor) else 1,
+            axes=axes)
+        if isinstance(k, Tensor):
+            if k.ndim() == 1:
+                k = squeeze(k, 0)
+            layer.set_input(1, k.trt_tensor)
+        values = _create_tensor(layer.get_output(0), layer)
+        indices = _create_tensor(layer.get_output(1), layer)
 
-    return _create_tensor(values, layer), _create_tensor(indices, layer)
+    return values, indices
 
 
 def scatter_nd(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:

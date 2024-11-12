@@ -611,6 +611,7 @@ class ModelConfig:
     redrafter_draft_len_per_beam: int = 0
     num_kv_heads_per_layer: Optional[List[int]] = None
     num_kv_heads_per_cross_attn_layer: Optional[List[int]] = None
+    skip_cross_attn_blocks: bool = False
 
 
 @dataclass
@@ -717,7 +718,7 @@ class RuntimeTensor:
             name: str,
             data: torch.Tensor,
             override_shape: Optional[Iterable] = None) -> 'RuntimeTensor':
-        assert (isinstance(data, torch.Tensor))
+        assert (isinstance(data, torch.Tensor)), f"data {name} is {type(data)}"
         t = RuntimeTensor()
         t._name = name
         # need to hold the torch tensor for memory life time
@@ -991,6 +992,8 @@ class GenerationSession(object):
                 'encoder_max_input_length',
                 'cross_kv_cache_gen',
             ]
+            if model_config.skip_cross_attn_blocks:
+                expected_tensor_names += ['skip_cross_attn_blocks']
             self.skip_cross_kv = model_config.skip_cross_kv
             if self.skip_cross_kv:
                 expected_tensor_names += ['cross_kv_reuse']
@@ -2020,6 +2023,7 @@ class GenerationSession(object):
         encoder_input_lengths: torch.Tensor = None,
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
+        skip_cross_attn_blocks: torch.Tensor = None,
     ) -> Dict[str, RuntimeTensor]:
         tensors = {}
 
@@ -2055,6 +2059,8 @@ class GenerationSession(object):
             # in context phase, need to generate cross kv cache, set to True
             add_tensor(torch.ones(1, dtype=torch.bool, device=self.device),
                        'cross_kv_cache_gen')
+            if self._model_config.skip_cross_attn_blocks:
+                add_tensor(skip_cross_attn_blocks, 'skip_cross_attn_blocks')
             if self.skip_cross_kv:
                 if self.cross_kv_reuse is None:
                     # see Attention's self.qkv output dim
@@ -2335,6 +2341,7 @@ class GenerationSession(object):
         encoder_input_lengths: torch.Tensor = None,
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
+        skip_cross_attn_blocks: torch.Tensor = None,
     ):
         torch.cuda.nvtx.range_push("_get_next_step_shape_buffer")
         tensors = {}  # Dict[str, RuntimeTensor]
@@ -2422,6 +2429,8 @@ class GenerationSession(object):
             # in generation phase, cross kv cache is already filled during context phase, set to False
             add_tensor(torch.zeros(1, dtype=torch.bool, device=self.device),
                        'cross_kv_cache_gen')
+            if self._model_config.skip_cross_attn_blocks:
+                add_tensor(skip_cross_attn_blocks, 'skip_cross_attn_blocks')
             add_tensor_with_shape(encoder_output, 'encoder_output',
                                   encoder_output_shape)
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
@@ -3279,6 +3288,7 @@ class GenerationSession(object):
             next_src_cache_indirection = cache_indirections[1]
 
         position_ids_raw = kwargs.get('position_ids', None)
+        skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
         if step == 0:
             model_inputs = self._prepare_context_inputs(
                 batch_size=batch_size,
@@ -3339,6 +3349,7 @@ class GenerationSession(object):
                 encoder_input_lengths,
                 host_runtime_perf_knobs=context_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
+                skip_cross_attn_blocks=skip_cross_attn_blocks,
             )
 
             context = self.runtime.ctx_context
@@ -3555,6 +3566,7 @@ class GenerationSession(object):
                 encoder_input_lengths,
                 host_runtime_perf_knobs=gen_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
+                skip_cross_attn_blocks=skip_cross_attn_blocks,
             )
 
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object

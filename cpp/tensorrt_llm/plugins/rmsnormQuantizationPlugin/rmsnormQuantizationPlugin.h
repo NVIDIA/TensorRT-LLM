@@ -29,7 +29,7 @@ namespace tensorrt_llm::plugins
 class RmsnormQuantizationPlugin : public BasePlugin
 {
 public:
-    RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, bool clampValEnabled,
+    RmsnormQuantizationPlugin(float eps, bool dynamicActivationScaling, bool sumPerToken, bool clampValEnabled,
         tensorrt_llm::common::QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType);
 
     RmsnormQuantizationPlugin(void const* data, size_t length);
@@ -52,7 +52,7 @@ public:
     template <typename T, typename QuantT>
     void dispatchDataType(void* out, void const* input, void const* gamma, void const* beta, float const eps,
         int const tokens, int const hidden_dim, cudaStream_t stream, void const* clampValPtr, void const* scale,
-        void* dynamic_scale, void* normed_output_quant) noexcept;
+        void* dynamic_scale, void* normed_output_quant, void* act_sum) noexcept;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
@@ -80,6 +80,8 @@ private:
     bool mClampValEnabled;
     // The quantization mode.
     tensorrt_llm::common::QuantMode mQuantMode;
+    // Should we output the sum of channels per-token? (Used by QServe GEMM)
+    bool mSumPerToken;
 };
 
 class RmsnormQuantizationPluginCreator : public BaseCreator

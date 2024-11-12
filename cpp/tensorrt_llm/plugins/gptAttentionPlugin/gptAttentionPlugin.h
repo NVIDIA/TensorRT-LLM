@@ -86,6 +86,8 @@ namespace tensorrt_llm::plugins
 //     30. kv_a_layernorm_tensor(MLA) [c_k_dim], rmsnorm weight for compacted kv
 //     31. kv_b_proj_tensor(MLA) [c_k_dim, head_num * 2 * (head_size - rope_dim)], weight for compacted kv to kv in
 //     context
+//     32. skip_attn (optional, bool) [1]: If it is set as true, skip the atteniton plugin and return
+//     directly.
 //
 // outputs
 //     output_tensor [batch_size, seq_len, local_hidden_size]
@@ -113,7 +115,7 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0);
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false);
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -223,7 +225,8 @@ private:
         MLA_FUSED_Q_PROJ_TENSOR,
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
-        ENUM_SIZE,
+        SKIP_ATTN,
+        ENUM_SIZE, // Used to count the number of IdxEntry, must put in last
     };
 
     std::string toString(IdxEntry const& entry) const;

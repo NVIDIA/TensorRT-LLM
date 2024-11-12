@@ -1,27 +1,23 @@
 #!/usr/bin/env python
 import asyncio
-import logging
 import signal
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
-from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
-                    TypedDict)
+from typing import AsyncGenerator, AsyncIterator, List, Tuple, TypedDict
 
-import click
 import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openai.types.chat import ChatCompletionMessageParam
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
+from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_utils import LlmArgs
-from tensorrt_llm.llmapi.openai_protocol import (
+from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionLogProbs, ChatCompletionLogProbsContent,
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionResponseChoice,
@@ -65,7 +61,7 @@ def parse_chat_message_content(
     return [ConversationMessage(role=role, content=text_prompt)]
 
 
-class OpenaiServer:
+class OpenAIServer:
 
     def __init__(self,
                  llm: LLM,
@@ -456,57 +452,3 @@ class OpenaiServer:
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
-
-
-@click.command()
-@click.argument("model_dir")
-@click.option("--tokenizer", type=str, default=None)
-@click.option("--host", type=str, default=None)
-@click.option("--port", type=int, default=8000)
-@click.option("--max_beam_width", type=int, default=1)
-@click.option("--max_seq_len", type=int, default=512)
-@click.option("--tp_size", type=int, default=1)
-@click.option("--pp_size", type=int, default=1)
-@click.option("--kv_cache_free_gpu_memory_fraction", type=float, default=0.8)
-@click.option("--trust_remote_code", is_flag=True, default=False)
-def entrypoint(model_dir: str,
-               tokenizer: Optional[str] = None,
-               host: Optional[str] = None,
-               port: int = 8000,
-               max_beam_width: int = 1,
-               max_seq_len: int = 512,
-               tp_size: int = 1,
-               pp_size: int = 1,
-               kv_cache_free_gpu_memory_fraction: float = 0.8,
-               trust_remote_code: bool = False):
-    host = host or "0.0.0.0"
-    port = port or 8000
-    logging.info(f"Starting server at {host}:{port}")
-
-    build_config = BuildConfig(max_batch_size=10, max_beam_width=max_beam_width, max_seq_len=max_seq_len)
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
-
-    llm_args = LlmArgs.from_kwargs(
-        model=model_dir,
-        tokenizer=tokenizer,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        trust_remote_code=trust_remote_code,
-        build_config=build_config,
-        kv_cache_config=kv_cache_config,
-    )
-
-    llm = LLM(**llm_args.to_dict())
-
-    hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model_dir)
-
-    server = OpenaiServer(llm=llm,
-                          model=model_dir,
-                          hf_tokenizer=hf_tokenizer)
-
-    asyncio.run(server(host, port))
-
-
-if __name__ == "__main__":
-    entrypoint()

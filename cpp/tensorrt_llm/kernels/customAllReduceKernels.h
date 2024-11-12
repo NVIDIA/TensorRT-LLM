@@ -38,6 +38,7 @@ static constexpr int kWarpSize = 32;
 static constexpr int kMaxCtaSize = 1024;
 static constexpr int kClusterMaxSize = 8;
 static constexpr int kLamportTokenNumThreshold = 16;
+static constexpr int kLamportHiddenSizeThreshold = 256;
 }; // namespace reduce_fusion::details
 
 // Warning: python definition is in tensorrt_llm/functional.py
@@ -103,7 +104,7 @@ struct AllReduceParams
     AllReduceFusionParams fusion_params;
 
     static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
-        int token_num, AllReduceFusionOp op);
+        int token_num, int hidden_size, AllReduceFusionOp op);
 };
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
