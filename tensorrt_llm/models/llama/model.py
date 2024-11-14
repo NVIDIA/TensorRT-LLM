@@ -36,7 +36,6 @@ from .convert import (load_hf_llama, load_weights_from_gptq,
                       load_weights_from_hf_safetensors,
                       load_weights_from_lmquant, load_weights_from_meta_ckpt)
 
-from tensorrt_llm.quantization import QuantAlgo
 
 class LLaMADecoderLayer(Module):
 
