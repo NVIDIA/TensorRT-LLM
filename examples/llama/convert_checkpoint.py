@@ -439,7 +439,7 @@ def convert_and_save_hf(args):
         # llava_llama needs its own defined config.
         logger.warning("AutoConfig cannot load the huggingface config.")
 
-    if args.smoothquant is not None or args.int8_kv_cache:
+    if (args.smoothquant is not None or args.int8_kv_cache) and not args.use_qserve:
         assert not args.load_by_shard, "When using quantization, TRT-LLM needs to load the whole HF model, thus load by shard not supported"
         mapping = Mapping(world_size=world_size,
                           tp_size=args.tp_size,
@@ -474,6 +474,10 @@ def convert_and_save_hf(args):
                 args.dtype,
                 mapping=mapping,
                 quant_config=quant_config,
+                device='cpu' if args.load_model_on_cpu else 'cuda',
+                calib_dataset=args.calib_dataset,
+                calib_batches=args.calib_size,
+                calib_max_seq_length=args.calib_max_seq_length,
                 load_by_shard=load_by_shard,
                 **override_fields,
             )

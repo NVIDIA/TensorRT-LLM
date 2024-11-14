@@ -521,7 +521,7 @@ def qserve_quantize(model, quant_config: QuantConfig):
 def kv_cache_quantize(model):
     for name, module in model.named_modules():
         if isinstance(module,
-                      (Attention, SmoothQuantAttention, Fp8RowwiseAttention)):
+                      (Attention, SmoothQuantAttention, Fp8RowwiseAttention, QServeAttention)):
             module.kv_cache_scaling_factor = Parameter(shape=(1, ),
                                                        dtype='float32')
     return model

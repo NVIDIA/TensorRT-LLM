@@ -36,6 +36,7 @@ from .convert import (load_hf_llama, load_weights_from_gptq,
                       load_weights_from_hf_safetensors,
                       load_weights_from_lmquant, load_weights_from_meta_ckpt)
 
+from tensorrt_llm.quantization import QuantAlgo
 
 class LLaMADecoderLayer(Module):
 
@@ -331,6 +332,10 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             dtype: str = 'auto',
             mapping: Optional[Mapping] = None,
             quant_config: Optional[QuantConfig] = None,
+            device: str = 'cuda',
+            calib_dataset: str = 'cnn_dailymail',
+            calib_batches: int = 512,
+            calib_max_seq_length: int = 512,
             **kwargs):
         ''' Create a LLaMAForCausalLM object from give parameters
         '''
@@ -413,7 +418,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 if quant_config.quant_mode.is_int4_weight_only():
                     weights = load_weights_from_gptq(quant_ckpt_path, config)
                 elif quant_config.quant_mode.is_qserve_w4a8():
-                    weights = load_weights_from_lmquant(quant_ckpt_path, config)
+                    weights = load_weights_from_lmquant(quant_ckpt_path, 
+                        config, quant_config, hf_model_dir,
+                        device, calib_dataset, calib_batches, calib_max_seq_length)
                 else:
                     raise ValueError(
                         "quant_ckpt_path should be specified only for GPTQ or QServe"

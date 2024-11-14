@@ -43,7 +43,7 @@ from ..convert_utils import (dup_kv_weight, generate_int8,
                              retrieved_layer_index_from_name, smooth_gemm,
                              smooth_gemm_fc1_gate, split, split_matrix_tp,
                              split_qkv_bias_tp, split_qkv_tp)
-from ..modeling_utils import PretrainedConfig
+from ..modeling_utils import PretrainedConfig, QuantConfig
 from .config import LLaMAConfig
 
 
@@ -1921,7 +1921,16 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
     return weights
 
 
-def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
+def load_weights_from_lmquant(
+        lmquant_ckpt_path: str, 
+        config: LLaMAConfig,
+        quant_config: QuantConfig,
+        hf_model_dir: str,
+        device: str = "cuda",
+        calib_dataset: str = "cnn_dailymail",
+        calib_batches: int = 512,
+        calib_max_seq_length: int = 512,
+        ):
     logger.info(
         'Loading weights from lmquant torch checkpoint for QServe W4A8 inference...'
     )
@@ -1944,6 +1953,40 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
     # scale.0, scale.1, zero
     quant_params = torch.load(lmquant_ckpt_path + '/scale.pt',
                               map_location='cpu')
+
+    int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
+
+    act_range = {}
+    if int8_kv_cache:
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            hf_model_dir,
+            device_map=device if device != 'cpu' else 'cpu',
+            torch_dtype='auto',
+            trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            hf_model_dir,
+            trust_remote_code=True,
+            use_fast=False,
+            padding_side='left')
+        
+        dataset = load_calib_dataset(calib_dataset)
+
+        if calib_batches == -1:
+            calib_batches = len(dataset)
+    
+        model_prefix, layer_prefix, param_name_map = get_prefix_and_param_name_map(
+            config.architecture, use_safetensors=True)
+        
+        lmquant_keys = fake_quant_weights.keys()
+        for name, param in hf_model.named_parameters():
+            if name in lmquant_keys:
+                param.data = fake_quant_weights[name].data.to(device)
+
+        act_range = capture_activation_range(hf_model,
+                                            tokenizer,
+                                            dataset,
+                                            num_samples=calib_batches,
+                                            seq_len=calib_max_seq_length)
 
     def load(key):
         if 'zero' in key:
@@ -2082,6 +2125,24 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         ]
         weights.update(
             process_weight_and_params(qkv, f'{tllm_prex}.attention.qkv'))
+        
+        if int8_kv_cache:
+            act_range_prefix = f'{model_prefix}.{layer_prefix}.{layer_idx}.'
+            qkv_y = torch.cat([
+                # act_range.get(act_range_prefix +
+                #               f'{param_name_map["attention.qkv"]}.q_proj')["y"],
+                act_range.get(act_range_prefix +
+                              f'{param_name_map["attention.qkv"]}.k_proj')["y"],
+                act_range.get(act_range_prefix +
+                              f'{param_name_map["attention.qkv"]}.v_proj')["y"]
+            ], dim=0)
+
+            int8_kv_scales = qkv_y.max() / 127.
+
+            kv_cache_weights = {}
+
+            kv_cache_weights[f'{tllm_prex}.attention.kv_cache_scaling_factor'] = int8_kv_scales.reshape([1])
+            weights.update(kv_cache_weights)
 
         # 4.2 attention.dense
         v = [
