@@ -767,9 +767,9 @@ Please follow the steps to run the model using QServe w4aINT8:
 
 1. Weight quantization:
 
-   Currently we rely on the 3rd-party repo [lmquant](https://github.com/mit-han-lab/lmquant) to prepare the quantized checkpoint. Follow the [instructions](https://github.com/mit-han-lab/lmquant/blob/main/projects/llm/README.md) to quantize the model. Please use the `configs/qoq/g128.yaml` for per-group quantization, and `configs/qoq/gchn.yaml` for the per-channel quantization. Do not forget to add the flag `--save-model` so that the quantized model is dumped to the disk.
+   Currently we rely on the 3rd-party repo [deepcompressor](https://github.com/mit-han-lab/deepcompressor) to prepare the fake-quantized checkpoint. Follow the [instructions](https://github.com/mit-han-lab/deepcompressor/blob/main/examples/llm/README.md#usage) to quantize the model. Please use the `configs/qoq-g128.yaml` for per-group quantization, and `configs/qoq-gchn.yaml` for the per-channel quantization. Do not forget to add the flag `--save-model path/to/deepcompressor/ckpt` so that the quantized model is dumped to the disk.
 
-   After quantization, the original Hugging Face checkpoint (assume under `path/to/huggingface/ckpt/`) will be quantized and the following files are obtained under your `path/to/lmquant/ckpt`:
+   After quantization, the weights in the original Hugging Face checkpoint (assume under `path/to/huggingface/ckpt/`) will be quantized and the following files are obtained under your `path/to/deepcompressor/ckpt`:
 
    - `model.pt`: fake-quantized fp16 weights.
    - `scale.pt`: quantization scales and zeros.

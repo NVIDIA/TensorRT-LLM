@@ -42,8 +42,6 @@
 #include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
 
-#pragma GCC diagnostic pop
-
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"

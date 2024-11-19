@@ -45,4 +45,6 @@ bool getEnvUseUCXKvCache();
 
 std::string getEnvUCXInterface();
 
+bool getEnvDisaggLayerwise();
+
 } // namespace tensorrt_llm::common

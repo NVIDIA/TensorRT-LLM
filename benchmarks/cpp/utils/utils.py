@@ -50,7 +50,7 @@ def print_dataset(input_ids, output_lens):
     for i, input_tokens in enumerate(input_ids):
         d = {
             "task_id": i,
-            "logits": input_tokens,
+            "input_ids": input_tokens,
             "output_tokens": output_lens[i]
         }
         print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))

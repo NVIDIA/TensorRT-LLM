@@ -169,7 +169,6 @@ class PromptTuningEmbedding(Embedding):
 
         # put virtual tokens in the [0, max_prompt_vocab_size) range
         prompt_tokens = where(prompt_tokens_mask, tokens - self.vocab_size, 0)
-
         # add offsets to match the concatenated embedding tables
         tasks = tasks * task_vocab_size
 

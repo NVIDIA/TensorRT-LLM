@@ -52,10 +52,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import (AutoModel, AutoModelForCausalLM,
+from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, AutoTokenizer,
                           GenerationConfig)
-from utils import add_common_args, load_tokenizer, read_model_name
+from utils import (add_common_args, load_tokenizer, prepare_enc_dec_inputs,
+                   read_model_name)
 
 import tensorrt_llm
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -248,7 +249,8 @@ def get_tokenizer(ckpt_path, max_seq_len):
 class Pipeline:
 
     def __init__(self, tokenizer, model, model_name, pad_id, end_id,
-                 max_attention_window_size):
+                 max_attention_window_size, is_enc_dec, hf_model_dir,
+                 engine_dir):
         self.tokenizer = tokenizer
         self.model = model
         self.model_name = model_name
@@ -256,6 +258,12 @@ class Pipeline:
         self.end_id = end_id
         self.max_attention_window_size = max_attention_window_size
         self.output_len = 2
+        self.is_enc_dec = is_enc_dec
+        self.decoder_start_token_id = None
+        self.engine_dir = engine_dir
+        if self.is_enc_dec:
+            self.decoder_start_token_id = AutoConfig.from_pretrained(
+                hf_model_dir).decoder_start_token_id
 
     def __call__(self, prompt):
         rank = tensorrt_llm.mpi_rank()
@@ -284,17 +292,40 @@ class Pipeline:
                 ]
                 batch_input_ids = torch.stack(batch_input_ids)
                 batch_input_ids = batch_input_ids.cuda()
+                if self.is_enc_dec:
+                    batch_decoder_input_ids = torch.IntTensor(
+                        [[self.decoder_start_token_id]]).to('cuda')
+                    batch_decoder_input_ids = batch_decoder_input_ids.repeat(
+                        (batch_input_ids.shape[0], 1))
+
                 with torch.no_grad():
                     # Use default temperature and top_k
-                    outputs = self.model.generate(batch_input_ids,
-                                                  max_new_tokens=output_len,
-                                                  top_k=top_k)
-                    output_ids = outputs[0, input_lengths[0]:]
+                    outputs = self.model.generate(
+                        batch_input_ids,
+                        max_new_tokens=output_len,
+                        top_k=top_k,
+                        decoder_input_ids=batch_decoder_input_ids
+                        if self.is_enc_dec else None)
+                    if not self.is_enc_dec:
+                        output_ids = outputs[0, input_lengths[0]:]
+                    else:
+                        output_ids = outputs[0]
 
             elif isinstance(self.model, ModelRunnerCpp) or isinstance(
                     self.model, ModelRunner):
+                if self.is_enc_dec:
+                    encoder_input_ids, encoder_input_features, encoder_output_lengths, decoder_input_ids = prepare_enc_dec_inputs(
+                        batch_input_ids, self.model_name, self.engine_dir, None)
+
                 outputs = self.model.generate(
-                    batch_input_ids,
+                    batch_input_ids=decoder_input_ids
+                    if self.is_enc_dec else batch_input_ids,
+                    encoder_input_ids=encoder_input_ids
+                    if self.is_enc_dec else None,
+                    encoder_input_features=encoder_input_features
+                    if self.is_enc_dec else None,
+                    encoder_output_lengths=encoder_output_lengths
+                    if self.is_enc_dec else None,
                     max_new_tokens=output_len,
                     max_attention_window_size=self.max_attention_window_size,
                     end_id=self.end_id,
@@ -304,8 +335,10 @@ class Pipeline:
                 )
                 torch.cuda.synchronize()
                 if rank == 0:
-                    output_ids = outputs[0, 0, input_lengths[0]:]
-
+                    if not self.is_enc_dec:
+                        output_ids = outputs[0, 0, input_lengths[0]:]
+                    else:
+                        output_ids = outputs[0, 0]
         if rank == 0:
             return self.tokenizer.decode(output_ids, skip_special_tokens=True)
         else:
@@ -365,7 +398,17 @@ def main():
     }
     cat_cors = {cat: [] for cat in get_categories()}
 
-    model_name, model_version = read_model_name(args.engine_dir)
+    # different handling if encoder-decoder models
+    is_enc_dec = {'encoder', 'decoder'}.issubset({
+        name
+        for name in os.listdir(args.engine_dir)
+        if os.path.isdir(os.path.join(args.engine_dir, name))
+    })
+
+    model_name, model_version = read_model_name(
+        args.engine_dir if not is_enc_dec else os.path.
+        join(args.engine_dir, 'encoder'))
+
     tokenizer, pad_id, end_id = load_tokenizer(
         tokenizer_dir=args.tokenizer_dir,
         vocab_file=args.vocab_file,
@@ -380,13 +423,16 @@ def main():
         if PYTHON_BINDINGS:
             runner_kwargs.update(max_beam_width=1)
         runner_kwargs.update(
+            is_enc_dec=is_enc_dec,
             max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
             kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
             kv_cache_free_gpu_memory_fraction=args.
             kv_cache_free_gpu_memory_fraction,
+            cross_kv_cache_fraction=args.cross_kv_cache_fraction
+            if is_enc_dec else None,
             enable_chunked_context=args.enable_chunked_context,
             multi_block_mode=args.multi_block_mode)
-        model = runner_cls.from_dir(args.engine_dir,
+        model = runner_cls.from_dir(engine_dir=args.engine_dir,
                                     rank=runtime_rank,
                                     **runner_kwargs)
     else:
@@ -395,6 +441,8 @@ def main():
             auto_model_cls = AutoModelForSeq2SeqLM
         elif 'GLM' in model_name and model_version == 'chatglm':
             auto_model_cls = AutoModel
+        elif is_enc_dec:
+            auto_model_cls = AutoModelForSeq2SeqLM
         else:
             auto_model_cls = AutoModelForCausalLM
         model = auto_model_cls.from_pretrained(
@@ -410,7 +458,8 @@ def main():
                 args.hf_model_dir, trust_remote_code=True)
 
     pipeline = Pipeline(tokenizer, model, model_name, pad_id, end_id,
-                        args.max_attention_window_size)
+                        args.max_attention_window_size, is_enc_dec,
+                        args.hf_model_dir, args.engine_dir)
 
     for subject in tqdm(subjects):
         dev_df = pd.read_csv(os.path.join(args.data_dir, "dev",

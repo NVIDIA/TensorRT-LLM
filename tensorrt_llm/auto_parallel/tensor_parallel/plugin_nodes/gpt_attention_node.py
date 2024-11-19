@@ -40,9 +40,11 @@ class IdxEntry(Enum):
     ENCODER_INPUT_LENGTH = auto()
     HOST_CONTEXT_LENGTH = auto()
     QKV_BIAS_TENSOR = auto()
+    SPEC_DECODING_GENERATION_LENGTHS = auto()
     SPEC_DECODING_PACKED_MASK = auto()
     SPEC_DECODING_POSITION_OFFSETS = auto()
-    SPEC_DECODING_GENERATION_LENGTHS = auto()
+    MROPE_ROTARY_SIN_COS = auto()
+    MROPE_POSITION_DELTAS = auto()
     HOST_RUNTIME_PERF_KNOBS = auto()
     HOST_CONTEXT_PROGRESS = auto()
     MLA_FUSED_Q_PROJ_TENSOR = auto()
@@ -144,6 +146,10 @@ class IdxEntryParser:
             return self.is_spec_decoding_enabled
         elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
             return self.is_spec_decoding_enabled
+        elif entry == IdxEntry.MROPE_ROTARY_SIN_COS:
+            return self.position_embedding_type.is_mrope()
+        elif entry == IdxEntry.MROPE_POSITION_DELTAS:
+            return self.position_embedding_type.is_mrope()
         elif entry == IdxEntry.HOST_RUNTIME_PERF_KNOBS:
             return True
         elif entry == IdxEntry.HOST_CONTEXT_PROGRESS:

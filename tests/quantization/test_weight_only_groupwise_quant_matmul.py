@@ -114,7 +114,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         session = create_session(builder,
                                  network,
                                  precision=dtype,
-                                 memory_pool_limit=33554432)
+                                 memory_pool_limit=133554432)
         inputs = {
             'activation': th_activation,
             'pre_quant_scale': th_pre_quant_scale,

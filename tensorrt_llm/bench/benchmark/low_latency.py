@@ -12,6 +12,7 @@ import click
 import yaml
 from click_option_group import optgroup
 
+from tensorrt_llm.bench.benchmark.utils.reporting import StatsKeeper
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 os.environ["TLLM_LOG_LEVEL"] = "WARNING"
@@ -19,9 +20,12 @@ os.environ["TLLM_LOG_LEVEL"] = "WARNING"
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.benchmark.dataclasses import (BenchmarkStatistics,
                                                       RuntimeConfig)
-from tensorrt_llm.bench.benchmark.utils import (StatsKeeper,
-                                                get_executor_requests,
-                                                get_settings_from_engine)
+
+# isort: off
+from tensorrt_llm.bench.benchmark.utils.general import (get_executor_requests,
+                                                        get_settings_from_engine
+                                                        )
+# isort: on
 from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
 from tensorrt_llm.bench.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,

@@ -1,4 +1,4 @@
-tensorrt_llm==0.15.0.dev2024111200
+tensorrt_llm==0.16.0.dev2024111900
 nemo-toolkit[all]==2.0.0rc1
 megatron-core==0.8.0
 datasets~=2.14.5

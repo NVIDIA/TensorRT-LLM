@@ -28,15 +28,16 @@ class EagleModule : public SpeculativeDecodingModule
 public:
     // Number of paths is maxDecodingTokens = maxDecodingDraftTokens + 1 to account for very flat trees with
     // depth 1.
-    explicit EagleModule(
-        SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens, SizeType32 numTransformersLayer) noexcept
+    explicit EagleModule(SizeType32 maxDraftPathLen, SizeType32 maxDecodingDraftTokens, SizeType32 numTransformersLayer,
+        SizeType32 maxNonLeafNodesPerLayer) noexcept
         : SpeculativeDecodingModule(maxDraftPathLen, maxDecodingDraftTokens, maxDecodingDraftTokens + 1)
         , mNumTransformersLayer(numTransformersLayer)
+        , mMaxNonLeafNodesPerLayer(maxNonLeafNodesPerLayer)
     {
     }
 
     explicit EagleModule() noexcept
-        : EagleModule(0, 0, 0)
+        : EagleModule(0, 0, 0, 0)
     {
     }
 
@@ -50,8 +51,14 @@ public:
         return mNumTransformersLayer;
     }
 
+    [[nodiscard]] SizeType32 getMaxNonLeafNodesPerLayer() const noexcept
+    {
+        return mMaxNonLeafNodesPerLayer;
+    }
+
 private:
     SizeType32 mNumTransformersLayer;
+    SizeType32 mMaxNonLeafNodesPerLayer;
 
     // We use mc_sim_7b_63 from official Medusa implementation, i.e. one of the best trees with 63 nodes found for 7B
     // Vicuna model. We use it as default, if no other are trees are specified per request or on the server level.

@@ -59,6 +59,7 @@ enum class PositionEmbeddingType : int8_t
     kRELATIVE = 6,
     kCHATGLM = 7,
     kYARN = 8,
+    kROPE_M = 9,
 };
 
 enum class RotaryScalingType : int8_t

@@ -402,11 +402,12 @@ def mpi_world_size():
 
 
 def mpi_barrier():
-    mpi_comm().Barrier()
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root)
+    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
 
 
 def pad_vocab_size(vocab_size, tp_size):

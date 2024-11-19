@@ -642,6 +642,7 @@ class RotaryScalingType(IntEnum):
     longrope = 3
     llama3 = 4
     yarn = 5
+    mrope = 6
 
     @staticmethod
     def from_string(s):
@@ -660,9 +661,16 @@ class PositionEmbeddingType(IntEnum):
     alibi_with_scale = 5
     relative = 6
     chatglm = 7
+    yarn = 8
+    mrope = 9
 
     def is_rope(self) -> bool:
-        return self in [self.rope_gptj, self.rope_gpt_neox, self.long_rope]
+        return self in [
+            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope
+        ]
+
+    def is_mrope(self) -> bool:
+        return self in [self.mrope]
 
     def is_alibi(self) -> bool:
         return self in [self.alibi, self.alibi_with_scale]
@@ -4233,8 +4241,9 @@ class RopeEmbeddingUtils:
                                                 dtype=dtype),
                                       axis=-1)
         # fuse cos/sin into float2 (cos, sin).
-        concat = np.concatenate((np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
-                                axis=-1)
+        concat = np.concatenate(
+            (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
+            axis=-1)  #np.cos(sinusoid_inp).shape = (32768, 64, 1)
 
         return inv_freq, concat.reshape(1, -1).astype(dtype)
 
@@ -4737,6 +4746,8 @@ def gpt_attention(
     spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
+    mrope_rotary_sin_cos: Tensor = None,
+    mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
     host_context_progress: Tensor = None,
     layer_idx_in_cache_pool: Optional[int] = None,
@@ -5009,6 +5020,8 @@ def gpt_attention(
 
     assert host_request_types is not None
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
+    assert (mrope_rotary_sin_cos
+            is not None) == (position_embedding_type.is_mrope())
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert attn_plg_creator is not None
@@ -5327,6 +5340,12 @@ def gpt_attention(
         plug_inputs += [
             spec_decoding_generation_lengths, spec_decoding_packed_mask,
             spec_decoding_position_offsets
+        ]
+    if mrope_rotary_sin_cos is not None:
+        assert mrope_position_deltas is not None
+        plug_inputs += [
+            mrope_rotary_sin_cos,
+            mrope_position_deltas,
         ]
     if host_runtime_perf_knobs is not None:
         plug_inputs += [host_runtime_perf_knobs]
@@ -6570,6 +6589,11 @@ def low_latency_gemm(input: Tensor,
         return _create_tensor(layer.get_output(0), layer)
 
 
+class SideStreamIDType(IntEnum):
+    disable = 0
+    moe = 1
+
+
 def low_latency_gemm_swiglu(input: Tensor,
                             weight: Tensor,
                             scale_d0: float = 1.0,
@@ -6630,3 +6654,38 @@ def low_latency_gemm_swiglu(input: Tensor,
                                            low_latency_gemm_swiglu_plug)
 
     return _create_tensor(layer.get_output(0), layer)
+
+
+def cuda_stream_sync(input_list: List[Tensor],
+                     side_stream_id: SideStreamIDType) -> Tensor:
+    '''
+    Wait for the side stream on the main stream.
+    output = input_list[0]
+
+    Parameters:
+        input_list : List[Tensor] (On GPU)
+            The list of input tensors.
+        side_stream_id : int (On CPU)
+            The side stream ID.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        "CudaStream", "1", TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_side_stream_id = trt.PluginField("side_stream_id",
+                                       np.array(side_stream_id, dtype=np.int32),
+                                       trt.PluginFieldType.INT32)
+    p_num_inputs = trt.PluginField("num_inputs",
+                                   np.array(len(input_list), dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(input_list[0].dtype)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([p_side_stream_id, p_num_inputs, pf_type])
+    plug = plg_creator.create_plugin("cuda_stream", pfc)
+    plug_inputs = [input.trt_tensor for input in input_list]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, plug)
+    _add_plugin_info(layer, plg_creator, "cuda_stream", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output

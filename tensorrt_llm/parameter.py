@@ -61,6 +61,8 @@ class Parameter:
         self._prefer_managed = prefer_managed
         self._tensor: Tensor = None
         self._network: weakref.ref = None
+        self._name = None
+        self.need_transpose = False
 
     @property
     def shape(self):
@@ -101,6 +103,7 @@ class Parameter:
         if self._network is None or self._network() != network:
             self._network = weakref.ref(network)
             self._tensor = network.get_parameter_tensor(self)
+            self.need_transpose = need_transpose
             if self._tensor is None:
                 self._tensor = self._create_managed_tensor(
                     network, need_transpose)

@@ -74,7 +74,9 @@ struct TopKSamplingKernelParams
     //! input/output buffer [maxBatchSize], optional.
     //! Cumulative log probability of selected tokens. Ignored if nullptr
     float* cumLogProbs{nullptr};
-    //! output buffer [maxBatchSize]. Log probs is the probability induced by the top-k sampling.
+    //! output buffer
+    //! [maxBatchSize, maxTopK] when returnAllSelectedTokens, otherwise [maxSeqLen, maxBatchSize]
+    //! Log probs is the probability induced by the top-k sampling.
     //! If normalizeLogProbs is true, we normalize the probability 'expLogit' of the selected token
     //! by the probability 's_sum' of a set of top-k tokens, meaning the logProb is the probability
     //! of the selected token, conditioned on the event that it is selected,
@@ -137,8 +139,13 @@ struct TopKSamplingKernelParams
         TLLM_CHECK(maxTokensPerStep != 1 || returnAllSelectedTokens || endIds);
         if (cumLogProbs != nullptr || outputLogProbs != nullptr)
         {
-            TLLM_CHECK(maxTokensPerStep == 1 && !returnAllSelectedTokens);
+            TLLM_CHECK(maxTokensPerStep == 1);
+            if (cumLogProbs != nullptr)
+            {
+                TLLM_CHECK(!returnAllSelectedTokens);
+            }
         }
+
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
 
         TLLM_CHECK(0 < maxTopP && maxTopP <= 1.f);

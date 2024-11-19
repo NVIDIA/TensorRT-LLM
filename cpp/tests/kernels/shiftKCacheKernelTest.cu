@@ -103,6 +103,7 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
             k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
         break;
     }
+    case PositionEmbeddingType::kROPE_M: [[fallthrough]];
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -159,8 +160,10 @@ void invokeApplyRoPE(KVCacheBuffer const& kCacheRead, KVLinearBuffer const& kCac
     int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num, kv_head_num, batch_beam);
-    size_t smem_size
-        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+    size_t smem_size = ((position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                            || position_embedding_type == PositionEmbeddingType::kROPE_M)
+            ? 2 * rotary_embedding_dim * sizeof(T)
+            : 0);
 
     applyRoPE<T, KVCacheBuffer><<<grid, block, smem_size, stream>>>(kCacheRead, kCacheWrite, sizePerHead, beam_width,
         token_read_idxs, token_write_idxs, token_pos_idxs, token_seq_idxs, sequence_lengths, input_lengths,

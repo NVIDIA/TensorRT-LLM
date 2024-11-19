@@ -92,6 +92,8 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -131,6 +133,8 @@ public:
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
+        , mMropeRotarySinCos(std::move(mropeRotarySinCos))
+        , mMropePositionDeltas(std::move(mropePositionDeltas))
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
@@ -188,6 +192,8 @@ public:
         , mPositionIds(std::nullopt)
         , mPromptEmbeddingTable(std::nullopt)
         , mPromptVocabSize(std::nullopt)
+        , mMropeRotarySinCos(std::nullopt)
+        , mMropePositionDeltas(std::nullopt)
         , mLoraTaskId(std::nullopt)
         , mLoraWeights(std::nullopt)
         , mLoraConfig(std::nullopt)
@@ -284,6 +290,12 @@ public:
                 mInputTokenExtraIds
                     = std::make_shared<VecTokenExtraIds>(pTuningConfig->getInputTokenExtraIds().value());
             }
+        }
+        auto mRopeConfig = req.getMropeConfig();
+        if (mRopeConfig)
+        {
+            mMropeRotarySinCos = executor::detail::toITensor(mRopeConfig.value().getMRopeRotarySinCos());
+            mMropePositionDeltas = mRopeConfig.value().getMRopePositionDeltas();
         }
 
         auto loraConfig = req.getLoraConfig();
@@ -445,16 +457,6 @@ public:
     void setContextPhaseParams(executor::ContextPhaseParams contextPhaseParams)
     {
         mContextPhaseParams = std::move(contextPhaseParams);
-    }
-
-    [[nodiscard]] bool isLayerWiseKvCacheEnabled() const
-    {
-        return isContextOnlyRequest() && mLayerWiseKvCacheEnabled;
-    }
-
-    void setLayerWiseKvCacheEnabled(bool enabled)
-    {
-        mLayerWiseKvCacheEnabled = enabled;
     }
 
     /// @brief Get the state params of the context
@@ -796,6 +798,16 @@ public:
     [[nodiscard]] std::optional<SizeType32> getPromptVocabSize() const
     {
         return mPromptVocabSize;
+    }
+
+    [[nodiscard]] std::optional<TensorPtr> getMropeRotarySinCos() const
+    {
+        return mMropeRotarySinCos;
+    }
+
+    [[nodiscard]] std::optional<SizeType32> getMropePositionDeltas() const
+    {
+        return mMropePositionDeltas;
     }
 
     [[nodiscard]] std::optional<LoraTaskIdType> getLoraTaskId() const
@@ -1604,6 +1616,8 @@ protected:
 
     std::optional<TensorPtr> mPromptEmbeddingTable;
     std::optional<SizeType32> mPromptVocabSize;
+    std::optional<TensorPtr> mMropeRotarySinCos;
+    std::optional<SizeType32> mMropePositionDeltas;
 
     std::optional<LoraTaskIdType> mLoraTaskId;
     std::optional<TensorPtr> mLoraWeights;
@@ -1654,7 +1668,6 @@ protected:
     std::optional<TensorPtr> mCrossAttentionMask; // Input cross attention mask
     LlmRequestType mLlmRequestType;
     std::optional<executor::ContextPhaseParams> mContextPhaseParams;
-    bool mLayerWiseKvCacheEnabled = false;
 
     std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds;
     BeamUniqueTokens mUniqueTokens;
@@ -1819,6 +1832,8 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -1840,7 +1855,8 @@ public:
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
-            std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotarySinCos),
+            std::move(mropePositionDeltas), loraTaskId, std::move(loraWeights), std::move(loraConfig),
             std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
             returnGenerationLogits, std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput,
             std::move(logitsPostProcessor), applyLogitsPostProcessorBatched, std::move(encoderInputTokens),
@@ -1857,6 +1873,8 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -1879,7 +1897,8 @@ public:
             std::move(stopWordsList),
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotarySinCos),
+            std::move(mropePositionDeltas), loraTaskId, std::move(loraWeights), std::move(loraConfig),
             std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
             returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))

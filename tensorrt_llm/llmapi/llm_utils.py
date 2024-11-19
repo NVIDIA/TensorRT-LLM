@@ -246,6 +246,8 @@ LLMARGS_DOCSTRING = r"""
 
         kv_cache_config (KvCacheConfig, optional): The key-value cache configuration for the model. Defaults to None.
 
+        enable_chunked_prefill (bool): Whether to enable chunked prefill. Defaults to False.
+
         decoding_config (DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
 
         logits_post_processor_map (Dict[str, Callable], optional): A map of logit post-processing functions. Defaults to None.
@@ -352,6 +354,8 @@ class LlmArgs:
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: Optional[KvCacheConfig] = None
 
+    enable_chunked_prefill: bool = False
+
     # TODO[enweiz]: this might affect medusa, and could be removed in the future for API consistency
     decoding_config: Optional[DecodingConfig] = None
 
@@ -384,10 +388,6 @@ class LlmArgs:
     use_runtime_defaults: bool = True
 
     def __post_init__(self):
-        # NOTE: this is only for the compatibility with the old API, and will be removed in the future
-        # chunked context is disabled by default, and it is recommended to keep it enabled.
-        # The underlying implementation might disable it if it is not supported.
-        self.enable_chunked_context: bool = False
         # TODO[chunweiy]: Enable this option in the future
         # Currently we want LLMAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
         # magics.
@@ -682,9 +682,9 @@ class LlmArgs:
         def fallback():
             logger.warning(
                 f"Disabling chunked context due to configuration conflict.")
-            self.enable_chunked_context = False
+            self.enable_chunked_prefill = False
 
-        if self.enable_chunked_context:
+        if self.enable_chunked_prefill:
             if self.build_config_mutable:
                 self._config_arbitrator.claim_perf("chunked_context",
                                                    config_name="plugin_config",

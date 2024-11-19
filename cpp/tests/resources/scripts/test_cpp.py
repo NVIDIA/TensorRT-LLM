@@ -16,6 +16,7 @@
 
 import argparse as _arg
 import copy
+import datetime
 import glob
 import logging as _log
 import os as _os
@@ -69,6 +70,33 @@ def run_command(command: _tp.Sequence[str],
     _sp.check_call(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
 
 
+def run_ctest(command: _tp.Sequence[str],
+              cwd: _pl.Path,
+              *,
+              shell=False,
+              env=None,
+              timeout=None) -> None:
+    override_timeout = int(_os.environ.get("CPP_TEST_TIMEOUT_OVERRIDDEN", "-1"))
+    if override_timeout > 0 and (timeout is None or override_timeout > timeout):
+        _log.info("Overriding the command timeout: %s (before) and %s (after)",
+                  timeout, override_timeout)
+        timeout = override_timeout
+    deadline = None
+    if timeout is not None:
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+        command = list(command)
+        command += ["--stop-time", deadline.strftime("%H:%M:%S")]
+    try:
+        _log.info("Running: cd %s && %s", str(cwd), " ".join(command))
+        _sp.check_call(command, cwd=cwd, shell=shell, env=env)
+    except _sp.CalledProcessError as e:
+        fuzz = datetime.timedelta(seconds=2)
+        if deadline is not None and deadline - fuzz < datetime.datetime.now():
+            # Detect timeout
+            raise _sp.TimeoutExpired(e.cmd, timeout, e.output, e.stderr)
+        raise
+
+
 def merge_report(parallel, retry, output):
     import xml.etree.ElementTree as ElementTree
     base = ElementTree.parse(parallel)
@@ -114,11 +142,11 @@ def parallel_run_ctest(
     parallel=default_test_parallel,
 ) -> None:
     if parallel == 1:
-        return run_command(command,
-                           cwd=cwd,
-                           shell=shell,
-                           env=env,
-                           timeout=timeout)
+        return run_ctest(command,
+                         cwd=cwd,
+                         shell=shell,
+                         env=env,
+                         timeout=timeout)
 
     env = {} if env is None else env
     env['CTEST_PARALLEL_LEVEL'] = str(parallel)
@@ -132,7 +160,9 @@ def parallel_run_ctest(
 
     report = None
     try:
-        run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+        run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+    # except _sp.TimeoutExpired:
+    # Deliberately let timeout propagate. We don't want to retry on timeout
     except _sp.CalledProcessError:
         report = get_report()
         if report == '':
@@ -147,7 +177,7 @@ def parallel_run_ctest(
             _log.info("Parallel test failed, retry serial on failed tests")
             del env['CTEST_PARALLEL_LEVEL']
             command = [*command, "--rerun-failed"]
-            run_command(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
+            run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
         finally:
             if not _os.path.exists(cwd / report):
                 # Some catastrophic fail happened that there's no report generated
@@ -209,6 +239,10 @@ def run_tests(build_dir: _pl.Path,
             cwd=root_dir,
             env=_os.environ,
             timeout=300)
+        run_command([python_exe, "-m", "pip", "install", "jaxtyping<=0.2.34"],
+                    cwd=root_dir,
+                    env=_os.environ,
+                    timeout=300)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
@@ -1185,11 +1219,10 @@ if __name__ == "__main__":
                                         build_args.build_type)
     # Make modelSpec module since build engine and generate output scripts will need it.
     make_modelSpec = [
-        "cmake", "--build",
-        test_args.build_dir.__str__(), "--config", build_args.build_type, "-j",
+        "cmake", "--build", ".", "--config", build_args.build_type, "-j",
         "--target", "modelSpec"
     ]
-    run_command(make_modelSpec, cwd=build_args.build_dir, timeout=300)
+    run_command(make_modelSpec, cwd=test_args.build_dir, timeout=300)
 
     from build_engines_utils import init_model_spec_module
 

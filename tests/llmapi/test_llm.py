@@ -1261,10 +1261,47 @@ def test_llm_get_stats_async(tp_size: int = 1):
     asyncio.run(main())
 
 
+def test_llm_chunked_prefill():
+    sampling_params = SamplingParams(max_tokens=8)
+    build_config = BuildConfig()
+    build_config.plugin_config.use_paged_context_fmha = True
+    build_config.max_num_tokens = 64
+    new_tokens = 8
+    build_config.max_seq_len = build_config.max_num_tokens + new_tokens
+
+    def fail_path():
+        sampling_params = SamplingParams(max_tokens=8)
+        llm = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  build_config=build_config,
+                  enable_chunked_prefill=False)
+
+        with pytest.raises(ValueError):
+            output = llm.generate_async(
+                "A " * build_config.max_num_tokens,
+                sampling_params=sampling_params,
+            ).result()
+
+    def success_path():
+        llm = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  build_config=build_config,
+                  enable_chunked_prefill=True)
+
+        output = llm.generate_async(
+            "A " * build_config.max_num_tokens,
+            sampling_params=sampling_params,
+        ).result()
+
+    fail_path()
+    success_path()
+
+
 if __name__ == '__main__':
     #test_llm_get_stats()
     #test_llm_get_stats_async()
     #test_executor_pending_requests()
-    test_llm_handling_per_requeust_error()
-    test_llm_handling_per_requeust_error_async()
+    #test_llm_handling_per_requeust_error()
+    #test_llm_handling_per_requeust_error_async()
     #test_llm_loading_from_hf()
+    test_llm_chunked_prefill()

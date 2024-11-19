@@ -357,11 +357,14 @@ class LLM:
 
         prompt_len = len(prompt_token_ids)
 
-        if prompt_len + sampling_params.max_tokens > built_enging_cfg[
+        # TODO: Remove this check and left the request verification to cpp runtime
+        if (not self.args.enable_chunked_prefill
+            ) and prompt_len + sampling_params.max_tokens > built_enging_cfg[
                 'build_config']['max_seq_len']:
             raise ValueError(
                 f"The sum of prompt length ({prompt_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
+
         if sampling_params.beam_width > build_config.max_beam_width:
             raise ValueError(
                 f"sampling_params's beam_width ({sampling_params.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
@@ -404,7 +407,7 @@ class LLM:
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
                 processor_map=self.args.logits_post_processor_map)
         executor_config.normalize_log_probs = self.args.normalize_log_probs
-        executor_config.enable_chunked_context = self.args.enable_chunked_context
+        executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         executor_config.max_beam_width = self.args.build_config.max_beam_width
 
         self._executor = self._executor_cls.create(

@@ -299,6 +299,7 @@ class PretrainedConfig:
                      PositionEmbeddingType,
                      str] = PositionEmbeddingType.learned_absolute,
                  max_position_embeddings: Optional[int] = None,
+                 rotary_embedding_dim: Optional[int] = None,
                  num_key_value_heads: Optional[int] = None,
                  intermediate_size: Optional[int] = None,
                  mapping: Optional[Union[Mapping, dict]] = None,
@@ -329,8 +330,6 @@ class PretrainedConfig:
         assert isinstance(position_embedding_type, PositionEmbeddingType)
         self.position_embedding_type = position_embedding_type
 
-        self.max_position_embeddings = max_position_embeddings
-
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -338,6 +337,7 @@ class PretrainedConfig:
         if intermediate_size is None:
             intermediate_size = hidden_size * 4
         self.intermediate_size = intermediate_size
+        self.max_position_embeddings = max_position_embeddings
 
         if mapping is None:
             mapping = Mapping()
@@ -376,6 +376,12 @@ class PretrainedConfig:
             head_size = hidden_size // num_attention_heads
         self.head_size = head_size
         self.qk_layernorm = qk_layernorm
+
+        if rotary_embedding_dim is None:
+            rotary_embedding_percentage = kwargs.get('rotary_pct', 1.0)
+            rotary_embedding_dim = kwargs.get(
+                'rotary_dim', int(head_size * rotary_embedding_percentage))
+        self.rotary_embedding_dim = rotary_embedding_dim
 
         for key, value in kwargs.items():
             try:
@@ -503,6 +509,7 @@ class DecoderLayerList(ModuleList):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                mrope_params=None,
                 position_ids=None,
                 lora_params=None,
                 spec_decoding_params=None,
@@ -528,6 +535,8 @@ class DecoderLayerList(ModuleList):
                 kwargs['lora_layer_params'] = lora_layer_params
             if spec_decoding_params is not None:
                 kwargs['spec_decoding_params'] = spec_decoding_params
+            if mrope_params is not None:
+                kwargs['mrope_params'] = mrope_params
             if default_net().plugin_config.reduce_fusion:
                 if layer_idx < self.layer_list[-1]:
                     kwargs['next_layer_input_layernorm_args'] = (
@@ -691,24 +700,26 @@ class PretrainedModel(Module,
             self.config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     def prepare_inputs(
-            self,
-            max_batch_size,
-            max_input_len,
-            max_seq_len,
-            max_num_tokens,
-            use_cache,
-            max_beam_width: int = 1,
-            opt_num_tokens: int = None,
-            prompt_embedding_table_size: int = 0,
-            position_encoding_2d: bool = False,
-            max_draft_len: int = 0,
-            speculative_decoding_draft_tokens_external: bool = False,
-            spec_decoding_is_generation_length_variable: bool = False,
-            gather_context_logits: bool = False,
-            gather_generation_logits: bool = False,
-            lora_target_modules: List[str] = None,
-            opt_batch_size: int = 0,
-            num_hidden_layers: int = None):
+        self,
+        max_batch_size,
+        max_input_len,
+        max_seq_len,
+        max_num_tokens,
+        use_cache,
+        max_beam_width: int = 1,
+        opt_num_tokens: int = None,
+        prompt_embedding_table_size: int = 0,
+        position_encoding_2d: bool = False,
+        max_draft_len: int = 0,
+        speculative_decoding_draft_tokens_external: bool = False,
+        spec_decoding_is_generation_length_variable: bool = False,
+        gather_context_logits: bool = False,
+        gather_generation_logits: bool = False,
+        lora_target_modules: List[str] = None,
+        opt_batch_size: int = 0,
+        num_hidden_layers: int = None,
+        mrope_rotary_sin_cos_size: int = None,
+    ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -771,7 +782,8 @@ class PretrainedModel(Module,
             multiple_profiles=multiple_profiles,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size,
-            pp_reduce_scatter=pp_reduce_scatter)
+            pp_reduce_scatter=pp_reduce_scatter,
+            mrope_rotary_sin_cos_size=mrope_rotary_sin_cos_size)
 
         result = {
             'input_ids':
@@ -829,6 +841,8 @@ class PretrainedModel(Module,
         if model_inputs['spec_decoding_params'] is not None:
             result['spec_decoding_params'] = model_inputs[
                 'spec_decoding_params']
+        if model_inputs['mrope_params'] is not None:
+            result['mrope_params'] = model_inputs['mrope_params']
 
         return result
 
@@ -909,6 +923,7 @@ class DecoderModelForCausalLM(PretrainedModel):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                mrope_params=None,
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
@@ -941,6 +956,8 @@ class DecoderModelForCausalLM(PretrainedModel):
 
         if spec_decoding_params is not None:
             kwargs['spec_decoding_params'] = spec_decoding_params
+        if mrope_params is not None:
+            kwargs['mrope_params'] = mrope_params
 
         hidden_states = self.transformer.forward(**kwargs)
 

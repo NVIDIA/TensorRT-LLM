@@ -1411,6 +1411,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
+    case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = !is_masked && vec_size * tidx < rotary_embedding_dim;
@@ -1531,6 +1532,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
         dim3 grid(token_num, std::max(head_num, 1));
         size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
                     || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                    || position_embedding_type == PositionEmbeddingType::kROPE_M
                 ? 2 * rotary_embedding_dim * sizeof(T)
                 : 0);
         // NOTE: add offset for rotary embedding
@@ -1923,6 +1925,7 @@ __global__ void shiftKCache(KVCacheBuffer kvCacheBuffer, KVLinearBuffer shiftKCa
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
+    case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -1983,6 +1986,7 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
     dim3 grid(token_num_in_k, kv_head_num, batch_beam);
     size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
                 || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+                || position_embedding_type == PositionEmbeddingType::kROPE_M
             ? 2 * rotary_embedding_dim * sizeof(T)
             : 0);
 

@@ -97,7 +97,8 @@ class QWenConfig(PretrainedConfig):
             hf_config = hf_config.text_config
             qwen_type = f'{hf_config.model_type}_llava_onevision'
 
-        valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision')
+        valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
+                       'qwen2_vl')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -135,6 +136,17 @@ class QWenConfig(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
         tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
+        if qwen_type == 'qwen2_vl':
+            pe_type = 'mrope'
+            rotary_embedding_percentage = getattr(hf_config, 'rotary_pct', 1.0)
+            rotary_embedding_dim = getattr(
+                hf_config, 'rotary_dim',
+                int(hf_config.hidden_size / hf_config.num_attention_heads *
+                    rotary_embedding_percentage))
+        else:
+            pe_type = 'rope_gpt_neox'
+            rotary_embedding_dim = None
+
         return cls(
             architecture=hf_config.architectures[0],
             dtype=dtype,
@@ -145,8 +157,9 @@ class QWenConfig(PretrainedConfig):
             num_key_value_heads=num_key_value_heads,
             head_size=head_size,
             vocab_size=hf_config.vocab_size,
-            position_embedding_type='rope_gpt_neox',
+            position_embedding_type=pe_type,
             max_position_embeddings=hf_config.max_position_embeddings,
+            rotary_embedding_dim=rotary_embedding_dim,
             hidden_act=hidden_act,
             norm_epsilon=rms_norm_eps,
             attn_bias=attn_bias,

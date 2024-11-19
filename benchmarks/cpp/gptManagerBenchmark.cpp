@@ -664,7 +664,7 @@ class ExecutorServer
 {
 public:
     ExecutorServer(std::optional<std::filesystem::path> const& decoderTrtEnginePath,
-        std::optional<std::filesystem::path> const& encoderTrtEnginePath, TrtGptModelType modelType,
+        std::optional<std::filesystem::path> const& encoderTrtEnginePath, texec::BatchingType batchingType,
         int32_t maxBeamWidth, texec::CapacitySchedulerPolicy capacitySchedulerPolicy,
         BenchmarkParams const& benchmarkParams, std::shared_ptr<Recorder> recorder, std::chrono::milliseconds waitSleep,
         bool logIterationData, texec::ModelType executorModelType)
@@ -692,8 +692,7 @@ public:
             maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext, true);
         executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
         executorConfig.setPeftCacheConfig(peftCacheConfig);
-        executorConfig.setBatchingType(
-            modelType == TrtGptModelType::V1 ? texec::BatchingType::kSTATIC : texec::BatchingType::kINFLIGHT);
+        executorConfig.setBatchingType(batchingType);
         if (benchmarkParams.maxBatchSize)
         {
             executorConfig.setMaxBatchSize(benchmarkParams.maxBatchSize.value());
@@ -947,6 +946,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // embeddingBias
         std::nullopt,    // speculativeDecoding
         std::nullopt,    // pTuning
+        std::nullopt,    // mRopeConfig
         loraConfig,      // loraConfig
         lookaheadConfig, // lookaheadConfig
         std::nullopt,    // kvCacheRetentionConfig
@@ -955,7 +955,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
 }
 
 void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngineDir,
-    std::optional<std::filesystem::path> const& encoderEngineDir, TrtGptModelType modelType,
+    std::optional<std::filesystem::path> const& encoderEngineDir, texec::BatchingType batchingType,
     std::string const& datasetPath, std::string const& opCsvFile, int maxNumSamples, int beamWidth, int warmUp,
     std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
     texec::CapacitySchedulerPolicy capacitySchedulerPolicy, std::chrono::milliseconds waitSleep,
@@ -977,16 +977,17 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
     {
         TLLM_CHECK_WITH_INFO(
             decoderEngineDir.has_value(), "decoder models require a path to decoder engine in executor benchmark.");
-        executorServer = std::make_shared<ExecutorServer>(decoderEngineDir.value(), std::nullopt, modelType, beamWidth,
-            capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, logIterationData, executorModelType);
+        executorServer
+            = std::make_shared<ExecutorServer>(decoderEngineDir.value(), std::nullopt, batchingType, beamWidth,
+                capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, logIterationData, executorModelType);
     }
     else if (executorModelType == texec::ModelType::kENCODER_DECODER)
     {
         TLLM_CHECK_WITH_INFO(encoderEngineDir.has_value(),
             "encoder-decoder models require a path to encoder engine in executor benchmark.");
-        executorServer
-            = std::make_shared<ExecutorServer>(decoderEngineDir.value(), encoderEngineDir.value(), modelType, beamWidth,
-                capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, logIterationData, executorModelType);
+        executorServer = std::make_shared<ExecutorServer>(decoderEngineDir.value(), encoderEngineDir.value(),
+            batchingType, beamWidth, capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, logIterationData,
+            executorModelType);
         try
         {
             std::ifstream decoderJsonConfigPath(decoderEngineDir.value() / "config.json");
@@ -1011,8 +1012,9 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
     {
         TLLM_CHECK_WITH_INFO(
             encoderEngineDir.has_value(), "encoder models require a path to encoder engine in executor benchmark.");
-        executorServer = std::make_shared<ExecutorServer>(std::nullopt, encoderEngineDir.value(), modelType, beamWidth,
-            capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, logIterationData, executorModelType);
+        executorServer
+            = std::make_shared<ExecutorServer>(std::nullopt, encoderEngineDir.value(), batchingType, beamWidth,
+                capacitySchedulerPolicy, benchmarkParams, recorder, waitSleep, logIterationData, executorModelType);
     }
     else
     {
@@ -1219,8 +1221,9 @@ int main(int argc, char* argv[])
         "encoder_engine_dir", "Directory that store the engines of the encoder models.", cxxopts::value<std::string>());
     options.add_options()(
         "api", "API type: gptManager or executor.", cxxopts::value<std::string>()->default_value("executor"));
-    options.add_options()("type", "Batching type: IFB, UIFB (unfused IFB) or V1 (non-IFB) batching.",
-        cxxopts::value<std::string>()->default_value("IFB"));
+    options.add_options()("type",
+        "Batching type: choose between inflight/static. (IFB/V1 options are going to be deprecated)",
+        cxxopts::value<std::string>()->default_value("inflight"));
     options.add_options()("dataset", "Dataset that is used for benchmarking BatchManager.",
         cxxopts::value<std::string>()->default_value(""));
     options.add_options()(
@@ -1332,18 +1335,22 @@ int main(int argc, char* argv[])
 
     // Argument: Batching Type
     auto const type = result["type"].as<std::string>();
-    TrtGptModelType modelType{TrtGptModelType::V1};
-    if (type == "V1")
+    texec::BatchingType batchingType{texec::BatchingType::kINFLIGHT};
+    if (type == "V1" || type == "static")
     {
-        modelType = TrtGptModelType::V1;
+        if (type == "V1")
+        {
+            TLLM_LOG_WARNING("type option \"V1\" is going to be renamed to \"static\".");
+        }
+        batchingType = texec::BatchingType::kSTATIC;
     }
-    else if (type == "UIFB")
+    else if (type == "IFB" || type == "inflight")
     {
-        modelType = TrtGptModelType::InflightBatching;
-    }
-    else if (type == "IFB")
-    {
-        modelType = TrtGptModelType::InflightFusedBatching;
+        if (type == "IFB")
+        {
+            TLLM_LOG_WARNING("type option \"IFB\" is going to be renamed to \"inflight\".");
+        }
+        batchingType = texec::BatchingType::kINFLIGHT;
     }
     else
     {
@@ -1604,7 +1611,7 @@ int main(int argc, char* argv[])
         {
             TLLM_CHECK_WITH_INFO(api == "executor", "encoder-decoder only support executor api.");
             TLLM_CHECK_WITH_INFO(
-                modelType == TrtGptModelType::InflightFusedBatching, "encoder-decoder only support inflight batching.");
+                batchingType == texec::BatchingType::kINFLIGHT, "encoder-decoder only support inflight batching.");
             executorModelType = texec::ModelType::kENCODER_DECODER;
             encoderEngineDir = result["encoder_engine_dir"].as<std::string>();
             decoderEngineDir = result["decoder_engine_dir"].as<std::string>();
@@ -1621,7 +1628,7 @@ int main(int argc, char* argv[])
         }
         try
         {
-            benchmarkExecutor(decoderEngineDir, encoderEngineDir, modelType, datasetPath, opCsvFile, maxNumSamples,
+            benchmarkExecutor(decoderEngineDir, encoderEngineDir, batchingType, datasetPath, opCsvFile, maxNumSamples,
                 beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, capacitySchedulerPolicy,
                 waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData,
                 maxPromptLen, executorModelType);

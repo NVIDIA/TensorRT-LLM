@@ -21,9 +21,9 @@ import torch
 from tqdm import tqdm
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, allreduce, recv, send, sigmoid
-from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, RmsNorm, RowLinear)
+from ...functional import Tensor, recv, send
+from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
 from ...logger import logger
 from ...lora_manager import (LoraConfig,
@@ -73,33 +73,19 @@ class QWenDecoderLayer(Module):
             quant_mode=config.quant_mode,
             dense_bias=False)
 
-        ClsMLP = GatedMLP
-        mlp_kwargs = {}
         if config.moe.has_moe():
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config": config.moe,
-                "mapping": config.mapping,
-            }
-
-        if config.qwen_type == 'qwen2_moe':
-            self.shared_expert = MLP(
-                hidden_size=config.hidden_size,
-                ffn_hidden_size=config.moe_shared_expert_intermediate_size,
-                hidden_act=config.hidden_act,
-                dtype=dtype,
-                bias=False,
-                tp_group=self.tp_group,
-                tp_size=self.tp_size,
-                quant_mode=config.quant_mode,
-                is_expert=True)
-            self.shared_expert_gate = RowLinear(config.hidden_size,
-                                                1,
-                                                bias=False,
-                                                dtype=dtype,
-                                                tp_group=None,
-                                                tp_size=1)
-            mlp_kwargs['use_all_reduce'] = False
+            mlp_kwargs = {'moe_config': config.moe, 'mapping': config.mapping}
+            if config.qwen_type == 'qwen2_moe':
+                ClsMLP = SharedMoE
+                mlp_kwargs['use_shared_gate'] = True
+                mlp_kwargs['use_side_stream'] = True
+                mlp_kwargs['moe_config'].shared_expert_intermediate_size = \
+                    config.moe_shared_expert_intermediate_size
+            else:
+                ClsMLP = MOE
+        else:
+            ClsMLP = GatedMLP
+            mlp_kwargs = {}
 
         # Qwen's real inter_size depends on qwen_type
         if self.config.qwen_type == 'qwen':
@@ -131,6 +117,7 @@ class QWenDecoderLayer(Module):
         kv_cache_params=None,
         attention_params=None,
         lora_layer_params=None,
+        mrope_params=None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -142,6 +129,7 @@ class QWenDecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
+            mrope_params=mrope_params,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -152,26 +140,8 @@ class QWenDecoderLayer(Module):
 
         hidden_states = self.post_layernorm(hidden_states)
 
-        shared_output = None
-        if self.config.qwen_type == 'qwen2_moe':
-            shared_output = self.shared_expert(
-                hidden_states, lora_layer_params=lora_layer_params)
-            if self.shared_expert_gate is not None:
-                gate_lora_params = None
-                if lora_layer_params is not None:
-                    gate_lora_params = lora_layer_params.get_runtime_params(
-                        0, "mlp_router")
-                shared_output = sigmoid(
-                    self.shared_expert_gate(hidden_states,
-                                            gate_lora_params)) * shared_output
-
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
-
-        if shared_output is not None:
-            hidden_states = hidden_states + shared_output
-            if self.tp_size > 1 and self.tp_group is not None:
-                hidden_states = allreduce(hidden_states, self.tp_group)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -204,6 +174,7 @@ class QWenModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                mrope_params=None,
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
@@ -226,7 +197,8 @@ class QWenModel(Module):
             attention_mask=attention_mask,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            lora_params=lora_params)
+            lora_params=lora_params,
+            mrope_params=mrope_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -352,11 +324,12 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 }
             elif config.qwen_type == "qwen2_moe":
                 custom_dict = {
-                    "shared_expert": "mlp.shared_expert",
-                    "shared_expert_gate": "mlp.shared_expert_gate",
+                    "mlp.shared_expert": "mlp.shared_expert",
+                    "mlp.shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
                 }
-            elif config.qwen_type == "qwen2" and config.tie_word_embeddings:
+            elif config.qwen_type in {"qwen2", "qwen2_vl"
+                                      } and config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
             elif config.architecture == "Qwen2ForSequenceClassification":
                 custom_dict = {

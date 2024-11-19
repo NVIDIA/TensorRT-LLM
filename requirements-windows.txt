@@ -16,11 +16,11 @@ h5py==3.10.0
 pywin32
 StrEnum
 sentencepiece>=0.2.0
-tensorrt~=10.5.0
+tensorrt~=10.6.0
 tokenizers>=0.14
 # Default torch is CPU-only on Windows, so need to specify a torch version with GPU support
 torch==2.4.1+cu124
-torchvision==0.19.1+cu124
+torchvision
 nvidia-modelopt[torch]~=0.17.0
 transformers>=4.38.2,<=4.45.1
 wheel
@@ -31,3 +31,4 @@ mpmath>=1.3.0
 click
 click_option_group
 pyzmq
+setuptools==69.5.1

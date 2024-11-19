@@ -1940,10 +1940,12 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
 
     # weight
     fake_quant_weights = torch.load(lmquant_ckpt_path + '/model.pt',
-                                    map_location='cpu')
+                                    map_location='cpu',
+                                    weights_only=True)
     # scale.0, scale.1, zero
     quant_params = torch.load(lmquant_ckpt_path + '/scale.pt',
-                              map_location='cpu')
+                              map_location='cpu',
+                              weights_only=True)
 
     def load(key):
         if 'zero' in key:
@@ -1958,7 +1960,7 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
 
     if per_group:
         lmquant_suffix = [
-            'weight', 'weight.scale.0', 'weight.scale.1', 'weight.zero'
+            'weight', 'weight.scale.0', 'weight.scale.1', 'weight.scaled_zero'
         ]
         qserve_suffix = ['weight', 's1_scales', 's2_scales', 's2_zeros']
     else:

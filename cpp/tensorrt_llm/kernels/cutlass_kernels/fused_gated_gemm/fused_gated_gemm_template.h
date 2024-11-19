@@ -16,10 +16,10 @@
 
 #pragma once
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -27,9 +27,9 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass_extensions/gemm_configs.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC
 
 #include "fused_gated_gemm.h"
 #include "fused_gated_gemm_kernel_template_sm90.h"

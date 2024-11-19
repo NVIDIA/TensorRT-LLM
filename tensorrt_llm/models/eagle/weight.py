@@ -611,6 +611,8 @@ def load_eagle_hf(eagle_model_dir,
                 continue
             if "lm_head" in name:
                 continue
+            if "ln_f" in name:
+                continue
             # FIXME tensors are duplicated on disk
             renamed_weights[f"eagle_nets.{di}.drafter.{name}"] = param.clone()
 

@@ -87,7 +87,7 @@ std::shared_ptr<tl::BaseDecodingOutputs> dynamicDecodeTest(std::shared_ptr<Buffe
     setupParams->penaltyParams = std::make_shared<tl::PenaltySetupParams>();
     setupParams->decodingParams = std::make_shared<tl::SamplingSetupParams>();
 
-    auto batchSlots = getDefaultBatchSlots(batchSize, *manager);
+    auto batchSlots = getDefaultBatchSlots(batchSize);
     auto workspace = std::make_shared<tensorrt_llm::runtime::DecodingLayerWorkspace>(
         manager, decodingDomain, TRTDataType<float>::value, ddLayer.getWorkspaceSize());
     ddLayer.setup(batchSize, beamWidth, batchSlots, setupParams, workspace);

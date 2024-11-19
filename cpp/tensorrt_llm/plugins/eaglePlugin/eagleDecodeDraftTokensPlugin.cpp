@@ -71,7 +71,7 @@ nvinfer1::DimsExprs EagleDecodeDraftTokensPlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     TLLM_CHECK(outputIndex < 2);
-    TLLM_CHECK(nbInputs == 5);
+    TLLM_CHECK(nbInputs == 6);
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[0];
     auto const maxDecodingTokensExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[1];
     auto const maxDecodingDraftTokensExpr
@@ -102,7 +102,7 @@ nvinfer1::DimsExprs EagleDecodeDraftTokensPlugin::getOutputDimensions(
 bool EagleDecodeDraftTokensPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    TLLM_CHECK(nbInputs == 5 && nbOutputs == 2);
+    TLLM_CHECK(nbInputs == 6 && nbOutputs == 2);
     TLLM_CHECK(pos < nbInputs + nbOutputs);
 
     if (pos == getIdx(InputIdxEntry::LOGITS)) // logits (input)
@@ -164,7 +164,12 @@ size_t EagleDecodeDraftTokensPlugin::getWorkspaceSizeType(nvinfer1::PluginTensor
         // [batchSize * maxDecodingTokens]
         auto const numSuccessorsForEachNodeSize = batchSize * maxDecodingTokens * sizeof(SizeType32);
 
-        SizeType32 constexpr NUM_BUFFERS{7};
+        // 7. Flag whether to do decoding or not. SamplingTopK is done for numInputLogits tokens.
+        // But only sum(numValidLogitsPerRequest[:]) of them are valid.
+        // [batchSize * maxDecodingTokens]
+        auto const skipDecodeSize = numInputLogits * sizeof(bool);
+
+        SizeType32 constexpr NUM_BUFFERS{8};
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = draftTokenSamplingWorkspaceSize;
         workspaces[1] = topKsSize;
@@ -173,6 +178,7 @@ size_t EagleDecodeDraftTokensPlugin::getWorkspaceSizeType(nvinfer1::PluginTensor
         workspaces[4] = outputIdsPtrsSize;
         workspaces[5] = outputIdsSize;
         workspaces[6] = numSuccessorsForEachNodeSize;
+        workspaces[7] = skipDecodeSize;
         workspaceSize = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
     else
@@ -221,6 +227,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
 
     // Plugin inputs
     auto logits = static_cast<T const*>(inputs[getIdx(InputIdxEntry::LOGITS)]);
+    auto numValidLogits = static_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::NUM_VALID_LOGITS)]);
     auto randSample = static_cast<float const*>(inputs[getIdx(InputIdxEntry::RAND_SAMPLE)]);
     auto paths = static_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::PATHS)]);
     auto pluginInputDraftTokenIdsPtrs
@@ -269,12 +276,16 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
     SizeType32* numSuccessorsForEachNode = reinterpret_cast<SizeType32*>(
         tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(SizeType32)));
 
+    // Workspace 7: skip decoding mask [numInputLogits]
+    bool* skipDecode
+        = reinterpret_cast<bool*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, numInputLogits * sizeof(bool)));
+
     // Fill logitsPtrs from logits, fill outputIdsPtrs from outputIdsFlatten and fill decodingTokens
-    invokeAssembleDraftLogitsOffsets(logitsPtrs, logits, outputIdsPtrs, outputIdsFlatten, numInputLogits,
-        maxDecodingDraftTokens, vocabSizePadded, stream);
+    invokeAssembleDraftLogitsOffsets(logitsPtrs, logits, outputIdsPtrs, outputIdsFlatten, skipDecode, numValidLogits,
+        numInputLogits, batchSize, maxDecodingDraftTokens, vocabSizePadded, stream);
     sync_check_cuda_error();
 
-    invokeExtractTopKsFromPath(paths, topKs, topKOffset, numSuccessorsForEachNode, mLayerIdx, batchSize, numInputLogits,
+    invokeExtractTopKsFromPath(paths, topKs, topKOffset, numSuccessorsForEachNode, mLayerIdx, batchSize,
         maxDecodingTokens, maxPathLen, stream);
     sync_check_cuda_error();
 
@@ -289,13 +300,14 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
     params.maxTokensPerStep = 1;
     params.vocabSizePadded = vocabSizePadded;
     params.returnAllSelectedTokens = true;
+    params.skipDecode = skipDecode;
 
     invokeBatchTopKSampling(params, stream);
     sync_check_cuda_error();
 
     // Copy output token id from outputIdsPtrs to the plugin output buffer
     invokeCopyOutputTokensIds(outputIdsPtrs, topKs, topKOffset, pluginInputDraftTokenIdsPtrs, pluginInputDraftLens,
-        pluginOutputDraftTokenIdsPtrs, pluginOutputDraftLens, mLayerIdx, batchSize, numInputLogits,
+        numValidLogits, pluginOutputDraftTokenIdsPtrs, pluginOutputDraftLens, mLayerIdx, batchSize,
         maxDecodingDraftTokens, stream);
     sync_check_cuda_error();
 

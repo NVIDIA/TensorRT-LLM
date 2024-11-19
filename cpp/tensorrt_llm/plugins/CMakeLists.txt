@@ -58,7 +58,8 @@ set(PLUGIN_LISTS
     lowLatencyGemmPlugin
     eaglePlugin
     lowLatencyGemmSwigluPlugin
-    qserveGemmPlugin)
+    qserveGemmPlugin
+    cudaStreamPlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})

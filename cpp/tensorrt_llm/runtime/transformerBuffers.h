@@ -27,7 +27,7 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 class KVCacheManager;
-}
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
 
 namespace tensorrt_llm::runtime
 {

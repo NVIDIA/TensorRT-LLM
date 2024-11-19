@@ -260,6 +260,17 @@ class SpecDecodingParams:
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
 
 
+class MropeParams:
+
+    def __init__(
+        self,
+        mrope_rotary_sin_cos: Tensor = None,
+        mrope_position_deltas: Tensor = None,
+    ):
+        self.mrope_rotary_sin_cos = mrope_rotary_sin_cos
+        self.mrope_position_deltas = mrope_position_deltas
+
+
 class KeyValueCacheParams:
 
     def __init__(self,
@@ -434,6 +445,7 @@ class Attention(Module):
                 "type", rotary_embedding_scaling.get("rope_type"))
             self.rotary_embedding_scale_type = RotaryScalingType.from_string(
                 rotary_scaling_type)
+
             self.rotary_embedding_scale = rotary_embedding_scaling.get(
                 "factor", 1.0)
 
@@ -684,6 +696,7 @@ class Attention(Module):
         attention_packed_mask=None,
         use_cache=False,
         spec_decoding_params=None,
+        mrope_params=None,
         kv_cache_params=None,
         attention_params=None,
         encoder_output: Optional[Tensor] = None,
@@ -700,6 +713,8 @@ class Attention(Module):
 
         spec_decoding_params = SpecDecodingParams(
         ) if spec_decoding_params is None else spec_decoding_params
+
+        mrope_params = MropeParams() if mrope_params is None else mrope_params
 
         alibi_slopes = None
         if self.position_embedding_type.is_alibi():
@@ -1080,6 +1095,8 @@ class Attention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
+                mrope_position_deltas=mrope_params.mrope_position_deltas,
                 qk_tanh_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
@@ -1826,6 +1843,8 @@ class CogVLMAttention(Attention):
                 use_cache=use_cache,
                 spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
+                mrope_rotary_sin_cos=None,
+                mrope_position_deltas=None,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,
@@ -1892,7 +1911,14 @@ class DeepseekV2Attention(Attention):
                          enable_qkv=False)
 
         self.tp_size = tp_size
-        self.q_lora_rank = q_lora_rank
+
+        if q_lora_rank is None:
+            self.q_lora_rank = hidden_size
+            self.is_deepseek_v2_lite = True
+        else:
+            self.q_lora_rank = q_lora_rank
+            self.is_deepseek_v2_lite = False
+
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -1927,14 +1953,22 @@ class DeepseekV2Attention(Attention):
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
 
-        self.fused_a = ColumnLinear(
-            hidden_size,
-            q_lora_rank + kv_lora_rank + qk_rope_head_dim,
-            bias=self.dense_bias,
-            dtype=dtype,
-        )
+        if self.is_deepseek_v2_lite:
+            self.fused_a = ColumnLinear(
+                hidden_size,
+                kv_lora_rank + qk_rope_head_dim,
+                bias=self.dense_bias,
+                dtype=dtype,
+            )
+        else:
+            self.fused_a = ColumnLinear(
+                hidden_size,
+                q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+                bias=self.dense_bias,
+                dtype=dtype,
+            )
+            self.q_a_layernorm = RmsNorm(q_lora_rank, dtype=dtype, eps=eps)
 
-        self.q_a_layernorm = RmsNorm(q_lora_rank, dtype=dtype, eps=eps)
         self.kv_a_layernorm = RmsNorm(kv_lora_rank, dtype=dtype, eps=eps)
 
         self.fused_q_proj = Parameter(
@@ -2007,11 +2041,19 @@ class DeepseekV2Attention(Attention):
         past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
         )
 
-        compressed_q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
-        compressed_q = self.q_a_layernorm(compressed_q)
-        compressed_kv = self.kv_a_layernorm(compressed_kv)
-        input_qkv = concat([compressed_q, compressed_kv, k_pe], dim=-1)
+        if self.is_deepseek_v2_lite:
+            compressed_kv, k_pe = self.fused_a(hidden_states).split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            compressed_kv = self.kv_a_layernorm(compressed_kv)
+            input_qkv = concat([hidden_states, compressed_kv, k_pe], dim=-1)
+        else:
+            compressed_q, compressed_kv, k_pe = self.fused_a(
+                hidden_states).split([
+                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+                ], -1)
+            compressed_q = self.q_a_layernorm(compressed_q)
+            compressed_kv = self.kv_a_layernorm(compressed_kv)
+            input_qkv = concat([compressed_q, compressed_kv, k_pe], dim=-1)
 
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):

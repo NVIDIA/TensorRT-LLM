@@ -835,7 +835,7 @@ public:
             * 2 * modelConfig.getSizePerHead();
     }
 
-    [[nodiscard]] static std::tuple<SizeType32, SizeType32> const calculateMaxNumBlocks(KvCacheConfig const& config,
+    [[nodiscard]] static std::tuple<SizeType32, SizeType32> calculateMaxNumBlocks(KvCacheConfig const& config,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 

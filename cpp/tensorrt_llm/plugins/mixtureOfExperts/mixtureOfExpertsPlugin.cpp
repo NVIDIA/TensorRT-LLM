@@ -18,6 +18,8 @@
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include <numeric>
 
 using namespace nvinfer1;
@@ -42,8 +44,8 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int nu
     nvinfer1::DataType type, nvinfer1::DataType weight_type, nvinfer1::DataType output_type, QuantMode quant_mode,
     bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
     MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
-    MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
-    LoraPluginProfilerPtr lora_profiler, int max_low_rank)
+    int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
+    nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank)
     : mRemoveInputPadding(remove_input_padding)
     , mNumExperts(number_of_experts)
     , mK(top_k)
@@ -60,6 +62,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int nu
     , mNormalizationMode(normalization_mode)
     , mSparseMixerEpsilon(sparse_mixer_epsilon)
     , mUseDeterministicKernels(force_determinism)
+    , mSideStreamId(side_stream_id)
     , mGemmProfiler(std::move(gemm_profiler_ptr))
     , mUseLora(use_lora)
     , mLoraType(lora_type)
@@ -90,6 +93,7 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mGemmId2(other.mGemmId2)
     , mSparseMixerEpsilon(other.mSparseMixerEpsilon)
     , mUseDeterministicKernels(other.mUseDeterministicKernels)
+    , mSideStreamId(other.mSideStreamId)
     , mGemmProfiler(other.mGemmProfiler)
     , mUseLora(other.mUseLora)
     , mLoraType(other.mLoraType)
@@ -111,8 +115,8 @@ size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
         + sizeof(mExpertInterSize) + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType)
         + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mParallelismConfig)
         + sizeof(mNormalizationMode) + sizeof(mSparseMixerEpsilon) + sizeof(mDims) + sizeof(mUseDeterministicKernels)
-        + mGemmProfiler->getSerializationSize(mGemmId1) + mGemmProfiler->getSerializationSize(mGemmId2)
-        + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
+        + sizeof(mSideStreamId) + mGemmProfiler->getSerializationSize(mGemmId1)
+        + mGemmProfiler->getSerializationSize(mGemmId2) + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
 
     if (hasLora())
     {
@@ -149,6 +153,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(void const* data, size_t length,
     read(d, mSparseMixerEpsilon);
     read(d, mDims);
     read(d, mUseDeterministicKernels);
+    read(d, mSideStreamId);
     read(d, mUseLora);
     read(d, mLoraType);
     read(d, mMaxLowRank);
@@ -193,6 +198,7 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mSparseMixerEpsilon);
     write(d, mDims);
     write(d, mUseDeterministicKernels);
+    write(d, mSideStreamId);
     write(d, mUseLora);
     write(d, mLoraType);
     write(d, mMaxLowRank);
@@ -308,6 +314,9 @@ void MixtureOfExpertsPlugin::init()
 
         TLLM_CUDA_CHECK(cudaEventCreate(&mMemcpyEvent));
     }
+    mSideStreamPtr = nullptr;
+    mDebugStallMain = tensorrt_llm::runtime::utils::stallStream("TLLM_DEBUG_MOE_STALL_MAIN");
+    mDebugStallSide = tensorrt_llm::runtime::utils::stallStream("TLLM_DEBUG_MOE_STALL_SIDE");
 }
 
 // IPluginV2DynamicExt Methods
@@ -321,7 +330,7 @@ nvinfer1::IPluginV2DynamicExt* MixtureOfExpertsPlugin::clone() const noexcept
 nvinfer1::DimsExprs MixtureOfExpertsPlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    assert(outputIndex == getOutputTensorIndex());
+    assert(outputIndex == getOutputTensorIndex() || outputIndex == getOutputDummyTensorIndex());
     return inputs[getInputTensorIndex()];
 }
 
@@ -358,6 +367,10 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     else if (pos == nbInputs + getOutputTensorIndex())
     {
         return inOut[pos].type == mOutputType;
+    }
+    else if (useSideStream() && pos == nbInputs + getOutputDummyTensorIndex())
+    {
+        return inOut[pos].type == mType;
     }
     else if (hasExpertFp8QuantScales() && getExpertFP8Dequant1Index() <= pos && pos <= getExpertFP8QuantFinalIndex())
     {
@@ -514,6 +527,10 @@ size_t MixtureOfExpertsPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const
     TLLM_CHECK_WITH_INFO(nbInputs == getNbInputs(), "Required input to plugin is missing");
     TLLM_CHECK_WITH_INFO(nbOutputs == getNbOutputs(), "Required output to plugin is missing");
 
+    if (useSideStream())
+    {
+        return 0;
+    }
     int const num_tokens = getNumTokens(inputs);
     int const num_lora_reqs = getNumLoraRequests(inputs);
     return setupWorkspace(nullptr, num_tokens, num_lora_reqs).size;
@@ -661,6 +678,36 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int64_t const num_reqs = getNumLoraRequests(inputDesc);
     int64_t const num_not_finished = num_tokens; // TODO Take this as an input
 
+    if (useSideStream())
+    {
+        // Prepare the side stream
+        if (!mSideStreamPtr)
+        {
+            auto const resource_name = nvinfer1::pluginInternal::SideStream::getResourceKey(mSideStreamId);
+            nvinfer1::pluginInternal::SideStream side_stream{};
+            mSideStreamPtr = reinterpret_cast<nvinfer1::pluginInternal::SideStream*>(
+                getPluginRegistry()->acquirePluginResource(resource_name, &side_stream));
+        }
+        // Debug the code with the main stream stalled (only executed when the environment variable
+        // TLLM_DEBUG_MOE_STALL_MAIN is set and has a positive value)
+        mSideStreamPtr->stallMainStream("TLLM_DEBUG_MOE_STALL_MAIN", stream, mDebugStallMain);
+        // The side stream waits for the inputs managed by the main stream to be ready
+        mSideStreamPtr->waitMainStreamOnSideStream(stream);
+        // Provide data dependency for the shared experts running after this plugin by copying inputs on the main stream
+        size_t count = 1;
+        for (int i = 0; i < inputDesc[getInputTensorIndex()].dims.nbDims; ++i)
+        {
+            count *= inputDesc[getInputTensorIndex()].dims.d[i];
+        }
+        count *= tensorrt_llm::runtime::BufferDataType(inputDesc[getInputTensorIndex()].type).getSize();
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(outputs[getOutputDummyTensorIndex()], inputs[getInputTensorIndex()], count,
+            cudaMemcpyDeviceToDevice, stream));
+        // Switch from the main stream to the side stream
+        stream = mSideStreamPtr->getStream();
+        // The workspace is managed by the side stream (otherwise, the lifetime of workspace may be incorrect)
+        auto const workspace_size = setupWorkspace(nullptr, num_tokens, num_reqs).size;
+        workspace_ptr = mSideStreamPtr->getWorkspacePtr(workspace_size);
+    }
     auto workspace = setupWorkspace(workspace_ptr, num_tokens, num_reqs);
 
     auto w1_desc = inputDesc[getExpertWeights1Index()];
@@ -728,6 +775,13 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         static_cast<int*>(workspace.selected_experts), mSparseMixerEpsilon, mParallelismConfig, mNormalizationMode,
         hasLora(), lora_params, stream);
 
+    if (useSideStream())
+    {
+        // Debug the code with the side stream stalled (only executed when the environment variable
+        // TLLM_DEBUG_MOE_STALL_SIDE is set and has a positive value)
+        mSideStreamPtr->stallSideStream("TLLM_DEBUG_MOE_STALL_SIDE", mDebugStallSide);
+    }
+
     return 0;
 }
 
@@ -735,8 +789,12 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 nvinfer1::DataType MixtureOfExpertsPlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    TLLM_CHECK(index == getOutputTensorIndex());
+    TLLM_CHECK(index == getOutputTensorIndex() || index == getOutputDummyTensorIndex());
     TLLM_CHECK(inputTypes[getInputTensorIndex()] == mType);
+    if (useSideStream() && index == getOutputDummyTensorIndex())
+    {
+        return mType;
+    }
     return mOutputType;
 }
 
@@ -769,7 +827,15 @@ int MixtureOfExpertsPlugin::initialize() noexcept
     return 0;
 }
 
-void MixtureOfExpertsPlugin::terminate() noexcept {}
+void MixtureOfExpertsPlugin::terminate() noexcept
+{
+    if (mSideStreamPtr)
+    {
+        auto const resource_name = nvinfer1::pluginInternal::SideStream::getResourceKey(mSideStreamId);
+        getPluginRegistry()->releasePluginResource(resource_name);
+        mSideStreamPtr = nullptr;
+    }
+}
 
 void MixtureOfExpertsPlugin::destroy() noexcept
 {
@@ -836,6 +902,7 @@ MixtureOfExpertsPluginCreator::MixtureOfExpertsPluginCreator()
         static_cast<int>(MOEExpertScaleNormalizationMode::NONE)));
     mPluginAttributes.emplace_back(
         nvinfer1::PluginField("sparse_mixer_epsilon", nullptr, PluginFieldType::kFLOAT32, 0));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("side_stream_id", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("use_lora", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("lora_type_id", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("max_low_rank", nullptr, PluginFieldType::kINT32, 0));
@@ -865,6 +932,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mEPRank{};
     int mNormalizationMode{};
     int mRequiresDeterminism{0};
+    int mSideStreamId{0};
     int mUseLora{};
     int mLoraType{INT_MAX};
     int mMaxLowRank{0};
@@ -902,6 +970,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"use_bias", std::ref(mUseBias), true},
         MapPair{"output_type_id", std::ref(mOutputType), true},
         MapPair{"force_determinism", std::ref(mRequiresDeterminism), true},
+        MapPair{"side_stream_id", std::ref(mSideStreamId), true},
         MapPair{"lora_type_id", std::ref(mLoraType), true},
         MapPair{"max_low_rank", std::ref(mMaxLowRank), true},
     };
@@ -962,8 +1031,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
             static_cast<nvinfer1::DataType>(mWeightType), static_cast<nvinfer1::DataType>(mOutputType),
             QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank, mEPSize, mEPRank,
             static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), mSparseMixerEpsilon,
-            mRequiresDeterminism != 0, gemmProfiler, mUseLora != 0, static_cast<nvinfer1::DataType>(mLoraType),
-            loraProfiler, mMaxLowRank);
+            mRequiresDeterminism != 0, mSideStreamId, gemmProfiler, mUseLora != 0,
+            static_cast<nvinfer1::DataType>(mLoraType), loraProfiler, mMaxLowRank);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

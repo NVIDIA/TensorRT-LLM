@@ -70,6 +70,8 @@ private:
         RAND_SAMPLE,
         // [batch_size, max_decoding_tokens, max_path_len]
         PATHS,
+        // [1]
+        NUM_VALID_LOGITS,
 
         // [batch_size, max_decoding_draft_tokens]
         INPUT_DRAFT_TOKEN_IDS,

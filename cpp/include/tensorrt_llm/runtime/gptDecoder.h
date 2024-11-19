@@ -67,7 +67,7 @@ public:
     static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
         size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
         BufferManager::CudaStreamPtr const& stream,
-        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
+        std::shared_ptr<SpeculativeDecodingModule const> const& speculativeDecodingModule = nullptr);
 };
 
 template <typename T>
@@ -110,7 +110,7 @@ private:
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
     size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
     BufferManager::CudaStreamPtr const& stream,
-    std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
+    std::shared_ptr<SpeculativeDecodingModule const> const& speculativeDecodingModule)
 {
     switch (dtype)
     {
@@ -128,10 +128,9 @@ inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode c
 
 /// @brief Helper function to produce batch slots [0, 1, ..., batchSize - 1] for paths that do not explicitly provide
 /// batch slots to the decoder.
-inline runtime::ITensor::SharedConstPtr getDefaultBatchSlots(
-    runtime::SizeType32 batchSize, runtime::BufferManager const& bufferManager)
+inline runtime::ITensor::SharedConstPtr getDefaultBatchSlots(runtime::SizeType32 batchSize)
 {
-    auto defaultBatchSlots = bufferManager.pinnedPool(
+    auto defaultBatchSlots = runtime::BufferManager::pinnedPool(
         runtime::ITensor::makeShape({batchSize}), runtime::TRTDataType<runtime::SizeType32>::value);
     auto range = runtime::BufferRange<runtime::SizeType32>(*defaultBatchSlots);
     std::iota(range.begin(), range.end(), 0);

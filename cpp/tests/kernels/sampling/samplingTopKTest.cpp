@@ -73,9 +73,8 @@ protected:
         kernelParams.cumLogProbs = params.returnAllSelectedTokens || params.maxTokensPerStep > 1
             ? nullptr
             : bufferCast<float>(*this->mCumLogProbsDevice);
-        kernelParams.outputLogProbs = params.returnAllSelectedTokens || params.maxTokensPerStep > 1
-            ? nullptr
-            : bufferCast<float>(*this->mOutputLogProbsDevice);
+        kernelParams.outputLogProbs
+            = params.maxTokensPerStep > 1 ? nullptr : bufferCast<float>(*this->mOutputLogProbsDevice);
         kernelParams.curandState = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*this->mCurandStatesDevice));
         kernelParams.batchSize = params.batchSize;
         kernelParams.maxBatchSize = maxBatchSize;
@@ -144,6 +143,17 @@ TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllSelectedTokens)
                       .setTopK(10)
                       .setTopP(1.0f)
                       .setMaxTokensPerStep(4)
+                      .setReturnAllSelectedTokens());
+};
+
+TYPED_TEST(TopKSamplingKernelTest, CorrectnessReturnAllSelectedTokensMaxTokensPerStep1)
+{
+    this->runTest(SamplingKernelTestParam()
+                      .setBatchSize(16)
+                      .setVocabSize(50)
+                      .setTopK(10)
+                      .setTopP(1.0f)
+                      .setMaxTokensPerStep(1)
                       .setReturnAllSelectedTokens());
 };
 

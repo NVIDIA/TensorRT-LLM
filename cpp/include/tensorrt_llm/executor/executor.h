@@ -250,6 +250,24 @@ private:
     std::optional<VecTokenExtraIds> mInputTokenExtraIds;
 };
 
+/// @brief Configuration for mrope
+class MropeConfig
+{
+public:
+    explicit MropeConfig(Tensor mropeRoratySinCos, SizeType32 mropePositionDeltas);
+
+    [[nodiscard]] Tensor getMRopeRotarySinCos() const;
+    [[nodiscard]] SizeType32 getMRopePositionDeltas() const;
+
+private:
+    friend class Serialization;
+    /// @brief The mrope rotary sin and cos cache. Expected shape: [maxPositionEmbeddings*rotaryEmbeddingDim],Data type
+    /// must float32
+    Tensor mMRopeRotarySinCos;
+    /// @brief The mrope position deltas
+    SizeType32 mMRopePositionDeltas;
+};
+
 /// @brief Configuration for LoRA
 class LoraConfig
 {
@@ -330,9 +348,10 @@ public:
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state);
 
     ContextPhaseParams(ContextPhaseParams const&);
-    ContextPhaseParams(ContextPhaseParams&&);
+    ContextPhaseParams(ContextPhaseParams&&) noexcept;
     ContextPhaseParams& operator=(ContextPhaseParams const&);
-    ContextPhaseParams& operator=(ContextPhaseParams&&);
+    ContextPhaseParams& operator=(ContextPhaseParams&&) noexcept;
+    ~ContextPhaseParams();
 
     [[nodiscard]] bool operator==(ContextPhaseParams const&) const noexcept;
 
@@ -511,7 +530,7 @@ public:
         std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
-        std::optional<LoraConfig> loraConfig = std::nullopt,
+        std::optional<MropeConfig> mRopeConfig = std::nullopt, std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
@@ -548,6 +567,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
+    [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const;
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
@@ -576,6 +596,7 @@ public:
     void setEmbeddingBias(Tensor const& embeddingBias);
     void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
+    void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
     void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig);
@@ -648,7 +669,10 @@ struct Result
     /// @brief The params of the context phase.
     std::optional<ContextPhaseParams> contextPhaseParams;
 
-    /// @brief The decoding iterations it takes.
+    /// @brief The number of the decoding iterations used to generate the result.
+    /// In autoregressive decoding, it is equal to the maximum length of the beam in outputTokenIds.
+    /// In speculative decoding, might be less than maximum length of the beam in outputTokenIds as more than
+    /// one token can be generated per iteration. Used for speculative decoding statistics.
     SizeType32 decodingIter{0};
 
     /// @brief The index of the output sequence of this result where 0 <= sequenceIndex < numReturnSequences.

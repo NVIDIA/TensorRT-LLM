@@ -56,12 +56,17 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     assert len(chat_completion.choices) == 1
     assert chat_completion.usage.completion_tokens == 10
     message = chat_completion.choices[0].message
-    assert message.content is not None and len(message.content) >= 10
+    assert message.content is not None
     assert message.role == "assistant"
 
     # test logprobs
     logprobs = chat_completion.choices[0].logprobs.content
-    assert len(logprobs) == 10
+    if chat_completion.choices[0].finish_reason == "length":
+        assert len(logprobs) == 10
+    elif chat_completion.choices[0].finish_reason == "stop":
+        assert len(logprob) <= 10
+    else:
+        raise RuntimeError("finish_reason not in [length, stop]")
     for logprob in logprobs:
         assert logprob.token is not None
         assert logprob.logprob is not None
@@ -117,6 +122,7 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
         logprob_content.logprob
         for logprob_content in chat_completion.choices[0].logprobs.content
     ]
+    _finish_reason = chat_completion.choices[0].finish_reason
 
     # test streaming
     stream = await async_client.chat.completions.create(
@@ -130,22 +136,41 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
     str_chunks: List[str] = []
     logprob_chunks: List[float] = []
 
-    # TODO{pengyunl}: add stop_reason test when supported
+    finish_reason_counter = 0
+    finish_reason: str = None
     async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if logprob_chunk := chunk.choices[0].logprobs:
-            assert len(logprob_chunk.content) == 1
-            assert len(logprob_chunk.content[0].top_logprobs) == 0
-            logprob_chunks.append(logprob_chunk.content[0].logprob)
+        choice = chunk.choices[0]
+        delta = choice.delta
+        if logprob_chunk := choice.logprobs:
+            if len(logprob_chunk.content) == 1:
+                assert logprob_chunk.content[0].top_logprobs is None
+                logprob_chunks.append(logprob_chunk.content[0].logprob)
+            elif len(logprob_chunk.content) == 0:
+                assert delta.content == ""
+            else:
+                raise RuntimeError("logprobs streaming error")
+        if choice.finish_reason is not None:
+            finish_reason_counter += 1
+            finish_reason = choice.finish_reason
         if delta.role:
             assert delta.role == "assistant"
         if delta.content:
             str_chunks.append(delta.content)
-    assert delta.content
+    if delta.content == "":
+        assert finish_reason == "stop"
     assert "".join(str_chunks) == output
     assert len(logprob_chunks) == len(logprobs)
     logprobs, logprob_chunks = np.array(logprobs), np.array(logprob_chunks)
     assert np.allclose(logprobs, logprob_chunks)
+    assert finish_reason_counter == 1
+    assert finish_reason == _finish_reason
+    num_tokens = len(logprob_chunks)
+    if finish_reason == "length":
+        assert num_tokens == 10
+    elif finish_reason == "stop":
+        assert num_tokens <= 10
+    else:
+        raise RuntimeError("finish_reason not in [length, stop]")
 
 
 @pytest.mark.asyncio
@@ -245,7 +270,7 @@ async def test_custom_role(async_client: openai.AsyncOpenAI, model_name: str):
             "role": "my-custom-role",
             "content": "what is 1+1?",
         }],  # type: ignore
-        temperature=0,
+        temperature=0.0,
         seed=0)
 
     resp2 = await async_client.chat.completions.create(
@@ -257,9 +282,29 @@ async def test_custom_role(async_client: openai.AsyncOpenAI, model_name: str):
                 "text": "what is 1+1?"
             }]
         }],  # type: ignore
-        temperature=0,
+        temperature=0.0,
         seed=0)
 
     content1 = resp1.choices[0].message.content
     content2 = resp2.choices[0].message.content
     assert content1 == content2
+
+
+def test_stop_reason(client: openai.OpenAI, model_name: str):
+    messages = [{
+        "role": "system",
+        "content": "you are a helpful assistant"
+    }, {
+        "role": "user",
+        "content": "what is the result of one plus one?"
+    }]
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=10,
+        temperature=0.0,
+        stop="two",
+    )
+    assert resp.choices[0].finish_reason == "stop"
+    assert resp.choices[0].stop_reason == "two"

@@ -25,17 +25,17 @@ import sys
 
 from cuda import cudart
 from parameterized import parameterized
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionOp,
                                      AllReduceFusionParams, AllReduceStrategy,
                                      allreduce)
-from tensorrt_llm.plugin.plugin import current_all_reduce_helper
+from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
+                                        init_all_reduce_helper)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import unittest_name_func
+from utils.util import create_session, run_session, unittest_name_func
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
@@ -100,6 +100,8 @@ class TestCommunicationPlugin(unittest.TestCase):
 
         builder = tllm.Builder()
         net = builder.create_network()
+        net.plugin_config.set_nccl_plugin(dtype)
+        init_all_reduce_helper()
         _, workspace = current_all_reduce_helper().allocate_workspace(
             self.mapping, size * dtype_size)
 
@@ -107,7 +109,7 @@ class TestCommunicationPlugin(unittest.TestCase):
             torch_dtype).reshape(token_num, hidden_size)
 
         with tllm.net_guard(net):
-            network = tllm.default_trtnet()
+            tllm.default_trtnet()
 
             x = Tensor(name='x',
                        shape=input.shape,
@@ -127,33 +129,17 @@ class TestCommunicationPlugin(unittest.TestCase):
             current, z = allreduce(
                 current,
                 self.mapping.tp_group,
-                strategy,
-                config,
+                strategy=strategy,
+                config=config,
                 reduce_fusion_params=AllReduceFusionParams(
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                     bias=y,
                     residual=z,
                     norm_weight=w,
                     eps=eps),
             )
-            output = current.trt_tensor
+            current.mark_output('output', dtype)
 
-            output.name = 'output'
-            output.dtype = tllm.str_dtype_to_trt(dtype)
-            network.mark_output(output)
-
-        build_engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                fp16=(dtype == 'float16'),
-                bf16=(dtype == 'bfloat16'),
-                precision_constraints='obey',
-            ),
-        )
-
-        output = torch.zeros_like(input)
-
-        stream = torch.cuda.current_stream()
         feed_dict = {
             'x': input,
             'y': bias,
@@ -162,23 +148,24 @@ class TestCommunicationPlugin(unittest.TestCase):
             'all_reduce_workspace': workspace
         }
 
-        session = tllm.runtime.Session.from_engine(build_engine())
-        session.run(inputs=feed_dict,
-                    outputs={"output": output},
-                    stream=stream.cuda_stream)
-        torch.cuda.synchronize()
+        session = create_session(builder, net, precision=dtype)
+        outputs = run_session(session, feed_dict)
 
-        close = torch.isclose(allreduce_ref, output, rtol=1e-2, atol=1e-3)
+        close = torch.isclose(allreduce_ref,
+                              outputs['output'],
+                              rtol=1e-2,
+                              atol=1e-3)
         if not torch.all(close):
             not_close_a = allreduce_ref[~close]
-            not_close_b = output[~close]
-            print("rank {}, \n{}\n{}".format(self.rank, allreduce_ref, output))
+            not_close_b = outputs['output'][~close]
+            print("rank {}, \n{}\n{}".format(self.rank, allreduce_ref,
+                                             outputs['output']))
             print("mismatch value:")
             print("ref:", not_close_a)
             print("output:", not_close_b)
 
         self.assertTrue(
-            torch.allclose(output.cpu(),
+            torch.allclose(outputs['output'].cpu(),
                            allreduce_ref.cpu(),
                            rtol=1e-2,
                            atol=1e-3))

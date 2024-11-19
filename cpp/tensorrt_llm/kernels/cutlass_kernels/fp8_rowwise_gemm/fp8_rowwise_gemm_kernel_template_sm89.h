@@ -16,10 +16,10 @@
 
 #pragma once
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 // clang-format off
 #include "cutlass/cutlass.h"
@@ -29,9 +29,9 @@
 #include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
 // clang-format on
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC__
 
 using namespace cute;
 
